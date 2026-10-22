@@ -176,6 +176,7 @@ fn refuse(conn: &Connection, request_id: &str, reason: &str, now: u64) -> Result
 /// newest message delivered (or read) TO `from` within `LOOP_WINDOW_S`: hops = trigger.hops + 1, and
 /// the thread is the trigger's if `to` is the trigger's sender, else a new one. No trigger: hops 0,
 /// new thread. (Forwarding to a third session therefore cannot reset the agent-chain count.)
+/// A `request_id` must match `[A-Za-z0-9._-]{1,128}`, else `Refused` (`bad_request_id`, nothing stored).
 /// Retrying a `request_id` that was accepted returns its receipt; one that was
 /// refused (`loop`, `too_long`) is refused again, whatever text comes with the retry, because a
 /// refusal stores no `to`/`text`. Clients mint a new `request_id` after any refusal.
@@ -189,8 +190,12 @@ pub fn send(
     now: u64,
 ) -> Result<Receipt> {
     let conn = store.conn();
-    if request_id.is_empty() || request_id.len() > MAX_REQUEST_ID {
-        // Nothing to key a receipt on.
+    let ok_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-');
+    if request_id.is_empty()
+        || request_id.len() > MAX_REQUEST_ID
+        || !request_id.chars().all(ok_char)
+    {
+        // Nothing safe to key a receipt on.
         return Ok(Receipt {
             request_id: request_id.into(),
             state: State::Refused,
@@ -443,6 +448,26 @@ mod tests {
         // Only the 12 accepted count: at 1600 they are all outside the window.
         assert_eq!(
             send(&s, &k("a"), &k("b"), "x", "after", None, 1600)
+                .unwrap()
+                .state,
+            State::Stored
+        );
+    }
+
+    #[test]
+    fn a_request_id_with_other_characters_is_refused() {
+        let (_d, s) = setup();
+        for rid in ["a\"b", "a\nb", "a b", "é"] {
+            let r = send(&s, &k("a"), &k("b"), "x", rid, None, 1).unwrap();
+            assert_eq!(
+                (r.state, r.reason.as_deref()),
+                (State::Refused, Some("bad_request_id")),
+                "{rid:?}"
+            );
+            assert!(receipt(&s, rid).unwrap().is_none());
+        }
+        assert_eq!(
+            send(&s, &k("a"), &k("b"), "x", "Ok.id_1-2", None, 1)
                 .unwrap()
                 .state,
             State::Stored
