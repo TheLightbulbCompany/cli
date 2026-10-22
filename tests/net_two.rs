@@ -16,7 +16,6 @@ mod common;
 
 use common::{seed_pair, until, Env, EXE};
 
-const LAN_OFF: &str = "lan = false\n";
 const PAGE_BYTES: usize = 512 * 1024;
 
 /// A member played by the test: its own endpoint, holding `id`'s key.
@@ -118,8 +117,8 @@ fn store_all(env: &Env, entries: &[Entry]) {
 async fn two_members_connect_and_converge_rosters() {
     let (a, b) = (Env::new(), Env::new());
     seed_pair(&a, &b);
-    b.daemon(LAN_OFF, &[]);
-    a.daemon(LAN_OFF, &[("LIGHTBULB_NETWORK_PEERS", b.peer_arg())]);
+    b.daemon("", &[]);
+    a.daemon("", &[("LIGHTBULB_NETWORK_PEERS", b.peer_arg())]);
     let connected = json!({"online": 1, "total": 1});
     until(5, "both online", || {
         a.status()["peers"] == connected && b.status()["peers"] == connected
@@ -144,7 +143,7 @@ async fn sync_sends_only_the_delta_in_pages() {
         .flat_map(|c| chain(&ia, &admit, 10, 0, &c.to_string()))
         .collect();
     store_all(&a, &lag);
-    a.daemon(LAN_OFF, &[]);
+    a.daemon("", &[]);
 
     let ep = endpoint(&b.identity()).await;
     let mut p = Peer::dial(&ep, &a).await;
@@ -184,7 +183,7 @@ async fn child_before_parent_in_one_frame_still_converges() {
     let (a, b) = (Env::new(), Env::new());
     let [_, admit] = seed_pair(&a, &b);
     let pc = chain(&a.identity(), &admit, 2, 0, "pc");
-    b.daemon(LAN_OFF, &[]);
+    b.daemon("", &[]);
 
     let ep = endpoint(&a.identity()).await;
     let mut p = Peer::dial(&ep, &b).await;
@@ -203,13 +202,71 @@ async fn child_before_parent_in_one_frame_still_converges() {
     assert_eq!(roster::entries(&b.store()).unwrap().len(), 4);
 }
 
+/// Dials `env`'s daemon as `id` and finishes the opening exchange (`hello`s, empty delta).
+async fn synced(ep: &Endpoint, env: &Env, head: &Entry) -> Peer {
+    let mut p = Peer::dial(ep, env).await;
+    p.hello(vec![head.hash()]).await;
+    assert!(matches!(p.recv().await, Frame::Hello { .. }));
+    assert!(entries_of(&p.pages().await).is_empty());
+    p
+}
+
+fn roster_frame(entries: Vec<Entry>) -> Frame {
+    Frame::Roster {
+        entries,
+        more: false,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn child_and_parent_in_separate_frames_converge() {
+    let (a, b) = (Env::new(), Env::new());
+    let [_, admit] = seed_pair(&a, &b);
+    let pc = chain(&a.identity(), &admit, 2, 0, "pc");
+    b.daemon("", &[]);
+
+    let ep = endpoint(&a.identity()).await;
+    let mut p = synced(&ep, &b, &admit).await;
+    p.send(&roster_frame(vec![pc[1].clone()])).await;
+    p.send(&roster_frame(vec![pc[0].clone()])).await;
+    until(2, "B applies both", || {
+        heads(b.heads()) == vec![pc[1].hash()]
+    });
+    assert_eq!(roster::entries(&b.store()).unwrap().len(), 4);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn waiting_entries_are_dropped_on_close() {
+    let (a, b) = (Env::new(), Env::new());
+    let [_, admit] = seed_pair(&a, &b);
+    let pc = chain(&a.identity(), &admit, 2, 0, "pc");
+    b.daemon("", &[]);
+
+    let ep = endpoint(&a.identity()).await;
+    let mut p = synced(&ep, &b, &admit).await;
+    p.send(&roster_frame(vec![pc[1].clone()])).await;
+    // B answers this hello only after it has read the child: the child is waiting.
+    p.hello(vec![admit.hash()]).await;
+    assert!(entries_of(&p.pages().await).is_empty());
+    p.conn.close(0u32.into(), b"");
+
+    // The parent on a new connection: only the parent lands.
+    let mut q = synced(&ep, &b, &admit).await;
+    q.send(&roster_frame(vec![pc[0].clone()])).await;
+    until(2, "B applies the parent", || {
+        roster::entries(&b.store()).unwrap().len() >= 3
+    });
+    assert_eq!(heads(b.heads()), vec![pc[0].hash()]);
+    assert_eq!(roster::entries(&b.store()).unwrap().len(), 3);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn roster_pages_split_by_bytes_not_only_count() {
     let (a, b) = (Env::new(), Env::new());
     let [_, admit] = seed_pair(&a, &b);
     store_all(&a, &chain(&a.identity(), &admit, 300, 4096, "big"));
-    a.daemon(LAN_OFF, &[]);
-    b.daemon(LAN_OFF, &[]);
+    a.daemon("", &[]);
+    b.daemon("", &[]);
 
     // A's pages, as B would get them.
     let ep_b = endpoint(&b.identity()).await;
@@ -241,7 +298,7 @@ async fn roster_pages_split_by_bytes_not_only_count() {
 async fn non_member_is_refused_on_member_alpn() {
     let (a, b) = (Env::new(), Env::new());
     seed_pair(&a, &b);
-    a.daemon(LAN_OFF, &[]);
+    a.daemon("", &[]);
     let stranger = Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
     let ep = endpoint(&stranger).await;
     let conn = ep.connect(addr(&a), ALPN).await.unwrap();
@@ -255,7 +312,7 @@ async fn non_member_is_refused_on_member_alpn() {
 async fn removed_member_connection_is_closed_on_removal() {
     let (a, b) = (Env::new(), Env::new());
     seed_pair(&a, &b);
-    a.daemon(LAN_OFF, &[]);
+    a.daemon("", &[]);
     let ep = endpoint(&b.identity()).await;
     let mut p = Peer::dial(&ep, &a).await;
     p.hello(vec![]).await;
@@ -277,18 +334,42 @@ async fn removed_member_connection_is_closed_on_removal() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn removal_inside_the_gate_closes_the_connection() {
+    let (a, b) = (Env::new(), Env::new());
+    seed_pair(&a, &b);
+    let pause = ("LIGHTBULB_NETWORK_DEBUG_GATE_PAUSE_MS", "1500".to_string());
+    a.daemon("", &[pause]);
+    let ep = endpoint(&b.identity()).await;
+    let conn = ep.connect(addr(&a), ALPN).await.unwrap();
+    // A holds its gate 1.5 s after the handshake; the removal lands in that window and
+    // waits for the adoption, so its install closes the adopted connection.
+    let o = a.detached(&[EXE, "remove", "bob"], "");
+    assert!(o.status.success(), "{}", common::err(&o));
+    tokio::time::timeout(Duration::from_secs(3), conn.closed())
+        .await
+        .expect("closed within 3 s of the removal");
+    assert_eq!(a.status()["peers"], json!({"online": 0, "total": 0}));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn older_protocol_is_reported_not_served() {
     let (a, b) = (Env::new(), Env::new());
     seed_pair(&a, &b);
-    b.daemon(LAN_OFF, &[("LIGHTBULB_NETWORK_DEBUG_PROTOCOL", "0".into())]);
-    a.daemon(LAN_OFF, &[("LIGHTBULB_NETWORK_PEERS", b.peer_arg())]);
+    a.daemon("", &[]);
+    // B, played here, speaks protocol 0.
+    let ep = endpoint(&b.identity()).await;
+    let mut p = Peer::dial(&ep, &a).await;
+    p.send(&Frame::Hello {
+        protocol: 0,
+        heads: vec![],
+    })
+    .await;
+    assert!(matches!(p.recv().await, Frame::Hello { .. }));
     let notice = json!(["mbp needs an update (protocol 0, yours 1)"]);
     until(5, "A reports B", || a.status()["needs_update"] == notice);
-    let notice = json!(["mac needs an update (protocol 1, yours 0)"]);
-    until(5, "B reports A", || b.status()["needs_update"] == notice);
     assert_eq!(a.status()["peers"]["online"], 0);
-    assert_eq!(b.status()["peers"]["online"], 0);
-    // No roster flows.
+    // A writes: nothing follows its hello, neither the delta nor the push.
     assert_eq!(a.ask(json!({"id": 1, "op": "team.invite"}))["ok"], true);
-    assert_ne!(a.heads(), b.heads());
+    let next = tokio::time::timeout(Duration::from_secs(2), frames::read(&mut p.recv)).await;
+    assert!(next.is_err(), "a frame after hello: {next:?}");
 }

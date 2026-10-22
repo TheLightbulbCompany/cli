@@ -16,8 +16,6 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast::{error::RecvError, Receiver};
 use tokio::task::JoinSet;
 
-pub const PROTOCOL: u32 = 1;
-
 // The closed list of `error` codes.
 pub const UNKNOWN_OP: &str = "unknown_op";
 pub const BAD_REQUEST: &str = "bad_request";
@@ -158,7 +156,7 @@ async fn handle(
                 id,
                 json!({
                     "version": env!("CARGO_PKG_VERSION"),
-                    "protocol": PROTOCOL,
+                    "protocol": crate::net::protocol(),
                     "member_key_short": daemon.identity.short,
                     "team": { "id": t.roster.team_id, "name": t.roster.team_name },
                     "sessions": live_count(daemon),

@@ -50,9 +50,16 @@ impl Env {
         Store::open(&self.state.path().join("state.db")).unwrap()
     }
 
-    /// Starts `lightbulb-network daemon` on this state dir with `config` as `config.toml` and
-    /// `env` set, and waits until it answers.
+    /// Starts `lightbulb-network daemon` on this state dir with `config` as `config.toml`
+    /// (`lan = false` unless `config` sets `lan`) and `env` set, and waits until it answers.
     pub fn daemon(&self, config: &str, env: &[(&str, String)]) {
+        // mDNS only where a test asks for it (`lan = true`).
+        let lan = if config.contains("lan") {
+            ""
+        } else {
+            "lan = false\n"
+        };
+        let config = format!("{lan}{config}");
         std::fs::write(self.state.path().join("config.toml"), config).unwrap();
         let log = std::fs::File::create(self.state.path().join("daemon.log")).unwrap();
         let mut c = Command::new(EXE);

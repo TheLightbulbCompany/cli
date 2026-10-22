@@ -2,7 +2,7 @@
 //! replayed deterministically, so every member computes the same team from the same set of
 //! entries whatever order they arrived in. Pure: no network, no IPC, no logging.
 
-use crate::identity::{unsigned, verify, Identity};
+use crate::identity::{canonical, unsigned, verify, Identity};
 use crate::store::Store;
 use crate::Result;
 use data_encoding::HEXLOWER;
@@ -14,6 +14,9 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 /// How far ahead of our clock an entry may be stamped.
 const MAX_SKEW_S: i64 = 86_400;
+/// An entry's canonical JSON may not pass this (a proof is at most 4 KiB): one entry must
+/// always fit a `roster` frame, or sync with that peer would fail for good.
+pub const MAX_ENTRY_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -545,6 +548,9 @@ pub fn entries(store: &Store) -> Result<Vec<Entry>> {
 /// Refuses a bad signature, a stamp more than a day ahead of `now`, an unknown parent and a
 /// second root.
 pub fn accept(store: &Store, entry: &Entry, now: i64) -> Result<bool> {
+    if canonical(&entry.value()).len() > MAX_ENTRY_BYTES {
+        return Err("roster entry is too large".into());
+    }
     if !verify(&entry.signer, &entry.value(), &entry.sig) {
         return Err("roster entry has a bad signature".into());
     }
@@ -958,6 +964,31 @@ mod tests {
         let mut forged = e_at(now);
         forged.at += 1;
         assert!(accept(&s, &forged, now).is_err());
+    }
+
+    #[test]
+    fn oversize_entry_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("state.db")).unwrap();
+        let f = id();
+        let now = 1_000;
+        let g = genesis(&f);
+        assert!(accept(&s, &g, now).unwrap());
+        let padded = |n: usize| {
+            let body = json!({ "pad": "x".repeat(n) });
+            Entry::signed(&f, vec![g.hash()], Kind::Meta, body, now)
+        };
+        let fits = padded(MAX_ENTRY_BYTES - 1024);
+        assert!(canonical(&fits.value()).len() <= MAX_ENTRY_BYTES);
+        assert!(accept(&s, &fits, now).unwrap());
+        let over = padded(MAX_ENTRY_BYTES);
+        assert!(accept(&s, &over, now).is_err());
+        assert!(!s
+            .conn()
+            .prepare("SELECT 1 FROM roster WHERE hash = ?1")
+            .unwrap()
+            .exists([over.hash()])
+            .unwrap());
     }
 
     #[test]

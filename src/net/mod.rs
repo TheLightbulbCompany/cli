@@ -51,6 +51,7 @@ pub fn protocol() -> u32 {
 
 /// Addresses to dial members at without discovery: in debug builds,
 /// `LIGHTBULB_NETWORK_PEERS=<key>@<ip:port>,…`.
+#[cfg_attr(not(debug_assertions), allow(unused_mut))]
 fn known_addrs() -> HashMap<String, Vec<SocketAddr>> {
     let mut out: HashMap<String, Vec<SocketAddr>> = HashMap::new();
     #[cfg(debug_assertions)]
@@ -82,6 +83,7 @@ pub struct Peers {
 
 struct Link {
     conn: Connection,
+    // ponytail: unbounded; only members get a queue, bound it if one shows up growing.
     tx: mpsc::UnboundedSender<Frame>,
     /// The member key that dialed this connection.
     dialer: String,
@@ -173,6 +175,8 @@ struct Inner {
     endpoint: Endpoint,
     daemon: Arc<Daemon>,
     addrs: HashMap<String, Vec<SocketAddr>>,
+    /// Members whose last dial failed, so a failure is logged once, not every 30 s.
+    failed: Mutex<HashSet<String>>,
 }
 
 impl Net {
@@ -194,6 +198,7 @@ impl Net {
             endpoint,
             daemon,
             addrs: known_addrs(),
+            failed: Mutex::default(),
         }));
         tokio::spawn(net.clone().accept_loop());
         tokio::spawn(net.clone().keep_up());
@@ -280,7 +285,7 @@ impl Net {
             .unwrap()
             .retain(|k, _| r.members.contains_key(k));
         if changed {
-            for l in live.values() {
+            for l in live.values_mut() {
                 let Some(heads) = &l.heads else { continue };
                 let delta = delta(&all, r, heads);
                 if !delta.is_empty() {
@@ -289,6 +294,8 @@ impl Net {
                     }
                 }
                 let _ = l.tx.send(hello(r));
+                // After the push the peer holds all of ours: the next change sends only itself.
+                l.heads = Some(r.heads.clone());
             }
         }
         let mut dialing = d.peers.dialing.lock().unwrap();
@@ -312,9 +319,20 @@ impl Net {
             None => None,
         };
         d.peers.dialing.lock().unwrap().remove(&key);
+        // Logged when the outcome changes, not on every redial.
+        let newly_failed = {
+            let mut failed = self.0.failed.lock().unwrap();
+            if r.is_some() {
+                failed.remove(&key);
+                false
+            } else {
+                failed.insert(key.clone())
+            }
+        };
         match r {
             Some(conn) => self.serve(conn, key, true).await,
-            None => eprintln!("net: dial {}: failed", short(&key)),
+            None if newly_failed => eprintln!("net: dial {}: failed", short(&key)),
+            None => {}
         }
     }
 
@@ -322,17 +340,30 @@ impl Net {
     async fn serve(&self, conn: Connection, key: String, outgoing: bool) {
         let d = &self.0.daemon;
         let me = d.identity.key.as_str();
-        let member = key != me && d.team.lock().unwrap().roster.members.contains_key(&key);
-        if !member {
-            conn.close(VarInt::from_u32(NOT_MEMBER), b"not a member");
-            eprintln!("net: refused {} (not a member)", short(&key));
-            return;
-        }
         let (tx, mut rx) = mpsc::unbounded_channel();
         let dialer = if outgoing { me } else { key.as_str() };
-        if !d.peers.adopt(&key, me, &conn, dialer, &tx) {
-            conn.close(VarInt::from_u32(SUPERSEDED), b"superseded");
-            return;
+        // The gate and the adoption are one section under `team`: a removal installed between
+        // them would find nothing to close, and the ex-member's connection would be adopted.
+        let refused = {
+            let team = d.team.lock().unwrap();
+            if key == me || !team.roster.members.contains_key(&key) {
+                Some(NOT_MEMBER)
+            } else {
+                gate_pause();
+                (!d.peers.adopt(&key, me, &conn, dialer, &tx)).then_some(SUPERSEDED)
+            }
+        };
+        match refused {
+            Some(NOT_MEMBER) => {
+                conn.close(VarInt::from_u32(NOT_MEMBER), b"not a member");
+                eprintln!("net: refused {} (not a member)", short(&key));
+                return;
+            }
+            Some(code) => {
+                conn.close(VarInt::from_u32(code), b"superseded");
+                return;
+            }
+            None => {}
         }
         let streams = if outgoing {
             conn.open_bi().await
@@ -387,6 +418,8 @@ impl Net {
         if !frames::from_peer_ok(&f, peer, d) {
             eprintln!("net: dropped a {} frame from {short}", f.kind());
         } else if let Frame::Hello { protocol: p, heads } = f {
+            // ponytail: a hello costs O(heads × log) under `team`, and a member may send them
+            // back to back; rate-limit per connection if one does.
             if p != protocol() {
                 eprintln!("net: {short} speaks protocol {p}");
                 d.peers.outdated.lock().unwrap().insert(key.to_string(), p);
@@ -414,6 +447,18 @@ impl Net {
             }
         }
         true
+    }
+}
+
+/// In debug builds, `LIGHTBULB_NETWORK_DEBUG_GATE_PAUSE_MS` holds the gate (with `team`)
+/// that long before adopting, so a test can land a removal in the window.
+fn gate_pause() {
+    #[cfg(debug_assertions)]
+    if let Some(ms) = std::env::var("LIGHTBULB_NETWORK_DEBUG_GATE_PAUSE_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        std::thread::sleep(Duration::from_millis(ms));
     }
 }
 
