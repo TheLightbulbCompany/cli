@@ -224,3 +224,32 @@ async fn send_qualifies_a_bare_name_and_refuses_bad_addresses() {
     }
     call(&mut l, &mut w, json!({"id": 4, "op": "shutdown"})).await;
 }
+
+#[tokio::test]
+async fn a_peer_hanging_up_as_mail_arrives_never_loses_the_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let claude_home = tempfile::tempdir().unwrap();
+    std::env::set_var("LIGHTBULB_NETWORK_CLAUDE_HOME", claude_home.path());
+    let home = dir.path().to_path_buf();
+    tokio::spawn(async move { daemon::run(&home).await.unwrap() });
+    let sock = dir.path().join(paths::SOCKET);
+    let (mut l, mut w) = connect(&sock).await;
+    for i in 0..50 {
+        let key = format!("x/codex:race{i}");
+        let (r2, mut w2) = connect(&sock).await;
+        let req = json!({"id": 1, "op": "inbox", "key": key, "wait_secs": 30});
+        w2.write_all(format!("{req}\n").as_bytes()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        // Send and hang up at the same instant: both reach the daemon in one go.
+        let send = json!({"id": 2, "op": "send", "from": "x/claude:a", "to": key,
+            "text": "kept", "request_id": format!("r{i}")});
+        w.write_all(format!("{send}\n").as_bytes()).await.unwrap();
+        drop((r2, w2));
+        let sent: Value = serde_json::from_str(&l.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(sent["receipt"]["state"], "stored", "{sent}");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let got = call(&mut l, &mut w, json!({"id": 3, "op": "inbox", "key": key})).await;
+        assert_eq!(got["messages"][0]["text"], "kept", "iteration {i}: {got}");
+    }
+    call(&mut l, &mut w, json!({"id": 4, "op": "shutdown"})).await;
+}

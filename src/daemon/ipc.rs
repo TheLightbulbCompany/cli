@@ -446,6 +446,18 @@ async fn inbox(
         let Ok(held) = tokio::time::timeout_at(deadline, lock.lock()).await else {
             return Response::ok(id, json!({ "messages": [] }));
         };
+        // Look at the peer once more, without waiting: one that hung up as the mail arrived
+        // (both ready in the same wakeup) must not have mail taken for it.
+        if watch_peer {
+            tokio::select! {
+                biased;
+                buf = peer.get_mut().fill_buf() => match buf {
+                    Ok(b) if !b.is_empty() => watch_peer = false,
+                    _ => return Response::ok(id, json!({ "messages": [] })),
+                },
+                () = std::future::ready(()) => {}
+            }
+        }
         let taken = mail::take(&daemon.store.lock().unwrap(), &key, now());
         match taken {
             Err(_) => return Response::err(id, INTERNAL),
