@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::broadcast::{error::RecvError, Receiver};
 use tokio::task::JoinSet;
 
 pub const PROTOCOL: u32 = 1;
@@ -56,7 +56,9 @@ pub async fn serve(listener: UnixListener, daemon: Arc<Daemon>) {
         tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => {
-                    conns.spawn(connection(stream, daemon.clone()));
+                    // Subscribe here, not in the task, so a connection accepted
+                    // just before shutdown cannot miss the shutdown event.
+                    conns.spawn(connection(stream, daemon.events.subscribe(), daemon.clone()));
                 }
                 Err(e) => eprintln!("accept: {e}"),
             },
@@ -68,8 +70,7 @@ pub async fn serve(listener: UnixListener, daemon: Arc<Daemon>) {
     let _ = tokio::time::timeout(Duration::from_secs(2), conns.join_all()).await;
 }
 
-async fn connection(stream: UnixStream, daemon: Arc<Daemon>) {
-    let mut events = daemon.events.subscribe();
+async fn connection(stream: UnixStream, mut events: Receiver<Value>, daemon: Arc<Daemon>) {
     let (read, mut write) = stream.into_split();
     let mut lines = BufReader::new(read).lines();
     let mut subscribed = false;

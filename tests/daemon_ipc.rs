@@ -121,3 +121,48 @@ async fn two_ensure_running_calls_leave_one_daemon() {
     }
     panic!("daemon {pid} did not exit after shutdown");
 }
+
+#[tokio::test]
+async fn ensure_running_right_after_shutdown_starts_a_new_daemon() {
+    let dir = tempfile::tempdir().unwrap();
+    let exe = Path::new(env!("CARGO_BIN_EXE_lightbulb-network"));
+    let d = dir.path().to_path_buf();
+    tokio::task::spawn_blocking(move || daemon::ensure_running_at(exe, &d).unwrap())
+        .await
+        .unwrap();
+
+    let (mut lines, mut w) = connect(dir.path()).await;
+    assert_eq!(
+        call(&mut lines, &mut w, json!({"id": 1, "op": "shutdown"})).await,
+        json!({"id": 1, "ok": true})
+    );
+    let d = dir.path().to_path_buf();
+    tokio::task::spawn_blocking(move || daemon::ensure_running_at(exe, &d).unwrap())
+        .await
+        .unwrap();
+
+    let (mut lines, mut w) = connect(dir.path()).await;
+    assert_eq!(
+        call(&mut lines, &mut w, json!({"id": 2, "op": "ping"})).await,
+        json!({"id": 2, "ok": true})
+    );
+    call(&mut lines, &mut w, json!({"id": 3, "op": "shutdown"})).await;
+}
+
+/// A daemon still flushing on shutdown holds the lock with no listener: the
+/// first spawned child loses the lock and exits, so ensure_running must respawn.
+#[tokio::test]
+async fn ensure_running_respawns_when_a_dying_daemon_holds_the_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let exe = Path::new(env!("CARGO_BIN_EXE_lightbulb-network"));
+    let lock = std::fs::File::create(dir.path().join("daemon.lock")).unwrap();
+    lock.try_lock().unwrap();
+    let d = dir.path().to_path_buf();
+    let ensure = tokio::task::spawn_blocking(move || daemon::ensure_running_at(exe, &d));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    drop(lock);
+    ensure.await.unwrap().unwrap();
+
+    let (mut lines, mut w) = connect(dir.path()).await;
+    call(&mut lines, &mut w, json!({"id": 1, "op": "shutdown"})).await;
+}

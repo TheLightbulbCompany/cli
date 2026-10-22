@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 /// Overrides the state dir (tests, side-by-side installs).
 pub const HOME_ENV: &str = "LIGHTBULB_NETWORK_HOME";
-pub const SOCKET: &str = "daemon.sock";
+pub const SOCKET: &str = "sock";
 
 /// `~/.lightbulb/network` (or `$LIGHTBULB_NETWORK_HOME`), created with mode 0700.
 pub fn state_dir() -> PathBuf {

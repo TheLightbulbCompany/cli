@@ -5,14 +5,14 @@ use data_encoding::BASE32_NOPAD;
 use ed25519_dalek::SigningKey;
 use serde_json::Value;
 use std::fs::{self, File, OpenOptions, Permissions, TryLockError};
-use std::io::{ErrorKind, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::UnixListener;
 use tokio::sync::{broadcast, Notify};
 
@@ -61,6 +61,7 @@ pub async fn run(dir: &Path) -> Result<()> {
         _ => {}
     }
     let listener = UnixListener::bind(&sock)?;
+    // Briefly wider than 0600 after bind; the 0700 state dir closes that window.
     fs::set_permissions(&sock, Permissions::from_mode(0o600))?;
 
     let daemon = Arc::new(Daemon {
@@ -87,13 +88,19 @@ fn identity(dir: &Path) -> Result<[u8; 32]> {
                 .map_err(|_| "identity.key is not 32 bytes")?,
         ),
         Err(e) if e.kind() == ErrorKind::NotFound => {
+            // Write then rename, so a crash never leaves a truncated key.
+            // We hold the lock, so a leftover .tmp is ours to replace.
+            let tmp = dir.join("identity.key.tmp");
+            let _ = fs::remove_file(&tmp);
             let key = SigningKey::generate(&mut rand::rngs::OsRng);
-            OpenOptions::new()
+            let mut f = OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .mode(0o600)
-                .open(&path)?
-                .write_all(&key.to_bytes())?;
+                .open(&tmp)?;
+            f.write_all(&key.to_bytes())?;
+            f.sync_all()?;
+            fs::rename(&tmp, &path)?;
             key
         }
         Err(e) => return Err(e.into()),
@@ -109,28 +116,55 @@ pub fn ensure_running() -> Result<()> {
 /// `ensure_running` for an explicit binary and state dir (tests).
 pub fn ensure_running_at(exe: &Path, dir: &Path) -> Result<()> {
     let sock = dir.join(paths::SOCKET);
-    if UnixStream::connect(&sock).is_ok() {
+    if answers_ping(&sock) {
         return Ok(());
     }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut child = spawn_daemon(exe, dir)?;
+    let mut up = false;
+    while !up && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+        up = answers_ping(&sock);
+        // It lost the lock to a daemon that has since gone (one shutting
+        // down when we looked): start another. try_wait reaps the loser.
+        if !up && child.try_wait()?.is_some() {
+            child = spawn_daemon(exe, dir)?;
+        }
+    }
+    // Reap the last child whenever it exits, so a long-lived caller is not
+    // left holding a zombie daemon.
+    std::thread::spawn(move || child.wait());
+    if up {
+        Ok(())
+    } else {
+        Err("daemon did not start within 5 s".into())
+    }
+}
+
+fn spawn_daemon(exe: &Path, dir: &Path) -> Result<Child> {
     let log = File::options()
         .create(true)
         .append(true)
         .open(dir.join("daemon.log"))?;
-    let mut child = Command::new(exe)
+    Ok(Command::new(exe)
         .arg("daemon")
         .env(paths::HOME_ENV, dir)
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log)
         .process_group(0) // detached from the caller's terminal signals
-        .spawn()?;
-    // Reap it whenever it exits (a lock-race loser exits at once).
-    std::thread::spawn(move || child.wait());
-    for _ in 0..50 {
-        std::thread::sleep(Duration::from_millis(100));
-        if UnixStream::connect(&sock).is_ok() {
-            return Ok(());
-        }
-    }
-    Err("daemon did not start within 5 s".into())
+        .spawn()?)
+}
+
+/// A bare connect can land in the backlog of a daemon that is shutting down,
+/// so liveness is a ping answered.
+fn answers_ping(sock: &Path) -> bool {
+    let Ok(mut stream) = UnixStream::connect(sock) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+    let mut line = String::new();
+    stream.write_all(b"{\"id\":0,\"op\":\"ping\"}\n").is_ok()
+        && BufReader::new(stream).read_line(&mut line).is_ok()
+        && line.contains("\"ok\":true")
 }
