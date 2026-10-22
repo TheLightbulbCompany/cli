@@ -123,18 +123,19 @@ pub fn send(
 ) -> Result<i32> {
     let group = target == "*" || target.ends_with("/*");
     let from = from.or_else(|| std::env::var(SESSION_ENV).ok());
-    let identity = from.is_none() && session_identity();
+    let identity = session_identity();
     if group && (from.is_some() || identity) {
         return Err("group sends are for people at a terminal".into());
     }
     let mut conn = connect()?;
     let short = conn.member()?;
-    let from = match from {
-        Some(f) => f,
-        // An agent's shell speaks as its session, never as the terminal.
-        None if identity => calling_session(&mut conn)
-            .ok_or("send from an agent's shell must name --from <session_id>")?,
-        None => format!("{short}/terminal"),
+    let from = if identity {
+        // An agent's shell speaks as its own session, never as the terminal or another one.
+        calling_session(&mut conn)
+            .filter(|own| from.as_ref().is_none_or(|f| f == own))
+            .ok_or("send from an agent's shell must name --from <session_id>, your own session")?
+    } else {
+        from.unwrap_or_else(|| format!("{short}/terminal"))
     };
     let rid = request_id.unwrap_or_else(|| ulid::Ulid::generate().to_string());
     let targets: Vec<(String, String)> = if group {

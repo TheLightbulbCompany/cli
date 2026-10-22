@@ -386,6 +386,21 @@ fn send_from_an_agent_shell_sends_as_its_session_or_refuses() {
         .as_str()
         .unwrap()
         .contains("from Your Codex {"));
+    // --from cannot speak for the terminal (or anyone else) from that shell; its own is fine.
+    let pinned = |from: &str| {
+        e.cmd(&["send", "bob", "x", "--from", from])
+            .env(
+                "LIGHTBULB_NETWORK_HOOK_CALLER",
+                format!("{}:{birth}", std::process::id()),
+            )
+            .output()
+            .unwrap()
+    };
+    let o = pinned(&format!("{}/terminal", e.short()));
+    assert!(!o.status.success());
+    assert!(err(&o).contains("your own session"), "{}", err(&o));
+    let o = pinned(&key);
+    assert!(o.status.success(), "{}", err(&o));
 
     // An agent above that no session belongs to: refused, nothing sent.
     let other = std::process::Command::new("sleep")
@@ -406,7 +421,8 @@ fn send_from_an_agent_shell_sends_as_its_session_or_refuses() {
     let _ = other.wait();
     assert!(!o.status.success());
     assert!(
-        err(&o).contains("send from an agent's shell must name --from <session_id>"),
+        err(&o)
+            .contains("send from an agent's shell must name --from <session_id>, your own session"),
         "{}",
         err(&o)
     );
