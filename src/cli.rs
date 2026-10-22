@@ -2,9 +2,10 @@
 //! `daemon --install/--uninstall`, the `lightbulb` alias, and forwarding to the Lightbulb app.
 //! Each is a client of the daemon, like the hook.
 
+use crate::daemon::ipc;
 use crate::daemon::net_ops::Invite;
 use crate::hook::{self, Conn};
-use crate::{daemon, paths, setup, Result};
+use crate::{admission, daemon, paths, setup, Result};
 use serde_json::{json, Value};
 use std::ffi::OsString;
 use std::fs;
@@ -287,12 +288,6 @@ pub fn invite(mode: Invite) -> Result<i32> {
 pub fn join(link: &str, name: Option<String>) -> Result<i32> {
     let name = name.unwrap_or_else(daemon::user_name);
     let mut conn = connect()?;
-    let t = ask(&mut conn, "team.get", json!({}))?;
-    if t["members"].as_array().is_some_and(|m| m.len() > 1) {
-        let team = t["name"].as_str().unwrap_or_default();
-        eprintln!("You are in \"{team}\". Leave it first: lightbulb-network leave");
-        return Ok(1);
-    }
     if crate::ticket::decode(link).is_ok_and(|t| t.mode == "ask") {
         println!("Waiting for an admin to allow this...");
     }
@@ -314,14 +309,14 @@ pub fn join(link: &str, name: Option<String>) -> Result<i32> {
             return Ok(0);
         }
         (Some("waiting"), _) => "No one has answered yet. Run the same command again to keep asking.".to_string(),
-        (_, Some("already_in_team")) => format!("You are in \"{team}\". Leave it first: lightbulb-network leave"),
-        (_, Some("name_taken")) => format!(
+        (_, Some(admission::ALREADY_IN_TEAM)) => format!("You are in \"{team}\". Leave it first: lightbulb-network leave"),
+        (_, Some(admission::NAME_TAKEN)) => format!(
             "The name \"{name}\" is already used in this network. Try: lightbulb-network join '{link}' --name {name}-2"
         ),
-        (_, Some("unreachable")) => "No one from this network is online right now. Ask them to open their laptop, then run the same command again. Your key is ready; nothing was lost.".to_string(),
-        (_, Some("declined")) => "Your request to join was declined.".to_string(),
-        (_, Some("bad_ticket")) => "This invite link does not work. Ask for a new one.".to_string(),
-        (_, Some("expired_ticket")) => "This invite link has expired. Ask for a new one.".to_string(),
+        (_, Some(admission::UNREACHABLE)) => "No one from this network is online right now. Ask them to open their laptop, then run the same command again. Your key is ready; nothing was lost.".to_string(),
+        (_, Some(admission::DECLINED)) => "Your request to join was declined.".to_string(),
+        (_, Some(admission::BAD_TICKET)) => "This invite link does not work. Ask for a new one.".to_string(),
+        (_, Some(admission::EXPIRED_TICKET)) => "This invite link has expired. Ask for a new one.".to_string(),
         (_, reason) => format!("join: {}", reason.unwrap_or("refused")),
     };
     eprintln!("{text}");
@@ -330,18 +325,17 @@ pub fn join(link: &str, name: Option<String>) -> Result<i32> {
 
 /// `approve J<n>` / `decline J<n>`: answers a join request.
 pub fn answer_join(request: &str, allow: bool) -> Result<i32> {
-    let verdict = if allow { "allow" } else { "decline" };
     let r = connect()?.call(
         "team.admit",
-        json!({"request": request, "verdict": verdict}),
+        json!({"request": request, "verdict": if allow { "allow" } else { "decline" }}),
     )?;
     if r["ok"] != true {
         let texts = [
             (
-                "not_open",
+                admission::NOT_OPEN,
                 format!("{request} was already answered or withdrawn."),
             ),
-            ("not_found", format!("No join request {request}.")),
+            (ipc::NOT_FOUND, format!("No join request {request}.")),
         ];
         return refuse(&r, &texts, if allow { "approve" } else { "decline" });
     }

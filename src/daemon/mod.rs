@@ -52,6 +52,8 @@ pub struct Daemon {
     pub dialog_answers: Mutex<Option<dialog::Answers>>,
     /// The join requests waiting for their person's answer (`admission`).
     pub admissions: crate::admission::Waiting,
+    /// Held while a `team.join` runs: one at a time.
+    pub joining: tokio::sync::Mutex<()>,
 }
 
 impl Daemon {
@@ -177,9 +179,10 @@ pub async fn run(dir: &Path) -> Result<()> {
         dialogs,
         dialog_answers: Mutex::new(Some(answers)),
         admissions: Mutex::default(),
+        joining: tokio::sync::Mutex::new(()),
     });
     // No join connection outlives a restart: its open requests are over.
-    daemon.store.lock().unwrap().expire_joins(i64::MAX)?;
+    daemon.store.lock().unwrap().expire_joins(i64::MAX, now)?;
     tokio::spawn(crate::admission::route(daemon.clone()));
     let net = net::Net::start(daemon.clone()).await?;
     ipc::serve(listener, daemon).await;

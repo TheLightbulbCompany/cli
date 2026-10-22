@@ -1,11 +1,13 @@
 //! What the CLI and network test files share: a temp state dir and HOME, a daemon shut down
-//! on drop, a person's shell (`detached`), and a two-member team seeded before start.
-//! ponytail: only `cli.rs`, `team_cli.rs`, `net_two.rs`, `ui_claim.rs` and `dialog.rs` use it;
+//! on drop, a person's shell (`detached`) and socket client (`person`), the daemon env knobs,
+//! and a two-member team seeded before start.
+//! ponytail: only `cli.rs`, `team_cli.rs`, `net_two.rs`, `join.rs`, `ui_claim.rs` and `dialog.rs` use it;
 //! the other test files keep their own copies.
 #![allow(dead_code)]
 
+use iroh::{EndpointAddr, PublicKey};
 use lightbulb_network::daemon::net_ops;
-use lightbulb_network::identity::Identity;
+use lightbulb_network::identity::{self, Identity};
 use lightbulb_network::roster::{self, Entry, Kind};
 use lightbulb_network::store::Store;
 use serde_json::{json, Value};
@@ -193,4 +195,56 @@ pub fn script(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
     std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
     p
+}
+
+/// One request from a person: a line over `e`'s socket from a detached `perl`, which returns
+/// as soon as the answer arrives (the daemon refuses person-only ops from an agent's tree).
+pub fn person(e: &Env, req: Value) -> Value {
+    let sock = e.state.path().join("sock");
+    let script = "my $s = IO::Socket::UNIX->new(Peer => $ARGV[0]) or die $!; \
+                  print $s scalar <STDIN>; print scalar <$s>;";
+    let o = e.detached(
+        &[
+            "/usr/bin/perl",
+            "-MIO::Socket::UNIX",
+            "-e",
+            script,
+            sock.to_str().unwrap(),
+        ],
+        &format!("{req}\n"),
+    );
+    serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{}{}", out(&o), err(&o)))
+}
+
+/// `LIGHTBULB_NETWORK_DIALOG`: every dialog answers `button` (empty: no answer).
+pub fn dialog(button: &str) -> (&'static str, String) {
+    ("LIGHTBULB_NETWORK_DIALOG", button.into())
+}
+
+/// `LIGHTBULB_NETWORK_PEERS`: the running daemons of `envs`.
+pub fn peers(envs: &[&Env]) -> (&'static str, String) {
+    let list: Vec<String> = envs.iter().map(|e| e.peer_arg()).collect();
+    ("LIGHTBULB_NETWORK_PEERS", list.join(","))
+}
+
+/// The join wait (600 s), shortened to `s`.
+pub fn wait_s(s: u64) -> (&'static str, String) {
+    ("LIGHTBULB_NETWORK_DEBUG_JOIN_WAIT_S", s.to_string())
+}
+
+/// A `config.toml` line naming the computer.
+pub fn computer(name: &str) -> String {
+    format!("computer = \"{name}\"\n")
+}
+
+/// A fresh identity outside any state dir.
+pub fn identity() -> Identity {
+    Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap()
+}
+
+/// The running daemon of `env`, on the loopback.
+pub fn addr(env: &Env) -> EndpointAddr {
+    let key = PublicKey::from_bytes(&identity::key_bytes(&env.identity().key).unwrap()).unwrap();
+    let port = env.status()["port"].as_u64().unwrap();
+    EndpointAddr::new(key).with_ip_addr(format!("127.0.0.1:{port}").parse().unwrap())
 }

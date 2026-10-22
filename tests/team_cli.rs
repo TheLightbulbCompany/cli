@@ -6,7 +6,7 @@ use lightbulb_network::identity::Identity;
 use lightbulb_network::os;
 use lightbulb_network::roster::{self, Entry, Kind};
 use lightbulb_network::store::Store;
-use serde_json::{json, Value};
+use serde_json::json;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::process::Output;
@@ -110,14 +110,7 @@ fn non_admin_remove_prints_exact_text() {
     assert!(team.contains("acme") && team.contains("aden"), "{team}");
     assert_eq!(e.entries().len(), 2, "no genesis over a joined team");
     // An open link is for the founder and admins.
-    // From a person: a detached `nc`.
-    let sock = e.state.path().join("sock");
-    let req = json!({"id": 1, "op": "team.invite", "mode": "open"});
-    let nc = e.detached(
-        &["nc", "-w", "1", "-U", sock.to_str().unwrap()],
-        &format!("{req}\n"),
-    );
-    let r: Value = serde_json::from_slice(&nc.stdout).unwrap();
+    let r = common::person(&e, json!({"id": 1, "op": "team.invite", "mode": "open"}));
     assert_eq!(r["error"], "not_admin", "{r}");
     assert_eq!(e.entries().len(), 2);
 }

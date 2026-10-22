@@ -276,7 +276,7 @@ impl Store {
     pub fn put_join(&self, j: &Join) -> rusqlite::Result<i64> {
         self.conn.execute(
             "INSERT INTO join_requests (ticket_id, inviter, candidate, name, computer, kind,
-             created_at, state) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'open')",
+             created_at, state) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 j.ticket_id,
                 j.inviter,
@@ -284,35 +284,52 @@ impl Store {
                 j.name,
                 j.computer,
                 j.kind,
-                j.created_at
+                j.created_at,
+                OPEN
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
 
-    /// Moves join request `id` from `open` to `state`; whether it was open.
-    pub fn close_join(&self, id: i64, state: &str) -> rusqlite::Result<bool> {
-        Ok(self.conn.execute(
-            "UPDATE join_requests SET state = ?2 WHERE id = ?1 AND state = 'open'",
-            params![id, state],
-        )? == 1)
-    }
-
-    /// Marks `expired` every open join request created before `before`.
-    pub fn expire_joins(&self, before: i64) -> rusqlite::Result<()> {
+    /// Moves join request `id` from `open` to `state` (nothing if it is no longer open).
+    pub fn close_join(&self, id: i64, state: &str) -> rusqlite::Result<()> {
         self.conn.execute(
-            "UPDATE join_requests SET state = 'expired' WHERE state = 'open' AND created_at < ?1",
-            [before],
+            "UPDATE join_requests SET state = ?2 WHERE id = ?1 AND state = ?3",
+            params![id, state, OPEN],
         )?;
         Ok(())
+    }
+
+    /// Marks `expired` every open join request created before `before`, and deletes the
+    /// closed ones older than 30 days.
+    pub fn expire_joins(&self, before: i64, now: i64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE join_requests SET state = 'expired' WHERE state = ?2 AND created_at < ?1",
+            params![before, OPEN],
+        )?;
+        self.conn.execute(
+            "DELETE FROM join_requests WHERE state != ?2 AND created_at < ?1",
+            params![now - JOIN_KEEP_S, OPEN],
+        )?;
+        Ok(())
+    }
+
+    /// The open join requests: in all, by `inviter`, and by `candidate`.
+    pub fn open_counts(&self, inviter: &str, candidate: &str) -> rusqlite::Result<[usize; 3]> {
+        self.conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(inviter = ?1), 0), COALESCE(SUM(candidate = ?2), 0)
+             FROM join_requests WHERE state = ?3",
+            params![inviter, candidate, OPEN],
+            |r| Ok([r.get(0)?, r.get(1)?, r.get(2)?]),
+        )
     }
 
     pub fn open_joins(&self) -> rusqlite::Result<Vec<Join>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, ticket_id, inviter, candidate, name, computer, kind, created_at
-             FROM join_requests WHERE state = 'open' ORDER BY id",
+             FROM join_requests WHERE state = ?1 ORDER BY id",
         )?;
-        let rows = stmt.query_map([], |r| {
+        let rows = stmt.query_map([OPEN], |r| {
             Ok(Join {
                 id: r.get(0)?,
                 ticket_id: r.get(1)?,
@@ -333,6 +350,11 @@ impl Store {
             .exists([id])
     }
 }
+
+/// A join request waiting for its person.
+const OPEN: &str = "open";
+/// How long answered join requests are kept.
+const JOIN_KEEP_S: i64 = 30 * 86_400;
 
 /// A `join_requests` row (`id` is unset until stored).
 #[derive(Debug, Clone, PartialEq)]

@@ -3,8 +3,8 @@
 //! member itself, with that member's key, over its own iroh endpoint.
 
 use iroh::endpoint::{presets, Connection, RecvStream, SendStream};
-use iroh::{Endpoint, EndpointAddr, PublicKey, SecretKey};
-use lightbulb_network::identity::{self, Identity};
+use iroh::{Endpoint, SecretKey};
+use lightbulb_network::identity::Identity;
 use lightbulb_network::net::frames::{self, Frame};
 use lightbulb_network::net::{ALPN, PROTOCOL};
 use lightbulb_network::roster::{self, Entry, Kind};
@@ -14,7 +14,7 @@ use std::time::Duration;
 
 mod common;
 
-use common::{seed_pair, until, Env, EXE};
+use common::{addr, seed_pair, until, Env, EXE};
 
 const PAGE_BYTES: usize = 512 * 1024;
 
@@ -25,13 +25,6 @@ async fn endpoint(id: &Identity) -> Endpoint {
         .bind()
         .await
         .unwrap()
-}
-
-/// The running daemon of `env`, on the loopback.
-fn addr(env: &Env) -> EndpointAddr {
-    let key = PublicKey::from_bytes(&identity::key_bytes(&env.identity().key).unwrap()).unwrap();
-    let port = env.status()["port"].as_u64().unwrap();
-    EndpointAddr::new(key).with_ip_addr(format!("127.0.0.1:{port}").parse().unwrap())
 }
 
 struct Peer {

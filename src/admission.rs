@@ -5,12 +5,13 @@
 //! candidate checks every entry itself before that roster replaces its solo one.
 
 use crate::daemon::ipc::{self, Response, BAD_REQUEST, INTERNAL, NOT_FOUND, UNSUPPORTED};
+use crate::daemon::TeamState;
 use crate::daemon::{net_ops, user_name, Daemon};
 use crate::dialog;
 use crate::identity::{self, Identity};
 use crate::net::frames::{self, Frame};
 use crate::net::{self, JOIN_ALPN};
-use crate::roster::{self, Entry, Kind, MemberKind, Role, Roster};
+use crate::roster::{self, Collision, Entry, Kind, MemberKind, Role, Roster};
 use crate::store::{Join, Store};
 use crate::ticket::{self, Ticket};
 use data_encoding::HEXLOWER;
@@ -18,9 +19,8 @@ use iroh::endpoint::{Connection, SendStream, VarInt};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::oneshot;
 
 pub const NOT_OPEN: &str = "not_open";
@@ -34,6 +34,20 @@ pub const DECLINED: &str = "declined";
 pub const TOO_MANY: &str = "too_many_requests";
 /// The person did not answer within the wait: the candidate is told so and stops asking.
 pub const NOT_ANSWERED: &str = "not_answered";
+/// Every reason a `join_decision` may carry; another reads as `refused`.
+const REASONS: &[&str] = &[
+    BAD_TICKET,
+    EXPIRED_TICKET,
+    NAME_TAKEN,
+    KEY_COLLISION,
+    DECLINED,
+    TOO_MANY,
+    NOT_ANSWERED,
+    UNSUPPORTED,
+    BAD_REQUEST,
+    INTERNAL,
+    net_ops::NOT_ADMIN,
+];
 
 /// A dial, a first frame, a `roster` page, the goodbye: each gets this long.
 const STEP: Duration = Duration::from_secs(10);
@@ -44,6 +58,20 @@ const MAX_ENTRIES: usize = 100_000;
 
 /// `Ok` allows; `Err(reason)` refuses (`declined`: the person said no).
 type Verdict = Result<(), &'static str>;
+
+/// `v` as the decision's `verdict` and as the request's state.
+fn words(v: Verdict) -> (&'static str, &'static str) {
+    match v {
+        Ok(()) => ("allow", "admitted"),
+        Err(DECLINED) => ("decline", "declined"),
+        Err(_) => ("refused", "refused"),
+    }
+}
+
+/// `J<n>`'s `n`.
+fn parse_jid(id: &str) -> Option<i64> {
+    id.strip_prefix('J')?.parse().ok()
+}
 
 /// A request waiting for its person, and the connection task to tell.
 pub struct Pending {
@@ -133,44 +161,34 @@ pub async fn serve(d: Arc<Daemon>, conn: Connection) {
         conn.close(VarInt::from_u32(0), b"");
         return;
     }
+    let Ok(ticket) = ticket::decode(&ticket) else {
+        eprintln!("join: refused {} ({BAD_TICKET})", net::short(&peer));
+        return tell(&d, &conn, send, "", &peer, Err(BAD_TICKET)).await;
+    };
+    let ticket_id = ticket.ticket_id.clone();
     // Admitted already (its roster lost on the way): the roster again, nothing written.
     if d.team.lock().unwrap().roster.members.contains_key(&peer) {
         eprintln!(
             "join: {} is a member; resending the roster",
             net::short(&peer)
         );
-        let ticket_id = ticket::decode(&ticket).map_or_else(|_| String::new(), |t| t.ticket_id);
-        tell(&d, &conn, send, &ticket_id, &peer, Ok(())).await;
-        return;
+        return tell(&d, &conn, send, &ticket_id, &peer, Ok(())).await;
     }
-    let ticket_id;
-    let verdict = match ticket::decode(&ticket) {
-        Err(_) => {
-            ticket_id = String::new();
-            Err(BAD_TICKET)
-        }
-        Ok(ticket) => {
-            ticket_id = ticket.ticket_id.clone();
-            let req = Request {
-                ticket,
-                proof: secret_proof,
-                candidate,
-                name,
-                computer,
-                kind,
-            };
-            match open(&d, &req) {
-                Err(r) => Err(r),
-                Ok(n) if req.ticket.mode == "open" => admit(&d, n, &req),
-                Ok(n) => match wait(&d, &conn, n, req).await {
-                    Some(v) => v,
-                    None => {
-                        conn.close(VarInt::from_u32(0), b"");
-                        return;
-                    }
-                },
-            }
-        }
+    let req = Request {
+        ticket,
+        proof: secret_proof,
+        candidate,
+        name,
+        computer,
+        kind,
+    };
+    let verdict = match open(&d, &req) {
+        Err(r) => Err(r),
+        Ok((_, Some(v))) => v,
+        Ok((n, None)) => match wait(&d, &conn, n, req).await {
+            Some(v) => v,
+            None => return conn.close(VarInt::from_u32(0), b""),
+        },
     };
     if let Err(r) = verdict {
         eprintln!("join: refused {} ({r})", net::short(&peer));
@@ -178,12 +196,13 @@ pub async fn serve(d: Arc<Daemon>, conn: Connection) {
     tell(&d, &conn, send, &ticket_id, &peer, verdict).await;
 }
 
-/// Checks `req` and stores it as an `open` row within the limits: its row id.
-fn open(d: &Daemon, req: &Request) -> Result<i64, &'static str> {
-    let team = d.team.lock().unwrap();
+/// Checks `req` and stores it as an `open` row within the limits; an `open` link's request is
+/// admitted at once, under the same locks. Its row id, and its verdict when decided already.
+fn open(d: &Daemon, req: &Request) -> Result<(i64, Option<Verdict>), &'static str> {
+    let mut team = d.team.lock().unwrap();
     let store = d.store.lock().unwrap();
     let now = ipc::now() as i64;
-    check(&team.roster, &store, req, &d.identity.key, now)?;
+    let once = check(&team.roster, &store, req, &d.identity.key, now)?;
     let fail = |e: rusqlite::Error| {
         eprintln!("join: {e}");
         INTERNAL
@@ -191,13 +210,11 @@ fn open(d: &Daemon, req: &Request) -> Result<i64, &'static str> {
     // A request older than the wait (and the step its waiter may lag) is one its candidate
     // stopped waiting for.
     let window = (d.peers.knobs().join_wait + STEP).as_secs() as i64;
-    store.expire_joins(now - window).map_err(fail)?;
-    let open = store.open_joins().map_err(fail)?;
-    let count = |f: &dyn Fn(&Join) -> bool| open.iter().filter(|j| f(j)).count();
-    if open.len() >= LIMITS.0
-        || count(&|j| j.inviter == req.ticket.inviter) >= LIMITS.1
-        || count(&|j| j.candidate == req.candidate) >= LIMITS.2
-    {
+    store.expire_joins(now - window, now).map_err(fail)?;
+    let [all, by_inviter, by_candidate] = store
+        .open_counts(&req.ticket.inviter, &req.candidate)
+        .map_err(fail)?;
+    if all >= LIMITS.0 || by_inviter >= LIMITS.1 || by_candidate >= LIMITS.2 {
         return Err(TOO_MANY);
     }
     let row = Join {
@@ -212,7 +229,12 @@ fn open(d: &Daemon, req: &Request) -> Result<i64, &'static str> {
     };
     let n = store.put_join(&row).map_err(fail)?;
     eprintln!("join: J{n} open for {}", net::short(&req.candidate));
-    Ok(n)
+    if req.ticket.mode != "open" {
+        return Ok((n, None));
+    }
+    let v = try_admit(d, &mut team, &store, n, req, once, now);
+    close(&store, n, v);
+    Ok((n, Some(v)))
 }
 
 /// Whether this computer may admit `req` into `r` now: the ticket and its live link, the
@@ -242,18 +264,13 @@ fn check(
     if req.kind != "computer" {
         return Err(UNSUPPORTED);
     }
-    if !label(&req.name) || !label(&req.computer) {
+    if !fits(&req.name) || !fits(&req.computer) {
         return Err(BAD_REQUEST);
     }
-    let name = req.name.to_lowercase();
-    if r.members.values().any(|m| m.name.to_lowercase() == name) {
-        return Err(NAME_TAKEN);
-    }
-    if r.members
-        .values()
-        .any(|m| req.candidate.starts_with(&m.short))
-    {
-        return Err(KEY_COLLISION);
+    match r.collides(&req.name, &req.candidate) {
+        Some(Collision::Name) => return Err(NAME_TAKEN),
+        Some(Collision::Key) => return Err(KEY_COLLISION),
+        None => {}
     }
     let authorised = r.members.get(me).is_some_and(|m| {
         m.kind == MemberKind::Computer && (m.role != Role::Member || link.signer == me)
@@ -265,37 +282,51 @@ fn check(
 }
 
 /// A name or computer name: trimmed, 1-64 characters, no control characters.
-fn label(s: &str) -> bool {
+fn fits(s: &str) -> bool {
     !s.is_empty() && s.trim() == s && s.chars().count() <= 64 && !s.chars().any(char::is_control)
 }
 
-/// Writes request `n`'s `admit` after checking it again (the roster may have moved since).
+/// Writes request `n`'s checked `admit`; for a `once` link, marks it used here.
+fn try_admit(
+    d: &Daemon,
+    team: &mut TeamState,
+    store: &Store,
+    n: i64,
+    req: &Request,
+    once: bool,
+    now: i64,
+) -> Verdict {
+    let body = json!({"member": req.candidate, "name": req.name, "computer": req.computer,
+        "person_id": req.candidate, "kind": "computer", "role": "member",
+        "ticket_id": req.ticket.ticket_id});
+    if let Err(e) = net_ops::write(d, team, store, Kind::Admit, body, now) {
+        eprintln!("join: J{n}: {e}");
+        return Err(INTERNAL);
+    }
+    if !team.roster.members.contains_key(&req.candidate) {
+        return Err(BAD_TICKET);
+    }
+    if once {
+        let _ = store.use_link(&req.ticket.ticket_id, &req.candidate);
+    }
+    Ok(())
+}
+
+/// Closes request `n`'s row with `v`'s state.
+fn close(store: &Store, n: i64, v: Verdict) {
+    let state = words(v).1;
+    let _ = store.close_join(n, state);
+    eprintln!("join: J{n} {state}");
+}
+
+/// The person allowed request `n`: checked again (the roster may have moved), then admitted.
 fn admit(d: &Daemon, n: i64, req: &Request) -> Verdict {
     let mut team = d.team.lock().unwrap();
     let store = d.store.lock().unwrap();
     let now = ipc::now() as i64;
-    let v = (|| {
-        let once = check(&team.roster, &store, req, &d.identity.key, now)?;
-        let body = json!({"member": req.candidate, "name": req.name, "computer": req.computer,
-            "person_id": req.candidate, "kind": "computer", "role": "member",
-            "ticket_id": req.ticket.ticket_id});
-        if let Err(e) = net_ops::write(d, &mut team, &store, Kind::Admit, body, now) {
-            eprintln!("join: J{n}: {e}");
-            return Err(INTERNAL);
-        }
-        if !team.roster.members.contains_key(&req.candidate) {
-            return Err(BAD_TICKET);
-        }
-        if once {
-            let _ = store.use_link(&req.ticket.ticket_id, &req.candidate);
-        }
-        Ok(())
-    })();
-    let _ = store.close_join(n, if v.is_ok() { "admitted" } else { "refused" });
-    eprintln!(
-        "join: J{n} {}",
-        if v.is_ok() { "admitted" } else { "refused" }
-    );
+    let v = check(&team.roster, &store, req, &d.identity.key, now)
+        .and_then(|once| try_admit(d, &mut team, &store, n, req, once, now));
+    close(&store, n, v);
     v
 }
 
@@ -334,8 +365,7 @@ fn answer(d: &Daemon, n: i64, allow: bool) -> Option<(String, Verdict)> {
     let v = if allow {
         admit(d, n, &p.req)
     } else {
-        let _ = d.store.lock().unwrap().close_join(n, "declined");
-        eprintln!("join: J{n} declined");
+        close(&d.store.lock().unwrap(), n, Err(DECLINED));
         Err(DECLINED)
     };
     let _ = p.tx.send(v);
@@ -352,24 +382,16 @@ async fn tell(
     candidate: &str,
     v: Verdict,
 ) {
-    let (verdict, reason) = match v {
-        Ok(()) => ("allow", None),
-        Err(DECLINED) => ("decline", Some(DECLINED)),
-        Err(r) => ("refused", Some(r)),
-    };
     let decision = Frame::JoinDecision {
         ticket_id: ticket_id.into(),
         candidate: candidate.into(),
-        verdict: verdict.into(),
-        reason: reason.map(Into::into),
+        verdict: words(v).0.into(),
+        reason: v.err().map(Into::into),
         sig: String::new(),
     };
     let mut out = vec![signed(&d.identity, decision)];
     if v.is_ok() {
-        let team = d.team.lock().unwrap();
-        out.extend(net::pages(
-            team.roster.log().iter().map(|(_, e)| e.clone()).collect(),
-        ));
+        out.extend(net::pages(net::delta(&d.team.lock().unwrap().roster, &[])));
     }
     for f in &out {
         if frames::write(&mut send, f).await.is_err() {
@@ -388,14 +410,13 @@ pub async fn route(d: Arc<Daemon>) {
         return;
     };
     while let Some((id, button)) = answers.recv().await {
-        match id.split_at_checked(1) {
-            Some(("J", n)) => {
-                if let (Ok(n), Some(b)) = (n.parse(), button) {
-                    answer(&d, n, b == "Allow");
-                }
+        if let Some(n) = parse_jid(&id) {
+            if let Some(b) = button {
+                answer(&d, n, b == "Allow");
             }
+        } else {
             // Task 9 adds `H<n>`, a hold's answer.
-            _ => eprintln!("dialog {id}: nothing waits for it"),
+            eprintln!("dialog {id}: nothing waits for it");
         }
     }
 }
@@ -421,27 +442,19 @@ pub fn requests_op(id: u64, d: &Daemon) -> Response {
 /// `team.admit {request: "J<n>", verdict: "allow"|"decline"}` -> `{name, state, reason?}`
 /// (person-only); `not_open` once it was answered or its candidate gave up.
 pub fn admit_op(id: u64, body: &Value, d: &Daemon) -> Response {
-    let n = body["request"]
-        .as_str()
-        .and_then(|s| s.strip_prefix('J'))
-        .and_then(|s| s.parse::<i64>().ok());
     let allow = match body["verdict"].as_str() {
         Some("allow") => true,
         Some("decline") => false,
         _ => return Response::err(id, BAD_REQUEST),
     };
-    let Some(n) = n else {
+    let Some(n) = body["request"].as_str().and_then(parse_jid) else {
         return Response::err(id, BAD_REQUEST);
     };
     match answer(d, n, allow) {
-        Some((name, v)) => {
-            let state = match v {
-                Ok(()) => "admitted",
-                Err(DECLINED) => "declined",
-                Err(_) => "refused",
-            };
-            Response::ok(id, json!({"name": name, "state": state, "reason": v.err()}))
-        }
+        Some((name, v)) => Response::ok(
+            id,
+            json!({"name": name, "state": words(v).1, "reason": v.err()}),
+        ),
         None => match d.store.lock().unwrap().join_exists(n) {
             Ok(true) => Response::err(id, NOT_OPEN),
             Ok(false) => Response::err(id, NOT_FOUND),
@@ -454,23 +467,11 @@ pub fn admit_op(id: u64, body: &Value, d: &Daemon) -> Response {
 
 enum Outcome {
     Admitted,
-    Refused(String),
-    /// No decision within the wait.
-    Waiting,
+    /// `not_answered`: no decision within the wait.
+    Refused(&'static str),
     /// This member cannot decide (`not_admin`, `bad_ticket`: it may lack a fresh link, or the
     /// connection broke, `None`): try the next.
-    Next(Option<String>),
-}
-
-/// Set while a `team.join` runs: one at a time.
-static JOINING: AtomicBool = AtomicBool::new(false);
-
-struct Joining;
-
-impl Drop for Joining {
-    fn drop(&mut self) {
-        JOINING.store(false, Ordering::SeqCst);
-    }
+    Next(Option<&'static str>),
 }
 
 /// `team.join {ticket, name?, kind?}` -> `{state: admitted|waiting|refused, reason?, team,
@@ -479,10 +480,9 @@ pub async fn join(id: u64, body: &Value, d: &Arc<Daemon>) -> Response {
     let Some(link) = body["ticket"].as_str() else {
         return Response::err(id, BAD_REQUEST);
     };
-    if JOINING.swap(true, Ordering::SeqCst) {
+    let Ok(_joining) = d.joining.try_lock() else {
         return Response::err(id, BAD_REQUEST);
-    }
-    let _joining = Joining;
+    };
     let name = body["name"]
         .as_str()
         .map_or_else(user_name, str::to_string)
@@ -498,9 +498,8 @@ pub async fn join(id: u64, body: &Value, d: &Arc<Daemon>) -> Response {
     };
     let (computer, team, solo) = {
         let t = d.team.lock().unwrap();
-        let solo = t.roster.members.len() == 1 && t.roster.members.contains_key(me);
         let computer = t.config.computer.trim().to_string();
-        (computer, t.roster.team_name.clone(), solo)
+        (computer, t.roster.team_name.clone(), t.roster.is_solo(me))
     };
     if !solo {
         return done("refused", Some(ALREADY_IN_TEAM), &team, 0);
@@ -525,30 +524,28 @@ pub async fn join(id: u64, body: &Value, d: &Arc<Daemon>) -> Response {
         let outcome = attempt(d, &conn, &req, m, &t).await;
         conn.close(VarInt::from_u32(0), b"");
         match outcome {
-            Outcome::Next(r) => {
-                last = r.or(last);
-                continue;
-            }
-            Outcome::Waiting => return done("waiting", None, "", 0),
-            Outcome::Refused(r) => return done("refused", Some(&r), "", 0),
+            Outcome::Next(r) => last = r.or(last),
+            Outcome::Refused(NOT_ANSWERED) => return done("waiting", None, "", 0),
+            Outcome::Refused(r) => return done("refused", Some(r), "", 0),
             Outcome::Admitted => {
-                // The dial loop connects to the team; give it a moment for the count.
-                let deadline = Instant::now() + Duration::from_secs(5);
-                while d.peers.online().is_empty() && Instant::now() < deadline {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-                let team = d.team.lock().unwrap().roster.team_name.clone();
                 eprintln!("join: admitted by {}", net::short(m));
+                // The dial loop connects to the team; give it a moment for the count.
+                let _ = tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        let hello = d.peers.connected.notified();
+                        if !d.peers.online().is_empty() {
+                            return;
+                        }
+                        hello.await;
+                    }
+                })
+                .await;
+                let team = d.team.lock().unwrap().roster.team_name.clone();
                 return done("admitted", None, &team, d.peers.online().len() + 1);
             }
         }
     }
-    done(
-        "refused",
-        Some(last.as_deref().unwrap_or(UNREACHABLE)),
-        "",
-        0,
-    )
+    done("refused", Some(last.unwrap_or(UNREACHABLE)), "", 0)
 }
 
 /// One member's answer to `req` on `conn`.
@@ -562,7 +559,7 @@ async fn attempt(d: &Daemon, conn: &Connection, req: &Frame, m: &str, t: &Ticket
     // The member gives up at its wait; we a step later.
     let wait = d.peers.knobs().join_wait + STEP;
     let f = match tokio::time::timeout(wait, frames::read(&mut recv)).await {
-        Err(_) => return Outcome::Waiting,
+        Err(_) => return Outcome::Refused(NOT_ANSWERED),
         Ok(Err(_)) => return Outcome::Next(None),
         Ok(Ok(f)) => f,
     };
@@ -580,12 +577,18 @@ async fn attempt(d: &Daemon, conn: &Connection, req: &Frame, m: &str, t: &Ticket
     if !genuine || candidate != d.identity.key || ticket_id != t.ticket_id {
         return Outcome::Next(None);
     }
-    match (verdict.as_str(), reason.as_deref()) {
-        ("allow", _) => {}
-        ("decline", _) => return Outcome::Refused(DECLINED.into()),
-        (_, Some(NOT_ANSWERED)) => return Outcome::Waiting,
-        (_, Some(r @ (net_ops::NOT_ADMIN | BAD_TICKET))) => return Outcome::Next(Some(r.into())),
-        (_, r) => return Outcome::Refused(r.unwrap_or("refused").into()),
+    let reason = REASONS
+        .iter()
+        .find(|r| reason.as_deref() == Some(**r))
+        .copied()
+        .unwrap_or("refused");
+    match verdict.as_str() {
+        "allow" => {}
+        "decline" => return Outcome::Refused(DECLINED),
+        _ if reason == net_ops::NOT_ADMIN || reason == BAD_TICKET => {
+            return Outcome::Next(Some(reason))
+        }
+        _ => return Outcome::Refused(reason),
     }
     // ponytail: a roster lost after an allow tries the next member, which may then find the
     // name taken; the person runs `join` again with another name.
@@ -603,10 +606,10 @@ async fn attempt(d: &Daemon, conn: &Connection, req: &Frame, m: &str, t: &Ticket
     }
     match take_roster(d, &entries, &t.team_id) {
         Ok(true) => Outcome::Admitted,
-        Ok(false) => Outcome::Refused(BAD_TICKET.into()),
+        Ok(false) => Outcome::Refused(BAD_TICKET),
         Err(e) => {
             eprintln!("join: taking the roster: {e}");
-            Outcome::Refused(INTERNAL.into())
+            Outcome::Refused(INTERNAL)
         }
     }
 }
@@ -617,8 +620,9 @@ async fn attempt(d: &Daemon, conn: &Connection, req: &Frame, m: &str, t: &Ticket
 fn take_roster(d: &Daemon, entries: &[Entry], team_id: &str) -> crate::Result<bool> {
     let mut team = d.team.lock().unwrap();
     let store = d.store.lock().unwrap();
+    let me = &d.identity.key;
     // Another join may have finished meanwhile.
-    if team.roster.members.len() != 1 {
+    if !team.roster.is_solo(me) {
         return Ok(false);
     }
     let now = ipc::now() as i64;
@@ -629,7 +633,7 @@ fn take_roster(d: &Daemon, entries: &[Entry], team_id: &str) -> crate::Result<bo
         roster::accept(&store, e, now)?;
     }
     let new = roster::replay(&roster::entries(&store)?);
-    if new.team_id != team_id || !new.members.contains_key(&d.identity.key) {
+    if new.team_id != team_id || !new.members.contains_key(me) {
         return Ok(false);
     }
     tx.commit()?;

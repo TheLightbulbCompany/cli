@@ -104,6 +104,8 @@ pub struct Peers {
     knobs: OnceLock<Knobs>,
     /// Poked by every roster install.
     pub changed: Notify,
+    /// Woken (`notify_waiters`) whenever a member says `hello` in our protocol.
+    pub connected: Notify,
     /// The endpoint's UDP port.
     pub port: OnceLock<u16>,
     /// The endpoint, for the candidate side of a join.
@@ -485,6 +487,7 @@ impl Net {
             push_delta(tx, &team.roster, &heads, &mut HashMap::new(), false);
             d.peers
                 .with_link(key, conn, |l| l.protocol = Protocol::Ok(heads));
+            d.peers.connected.notify_waiters();
         } else if let Frame::Roster { entries, more } = f {
             sync.page.extend(entries);
             // A sync is applied once, at its last page (or when it alone would overflow).
@@ -582,7 +585,7 @@ fn push_delta(
 
 /// Of the roster's log (parents first), the entries that are neither `heads` nor their
 /// ancestors; all of them when no head is known.
-fn delta(r: &Roster, heads: &[String]) -> Vec<Entry> {
+pub(crate) fn delta(r: &Roster, heads: &[String]) -> Vec<Entry> {
     let known: Vec<&String> = heads.iter().filter(|h| r.knows(h)).collect();
     let mut covered = r.ancestors_of(&known);
     covered.extend(known.into_iter().cloned());

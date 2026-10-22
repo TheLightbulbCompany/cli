@@ -101,6 +101,12 @@ pub struct Member {
     pub proof: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Collision {
+    Name,
+    Key,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Link {
     pub ticket_id: String,
@@ -129,6 +135,26 @@ pub struct Roster {
 impl Roster {
     pub fn founder(&self) -> Option<&Member> {
         self.members.values().find(|m| m.role == Role::Founder)
+    }
+
+    /// Whether `me` is this roster's only member: a computer on its own network.
+    pub fn is_solo(&self, me: &str) -> bool {
+        self.members.len() == 1 && self.members.contains_key(me)
+    }
+
+    /// What an admission of `key` called `name` would collide with: a member's name (any
+    /// case), else a member's 12-character prefix. The one rule for replay and admission.
+    pub fn collides(&self, name: &str, key: &str) -> Option<Collision> {
+        let name = name.to_lowercase();
+        let prefix = key.get(..12);
+        let ms = || self.members.values();
+        if ms().any(|m| m.name.to_lowercase() == name) {
+            Some(Collision::Name)
+        } else if ms().any(|m| Some(m.short.as_str()) == prefix) {
+            Some(Collision::Key)
+        } else {
+            None
+        }
     }
 
     pub fn by_short(&self, short: &str) -> Option<&Member> {
@@ -311,14 +337,10 @@ fn pass(
                             })
                     })
                 };
-                let Some(prefix) = target.get(..12) else {
+                if target.get(..12).is_none() {
                     continue;
-                };
-                let name = e.text("name").to_lowercase();
-                let collides = r
-                    .members
-                    .values()
-                    .any(|m| m.short == prefix || m.name.to_lowercase() == name);
+                }
+                let collides = r.collides(e.text("name"), &target).is_some();
                 let role_ok = matches!(
                     e.body.get("role").and_then(Value::as_str),
                     None | Some("member")
