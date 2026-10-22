@@ -171,7 +171,12 @@ fn refuse(conn: &Connection, request_id: &str, reason: &str, now: u64) -> Result
     })
 }
 
-/// Stores `text` for `to`. Retrying a `request_id` that was accepted returns its receipt; one that was
+/// Stores `text` for `to`. Thread and hops: with `reply_to` (a message id or request id the store
+/// knows) the message takes that message's thread and its hops + 1. Without it, the trigger is the
+/// newest message delivered (or read) TO `from` within `LOOP_WINDOW_S`: hops = trigger.hops + 1, and
+/// the thread is the trigger's if `to` is the trigger's sender, else a new one. No trigger: hops 0,
+/// new thread. (Forwarding to a third session therefore cannot reset the agent-chain count.)
+/// Retrying a `request_id` that was accepted returns its receipt; one that was
 /// refused (`loop`, `too_long`) is refused again, whatever text comes with the retry, because a
 /// refusal stores no `to`/`text`. Clients mint a new `request_id` after any refusal.
 pub fn send(
@@ -242,17 +247,25 @@ pub fn send(
     let (thread, hops) = match parent {
         Some((pid, thread, hops)) => (thread.unwrap_or(pid), hops + 1),
         None => {
-            let latest: Option<(String, Option<String>)> = conn
+            // The trigger: the newest message delivered to `from` in the window. Hops carry on
+            // from it even when the work is forwarded to a third session.
+            let trigger: Option<(String, Option<String>, i64, String)> = conn
                 .query_row(
-                    "SELECT id, thread FROM messages WHERE from_key = ?1 AND to_key = ?2 ORDER BY rowid DESC LIMIT 1",
-                    params![to.0, from.0],
-                    |x| Ok((x.get(0)?, x.get(1)?)),
+                    "SELECT m.id, m.thread, m.hops, m.from_key FROM messages m \
+                     JOIN receipts r ON r.request_id = m.request_id \
+                     WHERE m.to_key = ?1 AND r.state IN ('delivered', 'read') AND m.sent_at > ?2 \
+                     ORDER BY m.rowid DESC LIMIT 1",
+                    params![from.0, since],
+                    |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?, x.get(3)?)),
                 )
                 .optional()?;
-            (
-                latest.map_or_else(|| id.clone(), |(lid, t)| t.unwrap_or(lid)),
-                0,
-            )
+            match trigger {
+                Some((tid, thread, hops, sender)) if sender == to.0 => {
+                    (thread.unwrap_or(tid), hops + 1)
+                }
+                Some((_, _, hops, _)) => (id.clone(), hops + 1),
+                None => (id.clone(), 0),
+            }
         }
     };
     let tx = conn.unchecked_transaction()?;
@@ -458,6 +471,7 @@ mod tests {
     fn unknown_reply_to_falls_back_to_the_default_thread_rule() {
         let (_d, s) = setup();
         send(&s, &k("b"), &k("a"), "first", "r1", None, 1).unwrap();
+        take(&s, &k("a"), 1).unwrap();
         let first: String = s
             .conn()
             .query_row(
@@ -475,7 +489,7 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!((t, h), (first, 0));
+        assert_eq!((t, h), (first, 1));
     }
 
     #[test]
@@ -563,7 +577,8 @@ mod tests {
             })
             .collect();
         assert_eq!(rows, vec![(m1.1.clone(), 1), (m1.1.clone(), 1)]);
-        // no reply_to: thread of the newest inbound from the target (r2 -> a is from b)
+        // no reply_to: the trigger is the newest message delivered to a (r2, from b)
+        take(&s, &a, 3).unwrap();
         send(&s, &a, &b, "follow", "r4", None, 4).unwrap();
         let (t, h): (String, i64) = s
             .conn()
@@ -573,8 +588,8 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!((t, h), (m1.1, 0));
-        // nothing inbound: a fresh thread
+        assert_eq!((t, h), (m1.1.clone(), 2));
+        // trigger came from someone else: a fresh thread, hops still carry on
         send(&s, &a, &k("z"), "hello", "r5", None, 5).unwrap();
         let (id, t): (String, String) = s
             .conn()
@@ -585,5 +600,53 @@ mod tests {
             )
             .unwrap();
         assert_eq!(id, t);
+        assert_ne!(t, m1.1);
+        let h: i64 = s
+            .conn()
+            .query_row("SELECT hops FROM messages WHERE request_id='r5'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(h, 2);
+    }
+
+    fn thread_hops(s: &Store, rid: &str) -> (String, String, i64) {
+        s.conn()
+            .query_row(
+                "SELECT id, thread, hops FROM messages WHERE request_id = ?1",
+                [rid],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn forwarding_without_reply_to_keeps_hop_ancestry() {
+        let (_d, s) = setup();
+        send(&s, &k("a"), &k("b"), "do it", "r1", None, 1).unwrap();
+        take(&s, &k("b"), 2).unwrap();
+        send(&s, &k("b"), &k("c"), "you do it", "r2", None, 3).unwrap();
+        let (id, thread, hops) = thread_hops(&s, "r2");
+        assert_eq!((hops, thread == id), (1, true));
+        assert_ne!(thread, thread_hops(&s, "r1").1);
+    }
+
+    #[test]
+    fn a_reply_without_reply_to_to_the_trigger_sender_keeps_its_thread() {
+        let (_d, s) = setup();
+        send(&s, &k("a"), &k("b"), "do it", "r1", None, 1).unwrap();
+        take(&s, &k("b"), 2).unwrap();
+        send(&s, &k("b"), &k("a"), "done", "r2", None, 3).unwrap();
+        let (_, thread, hops) = thread_hops(&s, "r2");
+        assert_eq!((thread, hops), (thread_hops(&s, "r1").1, 1));
+    }
+
+    #[test]
+    fn an_old_delivery_is_no_trigger() {
+        let (_d, s) = setup();
+        send(&s, &k("a"), &k("b"), "x", "r1", None, 1).unwrap();
+        take(&s, &k("b"), 2).unwrap();
+        send(&s, &k("b"), &k("c"), "y", "r2", None, 1 + LOOP_WINDOW_S).unwrap();
+        assert_eq!(thread_hops(&s, "r2").2, 0);
     }
 }
