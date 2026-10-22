@@ -104,6 +104,16 @@ fn session_identity() -> bool {
         || !crate::agents::caller::walked_to_a_person()
 }
 
+/// The session of the agent above this invocation, resolved as the MCP server resolves it.
+fn calling_session(conn: &mut Conn) -> Option<String> {
+    let me = hook::calling_agent(None).ok()?;
+    let sessions = ask(conn, "sessions", json!({})).ok()?["sessions"].clone();
+    let sessions: Vec<crate::sessions::Session> = serde_json::from_value(sessions).ok()?;
+    crate::agents::source::resolve(&me, &json!({}), &sessions)
+        .ok()
+        .map(|k| k.0)
+}
+
 pub fn send(
     target: &str,
     text: &str,
@@ -113,12 +123,19 @@ pub fn send(
 ) -> Result<i32> {
     let group = target == "*" || target.ends_with("/*");
     let from = from.or_else(|| std::env::var(SESSION_ENV).ok());
-    if group && (from.is_some() || session_identity()) {
+    let identity = from.is_none() && session_identity();
+    if group && (from.is_some() || identity) {
         return Err("group sends are for people at a terminal".into());
     }
     let mut conn = connect()?;
     let short = conn.member()?;
-    let from = from.unwrap_or_else(|| format!("{short}/terminal"));
+    let from = match from {
+        Some(f) => f,
+        // An agent's shell speaks as its session, never as the terminal.
+        None if identity => calling_session(&mut conn)
+            .ok_or("send from an agent's shell must name --from <session_id>")?,
+        None => format!("{short}/terminal"),
+    };
     let rid = request_id.unwrap_or_else(|| ulid::Ulid::generate().to_string());
     let targets: Vec<(String, String)> = if group {
         let sessions = ask(&mut conn, "sessions", json!({}))?["sessions"].clone();

@@ -369,7 +369,10 @@ fn send(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
         Ok(receipt) => {
             if receipt.state == mail::State::Stored {
                 daemon.mail.notify_waiters();
-                if matches!(provider_of(to), "claude" | "codex") {
+                if matches!(
+                    frame::Sender::of("", to),
+                    frame::Sender::Agent("claude" | "codex")
+                ) {
                     tokio::spawn(super::deliver(daemon.clone(), Key(to.into())));
                 }
             }
@@ -379,15 +382,8 @@ fn send(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
     }
 }
 
-/// The provider in a key (`<member>/<provider>:<conversation>`); `unknown` when malformed.
-pub(super) fn provider_of(key: &str) -> &str {
-    key.split_once('/')
-        .and_then(|(_, rest)| rest.split_once(':'))
-        .map_or("unknown", |(p, _)| p)
-}
-
 /// `inbox {key, wait_secs?}` -> `{messages}`, each with `framed`, the text as the agent
-/// is shown it (`frame::peer_from_provider`): takes (and so delivers) what waits for `key`;
+/// is shown it (`frame::framed`): takes (and so delivers) what waits for `key`;
 /// with `wait_secs` (at most 600) it first waits for something to arrive. With `caller`, only
 /// the row's own process may take it (`bad_request`, reason `not_owner`, otherwise).
 async fn inbox(
@@ -440,7 +436,7 @@ async fn inbox(
                         json!({ "id": m.id, "request_id": m.request_id, "from": m.from_key,
                             "to": m.to_key, "kind": m.kind, "thread": m.thread, "hops": m.hops,
                             "text": m.body, "sent_at": m.sent_at,
-                            "framed": frame::peer_from_provider(provider_of(&m.from_key), None, &m.request_id, &m.body) })
+                            "framed": frame::framed(frame::Sender::of(&daemon.member_key_short, &m.from_key), None, &m.request_id, &m.body) })
                     })
                     .collect();
                 return Response::ok(id, json!({ "messages": messages }));

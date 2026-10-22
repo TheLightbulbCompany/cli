@@ -114,7 +114,7 @@ async fn claude_push_posts_a_user_frame_to_the_inbox_socket_and_marks_delivered(
         .unwrap();
     let mut got = String::new();
     BufReader::new(conn).read_line(&mut got).await.unwrap();
-    let framed = frame::peer_from_provider("codex", None, "r1", "hello claude");
+    let framed = frame::framed(frame::Sender::Agent("codex"), None, "r1", "hello claude");
     assert_eq!(
         got,
         format!(

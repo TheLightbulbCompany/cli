@@ -339,3 +339,75 @@ fn doctor_reports_a_foreign_alias_as_not_ours_not_missing() {
     assert!(d.contains("alias: not ours (left alone)"), "{d}");
     assert!(!d.contains("alias: missing"), "{d}");
 }
+
+#[test]
+fn the_frame_names_the_terminal_and_name_senders() {
+    let e = Env::new();
+    let key = e.session();
+    assert!(e.run(&["send", &key, "from me"]).status.success());
+    let m = e.ask(json!({"id": 1, "op": "inbox", "key": key}));
+    let framed = m["messages"][0]["framed"].as_str().unwrap().to_string();
+    assert!(
+        framed.starts_with("[Lightbulb teammate contribution from You, at the terminal {"),
+        "{framed}"
+    );
+    // A name address is named by its name.
+    let short = e.short();
+    let r = e.ask(
+        json!({"id": 2, "op": "send", "from": format!("{short}/desk"), "to": key,
+        "text": "x", "request_id": "n1"}),
+    );
+    assert_eq!(r["receipt"]["state"], "stored", "{r}");
+    let m = e.ask(json!({"id": 3, "op": "inbox", "key": key}));
+    let framed = m["messages"][0]["framed"].as_str().unwrap();
+    assert!(
+        framed.starts_with("[Lightbulb teammate contribution from desk {"),
+        "{framed}"
+    );
+}
+
+#[test]
+fn send_from_an_agent_shell_sends_as_its_session_or_refuses() {
+    let e = Env::new();
+    let key = e.session(); // this test process, as a codex session
+    let birth = os::process(std::process::id()).unwrap().birth_micros;
+    let o = e
+        .cmd(&["send", "bob", "from my shell", "--request-id", "s1"])
+        .env(
+            "LIGHTBULB_NETWORK_HOOK_CALLER",
+            format!("{}:{birth}", std::process::id()),
+        )
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", err(&o));
+    let m = e.ask(json!({"id": 1, "op": "inbox", "key": format!("{}/bob", e.short())}));
+    assert_eq!(m["messages"][0]["from"], key.as_str(), "{m}");
+    assert!(m["messages"][0]["framed"]
+        .as_str()
+        .unwrap()
+        .contains("from Your Codex {"));
+
+    // An agent above that no session belongs to: refused, nothing sent.
+    let other = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let ob = os::process(other.id()).unwrap().birth_micros;
+    let o = e
+        .cmd(&["send", "bob", "who am i"])
+        .env(
+            "LIGHTBULB_NETWORK_HOOK_CALLER",
+            format!("{}:{ob}", other.id()),
+        )
+        .output()
+        .unwrap();
+    let mut other = other;
+    let _ = other.kill();
+    let _ = other.wait();
+    assert!(!o.status.success());
+    assert!(
+        err(&o).contains("send from an agent's shell must name --from <session_id>"),
+        "{}",
+        err(&o)
+    );
+}

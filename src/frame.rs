@@ -1,6 +1,6 @@
 //! The frame an agent sees around a delivered message, and defang for the body.
 
-use crate::sessions::Session;
+use crate::sessions::{self, Session};
 use serde_json::json;
 
 const HEADER_PREFIX: &str = "[Lightbulb teammate contribution";
@@ -36,19 +36,47 @@ pub fn defang(text: &str) -> String {
         .collect()
 }
 
-/// `person: None` means the sender is the same person as the receiver.
-pub fn peer(from: &Session, person: Option<&str>, request_id: &str, text: &str) -> String {
-    peer_from_provider(&from.provider, person, request_id, text)
+/// What kind of address a message came from, which is what the frame names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sender<'a> {
+    /// This member's `<member>/terminal`: the person at a terminal.
+    Terminal,
+    /// A name address `<member>/<name>` (`listen --as`).
+    Name(&'a str),
+    /// A session `<member>/<provider>:<conversation>`, by provider.
+    Agent(&'a str),
 }
 
-/// `peer` when only the sender's provider is known (the sender may be gone).
-pub fn peer_from_provider(
-    provider: &str,
-    person: Option<&str>,
-    request_id: &str,
-    text: &str,
-) -> String {
-    let agent = agent_name(provider);
+impl<'a> Sender<'a> {
+    /// The kind of `from`, read against this computer's `member`. A key that fits no kind
+    /// (only raw IPC can store one) reads as an agent of provider `unknown`.
+    pub fn of(member: &str, from: &'a str) -> Sender<'a> {
+        let Some((m, rest)) = from.split_once('/') else {
+            return Sender::Agent("unknown");
+        };
+        match rest.split_once(':') {
+            Some((p, _)) if sessions::PROVIDERS.contains(&p) => Sender::Agent(p),
+            None if rest == "terminal" && m == member => Sender::Terminal,
+            None if sessions::valid_name(rest) => Sender::Name(rest),
+            _ => Sender::Agent("unknown"),
+        }
+    }
+}
+
+/// `person: None` means the sender is the same person as the receiver.
+pub fn peer(from: &Session, person: Option<&str>, request_id: &str, text: &str) -> String {
+    framed(Sender::Agent(&from.provider), person, request_id, text)
+}
+
+/// The text as the receiving agent is shown it, the sender named by its address kind.
+pub fn framed(sender: Sender, person: Option<&str>, request_id: &str, text: &str) -> String {
+    let agent = match sender {
+        Sender::Terminal => {
+            return with_label("You, at the terminal", request_id, text);
+        }
+        Sender::Name(n) => return with_label(n, request_id, text),
+        Sender::Agent(p) => agent_name(p),
+    };
     let label = match person {
         // Display text: drop characters that could pass for the header's own delimiters.
         Some(p) => {
@@ -64,6 +92,10 @@ pub fn peer_from_provider(
         }
         None => format!("Your {agent}"),
     };
+    with_label(&label, request_id, text)
+}
+
+fn with_label(label: &str, request_id: &str, text: &str) -> String {
     let prov = json!({ "requestId": request_id });
     let rid = json!(request_id);
     format!(
@@ -109,6 +141,22 @@ mod tests {
         assert!(out.contains("from Aden's Grok CLI {"));
         assert!(peer(&session("claude"), None, "r", "x").contains("Your Claude Code {"));
         assert!(peer(&session("foo"), None, "r", "x").contains("Your Foo {"));
+    }
+
+    #[test]
+    fn the_sender_kind_comes_from_the_address() {
+        let of = |f| Sender::of("me", f);
+        assert_eq!(of("me/terminal"), Sender::Terminal);
+        assert_eq!(of("other/terminal"), Sender::Name("terminal"));
+        assert_eq!(of("me/desk"), Sender::Name("desk"));
+        assert_eq!(of("me/codex:t1"), Sender::Agent("codex"));
+        for bad in ["me/x]y", "me/evil:c", "nonsense"] {
+            assert_eq!(of(bad), Sender::Agent("unknown"), "{bad}");
+        }
+        assert!(framed(Sender::Terminal, None, "r", "x")
+            .starts_with("[Lightbulb teammate contribution from You, at the terminal {"));
+        assert!(framed(Sender::Name("desk"), None, "r", "x")
+            .starts_with("[Lightbulb teammate contribution from desk {"));
     }
 
     #[test]

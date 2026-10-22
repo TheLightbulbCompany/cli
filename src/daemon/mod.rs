@@ -72,8 +72,8 @@ pub async fn deliver(daemon: Arc<Daemon>, to: Key) {
         let Some(m) = next.ok().and_then(|w| w.into_iter().next()) else {
             return;
         };
-        let framed =
-            frame::peer_from_provider(ipc::provider_of(&m.from_key), None, &m.request_id, &m.body);
+        let sender = frame::Sender::of(&daemon.member_key_short, &m.from_key);
+        let framed = frame::framed(sender, None, &m.request_id, &m.body);
         let pushed = match session.provider.as_str() {
             "claude" => claude::push(&session, &framed).await,
             _ => codex::push(&session, &framed).await,
