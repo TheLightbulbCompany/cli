@@ -46,6 +46,9 @@ pub struct Knobs {
     /// `LIGHTBULB_NETWORK_DEBUG_GATE_PAUSE_MS`: the gate holds `team` that long before adopting,
     /// so a test can land a removal in the window.
     gate_pause: Option<Duration>,
+    /// `LIGHTBULB_NETWORK_DIALOG=<button>`: every OS dialog answers that button, in its turn,
+    /// without a window (empty: answers `None`).
+    pub dialog: Option<Option<String>>,
 }
 
 impl Knobs {
@@ -71,6 +74,7 @@ impl Knobs {
             gate_pause: var("LIGHTBULB_NETWORK_DEBUG_GATE_PAUSE_MS")
                 .and_then(|v| v.parse().ok())
                 .map(Duration::from_millis),
+            dialog: var("LIGHTBULB_NETWORK_DIALOG").map(|b| Some(b).filter(|b| !b.is_empty())),
         }
     }
 
@@ -80,6 +84,7 @@ impl Knobs {
             protocol: PROTOCOL,
             peers: HashMap::new(),
             gate_pause: None,
+            dialog: None,
         }
     }
 }

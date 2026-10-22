@@ -155,7 +155,9 @@ pub async fn run(dir: &Path) -> Result<()> {
     // Briefly wider than 0600 after bind; the 0700 state dir closes that window.
     fs::set_permissions(&sock, Permissions::from_mode(0o600))?;
 
+    let peers = net::Peers::default();
     let (dialogs, answers) = dialog::Queue::new("/usr/bin/osascript".into());
+    dialogs.set_knob(peers.knobs().dialog.clone());
     let daemon = Arc::new(Daemon {
         store: Mutex::new(store),
         identity,
@@ -169,7 +171,7 @@ pub async fn run(dir: &Path) -> Result<()> {
         mail: Notify::new(),
         mailbox_locks: Mutex::default(),
         push_failed: Mutex::default(),
-        peers: net::Peers::default(),
+        peers,
         dialogs,
         dialog_answers: Mutex::new(Some(answers)),
     });

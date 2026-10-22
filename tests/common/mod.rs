@@ -1,7 +1,7 @@
 //! What the CLI and network test files share: a temp state dir and HOME, a daemon shut down
 //! on drop, a person's shell (`detached`), and a two-member team seeded before start.
-//! ponytail: only `cli.rs`, `team_cli.rs` and `net_two.rs` use it; the other test files keep
-//! their own copies.
+//! ponytail: only `cli.rs`, `team_cli.rs`, `net_two.rs`, `ui_claim.rs` and `dialog.rs` use it;
+//! the other test files keep their own copies.
 #![allow(dead_code)]
 
 use lightbulb_network::daemon::net_ops;
@@ -184,4 +184,13 @@ pub fn out(o: &Output) -> String {
 
 pub fn err(o: &Output) -> String {
     String::from_utf8_lossy(&o.stderr).into_owned()
+}
+
+/// An executable `/bin/sh` script `dir/osascript` running `body` (a fake `osascript`).
+pub fn script(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let p = dir.join("osascript");
+    std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    p
 }

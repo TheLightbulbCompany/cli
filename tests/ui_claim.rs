@@ -1,10 +1,10 @@
 mod common;
 
-use common::Env;
+use common::{script, Env};
+use lightbulb_network::daemon::ipc;
 use lightbulb_network::dialog::{self, Queue};
 use serde_json::json;
-use std::os::unix::fs::PermissionsExt;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 #[test]
 fn ui_claim_returns_its_lease() {
@@ -21,16 +21,11 @@ fn ui_claim_returns_its_lease() {
 async fn claim_suppresses_dialog_for_20_seconds() {
     let d = tempfile::tempdir().unwrap();
     // A fake `osascript` that answers at once, noting that it ran.
-    let prog = d.path().join("osascript");
-    std::fs::write(
-        &prog,
-        format!(
-            "#!/bin/sh\ntouch {}/ran\necho 'button returned:Allow'\n",
-            d.path().display()
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&prog, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let ran = d.path().join("ran");
+    let prog = script(
+        d.path(),
+        &format!("touch {}\necho 'button returned:Allow'", ran.display()),
+    );
     let (q, mut rx) = Queue::new(prog);
 
     let t = 1_000;
@@ -39,14 +34,10 @@ async fn claim_suppresses_dialog_for_20_seconds() {
     assert!(!q.claim_live(t + 21));
 
     // A claim made 18 s ago has 2 s left: the dialog waits it out, then shows.
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
-    q.claim(now - 18);
+    q.claim(ipc::now() as i64 - 18);
     q.show("1", dialog::args("T", "x", &["Allow"]));
     tokio::time::sleep(Duration::from_millis(500)).await;
-    assert!(!d.path().join("ran").exists(), "no dialog while claimed");
+    assert!(!ran.exists(), "no dialog while claimed");
     let a = tokio::time::timeout(Duration::from_secs(5), rx.recv())
         .await
         .unwrap();
