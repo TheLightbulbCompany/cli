@@ -172,3 +172,60 @@ async fn ensure_running_respawns_when_a_dying_daemon_holds_the_lock() {
     let (mut lines, mut w) = connect(dir.path()).await;
     call(&mut lines, &mut w, json!({"id": 1, "op": "shutdown"})).await;
 }
+
+/// Two daemons started at once: one serves, the other waits on the lock (alive, not
+/// serving) and takes over when the first shuts down.
+#[tokio::test]
+async fn a_lock_loser_waits_and_takes_over() {
+    let dir = tempfile::tempdir().unwrap();
+    let start = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_lightbulb-network"))
+            .arg("daemon")
+            .env(paths::HOME_ENV, dir.path())
+            .env("LIGHTBULB_NETWORK_CLAUDE_HOME", dir.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap()
+    };
+    let mut daemons = [start(), start()];
+    let holder = |dir: &Path| -> u32 {
+        std::fs::read_to_string(dir.join("daemon.lock"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    };
+    let (mut lines, mut w) = connect(dir.path()).await;
+    assert_eq!(
+        call(&mut lines, &mut w, json!({"id": 1, "op": "ping"})).await["ok"],
+        true
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    for d in &mut daemons {
+        assert!(d.try_wait().unwrap().is_none(), "both daemons stay alive");
+    }
+    let first = holder(dir.path());
+    let (winner, loser) = if daemons[0].id() == first {
+        (0, 1)
+    } else {
+        (1, 0)
+    };
+    assert_eq!(daemons[winner].id(), first);
+
+    call(&mut lines, &mut w, json!({"id": 2, "op": "shutdown"})).await;
+    daemons[winner].wait().unwrap();
+    // The waiting one takes the lock and serves.
+    let mut served = false;
+    for _ in 0..50 {
+        if holder(dir.path()) == daemons[loser].id() && dir.path().join(paths::SOCKET).exists() {
+            served = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(served, "the waiting daemon never took over");
+    let (mut lines, mut w) = connect(dir.path()).await;
+    call(&mut lines, &mut w, json!({"id": 3, "op": "shutdown"})).await;
+    daemons[loser].wait().unwrap();
+}

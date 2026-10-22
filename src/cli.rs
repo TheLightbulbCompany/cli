@@ -30,7 +30,7 @@ fn canonical(home: &Path) -> PathBuf {
     home.join(".lightbulb/network/bin/lightbulb-network")
 }
 
-fn plist_path(home: &Path) -> PathBuf {
+pub(crate) fn plist_path(home: &Path) -> PathBuf {
     home.join("Library/LaunchAgents")
         .join(format!("{LABEL}.plist"))
 }
@@ -296,8 +296,16 @@ fn launchctl(args: &[&str]) -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
-fn use_launchctl() -> bool {
+pub(crate) fn use_launchctl() -> bool {
     std::env::var_os(NO_LAUNCHCTL).is_none()
+}
+
+/// Asks launchd to start the installed job if it is not running; whether launchctl agreed.
+pub(crate) fn kickstart() -> bool {
+    launchctl(&[
+        "kickstart",
+        &format!("gui/{}/{LABEL}", unsafe { libc::getuid() }),
+    ])
 }
 
 fn xml(s: &str) -> String {

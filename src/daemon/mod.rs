@@ -2,12 +2,12 @@ pub mod ipc;
 
 use crate::agents::{claude, codex};
 use crate::sessions::{self, Key, Tier};
-use crate::{frame, mail, paths, store::Store, Result};
+use crate::{cli, frame, mail, paths, store::Store, Result};
 use data_encoding::BASE32_NOPAD;
 use ed25519_dalek::SigningKey;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File, OpenOptions, Permissions, TryLockError};
+use std::fs::{self, File, OpenOptions, Permissions};
 use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
@@ -95,8 +95,9 @@ pub async fn deliver(daemon: Arc<Daemon>, to: Key) {
     }
 }
 
-/// Runs the daemon for `dir` until a `shutdown` op. Returns `Ok` at once,
-/// without touching anything, when another daemon already holds `daemon.lock`.
+/// Runs the daemon for `dir` until a `shutdown` op. While another daemon holds `daemon.lock`
+/// it waits, touching nothing, and takes over when that one exits: so launchd's copy, started
+/// while a spawned daemon serves, neither exits into a respawn loop nor serves twice.
 pub async fn run(dir: &Path) -> Result<()> {
     let mut lock = OpenOptions::new()
         .read(true)
@@ -104,11 +105,8 @@ pub async fn run(dir: &Path) -> Result<()> {
         .create(true)
         .truncate(false)
         .open(dir.join("daemon.lock"))?;
-    match lock.try_lock() {
-        Ok(()) => {}
-        Err(TryLockError::WouldBlock) => return Ok(()),
-        Err(TryLockError::Error(e)) => return Err(e.into()),
-    }
+    // Blocks this (otherwise idle) thread; nothing else runs until the lock is ours.
+    lock.lock()?;
     lock.set_len(0)?;
     writeln!(lock, "{}", std::process::id())?;
 
@@ -183,9 +181,31 @@ fn identity(dir: &Path) -> Result<[u8; 32]> {
     Ok(key.verifying_key().to_bytes())
 }
 
-/// Makes sure a daemon is listening on this user's socket, starting one if not.
+/// Makes sure a daemon is listening on this user's socket, starting one if not. When the
+/// launchd job is installed (macOS, the default state dir), launchd starts it, so there is
+/// never a second owner; otherwise this binary spawns one.
 pub fn ensure_running() -> Result<()> {
-    ensure_running_at(&std::env::current_exe()?, &paths::state_dir())
+    let dir = paths::state_dir();
+    let sock = dir.join(paths::SOCKET);
+    if answers_ping(&sock) {
+        return Ok(());
+    }
+    let launchd = cfg!(target_os = "macos")
+        && cli::use_launchctl()
+        && std::env::var_os(paths::HOME_ENV).is_none()
+        && dirs::home_dir().is_some_and(|h| cli::plist_path(&h).exists());
+    // A job launchd does not know (booted out) cannot be kickstarted: spawn instead.
+    if launchd && cli::kickstart() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if answers_ping(&sock) {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        return Err("launchd's daemon did not answer within 5 s".into());
+    }
+    ensure_running_at(&std::env::current_exe()?, &dir)
 }
 
 /// `ensure_running` for an explicit binary and state dir (tests).
@@ -205,6 +225,12 @@ pub fn ensure_running_at(exe: &Path, dir: &Path) -> Result<()> {
         if !up && child.try_wait()?.is_some() {
             child = spawn_daemon(exe, dir)?;
         }
+    }
+    // A child that lost the lock to another daemon would wait for it forever: stop it, so
+    // bursts of callers do not pile up waiting daemons.
+    let holder = fs::read_to_string(dir.join("daemon.lock")).ok();
+    if up && holder.is_some_and(|h| h.trim() != child.id().to_string()) {
+        let _ = child.kill();
     }
     // Reap the last child whenever it exits, so a long-lived caller is not
     // left holding a zombie daemon.
