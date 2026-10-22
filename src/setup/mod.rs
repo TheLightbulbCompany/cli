@@ -8,6 +8,11 @@
 //! An MCP entry under our server name whose command is not our executable is foreign: it is
 //! left alone and reported, and no allow rule is written for it. Our allow rule exists only
 //! while the MCP entry is ours.
+//!
+//! A vendor config file that is missing is created, but only when that agent's home
+//! directory exists (the agent reads it from there); Cursor's `cli-config.json` is the
+//! exception: it is edited only if Cursor made it. Backups, temp files and new files are
+//! created with the source file's mode (0600 for a new file), never wider.
 
 mod claude;
 mod codex;
@@ -17,7 +22,8 @@ mod grok;
 use crate::Result;
 use serde_json::{json, Value};
 use std::fs::{self, OpenOptions};
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Default)]
@@ -44,6 +50,14 @@ pub(crate) struct Ctx<'a> {
     pub remove: bool,
 }
 
+/// Whether `name` can name the MCP server: it lands in TOML keys and allow rules.
+pub fn valid_server_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 pub fn run(home: &Path, executable: &Path, server_name: &str, remove: bool) -> Report {
     let exe = executable.to_string_lossy();
     let ctx = Ctx {
@@ -65,7 +79,10 @@ pub fn run(home: &Path, executable: &Path, server_name: &str, remove: bool) -> R
             found: home.join(dir).is_dir(),
             ..Default::default()
         };
-        if r.found {
+        if r.found && !valid_server_name(server_name) {
+            r.notes
+                .push("skipped: the server name takes letters, digits, - and _".into());
+        } else if r.found {
             if let Err(e) = configure(&ctx, &mut r) {
                 r.notes.push(format!("stopped: {e}"));
             }
@@ -156,7 +173,7 @@ pub(crate) fn edit_json(
     let before = doc.clone();
     edit(&mut doc)?;
     if doc != before {
-        write(path, &(serde_json::to_string_pretty(&doc)? + "\n"), r)?;
+        write(path, &(serde_json::to_string_pretty(&doc)? + "\n"), true, r)?;
     }
     Ok(())
 }
@@ -177,7 +194,7 @@ pub(crate) fn edit_toml(
     edit(&mut doc)?;
     let after = doc.to_string();
     if after != text {
-        write(path, &after, r)?;
+        write(path, &after, true, r)?;
     }
     Ok(())
 }
@@ -191,23 +208,51 @@ fn read(path: &Path, create: bool) -> Result<Option<String>> {
     }
 }
 
-/// Backs `path` up once, then replaces it atomically (through a symlink, keeping its mode).
-fn write(path: &Path, text: &str, r: &mut AgentReport) -> Result<()> {
-    if path.exists() {
+/// Replaces `path` atomically (through a symlink), backing it up once first when `backup`.
+/// The new contents are written and synced at the target's mode (0600 for a new file).
+pub(crate) fn write(path: &Path, text: &str, backup: bool, r: &mut AgentReport) -> Result<()> {
+    if backup && path.exists() {
         backup_once(path)?;
     }
     let target = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     if let Some(dir) = target.parent() {
         fs::create_dir_all(dir)?;
     }
-    let name = target.file_name().ok_or("no file name")?.to_string_lossy();
-    let tmp = target.with_file_name(format!(".{name}.lightbulb-tmp"));
-    fs::write(&tmp, text)?;
-    if let Ok(meta) = fs::metadata(&target) {
-        fs::set_permissions(&tmp, meta.permissions())?;
+    let tmp = tmp_path(&target);
+    create_with(&tmp, text.as_bytes(), mode_of(&target).unwrap_or(0o600))?;
+    if let Err(e) = fs::rename(&tmp, &target) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e.into());
     }
-    fs::rename(&tmp, &target)?;
     r.wrote.push(path.to_path_buf());
+    Ok(())
+}
+
+fn mode_of(path: &Path) -> Option<u32> {
+    fs::metadata(path)
+        .ok()
+        .map(|m| m.permissions().mode() & 0o777)
+}
+
+/// `.<name>.<pid>.lightbulb-tmp` beside `path`.
+fn tmp_path(path: &Path) -> PathBuf {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    path.with_file_name(format!(".{name}.{}.lightbulb-tmp", std::process::id()))
+}
+
+/// A new file holding `bytes`, created at `mode` and synced; removed again on failure.
+fn create_with(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
+    let _ = fs::remove_file(path); // a leftover of a crashed run with this pid
+    let written = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(path)
+        .and_then(|mut f| f.write_all(bytes).and_then(|()| f.sync_all()));
+    if let Err(e) = written {
+        let _ = fs::remove_file(path);
+        return Err(e.into());
+    }
     Ok(())
 }
 
@@ -217,18 +262,21 @@ pub(crate) fn backup_path(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
+/// Copies `path` to its backup unless one exists: complete in a temp file at the source's
+/// mode first, then hard-linked into place (which fails if a backup appeared meanwhile), so
+/// a crash never leaves a truncated backup behind.
 fn backup_once(path: &Path) -> Result<()> {
-    match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(backup_path(path))
-    {
-        Ok(mut backup) => {
-            std::io::copy(&mut fs::File::open(path)?, &mut backup)?;
-            Ok(())
-        }
-        Err(e) if e.kind() == ErrorKind::AlreadyExists => Ok(()),
-        Err(e) => Err(e.into()),
+    let backup = backup_path(path);
+    if backup.symlink_metadata().is_ok() {
+        return Ok(());
+    }
+    let tmp = tmp_path(&backup);
+    create_with(&tmp, &fs::read(path)?, mode_of(path).unwrap_or(0o600))?;
+    let linked = fs::hard_link(&tmp, &backup);
+    let _ = fs::remove_file(&tmp);
+    match linked {
+        Err(e) if e.kind() != ErrorKind::AlreadyExists => Err(e.into()),
+        _ => Ok(()),
     }
 }
 
@@ -236,18 +284,19 @@ fn backup_once(path: &Path) -> Result<()> {
 /// `{matcher?, hooks: [{type, command, ...}]}`. Installing puts `group` where our group for
 /// `event` already is (an index others' trust may be keyed by), or appends it; removing
 /// (`group` = None) takes our hooks out of every group and drops groups left empty.
-/// Returns the index our group had or now has.
+/// In a group that also holds someone else's hooks only our hook is replaced or removed.
+/// Returns the index of our group when the group is only ours (Codex trusts it by index).
 pub(crate) fn set_hook_group(
     ctx: &Ctx,
     doc: &mut Value,
     event: &str,
     group: Option<Value>,
 ) -> Result<Option<usize>> {
+    let ours_hook = |h: &Value| h["command"].as_str().is_some_and(|c| ctx.is_ours(c));
     let ours = |g: &Value| {
-        g["hooks"].as_array().is_some_and(|hs| {
-            hs.iter()
-                .any(|h| h["command"].as_str().is_some_and(|c| ctx.is_ours(c)))
-        })
+        g["hooks"]
+            .as_array()
+            .is_some_and(|hs| hs.iter().any(ours_hook))
     };
     let root = doc.as_object_mut().ok_or("not an object")?;
     if group.is_none() && root.get("hooks").and_then(|h| h.get(event)).is_none() {
@@ -264,11 +313,22 @@ pub(crate) fn set_hook_group(
         .as_array_mut()
         .ok_or_else(|| format!("`hooks.{event}` is not a list"))?;
     let at = list.iter().position(ours);
+    let only_ours = at.filter(|&i| {
+        list[i]["hooks"]
+            .as_array()
+            .is_some_and(|hs| hs.iter().all(ours_hook))
+    });
     let index = match group {
         Some(g) => match at {
-            Some(i) => {
+            Some(i) if only_ours.is_some() => {
                 list[i] = g;
                 Some(i)
+            }
+            Some(i) => {
+                let hs = list[i]["hooks"].as_array_mut().expect("holds our hook");
+                let j = hs.iter().position(ours_hook).expect("holds our hook");
+                hs[j] = g["hooks"][0].clone();
+                None
             }
             None => {
                 list.push(g);
@@ -282,7 +342,7 @@ pub(crate) fn set_hook_group(
                 }
             }
             list.retain(|g| g["hooks"].as_array().is_none_or(|hs| !hs.is_empty()));
-            at
+            only_ours
         }
     };
     if list.is_empty() {

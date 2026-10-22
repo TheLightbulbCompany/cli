@@ -7,6 +7,7 @@ use super::{edit_json, set_json_rule, set_json_server, AgentReport, Ctx, Owner};
 use crate::hook::{Event, EVENTS};
 use crate::Result;
 use serde_json::{json, Value};
+use std::fs;
 
 fn cursor_event(e: Event) -> &'static str {
     match e {
@@ -20,7 +21,8 @@ fn cursor_event(e: Event) -> &'static str {
 
 pub(super) fn configure(ctx: &Ctx, r: &mut AgentReport) -> Result<()> {
     let dir = ctx.home.join(".cursor");
-    edit_json(&dir.join("hooks.json"), !ctx.remove, r, |doc| {
+    let hooks = dir.join("hooks.json");
+    edit_json(&hooks, !ctx.remove, r, |doc| {
         if !ctx.remove && doc.get("version").is_none() {
             doc["version"] = json!(1);
         }
@@ -33,6 +35,15 @@ pub(super) fn configure(ctx: &Ctx, r: &mut AgentReport) -> Result<()> {
         }
         Ok(())
     })?;
+    // Removed down to nothing but the version: the file was only ours.
+    if ctx.remove
+        && fs::read_to_string(&hooks)
+            .ok()
+            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+            == Some(json!({"version": 1}))
+    {
+        fs::remove_file(&hooks)?;
+    }
     let mcp = dir.join("mcp.json");
     let mut owner = Owner::Absent;
     edit_json(&mcp, !ctx.remove, r, |doc| {

@@ -67,6 +67,10 @@ pub(super) fn configure(ctx: &Ctx, r: &mut AgentReport) -> Result<()> {
     if owner == Owner::Foreign {
         r.notes.push(ctx.foreign_note(&config));
     }
+    if !ctx.remove && !trust.is_empty() && r.wrote.contains(&config) {
+        r.notes
+            .push("Codex hooks trusted on your behalf (Codex would otherwise ask once)".into());
+    }
     Ok(())
 }
 

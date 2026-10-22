@@ -1,10 +1,8 @@
-//! Grok CLI: hooks in `~/.grok/hooks/lightbulb.json` (Claude-shaped), and
+//! Grok CLI: hooks in our own `~/.grok/hooks/lightbulb-network.json` (Claude-shaped), and
 //! `[mcp_servers.<name>]` plus `permission.allow = ["MCPTool(<name>__*)"]` in
 //! `~/.grok/config.toml`. Written from those files' formats and the Grok CLI manual.
 
-use super::{
-    edit_json, edit_toml, set_hook_group, set_toml_server, toml_table, AgentReport, Ctx, Owner,
-};
+use super::{edit_toml, set_toml_server, toml_table, write, AgentReport, Ctx, Owner};
 use crate::hook::{Event, EVENTS};
 use crate::Result;
 use serde_json::json;
@@ -12,8 +10,16 @@ use std::fs;
 
 pub(super) fn configure(ctx: &Ctx, r: &mut AgentReport) -> Result<()> {
     let dir = ctx.home.join(".grok");
-    let hooks = dir.join("hooks/lightbulb.json");
-    edit_json(&hooks, !ctx.remove, r, |doc| {
+    // Grok loads every `*.json` in `hooks/`, so this file is ours alone: written whole,
+    // deleted on remove, never backed up.
+    let hooks = dir.join("hooks/lightbulb-network.json");
+    if ctx.remove {
+        if hooks.exists() {
+            fs::remove_file(&hooks)?;
+            r.wrote.push(hooks);
+        }
+    } else {
+        let mut doc = json!({});
         for e in EVENTS {
             let timeout = if e == Event::SessionEnd { 3 } else { 10 };
             let mut group = json!({"hooks": [{"type": "command",
@@ -21,13 +27,12 @@ pub(super) fn configure(ctx: &Ctx, r: &mut AgentReport) -> Result<()> {
             if e == Event::PostToolUse {
                 group["matcher"] = json!("*");
             }
-            set_hook_group(ctx, doc, e.name(), (!ctx.remove).then_some(group))?;
+            doc["hooks"][e.name()] = json!([group]);
         }
-        Ok(())
-    })?;
-    // Removed down to nothing: the file was only ours.
-    if ctx.remove && fs::read_to_string(&hooks).is_ok_and(|t| t.trim() == "{}") {
-        fs::remove_file(&hooks)?;
+        let text = serde_json::to_string_pretty(&doc)? + "\n";
+        if fs::read_to_string(&hooks).ok().as_deref() != Some(text.as_str()) {
+            write(&hooks, &text, false, r)?;
+        }
     }
     let config = dir.join("config.toml");
     let mut owner = Owner::Absent;

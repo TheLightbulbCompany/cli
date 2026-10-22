@@ -60,11 +60,7 @@ fn main() -> lightbulb_network::Result<()> {
             executable,
             server_name,
         } => {
-            if server_name.is_empty()
-                || !server_name
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-            {
+            if !setup::valid_server_name(&server_name) {
                 return Err("--server-name takes letters, digits, - and _".into());
             }
             let executable = match executable {

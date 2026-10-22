@@ -227,11 +227,11 @@ fn setup_writes_grok_hooks_and_mcp_and_backs_up_once() {
     assert_eq!(
         agent(&r, "grok").wrote,
         [
-            h.join(".grok/hooks/lightbulb.json"),
+            h.join(".grok/hooks/lightbulb-network.json"),
             h.join(".grok/config.toml")
         ]
     );
-    let hooks = json_at(h, ".grok/hooks/lightbulb.json");
+    let hooks = json_at(h, ".grok/hooks/lightbulb-network.json");
     for (event, arg) in EVENTS {
         let timeout = if event == "SessionEnd" { 3 } else { 10 };
         let mut ours = json!({"hooks": [{"type": "command", "command": cmd("grok", arg), "timeout": timeout}]});
@@ -306,8 +306,8 @@ fn remove_takes_only_our_entries() {
     }
     assert_eq!(get(h, ".codex/config.toml").trim_end(), codex.trim_end());
     assert_eq!(get(h, ".grok/config.toml").trim_end(), grok.trim_end());
-    // Grok's hook file was only ours.
-    assert!(!h.join(".grok/hooks/lightbulb.json").exists());
+    // Our own Grok hook file is gone.
+    assert!(!h.join(".grok/hooks/lightbulb-network.json").exists());
     // Nothing left to remove.
     assert!(setup(h, true).agents.iter().all(|a| a.wrote.is_empty()));
 }
@@ -385,4 +385,104 @@ fn hook_command_quotes_the_executable() {
     assert_eq!(c, r"'/opt/it'\''s/lightbulb-network' hook grok stop");
     assert!(ctx.is_ours(&c));
     assert!(!ctx.is_ours(&format!("'{APP}' local-session-hook grok stop")));
+}
+
+#[test]
+fn backups_and_rewrites_keep_the_source_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::tempdir().unwrap();
+    let h = home.path();
+    put(h, ".claude/settings.json", "{}");
+    put(h, ".claude.json", "{\"token\": \"secret\"}");
+    for rel in [".claude/settings.json", ".claude.json"] {
+        fs::set_permissions(h.join(rel), fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    setup(h, false);
+    for rel in [".claude/settings.json", ".claude.json"] {
+        let p = h.join(rel);
+        for f in [backup_path(&p), p] {
+            let mode = fs::metadata(&f).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{}", f.display());
+        }
+    }
+    // No temp files left behind.
+    let left: Vec<_> = fs::read_dir(h.join(".claude"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains("lightbulb-tmp"))
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
+}
+
+#[test]
+fn a_shared_group_keeps_the_other_hooks() {
+    let home = tempfile::tempdir().unwrap();
+    let h = home.path();
+    let mine = json!({"type": "command", "command": "echo mine"});
+    let stale = json!({"type": "command", "command": cmd("claude", "stop"), "timeout": 99});
+    put(
+        h,
+        ".claude/settings.json",
+        &json!({"hooks": {"Stop": [{"hooks": [mine, stale]}]}}).to_string(),
+    );
+    setup(h, false);
+    let ours = json!({"type": "command", "command": cmd("claude", "stop"), "timeout": 5});
+    assert_eq!(
+        json_at(h, ".claude/settings.json")["hooks"]["Stop"],
+        json!([{"hooks": [mine, ours]}])
+    );
+    setup(h, true);
+    assert_eq!(
+        json_at(h, ".claude/settings.json"),
+        json!({"hooks": {"Stop": [{"hooks": [mine]}]}})
+    );
+}
+
+#[test]
+fn files_setup_created_are_deleted_on_remove() {
+    let home = tempfile::tempdir().unwrap();
+    let h = home.path();
+    fs::create_dir(h.join(".cursor")).unwrap();
+    fs::create_dir(h.join(".grok")).unwrap();
+    setup(h, false);
+    assert!(h.join(".cursor/hooks.json").exists());
+    assert!(h.join(".grok/hooks/lightbulb-network.json").exists());
+    setup(h, true);
+    assert!(!h.join(".cursor/hooks.json").exists());
+    assert!(!h.join(".grok/hooks/lightbulb-network.json").exists());
+}
+
+#[test]
+fn a_grok_lightbulb_json_of_someone_else_is_never_touched() {
+    let home = tempfile::tempdir().unwrap();
+    let h = home.path();
+    let app = json!({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "app"}]}]}})
+        .to_string();
+    put(h, ".grok/hooks/lightbulb.json", &app);
+    setup(h, false);
+    setup(h, true);
+    assert_eq!(get(h, ".grok/hooks/lightbulb.json"), app);
+    assert!(!backup_path(&h.join(".grok/hooks/lightbulb.json")).exists());
+}
+
+#[test]
+fn a_bad_server_name_writes_nothing() {
+    let home = tempfile::tempdir().unwrap();
+    let h = home.path();
+    fs::create_dir(h.join(".claude")).unwrap();
+    let r = run(h, Path::new(EXE), "a:b", false);
+    assert!(agent(&r, "claude").wrote.is_empty());
+    assert!(agent(&r, "claude").notes[0].contains("server name"));
+    assert!(!h.join(".claude.json").exists());
+}
+
+#[test]
+fn codex_says_it_trusted_the_hooks() {
+    let home = tempfile::tempdir().unwrap();
+    fs::create_dir(home.path().join(".codex")).unwrap();
+    let r = setup(home.path(), false);
+    assert!(agent(&r, "codex")
+        .line()
+        .contains("Codex hooks trusted on your behalf"));
+    assert!(agent(&setup(home.path(), false), "codex").notes.is_empty());
 }
