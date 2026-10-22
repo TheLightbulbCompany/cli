@@ -2,16 +2,21 @@
 //! daemon keeps across restarts.
 
 use lightbulb_network::identity::Identity;
+use lightbulb_network::os;
 use lightbulb_network::roster::{self, Entry, Kind};
 use lightbulb_network::store::Store;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
-use std::process::{Command, Output, Stdio};
+use std::os::unix::process::ExitStatusExt;
+use std::process::{Command, ExitStatus, Output};
+use std::time::{Duration, Instant};
 
 struct Env {
     state: tempfile::TempDir,
     home: tempfile::TempDir,
+    /// `LIGHTBULB_NETWORK_HOOK_CALLER` for the daemon: the process it treats as an agent.
+    pin: Option<String>,
 }
 
 impl Env {
@@ -19,24 +24,98 @@ impl Env {
         Env {
             state: tempfile::tempdir().unwrap(),
             home: tempfile::tempdir().unwrap(),
+            pin: None,
         }
     }
 
-    fn run_with(&self, args: &[&str], stdin: &str) -> Output {
-        let mut p = Command::new(env!("CARGO_BIN_EXE_lightbulb-network"))
-            .args(args)
+    /// A daemon that takes this test process for an agent.
+    fn pinned() -> Env {
+        let birth = os::process(std::process::id()).unwrap().birth_micros;
+        let mut e = Env::new();
+        e.pin = Some(format!("{}:{birth}", std::process::id()));
+        e
+    }
+
+    /// Runs `argv` reparented to launchd, so no agent is above it even when the tests run
+    /// under one: the daemon sees a person, as at a terminal.
+    fn detached(&self, argv: &[&str], stdin: &str) -> Output {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("in"), stdin).unwrap();
+        let script =
+            r#"( "$@" <"$D/in" >"$D/out" 2>"$D/err"; echo $? >"$D/c"; mv "$D/c" "$D/code" ) &"#;
+        let mut c = Command::new("/bin/sh");
+        c.args(["-c", script, "sh"])
+            .args(argv)
+            .env("D", d.path())
             .env("LIGHTBULB_NETWORK_HOME", self.state.path())
             .env("LIGHTBULB_NETWORK_CLAUDE_HOME", self.home.path())
             .env("LIGHTBULB_NETWORK_NO_LAUNCHCTL", "1")
             .env("HOME", self.home.path())
             .env("USER", "prasiddha")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        p.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
-        p.wait_with_output().unwrap()
+            .env_remove("LIGHTBULB_NETWORK_HOOK_CALLER");
+        if let Some(pin) = &self.pin {
+            c.env("LIGHTBULB_NETWORK_HOOK_CALLER", pin);
+        }
+        assert!(c.status().unwrap().success());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let code = loop {
+            if let Ok(c) = std::fs::read_to_string(d.path().join("code")) {
+                break c.trim().parse::<i32>().unwrap();
+            }
+            assert!(Instant::now() < deadline, "{argv:?} did not finish");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        Output {
+            status: ExitStatus::from_raw(code << 8),
+            stdout: std::fs::read(d.path().join("out")).unwrap(),
+            stderr: std::fs::read(d.path().join("err")).unwrap(),
+        }
+    }
+
+    fn run_with(&self, args: &[&str], stdin: &str) -> Output {
+        let exe = env!("CARGO_BIN_EXE_lightbulb-network");
+        self.detached(&[[exe].as_slice(), args].concat(), stdin)
+    }
+
+    /// One daemon request from a person (a detached `nc`).
+    fn ask_as_person(&self, body: Value) -> Value {
+        let sock = self.state.path().join("sock");
+        let o = self.detached(
+            &["nc", "-w", "1", "-U", sock.to_str().unwrap()],
+            &format!("{body}\n"),
+        );
+        serde_json::from_slice(&o.stdout).unwrap()
+    }
+
+    /// Seeds a two-member team "acme" before the daemon starts: this computer and aden's,
+    /// founded by this computer or (`member`) by aden, admitting this one as "me".
+    fn seed(&self, member: bool) {
+        let me = Identity::load_or_create(self.state.path()).unwrap();
+        let aden = Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
+        let (f, m, f_name, m_name) = if member {
+            (&aden, &me, "aden", "me")
+        } else {
+            (&me, &aden, "prasiddha", "aden")
+        };
+        let g = Entry::signed(
+            f,
+            vec![],
+            Kind::Admit,
+            json!({"member": f.key, "name": f_name, "computer": "mac", "person_id": f.key,
+                   "kind": "computer", "role": "founder", "ticket_id": "", "team_name": "acme"}),
+            1,
+        );
+        let a = Entry::signed(
+            f,
+            vec![g.hash()],
+            Kind::Admit,
+            json!({"member": m.key, "name": m_name, "computer": "mbp", "person_id": m.key,
+                   "kind": "computer", "role": "member"}),
+            2,
+        );
+        let store = Store::open(&self.state.path().join("state.db")).unwrap();
+        roster::accept(&store, &g, 10).unwrap();
+        roster::accept(&store, &a, 10).unwrap();
     }
 
     fn run(&self, args: &[&str]) -> Output {
@@ -112,41 +191,47 @@ fn invite_reprints_the_same_link_until_new() {
 
 #[test]
 fn non_admin_remove_prints_exact_text() {
-    // A team founded elsewhere by "prasiddha", which admitted this computer as a member.
+    // A team founded elsewhere by aden, which admitted this computer as a plain member.
     let e = Env::new();
-    let me = Identity::load_or_create(e.state.path()).unwrap();
-    let founder = Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
-    let store = Store::open(&e.state.path().join("state.db")).unwrap();
-    let g = Entry::signed(
-        &founder,
-        vec![],
-        Kind::Admit,
-        json!({"member": founder.key, "name": "prasiddha", "computer": "mac",
-               "person_id": founder.key, "kind": "computer", "role": "founder",
-               "ticket_id": "", "team_name": "acme"}),
-        1,
-    );
-    let a = Entry::signed(
-        &founder,
-        vec![g.hash()],
-        Kind::Admit,
-        json!({"member": me.key, "name": "aden", "computer": "mbp", "person_id": me.key,
-               "kind": "computer", "role": "member"}),
-        2,
-    );
-    roster::accept(&store, &g, 10).unwrap();
-    roster::accept(&store, &a, 10).unwrap();
-    drop(store);
-
-    let o = e.run(&["remove", "prasiddha"]);
+    e.seed(true);
+    let o = e.run(&["remove", "aden"]);
     assert_eq!(o.status.code(), Some(1));
     assert_eq!(
         err(&o).trim(),
-        "Only the founder and admins can remove computers. Ask prasiddha."
+        "Only the founder and admins can remove computers. Ask aden."
     );
     let team = out(&e.run(&["team"]));
     assert!(team.contains("acme") && team.contains("aden"), "{team}");
     assert_eq!(e.entries().len(), 2, "no genesis over a joined team");
+    // An open link is for the founder and admins.
+    let r = e.ask_as_person(json!({"id": 1, "op": "team.invite", "mode": "open"}));
+    assert_eq!(r["error"], "not_admin", "{r}");
+    assert_eq!(e.entries().len(), 2);
+}
+
+#[test]
+fn remove_admin_and_leave_from_an_agent_shell_are_refused() {
+    let e = Env::pinned();
+    e.seed(false);
+    assert!(e.run(&["team"]).status.success()); // starts the pinned daemon
+    let before = e.entries();
+    for req in [
+        json!({"op": "team.remove", "member": "aden"}),
+        json!({"op": "team.admin", "member": "aden", "founder": false}),
+        json!({"op": "team.admin", "member": "aden", "founder": true}),
+        json!({"op": "team.leave"}),
+        json!({"op": "team.invite", "mode": "open"}),
+    ] {
+        let mut req = req;
+        req["id"] = 1.into();
+        let r = e.ask(req.clone());
+        assert_eq!(
+            (r["error"].as_str(), r["reason"].as_str()),
+            (Some("bad_request"), Some("not_a_person")),
+            "{req}"
+        );
+    }
+    assert_eq!(e.entries(), before);
 }
 
 #[test]
@@ -192,28 +277,7 @@ fn leave_locally_recreates_a_solo_network() {
 fn founder_admin_remove_and_leave_texts() {
     // This computer founded "acme" and admitted aden.
     let e = Env::new();
-    let me = Identity::load_or_create(e.state.path()).unwrap();
-    let aden = Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
-    let store = Store::open(&e.state.path().join("state.db")).unwrap();
-    let g = Entry::signed(
-        &me,
-        vec![],
-        Kind::Admit,
-        json!({"member": me.key, "name": "prasiddha", "computer": "mac", "person_id": me.key,
-               "kind": "computer", "role": "founder", "ticket_id": "", "team_name": "acme"}),
-        1,
-    );
-    let a = Entry::signed(
-        &me,
-        vec![g.hash()],
-        Kind::Admit,
-        json!({"member": aden.key, "name": "aden", "computer": "mbp", "person_id": aden.key,
-               "kind": "computer", "role": "member"}),
-        2,
-    );
-    roster::accept(&store, &g, 10).unwrap();
-    roster::accept(&store, &a, 10).unwrap();
-    drop(store);
+    e.seed(false);
 
     let o = e.run_with(&["leave"], "y\n");
     assert_eq!(o.status.code(), Some(1));
@@ -235,4 +299,34 @@ fn founder_admin_remove_and_leave_texts() {
     assert!(line.starts_with(LINE) && line != old, "{o}");
     assert_eq!(out(&e.run(&["invite"])), line);
     assert!(!out(&e.run(&["team"])).contains("aden"));
+}
+
+#[test]
+fn founder_whose_only_other_member_is_cloud_can_leave() {
+    let e = Env::new();
+    assert!(e.run(&["team"]).status.success());
+    e.stop();
+    let me = Identity::load_or_create(e.state.path()).unwrap();
+    let bridge = Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
+    let g = e.entries().remove(0);
+    let a = Entry::signed(
+        &me,
+        vec![g.hash()],
+        Kind::Admit,
+        json!({"member": bridge.key, "name": "bridge", "computer": "cloud", "person_id": me.key,
+               "kind": "cloud", "role": "member", "proof": "p"}),
+        2,
+    );
+    roster::accept(
+        &Store::open(&e.state.path().join("state.db")).unwrap(),
+        &a,
+        10,
+    )
+    .unwrap();
+    // A cloud member can be neither admin nor founder.
+    let o = e.run(&["admin", "bridge"]);
+    assert_eq!(o.status.code(), Some(1), "{}", out(&o));
+    let o = e.run_with(&["leave"], "y\n");
+    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(e.entries().len(), 1);
 }

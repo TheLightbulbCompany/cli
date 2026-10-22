@@ -4,7 +4,7 @@ use super::ipc::{refused, Response, BAD_REQUEST, INTERNAL, NOT_FOUND, UNKNOWN_OP
 use super::{Daemon, TeamState};
 use crate::agents::caller;
 use crate::identity::Identity;
-use crate::roster::{self, Entry, Kind, Role, Roster};
+use crate::roster::{self, Entry, Kind, MemberKind, Role, Roster};
 use crate::store::Store;
 use crate::{os, ticket};
 use rusqlite::params;
@@ -17,6 +17,12 @@ pub const FOUNDER_MUST_TRANSFER: &str = "founder_must_transfer";
 
 pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, peer_pid: Option<u32>) -> Response {
     if op.starts_with("team.") {
+        // Governance and open links need a person at the socket, before any authority check.
+        let governs = matches!(op, "team.remove" | "team.admin" | "team.leave")
+            || (op == "team.invite" && body["mode"] == "open");
+        if governs && !peer_pid.is_some_and(person_only) {
+            return refused(id, "not_a_person");
+        }
         let mut team = daemon.team.lock().unwrap();
         let store = daemon.store.lock().unwrap();
         let ops = TeamOps {
@@ -26,7 +32,7 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, peer_pid: Option
             store: &store,
             now: super::ipc::now() as i64,
         };
-        return match ops.run(op, body, peer_pid) {
+        return match ops.run(op, body) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("{op}: {e}");
@@ -95,7 +101,7 @@ struct TeamOps<'a> {
 }
 
 impl TeamOps<'_> {
-    fn run(mut self, op: &str, body: &Value, peer_pid: Option<u32>) -> crate::Result<Response> {
+    fn run(mut self, op: &str, body: &Value) -> crate::Result<Response> {
         let id = self.id;
         let r = roster::replay(&roster::entries(self.store)?);
         let me_key = self.daemon.identity.key.clone();
@@ -128,9 +134,6 @@ impl TeamOps<'_> {
                 let open = mode == "open";
                 if role.is_none() {
                     return Ok(Response::err(id, NOT_MEMBER));
-                }
-                if open && !peer_pid.is_some_and(person_only) {
-                    return Ok(refused(id, "not_a_person"));
                 }
                 if open && role == Some(Role::Member) {
                     return Ok(Response::err(id, NOT_ADMIN));
@@ -166,7 +169,8 @@ impl TeamOps<'_> {
                 let Some(t) = target() else {
                     return Ok(Response::err(id, NOT_FOUND));
                 };
-                if t.key == me_key {
+                // A cloud member never governs.
+                if t.key == me_key || t.kind == MemberKind::Cloud {
                     return Ok(Response::err(id, BAD_REQUEST));
                 }
                 let kind = if body["founder"] == true {
@@ -194,20 +198,26 @@ impl TeamOps<'_> {
                 if t.key == me_key || t.role == Role::Founder {
                     return Ok(Response::err(id, BAD_REQUEST));
                 }
-                let after = self.write(Kind::Remove, json!({"member": t.key}))?;
+                let (_, after) = self.write(Kind::Remove, json!({"member": t.key}))?;
                 let link = self.new_link(&after, "ask", false)?;
                 Response::ok(id, json!({"name": t.name, "line": ticket::line(&link)}))
             }
             // `team.leave {}` -> `{name}`: leaves, then starts this computer's solo network.
             "team.leave" => {
-                let others = r.members.len() > 1;
+                // Cloud members (a person's bridge) do not keep the founder in.
+                let others = r
+                    .members
+                    .values()
+                    .any(|m| m.key != me_key && m.kind == MemberKind::Computer);
                 let admin = r.members.values().any(|m| m.role == Role::Admin);
                 if role == Some(Role::Founder) && others && !admin {
                     return Ok(Response::err(id, FOUNDER_MUST_TRANSFER));
                 }
-                if role.is_some() {
-                    self.write(Kind::Leave, json!({"member": me_key}))?;
-                }
+                // ponytail: kept in a local only; Task 8 sends it to peers before the wipe.
+                let _leave = match role {
+                    Some(_) => Some(self.write(Kind::Leave, json!({"member": me_key}))?.0),
+                    None => None,
+                };
                 let root_at = roster::entries(self.store)?
                     .iter()
                     .find(|e| e.parents.is_empty())
@@ -230,8 +240,8 @@ impl TeamOps<'_> {
         })
     }
 
-    /// Signs `kind` over the current heads and applies it.
-    fn write(&mut self, kind: Kind, body: Value) -> crate::Result<Roster> {
+    /// Signs `kind` over the current heads and applies it: the entry and the roster after it.
+    fn write(&mut self, kind: Kind, body: Value) -> crate::Result<(Entry, Roster)> {
         let e = Entry::signed(
             &self.daemon.identity,
             self.team.heads.clone(),
@@ -240,7 +250,7 @@ impl TeamOps<'_> {
             self.now,
         );
         roster::accept(self.store, &e, self.now)?;
-        reload(self.store, self.team, self.now)
+        Ok((e, reload(self.store, self.team, self.now)?))
     }
 
     /// Mints a link of `mode` (signed into the roster, recorded in `team_link`): its ticket.

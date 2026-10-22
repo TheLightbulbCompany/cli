@@ -27,7 +27,8 @@ CREATE TABLE IF NOT EXISTS team (
 );
 ";
 
-/// The network tables. `team_link` holds the current team link secret (`team.link_secret`).
+/// The network tables. `team_link` holds one row per link minted on this computer (`secret`
+/// NULL for a once link, which keeps only `secret_hash`).
 const V2: &str = "
 CREATE TABLE IF NOT EXISTS roster (hash TEXT PRIMARY KEY, entry TEXT, received_at INTEGER);
 CREATE TABLE IF NOT EXISTS team_link (

@@ -334,16 +334,18 @@ fn pass(
                     applied.insert(h.clone());
                 }
             }
+            // A cloud member is never made an admin or the founder.
             Kind::Admin if founder => {
                 if let Some(t) = r.members.get_mut(&target) {
-                    if t.role == Role::Member {
+                    if t.role == Role::Member && t.kind == MemberKind::Computer {
                         t.role = Role::Admin;
                         admins.push(target);
                     }
                 }
             }
             Kind::Transfer if founder && target != e.signer => {
-                if let Some(t) = r.members.get_mut(&target) {
+                let to = r.members.get_mut(&target);
+                if let Some(t) = to.filter(|t| t.kind == MemberKind::Computer) {
                     t.role = Role::Founder;
                     r.members.get_mut(&e.signer).expect("active").role = Role::Admin;
                     admins.push(e.signer.clone());
@@ -761,11 +763,22 @@ mod tests {
         let ak = admit_cloud(&f, &g, &k, "bridge", &f.key);
         let pk = member(&f, &ak, Kind::Admin, &k.key);
         let lk = link_with(&k, &pk, &tid(&k, "tk"), false);
-        let kd = admit(&k, &lk, &d.key, "d"); // an admin, but a cloud one
+        let kd = admit(&k, &lk, &d.key, "d");
         let r = replay(&[g, ak, pk, lk, kd]);
-        assert_eq!(r.members[&k.key].role, Role::Admin);
         assert!(r.links.is_empty());
         assert!(!r.members.contains_key(&d.key));
+    }
+
+    #[test]
+    fn cloud_member_cannot_be_admin_or_founder() {
+        let (f, k) = (id(), id());
+        let g = genesis(&f);
+        let ak = admit_cloud(&f, &g, &k, "bridge", &f.key);
+        let pk = member(&f, &ak, Kind::Admin, &k.key);
+        let tk = member(&f, &pk, Kind::Transfer, &k.key);
+        let r = replay(&[g, ak, pk, tk]);
+        assert_eq!(r.members[&k.key].role, Role::Member);
+        assert_eq!(r.members[&f.key].role, Role::Founder);
     }
 
     #[test]

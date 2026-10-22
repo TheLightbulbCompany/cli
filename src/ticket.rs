@@ -220,6 +220,7 @@ mod tests {
         let (_, _, r, t) = team("ask", false);
         let mut open = decode(&encode(&t)).unwrap();
         open.mode = "open".into();
+        assert!(!identity::verify(&open.inviter, &value(&open), &open.sig));
         assert!(verify(&open, &r).is_err());
     }
 
