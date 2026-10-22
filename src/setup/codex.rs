@@ -1,7 +1,6 @@
 //! Codex: hooks in `~/.codex/hooks.json`, trusted in `~/.codex/config.toml`
 //! (`[hooks.state."<hooks.json>:<event>:<group>:0"]`; Codex skips an untrusted group
-//! silently), and `[mcp_servers.<name>]` in the same `config.toml`. Adapted from the
-//! Lightbulb desktop app's local-session enrollment.
+//! silently), and `[mcp_servers.<name>]` in the same `config.toml`.
 
 use super::{
     edit_json, edit_toml, set_hook_group, set_toml_server, toml_table, AgentReport, Ctx, Owner,

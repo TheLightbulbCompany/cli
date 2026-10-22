@@ -1,5 +1,5 @@
 //! Claude Code: hooks in `~/.claude/settings.json`, the user-scope MCP server in
-//! `~/.claude.json`. Adapted from the Lightbulb desktop app's local-session enrollment.
+//! `~/.claude.json`.
 
 use super::{edit_json, set_hook_group, set_json_server, AgentReport, Ctx, Owner};
 use crate::hook::{Event, EVENTS};
