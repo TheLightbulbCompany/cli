@@ -5,10 +5,11 @@ on:
     branches: [main]
 jobs:
   ci:
+    # Plan A is macOS-only; Linux returns to this matrix with the port.
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

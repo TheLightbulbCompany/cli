@@ -34,6 +34,10 @@ cargo build
 ./target/debug/lightbulb-network version
 ```
 
+## Stopping it
+
+`lightbulb-network setup --remove` is the off switch (a live MCP process can restart the daemon after `daemon --uninstall`).
+
 ## Security
 
 See [SECURITY.md](SECURITY.md).
