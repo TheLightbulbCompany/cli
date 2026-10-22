@@ -232,7 +232,11 @@ impl Server {
         let sessions: Vec<Session> =
             serde_json::from_value(r["sessions"].clone()).map_err(|_| code("internal"))?;
         match source::resolve(&me, &Value::Object(meta.0 .0), &sessions) {
-            Ok(from) => Ok(Call { me, from, sessions }),
+            Ok(from) => {
+                // A tool call is a step: mail delivered before it has been seen.
+                let _ = ask("mark_read", json!({ "key": from })).await;
+                Ok(Call { me, from, sessions })
+            }
             Err(SourceError::Unidentified) => Err(code("source_unidentified")),
             Err(SourceError::Ambiguous) => Err(code("source_ambiguous")),
         }

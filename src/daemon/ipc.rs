@@ -161,6 +161,17 @@ async fn handle(
             _ => Response::err(id, BAD_REQUEST),
         },
         "inbox" => inbox(id, &req.body, daemon, peer).await,
+        // `mark_read {key}` -> `{}`: `key`'s session took a step (an MCP tool call), so the mail
+        // delivered to it before now has been seen.
+        "mark_read" => match req.body["key"].as_str() {
+            Some(key) => {
+                match mail::mark_read_for(&daemon.store.lock().unwrap(), &Key(key.into()), now()) {
+                    Ok(()) => Response::ok(id, json!({})),
+                    Err(_) => Response::err(id, INTERNAL),
+                }
+            }
+            None => Response::err(id, BAD_REQUEST),
+        },
         // `unread {key}` -> `{unread}`: how many messages wait for `key`; takes nothing.
         "unread" => match req.body["key"].as_str() {
             Some(key) => match mail::unread(&daemon.store.lock().unwrap(), &Key(key.into()), now())
@@ -308,7 +319,12 @@ fn register(id: u64, body: &Value, daemon: &Daemon) -> Response {
             .map_or(0, |d| d.as_secs() as i64),
         executable: r.executable,
     };
-    match store.put_session(&row) {
+    // Every hook event registers: mail delivered before it has been seen.
+    match store
+        .put_session(&row)
+        .map_err(Into::into)
+        .and_then(|()| mail::mark_read_for(&store, &key, now()))
+    {
         Ok(()) => Response::ok(id, json!({ "key": key })),
         Err(_) => Response::err(id, INTERNAL),
     }

@@ -164,6 +164,21 @@ fn stop_hook_hands_waiting_mail_to_grok_as_block_decision() {
 }
 
 #[test]
+fn the_receipt_walks_stored_delivered_read_through_the_hooks() {
+    let net = Net::new();
+    net.hook("grok", "session-start", "grok-session-start");
+    let key = net.key("grok", "019a0000-0000-7000-8000-0000000000f1");
+    net.send(&key, "body r1", "r1");
+    assert_eq!(net.receipt("r1"), "stored");
+    assert_ne!(net.hook("grok", "stop", "grok-stop"), "");
+    assert_eq!(net.receipt("r1"), "delivered");
+    // The agent's next hook event, a later second: it has had the message in front of it.
+    std::thread::sleep(Duration::from_millis(1100));
+    net.hook("grok", "post-tool-use", "grok-post-tool-use");
+    assert_eq!(net.receipt("r1"), "read");
+}
+
+#[test]
 fn session_end_removes_the_record_and_keeps_its_mail() {
     let net = Net::new();
     net.hook("grok", "session-start", "grok-session-start");

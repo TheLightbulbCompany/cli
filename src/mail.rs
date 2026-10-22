@@ -287,8 +287,8 @@ pub fn send(
     }
 
     let id = ulid::Ulid::generate().to_string();
-    let (thread, hops) = match parent {
-        Some((pid, thread, hops, _)) => (thread.unwrap_or(pid), hops + 1),
+    let (thread, hops) = match &parent {
+        Some((pid, thread, hops, _)) => (thread.clone().unwrap_or(pid.clone()), hops + 1),
         None => {
             // The trigger: the newest message delivered to `from` in the window. Hops carry on
             // from it even when the work is forwarded to a third session.
@@ -340,6 +340,12 @@ pub fn send(
         params![to.0, id, now as i64, expires],
     )?;
     advance(&tx, &from.0, request_id, State::Stored, None, now)?;
+    // Answering a message read it.
+    if let Some((pid, ..)) = &parent {
+        if store.message(pid)?.is_some_and(|m| m.to_key == from.0) {
+            mark_read(store, pid, now)?;
+        }
+    }
     tx.commit()?;
     Ok(receipt(store, from, request_id)?.ok_or("receipt missing after write")?)
 }
@@ -400,6 +406,19 @@ pub fn unread(store: &Store, to: &Key, now: u64) -> Result<u64> {
         |r| r.get(0),
     )?;
     Ok(n as u64)
+}
+
+/// Marks `read` every message to `to` whose receipt is `delivered` from before `now`: the
+/// session's next step after a delivery has had it in front of it.
+pub fn mark_read_for(store: &Store, to: &Key, now: u64) -> Result<()> {
+    // `updated_at` stays the delivery time: the hops trigger window runs on it.
+    store.conn().execute(
+        "UPDATE receipts SET state = 'read' WHERE state = 'delivered' AND updated_at < ?2 \
+         AND EXISTS (SELECT 1 FROM messages m WHERE m.to_key = ?1 \
+         AND m.from_key = receipts.from_key AND m.request_id = receipts.request_id)",
+        params![to.0, now as i64],
+    )?;
+    Ok(())
 }
 
 pub fn mark_read(store: &Store, message_id: &str, now: u64) -> Result<()> {
@@ -507,7 +526,15 @@ mod tests {
         );
         assert_eq!(state(&s, "r1"), State::Delivered);
         assert!(take(&s, &k("m/codex:b"), 102).unwrap().is_empty());
-        mark_read(&s, &got[0].id, 103).unwrap();
+        mark_read_for(&s, &k("m/codex:b"), 101).unwrap();
+        assert_eq!(
+            state(&s, "r1"),
+            State::Delivered,
+            "not in the second it was taken"
+        );
+        mark_read_for(&s, &k("m/codex:a"), 103).unwrap();
+        assert_eq!(state(&s, "r1"), State::Delivered, "only mail to that key");
+        mark_read_for(&s, &k("m/codex:b"), 103).unwrap();
         assert_eq!(state(&s, "r1"), State::Read);
         // never backwards
         advance(s.conn(), "m/codex:a", "r1", State::Stored, None, 104).unwrap();
@@ -531,6 +558,7 @@ mod tests {
         let r = send(&s, &k("m/codex:b"), None, "a", "r2", Some("r1"), 3).unwrap();
         assert_eq!(r.state, State::Stored);
         assert_eq!(take(&s, &k("m/terminal"), 4).unwrap()[0].body, "a");
+        assert_eq!(state(&s, "r1"), State::Read, "answering it read it");
         // No recipient and nothing to answer: refused, nothing stored.
         let r = send(&s, &k("m/codex:b"), None, "a", "r3", Some("nope"), 5).unwrap();
         assert_eq!(

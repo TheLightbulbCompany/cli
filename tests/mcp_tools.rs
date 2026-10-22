@@ -466,7 +466,28 @@ fn send_message_with_reply_to_alone_answers_the_sender() {
     assert!(!out.error, "{}", out.text);
     let r = net.call(json!({"id": 1, "op": "inbox", "key": "x/terminal"}));
     assert_eq!(r["messages"][0]["text"], "answer", "{r}");
+    // Answering it marked the question read.
+    let r = net.call(json!({"id": 1, "op": "receipt", "from": "x/terminal", "request_id": "q1"}));
+    assert_eq!(r["receipt"]["state"], "read", "{r}");
     // Neither a recipient nor a reply_to: refused.
     let out = m.tool("send_message", json!({"request_id": "a2", "text": "t"}));
     assert!(out.error, "{}", out.text);
+}
+
+#[test]
+fn a_tool_call_after_a_delivery_marks_it_read() {
+    let net = Net::new();
+    let key = net.register("claude", "c1", &me());
+    net.send("x/codex:a", &key, "hello", "r1");
+    let mut m = net.mcp(&me());
+    assert!(!m.tool("check_inbox", json!({})).error);
+    let receipt = || {
+        net.call(json!({"id": 1, "op": "receipt", "from": "x/codex:a", "request_id": "r1"}))
+            ["receipt"]["state"]
+            .clone()
+    };
+    assert_eq!(receipt(), "delivered");
+    std::thread::sleep(Duration::from_millis(1100));
+    assert!(!m.tool("find_sessions", json!({})).error);
+    assert_eq!(receipt(), "read");
 }
