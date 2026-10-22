@@ -19,11 +19,12 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 /// Runs the server on stdin/stdout until the client closes it.
-pub fn run() -> crate::Result<()> {
+pub fn run(name: String) -> crate::Result<()> {
     daemon::ensure_running()?;
     tokio::runtime::Runtime::new()?.block_on(async {
         Server {
             me: OnceLock::new(),
+            name,
         }
         .serve(rmcp::transport::stdio())
         .await?
@@ -36,6 +37,8 @@ pub fn run() -> crate::Result<()> {
 struct Server {
     /// The agent process above this server, once a call has found it.
     me: OnceLock<Process>,
+    /// The name this server advertises (`mcp --server-name`).
+    name: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -381,11 +384,23 @@ impl Server {
     }
 }
 
-#[tool_handler(
-    name = "lightbulb",
-    instructions = "These tools message the other coding sessions (Claude Code, Codex, Cursor, Grok CLI) on this computer. Call find_sessions to see them, then send_message to one by its session_id. Every send_message needs a request_id: a new [A-Za-z0-9._-]{1,128} string, reused only to retry that same send. Messages delivered to you show a requestId; pass it as reply_to to answer one."
-)]
-impl ServerHandler for Server {}
+#[tool_handler]
+impl ServerHandler for Server {
+    fn get_info(&self) -> rmcp::model::ServerConfig {
+        rmcp::model::ServerConfig::new(
+            rmcp::model::ServerCapabilities::builder()
+                .enable_tools()
+                .build(),
+        )
+        .with_server_info(rmcp::model::Implementation::new(
+            &self.name,
+            env!("CARGO_PKG_VERSION"),
+        ))
+        .with_instructions(INSTRUCTIONS.to_string())
+    }
+}
+
+const INSTRUCTIONS: &str = "These tools message the other coding sessions (Claude Code, Codex, Cursor, Grok CLI) on this computer. Call find_sessions to see them, then send_message to one by its session_id. Every send_message needs a request_id: a new [A-Za-z0-9._-]{1,128} string, reused only to retry that same send. Messages delivered to you show a requestId; pass it as reply_to to answer one.";
 
 #[cfg(test)]
 mod tests {

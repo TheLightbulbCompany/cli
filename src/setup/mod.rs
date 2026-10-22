@@ -50,6 +50,9 @@ pub(crate) struct Ctx<'a> {
     pub remove: bool,
 }
 
+/// The MCP server name when `--server-name` is not given.
+pub const DEFAULT_SERVER: &str = "lightbulb";
+
 /// Whether `name` can name the MCP server: it lands in TOML keys and allow rules.
 pub fn valid_server_name(name: &str) -> bool {
     !name.is_empty()
@@ -140,6 +143,15 @@ impl Ctx<'_> {
     /// Whether a hook command runs our executable.
     pub fn is_ours(&self, command: &str) -> bool {
         command.starts_with(&format!("{} hook ", self.quoted()))
+    }
+
+    /// The MCP entry's `args`: `mcp`, plus `--server-name` when it is not the default.
+    pub fn mcp_args(&self) -> Vec<&str> {
+        if self.server == DEFAULT_SERVER {
+            vec!["mcp"]
+        } else {
+            vec!["mcp", "--server-name", self.server]
+        }
     }
 
     fn quoted(&self) -> String {

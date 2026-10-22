@@ -477,6 +477,35 @@ fn a_bad_server_name_writes_nothing() {
 }
 
 #[test]
+fn a_non_default_server_name_is_passed_to_mcp() {
+    let home = tempfile::tempdir().unwrap();
+    let h = home.path();
+    for dir in [".claude", ".codex", ".cursor", ".grok"] {
+        fs::create_dir(h.join(dir)).unwrap();
+    }
+    run(h, Path::new(EXE), "lightbulb-network", false);
+    let args = json!(["mcp", "--server-name", "lightbulb-network"]);
+    assert_eq!(
+        json_at(h, ".claude.json")["mcpServers"]["lightbulb-network"]["args"],
+        args
+    );
+    assert_eq!(
+        json_at(h, ".cursor/mcp.json")["mcpServers"]["lightbulb-network"]["args"],
+        args
+    );
+    for rel in [".codex/config.toml", ".grok/config.toml"] {
+        let doc = toml_at(h, rel);
+        let got: Vec<_> = doc["mcp_servers"]["lightbulb-network"]["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(got, ["mcp", "--server-name", "lightbulb-network"], "{rel}");
+    }
+}
+
+#[test]
 fn codex_says_it_trusted_the_hooks() {
     let home = tempfile::tempdir().unwrap();
     fs::create_dir(home.path().join(".codex")).unwrap();

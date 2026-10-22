@@ -73,7 +73,11 @@ enum Command {
     /// Run the stdio MCP server an agent talks to (find_sessions, send_message, ...).
     ///
     /// Debug builds only: LIGHTBULB_NETWORK_HOOK_CALLER=<pid>:<birth_micros> names the calling agent (tests).
-    Mcp,
+    Mcp {
+        /// The name this server advertises: the one its MCP entry was installed under.
+        #[arg(long, default_value = setup::DEFAULT_SERVER)]
+        server_name: String,
+    },
     /// Wire the installed agents (Claude Code, Codex, Cursor, Grok CLI) to this engine:
     /// their hooks and MCP server entry. Each file is backed up once as <file>.lightbulb-backup.
     Setup {
@@ -84,7 +88,7 @@ enum Command {
         #[arg(long)]
         executable: Option<std::path::PathBuf>,
         /// The MCP server entry's name, also used in Cursor's and Grok's allow rules.
-        #[arg(long, default_value = "lightbulb")]
+        #[arg(long, default_value = setup::DEFAULT_SERVER)]
         server_name: String,
     },
 }
@@ -136,7 +140,7 @@ fn main() -> lightbulb_network::Result<()> {
         Command::Doctor => exit(cli::doctor()?),
         Command::Leave => cli::leave(),
         Command::External(args) => exit(cli::forward(args)?),
-        Command::Mcp => mcp::run()?,
+        Command::Mcp { server_name } => mcp::run(server_name)?,
         Command::Setup {
             remove,
             executable,

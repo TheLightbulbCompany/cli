@@ -37,7 +37,7 @@ pub(super) fn configure(ctx: &Ctx, r: &mut AgentReport) -> Result<()> {
     let config = dir.join("config.toml");
     let mut owner = Owner::Absent;
     edit_toml(&config, !ctx.remove, r, |doc| {
-        let args = toml_edit::Array::from_iter(["mcp"]);
+        let args = toml_edit::Array::from_iter(ctx.mcp_args());
         let fields = [
             ("command", ctx.exe.into()),
             ("args", args.into()),

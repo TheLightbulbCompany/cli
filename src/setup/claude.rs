@@ -31,7 +31,7 @@ pub(super) fn configure(ctx: &Ctx, r: &mut AgentReport) -> Result<()> {
     let config = ctx.home.join(".claude.json");
     let mut owner = Owner::Absent;
     edit_json(&config, !ctx.remove, r, |doc| {
-        let entry = json!({"command": ctx.exe, "args": ["mcp"]});
+        let entry = json!({"command": ctx.exe, "args": ctx.mcp_args()});
         owner = set_json_server(ctx, doc, "mcpServers", entry)?;
         Ok(())
     })?;

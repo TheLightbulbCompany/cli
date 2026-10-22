@@ -72,8 +72,14 @@ impl Net {
 
     /// The MCP server, run as the agent process `as_`.
     fn mcp(&self, as_: &os::Process) -> Mcp {
+        self.mcp_named(as_, None)
+    }
+
+    /// `mcp`, with `--server-name` when `name` is given.
+    fn mcp_named(&self, as_: &os::Process, name: Option<&str>) -> Mcp {
         let mut child = Command::new(EXE)
             .arg("mcp")
+            .args(name.map(|n| ["--server-name", n]).into_iter().flatten())
             .env(paths::HOME_ENV, self.dir.path())
             .env("LIGHTBULB_NETWORK_CLAUDE_HOME", self.claude.path())
             .env(
@@ -96,7 +102,11 @@ impl Net {
             json!({"protocolVersion": "2025-06-18", "capabilities": {},
                 "clientInfo": {"name": "test", "version": "0"}}),
         );
-        assert_eq!(init["result"]["serverInfo"]["name"], "lightbulb", "{init}");
+        assert_eq!(
+            init["result"]["serverInfo"]["name"],
+            name.unwrap_or("lightbulb"),
+            "{init}"
+        );
         m.write(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
         m
     }
@@ -433,4 +443,11 @@ fn a_failed_push_brings_the_unread_note_back() {
         out.text
     );
     assert!(out.text.ends_with(&format!("\n\n1 {NOTE}")), "{}", out.text);
+}
+
+#[test]
+fn the_server_advertises_its_installed_name() {
+    let net = Net::new();
+    // mcp_named asserts serverInfo.name on initialize.
+    net.mcp_named(&me(), Some("lightbulb-network"));
 }
