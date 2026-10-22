@@ -15,14 +15,17 @@ Coming with the cutover release.
 Three parts:
 
 ```
-  lightbulb-network  (this repo, public engine)
-        ^
-        |
-  Lightbulb app and bridge  (private)
+  lightbulb-network (public engine, this repo)
+        ^                       ^
+        |                       |
+  Lightbulb app (private)   Bridge (private)
 ```
 
 - **Engine** (this repo): the peer-to-peer, end-to-end encrypted messaging core.
-- **Lightbulb app and bridge** (private): the product that builds on the engine.
+- **Lightbulb app** (private): the product UI; depends on the engine.
+- **Bridge** (private): connects coding agents to the engine; depends on the engine.
+
+The engine never depends on the app or the bridge.
 
 ## Build
 
