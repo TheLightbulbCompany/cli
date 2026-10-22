@@ -1,0 +1,3 @@
+# Default rules; add per-file allowlist entries for known false positives only.
+[extend]
+useDefault = true

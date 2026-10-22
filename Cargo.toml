@@ -1,0 +1,13 @@
+[package]
+name = "lightbulb-network"
+version = "0.1.0"
+edition = "2021"
+description = "Peer-to-peer, end-to-end encrypted messaging between coding agents"
+license = "Apache-2.0"
+
+[[bin]]
+name = "lightbulb-network"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
