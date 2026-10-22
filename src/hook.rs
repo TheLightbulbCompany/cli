@@ -134,11 +134,7 @@ pub fn run(agent: &str, event: &str, stdin: &str) -> Result<Option<String>> {
         // can fail; then the daemon ends the row only if its recorded process is gone too.
         daemon::ensure_running()?;
         let mut conn = Conn::open()?;
-        let short = conn.call("status", json!({}))?["member_key_short"]
-            .as_str()
-            .ok_or("status without member_key_short")?
-            .to_string();
-        let key = crate::sessions::Key::new(&short, h.provider, &h.conversation);
+        let key = crate::sessions::Key::new(&conn.member()?, h.provider, &h.conversation);
         let r = match &caller {
             Ok(me) => conn.call("end", json!({ "key": key, "caller": proc_json(me) }))?,
             Err(_) => conn.call("end", json!({ "key": key, "if_gone": true }))?,
@@ -232,6 +228,14 @@ impl Conn {
             stream: BufReader::new(stream),
             next: 1,
         })
+    }
+
+    /// This computer's member prefix, from the daemon's `status`.
+    pub(crate) fn member(&mut self) -> Result<String> {
+        Ok(self.call("status", json!({}))?["member_key_short"]
+            .as_str()
+            .ok_or("status without member_key_short")?
+            .to_string())
     }
 
     pub(crate) fn call(&mut self, op: &str, mut body: Value) -> Result<Value> {

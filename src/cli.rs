@@ -58,13 +58,6 @@ fn ask(conn: &mut Conn, op: &str, body: Value) -> Result<Value> {
     }
 }
 
-fn member(conn: &mut Conn) -> Result<String> {
-    Ok(ask(conn, "status", json!({}))?["member_key_short"]
-        .as_str()
-        .ok_or("status without member_key_short")?
-        .to_string())
-}
-
 fn cell(s: &str) -> String {
     s.replace(['\n', '\t'], " ")
 }
@@ -124,7 +117,7 @@ pub fn send(
         return Err("group sends are for people at a terminal".into());
     }
     let mut conn = connect()?;
-    let short = member(&mut conn)?;
+    let short = conn.member()?;
     // A bare name is one of this member's name addresses.
     let target = &if target.contains('/') || group {
         target.to_string()
@@ -200,7 +193,7 @@ pub fn listen(name: &str, once: bool) -> Result<i32> {
 }
 
 fn key_for(name: &str) -> Result<String> {
-    Ok(format!("{}/{name}", member(&mut connect()?)?))
+    Ok(format!("{}/{name}", connect()?.member()?))
 }
 
 /// One connection's worth of listening; `Ok` only for `--once` done.
@@ -223,7 +216,7 @@ pub fn receipt(request_id: &str, from: Option<String>) -> Result<i32> {
     let mut conn = connect()?;
     let from = match from {
         Some(f) => f,
-        None => format!("{}/terminal", member(&mut conn)?),
+        None => format!("{}/terminal", conn.member()?),
     };
     let r = conn.call("receipt", json!({ "from": from, "request_id": request_id }))?;
     if r["ok"] == true {
