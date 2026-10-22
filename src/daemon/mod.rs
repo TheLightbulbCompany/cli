@@ -6,7 +6,7 @@ use crate::{frame, mail, paths, store::Store, Result};
 use data_encoding::BASE32_NOPAD;
 use ed25519_dalek::SigningKey;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions, Permissions, TryLockError};
 use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -35,6 +35,8 @@ pub struct Daemon {
     /// One lock per recipient key, held while its mail is pushed or taken.
     /// ponytail: never pruned (one entry per key ever written to); prune when keys churn.
     pub mailbox_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Keys whose last push failed (more recently than one succeeded).
+    pub push_failed: Mutex<HashSet<String>>,
 }
 
 impl Daemon {
@@ -50,10 +52,11 @@ impl Daemon {
 
 /// Pushes the mail waiting for `to` into its session, oldest first, when the session is push
 /// tier. Each message is taken (`delivered`) only after its push succeeds; at the first failure
-/// it and everything after it stay in the mailbox for the next hook or `check_inbox`.
+/// it and everything after it stay in the mailbox for the next hook or `check_inbox`, and the
+/// session reads `next_step` until a push succeeds again. At-least-once: a push whose result is
+/// unknown (a timeout after the agent took it) counts as failed and is pushed again on the next
+/// send, or handed over by the next hook.
 pub async fn deliver(daemon: Arc<Daemon>, to: Key) {
-    let lock = daemon.key_lock(&to.0);
-    let _held = lock.lock().await;
     let rows = daemon.store.lock().unwrap().sessions().unwrap_or_default();
     let Some(session) = sessions::all(&rows, &daemon.claude_home, &daemon.member_key_short)
         .into_iter()
@@ -61,10 +64,14 @@ pub async fn deliver(daemon: Arc<Daemon>, to: Key) {
     else {
         return;
     };
-    let Ok(waiting) = mail::waiting(&daemon.store.lock().unwrap(), &to, ipc::now()) else {
-        return;
-    };
-    for m in waiting {
+    let lock = daemon.key_lock(&to.0);
+    loop {
+        // One message per hold, so an `inbox` waits for at most one push.
+        let _held = lock.lock().await;
+        let next = mail::waiting(&daemon.store.lock().unwrap(), &to, ipc::now());
+        let Some(m) = next.ok().and_then(|w| w.into_iter().next()) else {
+            return;
+        };
         let framed =
             frame::peer_from_provider(ipc::provider_of(&m.from_key), None, &m.request_id, &m.body);
         let pushed = match session.provider.as_str() {
@@ -73,11 +80,17 @@ pub async fn deliver(daemon: Arc<Daemon>, to: Key) {
         };
         if let Err(e) = pushed {
             eprintln!("push to {}: {}", to.0, e.0);
+            daemon.push_failed.lock().unwrap().insert(to.0.clone());
             return;
         }
-        if let Err(e) = mail::take_one(&daemon.store.lock().unwrap(), &to, &m.id, ipc::now()) {
-            eprintln!("push to {}: {e}", to.0);
-            return;
+        daemon.push_failed.lock().unwrap().remove(&to.0);
+        match mail::take_one(&daemon.store.lock().unwrap(), &to, &m.id, ipc::now()) {
+            Ok(Some(_)) => {}
+            Ok(None) => return,
+            Err(e) => {
+                eprintln!("push to {}: {e}", to.0);
+                return;
+            }
         }
     }
 }
@@ -132,6 +145,7 @@ pub async fn run(dir: &Path) -> Result<()> {
         shutdown: Notify::new(),
         mail: Notify::new(),
         mailbox_locks: Mutex::default(),
+        push_failed: Mutex::default(),
     });
     ipc::serve(listener, daemon).await;
     let _ = fs::remove_file(&sock);

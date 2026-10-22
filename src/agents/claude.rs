@@ -18,7 +18,7 @@ const FROM: &str = "lightbulb-teammate";
 /// Writes `framed` into the session as a user turn (starting one if it is idle).
 pub async fn push(session: &Session, framed: &str) -> Result<(), PushError> {
     let path = session
-        .push_socket
+        .push_via
         .as_deref()
         .ok_or(PushError("no messaging socket"))?;
     // The socket must sit in a directory this user owns, and be served by the session itself.

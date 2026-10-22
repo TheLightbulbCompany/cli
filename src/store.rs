@@ -4,7 +4,7 @@ use std::path::Path;
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
     key TEXT PRIMARY KEY, provider TEXT, conversation TEXT, pid INTEGER,
-    birth_micros INTEGER, cwd TEXT, title TEXT, status TEXT, seen_at INTEGER
+    birth_micros INTEGER, cwd TEXT, title TEXT, status TEXT, seen_at INTEGER, executable TEXT
 );
 CREATE TABLE IF NOT EXISTS messages (
     id TEXT PRIMARY KEY, request_id TEXT, from_key TEXT, to_key TEXT,
@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS mailbox (
 CREATE TABLE IF NOT EXISTS team (
     id TEXT PRIMARY KEY, name TEXT, founder_key TEXT, created_at INTEGER
 );
-PRAGMA user_version = 2;
+PRAGMA user_version = 3;
 ";
 
 #[derive(Debug, Clone, PartialEq)]
@@ -35,6 +35,8 @@ pub struct Session {
     pub title: Option<String>,
     pub status: String,
     pub seen_at: i64,
+    /// The agent process's executable, as the registering hook found it.
+    pub executable: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -62,6 +64,7 @@ fn row_session(r: &rusqlite::Row) -> rusqlite::Result<Session> {
         title: r.get("title")?,
         status: r.get("status")?,
         seen_at: r.get("seen_at")?,
+        executable: r.get("executable")?,
     })
 }
 
@@ -73,12 +76,20 @@ impl Store {
     pub fn open(path: &Path) -> rusqlite::Result<Store> {
         let conn = Connection::open(path)?;
         // v1 keyed requests globally; v2 keys them by sender. Recreate (the mailbox points at messages).
-        if conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))? == 1 {
-            conn.execute_batch(
-                "DROP TABLE messages; DROP TABLE receipts; DELETE FROM mailbox; PRAGMA user_version = 2;",
-            )?;
+        let version = conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))?;
+        if version == 1 {
+            conn.execute_batch("DROP TABLE messages; DROP TABLE receipts; DELETE FROM mailbox;")?;
         }
         conn.execute_batch(SCHEMA)?;
+        // v3 adds `sessions.executable` to a sessions table made before it.
+        let has: bool = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'executable'",
+            [],
+            |r| r.get(0),
+        )?;
+        if !has {
+            conn.execute_batch("ALTER TABLE sessions ADD COLUMN executable TEXT;")?;
+        }
         Ok(Store { conn })
     }
 
@@ -88,7 +99,7 @@ impl Store {
 
     pub fn put_session(&self, s: &Session) -> rusqlite::Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO sessions VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT OR REPLACE INTO sessions VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 s.key,
                 s.provider,
@@ -98,7 +109,8 @@ impl Store {
                 s.cwd,
                 s.title,
                 s.status,
-                s.seen_at
+                s.seen_at,
+                s.executable
             ],
         )?;
         Ok(())
@@ -185,6 +197,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_v2_database_gains_the_executable_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE sessions (key TEXT PRIMARY KEY, provider TEXT, conversation TEXT, \
+                 pid INTEGER, birth_micros INTEGER, cwd TEXT, title TEXT, status TEXT, seen_at INTEGER); \
+                 INSERT INTO sessions VALUES ('k', 'codex', 'c', 1, 1, '/', NULL, 'idle', 0); \
+                 PRAGMA user_version = 2;",
+            )
+            .unwrap();
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.session("k").unwrap().unwrap().executable, None);
+    }
+
+    #[test]
     fn store_round_trips_a_session_and_a_message() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("state.db")).unwrap();
@@ -198,6 +227,7 @@ mod tests {
             title: None,
             status: "idle".into(),
             seen_at: 7,
+            executable: Some("/bin/claude".into()),
         };
         store.put_session(&session).unwrap();
         assert_eq!(store.session("claude:abc").unwrap(), Some(session));

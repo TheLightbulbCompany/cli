@@ -25,7 +25,6 @@ impl Net {
         let claude = tempfile::tempdir().unwrap();
         let daemon = Command::new(EXE)
             .arg("daemon")
-            .env("PATH", "/usr/bin:/bin") // no real `codex`: sessions stay next_step
             .env(paths::HOME_ENV, dir.path())
             .env("LIGHTBULB_NETWORK_CLAUDE_HOME", claude.path())
             .stdout(Stdio::null())

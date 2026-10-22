@@ -24,7 +24,6 @@ impl Net {
         let claude = tempfile::tempdir().unwrap();
         let daemon = Command::new(EXE)
             .arg("daemon")
-            .env("PATH", "/usr/bin:/bin") // no real `codex`: sessions stay next_step
             .env(paths::HOME_ENV, dir.path())
             .env("LIGHTBULB_NETWORK_CLAUDE_HOME", claude.path())
             .stdout(Stdio::null())
@@ -398,4 +397,40 @@ fn codex_calls_pick_their_thread_from_meta() {
         .collect();
     assert_eq!(this.len(), 1, "{v}");
     assert_eq!(this[0]["session_id"], t1.as_str());
+}
+
+#[test]
+fn a_failed_push_brings_the_unread_note_back() {
+    let net = Net::new();
+    // This process as a Claude session whose messaging socket has no listener.
+    let sock = net.claude.path().join("dead.sock");
+    drop(std::os::unix::net::UnixListener::bind(&sock).unwrap());
+    let sessions = net.claude.path().join(".claude/sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let entry = json!({"pid": me().pid, "sessionId": "c9", "cwd": "/tmp",
+        "startedAt": me().birth_micros / 1000, "status": "idle", "messagingSocketPath": sock});
+    std::fs::write(sessions.join("a.json"), entry.to_string()).unwrap();
+    let short = net.call(json!({"id": 1, "op": "status"}))["member_key_short"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let key = format!("{short}/claude:c9");
+    let mut m = net.mcp(&me());
+    let tier =
+        |m: &mut Mcp| m.tool("find_sessions", json!({})).json()["sessions"][0]["tier"].clone();
+    assert_eq!(tier(&mut m), "push");
+
+    net.send("x/codex:a", &key, "one", "r1");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while tier(&mut m) != "next_step" && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let out = m.tool("find_sessions", json!({}));
+    assert_eq!(
+        out.json()["sessions"][0]["tier"],
+        "next_step",
+        "{}",
+        out.text
+    );
+    assert!(out.text.ends_with(&format!("\n\n1 {NOTE}")), "{}", out.text);
 }

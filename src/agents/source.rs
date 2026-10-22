@@ -65,7 +65,7 @@ mod tests {
             doing: None,
             status: Status::Idle,
             tier: Tier::Pull,
-            push_socket: None,
+            push_via: None,
         }
     }
 

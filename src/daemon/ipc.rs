@@ -261,11 +261,12 @@ struct Register {
     cwd: String,
     title: Option<String>,
     status: Option<String>,
+    executable: Option<String>,
 }
 
 const PROVIDERS: [&str; 4] = ["claude", "codex", "cursor", "grok"];
 
-/// `register {session: {provider, conversation, pid, birth_micros, cwd, title?, status?}, caller?}`
+/// `register {session: {provider, conversation, pid, birth_micros, cwd, title?, status?, executable?}, caller?}`
 /// upserts by key; the daemon supplies the member prefix. A key whose row names another
 /// live process is refused (`bad_request`, reason `owned_by_live_process`). `status` is `idle` (default) or
 /// `busy` (stored as live); `conversation` is `[A-Za-z0-9._-]{1,128}`.
@@ -312,6 +313,7 @@ fn register(id: u64, body: &Value, daemon: &Daemon) -> Response {
         seen_at: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs() as i64),
+        executable: r.executable,
     };
     match store.put_session(&row) {
         Ok(()) => Response::ok(id, json!({ "key": key })),
@@ -320,9 +322,17 @@ fn register(id: u64, body: &Value, daemon: &Daemon) -> Response {
 }
 
 /// Registered and discovered sessions, `gone` ones left out (their rows stay until `end`).
+/// A session whose last push failed reads `next_step`: its mail waits for the next step.
 fn live_sessions(daemon: &Daemon) -> Vec<sessions::Session> {
     let rows = daemon.store.lock().unwrap().sessions().unwrap_or_default();
-    sessions::all(&rows, &daemon.claude_home, &daemon.member_key_short)
+    let mut all = sessions::all(&rows, &daemon.claude_home, &daemon.member_key_short);
+    let failed = daemon.push_failed.lock().unwrap();
+    for s in &mut all {
+        if s.tier == sessions::Tier::Push && failed.contains(&s.key.0) {
+            s.tier = sessions::Tier::NextStep;
+        }
+    }
+    all
 }
 
 fn live_count(daemon: &Daemon) -> usize {
@@ -415,12 +425,13 @@ async fn inbox(
         let notified = daemon.mail.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
-        // Under the key's lock, so a push in flight is not delivered twice.
-        let taken = {
-            let lock = daemon.key_lock(&key.0);
-            let _held = lock.lock().await;
-            mail::take(&daemon.store.lock().unwrap(), &key, now())
+        // Under the key's lock, so a push in flight is not delivered twice; a push holding
+        // it past the deadline means nothing for this call.
+        let lock = daemon.key_lock(&key.0);
+        let Ok(held) = tokio::time::timeout_at(deadline, lock.lock()).await else {
+            return Response::ok(id, json!({ "messages": [] }));
         };
+        let taken = mail::take(&daemon.store.lock().unwrap(), &key, now());
         match taken {
             Err(_) => return Response::err(id, INTERNAL),
             Ok(m) if !m.is_empty() => {
@@ -437,6 +448,7 @@ async fn inbox(
             }
             Ok(_) => {}
         }
+        drop(held);
         // Wake on mail, the deadline, shutdown (so this connection can say goodbye), or the
         // peer hanging up (then take nothing: there is no one to hand it to).
         let woke = tokio::select! {

@@ -427,6 +427,7 @@ mod tests {
                 title: None,
                 status: "idle".into(),
                 seen_at: 0,
+                executable: None,
             })
             .unwrap();
     }

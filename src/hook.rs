@@ -162,7 +162,8 @@ pub fn run(agent: &str, event: &str, stdin: &str) -> Result<Option<String>> {
     let r = conn.call(
         "register",
         json!({ "session": { "provider": h.provider, "conversation": h.conversation,
-            "pid": me.pid, "birth_micros": me.birth_micros, "cwd": h.cwd, "status": status },
+            "pid": me.pid, "birth_micros": me.birth_micros, "cwd": h.cwd, "status": status,
+            "executable": me.executable },
             "caller": proc_json(&me) }),
     )?;
     let key = r["key"].clone();

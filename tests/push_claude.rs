@@ -45,7 +45,6 @@ fn claude_home() -> &'static Path {
             std::fs::write(dir.join(format!("{file}.json")), entry.to_string()).unwrap();
         }
         std::env::set_var("LIGHTBULB_NETWORK_CLAUDE_HOME", home.path());
-        std::env::set_var("PATH", "/usr/bin:/bin"); // no real `codex` for this daemon
         home
     })
     .path()
@@ -154,6 +153,18 @@ async fn a_failed_push_leaves_the_mail_for_the_next_hook() {
     tokio::time::sleep(Duration::from_millis(500)).await; // the push has been tried and failed
 
     assert_eq!(receipt(&mut l, &mut w, "r2").await, "stored");
+    let s = call(&mut l, &mut w, json!({"id": 5, "op": "sessions"})).await;
+    let mine = s["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["key"] == to.as_str())
+        .cloned();
+    assert_eq!(
+        mine.unwrap_or_default()["tier"],
+        "next_step",
+        "a failed push reads next_step: {s}"
+    );
     let unread = call(&mut l, &mut w, json!({"id": 3, "op": "unread", "key": to})).await;
     assert_eq!(unread["unread"], 1);
     let got = call(&mut l, &mut w, json!({"id": 4, "op": "inbox", "key": to})).await;

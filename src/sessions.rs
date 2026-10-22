@@ -47,18 +47,10 @@ pub struct Session {
     pub status: Status,
     /// Computed at read time: `push` when the provider's push channel is reachable.
     pub tier: Tier,
-    /// Claude's messaging socket, when its registry names one that exists.
+    /// The push channel: Claude's messaging socket, or the Codex app-server daemon binary
+    /// that serves the thread. `tier` is `push` exactly when this is set.
     #[serde(skip)]
-    pub push_socket: Option<PathBuf>,
-}
-
-/// Codex pushes through the `codex` CLI; Claude's tier comes from its registry (`scan_claude`).
-fn tier(provider: &str) -> Tier {
-    if provider == "codex" && codex::program().is_some() {
-        Tier::Push
-    } else {
-        Tier::NextStep
-    }
+    pub push_via: Option<PathBuf>,
 }
 
 /// Alive means the pid exists AND was born at `birth_micros`; a reused pid is not the session.
@@ -67,15 +59,31 @@ pub fn alive(pid: u32, birth_micros: u64) -> bool {
 }
 
 /// A stored (registered) row as a `Session`; `Gone` when its process is not the registered one.
-fn from_row(r: &store::Session) -> Option<Session> {
+/// A Codex thread is push tier when its process (the executable the hook recorded, else the
+/// pid's) is Codex's app-server daemon under `home` (`codex::daemon_program`).
+fn from_row(r: &store::Session, home: &Path) -> Option<Session> {
     let (provider, conversation) = (r.provider.clone(), r.conversation.clone()?);
     let (pid, birth) = (
         u32::try_from(r.pid?).ok()?,
         u64::try_from(r.birth_micros?).ok()?,
     );
+    let push_via = (provider == "codex")
+        .then(|| {
+            r.executable
+                .as_ref()
+                .map(PathBuf::from)
+                .or_else(|| os::process(pid).ok().map(|p| p.executable))
+        })
+        .flatten()
+        .and_then(|exe| codex::daemon_program(home, &exe));
     Some(Session {
         key: Key(r.key.clone()),
-        tier: tier(&provider),
+        tier: if push_via.is_some() {
+            Tier::Push
+        } else {
+            Tier::NextStep
+        },
+        push_via,
         provider,
         conversation,
         pid,
@@ -83,7 +91,6 @@ fn from_row(r: &store::Session) -> Option<Session> {
         cwd: r.cwd.clone(),
         title: r.title.clone(),
         doing: None,
-        push_socket: None,
         status: if !alive(pid, birth) {
             Status::Gone
         } else if r.status == "live" {
@@ -124,10 +131,11 @@ pub fn scan_claude(home: &Path, member_short: &str) -> Vec<Session> {
         if (p.birth_micros / 1000).abs_diff(started_ms) > 10_000 {
             continue;
         }
+        // Pushing checks the socket's peer pid, which only `os::PEER_PID` platforms can.
         let socket = v["messagingSocketPath"]
             .as_str()
             .map(PathBuf::from)
-            .filter(|s| s.exists());
+            .filter(|s| os::PEER_PID && s.exists());
         out.push(Session {
             key: Key::new(member_short, "claude", conversation),
             provider: "claude".into(),
@@ -147,7 +155,7 @@ pub fn scan_claude(home: &Path, member_short: &str) -> Vec<Session> {
             } else {
                 Tier::NextStep
             },
-            push_socket: socket,
+            push_via: socket,
         });
     }
     out
@@ -156,7 +164,7 @@ pub fn scan_claude(home: &Path, member_short: &str) -> Vec<Session> {
 /// Registered rows plus Claude discoveries, deduplicated by key (a discovery wins:
 /// its status is fresher), `Gone` dropped, `title`/`doing` filled from the transcript.
 pub fn all(rows: &[store::Session], home: &Path, member_short: &str) -> Vec<Session> {
-    let mut out: Vec<Session> = rows.iter().filter_map(from_row).collect();
+    let mut out: Vec<Session> = rows.iter().filter_map(|r| from_row(r, home)).collect();
     for found in scan_claude(home, member_short) {
         match out.iter_mut().find(|s| s.key == found.key) {
             Some(s) => {

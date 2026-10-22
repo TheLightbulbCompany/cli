@@ -37,6 +37,9 @@ pub fn hostname() -> String {
     String::from_utf8_lossy(&buf[..end]).into_owned()
 }
 
+/// Whether `peer_pid` works here (Claude pushes need it).
+pub const PEER_PID: bool = cfg!(target_os = "macos");
+
 /// The pid of the process at the other end of a connected Unix socket.
 pub fn peer_pid(fd: std::os::fd::RawFd) -> Result<u32> {
     imp::peer_pid(fd)
