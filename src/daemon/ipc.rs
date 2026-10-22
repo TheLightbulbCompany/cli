@@ -139,17 +139,7 @@ async fn handle(line: &str, daemon: &Daemon, subscribed: &mut bool) -> Response 
         "register" => register(id, &req.body, daemon),
         "sessions" => Response::ok(id, json!({ "sessions": live_sessions(daemon) })),
         "end" => match req.body["key"].as_str() {
-            Some(key) => {
-                let store = daemon.store.lock().unwrap();
-                match (
-                    mail::discard(&store, &Key(key.into()), now()),
-                    store.delete_session(key),
-                ) {
-                    (Ok(()), Ok(true)) => Response::ok(id, json!({})),
-                    (Ok(()), Ok(false)) => Response::err(id, NOT_FOUND),
-                    _ => Response::err(id, INTERNAL),
-                }
-            }
+            Some(key) => end(id, key, req.body["if_gone"] == true, daemon),
             None => Response::err(id, BAD_REQUEST),
         },
         "send" => send(id, &req.body, daemon),
@@ -164,6 +154,32 @@ async fn handle(line: &str, daemon: &Daemon, subscribed: &mut bool) -> Response 
         "inbox" => inbox(id, &req.body, daemon).await,
         "tool" => Response::err(id, UNSUPPORTED),
         _ => Response::err(id, UNKNOWN_OP),
+    }
+}
+
+/// `end {key, if_gone?}` -> `{ended}`: deletes the session row; its mail stays for the hold.
+/// With `if_gone`, only when the row's recorded process is no longer alive (`ended: false`
+/// otherwise), so a hook run by hand can never end a live session.
+fn end(id: u64, key: &str, if_gone: bool, daemon: &Daemon) -> Response {
+    let store = daemon.store.lock().unwrap();
+    if if_gone {
+        let live = match store.session(key) {
+            Ok(Some(s)) => s
+                .pid
+                .zip(s.birth_micros)
+                .and_then(|(p, b)| Some((u32::try_from(p).ok()?, u64::try_from(b).ok()?)))
+                .is_some_and(|(p, b)| sessions::alive(p, b)),
+            Ok(None) => false,
+            Err(_) => return Response::err(id, INTERNAL),
+        };
+        if live {
+            return Response::ok(id, json!({ "ended": false }));
+        }
+    }
+    match store.delete_session(key) {
+        Ok(true) => Response::ok(id, json!({ "ended": true })),
+        Ok(false) => Response::err(id, NOT_FOUND),
+        Err(_) => Response::err(id, INTERNAL),
     }
 }
 
@@ -268,29 +284,15 @@ fn send(id: u64, body: &Value, daemon: &Daemon) -> Response {
     }
 }
 
-/// Who a message is from, for its frame. The frame reads only the provider, which the key
-/// carries (`<member>/<provider>:<conversation>`), so the sender need not be live.
-fn sender(key: &str) -> sessions::Session {
-    let provider = key
-        .split_once('/')
+/// The provider in a key (`<member>/<provider>:<conversation>`); `unknown` when malformed.
+fn provider_of(key: &str) -> &str {
+    key.split_once('/')
         .and_then(|(_, rest)| rest.split_once(':'))
-        .map_or("", |(p, _)| p);
-    sessions::Session {
-        key: Key(key.into()),
-        provider: provider.into(),
-        conversation: String::new(),
-        pid: 0,
-        birth_micros: 0,
-        cwd: String::new(),
-        title: None,
-        doing: None,
-        status: sessions::Status::Gone,
-        tier: sessions::Tier::Pull,
-    }
+        .map_or("unknown", |(p, _)| p)
 }
 
 /// `inbox {key, wait_secs?}` -> `{messages}`, each with `framed`, the text as the agent
-/// is shown it (`frame::peer`): takes (and so delivers) what waits for `key`;
+/// is shown it (`frame::peer_from_provider`): takes (and so delivers) what waits for `key`;
 /// with `wait_secs` (at most 600) it first waits for something to arrive.
 async fn inbox(id: u64, body: &Value, daemon: &Daemon) -> Response {
     let Some(key) = body["key"].as_str().map(|k| Key(k.into())) else {
@@ -320,7 +322,7 @@ async fn inbox(id: u64, body: &Value, daemon: &Daemon) -> Response {
                         json!({ "id": m.id, "request_id": m.request_id, "from": m.from_key,
                             "to": m.to_key, "kind": m.kind, "thread": m.thread, "hops": m.hops,
                             "text": m.body, "sent_at": m.sent_at,
-                            "framed": frame::peer(&sender(&m.from_key), None, &m.request_id, &m.body) })
+                            "framed": frame::peer_from_provider(provider_of(&m.from_key), None, &m.request_id, &m.body) })
                     })
                     .collect();
                 return Response::ok(id, json!({ "messages": messages }));

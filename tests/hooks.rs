@@ -1,6 +1,7 @@
 //! `hook <agent> <event>` run as the agents run it: the built binary, a fixture on stdin.
-//! The caller is pinned with LIGHTBULB_NETWORK_HOOK_CALLER (debug builds only), since the
-//! test runner is not an agent.
+//! The caller is pinned with LIGHTBULB_NETWORK_HOOK_CALLER, since the test runner is not
+//! an agent. That override is compiled out of release builds, so `cargo test --release`
+//! fails the pinned tests here; run them in a debug build.
 
 use lightbulb_network::{os, paths};
 use serde_json::{json, Value};
@@ -79,20 +80,29 @@ impl Net {
             .cloned()
     }
 
-    /// Runs the hook with `tests/fixtures/hooks/<fixture>.json` on stdin; returns stdout.
+    /// Runs the hook with `tests/fixtures/hooks/<fixture>.json` on stdin, called as the
+    /// agent; returns stdout.
     fn hook(&self, agent: &str, event: &str, fixture: &str) -> String {
+        self.hook_as(agent, event, fixture, true)
+    }
+
+    /// `pinned: false` leaves the real caller (this test runner, which is no agent).
+    fn hook_as(&self, agent: &str, event: &str, fixture: &str, pinned: bool) -> String {
         let me = os::process(std::process::id()).unwrap();
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/hooks")
             .join(format!("{fixture}.json"));
-        let mut child = Command::new(EXE)
+        let mut cmd = Command::new(EXE);
+        if pinned {
+            cmd.env(
+                "LIGHTBULB_NETWORK_HOOK_CALLER",
+                format!("{}:{}", me.pid, me.birth_micros),
+            );
+        }
+        let mut child = cmd
             .args(["hook", agent, event])
             .env(paths::HOME_ENV, self.dir.path())
             .env("LIGHTBULB_NETWORK_CLAUDE_HOME", self.claude.path())
-            .env(
-                "LIGHTBULB_NETWORK_HOOK_CALLER",
-                format!("{}:{}", me.pid, me.birth_micros),
-            )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -146,21 +156,64 @@ fn stop_hook_hands_waiting_mail_to_grok_as_block_decision() {
 }
 
 #[test]
-fn session_end_removes_the_record_and_its_mail() {
+fn session_end_removes_the_record_and_keeps_its_mail() {
     let net = Net::new();
-    net.hook("claude", "session-start", "claude-session-start");
-    let key = net.key("claude", "00000000-0000-4000-8000-0000000000c1");
+    net.hook("grok", "session-start", "grok-session-start");
+    let key = net.key("grok", "019a0000-0000-7000-8000-0000000000f1");
     assert!(net.session(&key).is_some());
     net.send(&key, "body r1", "r1");
 
-    assert_eq!(net.hook("claude", "session-end", "claude-session-end"), "");
+    assert_eq!(net.hook("grok", "session-end", "grok-session-end"), "");
     assert!(net.session(&key).is_none());
-    assert_eq!(net.receipt("r1"), "expired");
-    // The same conversation coming back finds an empty mailbox.
+    assert_eq!(net.receipt("r1"), "stored", "mail waits out the hold");
+    // A resume registers the same conversation again and its next stop gets the mail.
+    assert_eq!(net.hook("grok", "session-start", "grok-session-start"), "");
+    let out: Value = serde_json::from_str(&net.hook("grok", "stop", "grok-stop")).unwrap();
+    assert_eq!(out, json!({"decision": "block", "reason": frame_of("r1")}));
+    assert_eq!(net.receipt("r1"), "delivered");
+}
+
+fn register(net: &Net, conversation: &str, pid: u32, birth: u64) -> String {
+    net.call(
+        json!({"id": 1, "op": "register", "session": {"provider": "claude",
+        "conversation": conversation, "pid": pid, "birth_micros": birth, "cwd": "/"}}),
+    )["key"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+#[test]
+fn a_session_end_after_the_agent_exited_still_ends_the_session() {
+    let net = Net::new();
+    let key = register(&net, "00000000-0000-4000-8000-0000000000c1", 999_999, 1);
+    // The caller check fails (no agent above the hook), yet the recorded process is gone.
     assert_eq!(
-        net.hook("claude", "session-start", "claude-session-start"),
+        net.hook_as("claude", "session-end", "claude-session-end", false),
         ""
     );
+    let r = net.call(json!({"id": 1, "op": "end", "key": key}));
+    assert_eq!(r["error"], "not_found", "the row was already ended");
+}
+
+#[test]
+fn a_hand_run_session_end_cannot_end_a_live_session() {
+    let net = Net::new();
+    let me = os::process(std::process::id()).unwrap();
+    let key = register(
+        &net,
+        "00000000-0000-4000-8000-0000000000c1",
+        me.pid,
+        me.birth_micros,
+    );
+    assert_eq!(
+        net.hook_as("claude", "session-end", "claude-session-end", false),
+        ""
+    );
+    assert!(net.session(&key).is_some());
+    // The agent itself ending it works.
+    net.hook("claude", "session-end", "claude-session-end");
+    assert!(net.session(&key).is_none());
 }
 
 #[test]

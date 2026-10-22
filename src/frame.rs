@@ -39,7 +39,17 @@ pub fn defang(text: &str) -> String {
 
 /// `person: None` means the sender is the same person as the receiver.
 pub fn peer(from: &Session, person: Option<&str>, request_id: &str, text: &str) -> String {
-    let agent = agent_name(&from.provider);
+    peer_from_provider(&from.provider, person, request_id, text)
+}
+
+/// `peer` when only the sender's provider is known (the sender may be gone).
+pub fn peer_from_provider(
+    provider: &str,
+    person: Option<&str>,
+    request_id: &str,
+    text: &str,
+) -> String {
+    let agent = agent_name(provider);
     let label = match person {
         // Display text: drop characters that could pass for the header's own delimiters.
         Some(p) => {

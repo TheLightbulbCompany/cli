@@ -9,11 +9,11 @@ use crate::{daemon, paths, Result};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
 use std::time::Duration;
 
 /// Debug builds only: `<pid>:<birth_micros>` stands in for the calling agent (tests).
-/// Release builds ignore it.
+/// Compiled out of release builds.
+#[cfg(debug_assertions)]
 pub const CALLER_ENV: &str = "LIGHTBULB_NETWORK_HOOK_CALLER";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,25 +124,30 @@ pub fn run(agent: &str, event: &str, stdin: &str) -> Result<Option<String>> {
     let Some(h) = normalize(agent, event, &serde_json::from_str(stdin)?) else {
         return Ok(None);
     };
-    let me = match calling_agent(agent) {
+    let caller = calling_agent(agent);
+    if h.event == Event::SessionEnd {
+        // The agent may have exited before its SessionEnd hook ran, so the caller check
+        // can fail; then the daemon ends the row only if its recorded process is gone too.
+        daemon::ensure_running()?;
+        let mut conn = Conn::open()?;
+        let short = conn.call("status", json!({}))?["member_key_short"]
+            .as_str()
+            .ok_or("status without member_key_short")?
+            .to_string();
+        let key = crate::sessions::Key::new(&short, h.provider, &h.conversation);
+        let r = conn.call("end", json!({ "key": key, "if_gone": caller.is_err() }))?;
+        if r["ok"] != true && r["error"] != "not_found" {
+            return Err(format!("end: {r}").into());
+        }
+        return Ok(None);
+    }
+    let me = match caller {
         Ok(p) => p,
         Err(CallerError::NotThatAgent) => return Ok(None),
         Err(CallerError::Lookup(e)) => return Err(e.into()),
     };
     daemon::ensure_running()?;
     let mut conn = Conn::open()?;
-    if h.event == Event::SessionEnd {
-        let short = conn.call("status", json!({}))?["member_key_short"]
-            .as_str()
-            .ok_or("status without member_key_short")?
-            .to_string();
-        let key = crate::sessions::Key::new(&short, h.provider, &h.conversation);
-        let r = conn.call("end", json!({ "key": key }))?;
-        if r["ok"] != true && r["error"] != "not_found" {
-            return Err(format!("end: {r}").into());
-        }
-        return Ok(None);
-    }
     let status = match h.event {
         Event::UserPromptSubmit | Event::PostToolUse => "busy",
         _ => "idle",
@@ -173,7 +178,8 @@ pub fn run(agent: &str, event: &str, stdin: &str) -> Result<Option<String>> {
 }
 
 fn calling_agent(agent: &str) -> std::result::Result<Process, CallerError> {
-    if cfg!(debug_assertions) {
+    #[cfg(debug_assertions)]
+    {
         if let Some((pid, birth)) = std::env::var(CALLER_ENV)
             .ok()
             .as_deref()
@@ -183,7 +189,7 @@ fn calling_agent(agent: &str) -> std::result::Result<Process, CallerError> {
             return Ok(Process {
                 pid: pid.parse().map_err(bad)?,
                 birth_micros: birth.parse().map_err(bad)?,
-                executable: PathBuf::new(),
+                executable: std::path::PathBuf::new(),
             });
         }
     }
