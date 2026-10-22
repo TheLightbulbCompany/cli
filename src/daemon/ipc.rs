@@ -6,6 +6,7 @@ use crate::store;
 use crate::{frame, mail};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::Lines;
@@ -77,13 +78,15 @@ pub async fn serve(listener: UnixListener, daemon: Arc<Daemon>) {
 }
 
 async fn connection(stream: UnixStream, mut events: Receiver<Value>, daemon: Arc<Daemon>) {
+    // `None` when the OS will not say: person-only ops then refuse.
+    let peer_pid = crate::os::peer_pid(stream.as_raw_fd()).ok();
     let (read, mut write) = stream.into_split();
     let mut lines = BufReader::new(read).lines();
     let mut subscribed = false;
     loop {
         let (frame, last) = tokio::select! {
             line = lines.next_line() => match line {
-                Ok(Some(line)) => (Some(json!(handle(&line, &daemon, &mut subscribed, &mut lines).await)), false),
+                Ok(Some(line)) => (Some(json!(handle(&line, &daemon, &mut subscribed, &mut lines, peer_pid).await)), false),
                 _ => return,
             },
             event = events.recv() => match event {
@@ -115,6 +118,7 @@ async fn handle(
     daemon: &Arc<Daemon>,
     subscribed: &mut bool,
     peer: &mut Lines<BufReader<OwnedReadHalf>>,
+    peer_pid: Option<u32>,
 ) -> Response {
     let Ok(value) = serde_json::from_str::<Value>(line) else {
         return Response::err(0, BAD_REQUEST);
@@ -125,16 +129,22 @@ async fn handle(
     };
     match req.op.as_str() {
         "ping" => Response::ok(id, json!({})),
-        "status" => Response::ok(
-            id,
-            json!({
-                "version": env!("CARGO_PKG_VERSION"),
-                "protocol": PROTOCOL,
-                "member_key_short": daemon.member_key_short,
-                "team": { "id": daemon.team_id, "name": daemon.team_name },
-                "sessions": live_count(daemon),
-            }),
-        ),
+        "status" => {
+            let team = {
+                let t = daemon.team.lock().unwrap();
+                json!({ "id": t.team_id, "name": t.team_name })
+            };
+            Response::ok(
+                id,
+                json!({
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "protocol": PROTOCOL,
+                    "member_key_short": daemon.identity.short,
+                    "team": team,
+                    "sessions": live_count(daemon),
+                }),
+            )
+        }
         "subscribe" => {
             *subscribed = true;
             Response::ok(id, json!({}))
@@ -181,7 +191,7 @@ async fn handle(
             },
             None => Response::err(id, BAD_REQUEST),
         },
-        _ => Response::err(id, UNKNOWN_OP),
+        op => super::net_ops::handle(id, op, &req.body, daemon, peer_pid),
     }
 }
 
@@ -220,7 +230,7 @@ fn owner_process(daemon: &Daemon, key: &str) -> rusqlite::Result<Option<Proc>> {
         return Ok(Some(p));
     }
     Ok(
-        sessions::scan_claude(&daemon.claude_home, &daemon.member_key_short)
+        sessions::scan_claude(&daemon.claude_home, &daemon.identity.short)
             .into_iter()
             .find(|s| s.key.0 == key)
             .map(|s| (s.pid, s.birth_micros)),
@@ -296,7 +306,7 @@ fn register(id: u64, body: &Value, daemon: &Daemon) -> Response {
         return Response::err(id, BAD_REQUEST);
     };
     let me = caller.unwrap_or((r.pid, r.birth_micros));
-    let key = Key::new(&daemon.member_key_short, &r.provider, &r.conversation);
+    let key = Key::new(&daemon.identity.short, &r.provider, &r.conversation);
     let store = daemon.store.lock().unwrap();
     match row_process(&store, &key.0) {
         Ok(Some(owner)) if owner != me && sessions::alive(owner.0, owner.1) => {
@@ -334,7 +344,7 @@ fn register(id: u64, body: &Value, daemon: &Daemon) -> Response {
 /// A session whose last push failed reads `next_step`: its mail waits for the next step.
 fn live_sessions(daemon: &Daemon) -> Vec<sessions::Session> {
     let rows = daemon.store.lock().unwrap().sessions().unwrap_or_default();
-    let mut all = sessions::all(&rows, &daemon.claude_home, &daemon.member_key_short);
+    let mut all = sessions::all(&rows, &daemon.claude_home, &daemon.identity.short);
     let failed = daemon.push_failed.lock().unwrap();
     for s in &mut all {
         if s.tier == sessions::Tier::Push && failed.contains(&s.key.0) {
@@ -369,7 +379,7 @@ fn send(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
     };
     let reply_to = body["reply_to"].as_str();
     let to = match body["to"].as_str() {
-        Some(t) => match sessions::qualify(&daemon.member_key_short, t) {
+        Some(t) => match sessions::qualify(&daemon.identity.short, t) {
             Some(t) => Some(Key(t)),
             None => return refused(id, "bad_address"),
         },
@@ -468,7 +478,7 @@ async fn inbox(
                         json!({ "id": m.id, "request_id": m.request_id, "from": m.from_key,
                             "to": m.to_key, "kind": m.kind, "thread": m.thread, "hops": m.hops,
                             "text": m.body, "sent_at": m.sent_at,
-                            "framed": frame::framed(frame::Sender::of(&daemon.member_key_short, &m.from_key), None, &m.request_id, &m.body) })
+                            "framed": frame::framed(frame::Sender::of(&daemon.identity.short, &m.from_key), None, &m.request_id, &m.body) })
                     })
                     .collect();
                 return Response::ok(id, json!({ "messages": messages }));

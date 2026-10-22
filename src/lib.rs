@@ -1,9 +1,11 @@
 pub mod agents;
 pub mod cli;
+pub mod config;
 pub mod daemon;
 pub mod doing;
 pub mod frame;
 pub mod hook;
+pub mod identity;
 pub mod mail;
 pub mod mcp;
 pub mod os;

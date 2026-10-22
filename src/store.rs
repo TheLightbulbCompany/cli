@@ -1,7 +1,11 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
-const SCHEMA: &str = "
+/// Migration `i` takes the db to `user_version` `i + 1`. Forward only; each one only adds
+/// tables, so it is safe to run again.
+const MIGRATIONS: &[&str] = &[V1, V2];
+
+const V1: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
     key TEXT PRIMARY KEY, provider TEXT, conversation TEXT, pid INTEGER,
     birth_micros INTEGER, cwd TEXT, title TEXT, status TEXT, seen_at INTEGER, executable TEXT
@@ -21,7 +25,45 @@ CREATE TABLE IF NOT EXISTS mailbox (
 CREATE TABLE IF NOT EXISTS team (
     id TEXT PRIMARY KEY, name TEXT, founder_key TEXT, created_at INTEGER
 );
-PRAGMA user_version = 1;
+";
+
+/// The network tables. `team_link` holds the current team link secret (`team.link_secret`).
+const V2: &str = "
+CREATE TABLE IF NOT EXISTS roster (hash TEXT PRIMARY KEY, entry TEXT, received_at INTEGER);
+CREATE TABLE IF NOT EXISTS team_link (
+    ticket_id TEXT PRIMARY KEY, secret TEXT, secret_hash TEXT, mode TEXT, once INTEGER,
+    expires_at INTEGER, used_by TEXT
+);
+CREATE TABLE IF NOT EXISTS join_requests (
+    id INTEGER PRIMARY KEY, ticket_id TEXT, inviter TEXT, candidate TEXT, name TEXT,
+    computer TEXT, kind TEXT, proof TEXT, via TEXT, created_at INTEGER, state TEXT
+);
+CREATE TABLE IF NOT EXISTS peers_sessions (
+    member TEXT PRIMARY KEY, seq INTEGER, presence TEXT, seen_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS outbox (
+    message_id TEXT PRIMARY KEY, to_member TEXT, frame TEXT, attempts INTEGER,
+    next_at INTEGER, created_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS receipt_out (
+    member TEXT, envelope_id TEXT, state TEXT, reason TEXT, PRIMARY KEY (member, envelope_id)
+);
+CREATE TABLE IF NOT EXISTS seen_ids (
+    sender TEXT, envelope_id TEXT, state TEXT, seen_at INTEGER, PRIMARY KEY (sender, envelope_id)
+);
+CREATE TABLE IF NOT EXISTS holds (
+    id INTEGER PRIMARY KEY, message_id TEXT, target_session TEXT, from_session TEXT,
+    from_member TEXT, created_at INTEGER, state TEXT
+);
+CREATE TABLE IF NOT EXISTS policy (
+    scope TEXT, person_id TEXT, value TEXT, set_by TEXT, updated_at INTEGER,
+    PRIMARY KEY (scope, person_id)
+);
+CREATE TABLE IF NOT EXISTS approvals (
+    hold_id INTEGER, verdict TEXT, scope TEXT, \"by\" TEXT, nonce TEXT UNIQUE,
+    decided_at INTEGER, record TEXT
+);
+CREATE TABLE IF NOT EXISTS grants (grant_id TEXT PRIMARY KEY, \"grant\" TEXT, expires_at INTEGER);
 ";
 
 #[derive(Debug, Clone, PartialEq)]
@@ -73,9 +115,24 @@ pub struct Store {
 }
 
 impl Store {
-    pub fn open(path: &Path) -> rusqlite::Result<Store> {
+    /// Opens `path`, migrating it forward; refuses a db written by a newer version.
+    pub fn open(path: &Path) -> crate::Result<Store> {
         let conn = Connection::open(path)?;
-        conn.execute_batch(SCHEMA)?;
+        let version: usize = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version > MIGRATIONS.len() {
+            return Err(format!(
+                "State is from a newer version (v{version}). Install {} or later.",
+                env!("CARGO_PKG_VERSION")
+            )
+            .into());
+        }
+        for (i, m) in MIGRATIONS.iter().enumerate().skip(version) {
+            // One transaction: `user_version` moves only once all of it ran.
+            conn.execute_batch(&format!(
+                "BEGIN; {m} PRAGMA user_version = {}; COMMIT;",
+                i + 1
+            ))?;
+        }
         Ok(Store { conn })
     }
 
@@ -216,5 +273,66 @@ mod tests {
         store.put_message(&message).unwrap();
         assert_eq!(store.message("m1").unwrap(), Some(message));
         assert_eq!(store.message("missing").unwrap(), None);
+    }
+
+    fn user_version(path: &Path) -> i64 {
+        Connection::open(path)
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn v1_db_migrates_to_v2_adding_tables_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(MIGRATIONS[0]).unwrap();
+            conn.execute_batch(
+                "INSERT INTO messages (id, request_id, from_key, to_key, body, sent_at)
+                 VALUES ('m1', 'r1', 'a', 'b', 'hello', 9);
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+        }
+        let message = Message {
+            id: "m1".into(),
+            request_id: "r1".into(),
+            from_key: "a".into(),
+            to_key: "b".into(),
+            kind: "message".into(),
+            thread: None,
+            hops: 0,
+            origin: None,
+            body: "hello".into(),
+            sent_at: 9,
+        };
+        Store::open(&path).unwrap();
+        let store = Store::open(&path).unwrap();
+        assert_eq!(user_version(&path), 2);
+        assert_eq!(store.message("m1").unwrap(), Some(message));
+        let holds: i64 = store
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'holds'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(holds, 1);
+    }
+
+    #[test]
+    fn newer_db_refuses_to_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("PRAGMA user_version = 9;")
+            .unwrap();
+        let err = Store::open(&path).err().unwrap().to_string();
+        assert!(err.contains("State is from a newer version (v9)"), "{err}");
+        assert_eq!(user_version(&path), 9);
     }
 }

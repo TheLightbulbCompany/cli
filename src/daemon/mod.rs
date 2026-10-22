@@ -1,15 +1,16 @@
 pub mod ipc;
+pub mod net_ops;
 
 use crate::agents::{claude, codex};
+use crate::config::Config;
+use crate::identity::Identity;
 use crate::sessions::{self, Key, Tier};
 use crate::{cli, frame, mail, paths, store::Store, Result};
-use data_encoding::BASE32_NOPAD;
-use ed25519_dalek::SigningKey;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions, Permissions};
 use std::io::{BufRead, BufReader, ErrorKind, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -19,12 +20,19 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::UnixListener;
 use tokio::sync::{broadcast, Notify};
 
+/// The team this computer is in, and its settings: replaced at runtime (join, leave, reload).
+pub struct TeamState {
+    pub team_id: String,
+    pub team_name: String,
+    pub heads: Vec<String>,
+    pub config: Config,
+}
+
 /// What every connection handler shares.
 pub struct Daemon {
     pub store: Mutex<Store>,
-    pub member_key_short: String,
-    pub team_id: String,
-    pub team_name: String,
+    pub identity: Identity,
+    pub team: Mutex<TeamState>,
     /// Where Claude Code's `.claude/` lives: `$LIGHTBULB_NETWORK_CLAUDE_HOME`, else the home dir.
     pub claude_home: PathBuf,
     /// Pushed to every `subscribe`d connection as `{"event": ...}` frames.
@@ -58,7 +66,7 @@ impl Daemon {
 /// send, or handed over by the next hook.
 pub async fn deliver(daemon: Arc<Daemon>, to: Key) {
     let rows = daemon.store.lock().unwrap().sessions().unwrap_or_default();
-    let Some(session) = sessions::all(&rows, &daemon.claude_home, &daemon.member_key_short)
+    let Some(session) = sessions::all(&rows, &daemon.claude_home, &daemon.identity.short)
         .into_iter()
         .find(|s| s.key == to && s.tier == Tier::Push)
     else {
@@ -72,7 +80,7 @@ pub async fn deliver(daemon: Arc<Daemon>, to: Key) {
         let Some(m) = next.ok().and_then(|w| w.into_iter().next()) else {
             return;
         };
-        let sender = frame::Sender::of(&daemon.member_key_short, &m.from_key);
+        let sender = frame::Sender::of(&daemon.identity.short, &m.from_key);
         let framed = frame::framed(sender, None, &m.request_id, &m.body);
         let pushed = match session.provider.as_str() {
             "claude" => claude::push(&session, &framed).await,
@@ -110,15 +118,11 @@ pub async fn run(dir: &Path) -> Result<()> {
     lock.set_len(0)?;
     writeln!(lock, "{}", std::process::id())?;
 
-    let public = identity(dir)?;
-    let team_key = BASE32_NOPAD.encode(&public).to_lowercase();
+    let identity = Identity::load_or_create(dir)?;
+    let config = Config::load(dir)?;
     let store = Store::open(&dir.join("state.db"))?;
-    let user = std::env::var("USER")
-        .ok()
-        .filter(|u| !u.is_empty())
-        .unwrap_or_else(|| "me".into());
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
-    let (team_id, team_name) = store.ensure_team(&team_key, &user, now)?;
+    let (team_id, team_name) = store.ensure_team(&identity.key, &user_name(), now)?;
 
     // We hold the lock, so any socket file left behind is stale.
     let sock = dir.join(paths::SOCKET);
@@ -132,9 +136,13 @@ pub async fn run(dir: &Path) -> Result<()> {
 
     let daemon = Arc::new(Daemon {
         store: Mutex::new(store),
-        member_key_short: team_key[..12].to_string(),
-        team_id,
-        team_name,
+        identity,
+        team: Mutex::new(TeamState {
+            team_id,
+            team_name,
+            heads: vec![],
+            config,
+        }),
         claude_home: std::env::var_os("LIGHTBULB_NETWORK_CLAUDE_HOME")
             .map(PathBuf::from)
             .or_else(dirs::home_dir)
@@ -150,35 +158,12 @@ pub async fn run(dir: &Path) -> Result<()> {
     Ok(()) // `lock` drops here, after the socket is gone.
 }
 
-/// Loads `identity.key` (a raw 32-byte Ed25519 secret), creating it 0600 on
-/// first run. Returns the public key.
-fn identity(dir: &Path) -> Result<[u8; 32]> {
-    let path = dir.join("identity.key");
-    let key = match fs::read(&path) {
-        Ok(bytes) => SigningKey::from_bytes(
-            &bytes
-                .try_into()
-                .map_err(|_| "identity.key is not 32 bytes")?,
-        ),
-        Err(e) if e.kind() == ErrorKind::NotFound => {
-            // Write then rename, so a crash never leaves a truncated key.
-            // We hold the lock, so a leftover .tmp is ours to replace.
-            let tmp = dir.join("identity.key.tmp");
-            let _ = fs::remove_file(&tmp);
-            let key = SigningKey::generate(&mut rand::rngs::OsRng);
-            let mut f = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&tmp)?;
-            f.write_all(&key.to_bytes())?;
-            f.sync_all()?;
-            fs::rename(&tmp, &path)?;
-            key
-        }
-        Err(e) => return Err(e.into()),
-    };
-    Ok(key.verifying_key().to_bytes())
+/// This person's name: `$USER`, else `me`.
+pub fn user_name() -> String {
+    std::env::var("USER")
+        .ok()
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| "me".into())
 }
 
 /// Makes sure a daemon is listening on this user's socket, starting one if not. When the

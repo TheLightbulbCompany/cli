@@ -14,7 +14,11 @@ pub struct Process {
 
 /// The parent of `pid`.
 pub fn parent(pid: u32) -> Result<Process> {
-    process(imp::info(pid)?.ppid)
+    process(parent_pid(pid)?)
+}
+
+pub fn parent_pid(pid: u32) -> Result<u32> {
+    Ok(imp::info(pid)?.ppid)
 }
 
 pub fn process(pid: u32) -> Result<Process> {
