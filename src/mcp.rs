@@ -14,26 +14,28 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::io::Read;
 use std::path::Path;
+use std::sync::OnceLock;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 /// Runs the server on stdin/stdout until the client closes it.
 pub fn run() -> crate::Result<()> {
     daemon::ensure_running()?;
-    let me = hook::calling_agent(None).ok();
     tokio::runtime::Runtime::new()?.block_on(async {
-        Server { me }
-            .serve(rmcp::transport::stdio())
-            .await?
-            .waiting()
-            .await?;
+        Server {
+            me: OnceLock::new(),
+        }
+        .serve(rmcp::transport::stdio())
+        .await?
+        .waiting()
+        .await?;
         Ok(())
     })
 }
 
 struct Server {
-    /// The agent process above this server; `None` when there is no agent above it.
-    me: Option<Process>,
+    /// The agent process above this server, once a call has found it.
+    me: OnceLock<Process>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -212,8 +214,13 @@ fn record(s: &Session, from: &Key, person: &str, computer: &str) -> Value {
 impl Server {
     /// Resolves the calling session, or the error result the tool returns instead.
     async fn source(&self, meta: RequestMetaObject) -> Result<Call, CallToolResult> {
-        let Some(me) = self.me.clone() else {
-            return Err(code("source_unidentified"));
+        // Looked up on each call until found: the agent may not be above us yet at startup.
+        let me = match self.me.get() {
+            Some(p) => p.clone(),
+            None => match hook::calling_agent(None) {
+                Ok(p) => self.me.get_or_init(|| p).clone(),
+                Err(_) => return Err(code("source_unidentified")),
+            },
         };
         let r = ask("sessions", json!({}))
             .await
