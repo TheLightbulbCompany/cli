@@ -384,3 +384,30 @@ fn inbox_from_another_process_is_refused() {
         "caller": {"pid": other.1.pid, "birth_micros": other.1.birth_micros}}));
     assert_eq!(r["messages"][0]["text"], "body r1");
 }
+
+#[test]
+fn a_discovered_claude_session_drains_its_own_inbox() {
+    let net = Net::new();
+    let me = os::process(std::process::id()).unwrap();
+    let dir = net.claude.path().join(".claude/sessions");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join(format!("{}.json", me.pid)),
+        json!({"pid": me.pid, "sessionId": "found-only", "cwd": "/tmp",
+            "startedAt": me.birth_micros / 1000})
+        .to_string(),
+    )
+    .unwrap();
+    let key = net.key("claude", "found-only");
+    net.send(&key, "hello", "r1");
+
+    // Never registered: the owner is the discovered session's process.
+    let r = net.call(json!({"id": 1, "op": "inbox", "key": key,
+        "caller": {"pid": me.pid, "birth_micros": me.birth_micros}}));
+    assert_eq!(r["messages"][0]["text"], "hello", "{r}");
+    assert_eq!(net.receipt("r1"), "delivered");
+    // Someone else is still refused.
+    let r = net.call(json!({"id": 1, "op": "inbox", "key": key,
+        "caller": {"pid": me.pid, "birth_micros": 1}}));
+    assert_eq!(r["reason"], "not_owner", "{r}");
+}

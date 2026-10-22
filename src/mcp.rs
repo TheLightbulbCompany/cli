@@ -12,7 +12,8 @@ use rmcp::{tool, tool_handler, tool_router, ServerHandler, ServiceExt};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::path::Path;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
@@ -70,9 +71,13 @@ struct ReceiptArgs {
     request_id: String,
 }
 
+/// The longest one `check_inbox` call waits: clients such as Codex time a tool out at 60 s.
+const WAIT_CAP_S: u32 = 30;
+
 #[derive(Deserialize, JsonSchema)]
 struct InboxArgs {
-    /// Wait up to this many seconds (at most 600) for a message to arrive.
+    /// Wait up to this many seconds for a message to arrive. Accepts up to 600, but one call
+    /// waits at most 30 (clients time tool calls out); call again to keep waiting.
     #[serde(default)]
     wait_secs: u32,
 }
@@ -119,24 +124,49 @@ async fn ask(op: &str, mut body: Value) -> crate::Result<Value> {
     Ok(serde_json::from_str(&line)?)
 }
 
+/// A file's text, at most 64 KiB of it.
+fn read_capped(p: &Path) -> Option<String> {
+    let mut text = String::new();
+    std::fs::File::open(p)
+        .ok()?
+        .take(64 * 1024)
+        .read_to_string(&mut text)
+        .ok()?;
+    Some(text)
+}
+
+/// `p` resolved, when it lies inside `root` (already canonical).
+fn inside(root: &Path, p: &Path) -> Option<PathBuf> {
+    let p = p.canonicalize().ok()?;
+    p.starts_with(root).then_some(p)
+}
+
 /// Origin's repo name (the URL's last path segment) and the checked-out branch, from
-/// `<cwd>/.git` (a directory, or a worktree's `gitdir:` file).
+/// `<cwd>/.git`: a directory, or a `gitdir:` file pointing inside `cwd`. A symlinked `.git`,
+/// or one pointing outside `cwd`, is not followed.
 fn git(cwd: &str) -> (Option<String>, Option<String>) {
-    let cwd = Path::new(cwd);
+    git_in(Path::new(cwd)).unwrap_or_default()
+}
+
+fn git_in(cwd: &Path) -> Option<(Option<String>, Option<String>)> {
+    let cwd = cwd.canonicalize().ok()?;
     let dot = cwd.join(".git");
-    let dir = match std::fs::read_to_string(&dot) {
-        Ok(f) => match f.trim().strip_prefix("gitdir:") {
-            Some(d) => cwd.join(d.trim()),
-            None => return (None, None),
-        },
-        Err(_) => dot,
+    let kind = std::fs::symlink_metadata(&dot).ok()?.file_type();
+    let dir = if kind.is_dir() {
+        dot
+    } else if kind.is_file() {
+        let d = read_capped(&dot)?;
+        inside(&cwd, &cwd.join(d.trim().strip_prefix("gitdir:")?.trim()))?
+    } else {
+        return None;
     };
-    let branch = std::fs::read_to_string(dir.join("HEAD"))
-        .ok()
+    let branch = read_capped(&dir.join("HEAD"))
         .and_then(|h| Some(h.trim().strip_prefix("ref: refs/heads/")?.to_string()));
-    let common =
-        std::fs::read_to_string(dir.join("commondir")).map_or(dir.clone(), |c| dir.join(c.trim()));
-    let config = std::fs::read_to_string(common.join("config")).unwrap_or_default();
+    let common = match read_capped(&dir.join("commondir")) {
+        Some(c) => inside(&cwd, &dir.join(c.trim()))?,
+        None => dir,
+    };
+    let config = read_capped(&common.join("config")).unwrap_or_default();
     let mut origin = false;
     let mut repo = None;
     for line in config.lines().map(str::trim) {
@@ -156,7 +186,7 @@ fn git(cwd: &str) -> (Option<String>, Option<String>) {
             }
         }
     }
-    (repo, branch)
+    Some((repo, branch))
 }
 
 fn record(s: &Session, from: &Key, person: &str, computer: &str) -> Value {
@@ -269,8 +299,7 @@ impl Server {
         let r = ask(
             "send",
             json!({ "from": call.from, "to": a.session_id, "text": a.text,
-                "request_id": a.request_id, "reply_to": a.reply_to,
-                "caller": hook::proc_json(&call.me) }),
+                "request_id": a.request_id, "reply_to": a.reply_to }),
         )
         .await;
         match r {
@@ -303,7 +332,8 @@ impl Server {
         }
     }
 
-    /// Takes the messages waiting for this session, first waiting up to wait_secs for one.
+    /// Takes the messages waiting for this session, first waiting up to wait_secs (at most 30
+    /// per call) for one. Each message has its raw text and, in framed, the text as delivered.
     #[tool]
     async fn check_inbox(
         &self,
@@ -319,7 +349,7 @@ impl Server {
         }
         let r = ask(
             "inbox",
-            json!({ "key": call.from, "wait_secs": a.wait_secs,
+            json!({ "key": call.from, "wait_secs": a.wait_secs.min(WAIT_CAP_S),
                 "caller": hook::proc_json(&call.me) }),
         )
         .await;
@@ -333,7 +363,7 @@ impl Server {
                     .map(|m| {
                         json!({ "id": m["id"], "request_id": m["request_id"],
                             "thread": m["thread"], "from": m["from"],
-                            "text": m["framed"], "sent_at": m["sent_at"] })
+                            "text": m["text"], "framed": m["framed"], "sent_at": m["sent_at"] })
                     })
                     .collect();
                 Self::done(&call, json!({ "messages": messages })).await
@@ -356,7 +386,7 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn git_reads_origin_repo_and_branch_also_from_a_worktree() {
+    fn git_reads_origin_repo_and_branch_and_stays_inside_cwd() {
         let d = tempfile::tempdir().unwrap();
         let main = d.path().join("main");
         fs::create_dir_all(main.join(".git/worktrees/wt")).unwrap();
@@ -366,22 +396,43 @@ mod tests {
             "[remote \"upstream\"]\n\turl = x/other.git\n[remote \"origin\"]\n\turl = git@github.com:Org/lightbulb-network.git\n",
         )
         .unwrap();
-        let wt = d.path().join("wt");
-        fs::create_dir_all(&wt).unwrap();
-        fs::write(wt.join(".git"), "gitdir: ../main/.git/worktrees/wt\n").unwrap();
+        let name = Some("lightbulb-network".to_string());
+        assert_eq!(
+            git(main.to_str().unwrap()),
+            (name.clone(), Some("init".into()))
+        );
+        assert_eq!(git(d.path().to_str().unwrap()), (None, None));
+
+        // A gitdir inside cwd is followed, with its commondir.
+        fs::create_dir_all(main.join("sub")).unwrap();
+        fs::write(main.join("sub/.git"), "gitdir: ../.git/worktrees/wt\n").unwrap();
         fs::write(
             main.join(".git/worktrees/wt/HEAD"),
             "ref: refs/heads/feat/x\n",
         )
         .unwrap();
         fs::write(main.join(".git/worktrees/wt/commondir"), "../..\n").unwrap();
-
-        let name = Some("lightbulb-network".to_string());
         assert_eq!(
-            git(main.to_str().unwrap()),
-            (name.clone(), Some("init".into()))
+            git(main.join("sub").to_str().unwrap()),
+            (None, None),
+            "points outside sub"
         );
-        assert_eq!(git(wt.to_str().unwrap()), (name, Some("feat/x".into())));
-        assert_eq!(git(d.path().to_str().unwrap()), (None, None));
+
+        // One pointing outside cwd, or a symlinked .git, is not.
+        let wt = d.path().join("wt");
+        fs::create_dir_all(&wt).unwrap();
+        fs::write(wt.join(".git"), "gitdir: ../main/.git/worktrees/wt\n").unwrap();
+        assert_eq!(git(wt.to_str().unwrap()), (None, None));
+        let linked = d.path().join("linked");
+        fs::create_dir_all(&linked).unwrap();
+        std::os::unix::fs::symlink(main.join(".git"), linked.join(".git")).unwrap();
+        assert_eq!(git(linked.to_str().unwrap()), (None, None));
+
+        // Inside: a nested repo's own gitdir file.
+        let own = d.path().join("own");
+        fs::create_dir_all(own.join("meta")).unwrap();
+        fs::write(own.join("meta/HEAD"), "ref: refs/heads/b\n").unwrap();
+        fs::write(own.join(".git"), "gitdir: meta\n").unwrap();
+        assert_eq!(git(own.to_str().unwrap()), (None, Some("b".into())));
     }
 }

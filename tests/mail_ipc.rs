@@ -135,3 +135,43 @@ async fn shutdown_ends_a_waiting_inbox_promptly() {
         (json!(true), json!([]))
     );
 }
+
+#[tokio::test]
+async fn mail_arriving_after_a_waiting_inbox_hung_up_stays_in_the_mailbox() {
+    let dir = tempfile::tempdir().unwrap();
+    let claude_home = tempfile::tempdir().unwrap();
+    std::env::set_var("LIGHTBULB_NETWORK_CLAUDE_HOME", claude_home.path());
+    let home = dir.path().to_path_buf();
+    tokio::spawn(async move { daemon::run(&home).await.unwrap() });
+    let sock = dir.path().join(paths::SOCKET);
+    let (mut l, mut w) = connect(&sock).await;
+    let key = "x/codex:gone-reader";
+
+    // A reader waits, then hangs up before anything arrives.
+    let (l2, mut w2) = connect(&sock).await;
+    let req = json!({"id": 1, "op": "inbox", "key": key, "wait_secs": 30});
+    w2.write_all(format!("{req}\n").as_bytes()).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    drop((l2, w2));
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let sent = call(
+        &mut l,
+        &mut w,
+        json!({"id": 2, "op": "send", "from": "x/claude:a", "to": key, "text": "kept",
+            "request_id": "r1"}),
+    )
+    .await;
+    assert_eq!(sent["receipt"]["state"], "stored", "{sent}");
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let (mut l3, mut w3) = connect(&sock).await;
+    let got = call(
+        &mut l3,
+        &mut w3,
+        json!({"id": 3, "op": "inbox", "key": key}),
+    )
+    .await;
+    assert_eq!(got["messages"][0]["text"], "kept", "{got}");
+    call(&mut l, &mut w, json!({"id": 4, "op": "shutdown"})).await;
+}

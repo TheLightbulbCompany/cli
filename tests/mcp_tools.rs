@@ -250,8 +250,12 @@ fn check_inbox_waits_until_mail_arrives() {
         let msg = &msgs[0];
         assert_eq!(msg["request_id"], "r9");
         assert_eq!(msg["from"], "x/codex:a");
-        assert!(msg["text"].as_str().unwrap().contains("late news"), "{msg}");
-        assert!(msg["text"].as_str().unwrap().contains("reply_to=\"r9\""));
+        assert_eq!(msg["text"], "late news", "{msg}");
+        let framed = msg["framed"].as_str().unwrap();
+        assert!(
+            framed.contains("late news") && framed.contains("reply_to=\"r9\""),
+            "{msg}"
+        );
         for f in ["id", "thread", "sent_at"] {
             assert!(!msg[f].is_null(), "{f} missing: {msg}");
         }

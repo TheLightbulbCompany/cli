@@ -8,7 +8,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::io::Lines;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::unix::OwnedReadHalf;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast::{error::RecvError, Receiver};
 use tokio::task::JoinSet;
@@ -81,7 +83,7 @@ async fn connection(stream: UnixStream, mut events: Receiver<Value>, daemon: Arc
     loop {
         let (frame, last) = tokio::select! {
             line = lines.next_line() => match line {
-                Ok(Some(line)) => (Some(json!(handle(&line, &daemon, &mut subscribed).await)), false),
+                Ok(Some(line)) => (Some(json!(handle(&line, &daemon, &mut subscribed, &mut lines).await)), false),
                 _ => return,
             },
             event = events.recv() => match event {
@@ -108,7 +110,12 @@ async fn connection(stream: UnixStream, mut events: Receiver<Value>, daemon: Arc
     }
 }
 
-async fn handle(line: &str, daemon: &Daemon, subscribed: &mut bool) -> Response {
+async fn handle(
+    line: &str,
+    daemon: &Daemon,
+    subscribed: &mut bool,
+    peer: &mut Lines<BufReader<OwnedReadHalf>>,
+) -> Response {
     let Ok(value) = serde_json::from_str::<Value>(line) else {
         return Response::err(0, BAD_REQUEST);
     };
@@ -153,7 +160,7 @@ async fn handle(line: &str, daemon: &Daemon, subscribed: &mut bool) -> Response 
             }
             _ => Response::err(id, BAD_REQUEST),
         },
-        "inbox" => inbox(id, &req.body, daemon).await,
+        "inbox" => inbox(id, &req.body, daemon, peer).await,
         // `unread {key}` -> `{unread}`: how many messages wait for `key`; takes nothing.
         "unread" => match req.body["key"].as_str() {
             Some(key) => match mail::unread(&daemon.store.lock().unwrap(), &Key(key.into()), now())
@@ -163,7 +170,6 @@ async fn handle(line: &str, daemon: &Daemon, subscribed: &mut bool) -> Response 
             },
             None => Response::err(id, BAD_REQUEST),
         },
-        "tool" => Response::err(id, UNSUPPORTED),
         _ => Response::err(id, UNKNOWN_OP),
     }
 }
@@ -194,6 +200,20 @@ fn row_process(store: &store::Store, key: &str) -> rusqlite::Result<Option<Proc>
             u64::try_from(s.birth_micros?).ok()?,
         ))
     }))
+}
+
+/// The process a key belongs to: its stored row's, else (never registered) the Claude
+/// session discovered under that key.
+fn owner_process(daemon: &Daemon, key: &str) -> rusqlite::Result<Option<Proc>> {
+    if let Some(p) = row_process(&daemon.store.lock().unwrap(), key)? {
+        return Ok(Some(p));
+    }
+    Ok(
+        sessions::scan_claude(&daemon.claude_home, &daemon.member_key_short)
+            .into_iter()
+            .find(|s| s.key.0 == key)
+            .map(|s| (s.pid, s.birth_micros)),
+    )
 }
 
 fn refused(id: u64, reason: &str) -> Response {
@@ -357,13 +377,18 @@ fn provider_of(key: &str) -> &str {
 /// is shown it (`frame::peer_from_provider`): takes (and so delivers) what waits for `key`;
 /// with `wait_secs` (at most 600) it first waits for something to arrive. With `caller`, only
 /// the row's own process may take it (`bad_request`, reason `not_owner`, otherwise).
-async fn inbox(id: u64, body: &Value, daemon: &Daemon) -> Response {
+async fn inbox(
+    id: u64,
+    body: &Value,
+    daemon: &Daemon,
+    peer: &mut Lines<BufReader<OwnedReadHalf>>,
+) -> Response {
     let (Some(key), Ok(caller)) = (body["key"].as_str().map(|k| Key(k.into())), caller(body))
     else {
         return Response::err(id, BAD_REQUEST);
     };
     if let Some(c) = caller {
-        match row_process(&daemon.store.lock().unwrap(), &key.0) {
+        match owner_process(daemon, &key.0) {
             Ok(Some(owner)) if owner == c => {}
             Ok(_) => return refused(id, "not_owner"),
             Err(_) => return Response::err(id, INTERNAL),
@@ -378,6 +403,9 @@ async fn inbox(id: u64, body: &Value, daemon: &Daemon) -> Response {
     };
     let deadline = tokio::time::Instant::now() + Duration::from_secs(wait);
     let mut events = daemon.events.subscribe();
+    // Watch the peer for EOF while waiting, so mail that arrives after it hung up stays in
+    // the mailbox. Bytes it sent meanwhile stay buffered for the next request.
+    let mut watch_peer = true;
     loop {
         // Register interest before looking, so a send between the look and the wait is not missed.
         let notified = daemon.mail.notified();
@@ -400,10 +428,18 @@ async fn inbox(id: u64, body: &Value, daemon: &Daemon) -> Response {
             }
             Ok(_) => {}
         }
-        // Wake on mail, the deadline, or shutdown (so this connection can say goodbye).
+        // Wake on mail, the deadline, shutdown (so this connection can say goodbye), or the
+        // peer hanging up (then take nothing: there is no one to hand it to).
         let woke = tokio::select! {
-            r = tokio::time::timeout_at(deadline, notified) => r.is_ok(),
+            r = tokio::time::timeout_at(deadline, &mut notified) => r.is_ok(),
             _ = async { while !matches!(events.recv().await, Ok(e) if e["event"] == "shutdown") {} } => false,
+            buf = peer.get_mut().fill_buf(), if watch_peer => match buf {
+                Ok(b) if !b.is_empty() => {
+                    watch_peer = false;
+                    continue;
+                }
+                _ => false,
+            },
         };
         if !woke {
             return Response::ok(id, json!({ "messages": [] }));
