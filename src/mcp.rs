@@ -124,14 +124,20 @@ async fn ask(op: &str, mut body: Value) -> crate::Result<Value> {
     Ok(serde_json::from_str(&line)?)
 }
 
-/// A file's text, at most 64 KiB of it.
+/// A regular file's text, at most 64 KiB of it. Opened non-blocking, so a FIFO (or any
+/// other special file) planted under a name is refused, never waited on.
 fn read_capped(p: &Path) -> Option<String> {
-    let mut text = String::new();
-    std::fs::File::open(p)
-        .ok()?
-        .take(64 * 1024)
-        .read_to_string(&mut text)
+    use std::os::unix::fs::OpenOptionsExt;
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(p)
         .ok()?;
+    if !f.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut text = String::new();
+    f.take(64 * 1024).read_to_string(&mut text).ok()?;
     Some(text)
 }
 
@@ -411,5 +417,20 @@ mod tests {
         fs::create_dir_all(&linked).unwrap();
         std::os::unix::fs::symlink(main.join(".git"), linked.join(".git")).unwrap();
         assert_eq!(git(linked.to_str().unwrap()), (None, None));
+    }
+
+    #[test]
+    fn a_fifo_named_head_does_not_block() {
+        let d = tempfile::tempdir().unwrap();
+        fs::create_dir_all(d.path().join(".git")).unwrap();
+        let head = std::ffi::CString::new(d.path().join(".git/HEAD").to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(head.as_ptr(), 0o600) }, 0);
+        let cwd = d.path().to_str().unwrap().to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(git(&cwd)).unwrap());
+        let got = rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("git() blocked on a FIFO");
+        assert_eq!(got, (None, None));
     }
 }
