@@ -313,13 +313,38 @@ pub fn send(
 
 /// The messages waiting for `to`, oldest first; each becomes `delivered` and leaves the mailbox.
 pub fn take(store: &Store, to: &Key, now: u64) -> Result<Vec<Message>> {
+    take_where(store, to, None, now)
+}
+
+/// `take` for the one message `message_id`; `None` when it no longer waits.
+pub fn take_one(store: &Store, to: &Key, message_id: &str, now: u64) -> Result<Option<Message>> {
+    Ok(take_where(store, to, Some(message_id), now)?.pop())
+}
+
+/// The messages waiting for `to`, oldest first, left where they are.
+pub fn waiting(store: &Store, to: &Key, now: u64) -> Result<Vec<Message>> {
+    let mut stmt = store.conn().prepare(
+        "SELECT message_id FROM mailbox WHERE to_key = ?1 AND expires_at >= ?2 ORDER BY id",
+    )?;
+    let ids = stmt.query_map(params![to.0, now as i64], |r| r.get::<_, String>(0))?;
+    let mut out = vec![];
+    for id in ids {
+        out.extend(store.message(&id?)?);
+    }
+    Ok(out)
+}
+
+fn take_where(store: &Store, to: &Key, only: Option<&str>, now: u64) -> Result<Vec<Message>> {
     let conn = store.conn();
     let tx = conn.unchecked_transaction()?;
     let rows: Vec<(i64, String)> = {
         let mut stmt = tx.prepare(
-            "SELECT id, message_id FROM mailbox WHERE to_key = ?1 AND expires_at >= ?2 ORDER BY id",
+            "SELECT id, message_id FROM mailbox WHERE to_key = ?1 AND expires_at >= ?2 \
+             AND (?3 IS NULL OR message_id = ?3) ORDER BY id",
         )?;
-        let rows = stmt.query_map(params![to.0, now as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let rows = stmt.query_map(params![to.0, now as i64, only], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?;
         rows.collect::<rusqlite::Result<_>>()?
     };
     let mut out = vec![];

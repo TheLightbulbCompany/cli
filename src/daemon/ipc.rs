@@ -112,7 +112,7 @@ async fn connection(stream: UnixStream, mut events: Receiver<Value>, daemon: Arc
 
 async fn handle(
     line: &str,
-    daemon: &Daemon,
+    daemon: &Arc<Daemon>,
     subscribed: &mut bool,
     peer: &mut Lines<BufReader<OwnedReadHalf>>,
 ) -> Response {
@@ -329,14 +329,15 @@ fn live_count(daemon: &Daemon) -> usize {
     live_sessions(daemon).len()
 }
 
-fn now() -> u64 {
+pub(super) fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
 }
 
-/// `send {from, to, text, request_id, reply_to?}` -> `{receipt}`.
-fn send(id: u64, body: &Value, daemon: &Daemon) -> Response {
+/// `send {from, to, text, request_id, reply_to?}` -> `{receipt}`. Mail for a Claude or Codex
+/// session is then pushed into it (`super::deliver`), if its tier is `push`.
+fn send(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
     let (Some(from), Some(to), Some(text), Some(rid)) = (
         body["from"].as_str(),
         body["to"].as_str(),
@@ -359,6 +360,9 @@ fn send(id: u64, body: &Value, daemon: &Daemon) -> Response {
         Ok(receipt) => {
             if receipt.state == mail::State::Stored {
                 daemon.mail.notify_waiters();
+                if matches!(provider_of(to), "claude" | "codex") {
+                    tokio::spawn(super::deliver(daemon.clone(), Key(to.into())));
+                }
             }
             Response::ok(id, json!({ "receipt": receipt }))
         }
@@ -367,7 +371,7 @@ fn send(id: u64, body: &Value, daemon: &Daemon) -> Response {
 }
 
 /// The provider in a key (`<member>/<provider>:<conversation>`); `unknown` when malformed.
-fn provider_of(key: &str) -> &str {
+pub(super) fn provider_of(key: &str) -> &str {
     key.split_once('/')
         .and_then(|(_, rest)| rest.split_once(':'))
         .map_or("unknown", |(p, _)| p)
@@ -411,7 +415,12 @@ async fn inbox(
         let notified = daemon.mail.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
-        let taken = mail::take(&daemon.store.lock().unwrap(), &key, now());
+        // Under the key's lock, so a push in flight is not delivered twice.
+        let taken = {
+            let lock = daemon.key_lock(&key.0);
+            let _held = lock.lock().await;
+            mail::take(&daemon.store.lock().unwrap(), &key, now())
+        };
         match taken {
             Err(_) => return Response::err(id, INTERNAL),
             Ok(m) if !m.is_empty() => {

@@ -37,6 +37,11 @@ pub fn hostname() -> String {
     String::from_utf8_lossy(&buf[..end]).into_owned()
 }
 
+/// The pid of the process at the other end of a connected Unix socket.
+pub fn peer_pid(fd: std::os::fd::RawFd) -> Result<u32> {
+    imp::peer_pid(fd)
+}
+
 struct Info {
     ppid: u32,
     birth_micros: u64,
@@ -90,6 +95,25 @@ mod imp {
         }
         Ok(PathBuf::from(OsStr::from_bytes(&buf[..n as usize])))
     }
+
+    pub fn peer_pid(fd: std::os::fd::RawFd) -> Result<u32> {
+        let mut pid: libc::pid_t = 0;
+        let mut len = size_of::<libc::pid_t>() as libc::socklen_t;
+        // SAFETY: `pid` is `len` bytes and getsockopt writes at most that.
+        if unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_LOCAL,
+                libc::LOCAL_PEERPID,
+                (&mut pid as *mut libc::pid_t).cast(),
+                &mut len,
+            )
+        } != 0
+        {
+            return Err("no peer pid".into());
+        }
+        Ok(pid as u32)
+    }
 }
 
 // ponytail: Linux (/proc/<pid>/stat + btime) is not written; the crate builds, lookups fail.
@@ -104,6 +128,10 @@ mod imp {
     }
 
     pub fn executable(_pid: u32) -> Result<PathBuf> {
+        Err("process lookup is only implemented on macOS".into())
+    }
+
+    pub fn peer_pid(_fd: std::os::fd::RawFd) -> Result<u32> {
         Err("process lookup is only implemented on macOS".into())
     }
 }

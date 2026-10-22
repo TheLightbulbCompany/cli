@@ -1,9 +1,12 @@
 pub mod ipc;
 
-use crate::{paths, store::Store, Result};
+use crate::agents::{claude, codex};
+use crate::sessions::{self, Key, Tier};
+use crate::{frame, mail, paths, store::Store, Result};
 use data_encoding::BASE32_NOPAD;
 use ed25519_dalek::SigningKey;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions, Permissions, TryLockError};
 use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -29,6 +32,54 @@ pub struct Daemon {
     pub shutdown: Notify,
     /// Poked after every accepted `send`, so a waiting `inbox` looks again.
     pub mail: Notify,
+    /// One lock per recipient key, held while its mail is pushed or taken.
+    /// ponytail: never pruned (one entry per key ever written to); prune when keys churn.
+    pub mailbox_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl Daemon {
+    pub fn key_lock(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.mailbox_locks
+            .lock()
+            .unwrap()
+            .entry(key.into())
+            .or_default()
+            .clone()
+    }
+}
+
+/// Pushes the mail waiting for `to` into its session, oldest first, when the session is push
+/// tier. Each message is taken (`delivered`) only after its push succeeds; at the first failure
+/// it and everything after it stay in the mailbox for the next hook or `check_inbox`.
+pub async fn deliver(daemon: Arc<Daemon>, to: Key) {
+    let lock = daemon.key_lock(&to.0);
+    let _held = lock.lock().await;
+    let rows = daemon.store.lock().unwrap().sessions().unwrap_or_default();
+    let Some(session) = sessions::all(&rows, &daemon.claude_home, &daemon.member_key_short)
+        .into_iter()
+        .find(|s| s.key == to && s.tier == Tier::Push)
+    else {
+        return;
+    };
+    let Ok(waiting) = mail::waiting(&daemon.store.lock().unwrap(), &to, ipc::now()) else {
+        return;
+    };
+    for m in waiting {
+        let framed =
+            frame::peer_from_provider(ipc::provider_of(&m.from_key), None, &m.request_id, &m.body);
+        let pushed = match session.provider.as_str() {
+            "claude" => claude::push(&session, &framed).await,
+            _ => codex::push(&session, &framed).await,
+        };
+        if let Err(e) = pushed {
+            eprintln!("push to {}: {}", to.0, e.0);
+            return;
+        }
+        if let Err(e) = mail::take_one(&daemon.store.lock().unwrap(), &to, &m.id, ipc::now()) {
+            eprintln!("push to {}: {e}", to.0);
+            return;
+        }
+    }
 }
 
 /// Runs the daemon for `dir` until a `shutdown` op. Returns `Ok` at once,
@@ -80,6 +131,7 @@ pub async fn run(dir: &Path) -> Result<()> {
         events: broadcast::channel(256).0,
         shutdown: Notify::new(),
         mail: Notify::new(),
+        mailbox_locks: Mutex::default(),
     });
     ipc::serve(listener, daemon).await;
     let _ = fs::remove_file(&sock);

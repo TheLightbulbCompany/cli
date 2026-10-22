@@ -19,6 +19,7 @@ async fn register_sessions_end_round_trip() {
     let dir = tempfile::tempdir().unwrap();
     let claude_home = tempfile::tempdir().unwrap();
     std::env::set_var("LIGHTBULB_NETWORK_CLAUDE_HOME", claude_home.path());
+    std::env::set_var("PATH", "/usr/bin:/bin"); // no real `codex`: these sessions stay next_step
     let home = dir.path().to_path_buf();
     tokio::spawn(async move { daemon::run(&home).await.unwrap() });
 
@@ -62,7 +63,7 @@ async fn register_sessions_end_round_trip() {
     assert_eq!(sessions.len(), 1);
     assert_eq!(sessions[0]["key"], key);
     assert_eq!(sessions[0]["status"], "idle");
-    assert_eq!(sessions[0]["tier"], "pull");
+    assert_eq!(sessions[0]["tier"], "next_step");
     assert_eq!(sessions[0]["title"], "hello");
     assert_eq!(
         call(&mut lines, &mut w, json!({"id": 4, "op": "status"})).await["sessions"],

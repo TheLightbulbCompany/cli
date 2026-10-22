@@ -1,8 +1,9 @@
 //! Sessions: the coding-agent conversations on this machine, registered or discovered.
 
+use crate::agents::codex;
 use crate::{doing, os, store};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// `"<member_key_short>/<provider>:<conversation>"`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,14 +45,19 @@ pub struct Session {
     /// Computed at read time from the agent's transcript, never stored.
     pub doing: Option<String>,
     pub status: Status,
-    /// Computed at read time from the provider (Plan A: no provider pushes yet).
+    /// Computed at read time: `push` when the provider's push channel is reachable.
     pub tier: Tier,
+    /// Claude's messaging socket, when its registry names one that exists.
+    #[serde(skip)]
+    pub push_socket: Option<PathBuf>,
 }
 
+/// Codex pushes through the `codex` CLI; Claude's tier comes from its registry (`scan_claude`).
 fn tier(provider: &str) -> Tier {
-    match provider {
-        "cursor" | "grok" => Tier::NextStep,
-        _ => Tier::Pull,
+    if provider == "codex" && codex::program().is_some() {
+        Tier::Push
+    } else {
+        Tier::NextStep
     }
 }
 
@@ -77,6 +83,7 @@ fn from_row(r: &store::Session) -> Option<Session> {
         cwd: r.cwd.clone(),
         title: r.title.clone(),
         doing: None,
+        push_socket: None,
         status: if !alive(pid, birth) {
             Status::Gone
         } else if r.status == "live" {
@@ -117,6 +124,10 @@ pub fn scan_claude(home: &Path, member_short: &str) -> Vec<Session> {
         if (p.birth_micros / 1000).abs_diff(started_ms) > 10_000 {
             continue;
         }
+        let socket = v["messagingSocketPath"]
+            .as_str()
+            .map(PathBuf::from)
+            .filter(|s| s.exists());
         out.push(Session {
             key: Key::new(member_short, "claude", conversation),
             provider: "claude".into(),
@@ -131,7 +142,12 @@ pub fn scan_claude(home: &Path, member_short: &str) -> Vec<Session> {
             } else {
                 Status::Idle
             },
-            tier: tier("claude"),
+            tier: if socket.is_some() {
+                Tier::Push
+            } else {
+                Tier::NextStep
+            },
+            push_socket: socket,
         });
     }
     out
@@ -214,7 +230,7 @@ mod tests {
         );
         assert_eq!(
             (s.status, s.tier, s.title.as_deref()),
-            (Status::Live, Tier::Pull, Some("live one"))
+            (Status::Live, Tier::NextStep, Some("live one"))
         );
         assert!(dir.join("999999.json").exists(), "Claude owns its files");
     }
