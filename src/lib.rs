@@ -9,6 +9,7 @@ pub mod agents {
     #[derive(Debug)]
     pub struct PushError(pub &'static str);
 }
+pub mod cli;
 pub mod daemon;
 pub mod doing;
 pub mod frame;

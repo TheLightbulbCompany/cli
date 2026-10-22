@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
-use lightbulb_network::{daemon, hook, mcp, paths, setup};
+use lightbulb_network::{cli, daemon, hook, mcp, paths, setup};
+use std::ffi::OsString;
 use std::io::{Read, Write};
 
 #[derive(Parser)]
@@ -13,8 +14,57 @@ struct Cli {
 enum Command {
     /// Print the version.
     Version,
-    /// Run the per-computer daemon in the foreground.
-    Daemon,
+    /// Run the per-computer daemon in the foreground, or install/remove its launchd job.
+    Daemon {
+        /// Write the launchd job (and the `lightbulb` alias) and load it.
+        #[arg(long, conflicts_with = "uninstall")]
+        install: bool,
+        /// Stop the daemon and remove the launchd job; state is kept.
+        #[arg(long)]
+        uninstall: bool,
+    },
+    /// List the coding sessions on this computer.
+    Who {
+        /// Print the raw session list as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Send text to a session (`session_id`), a name address (`<member>/<name>`), or, from a
+    /// person's terminal, a group (`*`, `<member>/*`).
+    Send {
+        target: String,
+        #[arg(required = true, num_args = 1..)]
+        text: Vec<String>,
+        /// Send as this session (a person speaking for it) instead of the terminal.
+        #[arg(long)]
+        from: Option<String>,
+        /// The request_id of the message this answers.
+        #[arg(long)]
+        reply_to: Option<String>,
+        /// Use this request_id instead of a new one (to retry a send).
+        #[arg(long)]
+        request_id: Option<String>,
+    },
+    /// Print messages addressed to the name `<member>/<name>` as they arrive (Ctrl-C to stop).
+    Listen {
+        #[arg(long = "as")]
+        name: String,
+        /// Return after the first message.
+        #[arg(long)]
+        once: bool,
+    },
+    /// Print the receipt of a message sent from this terminal (or `--from` another address).
+    Receipt {
+        request_id: String,
+        #[arg(long)]
+        from: Option<String>,
+    },
+    /// Check the daemon, state permissions, agent wiring, alias and launchd job.
+    Doctor,
+    /// Leave the network.
+    Leave,
+    #[command(external_subcommand)]
+    External(Vec<OsString>),
     /// Run by an agent's hook config: `hook <claude|codex|cursor|grok> <session-start|user-prompt-submit|post-tool-use|stop|session-end>`.
     ///
     /// Always exits 0; errors go to stderr.
@@ -39,6 +89,13 @@ enum Command {
     },
 }
 
+/// Exits with `code` unless it is 0.
+fn exit(code: i32) {
+    if code != 0 {
+        std::process::exit(code);
+    }
+}
+
 fn main() -> lightbulb_network::Result<()> {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
@@ -51,9 +108,32 @@ fn main() -> lightbulb_network::Result<()> {
     };
     match cli.command {
         Command::Version => println!("lightbulb-network {}", env!("CARGO_PKG_VERSION")),
-        Command::Daemon => {
+        Command::Daemon { install: true, .. } => exit(cli::daemon_install()?),
+        Command::Daemon {
+            uninstall: true, ..
+        } => exit(cli::daemon_uninstall()?),
+        Command::Daemon { .. } => {
             tokio::runtime::Runtime::new()?.block_on(daemon::run(&paths::state_dir()))?
         }
+        Command::Who { json } => exit(cli::who(json)?),
+        Command::Send {
+            target,
+            text,
+            from,
+            reply_to,
+            request_id,
+        } => exit(cli::send(
+            &target,
+            &text.join(" "),
+            from,
+            reply_to,
+            request_id,
+        )?),
+        Command::Listen { name, once } => exit(cli::listen(&name, once)?),
+        Command::Receipt { request_id, from } => exit(cli::receipt(&request_id, from)?),
+        Command::Doctor => exit(cli::doctor()?),
+        Command::Leave => cli::leave(),
+        Command::External(args) => exit(cli::forward(args)?),
         Command::Mcp => mcp::run()?,
         Command::Setup {
             remove,
@@ -70,6 +150,13 @@ fn main() -> lightbulb_network::Result<()> {
             let home = dirs::home_dir().ok_or("no home directory")?;
             for agent in setup::run(&home, &executable, &server_name, remove).agents {
                 println!("{}", agent.line());
+            }
+            if !remove {
+                println!("{}", cli::install_alias(&home, &executable)?);
+                // The launchd job needs the canonical copy `install_alias` just made.
+                if cfg!(target_os = "macos") {
+                    cli::daemon_install()?;
+                }
             }
         }
         Command::Hook { agent, event } => {

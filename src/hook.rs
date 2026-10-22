@@ -214,13 +214,18 @@ pub(crate) fn calling_agent(agent: Option<&str>) -> std::result::Result<Process,
 }
 
 /// One blocking connection to the daemon.
-struct Conn {
+pub(crate) struct Conn {
     stream: BufReader<UnixStream>,
     next: u64,
 }
 
 impl Conn {
-    fn open() -> Result<Conn> {
+    /// How long one `call` waits for its answer (default 10 s).
+    pub(crate) fn wait_up_to(&self, d: Duration) -> Result<()> {
+        Ok(self.stream.get_ref().set_read_timeout(Some(d))?)
+    }
+
+    pub(crate) fn open() -> Result<Conn> {
         let stream = UnixStream::connect(paths::socket())?;
         stream.set_read_timeout(Some(Duration::from_secs(10)))?;
         Ok(Conn {
@@ -229,7 +234,7 @@ impl Conn {
         })
     }
 
-    fn call(&mut self, op: &str, mut body: Value) -> Result<Value> {
+    pub(crate) fn call(&mut self, op: &str, mut body: Value) -> Result<Value> {
         body["id"] = self.next.into();
         body["op"] = op.into();
         self.next += 1;

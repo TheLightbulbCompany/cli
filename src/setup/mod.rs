@@ -58,6 +58,19 @@ pub fn valid_server_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
+/// Whether `agent`'s hook file under `home` already runs `<some executable> hook <agent> ...`
+/// (what `doctor` checks; reads, never writes).
+pub fn wired(home: &Path, agent: &str) -> bool {
+    let file = match agent {
+        "claude" => ".claude/settings.json",
+        "codex" => ".codex/hooks.json",
+        "cursor" => ".cursor/hooks.json",
+        "grok" => ".grok/hooks/lightbulb-network.json",
+        _ => return false,
+    };
+    fs::read_to_string(home.join(file)).is_ok_and(|t| t.contains(&format!(" hook {agent} ")))
+}
+
 pub fn run(home: &Path, executable: &Path, server_name: &str, remove: bool) -> Report {
     let exe = executable.to_string_lossy();
     let ctx = Ctx {

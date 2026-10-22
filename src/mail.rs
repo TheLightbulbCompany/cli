@@ -289,6 +289,12 @@ pub fn send(
             }
         }
     };
+    // A name address (`<member>/<name>`, no `:`) is a person's mailbox and never expires.
+    let expires = if to.0.split_once('/').is_some_and(|(_, r)| !r.contains(':')) {
+        i64::MAX
+    } else {
+        (now + HOLD_S) as i64
+    };
     let tx = conn.unchecked_transaction()?;
     store.put_message(&Message {
         id: id.clone(),
@@ -304,7 +310,7 @@ pub fn send(
     })?;
     tx.execute(
         "INSERT INTO mailbox (to_key, message_id, queued_at, expires_at) VALUES (?1, ?2, ?3, ?4)",
-        params![to.0, id, now as i64, (now + HOLD_S) as i64],
+        params![to.0, id, now as i64, expires],
     )?;
     advance(&tx, &from.0, request_id, State::Stored, None, now)?;
     tx.commit()?;
@@ -598,6 +604,15 @@ mod tests {
         expire(&s, 1000 + HOLD_S + 1).unwrap();
         assert_eq!(state(&s, "r1"), State::Expired);
         assert!(take(&s, &k("b"), 1000 + HOLD_S + 2).unwrap().is_empty());
+    }
+
+    #[test]
+    fn mail_for_a_name_address_never_expires() {
+        let (_d, s) = setup();
+        send(&s, &k("a"), &k("m/bob"), "x", "r1", None, 1000).unwrap();
+        expire(&s, 1000 + 100 * HOLD_S).unwrap();
+        assert_eq!(state(&s, "r1"), State::Stored);
+        assert_eq!(take(&s, &k("m/bob"), 1000 + 100 * HOLD_S).unwrap().len(), 1);
     }
 
     #[test]
