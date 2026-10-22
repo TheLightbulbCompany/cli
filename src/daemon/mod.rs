@@ -27,6 +27,8 @@ pub struct Daemon {
     /// Pushed to every `subscribe`d connection as `{"event": ...}` frames.
     pub events: broadcast::Sender<Value>,
     pub shutdown: Notify,
+    /// Poked after every accepted `send`, so a waiting `inbox` looks again.
+    pub mail: Notify,
 }
 
 /// Runs the daemon for `dir` until a `shutdown` op. Returns `Ok` at once,
@@ -77,6 +79,7 @@ pub async fn run(dir: &Path) -> Result<()> {
             .ok_or("no home directory")?,
         events: broadcast::channel(256).0,
         shutdown: Notify::new(),
+        mail: Notify::new(),
     });
     ipc::serve(listener, daemon).await;
     let _ = fs::remove_file(&sock);

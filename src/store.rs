@@ -75,6 +75,10 @@ impl Store {
         Ok(Store { conn })
     }
 
+    pub(crate) fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
     pub fn put_session(&self, s: &Session) -> rusqlite::Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO sessions VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",

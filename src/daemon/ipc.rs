@@ -1,6 +1,7 @@
 //! Newline-delimited JSON over the daemon's Unix socket.
 
 use super::Daemon;
+use crate::mail;
 use crate::sessions::{self, Key};
 use crate::store;
 use serde::{Deserialize, Serialize};
@@ -80,7 +81,7 @@ async fn connection(stream: UnixStream, mut events: Receiver<Value>, daemon: Arc
     loop {
         let (frame, last) = tokio::select! {
             line = lines.next_line() => match line {
-                Ok(Some(line)) => (Some(json!(handle(&line, &daemon, &mut subscribed))), false),
+                Ok(Some(line)) => (Some(json!(handle(&line, &daemon, &mut subscribed).await)), false),
                 _ => return,
             },
             event = events.recv() => match event {
@@ -107,7 +108,7 @@ async fn connection(stream: UnixStream, mut events: Receiver<Value>, daemon: Arc
     }
 }
 
-fn handle(line: &str, daemon: &Daemon, subscribed: &mut bool) -> Response {
+async fn handle(line: &str, daemon: &Daemon, subscribed: &mut bool) -> Response {
     let Ok(value) = serde_json::from_str::<Value>(line) else {
         return Response::err(0, BAD_REQUEST);
     };
@@ -145,7 +146,17 @@ fn handle(line: &str, daemon: &Daemon, subscribed: &mut bool) -> Response {
             },
             None => Response::err(id, BAD_REQUEST),
         },
-        "send" | "receipt" | "inbox" | "hook" | "tool" => Response::err(id, UNSUPPORTED),
+        "send" => send(id, &req.body, daemon),
+        "receipt" => match req.body["request_id"].as_str() {
+            Some(rid) => match mail::receipt(&daemon.store.lock().unwrap(), rid) {
+                Ok(Some(r)) => Response::ok(id, json!({ "receipt": r })),
+                Ok(None) => Response::err(id, NOT_FOUND),
+                Err(_) => Response::err(id, INTERNAL),
+            },
+            None => Response::err(id, BAD_REQUEST),
+        },
+        "inbox" => inbox(id, &req.body, daemon).await,
+        "hook" | "tool" => Response::err(id, UNSUPPORTED),
         _ => Response::err(id, UNKNOWN_OP),
     }
 }
@@ -193,4 +204,82 @@ fn live_sessions(daemon: &Daemon) -> Vec<sessions::Session> {
 
 fn live_count(daemon: &Daemon) -> usize {
     live_sessions(daemon).len()
+}
+
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// `send {from, to, text, request_id, reply_to?}` -> `{receipt}`.
+fn send(id: u64, body: &Value, daemon: &Daemon) -> Response {
+    let (Some(from), Some(to), Some(text), Some(rid)) = (
+        body["from"].as_str(),
+        body["to"].as_str(),
+        body["text"].as_str(),
+        body["request_id"].as_str(),
+    ) else {
+        return Response::err(id, BAD_REQUEST);
+    };
+    let reply_to = body["reply_to"].as_str();
+    let sent = mail::send(
+        &daemon.store.lock().unwrap(),
+        &Key(from.into()),
+        &Key(to.into()),
+        text,
+        rid,
+        reply_to,
+        now(),
+    );
+    match sent {
+        Ok(receipt) => {
+            if receipt.state == mail::State::Stored {
+                daemon.mail.notify_waiters();
+            }
+            Response::ok(id, json!({ "receipt": receipt }))
+        }
+        Err(_) => Response::err(id, INTERNAL),
+    }
+}
+
+/// `inbox {key, wait_secs?}` -> `{messages}`: takes (and so delivers) what waits for `key`;
+/// with `wait_secs` (at most 600) it first waits for something to arrive.
+async fn inbox(id: u64, body: &Value, daemon: &Daemon) -> Response {
+    let Some(key) = body["key"].as_str().map(|k| Key(k.into())) else {
+        return Response::err(id, BAD_REQUEST);
+    };
+    let wait = match body.get("wait_secs") {
+        None | Some(Value::Null) => 0,
+        Some(v) => match v.as_u64() {
+            Some(w) if w <= 600 => w,
+            _ => return Response::err(id, BAD_REQUEST),
+        },
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(wait);
+    loop {
+        // Register interest before looking, so a send between the look and the wait is not missed.
+        let notified = daemon.mail.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let taken = mail::take(&daemon.store.lock().unwrap(), &key, now());
+        match taken {
+            Err(_) => return Response::err(id, INTERNAL),
+            Ok(m) if !m.is_empty() => {
+                let messages: Vec<Value> = m
+                    .iter()
+                    .map(|m| {
+                        json!({ "id": m.id, "request_id": m.request_id, "from": m.from_key,
+                            "to": m.to_key, "kind": m.kind, "thread": m.thread, "hops": m.hops,
+                            "text": m.body, "sent_at": m.sent_at })
+                    })
+                    .collect();
+                return Response::ok(id, json!({ "messages": messages }));
+            }
+            Ok(_) => {}
+        }
+        if tokio::time::timeout_at(deadline, notified).await.is_err() {
+            return Response::ok(id, json!({ "messages": [] }));
+        }
+    }
 }
