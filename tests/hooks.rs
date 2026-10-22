@@ -85,20 +85,26 @@ impl Net {
     /// Runs the hook with `tests/fixtures/hooks/<fixture>.json` on stdin, called as the
     /// agent; returns stdout.
     fn hook(&self, agent: &str, event: &str, fixture: &str) -> String {
-        self.hook_as(agent, event, fixture, true)
+        let me = os::process(std::process::id()).unwrap();
+        self.hook_as(agent, event, fixture, Some(&me))
     }
 
-    /// `pinned: false` leaves the real caller (this test runner, which is no agent).
-    fn hook_as(&self, agent: &str, event: &str, fixture: &str, pinned: bool) -> String {
-        let me = os::process(std::process::id()).unwrap();
+    /// `pin: None` leaves the real caller (this test runner, which is no agent).
+    fn hook_as(
+        &self,
+        agent: &str,
+        event: &str,
+        fixture: &str,
+        pin: Option<&os::Process>,
+    ) -> String {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/hooks")
             .join(format!("{fixture}.json"));
         let mut cmd = Command::new(EXE);
-        if pinned {
+        if let Some(p) = pin {
             cmd.env(
                 "LIGHTBULB_NETWORK_HOOK_CALLER",
-                format!("{}:{}", me.pid, me.birth_micros),
+                format!("{}:{}", p.pid, p.birth_micros),
             );
         }
         let mut child = cmd
@@ -191,7 +197,7 @@ fn a_session_end_after_the_agent_exited_still_ends_the_session() {
     let key = register(&net, "00000000-0000-4000-8000-0000000000c1", 999_999, 1);
     // The caller check fails (no agent above the hook), yet the recorded process is gone.
     assert_eq!(
-        net.hook_as("claude", "session-end", "claude-session-end", false),
+        net.hook_as("claude", "session-end", "claude-session-end", None),
         ""
     );
     let r = net.call(json!({"id": 1, "op": "end", "key": key}));
@@ -209,7 +215,7 @@ fn a_hand_run_session_end_cannot_end_a_live_session() {
         me.birth_micros,
     );
     assert_eq!(
-        net.hook_as("claude", "session-end", "claude-session-end", false),
+        net.hook_as("claude", "session-end", "claude-session-end", None),
         ""
     );
     assert!(net.session(&key).is_some());
@@ -278,4 +284,103 @@ fn register_refuses_a_bad_conversation_id() {
     assert_eq!(reg("vim", "ok", "idle")["error"], "bad_request");
     assert_eq!(reg("grok", "ok", "asleep")["error"], "bad_request");
     assert_eq!(reg("grok", "o.k_-1", "busy")["ok"], true);
+}
+
+/// Another live process for a session to belong to; killed on drop.
+struct Other(Child, os::Process);
+
+impl Other {
+    fn new() -> Other {
+        let child = Command::new("sleep").arg("30").spawn().unwrap();
+        let p = os::process(child.id()).unwrap();
+        Other(child, p)
+    }
+}
+
+impl Drop for Other {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+const C1: &str = "00000000-0000-4000-8000-0000000000c1";
+
+#[test]
+fn session_end_pinned_to_another_live_process_does_not_end_the_row() {
+    let net = Net::new();
+    let other = Other::new();
+    net.hook_as(
+        "claude",
+        "session-start",
+        "claude-session-start",
+        Some(&other.1),
+    );
+    let key = net.key("claude", C1);
+    // A hook from this test's own (live, different) process.
+    assert_eq!(net.hook("claude", "session-end", "claude-session-end"), "");
+    assert!(net.session(&key).is_some());
+    net.hook_as(
+        "claude",
+        "session-end",
+        "claude-session-end",
+        Some(&other.1),
+    );
+    assert!(net.session(&key).is_none());
+}
+
+#[test]
+fn register_cannot_overwrite_a_key_owned_by_another_live_process() {
+    let net = Net::new();
+    let other = Other::new();
+    net.hook_as(
+        "claude",
+        "session-start",
+        "claude-session-start",
+        Some(&other.1),
+    );
+    let me = os::process(std::process::id()).unwrap();
+    let r = net.call(
+        json!({"id": 1, "op": "register", "session": {"provider": "claude",
+        "conversation": C1, "pid": me.pid, "birth_micros": me.birth_micros, "cwd": "/"},
+        "caller": {"pid": me.pid, "birth_micros": me.birth_micros}}),
+    );
+    assert_eq!(
+        (r["error"].clone(), r["reason"].clone()),
+        (json!("bad_request"), json!("owned_by_live_process"))
+    );
+    let key = net.key("claude", C1);
+    assert_eq!(net.session(&key).unwrap()["pid"], other.1.pid);
+    // The owner itself may re-register.
+    net.hook_as(
+        "claude",
+        "user-prompt-submit",
+        "claude-user-prompt-submit",
+        Some(&other.1),
+    );
+    assert_eq!(net.session(&key).unwrap()["status"], "live");
+}
+
+#[test]
+fn inbox_from_another_process_is_refused() {
+    let net = Net::new();
+    let other = Other::new();
+    net.hook_as(
+        "grok",
+        "session-start",
+        "grok-session-start",
+        Some(&other.1),
+    );
+    let key = net.key("grok", "019a0000-0000-7000-8000-0000000000f1");
+    net.send(&key, "body r1", "r1");
+    let me = os::process(std::process::id()).unwrap();
+    let r = net.call(json!({"id": 1, "op": "inbox", "key": key,
+        "caller": {"pid": me.pid, "birth_micros": me.birth_micros}}));
+    assert_eq!(
+        (r["error"].clone(), r["reason"].clone()),
+        (json!("bad_request"), json!("not_owner"))
+    );
+    let r = net.call(json!({"id": 1, "op": "inbox", "key": key,
+        "caller": {"pid": other.1.pid, "birth_micros": other.1.birth_micros}}));
+    assert_eq!(r["messages"][0]["text"], "body r1");
 }

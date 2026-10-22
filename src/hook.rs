@@ -1,6 +1,10 @@
 //! `hook <agent> <event>`: run by an agent's hook config with the agent's payload on stdin.
 //! Registers or updates the session, ends it on SessionEnd, and hands waiting mail to the
 //! agent in the shape that agent reads. A client of the daemon, like every other.
+//! Every op carries the identified agent process as `caller`, so a hook run from an agent's
+//! own tools cannot end, take over or drain another live session; this is the ceiling,
+//! since any same-uid client can speak raw IPC: it stops an agent's ordinary tools, not a
+//! hostile user.
 
 use crate::agents::caller::{self, CallerError};
 use crate::agents::cursor_grok;
@@ -135,7 +139,10 @@ pub fn run(agent: &str, event: &str, stdin: &str) -> Result<Option<String>> {
             .ok_or("status without member_key_short")?
             .to_string();
         let key = crate::sessions::Key::new(&short, h.provider, &h.conversation);
-        let r = conn.call("end", json!({ "key": key, "if_gone": caller.is_err() }))?;
+        let r = match &caller {
+            Ok(me) => conn.call("end", json!({ "key": key, "caller": proc_json(me) }))?,
+            Err(_) => conn.call("end", json!({ "key": key, "if_gone": true }))?,
+        };
         if r["ok"] != true && r["error"] != "not_found" {
             return Err(format!("end: {r}").into());
         }
@@ -155,7 +162,8 @@ pub fn run(agent: &str, event: &str, stdin: &str) -> Result<Option<String>> {
     let r = conn.call(
         "register",
         json!({ "session": { "provider": h.provider, "conversation": h.conversation,
-            "pid": me.pid, "birth_micros": me.birth_micros, "cwd": h.cwd, "status": status } }),
+            "pid": me.pid, "birth_micros": me.birth_micros, "cwd": h.cwd, "status": status },
+            "caller": proc_json(&me) }),
     )?;
     let key = r["key"].clone();
     if !key.is_string() {
@@ -164,7 +172,7 @@ pub fn run(agent: &str, event: &str, stdin: &str) -> Result<Option<String>> {
     if !takes_mail(&h) {
         return Ok(None);
     }
-    let r = conn.call("inbox", json!({ "key": key }))?;
+    let r = conn.call("inbox", json!({ "key": key, "caller": proc_json(&me) }))?;
     let framed: Vec<&str> = r["messages"]
         .as_array()
         .ok_or_else(|| format!("inbox: {r}"))?
@@ -175,6 +183,10 @@ pub fn run(agent: &str, event: &str, stdin: &str) -> Result<Option<String>> {
         return Ok(None);
     }
     Ok(Some(output(&h, &framed.join("\n\n")).to_string()))
+}
+
+fn proc_json(p: &Process) -> Value {
+    json!({ "pid": p.pid, "birth_micros": p.birth_micros })
 }
 
 fn calling_agent(agent: &str) -> std::result::Result<Process, CallerError> {

@@ -139,7 +139,7 @@ async fn handle(line: &str, daemon: &Daemon, subscribed: &mut bool) -> Response 
         "register" => register(id, &req.body, daemon),
         "sessions" => Response::ok(id, json!({ "sessions": live_sessions(daemon) })),
         "end" => match req.body["key"].as_str() {
-            Some(key) => end(id, key, req.body["if_gone"] == true, daemon),
+            Some(key) => end(id, key, &req.body, daemon),
             None => Response::err(id, BAD_REQUEST),
         },
         "send" => send(id, &req.body, daemon),
@@ -159,22 +159,60 @@ async fn handle(line: &str, daemon: &Daemon, subscribed: &mut bool) -> Response 
     }
 }
 
-/// `end {key, if_gone?}` -> `{ended}`: deletes the session row; its mail stays for the hold.
-/// With `if_gone`, only when the row's recorded process is no longer alive (`ended: false`
-/// otherwise), so a hook run by hand can never end a live session.
-fn end(id: u64, key: &str, if_gone: bool, daemon: &Daemon) -> Response {
+/// A process as `(pid, birth_micros)`.
+type Proc = (u32, u64);
+
+/// The optional `caller: {pid, birth_micros}` a hook sends: the agent process it acts for.
+/// `Err` when present but malformed.
+fn caller(body: &Value) -> Result<Option<Proc>, ()> {
+    match body.get("caller") {
+        None | Some(Value::Null) => Ok(None),
+        Some(c) => match (
+            c["pid"].as_u64().and_then(|p| u32::try_from(p).ok()),
+            c["birth_micros"].as_u64(),
+        ) {
+            (Some(p), Some(b)) => Ok(Some((p, b))),
+            _ => Err(()),
+        },
+    }
+}
+
+/// The process a stored row names; `Ok(None)` for no row (or one without a process).
+fn row_process(store: &store::Store, key: &str) -> rusqlite::Result<Option<Proc>> {
+    Ok(store.session(key)?.and_then(|s| {
+        Some((
+            u32::try_from(s.pid?).ok()?,
+            u64::try_from(s.birth_micros?).ok()?,
+        ))
+    }))
+}
+
+fn refused(id: u64, reason: &str) -> Response {
+    Response {
+        id,
+        ok: false,
+        body: json!({ "error": BAD_REQUEST, "reason": reason }),
+    }
+}
+
+/// `end {key, caller?, if_gone?}` -> `{ended}`: deletes the session row; its mail stays for
+/// the hold. With `caller`, only the row's own process may end it; with `if_gone`, also
+/// anyone once the row's process is dead. `ended: false` when refused. Neither field (the
+/// CLI) ends it outright.
+fn end(id: u64, key: &str, body: &Value, daemon: &Daemon) -> Response {
+    let Ok(caller) = caller(body) else {
+        return Response::err(id, BAD_REQUEST);
+    };
+    let if_gone = body["if_gone"] == true;
     let store = daemon.store.lock().unwrap();
-    if if_gone {
-        let live = match store.session(key) {
-            Ok(Some(s)) => s
-                .pid
-                .zip(s.birth_micros)
-                .and_then(|(p, b)| Some((u32::try_from(p).ok()?, u64::try_from(b).ok()?)))
-                .is_some_and(|(p, b)| sessions::alive(p, b)),
-            Ok(None) => false,
+    if caller.is_some() || if_gone {
+        let row = match row_process(&store, key) {
+            Ok(r) => r,
             Err(_) => return Response::err(id, INTERNAL),
         };
-        if live {
+        let owned = caller.is_some() && row == caller;
+        let dead = !row.is_some_and(|(p, b)| sessions::alive(p, b));
+        if !(owned || (if_gone && dead)) {
             return Response::ok(id, json!({ "ended": false }));
         }
     }
@@ -198,8 +236,9 @@ struct Register {
 
 const PROVIDERS: [&str; 4] = ["claude", "codex", "cursor", "grok"];
 
-/// `register {session: {provider, conversation, pid, birth_micros, cwd, title?, status?}}`
-/// upserts by key; the daemon supplies the member prefix. `status` is `idle` (default) or
+/// `register {session: {provider, conversation, pid, birth_micros, cwd, title?, status?}, caller?}`
+/// upserts by key; the daemon supplies the member prefix. A key whose row names another
+/// live process is refused (`bad_request`, reason `owned_by_live_process`). `status` is `idle` (default) or
 /// `busy` (stored as live); `conversation` is `[A-Za-z0-9._-]{1,128}`.
 fn register(id: u64, body: &Value, daemon: &Daemon) -> Response {
     let Ok(r) = serde_json::from_value::<Register>(body["session"].clone()) else {
@@ -219,7 +258,19 @@ fn register(id: u64, body: &Value, daemon: &Daemon) -> Response {
     {
         return Response::err(id, BAD_REQUEST);
     }
+    let Ok(caller) = caller(body) else {
+        return Response::err(id, BAD_REQUEST);
+    };
+    let me = caller.unwrap_or((r.pid, r.birth_micros));
     let key = Key::new(&daemon.member_key_short, &r.provider, &r.conversation);
+    let store = daemon.store.lock().unwrap();
+    match row_process(&store, &key.0) {
+        Ok(Some(owner)) if owner != me && sessions::alive(owner.0, owner.1) => {
+            return refused(id, "owned_by_live_process")
+        }
+        Ok(_) => {}
+        Err(_) => return Response::err(id, INTERNAL),
+    }
     let row = store::Session {
         key: key.0.clone(),
         provider: r.provider,
@@ -233,7 +284,7 @@ fn register(id: u64, body: &Value, daemon: &Daemon) -> Response {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs() as i64),
     };
-    match daemon.store.lock().unwrap().put_session(&row) {
+    match store.put_session(&row) {
         Ok(()) => Response::ok(id, json!({ "key": key })),
         Err(_) => Response::err(id, INTERNAL),
     }
@@ -295,11 +346,20 @@ fn provider_of(key: &str) -> &str {
 
 /// `inbox {key, wait_secs?}` -> `{messages}`, each with `framed`, the text as the agent
 /// is shown it (`frame::peer_from_provider`): takes (and so delivers) what waits for `key`;
-/// with `wait_secs` (at most 600) it first waits for something to arrive.
+/// with `wait_secs` (at most 600) it first waits for something to arrive. With `caller`, only
+/// the row's own process may take it (`bad_request`, reason `not_owner`, otherwise).
 async fn inbox(id: u64, body: &Value, daemon: &Daemon) -> Response {
-    let Some(key) = body["key"].as_str().map(|k| Key(k.into())) else {
+    let (Some(key), Ok(caller)) = (body["key"].as_str().map(|k| Key(k.into())), caller(body))
+    else {
         return Response::err(id, BAD_REQUEST);
     };
+    if let Some(c) = caller {
+        match row_process(&daemon.store.lock().unwrap(), &key.0) {
+            Ok(Some(owner)) if owner == c => {}
+            Ok(_) => return refused(id, "not_owner"),
+            Err(_) => return Response::err(id, INTERNAL),
+        }
+    }
     let wait = match body.get("wait_secs") {
         None | Some(Value::Null) => 0,
         Some(v) => match v.as_u64() {
