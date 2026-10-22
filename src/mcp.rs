@@ -13,7 +13,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
@@ -135,35 +135,29 @@ fn read_capped(p: &Path) -> Option<String> {
     Some(text)
 }
 
-/// `p` resolved, when it lies inside `root` (already canonical).
-fn inside(root: &Path, p: &Path) -> Option<PathBuf> {
-    let p = p.canonicalize().ok()?;
-    p.starts_with(root).then_some(p)
-}
-
 /// Origin's repo name (the URL's last path segment) and the checked-out branch, from
-/// `<cwd>/.git`: a directory, or a `gitdir:` file pointing inside `cwd`. A symlinked `.git`,
-/// or one pointing outside `cwd`, is not followed.
+/// `<cwd>/.git`: a directory, or a `gitdir:` file (a linked worktree; `gitdir` and its
+/// `commondir` may point anywhere: only two names are read out). A symlinked `.git` is
+/// not followed. Every read is capped at 64 KiB.
 fn git(cwd: &str) -> (Option<String>, Option<String>) {
     git_in(Path::new(cwd)).unwrap_or_default()
 }
 
 fn git_in(cwd: &Path) -> Option<(Option<String>, Option<String>)> {
-    let cwd = cwd.canonicalize().ok()?;
     let dot = cwd.join(".git");
     let kind = std::fs::symlink_metadata(&dot).ok()?.file_type();
     let dir = if kind.is_dir() {
         dot
     } else if kind.is_file() {
         let d = read_capped(&dot)?;
-        inside(&cwd, &cwd.join(d.trim().strip_prefix("gitdir:")?.trim()))?
+        cwd.join(d.trim().strip_prefix("gitdir:")?.trim())
     } else {
         return None;
     };
     let branch = read_capped(&dir.join("HEAD"))
         .and_then(|h| Some(h.trim().strip_prefix("ref: refs/heads/")?.to_string()));
     let common = match read_capped(&dir.join("commondir")) {
-        Some(c) => inside(&cwd, &dir.join(c.trim()))?,
+        Some(c) => dir.join(c.trim()),
         None => dir,
     };
     let config = read_capped(&common.join("config")).unwrap_or_default();
@@ -386,10 +380,10 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn git_reads_origin_repo_and_branch_and_stays_inside_cwd() {
+    fn git_reads_origin_repo_and_branch_also_from_a_linked_worktree() {
         let d = tempfile::tempdir().unwrap();
         let main = d.path().join("main");
-        fs::create_dir_all(main.join(".git/worktrees/wt")).unwrap();
+        fs::create_dir_all(main.join(".git/worktrees/x")).unwrap();
         fs::write(main.join(".git/HEAD"), "ref: refs/heads/init\n").unwrap();
         fs::write(
             main.join(".git/config"),
@@ -403,36 +397,19 @@ mod tests {
         );
         assert_eq!(git(d.path().to_str().unwrap()), (None, None));
 
-        // A gitdir inside cwd is followed, with its commondir.
-        fs::create_dir_all(main.join("sub")).unwrap();
-        fs::write(main.join("sub/.git"), "gitdir: ../.git/worktrees/wt\n").unwrap();
-        fs::write(
-            main.join(".git/worktrees/wt/HEAD"),
-            "ref: refs/heads/feat/x\n",
-        )
-        .unwrap();
-        fs::write(main.join(".git/worktrees/wt/commondir"), "../..\n").unwrap();
-        assert_eq!(
-            git(main.join("sub").to_str().unwrap()),
-            (None, None),
-            "points outside sub"
-        );
-
-        // One pointing outside cwd, or a symlinked .git, is not.
-        let wt = d.path().join("wt");
+        // A linked worktree elsewhere, laid out as `git worktree add` writes it.
+        let wt = d.path().join("elsewhere/x");
         fs::create_dir_all(&wt).unwrap();
-        fs::write(wt.join(".git"), "gitdir: ../main/.git/worktrees/wt\n").unwrap();
-        assert_eq!(git(wt.to_str().unwrap()), (None, None));
+        let gitdir = main.join(".git/worktrees/x");
+        fs::write(wt.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
+        fs::write(gitdir.join("HEAD"), "ref: refs/heads/feat/x\n").unwrap();
+        fs::write(gitdir.join("commondir"), "../..\n").unwrap();
+        assert_eq!(git(wt.to_str().unwrap()), (name, Some("feat/x".into())));
+
+        // A symlinked .git is not followed.
         let linked = d.path().join("linked");
         fs::create_dir_all(&linked).unwrap();
         std::os::unix::fs::symlink(main.join(".git"), linked.join(".git")).unwrap();
         assert_eq!(git(linked.to_str().unwrap()), (None, None));
-
-        // Inside: a nested repo's own gitdir file.
-        let own = d.path().join("own");
-        fs::create_dir_all(own.join("meta")).unwrap();
-        fs::write(own.join("meta/HEAD"), "ref: refs/heads/b\n").unwrap();
-        fs::write(own.join(".git"), "gitdir: meta\n").unwrap();
-        assert_eq!(git(own.to_str().unwrap()), (None, Some("b".into())));
     }
 }
