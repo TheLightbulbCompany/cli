@@ -22,11 +22,11 @@ const DESKTOP: &str = "/Applications/Lightbulb.app/Contents/MacOS/lightbulb-desk
 /// Names a session the invocation speaks as (nothing sets it yet).
 const SESSION_ENV: &str = "LIGHTBULB_NETWORK_SESSION";
 
-fn home() -> Result<PathBuf> {
+pub fn home() -> Result<PathBuf> {
     dirs::home_dir().ok_or_else(|| "no home directory".into())
 }
 
-fn canonical(home: &Path) -> PathBuf {
+pub fn canonical(home: &Path) -> PathBuf {
     home.join(".lightbulb/network/bin/lightbulb-network")
 }
 
@@ -333,20 +333,29 @@ fn plist(exe: &Path, log: &Path) -> String {
     )
 }
 
-/// Installs the alias (printing its line) and the launchd job.
-pub fn daemon_install(exe: &Path) -> Result<i32> {
+/// Puts the running binary at the canonical path and the alias at that, printing the line.
+pub fn install_running(home: &Path) -> Result<()> {
+    let exe = std::env::current_exe()?.canonicalize()?;
+    println!("{}", install_alias(home, &exe)?);
+    Ok(())
+}
+
+/// `daemon --install`: the canonical binary and alias, then the launchd job running it.
+pub fn daemon_install() -> Result<i32> {
     if !cfg!(target_os = "macos") {
         eprintln!("not supported yet");
         return Ok(1);
     }
     let home = home()?;
-    println!("{}", install_alias(&home, exe)?);
-    let path = plist_path(&home);
+    install_running(&home)?;
+    install_job(&home, &canonical(&home))
+}
+
+/// Writes and loads the launchd job that runs `exe daemon`.
+pub fn install_job(home: &Path, exe: &Path) -> Result<i32> {
+    let path = plist_path(home);
     fs::create_dir_all(path.parent().unwrap())?;
-    fs::write(
-        &path,
-        plist(&canonical(&home), &paths::state_dir().join("daemon.log")),
-    )?;
+    fs::write(&path, plist(exe, &paths::state_dir().join("daemon.log")))?;
     // Replace any loaded job so an update restarts it: bootout (result ignored), bootstrap,
     // and `kickstart -k` if bootstrap fails.
     let uid = unsafe { libc::getuid() };

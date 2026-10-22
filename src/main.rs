@@ -84,7 +84,8 @@ enum Command {
         /// Take out only what setup wrote; backups are left as they are.
         #[arg(long)]
         remove: bool,
-        /// The engine binary the hooks and MCP entries run (default: this one).
+        /// The engine binary the hooks, MCP entries and launchd job run (default: the canonical
+        /// copy, ~/.lightbulb/network/bin/lightbulb-network, which setup installs from this one).
         #[arg(long)]
         executable: Option<std::path::PathBuf>,
         /// The MCP server entry's name, also used in Cursor's and Grok's allow rules.
@@ -112,9 +113,7 @@ fn main() -> lightbulb_network::Result<()> {
     };
     match cli.command {
         Command::Version => println!("lightbulb-network {}", env!("CARGO_PKG_VERSION")),
-        Command::Daemon { install: true, .. } => exit(cli::daemon_install(
-            &std::env::current_exe()?.canonicalize()?,
-        )?),
+        Command::Daemon { install: true, .. } => exit(cli::daemon_install()?),
         Command::Daemon {
             uninstall: true, ..
         } => exit(cli::daemon_uninstall()?),
@@ -149,21 +148,20 @@ fn main() -> lightbulb_network::Result<()> {
             if !setup::valid_server_name(&server_name) {
                 return Err("--server-name takes letters, digits, - and _".into());
             }
-            let executable = match executable {
-                Some(e) => e,
-                None => std::env::current_exe()?.canonicalize()?,
-            };
-            let home = dirs::home_dir().ok_or("no home directory")?;
+            if let Some(e) = executable.as_ref().filter(|e| !remove && !e.exists()) {
+                return Err(format!("--executable {} does not exist", e.display()).into());
+            }
+            let home = cli::home()?;
+            if !remove {
+                cli::install_running(&home)?;
+            }
+            // Wired to the canonical copy, never to wherever this binary was built.
+            let executable = executable.unwrap_or_else(|| cli::canonical(&home));
             for agent in setup::run(&home, &executable, &server_name, remove).agents {
                 println!("{}", agent.line());
             }
-            if !remove {
-                // The alias line prints once; the job needs the canonical copy it makes.
-                if cfg!(target_os = "macos") {
-                    exit(cli::daemon_install(&executable)?);
-                } else {
-                    println!("{}", cli::install_alias(&home, &executable)?);
-                }
+            if !remove && cfg!(target_os = "macos") {
+                exit(cli::install_job(&home, &executable)?);
             }
         }
         Command::Hook { agent, event } => {

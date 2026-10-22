@@ -411,3 +411,43 @@ fn send_from_an_agent_shell_sends_as_its_session_or_refuses() {
         err(&o)
     );
 }
+
+#[test]
+fn setup_installs_the_canonical_binary_and_wires_everything_to_it() {
+    let e = Env::new();
+    let h = e.home.path();
+    std::fs::create_dir(h.join(".claude")).unwrap();
+    let canon = h.join(".lightbulb/network/bin/lightbulb-network");
+
+    // A missing --executable is refused before anything is written.
+    let o = e.run(&["setup", "--executable", "/nonexistent/lightbulb-network"]);
+    assert!(!o.status.success());
+    assert!(err(&o).contains("does not exist"), "{}", err(&o));
+    assert!(!h.join(".claude.json").exists());
+
+    let o = e.run(&["setup"]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(
+        canon.is_file(),
+        "the running binary is copied to the canonical path"
+    );
+    let canon_s = canon.to_str().unwrap();
+    let mcp: Value =
+        serde_json::from_str(&std::fs::read_to_string(h.join(".claude.json")).unwrap()).unwrap();
+    assert_eq!(mcp["mcpServers"]["lightbulb"]["command"], canon_s);
+    let hooks = std::fs::read_to_string(h.join(".claude/settings.json")).unwrap();
+    assert!(
+        hooks.contains(&format!("'{canon_s}' hook claude ")),
+        "{hooks}"
+    );
+    assert!(!hooks.contains("target/"), "{hooks}");
+    if cfg!(target_os = "macos") {
+        let plist = std::fs::read_to_string(
+            h.join("Library/LaunchAgents/company.thelightbulb.network.plist"),
+        )
+        .unwrap();
+        assert!(plist.contains(&format!(
+            "<string>{canon_s}</string><string>daemon</string>"
+        )));
+    }
+}
