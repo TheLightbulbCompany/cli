@@ -78,7 +78,8 @@ pub fn verify(key: &str, v: &Value, sig: &str) -> bool {
     }
 }
 
-fn unsigned(v: &Value) -> Vec<u8> {
+/// `canonical(v)` with its `sig` field left out.
+pub(crate) fn unsigned(v: &Value) -> Vec<u8> {
     match v {
         Value::Object(m) if m.contains_key("sig") => {
             let mut m = m.clone();

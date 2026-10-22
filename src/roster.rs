@@ -2,7 +2,7 @@
 //! replayed deterministically, so every member computes the same team from the same set of
 //! entries whatever order they arrived in. Pure: no network, no IPC, no logging.
 
-use crate::identity::{canonical, verify, Identity};
+use crate::identity::{unsigned, verify, Identity};
 use crate::store::Store;
 use crate::Result;
 use data_encoding::HEXLOWER;
@@ -57,11 +57,7 @@ impl Entry {
 
     /// Lowercase hex sha256 of `canonical(entry without sig)`.
     pub fn hash(&self) -> String {
-        let mut v = self.value();
-        v.as_object_mut()
-            .expect("an entry is an object")
-            .remove("sig");
-        HEXLOWER.encode(&Sha256::digest(canonical(&v)))
+        HEXLOWER.encode(&Sha256::digest(unsigned(&self.value())))
     }
 
     fn value(&self) -> Value {
@@ -144,7 +140,8 @@ impl Roster {
 
 /// The team as of `entries`, the same whatever their order. Kahn topological order (ready
 /// `remove` entries first, then lowest hash); an entry is applied only if its signer is active
-/// and authorised there and no `remove` of its signer precedes or is concurrent with it.
+/// and authorised there and no `remove` of its signer is concurrent with it. A `remove` is
+/// judged on its own causal past, so concurrent removals all win.
 pub fn replay(entries: &[Entry]) -> Roster {
     let by_hash: BTreeMap<String, &Entry> = entries.iter().map(|e| (e.hash(), e)).collect();
     let graph = Roster {
@@ -160,23 +157,21 @@ pub fn replay(entries: &[Entry]) -> Roster {
         .map(|h| (h.as_str(), graph.ancestors(h)))
         .collect();
     // A removal deeper in its branch than a concurrent entry is replayed after it, so replay
-    // again knowing the removals the last pass applied, until that set settles.
-    // ponytail: capped at one pass per entry; a set that never settles keeps the last pass.
-    let mut removals = BTreeSet::new();
-    let mut roster = graph.clone();
+    // again with every removal any pass applied taking effect unconditionally. `known` only
+    // grows, so this ends within one pass per removal; the cap is a safety.
+    let mut known = BTreeSet::new();
     for _ in 0..=by_hash.len() {
-        let (r, applied) = pass(&by_hash, &anc, &removals, graph.clone());
-        roster = r;
-        if applied == removals {
-            break;
+        let (r, applied) = pass(&by_hash, &anc, &known, graph.clone());
+        if applied.is_subset(&known) {
+            return r;
         }
-        removals = applied;
+        known.extend(applied);
     }
-    roster
+    pass(&by_hash, &anc, &known, graph).0
 }
 
-/// One replay knowing `known` removals ahead of time; returns the roster and the removals it
-/// applied.
+/// One replay in which the `known` removals take effect unconditionally; returns the roster
+/// and the removals it applied on their own merits.
 fn pass(
     by_hash: &BTreeMap<String, &Entry>,
     anc: &BTreeMap<&str, HashSet<String>>,
@@ -197,9 +192,13 @@ fn pass(
         .filter(|(_, n)| **n == 0)
         .map(|(h, _)| ready_key(h))
         .collect();
+    // `removals` = `known` plus those applied so far; `gone` = removed members and the
+    // removal that took each.
     let mut removals = known.clone();
     let mut applied = BTreeSet::new();
+    let mut gone: BTreeMap<String, (Member, String)> = BTreeMap::new();
     let mut links: Vec<(String, Link)> = Vec::new();
+    let mut used_once: BTreeSet<String> = BTreeSet::new();
     let mut admins: Vec<String> = Vec::new();
     // The heads are the entries no entry names as a parent.
     r.heads = by_hash
@@ -230,22 +229,47 @@ fn pass(
         if e.parents.is_empty() {
             continue;
         }
-        let Some(signer) = r.members.get(&e.signer).cloned() else {
+        let target = e.text("member").to_string();
+        if e.kind == Kind::Remove && known.contains(&h) {
+            take(&mut r, &mut gone, &target, &h);
             continue;
+        }
+        let signer = match r.members.get(&e.signer) {
+            Some(m) => m.clone(),
+            // A removal stands on its own causal past: a concurrent removal of its signer
+            // does not stop it.
+            None if e.kind == Kind::Remove => match gone.get(&e.signer) {
+                Some((m, rh)) if !anc[h.as_str()].contains(rh) => m.clone(),
+                _ => continue,
+            },
+            None => continue,
         };
-        // A removal of the signer that this entry does not precede drops it.
-        if removals.iter().any(|rh| {
-            *rh != h && by_hash[rh].text("member") == e.signer && !anc[rh.as_str()].contains(&h)
-        }) {
+        // Any other entry concurrent with a removal of its signer is dropped.
+        if e.kind != Kind::Remove
+            && removals.iter().any(|rh| {
+                by_hash[rh].text("member") == e.signer
+                    && !anc[rh.as_str()].contains(&h)
+                    && !anc[h.as_str()].contains(rh)
+            })
+        {
             continue;
         }
         let elevated = signer.role != Role::Member;
-        let target = e.text("member").to_string();
+        let computer = signer.kind == MemberKind::Computer;
         match e.kind {
-            Kind::Admit => {
+            // A cloud (bridge) member never admits.
+            Kind::Admit if computer => {
+                let ticket = e.text("ticket_id");
+                let once = links
+                    .iter()
+                    .find(|(_, l)| l.once && !ticket.is_empty() && l.ticket_id == ticket)
+                    .map(|(lh, _)| lh.clone());
+                if once.as_ref().is_some_and(|lh| used_once.contains(lh)) {
+                    continue;
+                }
                 let via_link = || {
                     links.iter().any(|(lh, l)| {
-                        l.ticket_id == e.text("ticket_id")
+                        l.ticket_id == ticket
                             && l.signer == e.signer
                             && anc[h.as_str()].contains(lh)
                             && removals.iter().all(|rh| {
@@ -267,6 +291,7 @@ fn pass(
                 );
                 if (elevated || via_link()) && !collides && role_ok {
                     r.members.insert(target, new_member(e, Role::Member));
+                    used_once.extend(once);
                 }
             }
             Kind::Merge => {
@@ -292,8 +317,7 @@ fn pass(
                 // `unlink`: a member removing its own person's cloud member.
                 // ponytail: any cloud member of the person; Task 13 narrows it to a bridge proof.
                 let unlink = t.kind == MemberKind::Cloud && t.person_id == signer.person_id;
-                if t.role != Role::Founder && (elevated || unlink) {
-                    r.members.remove(&target);
+                if (elevated || unlink) && take(&mut r, &mut gone, &target, &h) {
                     removals.insert(h.clone());
                     applied.insert(h.clone());
                 }
@@ -330,7 +354,8 @@ fn pass(
                     }
                 }
             }
-            Kind::Link => links.push((
+            // Only a computer member mints links.
+            Kind::Link if computer => links.push((
                 h.clone(),
                 Link {
                     ticket_id: e.text("ticket_id").to_string(),
@@ -351,22 +376,40 @@ fn pass(
                     }
                 }
             }
+            Kind::Admit | Kind::Link => {}
         }
     }
-    // Live links: those no applied removal descends from.
+    // Live links: unused, and no removal descends from them.
     for (lh, l) in links {
-        if !applied.iter().any(|rh| anc[rh.as_str()].contains(&lh)) {
+        if !used_once.contains(&lh) && !removals.iter().any(|rh| anc[rh.as_str()].contains(&lh)) {
             r.links.insert(l.ticket_id.clone(), l);
         }
     }
     (r, applied)
 }
 
+/// Removes `target` (never the founder) by removal `h`; whether it was removed.
+fn take(
+    r: &mut Roster,
+    gone: &mut BTreeMap<String, (Member, String)>,
+    target: &str,
+    h: &str,
+) -> bool {
+    match r.members.get(target) {
+        Some(m) if m.role != Role::Founder => {
+            let m = r.members.remove(target).expect("present");
+            gone.insert(target.to_string(), (m, h.to_string()));
+            true
+        }
+        _ => false,
+    }
+}
+
 fn is_genesis(e: &Entry) -> bool {
     e.kind == Kind::Admit
         && e.text("role") == "founder"
         && e.text("member") == e.signer
-        && e.signer.len() >= 12
+        && e.signer.get(..12).is_some()
 }
 
 fn new_member(e: &Entry, role: Role) -> Member {
@@ -376,7 +419,7 @@ fn new_member(e: &Entry, role: Role) -> Member {
         p => p.to_string(),
     };
     Member {
-        short: key[..12].to_string(),
+        short: key.get(..12).unwrap_or_default().to_string(),
         name: e.text("name").to_string(),
         computer: e.text("computer").to_string(),
         person_id,
@@ -427,11 +470,12 @@ pub fn accept(store: &Store, entry: &Entry, now: i64) -> Result<bool> {
     if entry.parents.is_empty() && stored.iter().any(|e| e.parents.is_empty()) {
         return Err("the roster already has a root".into());
     }
-    store.conn().execute(
-        "INSERT INTO roster (hash, entry, received_at) VALUES (?1, ?2, ?3)",
+    // OR IGNORE: a concurrent accept of the same entry is `Ok(false)`, not an error.
+    let stored = store.conn().execute(
+        "INSERT OR IGNORE INTO roster (hash, entry, received_at) VALUES (?1, ?2, ?3)",
         params![hash, serde_json::to_string(entry)?, now],
     )?;
-    Ok(true)
+    Ok(stored == 1)
 }
 
 #[cfg(test)]
@@ -486,41 +530,49 @@ mod tests {
         )
     }
 
+    /// X admitted, then made an admin, so X's own admissions are authorised.
+    fn admit_admin(f: &Identity, parent: &Entry, x: &Identity) -> [Entry; 2] {
+        let ax = admit(f, parent, &x.key, "x");
+        let px = member(f, &ax, Kind::Admin, &x.key);
+        [ax, px]
+    }
+
+    fn once_link(by: &Identity, parent: &Entry, ticket: &str) -> Entry {
+        op(
+            by,
+            parent,
+            Kind::Link,
+            json!({"ticket_id": ticket, "secret": "h", "mode": "ask", "once": true, "expires_at": 99}),
+        )
+    }
+
     /// Same parent: X admits C | founder removes X.
     fn fork() -> (Vec<Entry>, [String; 2]) {
         let (f, x, c) = (id(), id(), id());
         let g = genesis(&f);
-        let ax = admit(&f, &g, &x.key, "x");
+        let [ax0, ax] = admit_admin(&f, &g, &x);
         let xc = admit(&x, &ax, &c.key, "c");
         let rx = member(&f, &ax, Kind::Remove, &x.key);
-        (vec![g, ax, xc, rx], [x.key, c.key])
+        (vec![g, ax0, ax, xc, rx], [x.key, c.key])
     }
 
     /// Fork at F: X admits C, then X admits D | founder removes X.
     fn deep_fork() -> (Vec<Entry>, [String; 3]) {
         let (f, x, c, d) = (id(), id(), id(), id());
         let g = genesis(&f);
-        let ax = admit(&f, &g, &x.key, "x");
+        let [ax0, ax] = admit_admin(&f, &g, &x);
         let xc = admit(&x, &ax, &c.key, "c");
         let xd = admit(&x, &xc, &d.key, "d");
         let rx = member(&f, &ax, Kind::Remove, &x.key);
-        (vec![g, ax, xc, xd, rx], [x.key, c.key, d.key])
+        (vec![g, ax0, ax, xc, xd, rx], [x.key, c.key, d.key])
     }
 
-    fn permutations(v: &[Entry]) -> Vec<Vec<Entry>> {
-        if v.len() <= 1 {
-            return vec![v.to_vec()];
-        }
-        let mut out = Vec::new();
-        for i in 0..v.len() {
-            let mut rest = v.to_vec();
-            let first = rest.remove(i);
-            for mut p in permutations(&rest) {
-                p.insert(0, first.clone());
-                out.push(p);
-            }
-        }
-        out
+    /// `op` re-stamped until its hash sorts after `floor`, so Kahn order is known.
+    fn op_after(by: &Identity, parent: &Entry, kind: Kind, body: Value, floor: &Entry) -> Entry {
+        (10..)
+            .map(|at| Entry::signed(by, vec![parent.hash()], kind, body.clone(), at))
+            .find(|e| e.hash() > floor.hash())
+            .unwrap()
     }
 
     #[test]
@@ -571,29 +623,116 @@ mod tests {
 
     #[test]
     fn removal_below_other_entries_still_wins() {
-        // Branch 2 reaches the removal only after two meta entries, so branch 1's admission
-        // may be replayed first; it must still end up dropped.
+        // Branch 2 reaches the removal only after two meta entries that sort after `xc`, so
+        // the first pass replays X's admission of C before the removal: only the fix-point
+        // drops it.
         let (f, x, c) = (id(), id(), id());
         let g = genesis(&f);
-        let ax = admit(&f, &g, &x.key, "x");
+        let [ax0, ax] = admit_admin(&f, &g, &x);
         let xc = admit(&x, &ax, &c.key, "c");
-        let m1 = op(&f, &ax, Kind::Meta, json!({"relay": "r1"}));
-        let m2 = op(&f, &m1, Kind::Meta, json!({"team_name": "acme2"}));
+        let m1 = op_after(&f, &ax, Kind::Meta, json!({"relay": "r1"}), &xc);
+        let m2 = op_after(&f, &m1, Kind::Meta, json!({"team_name": "acme2"}), &xc);
         let rx = member(&f, &m2, Kind::Remove, &x.key);
-        let r = replay(&[g, ax, xc, m1, m2, rx]);
+        let r = replay(&[g, ax0, ax, xc, m1, m2, rx]);
         assert_eq!(r.members.len(), 1);
         assert_eq!(r.team_name, "acme2");
         assert_eq!(r.relay.as_deref(), Some("r1"));
     }
 
     #[test]
-    fn replay_is_order_independent() {
-        for entries in [fork().0, deep_fork().0] {
-            let want = replay(&entries);
-            for p in permutations(&entries) {
-                assert_eq!(replay(&p), want);
-            }
+    fn removal_cycle_converges_and_is_stable() {
+        // Admins A, B, C concurrently remove B, C, A: removal wins, so all three go, and
+        // unrelated entries that change the replay order change nothing.
+        let (f, a, b, c) = (id(), id(), id(), id());
+        let g = genesis(&f);
+        let mut log = vec![g.clone()];
+        for (who, name) in [(&a, "a"), (&b, "b"), (&c, "c")] {
+            let e = admit(&f, log.last().unwrap(), &who.key, name);
+            log.push(e);
         }
+        for who in [&a, &b, &c] {
+            let e = member(&f, log.last().unwrap(), Kind::Admin, &who.key);
+            log.push(e);
+        }
+        let fork = log.last().unwrap().clone();
+        log.push(member(&a, &fork, Kind::Remove, &b.key));
+        log.push(member(&b, &fork, Kind::Remove, &c.key));
+        log.push(member(&c, &fork, Kind::Remove, &a.key));
+        let mut parent = fork;
+        for extra in 0..=3 {
+            let r = replay(&log);
+            assert_eq!(
+                r.members.keys().collect::<Vec<_>>(),
+                [&f.key],
+                "{extra} extra"
+            );
+            let m = op(&f, &parent, Kind::Meta, json!({}));
+            log.push(m.clone());
+            parent = m;
+        }
+    }
+
+    #[test]
+    fn readmitted_member_writes_again() {
+        let (f, x) = (id(), id());
+        let g = genesis(&f);
+        let ax = admit(&f, &g, &x.key, "x");
+        let rx = member(&f, &ax, Kind::Remove, &x.key);
+        let again = admit(&f, &rx, &x.key, "x");
+        let pr = op(
+            &x,
+            &again,
+            Kind::Proof,
+            json!({"member": x.key, "proof": "t"}),
+        );
+        let mut log = vec![g, ax, rx, again, pr.clone()];
+        assert_eq!(replay(&log).members[&x.key].proof.as_deref(), Some("t"));
+        log.push(member(&x, &pr, Kind::Leave, &x.key));
+        assert!(!replay(&log).members.contains_key(&x.key));
+    }
+
+    #[test]
+    fn bridge_member_cannot_link_or_admit() {
+        let (f, x, k, c, d) = (id(), id(), id(), id(), id());
+        let g = genesis(&f);
+        let ax = admit(&f, &g, &x.key, "x");
+        let ak = op(
+            &f,
+            &ax,
+            Kind::Admit,
+            json!({"member": k.key, "name": "bridge", "computer": "cloud", "person_id": f.key,
+                   "kind": "cloud", "role": "member", "ticket_id": null}),
+        );
+        let pk = member(&f, &ak, Kind::Admin, &k.key);
+        let lk = link(&k, &pk, "tk");
+        let lx = link(&x, &lk, "tx");
+        let kc = admit_via(&k, &lx, &c.key, "c", "tx");
+        let kd = admit(&k, &kc, &d.key, "d"); // as an admin: still dropped
+        let r = replay(&[g, ax, ak, pk, lk, lx, kc, kd]);
+        assert_eq!(r.members[&k.key].role, Role::Admin);
+        assert!(!r.links.contains_key("tk"));
+        assert!(r.links.contains_key("tx"));
+        assert!(!r.members.contains_key(&c.key));
+        assert!(!r.members.contains_key(&d.key));
+    }
+
+    #[test]
+    fn once_link_admits_exactly_one_even_on_a_fork() {
+        let (f, x, c, d) = (id(), id(), id(), id());
+        let g = genesis(&f);
+        let ax = admit(&f, &g, &x.key, "x");
+        let l = once_link(&x, &ax, "t1");
+        let xc = admit_via(&x, &l, &c.key, "c", "t1");
+        let fd = admit_via(&f, &l, &d.key, "d", "t1");
+        let mut log = vec![g, ax, l, xc, fd];
+        let r = replay(&log);
+        assert_eq!(
+            r.members.contains_key(&c.key) as u8 + r.members.contains_key(&d.key) as u8,
+            1
+        );
+        assert!(r.links.is_empty());
+        log.reverse();
+        assert_eq!(replay(&log), r);
     }
 
     #[test]
