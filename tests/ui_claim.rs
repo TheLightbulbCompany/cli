@@ -10,9 +10,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 fn ui_claim_returns_its_lease() {
     let env = Env::new();
     env.daemon(false, "", &[]);
+    assert_eq!(env.status()["claim_live"], false);
     let r = env.ask(json!({"id": 1, "op": "ui.claim"}));
     assert_eq!(r["ok"], true, "{r}");
     assert_eq!(r["lease_s"], 20);
+    assert_eq!(env.status()["claim_live"], true);
 }
 
 #[tokio::test]

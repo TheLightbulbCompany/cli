@@ -162,6 +162,7 @@ async fn handle(
                     "relay": "off",
                     "port": daemon.peers.port.get(),
                     "needs_update": needs_update,
+                    "claim_live": daemon.claim_live(now() as i64),
                 }),
             )
         }

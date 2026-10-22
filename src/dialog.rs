@@ -18,6 +18,9 @@ pub type Answers = mpsc::UnboundedReceiver<(String, Option<String>)>;
 /// `osascript` arguments for one dialog. The title, text and button names are only ever
 /// `argv` items after `--`, never AppleScript source. Callers put `Decline` first: it is the
 /// default button, so a stray Enter never allows. Unanswered, it gives up after 600 s.
+/// Callers pass 1-3 fixed button names, `Decline` first. Never `Cancel` (AppleScript treats it
+/// as a cancel and `osascript` exits -128), and never a name with a comma (`answer_of` splits
+/// on it).
 pub fn args(title: &str, text: &str, buttons: &[&str]) -> Vec<String> {
     let items: Vec<String> = (3..3 + buttons.len())
         .map(|i| format!("item {i} of argv"))

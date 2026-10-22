@@ -155,7 +155,7 @@ pub async fn run(dir: &Path) -> Result<()> {
     // Briefly wider than 0600 after bind; the 0700 state dir closes that window.
     fs::set_permissions(&sock, Permissions::from_mode(0o600))?;
 
-    let (dialogs, answers) = dialog::Queue::new("osascript".into());
+    let (dialogs, answers) = dialog::Queue::new("/usr/bin/osascript".into());
     let daemon = Arc::new(Daemon {
         store: Mutex::new(store),
         identity,
