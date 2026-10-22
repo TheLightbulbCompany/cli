@@ -467,3 +467,21 @@ fn setup_installs_the_canonical_binary_and_wires_everything_to_it() {
         )));
     }
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn setup_remove_also_stops_the_daemon_and_removes_the_job() {
+    let e = Env::new();
+    let h = e.home.path();
+    assert!(e.run(&["setup"]).status.success());
+    let plist = h.join("Library/LaunchAgents/company.thelightbulb.network.plist");
+    assert!(plist.exists());
+    let o = e.run(&["setup", "--remove"]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(!plist.exists());
+    assert!(
+        out(&o).contains("daemon stopped and launchd job removed"),
+        "{}",
+        out(&o)
+    );
+}

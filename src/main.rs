@@ -160,8 +160,13 @@ fn main() -> lightbulb_network::Result<()> {
             for agent in setup::run(&home, &executable, &server_name, remove).agents {
                 println!("{}", agent.line());
             }
-            if !remove && cfg!(target_os = "macos") {
-                exit(cli::install_job(&home, &executable)?);
+            if cfg!(target_os = "macos") {
+                // `--remove` is the off switch: the job and the running daemon go too.
+                exit(if remove {
+                    cli::daemon_uninstall()?
+                } else {
+                    cli::install_job(&home, &executable)?
+                });
             }
         }
         Command::Hook { agent, event } => {
