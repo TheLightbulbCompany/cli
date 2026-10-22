@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use lightbulb_network::{daemon, hook, mcp, paths};
+use lightbulb_network::{daemon, hook, mcp, paths, setup};
 use std::io::{Read, Write};
 
 #[derive(Parser)]
@@ -24,6 +24,19 @@ enum Command {
     ///
     /// Debug builds only: LIGHTBULB_NETWORK_HOOK_CALLER=<pid>:<birth_micros> names the calling agent (tests).
     Mcp,
+    /// Wire the installed agents (Claude Code, Codex, Cursor, Grok CLI) to this engine:
+    /// their hooks and MCP server entry. Each file is backed up once as <file>.lightbulb-backup.
+    Setup {
+        /// Take out only what setup wrote; backups are left as they are.
+        #[arg(long)]
+        remove: bool,
+        /// The engine binary the hooks and MCP entries run (default: this one).
+        #[arg(long)]
+        executable: Option<std::path::PathBuf>,
+        /// The MCP server entry's name, also used in Cursor's and Grok's allow rules.
+        #[arg(long, default_value = "lightbulb")]
+        server_name: String,
+    },
 }
 
 fn main() -> lightbulb_network::Result<()> {
@@ -42,6 +55,27 @@ fn main() -> lightbulb_network::Result<()> {
             tokio::runtime::Runtime::new()?.block_on(daemon::run(&paths::state_dir()))?
         }
         Command::Mcp => mcp::run()?,
+        Command::Setup {
+            remove,
+            executable,
+            server_name,
+        } => {
+            if server_name.is_empty()
+                || !server_name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            {
+                return Err("--server-name takes letters, digits, - and _".into());
+            }
+            let executable = match executable {
+                Some(e) => e,
+                None => std::env::current_exe()?.canonicalize()?,
+            };
+            let home = dirs::home_dir().ok_or("no home directory")?;
+            for agent in setup::run(&home, &executable, &server_name, remove).agents {
+                println!("{}", agent.line());
+            }
+        }
         Command::Hook { agent, event } => {
             let mut stdin = String::new();
             let ran = std::io::stdin()

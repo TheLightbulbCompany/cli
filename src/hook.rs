@@ -29,7 +29,7 @@ pub enum Event {
     SessionEnd,
 }
 
-const EVENTS: [Event; 5] = [
+pub const EVENTS: [Event; 5] = [
     Event::SessionStart,
     Event::UserPromptSubmit,
     Event::PostToolUse,
@@ -50,7 +50,7 @@ impl Event {
     }
 
     /// The command-line argument: `hook <agent> <arg>`.
-    fn arg(self) -> &'static str {
+    pub fn arg(self) -> &'static str {
         match self {
             Event::SessionStart => "session-start",
             Event::UserPromptSubmit => "user-prompt-submit",

@@ -22,7 +22,9 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros", "io-std", "process"] }
+toml_edit = "0.25"
 ulid = "3.0.0"
 
 [dev-dependencies]
