@@ -122,6 +122,8 @@ pub struct Roster {
     pub links: BTreeMap<String, Link>,
     pub relay: Option<String>,
     parents: BTreeMap<String, Vec<String>>,
+    /// Every replayed entry with its hash, parents first.
+    log: Vec<(String, Entry)>,
 }
 
 impl Roster {
@@ -138,10 +140,15 @@ impl Roster {
         self.parents.contains_key(hash)
     }
 
-    /// Every entry `hash` descends from, itself excluded.
-    pub fn ancestors(&self, hash: &str) -> HashSet<String> {
+    /// Every replayed entry with its hash, parents first.
+    pub fn log(&self) -> &[(String, Entry)] {
+        &self.log
+    }
+
+    /// Every entry one of `hashes` descends from (a start only if another descends from it).
+    pub fn ancestors_of<S: AsRef<str>>(&self, hashes: &[S]) -> HashSet<String> {
         let mut seen = HashSet::new();
-        let mut todo: Vec<&str> = vec![hash];
+        let mut todo: Vec<&str> = hashes.iter().map(AsRef::as_ref).collect();
         while let Some(h) = todo.pop() {
             for p in self.parents.get(h).into_iter().flatten() {
                 if seen.insert(p.clone()) {
@@ -179,7 +186,7 @@ pub fn replay(entries: &[Entry]) -> Roster {
     // ponytail: every ancestor set up front, O(n^2); index the DAG if rosters grow large.
     let anc: BTreeMap<&str, HashSet<String>> = by_hash
         .keys()
-        .map(|h| (h.as_str(), graph.ancestors(h)))
+        .map(|h| (h.as_str(), graph.ancestors_of(&[h])))
         .collect();
     // A removal deeper in its branch than a concurrent entry is replayed after it, so replay
     // again knowing every removal any pass applied: each drops its target's concurrent entries
@@ -200,9 +207,10 @@ pub fn replay(entries: &[Entry]) -> Roster {
     if applied != known {
         let (exact, again) = pass(&by_hash, &anc, &applied, graph);
         if again == applied {
-            return exact;
+            r = exact;
         }
     }
+    r.log = ordered(&by_hash);
     r
 }
 
@@ -500,33 +508,32 @@ fn new_member(e: &Entry, role: Role) -> Member {
     }
 }
 
-/// `entries` with every entry after its parents (lowest hash first among those ready); an
+/// `by_hash` with every entry after its parents (lowest hash first among those ready); an
 /// entry whose parent is missing is left out.
-pub fn ordered(entries: Vec<Entry>) -> Vec<Entry> {
-    let mut by_hash: BTreeMap<String, Entry> = entries.into_iter().map(|e| (e.hash(), e)).collect();
-    let mut waiting: BTreeMap<String, usize> = BTreeMap::new();
-    let mut children: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for (h, e) in &by_hash {
-        waiting.insert(h.clone(), e.parents.len());
+fn ordered(by_hash: &BTreeMap<String, &Entry>) -> Vec<(String, Entry)> {
+    let mut waiting: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut children: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (h, e) in by_hash {
+        waiting.insert(h, e.parents.len());
         for p in &e.parents {
-            children.entry(p.clone()).or_default().push(h.clone());
+            children.entry(p.as_str()).or_default().push(h);
         }
     }
-    let mut ready: BTreeSet<String> = waiting
+    let mut ready: BTreeSet<&str> = waiting
         .iter()
         .filter(|(_, n)| **n == 0)
-        .map(|(h, _)| h.clone())
+        .map(|(h, _)| *h)
         .collect();
     let mut out = Vec::new();
     while let Some(h) = ready.pop_first() {
-        for c in children.remove(&h).into_iter().flatten() {
-            let n = waiting.get_mut(&c).expect("a child is an entry");
+        for c in children.remove(h).into_iter().flatten() {
+            let n = waiting.get_mut(c).expect("a child is an entry");
             *n -= 1;
             if *n == 0 {
                 ready.insert(c);
             }
         }
-        out.push(by_hash.remove(&h).expect("ready entries are held"));
+        out.push((h.to_string(), by_hash[h].clone()));
     }
     out
 }

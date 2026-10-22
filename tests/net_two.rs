@@ -4,7 +4,7 @@
 
 use iroh::endpoint::{presets, Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, PublicKey, SecretKey};
-use lightbulb_network::identity::Identity;
+use lightbulb_network::identity::{self, Identity};
 use lightbulb_network::net::frames::{self, Frame};
 use lightbulb_network::net::{ALPN, PROTOCOL};
 use lightbulb_network::roster::{self, Entry, Kind};
@@ -29,7 +29,7 @@ async fn endpoint(id: &Identity) -> Endpoint {
 
 /// The running daemon of `env`, on the loopback.
 fn addr(env: &Env) -> EndpointAddr {
-    let key = PublicKey::from_bytes(env.identity().signing.verifying_key().as_bytes()).unwrap();
+    let key = PublicKey::from_bytes(&identity::key_bytes(&env.identity().key).unwrap()).unwrap();
     let port = env.status()["port"].as_u64().unwrap();
     EndpointAddr::new(key).with_ip_addr(format!("127.0.0.1:{port}").parse().unwrap())
 }
@@ -117,8 +117,8 @@ fn store_all(env: &Env, entries: &[Entry]) {
 async fn two_members_connect_and_converge_rosters() {
     let (a, b) = (Env::new(), Env::new());
     seed_pair(&a, &b);
-    b.daemon("", &[]);
-    a.daemon("", &[("LIGHTBULB_NETWORK_PEERS", b.peer_arg())]);
+    b.daemon(false, "", &[]);
+    a.daemon(false, "", &[("LIGHTBULB_NETWORK_PEERS", b.peer_arg())]);
     let connected = json!({"online": 1, "total": 1});
     until(5, "both online", || {
         a.status()["peers"] == connected && b.status()["peers"] == connected
@@ -143,7 +143,7 @@ async fn sync_sends_only_the_delta_in_pages() {
         .flat_map(|c| chain(&ia, &admit, 10, 0, &c.to_string()))
         .collect();
     store_all(&a, &lag);
-    a.daemon("", &[]);
+    a.daemon(false, "", &[]);
 
     let ep = endpoint(&b.identity()).await;
     let mut p = Peer::dial(&ep, &a).await;
@@ -183,19 +183,12 @@ async fn child_before_parent_in_one_frame_still_converges() {
     let (a, b) = (Env::new(), Env::new());
     let [_, admit] = seed_pair(&a, &b);
     let pc = chain(&a.identity(), &admit, 2, 0, "pc");
-    b.daemon("", &[]);
+    b.daemon(false, "", &[]);
 
     let ep = endpoint(&a.identity()).await;
-    let mut p = Peer::dial(&ep, &b).await;
-    p.hello(vec![admit.hash()]).await;
-    assert!(matches!(p.recv().await, Frame::Hello { .. }));
-    assert!(entries_of(&p.pages().await).is_empty());
-    let entries = vec![pc[1].clone(), pc[0].clone()];
-    p.send(&Frame::Roster {
-        entries,
-        more: false,
-    })
-    .await;
+    let mut p = synced(&ep, &b, &admit).await;
+    p.send(&roster_frame(vec![pc[1].clone(), pc[0].clone()]))
+        .await;
     until(2, "B applies both", || {
         heads(b.heads()) == vec![pc[1].hash()]
     });
@@ -223,7 +216,7 @@ async fn child_and_parent_in_separate_frames_converge() {
     let (a, b) = (Env::new(), Env::new());
     let [_, admit] = seed_pair(&a, &b);
     let pc = chain(&a.identity(), &admit, 2, 0, "pc");
-    b.daemon("", &[]);
+    b.daemon(false, "", &[]);
 
     let ep = endpoint(&a.identity()).await;
     let mut p = synced(&ep, &b, &admit).await;
@@ -240,7 +233,7 @@ async fn waiting_entries_are_dropped_on_close() {
     let (a, b) = (Env::new(), Env::new());
     let [_, admit] = seed_pair(&a, &b);
     let pc = chain(&a.identity(), &admit, 2, 0, "pc");
-    b.daemon("", &[]);
+    b.daemon(false, "", &[]);
 
     let ep = endpoint(&a.identity()).await;
     let mut p = synced(&ep, &b, &admit).await;
@@ -265,8 +258,8 @@ async fn roster_pages_split_by_bytes_not_only_count() {
     let (a, b) = (Env::new(), Env::new());
     let [_, admit] = seed_pair(&a, &b);
     store_all(&a, &chain(&a.identity(), &admit, 300, 4096, "big"));
-    a.daemon("", &[]);
-    b.daemon("", &[]);
+    a.daemon(false, "", &[]);
+    b.daemon(false, "", &[]);
 
     // A's pages, as B would get them.
     let ep_b = endpoint(&b.identity()).await;
@@ -283,10 +276,7 @@ async fn roster_pages_split_by_bytes_not_only_count() {
 
     // Handed to B's daemon as A: all applied.
     let ep_a = endpoint(&a.identity()).await;
-    let mut to_b = Peer::dial(&ep_a, &b).await;
-    to_b.hello(vec![admit.hash()]).await;
-    assert!(matches!(to_b.recv().await, Frame::Hello { .. }));
-    assert!(entries_of(&to_b.pages().await).is_empty());
+    let mut to_b = synced(&ep_a, &b, &admit).await;
     for f in &pages {
         to_b.send(f).await;
     }
@@ -298,7 +288,7 @@ async fn roster_pages_split_by_bytes_not_only_count() {
 async fn non_member_is_refused_on_member_alpn() {
     let (a, b) = (Env::new(), Env::new());
     seed_pair(&a, &b);
-    a.daemon("", &[]);
+    a.daemon(false, "", &[]);
     let stranger = Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
     let ep = endpoint(&stranger).await;
     let conn = ep.connect(addr(&a), ALPN).await.unwrap();
@@ -311,12 +301,10 @@ async fn non_member_is_refused_on_member_alpn() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn removed_member_connection_is_closed_on_removal() {
     let (a, b) = (Env::new(), Env::new());
-    seed_pair(&a, &b);
-    a.daemon("", &[]);
+    let [_, admit] = seed_pair(&a, &b);
+    a.daemon(false, "", &[]);
     let ep = endpoint(&b.identity()).await;
-    let mut p = Peer::dial(&ep, &a).await;
-    p.hello(vec![]).await;
-    assert!(matches!(p.recv().await, Frame::Hello { .. }));
+    let p = synced(&ep, &a, &admit).await;
     until(2, "A sees B online", || a.status()["peers"]["online"] == 1);
 
     let o = a.detached(&[EXE, "remove", "bob"], "");
@@ -338,7 +326,7 @@ async fn removal_inside_the_gate_closes_the_connection() {
     let (a, b) = (Env::new(), Env::new());
     seed_pair(&a, &b);
     let pause = ("LIGHTBULB_NETWORK_DEBUG_GATE_PAUSE_MS", "1500".to_string());
-    a.daemon("", &[pause]);
+    a.daemon(false, "", &[pause]);
     let ep = endpoint(&b.identity()).await;
     let conn = ep.connect(addr(&a), ALPN).await.unwrap();
     // A holds its gate 1.5 s after the handshake; the removal lands in that window and
@@ -355,7 +343,7 @@ async fn removal_inside_the_gate_closes_the_connection() {
 async fn older_protocol_is_reported_not_served() {
     let (a, b) = (Env::new(), Env::new());
     seed_pair(&a, &b);
-    a.daemon("", &[]);
+    a.daemon(false, "", &[]);
     // B, played here, speaks protocol 0.
     let ep = endpoint(&b.identity()).await;
     let mut p = Peer::dial(&ep, &a).await;

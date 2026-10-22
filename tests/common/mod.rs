@@ -33,6 +33,16 @@ impl Env {
         }
     }
 
+    /// `c` with this env's state dir, Claude home, HOME and user, launchctl off.
+    fn base_cmd(&self, mut c: Command) -> Command {
+        c.env("LIGHTBULB_NETWORK_HOME", self.state.path())
+            .env("LIGHTBULB_NETWORK_CLAUDE_HOME", self.home.path())
+            .env("LIGHTBULB_NETWORK_NO_LAUNCHCTL", "1")
+            .env("HOME", self.home.path())
+            .env("USER", "prasiddha");
+        c
+    }
+
     /// One daemon request on a fresh connection (the CLI starts the daemon on first use).
     pub fn ask(&self, body: Value) -> Value {
         let mut s = UnixStream::connect(self.state.path().join("sock")).unwrap();
@@ -50,25 +60,14 @@ impl Env {
         Store::open(&self.state.path().join("state.db")).unwrap()
     }
 
-    /// Starts `lightbulb-network daemon` on this state dir with `config` as `config.toml`
-    /// (`lan = false` unless `config` sets `lan`) and `env` set, and waits until it answers.
-    pub fn daemon(&self, config: &str, env: &[(&str, String)]) {
-        // mDNS only where a test asks for it (`lan = true`).
-        let lan = if config.contains("lan") {
-            ""
-        } else {
-            "lan = false\n"
-        };
-        let config = format!("{lan}{config}");
+    /// Starts `lightbulb-network daemon` on this state dir with `lan` (mDNS) and `config` as
+    /// `config.toml`, and `env` set, and waits until it answers.
+    pub fn daemon(&self, lan: bool, config: &str, env: &[(&str, String)]) {
+        let config = format!("lan = {lan}\n{config}");
         std::fs::write(self.state.path().join("config.toml"), config).unwrap();
         let log = std::fs::File::create(self.state.path().join("daemon.log")).unwrap();
-        let mut c = Command::new(EXE);
+        let mut c = self.base_cmd(Command::new(EXE));
         c.arg("daemon")
-            .env("LIGHTBULB_NETWORK_HOME", self.state.path())
-            .env("LIGHTBULB_NETWORK_CLAUDE_HOME", self.home.path())
-            .env("LIGHTBULB_NETWORK_NO_LAUNCHCTL", "1")
-            .env("HOME", self.home.path())
-            .env("USER", "prasiddha")
             .env_remove("LIGHTBULB_NETWORK_PEERS")
             .env_remove("LIGHTBULB_NETWORK_DEBUG_PROTOCOL")
             .envs(env.iter().map(|(k, v)| (k, v)))
@@ -84,12 +83,10 @@ impl Env {
                     && line.contains("\"ok\":true")
             })
         };
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !ping() {
+        until(10, "the daemon starts", || {
             assert!(child.try_wait().unwrap().is_none(), "the daemon exited");
-            assert!(Instant::now() < deadline, "the daemon did not start");
-            std::thread::sleep(Duration::from_millis(20));
-        }
+            ping()
+        });
         std::thread::spawn(move || child.wait());
     }
 
@@ -117,15 +114,10 @@ impl Env {
         std::fs::write(d.path().join("in"), stdin).unwrap();
         let script =
             r#"( "$@" <"$D/in" >"$D/out" 2>"$D/err"; echo $? >"$D/c"; mv "$D/c" "$D/code" ) &"#;
-        let mut c = Command::new("/bin/sh");
+        let mut c = self.base_cmd(Command::new("/bin/sh"));
         c.args(["-c", script, "sh"])
             .args(argv)
             .env("D", d.path())
-            .env("LIGHTBULB_NETWORK_HOME", self.state.path())
-            .env("LIGHTBULB_NETWORK_CLAUDE_HOME", self.home.path())
-            .env("LIGHTBULB_NETWORK_NO_LAUNCHCTL", "1")
-            .env("HOME", self.home.path())
-            .env("USER", "prasiddha")
             .env_remove("LIGHTBULB_NETWORK_HOOK_CALLER");
         if let Some(pin) = &self.pin {
             c.env("LIGHTBULB_NETWORK_HOOK_CALLER", pin);
