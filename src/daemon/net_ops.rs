@@ -111,6 +111,12 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, peer_pid: Option
                 "verified": false,
             }),
         ),
+        // `ui.claim {}` -> `{lease_s}`: the Lightbulb app shows the person's questions itself;
+        // no OS dialog opens until it stops heartbeating.
+        "ui.claim" => {
+            daemon.dialogs.claim(super::ipc::now() as i64);
+            Response::ok(id, json!({ "lease_s": crate::dialog::LEASE_S }))
+        }
         _ => Response::err(id, UNKNOWN_OP),
     }
 }

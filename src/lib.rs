@@ -2,6 +2,7 @@ pub mod agents;
 pub mod cli;
 pub mod config;
 pub mod daemon;
+pub mod dialog;
 pub mod doing;
 pub mod frame;
 pub mod hook;

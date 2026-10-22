@@ -5,7 +5,7 @@ use crate::agents::{claude, codex};
 use crate::config::Config;
 use crate::identity::Identity;
 use crate::sessions::{self, Key, Tier};
-use crate::{cli, frame, mail, net, paths, roster, store::Store, Result};
+use crate::{cli, dialog, frame, mail, net, paths, roster, store::Store, Result};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions, Permissions};
@@ -46,6 +46,10 @@ pub struct Daemon {
     pub push_failed: Mutex<HashSet<String>>,
     /// The member connections (`net`).
     pub peers: net::Peers,
+    /// The person's OS dialogs, one at a time, none while `ui.claim` is live.
+    pub dialogs: dialog::Queue,
+    /// `dialogs`' answers, for the task that routes them (admission, holds) to take.
+    pub dialog_answers: Mutex<Option<dialog::Answers>>,
 }
 
 impl Daemon {
@@ -56,6 +60,11 @@ impl Daemon {
             .entry(key.into())
             .or_default()
             .clone()
+    }
+
+    /// Whether the Lightbulb app holds a `ui.claim` at `now`.
+    pub fn claim_live(&self, now: i64) -> bool {
+        self.dialogs.claim_live(now)
     }
 }
 
@@ -146,6 +155,7 @@ pub async fn run(dir: &Path) -> Result<()> {
     // Briefly wider than 0600 after bind; the 0700 state dir closes that window.
     fs::set_permissions(&sock, Permissions::from_mode(0o600))?;
 
+    let (dialogs, answers) = dialog::Queue::new("osascript".into());
     let daemon = Arc::new(Daemon {
         store: Mutex::new(store),
         identity,
@@ -160,6 +170,8 @@ pub async fn run(dir: &Path) -> Result<()> {
         mailbox_locks: Mutex::default(),
         push_failed: Mutex::default(),
         peers: net::Peers::default(),
+        dialogs,
+        dialog_answers: Mutex::new(Some(answers)),
     });
     let net = net::Net::start(daemon.clone()).await?;
     ipc::serve(listener, daemon).await;
