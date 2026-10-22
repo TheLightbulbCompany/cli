@@ -86,6 +86,17 @@ enum Command {
     Remove { name: String },
     /// Leave the team; this computer is on its own network again.
     Leave,
+    /// Join the network an invite link is for (this computer must be on its own).
+    Join {
+        link: String,
+        /// The name you go by in the network (default: your user name).
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Allow a join request (`J<n>`).
+    Approve { request: String },
+    /// Decline a join request (`J<n>`).
+    Decline { request: String },
     #[command(external_subcommand)]
     External(Vec<OsString>),
     /// Run by an agent's hook config: `hook <claude|codex|cursor|grok> <session-start|user-prompt-submit|post-tool-use|stop|session-end>`.
@@ -170,6 +181,9 @@ fn main() -> lightbulb_network::Result<()> {
         Command::Admin { name, founder } => exit(cli::admin(&name, founder)?),
         Command::Remove { name } => exit(cli::remove(&name)?),
         Command::Leave => exit(cli::leave()?),
+        Command::Join { link, name } => exit(cli::join(&link, name)?),
+        Command::Approve { request } => exit(cli::answer_join(&request, true)?),
+        Command::Decline { request } => exit(cli::answer_join(&request, false)?),
         Command::External(args) => exit(cli::forward(args)?),
         Command::Mcp { server_name } => mcp::run(server_name)?,
         Command::Setup {

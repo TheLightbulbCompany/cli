@@ -50,6 +50,8 @@ pub struct Daemon {
     pub dialogs: dialog::Queue,
     /// `dialogs`' answers, for the task that routes them (admission, holds) to take.
     pub dialog_answers: Mutex<Option<dialog::Answers>>,
+    /// The join requests waiting for their person's answer (`admission`).
+    pub admissions: crate::admission::Waiting,
 }
 
 impl Daemon {
@@ -174,7 +176,9 @@ pub async fn run(dir: &Path) -> Result<()> {
         peers,
         dialogs,
         dialog_answers: Mutex::new(Some(answers)),
+        admissions: Mutex::default(),
     });
+    tokio::spawn(crate::admission::route(daemon.clone()));
     let net = net::Net::start(daemon.clone()).await?;
     ipc::serve(listener, daemon).await;
     net.close().await;

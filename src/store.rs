@@ -256,6 +256,95 @@ impl Store {
         self.conn
             .execute_batch("DELETE FROM roster; DELETE FROM team_link;")
     }
+
+    /// Notes that once link `ticket_id`, if minted here, admitted `by`.
+    pub fn use_link(&self, ticket_id: &str, by: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE team_link SET used_by = ?2 WHERE ticket_id = ?1",
+            [ticket_id, by],
+        )?;
+        Ok(())
+    }
+
+    pub fn link_used(&self, ticket_id: &str) -> rusqlite::Result<bool> {
+        self.conn
+            .prepare("SELECT 1 FROM team_link WHERE ticket_id = ?1 AND used_by IS NOT NULL")?
+            .exists([ticket_id])
+    }
+
+    /// Stores `j` as a new `open` join request; its id.
+    pub fn put_join(&self, j: &Join) -> rusqlite::Result<i64> {
+        self.conn.execute(
+            "INSERT INTO join_requests (ticket_id, inviter, candidate, name, computer, kind,
+             created_at, state) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'open')",
+            params![
+                j.ticket_id,
+                j.inviter,
+                j.candidate,
+                j.name,
+                j.computer,
+                j.kind,
+                j.created_at
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Moves join request `id` from `open` to `state`; whether it was open.
+    pub fn close_join(&self, id: i64, state: &str) -> rusqlite::Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE join_requests SET state = ?2 WHERE id = ?1 AND state = 'open'",
+            params![id, state],
+        )? == 1)
+    }
+
+    /// Marks `expired` every open join request created before `before`.
+    pub fn expire_joins(&self, before: i64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE join_requests SET state = 'expired' WHERE state = 'open' AND created_at < ?1",
+            [before],
+        )?;
+        Ok(())
+    }
+
+    pub fn open_joins(&self) -> rusqlite::Result<Vec<Join>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, ticket_id, inviter, candidate, name, computer, kind, created_at
+             FROM join_requests WHERE state = 'open' ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(Join {
+                id: r.get(0)?,
+                ticket_id: r.get(1)?,
+                inviter: r.get(2)?,
+                candidate: r.get(3)?,
+                name: r.get(4)?,
+                computer: r.get(5)?,
+                kind: r.get(6)?,
+                created_at: r.get(7)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn join_exists(&self, id: i64) -> rusqlite::Result<bool> {
+        self.conn
+            .prepare("SELECT 1 FROM join_requests WHERE id = ?1")?
+            .exists([id])
+    }
+}
+
+/// A `join_requests` row (`id` is unset until stored).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Join {
+    pub id: i64,
+    pub ticket_id: String,
+    pub inviter: String,
+    pub candidate: String,
+    pub name: String,
+    pub computer: String,
+    pub kind: String,
+    pub created_at: i64,
 }
 
 #[cfg(test)]

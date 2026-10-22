@@ -192,6 +192,7 @@ async fn handle(
             _ => Response::err(id, BAD_REQUEST),
         },
         "inbox" => inbox(id, &req.body, daemon, peer).await,
+        "team.join" => crate::admission::join(id, &req.body, daemon).await,
         // `mark_read {key}` -> `{}`: `key`'s session took a step (an MCP tool call), so the mail
         // delivered to it before now has been seen.
         "mark_read" => match req.body["key"].as_str() {

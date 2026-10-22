@@ -55,7 +55,7 @@ fn gate(op: &str, invite: Invite) -> Gate {
     let (person_only, min_role) = match op {
         "team.remove" => (true, Some(Role::Admin)),
         "team.admin" => (true, Some(Role::Founder)),
-        "team.leave" => (true, None),
+        "team.leave" | "team.admit" => (true, None),
         "team.invite" if invite == Invite::Open => (true, Some(Role::Admin)),
         "team.invite" => (false, Some(Role::Member)),
         _ => (false, None),
@@ -80,6 +80,11 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, peer_pid: Option
         // Governance and open links need a person at the socket, before any authority check.
         if gate.person_only && !peer_pid.is_some_and(person_only) {
             return refused(id, "not_a_person");
+        }
+        match op {
+            "team.admit" => return crate::admission::admit_op(id, body, daemon),
+            "team.join_requests" => return crate::admission::requests_op(id, daemon),
+            _ => {}
         }
         let mut team = daemon.team.lock().unwrap();
         let store = daemon.store.lock().unwrap();
@@ -155,6 +160,27 @@ pub fn install(
     team.roster = new;
     daemon.peers.changed.notify_one();
     Ok(())
+}
+
+/// Signs `kind` over `team`'s heads and accepts it; the one replay after it becomes the
+/// cached roster (`install`). Returns the entry. Under the `team` then `store` locks.
+pub fn write(
+    daemon: &Daemon,
+    team: &mut TeamState,
+    store: &Store,
+    kind: Kind,
+    body: Value,
+    now: i64,
+) -> crate::Result<Entry> {
+    let e = Entry::signed(&daemon.identity, team.roster.heads.clone(), kind, body, now);
+    roster::accept(store, &e, now)?;
+    install(
+        daemon,
+        team,
+        store,
+        roster::replay(&roster::entries(store)?),
+    )?;
+    Ok(e)
 }
 
 /// One team op, under the `team` then `store` locks.
@@ -308,19 +334,8 @@ impl TeamOps<'_> {
         })
     }
 
-    /// Signs `kind` over the current heads and accepts it; the one replay after it becomes
-    /// the cached roster. Returns the entry.
     fn write(&mut self, kind: Kind, body: Value) -> crate::Result<Entry> {
-        let e = Entry::signed(
-            &self.daemon.identity,
-            self.team.roster.heads.clone(),
-            kind,
-            body,
-            self.now,
-        );
-        roster::accept(self.store, &e, self.now)?;
-        self.install(roster::replay(&roster::entries(self.store)?))?;
-        Ok(e)
+        write(self.daemon, self.team, self.store, kind, body, self.now)
     }
 
     fn install(&mut self, new: Roster) -> crate::Result<()> {

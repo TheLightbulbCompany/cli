@@ -282,6 +282,84 @@ pub fn invite(mode: Invite) -> Result<i32> {
     Ok(0)
 }
 
+/// `join '<link>' [--name <n>]`: joins the network `link` invites to, waiting up to 600 s
+/// for its person to allow it.
+pub fn join(link: &str, name: Option<String>) -> Result<i32> {
+    let name = name.unwrap_or_else(daemon::user_name);
+    let mut conn = connect()?;
+    let t = ask(&mut conn, "team.get", json!({}))?;
+    if t["members"].as_array().is_some_and(|m| m.len() > 1) {
+        let team = t["name"].as_str().unwrap_or_default();
+        eprintln!("You are in \"{team}\". Leave it first: lightbulb-network leave");
+        return Ok(1);
+    }
+    if crate::ticket::decode(link).is_ok_and(|t| t.mode == "ask") {
+        println!("Waiting for an admin to allow this...");
+    }
+    conn.wait_up_to(Duration::from_secs(660))?;
+    let r = ask(
+        &mut conn,
+        "team.join",
+        json!({"ticket": link, "name": name, "kind": "computer"}),
+    )?;
+    let team = r["team"].as_str().unwrap_or_default();
+    let text = match (r["state"].as_str(), r["reason"].as_str()) {
+        (Some("admitted"), _) => {
+            let computer = ask(&mut conn, "identity.get", json!({}))?["computer"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            let n = r["online"].as_u64().unwrap_or(1);
+            println!("Connected as {name} ({computer}). Team \"{team}\": {n} computers online.");
+            return Ok(0);
+        }
+        (Some("waiting"), _) => "No one has answered yet. Run the same command again to keep asking.".to_string(),
+        (_, Some("already_in_team")) => format!("You are in \"{team}\". Leave it first: lightbulb-network leave"),
+        (_, Some("name_taken")) => format!(
+            "The name \"{name}\" is already used in this network. Try: lightbulb-network join '{link}' --name {name}-2"
+        ),
+        (_, Some("unreachable")) => "No one from this network is online right now. Ask them to open their laptop, then run the same command again. Your key is ready; nothing was lost.".to_string(),
+        (_, Some("declined")) => "Your request to join was declined.".to_string(),
+        (_, Some("bad_ticket")) => "This invite link does not work. Ask for a new one.".to_string(),
+        (_, Some("expired_ticket")) => "This invite link has expired. Ask for a new one.".to_string(),
+        (_, reason) => format!("join: {}", reason.unwrap_or("refused")),
+    };
+    eprintln!("{text}");
+    Ok(1)
+}
+
+/// `approve J<n>` / `decline J<n>`: answers a join request.
+pub fn answer_join(request: &str, allow: bool) -> Result<i32> {
+    let verdict = if allow { "allow" } else { "decline" };
+    let r = connect()?.call(
+        "team.admit",
+        json!({"request": request, "verdict": verdict}),
+    )?;
+    if r["ok"] != true {
+        let texts = [
+            (
+                "not_open",
+                format!("{request} was already answered or withdrawn."),
+            ),
+            ("not_found", format!("No join request {request}.")),
+        ];
+        return refuse(&r, &texts, if allow { "approve" } else { "decline" });
+    }
+    let name = r["name"].as_str().unwrap_or_default();
+    match r["state"].as_str() {
+        Some("admitted") => println!("{name} joined the network."),
+        Some("declined") => println!("Declined {name}."),
+        _ => {
+            eprintln!(
+                "Could not admit {name}: {}",
+                r["reason"].as_str().unwrap_or("refused")
+            );
+            return Ok(1);
+        }
+    }
+    Ok(0)
+}
+
 /// `team`: the team's name and members.
 pub fn team() -> Result<i32> {
     let t = ask(&mut connect()?, "team.get", json!({}))?;

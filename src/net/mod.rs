@@ -33,6 +33,7 @@ const PAGE_ENTRIES: usize = 500;
 const REDIAL: Duration = Duration::from_secs(30);
 /// Entries one connection may hold waiting for their parents.
 const MAX_PENDING: usize = 10_000;
+const JOIN_WAIT: Duration = Duration::from_secs(600);
 
 const NOT_MEMBER: u32 = 1;
 const SUPERSEDED: u32 = 2;
@@ -49,6 +50,9 @@ pub struct Knobs {
     /// `LIGHTBULB_NETWORK_DIALOG=<button>`: every OS dialog answers that button, in its turn,
     /// without a window (empty: answers `None`).
     pub dialog: Option<Option<String>>,
+    /// How long a join request waits for its person (600 s), or
+    /// `LIGHTBULB_NETWORK_DEBUG_JOIN_WAIT_S`.
+    pub join_wait: Duration,
 }
 
 impl Knobs {
@@ -75,6 +79,9 @@ impl Knobs {
                 .and_then(|v| v.parse().ok())
                 .map(Duration::from_millis),
             dialog: var("LIGHTBULB_NETWORK_DIALOG").map(|b| Some(b).filter(|b| !b.is_empty())),
+            join_wait: var("LIGHTBULB_NETWORK_DEBUG_JOIN_WAIT_S")
+                .and_then(|v| v.parse().ok())
+                .map_or(JOIN_WAIT, Duration::from_secs),
         }
     }
 
@@ -85,6 +92,7 @@ impl Knobs {
             peers: HashMap::new(),
             gate_pause: None,
             dialog: None,
+            join_wait: JOIN_WAIT,
         }
     }
 }
@@ -98,6 +106,8 @@ pub struct Peers {
     pub changed: Notify,
     /// The endpoint's UDP port.
     pub port: OnceLock<u16>,
+    /// The endpoint, for the candidate side of a join.
+    pub endpoint: OnceLock<Endpoint>,
 }
 
 struct Link {
@@ -122,6 +132,13 @@ enum Protocol {
 impl Peers {
     pub fn knobs(&self) -> &Knobs {
         self.knobs.get_or_init(Knobs::read)
+    }
+
+    /// Where to dial member `key`: its key, and the knob's addresses for it.
+    pub fn addr(&self, key: &str) -> Option<EndpointAddr> {
+        let id = PublicKey::from_bytes(&identity::key_bytes(key)?).ok()?;
+        let addrs = self.knobs().peers.get(key).into_iter().flatten();
+        Some(addrs.fold(EndpointAddr::new(id), |a, s| a.with_ip_addr(*s)))
     }
 
     /// Members with a live connection that said `hello` in our protocol.
@@ -259,6 +276,7 @@ impl Net {
         let endpoint = b.bind().await?;
         let port = endpoint.bound_sockets().first().map_or(0, |a| a.port());
         let _ = daemon.peers.port.set(port);
+        let _ = daemon.peers.endpoint.set(endpoint.clone());
         daemon.peers.knobs();
         let net = Net(Arc::new(Inner {
             endpoint,
@@ -284,10 +302,10 @@ impl Net {
                 let Ok(conn) = accepting.await else {
                     return;
                 };
-                let key = identity::key_of(conn.remote_id().as_bytes());
                 if conn.alpn() == JOIN_ALPN {
-                    join(conn).await;
+                    crate::admission::serve(net.0.daemon.clone(), conn).await;
                 } else {
+                    let key = identity::key_of(conn.remote_id().as_bytes());
                     net.serve(conn, key, false).await;
                 }
             });
@@ -353,14 +371,8 @@ impl Net {
     }
 
     async fn dial(self, key: String) {
-        let d = &self.0.daemon;
-        let id = identity::key_bytes(&key).and_then(|b| PublicKey::from_bytes(&b).ok());
-        let r = match id {
-            Some(id) => {
-                let addrs = d.peers.knobs().peers.get(&key).into_iter().flatten();
-                let addr = addrs.fold(EndpointAddr::new(id), |a, s| a.with_ip_addr(*s));
-                self.0.endpoint.connect(addr, ALPN).await.ok()
-            }
+        let r = match self.0.daemon.peers.addr(&key) {
+            Some(addr) => self.0.endpoint.connect(addr, ALPN).await.ok(),
             None => None,
         };
         // Logged when the outcome changes, not on every redial.
@@ -539,20 +551,6 @@ fn apply(d: &Daemon, pending: &mut Vec<Entry>, from: &str) -> Result<Vec<String>
     Ok(team.roster.heads.clone())
 }
 
-/// The `JOIN_ALPN` door: Task 6 admits candidates; until then a connection whose first frame
-/// is not a `join_request` is closed, and one that is goes unanswered.
-async fn join(conn: Connection) {
-    let first = async {
-        let (_send, mut recv) = conn.accept_bi().await.ok()?;
-        frames::read(&mut recv).await.ok()
-    };
-    match tokio::time::timeout(Duration::from_secs(10), first).await {
-        Ok(Some(Frame::JoinRequest { .. })) => eprintln!("net: a join request (not served yet)"),
-        _ => eprintln!("net: closed a join connection without a join request"),
-    }
-    conn.close(VarInt::from_u32(0), b"");
-}
-
 fn hello(r: &Roster, protocol: u32) -> Frame {
     Frame::Hello {
         protocol,
@@ -598,7 +596,7 @@ fn delta(r: &Roster, heads: &[String]) -> Vec<Entry> {
 /// `entries` as `roster` frames in order: each closes before the next entry would take its
 /// encoding past `PAGE_BYTES`, or at `PAGE_ENTRIES`; `more` on all but the last. At least one
 /// frame, empty when there is nothing.
-fn pages(entries: Vec<Entry>) -> Vec<Frame> {
+pub(crate) fn pages(entries: Vec<Entry>) -> Vec<Frame> {
     let empty = Frame::Roster {
         entries: vec![],
         more: false,
@@ -628,6 +626,6 @@ fn pages(entries: Vec<Entry>) -> Vec<Frame> {
         .collect()
 }
 
-fn short(key: &str) -> &str {
+pub(crate) fn short(key: &str) -> &str {
     key.get(..12).unwrap_or(key)
 }

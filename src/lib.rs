@@ -1,3 +1,4 @@
+pub mod admission;
 pub mod agents;
 pub mod cli;
 pub mod config;
