@@ -16,6 +16,7 @@ pub(super) fn configure(ctx: &Ctx, r: &mut AgentReport) -> Result<()> {
     let hooks = dir.join("hooks.json");
     // Trust key -> the hash to trust, or None to drop the key.
     let mut trust: Vec<(String, Option<String>)> = vec![];
+    let mut shared = vec![];
     edit_json(&hooks, !ctx.remove, r, |doc| {
         for e in EVENTS {
             let timeout = if e == Event::SessionEnd { 1 } else { 5 };
@@ -25,13 +26,22 @@ pub(super) fn configure(ctx: &Ctx, r: &mut AgentReport) -> Result<()> {
                 json!({"hooks": [{"type": "command", "command": command,
                     "timeout": timeout, "async": false}]})
             });
-            if let Some(i) = set_hook_group(ctx, doc, e.name(), group)? {
-                let hash = (!ctx.remove).then(|| trust_hash(&label, &command, timeout, false));
-                trust.push((format!("{}:{label}:{i}:0", hooks.display()), hash));
+            match set_hook_group(ctx, doc, e.name(), group)? {
+                Some(i) => {
+                    let hash = (!ctx.remove).then(|| trust_hash(&label, &command, timeout, false));
+                    trust.push((format!("{}:{label}:{i}:0", hooks.display()), hash));
+                }
+                // Installed into a group another tool's hook is in: its trust is not ours to write.
+                None if !ctx.remove => shared.push(format!(
+                    "Codex: the {} hook shares a group with another tool's; Codex will ask you to trust it once (/hooks)",
+                    e.name()
+                )),
+                None => {}
             }
         }
         Ok(())
     })?;
+    r.notes.append(&mut shared);
     let config = dir.join("config.toml");
     let mut owner = Owner::Absent;
     edit_toml(&config, !ctx.remove, r, |doc| {

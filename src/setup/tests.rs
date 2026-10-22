@@ -486,3 +486,28 @@ fn codex_says_it_trusted_the_hooks() {
         .contains("Codex hooks trusted on your behalf"));
     assert!(agent(&setup(home.path(), false), "codex").notes.is_empty());
 }
+
+#[test]
+fn a_codex_hook_in_a_shared_group_says_codex_will_ask() {
+    let home = tempfile::tempdir().unwrap();
+    let h = home.path();
+    let other = json!({"type": "command", "command": "echo other"});
+    let stale = json!({"type": "command", "command": cmd("codex", "stop")});
+    put(
+        h,
+        ".codex/hooks.json",
+        &json!({"hooks": {"Stop": [{"hooks": [other, stale]}]}}).to_string(),
+    );
+    let r = setup(h, false);
+    let codex = agent(&r, "codex");
+    assert!(
+        codex.notes.iter().any(|n| n
+            == "Codex: the Stop hook shares a group with another tool's; Codex will ask you to trust it once (/hooks)"),
+        "{:?}",
+        codex.notes
+    );
+    // Only the shared group goes untrusted.
+    let config = get(h, ".codex/config.toml");
+    assert!(!config.contains(":stop:"), "{config}");
+    assert!(config.contains(":session_start:0:0"), "{config}");
+}
