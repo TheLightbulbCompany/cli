@@ -7,6 +7,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 pub const LOOP_LIMIT: u32 = 12;
+/// Half-open: a send counts while `sent_at > now - LOOP_WINDOW_S`, so one sent at T stops counting at T + 600.
 pub const LOOP_WINDOW_S: u64 = 600;
 /// Offline mail (and, later, the outbox) waits this long.
 pub const HOLD_S: u64 = 86_400;
@@ -40,16 +41,17 @@ impl State {
         }
     }
 
-    fn parse(s: &str) -> State {
-        match s {
+    fn parse(s: &str) -> Result<State> {
+        Ok(match s {
             "queued" => State::Queued,
             "stored" => State::Stored,
             "delivered" => State::Delivered,
             "read" => State::Read,
             "held" => State::Held,
+            "refused" => State::Refused,
             "expired" => State::Expired,
-            _ => State::Refused,
-        }
+            _ => return Err(format!("unknown receipt state {s:?}").into()),
+        })
     }
 
     /// Receipts only move to a higher rank.
@@ -106,7 +108,10 @@ fn advance(
             |r| r.get::<_, String>(0),
         )
         .optional()?;
-    if old.is_none_or(|o| State::parse(&o).rank() < state.rank()) {
+    if match old {
+        Some(o) => State::parse(&o)?.rank() < state.rank(),
+        None => true,
+    } {
         conn.execute(
             "INSERT OR REPLACE INTO receipts VALUES (?1, ?2, ?3, ?4)",
             params![request_id, state.name(), reason, now as i64],
@@ -128,7 +133,7 @@ pub fn receipt(store: &Store, request_id: &str) -> Result<Option<Receipt>> {
     let Some((state, reason)) = row else {
         return Ok(None);
     };
-    let state = State::parse(&state);
+    let state = State::parse(&state)?;
     let where_ = if state == State::Stored {
         let to: Option<String> = conn
             .query_row(
@@ -166,6 +171,9 @@ fn refuse(conn: &Connection, request_id: &str, reason: &str, now: u64) -> Result
     })
 }
 
+/// Stores `text` for `to`. Retrying a `request_id` that was accepted returns its receipt; one that was
+/// refused (`loop`, `too_long`) is refused again, whatever text comes with the retry, because a
+/// refusal stores no `to`/`text`. Clients mint a new `request_id` after any refusal.
 pub fn send(
     store: &Store,
     from: &Key,
@@ -202,7 +210,7 @@ pub fn send(
                 where_: None,
             });
         }
-        return Ok(receipt(store, request_id)?.expect("a message always has a receipt"));
+        return Ok(receipt(store, request_id)?.ok_or("message without a receipt")?);
     }
     if let Some(r) = receipt(store, request_id)? {
         return Ok(r); // an earlier refusal; no message row to compare
@@ -266,7 +274,7 @@ pub fn send(
     )?;
     advance(&tx, request_id, State::Stored, None, now)?;
     tx.commit()?;
-    Ok(receipt(store, request_id)?.expect("just written"))
+    Ok(receipt(store, request_id)?.ok_or("receipt missing after write")?)
 }
 
 /// The messages waiting for `to`, oldest first; each becomes `delivered` and leaves the mailbox.
@@ -382,19 +390,92 @@ mod tests {
     #[test]
     fn thirteenth_send_in_ten_minutes_is_refused_with_loop() {
         let (_d, s) = setup();
+        let t = 1000;
         for i in 0..12 {
-            let r = send(&s, &k("a"), &k("b"), "x", &format!("r{i}"), None, 1000 + i).unwrap();
+            let r = send(&s, &k("a"), &k("b"), "x", &format!("r{i}"), None, t).unwrap();
             assert_eq!(r.state, State::Stored);
         }
-        let r = send(&s, &k("a"), &k("b"), "x", "r12", None, 1100).unwrap();
+        let r = send(&s, &k("a"), &k("b"), "x", "r12", None, t + 599).unwrap();
         assert_eq!(
             (r.state, r.reason.as_deref()),
             (State::Refused, Some("loop"))
         );
         assert_eq!(state(&s, "r12"), State::Refused);
-        // refused sends do not count toward the window
-        let r = send(&s, &k("a"), &k("b"), "x", "r13", None, 1000 + 600 + 11).unwrap();
+        let r = send(&s, &k("a"), &k("b"), "x", "r13", None, t + 600).unwrap();
         assert_eq!(r.state, State::Stored);
+    }
+
+    #[test]
+    fn refused_sends_do_not_count_toward_the_window() {
+        let (_d, s) = setup();
+        let big = "x".repeat(MAX_TEXT + 1);
+        // 11 accepted, then many refusals: none may push the 12th/13th over early.
+        for i in 0..11 {
+            send(&s, &k("a"), &k("b"), "x", &format!("r{i}"), None, 1000).unwrap();
+        }
+        for i in 0..5 {
+            let r = send(&s, &k("a"), &k("b"), &big, &format!("big{i}"), None, 1001).unwrap();
+            assert_eq!(r.reason.as_deref(), Some("too_long"));
+        }
+        assert_eq!(
+            send(&s, &k("a"), &k("b"), "x", "r11", None, 1002)
+                .unwrap()
+                .state,
+            State::Stored
+        );
+        for i in 0..5 {
+            let r = send(&s, &k("a"), &k("b"), "x", &format!("loop{i}"), None, 1003).unwrap();
+            assert_eq!(r.reason.as_deref(), Some("loop"));
+        }
+        // Only the 12 accepted count: at 1600 they are all outside the window.
+        assert_eq!(
+            send(&s, &k("a"), &k("b"), "x", "after", None, 1600)
+                .unwrap()
+                .state,
+            State::Stored
+        );
+    }
+
+    #[test]
+    fn a_refused_request_id_stays_refused_on_retry() {
+        let (_d, s) = setup();
+        let big = "x".repeat(MAX_TEXT + 1);
+        send(&s, &k("a"), &k("b"), &big, "r1", None, 1).unwrap();
+        let r = send(&s, &k("a"), &k("b"), "short now", "r1", None, 2).unwrap();
+        assert_eq!(
+            (r.state, r.reason.as_deref()),
+            (State::Refused, Some("too_long"))
+        );
+        assert_eq!(
+            send(&s, &k("a"), &k("b"), "short now", "r2", None, 3)
+                .unwrap()
+                .state,
+            State::Stored
+        );
+    }
+
+    #[test]
+    fn unknown_reply_to_falls_back_to_the_default_thread_rule() {
+        let (_d, s) = setup();
+        send(&s, &k("b"), &k("a"), "first", "r1", None, 1).unwrap();
+        let first: String = s
+            .conn()
+            .query_row(
+                "SELECT thread FROM messages WHERE request_id='r1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        send(&s, &k("a"), &k("b"), "re", "r2", Some("no-such-id"), 2).unwrap();
+        let (t, h): (String, i64) = s
+            .conn()
+            .query_row(
+                "SELECT thread, hops FROM messages WHERE request_id='r2'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((t, h), (first, 0));
     }
 
     #[test]

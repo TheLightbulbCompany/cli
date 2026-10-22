@@ -257,6 +257,7 @@ async fn inbox(id: u64, body: &Value, daemon: &Daemon) -> Response {
         },
     };
     let deadline = tokio::time::Instant::now() + Duration::from_secs(wait);
+    let mut events = daemon.events.subscribe();
     loop {
         // Register interest before looking, so a send between the look and the wait is not missed.
         let notified = daemon.mail.notified();
@@ -278,7 +279,12 @@ async fn inbox(id: u64, body: &Value, daemon: &Daemon) -> Response {
             }
             Ok(_) => {}
         }
-        if tokio::time::timeout_at(deadline, notified).await.is_err() {
+        // Wake on mail, the deadline, or shutdown (so this connection can say goodbye).
+        let woke = tokio::select! {
+            r = tokio::time::timeout_at(deadline, notified) => r.is_ok(),
+            _ = async { while !matches!(events.recv().await, Ok(e) if e["event"] == "shutdown") {} } => false,
+        };
+        if !woke {
             return Response::ok(id, json!({ "messages": [] }));
         }
     }

@@ -24,7 +24,7 @@ async fn call(
     serde_json::from_str(&l.next_line().await.unwrap().unwrap()).unwrap()
 }
 
-/// One test per file: it sets a process-wide env var so the daemon never reads the real ~/.claude.
+/// The tests here set a process-wide env var so the daemon never reads the real ~/.claude.
 #[tokio::test]
 async fn send_wakes_a_waiting_inbox_and_the_receipt_walks_to_delivered() {
     let dir = tempfile::tempdir().unwrap();
@@ -104,4 +104,34 @@ async fn send_wakes_a_waiting_inbox_and_the_receipt_walks_to_delivered() {
     .await;
     assert_eq!(r["messages"], json!([]));
     call(&mut l, &mut w, json!({"id": 7, "op": "shutdown"})).await;
+}
+
+#[tokio::test]
+async fn shutdown_ends_a_waiting_inbox_promptly() {
+    let dir = tempfile::tempdir().unwrap();
+    let claude_home = tempfile::tempdir().unwrap();
+    std::env::set_var("LIGHTBULB_NETWORK_CLAUDE_HOME", claude_home.path());
+    let home = dir.path().to_path_buf();
+    tokio::spawn(async move { daemon::run(&home).await.unwrap() });
+    let sock = dir.path().join(paths::SOCKET);
+    let (mut l, mut w) = connect(&sock).await;
+    let waiter = tokio::spawn(async move {
+        call(
+            &mut l,
+            &mut w,
+            json!({"id": 1, "op": "inbox", "key": "x/codex:z", "wait_secs": 60}),
+        )
+        .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let (mut l2, mut w2) = connect(&sock).await;
+    call(&mut l2, &mut w2, json!({"id": 2, "op": "shutdown"})).await;
+    let got = tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+        .await
+        .expect("inbox kept waiting through shutdown")
+        .unwrap();
+    assert_eq!(
+        (got["ok"].clone(), got["messages"].clone()),
+        (json!(true), json!([]))
+    );
 }
