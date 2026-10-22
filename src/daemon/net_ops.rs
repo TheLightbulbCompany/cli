@@ -35,36 +35,13 @@ pub fn handle(
 /// In debug builds, the process `CALLER_ENV` names counts as an agent.
 // ponytail: same-uid ceiling as `caller::walked_to_a_person` (a detached agent passes).
 pub fn person_only(peer_pid: u32) -> bool {
-    #[cfg(debug_assertions)]
-    let pinned = crate::hook::pinned_caller().and_then(|p| p.ok());
-    #[cfg(not(debug_assertions))]
-    let pinned = None;
-    person_walk(peer_pid, pinned)
+    no_agent(caller::ancestors_from(peer_pid))
 }
 
-/// `person_only`, with `pinned` (pid + birth) also counted as an agent.
-fn person_walk(peer_pid: u32, pinned: Option<os::Process>) -> bool {
-    // Only lookups that work across uids: the chain passes root-owned `login`, `sshd`, `sudo`.
-    // Pid 1 (launchd) is no agent.
-    let mut pid = peer_pid;
-    while pid > 1 {
-        if pinned.as_ref().is_some_and(|a| {
-            a.pid == pid && os::process(pid).is_ok_and(|p| p.birth_micros == a.birth_micros)
-        }) {
-            return false;
-        }
-        let Ok(exe) = os::executable(pid) else {
-            return false;
-        };
-        if caller::classify(&exe).is_some() {
-            return false;
-        }
-        let Ok(up) = os::parent_pid(pid) else {
-            return false;
-        };
-        pid = up;
-    }
-    true
+fn no_agent(
+    mut walk: impl Iterator<Item = Result<(os::Process, bool), caller::CallerError>>,
+) -> bool {
+    walk.all(|step| step.is_ok_and(|(_, agent)| !agent))
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -93,7 +70,8 @@ mod tests {
 
     #[test]
     fn person_only_accepts_people_and_refuses_agents() {
-        assert!(person_walk(1, None));
+        let person_walk = |pid, pin| no_agent(caller::ancestors_pinned(pid, pin));
+        assert!(person_only(1));
         assert!(!person_walk(999_999, None));
 
         // No agent above: a `sleep` reparented to pid 1 once its `sh` exits.
@@ -126,7 +104,7 @@ mod tests {
             ],
         );
         // Refused for the agent above it, not for a failed lookup.
-        let parent = os::executable(os::parent_pid(child).unwrap()).unwrap();
+        let parent = os::parent(child).unwrap().executable;
         assert_eq!(caller::classify(&parent), Some("claude"));
         assert!(!person_walk(child, None));
         kill(child);

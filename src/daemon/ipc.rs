@@ -130,17 +130,14 @@ async fn handle(
     match req.op.as_str() {
         "ping" => Response::ok(id, json!({})),
         "status" => {
-            let team = {
-                let t = daemon.team.lock().unwrap();
-                json!({ "id": t.team_id, "name": t.team_name })
-            };
+            let t = daemon.team.lock().unwrap();
             Response::ok(
                 id,
                 json!({
                     "version": env!("CARGO_PKG_VERSION"),
                     "protocol": PROTOCOL,
                     "member_key_short": daemon.identity.short,
-                    "team": team,
+                    "team": { "id": t.team_id, "name": t.team_name },
                     "sessions": live_count(daemon),
                 }),
             )

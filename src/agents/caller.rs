@@ -56,25 +56,59 @@ pub fn identify_any() -> Result<Process, CallerError> {
 // ponytail: this gate stops accidents, not a hostile agent (same-uid ceiling: it can detach,
 // rename a wrapper, or edit this binary's environment).
 pub fn walked_to_a_person() -> bool {
-    ancestors().is_ok_and(|chain| {
-        chain.last().is_some_and(|top| top.pid > 1)
-            && first_program(&chain).is_some_and(|p| classify(&p.executable).is_none())
-    })
+    for step in ancestors_from(std::process::id()).skip(1) {
+        let Ok((p, agent)) = step else { return false };
+        if agent || p.pid <= 1 {
+            return false;
+        }
+        if !skipped(&p.executable) {
+            return true;
+        }
+    }
+    false
 }
 
 /// This process's ancestors, nearest first, up to and including the first non-shell.
 fn ancestors() -> Result<Vec<Process>, CallerError> {
     let mut chain = vec![];
-    let mut pid = std::process::id();
-    loop {
-        let p = os::parent(pid).map_err(|e| CallerError::Lookup(e.to_string()))?;
-        let done = !skipped(&p.executable) || p.pid <= 1;
-        pid = p.pid;
+    for step in ancestors_from(std::process::id()).skip(1) {
+        let (p, _) = step?;
+        let done = !skipped(&p.executable);
         chain.push(p);
         if done {
-            return Ok(chain);
+            break;
         }
     }
+    Ok(chain)
+}
+
+/// `pid`, then each of its ancestors up to pid 1, nearest first, each with whether it is an
+/// agent. A failed lookup ends the walk. In debug builds the process `CALLER_ENV` pins is an
+/// agent too.
+pub fn ancestors_from(pid: u32) -> impl Iterator<Item = Result<(Process, bool), CallerError>> {
+    ancestors_pinned(pid, crate::hook::pinned_caller().and_then(Result::ok))
+}
+
+/// `ancestors_from`, with `pinned` (pid + birth) the process that counts as an agent.
+pub(crate) fn ancestors_pinned(
+    pid: u32,
+    pinned: Option<Process>,
+) -> impl Iterator<Item = Result<(Process, bool), CallerError>> {
+    let mut next = Some(os::process(pid));
+    std::iter::from_fn(move || {
+        let p = match next.take()? {
+            Ok(p) => p,
+            Err(e) => return Some(Err(CallerError::Lookup(e.to_string()))),
+        };
+        if p.pid > 1 {
+            next = Some(os::parent(p.pid));
+        }
+        let agent = classify(&p.executable).is_some()
+            || pinned
+                .as_ref()
+                .is_some_and(|a| a.pid == p.pid && a.birth_micros == p.birth_micros);
+        Some(Ok((p, agent)))
+    })
 }
 
 fn first_program(ancestors: &[Process]) -> Option<&Process> {

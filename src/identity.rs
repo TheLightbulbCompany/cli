@@ -2,13 +2,20 @@
 //! every signed object carries.
 
 use crate::Result;
-use data_encoding::{BASE32_NOPAD, BASE64URL_NOPAD};
+use data_encoding::{Encoding, Specification, BASE64URL_NOPAD};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde_json::Value;
-use std::fs::{self, OpenOptions};
-use std::io::{ErrorKind, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::fs;
+use std::io::ErrorKind;
 use std::path::Path;
+use std::sync::LazyLock;
+
+/// The member key's alphabet: base32, lowercase, no padding.
+static BASE32: LazyLock<Encoding> = LazyLock::new(|| {
+    let mut s = Specification::new();
+    s.symbols.push_str("abcdefghijklmnopqrstuvwxyz234567");
+    s.encoding().expect("a valid base32 alphabet")
+});
 
 pub struct Identity {
     pub signing: SigningKey,
@@ -33,23 +40,14 @@ impl Identity {
                 // Write then rename, so a crash never leaves a truncated key.
                 // We hold the lock, so a leftover .tmp is ours to replace.
                 let tmp = dir.join("identity.key.tmp");
-                let _ = fs::remove_file(&tmp);
                 let key = SigningKey::generate(&mut rand::rngs::OsRng);
-                let mut f = OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .mode(0o600)
-                    .open(&tmp)?;
-                f.write_all(&key.to_bytes())?;
-                f.sync_all()?;
+                crate::setup::create_with(&tmp, &key.to_bytes(), 0o600)?;
                 fs::rename(&tmp, &path)?;
                 key
             }
             Err(e) => return Err(e.into()),
         };
-        let key = BASE32_NOPAD
-            .encode(signing.verifying_key().as_bytes())
-            .to_lowercase();
+        let key = BASE32.encode(signing.verifying_key().as_bytes());
         Ok(Identity {
             short: key[..12].to_string(),
             key,
@@ -65,12 +63,9 @@ impl Identity {
 
 /// Whether `sig` is `key`'s signature over `v` (its own `sig` field left out).
 pub fn verify(key: &str, v: &Value, sig: &str) -> bool {
-    // The member key is lowercase: an uppercase spelling is another (invalid) key.
-    if key.bytes().any(|b| b.is_ascii_uppercase()) {
-        return false;
-    }
-    let key = BASE32_NOPAD
-        .decode(key.to_uppercase().as_bytes())
+    // `BASE32` is lowercase only: an uppercase spelling is another (invalid) key.
+    let key = BASE32
+        .decode(key.as_bytes())
         .ok()
         .and_then(|k| VerifyingKey::from_bytes(&k.try_into().ok()?).ok());
     let sig = BASE64URL_NOPAD

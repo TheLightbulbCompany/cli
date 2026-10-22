@@ -8,15 +8,33 @@ use std::path::{Path, PathBuf};
 use toml_edit::DocumentMut;
 
 pub const FILE: &str = "config.toml";
-const KEYS: [&str; 7] = [
-    "computer",
-    "issuer",
-    "preview_to_workspace",
-    "share_paths",
-    "lan",
-    "relay",
-    "folders_off",
+
+/// A setting's type, and the field it fills.
+#[derive(Clone, Copy)]
+enum Kind {
+    Str(fn(&mut Config) -> &mut String),
+    Bool(fn(&mut Config) -> &mut bool),
+    OptStr(fn(&mut Config) -> &mut Option<String>),
+    Paths(fn(&mut Config) -> &mut Vec<PathBuf>),
+}
+
+/// Every setting: the one list `load` and `set` read.
+const KEYS: [(&str, Kind); 7] = [
+    ("computer", Kind::Str(|c| &mut c.computer)),
+    ("issuer", Kind::Str(|c| &mut c.issuer)),
+    (
+        "preview_to_workspace",
+        Kind::Bool(|c| &mut c.preview_to_workspace),
+    ),
+    ("share_paths", Kind::Bool(|c| &mut c.share_paths)),
+    ("lan", Kind::Bool(|c| &mut c.lan)),
+    ("relay", Kind::OptStr(|c| &mut c.relay)),
+    ("folders_off", Kind::Paths(|c| &mut c.folders_off)),
 ];
+
+fn kind(key: &str) -> Option<Kind> {
+    KEYS.iter().find(|(k, _)| *k == key).map(|&(_, kind)| kind)
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
@@ -49,14 +67,18 @@ impl Config {
         from_doc(&read(dir)?)
     }
 
-    /// Sets one key, keeping the file's other text and comments. `value` is a TOML literal
-    /// (`false`, `["/a"]`) or else a plain string. Refuses an unknown key or a wrong type.
+    /// Sets one key, keeping the file's other text and comments. `value` is read by the
+    /// key's type: a string verbatim, `true`/`false`, or a TOML array of paths. Refuses an
+    /// unknown key or a value of the wrong type.
     pub fn set(dir: &Path, key: &str, value: &str) -> Result<()> {
-        if !KEYS.contains(&key) {
-            return Err(format!("{FILE}: no setting {key}").into());
-        }
+        let kind = kind(key).ok_or_else(|| format!("{FILE}: no setting {key}"))?;
+        let v: toml_edit::Value = match kind {
+            Kind::Str(_) | Kind::OptStr(_) => value.into(),
+            Kind::Bool(_) | Kind::Paths(_) => value
+                .parse()
+                .map_err(|_| format!("{FILE}: {key} has the wrong type"))?,
+        };
         let mut doc = read(dir)?;
-        let v: toml_edit::Value = value.parse().unwrap_or_else(|_| value.into());
         doc[key] = toml_edit::value(v);
         from_doc(&doc)?;
         setup::write(
@@ -80,25 +102,23 @@ fn read(dir: &Path) -> Result<DocumentMut> {
 fn from_doc(doc: &DocumentMut) -> Result<Config> {
     let mut c = Config::default();
     for (k, item) in doc.iter() {
+        let Some(kind) = kind(k) else {
+            continue; // a setting from a newer version
+        };
         let bad = || format!("{FILE}: {k} has the wrong type");
         let text = || item.as_str().map(String::from).ok_or_else(bad);
-        let flag = || item.as_bool().ok_or_else(bad);
-        match k {
-            "computer" => c.computer = text()?,
-            "issuer" => c.issuer = text()?,
-            "preview_to_workspace" => c.preview_to_workspace = flag()?,
-            "share_paths" => c.share_paths = flag()?,
-            "lan" => c.lan = flag()?,
-            "relay" => c.relay = Some(text()?),
-            "folders_off" => {
-                c.folders_off = item
+        match kind {
+            Kind::Str(f) => *f(&mut c) = text()?,
+            Kind::OptStr(f) => *f(&mut c) = Some(text()?),
+            Kind::Bool(f) => *f(&mut c) = item.as_bool().ok_or_else(bad)?,
+            Kind::Paths(f) => {
+                *f(&mut c) = item
                     .as_array()
                     .ok_or_else(bad)?
                     .iter()
                     .map(|v| v.as_str().map(PathBuf::from).ok_or_else(bad))
                     .collect::<std::result::Result<_, _>>()?
             }
-            _ => {} // a setting from a newer version
         }
     }
     Ok(c)
@@ -133,6 +153,9 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
+
+        Config::set(d, "computer", "2024").unwrap();
+        assert_eq!(Config::load(d).unwrap().computer, "2024");
 
         assert!(Config::set(d, "nope", "1").is_err());
         assert!(Config::set(d, "lan", "maybe").is_err());

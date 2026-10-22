@@ -266,7 +266,7 @@ fn tmp_path(path: &Path) -> PathBuf {
 }
 
 /// A new file holding `bytes`, created at `mode` and synced; removed again on failure.
-fn create_with(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
+pub(crate) fn create_with(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     let _ = fs::remove_file(path); // a leftover of a crashed run with this pid
     let written = OpenOptions::new()
         .write(true)

@@ -127,11 +127,12 @@ impl Store {
             .into());
         }
         for (i, m) in MIGRATIONS.iter().enumerate().skip(version) {
-            // One transaction: `user_version` moves only once all of it ran.
-            conn.execute_batch(&format!(
-                "BEGIN; {m} PRAGMA user_version = {}; COMMIT;",
-                i + 1
-            ))?;
+            // One transaction: `user_version` moves only once all of it ran; a failure rolls
+            // back when `tx` drops.
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(m)?;
+            tx.pragma_update(None, "user_version", i + 1)?;
+            tx.commit()?;
         }
         Ok(Store { conn })
     }

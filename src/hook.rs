@@ -188,7 +188,6 @@ pub(crate) fn proc_json(p: &Process) -> Value {
 
 /// The agent process this runs for: `agent`'s, or with `None` any agent's (the MCP server).
 pub(crate) fn calling_agent(agent: Option<&str>) -> std::result::Result<Process, CallerError> {
-    #[cfg(debug_assertions)]
     if let Some(pinned) = pinned_caller() {
         return pinned;
     }
@@ -198,19 +197,24 @@ pub(crate) fn calling_agent(agent: Option<&str>) -> std::result::Result<Process,
     }
 }
 
-/// The agent process `CALLER_ENV` (`<pid>:<birth_micros>`) names, when set (debug builds).
-#[cfg(debug_assertions)]
+/// The agent process `CALLER_ENV` (`<pid>:<birth_micros>`) names, when set; always `None`
+/// in release builds.
 pub(crate) fn pinned_caller() -> Option<std::result::Result<Process, CallerError>> {
-    let v = std::env::var(CALLER_ENV).ok()?;
-    let (pid, birth) = v.split_once(':')?;
-    let bad = |_| CallerError::Lookup(format!("{CALLER_ENV} is not <pid>:<birth_micros>"));
-    Some((|| {
-        Ok(Process {
-            pid: pid.parse().map_err(bad)?,
-            birth_micros: birth.parse().map_err(bad)?,
-            executable: std::path::PathBuf::new(),
-        })
-    })())
+    #[cfg(not(debug_assertions))]
+    return None;
+    #[cfg(debug_assertions)]
+    {
+        let v = std::env::var(CALLER_ENV).ok()?;
+        let (pid, birth) = v.split_once(':')?;
+        let bad = |_| CallerError::Lookup(format!("{CALLER_ENV} is not <pid>:<birth_micros>"));
+        Some((|| {
+            Ok(Process {
+                pid: pid.parse().map_err(bad)?,
+                birth_micros: birth.parse().map_err(bad)?,
+                executable: std::path::PathBuf::new(),
+            })
+        })())
+    }
 }
 
 /// One blocking connection to the daemon.
