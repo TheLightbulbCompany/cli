@@ -157,21 +157,35 @@ pub fn replay(entries: &[Entry]) -> Roster {
         .map(|h| (h.as_str(), graph.ancestors(h)))
         .collect();
     // A removal deeper in its branch than a concurrent entry is replayed after it, so replay
-    // again with every removal any pass applied taking effect unconditionally. `known` only
-    // grows, so this ends within one pass per removal; the cap is a safety.
+    // again knowing every removal any pass applied: each drops its target's concurrent entries
+    // ahead of its own position. `known` only grows, so this settles within one pass per
+    // removal. ponytail: the cap (#removes + 1) is a safety only.
+    let cap = by_hash.values().filter(|e| e.kind == Kind::Remove).count() + 1;
     let mut known = BTreeSet::new();
-    for _ in 0..=by_hash.len() {
+    let mut last = None;
+    for _ in 0..cap {
         let (r, applied) = pass(&by_hash, &anc, &known, graph.clone());
-        if applied.is_subset(&known) {
-            return r;
+        let settled = applied.is_subset(&known);
+        last = Some((r, applied));
+        if settled {
+            break;
         }
-        known.extend(applied);
+        known.extend(last.as_ref().expect("set").1.iter().cloned());
     }
-    pass(&by_hash, &anc, &known, graph).0
+    let (r, applied) = last.expect("at least one pass");
+    // A known removal whose signer's admission no longer survives is stale: replay once more
+    // knowing only the removals that still apply, and keep that if it agrees with itself.
+    if applied != known {
+        let (exact, again) = pass(&by_hash, &anc, &applied, graph);
+        if again == applied {
+            return exact;
+        }
+    }
+    r
 }
 
-/// One replay in which the `known` removals take effect unconditionally; returns the roster
-/// and the removals it applied on their own merits.
+/// One replay in which the `known` removals drop their targets' concurrent entries ahead of
+/// their own position; returns the roster and the removals it applied.
 fn pass(
     by_hash: &BTreeMap<String, &Entry>,
     anc: &BTreeMap<&str, HashSet<String>>,
@@ -230,14 +244,10 @@ fn pass(
             continue;
         }
         let target = e.text("member").to_string();
-        if e.kind == Kind::Remove && known.contains(&h) {
-            take(&mut r, &mut gone, &target, &h);
-            continue;
-        }
         let signer = match r.members.get(&e.signer) {
             Some(m) => m.clone(),
             // A removal stands on its own causal past: a concurrent removal of its signer
-            // does not stop it.
+            // does not stop it (`gone` keeps the signer's role from before that removal).
             None if e.kind == Kind::Remove => match gone.get(&e.signer) {
                 Some((m, rh)) if !anc[h.as_str()].contains(rh) => m.clone(),
                 _ => continue,
@@ -289,7 +299,7 @@ fn pass(
                     e.body.get("role").and_then(Value::as_str),
                     None | Some("member")
                 );
-                if (elevated || via_link()) && !collides && role_ok {
+                if (elevated || via_link()) && !collides && role_ok && own_person(e) {
                     r.members.insert(target, new_member(e, Role::Member));
                     used_once.extend(once);
                 }
@@ -354,18 +364,26 @@ fn pass(
                     }
                 }
             }
-            // Only a computer member mints links.
-            Kind::Link if computer => links.push((
-                h.clone(),
-                Link {
-                    ticket_id: e.text("ticket_id").to_string(),
-                    secret: e.text("secret").to_string(),
-                    mode: e.text("mode").to_string(),
-                    once: e.body["once"].as_bool().unwrap_or(false),
-                    expires_at: e.body["expires_at"].as_i64().unwrap_or(0),
-                    signer: e.signer.clone(),
-                },
-            )),
+            // Only a computer member mints links, and a `ticket_id` names one link ever.
+            Kind::Link
+                if computer
+                    && !e.text("ticket_id").is_empty()
+                    && links
+                        .iter()
+                        .all(|(_, l)| l.ticket_id != e.text("ticket_id")) =>
+            {
+                links.push((
+                    h.clone(),
+                    Link {
+                        ticket_id: e.text("ticket_id").to_string(),
+                        secret: e.text("secret").to_string(),
+                        mode: e.text("mode").to_string(),
+                        once: e.body["once"].as_bool().unwrap_or(false),
+                        expires_at: e.body["expires_at"].as_i64().unwrap_or(0),
+                        signer: e.signer.clone(),
+                    },
+                ))
+            }
             Kind::Meta => {
                 if elevated {
                     if let Some(n) = e.body["team_name"].as_str() {
@@ -405,8 +423,15 @@ fn take(
     }
 }
 
+/// Without a proof, an `admit` may only name the member's own key as its `person_id`; Task 13's
+/// verified proof is the one way to claim another person's id.
+fn own_person(e: &Entry) -> bool {
+    e.body["proof"].is_string() || e.text("person_id") == e.text("member")
+}
+
 fn is_genesis(e: &Entry) -> bool {
     e.kind == Kind::Admit
+        && own_person(e)
         && e.text("role") == "founder"
         && e.text("member") == e.signer
         && e.signer.get(..12).is_some()
@@ -691,29 +716,111 @@ mod tests {
         assert!(!replay(&log).members.contains_key(&x.key));
     }
 
+    /// A cloud member of `person`, admitted by `by` with an (opaque) proof.
+    fn admit_cloud(
+        by: &Identity,
+        parent: &Entry,
+        who: &Identity,
+        name: &str,
+        person: &str,
+    ) -> Entry {
+        op(
+            by,
+            parent,
+            Kind::Admit,
+            json!({"member": who.key, "name": name, "computer": "cloud", "person_id": person,
+                   "kind": "cloud", "role": "member", "ticket_id": null, "proof": "p"}),
+        )
+    }
+
     #[test]
     fn bridge_member_cannot_link_or_admit() {
-        let (f, x, k, c, d) = (id(), id(), id(), id(), id());
+        let (f, k, d) = (id(), id(), id());
         let g = genesis(&f);
-        let ax = admit(&f, &g, &x.key, "x");
-        let ak = op(
-            &f,
-            &ax,
-            Kind::Admit,
-            json!({"member": k.key, "name": "bridge", "computer": "cloud", "person_id": f.key,
-                   "kind": "cloud", "role": "member", "ticket_id": null}),
-        );
+        let ak = admit_cloud(&f, &g, &k, "bridge", &f.key);
         let pk = member(&f, &ak, Kind::Admin, &k.key);
         let lk = link(&k, &pk, "tk");
-        let lx = link(&x, &lk, "tx");
-        let kc = admit_via(&k, &lx, &c.key, "c", "tx");
-        let kd = admit(&k, &kc, &d.key, "d"); // as an admin: still dropped
-        let r = replay(&[g, ax, ak, pk, lk, lx, kc, kd]);
+        let kd = admit(&k, &lk, &d.key, "d"); // an admin, but a cloud one
+        let r = replay(&[g, ak, pk, lk, kd]);
         assert_eq!(r.members[&k.key].role, Role::Admin);
-        assert!(!r.links.contains_key("tk"));
-        assert!(r.links.contains_key("tx"));
-        assert!(!r.members.contains_key(&c.key));
+        assert!(r.links.is_empty());
         assert!(!r.members.contains_key(&d.key));
+    }
+
+    #[test]
+    fn stale_known_removal_stops_when_its_signers_admission_drops() {
+        // Plain member X admits Y through its link; Y unlinks its own cloud member M; the
+        // founder removes X concurrently. Y never survives, so neither does its removal of M,
+        // whether the founder's removal is shallow or behind entries replayed after Y's.
+        let (f, x, y, m) = (id(), id(), id(), id());
+        let g = genesis(&f);
+        let ax = admit(&f, &g, &x.key, "x");
+        let fork = admit_cloud(&f, &ax, &m, "m", &y.key);
+        let lx = link(&x, &fork, "t");
+        let xy = admit_via(&x, &lx, &y.key, "y", "t");
+        let ym = member(&y, &xy, Kind::Remove, &m.key);
+        // M's own entry is concurrent with Y's (stale) removal of M: it must stand.
+        let mp = op(
+            &m,
+            &fork,
+            Kind::Proof,
+            json!({"member": m.key, "proof": "renewed"}),
+        );
+        let branch = vec![g, ax, fork.clone(), lx.clone(), xy.clone(), ym, mp];
+        let shallow = [
+            branch.clone(),
+            vec![member(&f, &fork, Kind::Remove, &x.key)],
+        ]
+        .concat();
+        let late = if lx.hash() > xy.hash() { &lx } else { &xy };
+        let m1 = op_after(&f, &fork, Kind::Meta, json!({}), late);
+        let m2 = op(&f, &m1, Kind::Meta, json!({}));
+        let rx = member(&f, &m2, Kind::Remove, &x.key);
+        let deep = [branch, vec![m1, m2, rx]].concat();
+        let (s, d) = (replay(&shallow), replay(&deep));
+        for r in [&s, &d] {
+            assert!(!r.members.contains_key(&x.key));
+            assert!(!r.members.contains_key(&y.key));
+            assert_eq!(r.members[&m.key].proof.as_deref(), Some("renewed"));
+        }
+        assert_eq!(s.members, d.members);
+        assert_eq!(s.links, d.links);
+    }
+
+    #[test]
+    fn admit_cannot_claim_another_persons_id() {
+        let (f, c, k) = (id(), id(), id());
+        let g = genesis(&f);
+        let claim = op(
+            &f,
+            &g,
+            Kind::Admit,
+            json!({"member": c.key, "name": "c", "computer": "mac", "person_id": f.key,
+                   "kind": "computer", "role": "member", "ticket_id": null}),
+        );
+        let proven = admit_cloud(&f, &claim, &k, "k", &f.key);
+        let r = replay(&[g, claim, proven]);
+        assert!(!r.members.contains_key(&c.key));
+        assert_eq!(r.members[&k.key].person_id, f.key);
+    }
+
+    #[test]
+    fn duplicate_ticket_id_link_is_dropped() {
+        // Z reuses X's `ticket_id` for a once-link and admits a puppet through it: Z's link is
+        // dropped, so the puppet is too, and X's link still admits.
+        let (f, x, z, p, c) = (id(), id(), id(), id(), id());
+        let g = genesis(&f);
+        let ax = admit(&f, &g, &x.key, "x");
+        let az = admit(&f, &ax, &z.key, "z");
+        let lx = link(&x, &az, "t");
+        let lz = once_link(&z, &lx, "t");
+        let zp = admit_via(&z, &lz, &p.key, "p", "t");
+        let xc = admit_via(&x, &zp, &c.key, "c", "t");
+        let r = replay(&[g, ax, az, lx, lz, zp, xc]);
+        assert!(!r.members.contains_key(&p.key));
+        assert!(r.members.contains_key(&c.key));
+        assert_eq!(r.links["t"].signer, x.key);
+        assert!(!r.links["t"].once);
     }
 
     #[test]
