@@ -1,5 +1,6 @@
 pub mod daemon;
 pub mod doing;
+pub mod frame;
 pub mod mail;
 pub mod os;
 pub mod paths;
