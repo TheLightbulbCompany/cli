@@ -188,7 +188,7 @@ pub fn listen(name: &str, once: bool) -> Result<i32> {
     let mut backoff = 1;
     loop {
         // A daemon error (it restarted, say) reconnects with a 1 s to 10 s backoff.
-        match listen_on(&key_for(name)?, once) {
+        match key_for(name).and_then(|k| listen_on(&k, once)) {
             Ok(()) => return Ok(0),
             Err(e) => {
                 eprintln!("listen: {e}; retrying in {backoff} s");
