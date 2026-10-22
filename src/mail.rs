@@ -112,10 +112,18 @@ fn advance(
         Some(o) => State::parse(&o)?.rank() < state.rank(),
         None => true,
     } {
-        conn.execute(
-            "INSERT OR REPLACE INTO receipts VALUES (?1, ?2, ?3, ?4)",
-            params![request_id, state.name(), reason, now as i64],
-        )?;
+        if state == State::Read {
+            // `updated_at` stays the delivery time: the hops trigger window runs on it.
+            conn.execute(
+                "UPDATE receipts SET state = 'read' WHERE request_id = ?1",
+                [request_id],
+            )?;
+        } else {
+            conn.execute(
+                "INSERT OR REPLACE INTO receipts VALUES (?1, ?2, ?3, ?4)",
+                params![request_id, state.name(), reason, now as i64],
+            )?;
+        }
     }
     Ok(())
 }
@@ -173,7 +181,7 @@ fn refuse(conn: &Connection, request_id: &str, reason: &str, now: u64) -> Result
 
 /// Stores `text` for `to`. Thread and hops: with `reply_to` (a message id or request id the store
 /// knows) the message takes that message's thread and its hops + 1. Without it, the trigger is the
-/// newest message delivered (or read) TO `from` within `LOOP_WINDOW_S`: hops = trigger.hops + 1, and
+/// message delivered (or read) TO `from` most recently, if that was within `LOOP_WINDOW_S`: hops = trigger.hops + 1, and
 /// the thread is the trigger's if `to` is the trigger's sender, else a new one. No trigger: hops 0,
 /// new thread. (Forwarding to a third session therefore cannot reset the agent-chain count.)
 /// A `request_id` must match `[A-Za-z0-9._-]{1,128}`, else `Refused` (`bad_request_id`, nothing stored).
@@ -258,8 +266,8 @@ pub fn send(
                 .query_row(
                     "SELECT m.id, m.thread, m.hops, m.from_key FROM messages m \
                      JOIN receipts r ON r.request_id = m.request_id \
-                     WHERE m.to_key = ?1 AND r.state IN ('delivered', 'read') AND m.sent_at > ?2 \
-                     ORDER BY m.rowid DESC LIMIT 1",
+                     WHERE m.to_key = ?1 AND r.state IN ('delivered', 'read') AND r.updated_at > ?2 \
+                     ORDER BY r.updated_at DESC, m.rowid DESC LIMIT 1",
                     params![from.0, since],
                     |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?, x.get(3)?)),
                 )
@@ -670,8 +678,33 @@ mod tests {
     fn an_old_delivery_is_no_trigger() {
         let (_d, s) = setup();
         send(&s, &k("a"), &k("b"), "x", "r1", None, 1).unwrap();
-        take(&s, &k("b"), 2).unwrap();
-        send(&s, &k("b"), &k("c"), "y", "r2", None, 1 + LOOP_WINDOW_S).unwrap();
-        assert_eq!(thread_hops(&s, "r2").2, 0);
+        take(&s, &k("b"), 100).unwrap();
+        mark_read(&s, &thread_hops(&s, "r1").0, 150).unwrap();
+        send(
+            &s,
+            &k("b"),
+            &k("c"),
+            "y",
+            "r2",
+            None,
+            100 + LOOP_WINDOW_S - 1,
+        )
+        .unwrap();
+        assert_eq!(
+            thread_hops(&s, "r2").2,
+            1,
+            "inside the window, even after read"
+        );
+        send(&s, &k("b"), &k("c"), "z", "r3", None, 100 + LOOP_WINDOW_S).unwrap();
+        assert_eq!(thread_hops(&s, "r3").2, 0, "delivery 600 s ago is out");
+    }
+
+    #[test]
+    fn a_message_taken_long_after_sending_is_still_a_trigger() {
+        let (_d, s) = setup();
+        send(&s, &k("a"), &k("b"), "x", "r1", None, 1).unwrap();
+        take(&s, &k("b"), 1000).unwrap();
+        send(&s, &k("b"), &k("c"), "y", "r2", None, 1500).unwrap();
+        assert_eq!(thread_hops(&s, "r2").2, 1);
     }
 }
