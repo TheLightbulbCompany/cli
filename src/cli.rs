@@ -240,12 +240,14 @@ pub fn receipt(request_id: &str, from: Option<String>) -> Result<i32> {
 
 // ---- team -------------------------------------------------------------------------------
 
-/// Prints the text `texts` maps `r`'s error code to (`"{verb}: {code}"` for any other code);
+/// Prints the text `texts` maps `r`'s error code to (`not_member`'s shared text, else
+/// `"{verb}: {code}"`, for any other code);
 /// returns the exit code 1.
 fn refuse(r: &Value, texts: &[(&str, String)], verb: &str) -> Result<i32> {
     let code = r["error"].as_str().unwrap_or_default();
     match texts.iter().find(|(c, _)| *c == code) {
         Some((_, text)) => eprintln!("{text}"),
+        None if code == "not_member" => eprintln!("This computer is not in the network."),
         None => eprintln!("{verb}: {code}"),
     }
     Ok(1)
