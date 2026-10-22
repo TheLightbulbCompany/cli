@@ -121,7 +121,7 @@ impl Store {
         let version: usize = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version > MIGRATIONS.len() {
             return Err(format!(
-                "State is from a newer version (v{version}). Install {} or later.",
+                "State is from a newer version (v{version}). Install a newer lightbulb-network than {}.",
                 env!("CARGO_PKG_VERSION")
             )
             .into());

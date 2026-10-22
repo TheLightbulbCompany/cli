@@ -17,8 +17,14 @@ pub fn parent(pid: u32) -> Result<Process> {
     process(parent_pid(pid)?)
 }
 
+/// The parent pid of `pid`; readable for any uid's process (root-owned `login` included).
 pub fn parent_pid(pid: u32) -> Result<u32> {
-    Ok(imp::info(pid)?.ppid)
+    imp::parent_pid(pid)
+}
+
+/// `pid`'s executable; readable for any uid's process.
+pub fn executable(pid: u32) -> Result<PathBuf> {
+    imp::executable(pid)
 }
 
 pub fn process(pid: u32) -> Result<Process> {
@@ -50,7 +56,6 @@ pub fn peer_pid(fd: std::os::fd::RawFd) -> Result<u32> {
 }
 
 struct Info {
-    ppid: u32,
     birth_micros: u64,
 }
 
@@ -82,9 +87,29 @@ mod imp {
         // SAFETY: the kernel filled the whole struct (n == size).
         let b = unsafe { b.assume_init() };
         Ok(Info {
-            ppid: b.pbi_ppid,
             birth_micros: b.pbi_start_tvsec * 1_000_000 + b.pbi_start_tvusec,
         })
+    }
+
+    /// `PROC_PIDT_SHORTBSDINFO`, unlike `PROC_PIDTBSDINFO`, answers for another uid's process.
+    pub fn parent_pid(pid: u32) -> Result<u32> {
+        let mut b = MaybeUninit::<libc::proc_bsdshortinfo>::zeroed();
+        let size = size_of::<libc::proc_bsdshortinfo>() as libc::c_int;
+        // SAFETY: the buffer is `size` bytes and proc_pidinfo writes at most that.
+        let n = unsafe {
+            libc::proc_pidinfo(
+                pid as libc::c_int,
+                libc::PROC_PIDT_SHORTBSDINFO,
+                0,
+                b.as_mut_ptr().cast::<c_void>(),
+                size,
+            )
+        };
+        if n != size {
+            return Err(format!("no process {pid}").into());
+        }
+        // SAFETY: the kernel filled the whole struct (n == size).
+        Ok(unsafe { b.assume_init() }.pbsi_ppid)
     }
 
     pub fn executable(pid: u32) -> Result<PathBuf> {
@@ -138,6 +163,10 @@ mod imp {
         Err("process lookup is only implemented on macOS".into())
     }
 
+    pub fn parent_pid(_pid: u32) -> Result<u32> {
+        Err("process lookup is only implemented on macOS".into())
+    }
+
     pub fn peer_pid(_fd: std::os::fd::RawFd) -> Result<u32> {
         Err("process lookup is only implemented on macOS".into())
     }
@@ -157,5 +186,8 @@ mod tests {
             std::os::unix::process::parent_id()
         );
         assert!(process(999_999).is_err());
+        // Root-owned launchd: the walk's two lookups work across uids.
+        assert_eq!(parent_pid(1).unwrap(), 0);
+        assert_eq!(executable(1).unwrap(), PathBuf::from("/sbin/launchd"));
     }
 }

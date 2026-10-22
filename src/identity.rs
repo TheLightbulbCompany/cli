@@ -65,6 +65,10 @@ impl Identity {
 
 /// Whether `sig` is `key`'s signature over `v` (its own `sig` field left out).
 pub fn verify(key: &str, v: &Value, sig: &str) -> bool {
+    // The member key is lowercase: an uppercase spelling is another (invalid) key.
+    if key.bytes().any(|b| b.is_ascii_uppercase()) {
+        return false;
+    }
     let key = BASE32_NOPAD
         .decode(key.to_uppercase().as_bytes())
         .ok()
@@ -155,5 +159,8 @@ mod tests {
         v["n"] = json!([2]);
         assert!(!verify(&me.key, &v, &sig));
         assert!(!verify("not a key", &v, &sig));
+        v["n"] = json!([1, "é\""]);
+        assert!(verify(&me.key, &v, &sig));
+        assert!(!verify(&me.key.to_uppercase(), &v, &sig));
     }
 }

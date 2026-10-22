@@ -32,20 +32,31 @@ pub fn handle(
 
 /// Whether a person, not an agent, is at the other end of the socket: no process from
 /// `peer_pid` up to pid 1 is an agent. Fails closed: a lookup that fails is no person.
-/// In debug builds, `CALLER_ENV` set means an agent is the caller.
+/// In debug builds, the process `CALLER_ENV` names counts as an agent.
 // ponytail: same-uid ceiling as `caller::walked_to_a_person` (a detached agent passes).
 pub fn person_only(peer_pid: u32) -> bool {
     #[cfg(debug_assertions)]
-    if std::env::var_os(crate::hook::CALLER_ENV).is_some() {
-        return false;
-    }
-    // Pid 1 (launchd, which a non-root lookup cannot read) is no agent.
+    let pinned = crate::hook::pinned_caller().and_then(|p| p.ok());
+    #[cfg(not(debug_assertions))]
+    let pinned = None;
+    person_walk(peer_pid, pinned)
+}
+
+/// `person_only`, with `pinned` (pid + birth) also counted as an agent.
+fn person_walk(peer_pid: u32, pinned: Option<os::Process>) -> bool {
+    // Only lookups that work across uids: the chain passes root-owned `login`, `sshd`, `sudo`.
+    // Pid 1 (launchd) is no agent.
     let mut pid = peer_pid;
     while pid > 1 {
-        let Ok(p) = os::process(pid) else {
+        if pinned.as_ref().is_some_and(|a| {
+            a.pid == pid && os::process(pid).is_ok_and(|p| p.birth_micros == a.birth_micros)
+        }) {
+            return false;
+        }
+        let Ok(exe) = os::executable(pid) else {
             return false;
         };
-        if caller::classify(&p.executable).is_some() {
+        if caller::classify(&exe).is_some() {
             return false;
         }
         let Ok(up) = os::parent_pid(pid) else {
@@ -58,27 +69,75 @@ pub fn person_only(peer_pid: u32) -> bool {
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
-    #[test]
-    fn person_only_fails_closed() {
-        assert!(super::person_only(1));
-        assert!(!super::person_only(999_999));
-        // A process whose ancestry holds no agent: `sleep`, reparented to pid 1 once its
-        // `sh` exits. ponytail: the test's own ancestry may hold one (run under Claude Code).
-        let mut sh = std::process::Command::new("/bin/sh")
-            .args(["-c", "sleep 5 & echo $!"])
-            .stdout(std::process::Stdio::piped())
+    use super::*;
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+
+    /// Spawns `exe args`; returns it and the first stdout line that is a pid.
+    fn child_of(exe: &std::path::Path, args: &[&str]) -> (std::process::Child, u32) {
+        let mut p = Command::new(exe)
+            .args(args)
+            .stdout(Stdio::piped())
             .spawn()
             .unwrap();
-        let mut line = String::new();
-        std::io::BufRead::read_line(
-            &mut std::io::BufReader::new(sh.stdout.take().unwrap()),
-            &mut line,
-        )
-        .unwrap();
+        let pid = BufReader::new(p.stdout.take().unwrap())
+            .lines()
+            .find_map(|l| l.ok()?.trim().parse().ok())
+            .unwrap();
+        (p, pid)
+    }
+    fn kill(pid: u32) {
+        // SAFETY: a plain signal to a pid this test started.
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    }
+
+    #[test]
+    fn person_only_accepts_people_and_refuses_agents() {
+        assert!(person_walk(1, None));
+        assert!(!person_walk(999_999, None));
+
+        // No agent above: a `sleep` reparented to pid 1 once its `sh` exits.
+        // ponytail: the test's own ancestry may hold one (run under Claude Code), so detach.
+        let (mut sh, sleep) = child_of("/bin/sh".as_ref(), &["-c", "sleep 30 & echo $!"]);
         sh.wait().unwrap();
-        let sleep: u32 = line.trim().parse().unwrap();
-        assert!(super::person_only(sleep));
-        // SAFETY: a plain signal to the pid this test started.
-        unsafe { libc::kill(sleep as i32, libc::SIGKILL) };
+        assert!(person_walk(sleep, None));
+        // The pinned process counts as an agent; a stale pin (another birth) does not.
+        let pin = os::process(sleep).unwrap();
+        assert!(!person_walk(sleep, Some(pin.clone())));
+        let stale = os::Process {
+            birth_micros: pin.birth_micros + 1,
+            ..pin
+        };
+        assert!(person_walk(sleep, Some(stale)));
+        kill(sleep);
+
+        // An agent above: this test binary installed as `claude` (a copied system binary is
+        // killed on launch), running `sleep_under_me`, so `sleep`'s parent is `claude`.
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("claude");
+        std::fs::copy(std::env::current_exe().unwrap(), &agent).unwrap();
+        let (mut claude, child) = child_of(
+            &agent,
+            &[
+                "--exact",
+                "daemon::net_ops::tests::sleep_under_me",
+                "--ignored",
+                "--nocapture",
+            ],
+        );
+        // Refused for the agent above it, not for a failed lookup.
+        let parent = os::executable(os::parent_pid(child).unwrap()).unwrap();
+        assert_eq!(caller::classify(&parent), Some("claude"));
+        assert!(!person_walk(child, None));
+        kill(child);
+        claude.wait().unwrap();
+    }
+
+    #[test]
+    #[ignore = "a helper the test above runs as an agent"]
+    fn sleep_under_me() {
+        let mut sleep = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        println!("{}", sleep.id());
+        sleep.wait().unwrap();
     }
 }
