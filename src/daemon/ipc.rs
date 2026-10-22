@@ -143,13 +143,15 @@ async fn handle(line: &str, daemon: &Daemon, subscribed: &mut bool) -> Response 
             None => Response::err(id, BAD_REQUEST),
         },
         "send" => send(id, &req.body, daemon),
-        "receipt" => match req.body["request_id"].as_str() {
-            Some(rid) => match mail::receipt(&daemon.store.lock().unwrap(), rid) {
-                Ok(Some(r)) => Response::ok(id, json!({ "receipt": r })),
-                Ok(None) => Response::err(id, NOT_FOUND),
-                Err(_) => Response::err(id, INTERNAL),
-            },
-            None => Response::err(id, BAD_REQUEST),
+        "receipt" => match (req.body["from"].as_str(), req.body["request_id"].as_str()) {
+            (Some(from), Some(rid)) => {
+                match mail::receipt(&daemon.store.lock().unwrap(), &Key(from.into()), rid) {
+                    Ok(Some(r)) => Response::ok(id, json!({ "receipt": r })),
+                    Ok(None) => Response::err(id, NOT_FOUND),
+                    Err(_) => Response::err(id, INTERNAL),
+                }
+            }
+            _ => Response::err(id, BAD_REQUEST),
         },
         "inbox" => inbox(id, &req.body, daemon).await,
         "tool" => Response::err(id, UNSUPPORTED),

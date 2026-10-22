@@ -68,7 +68,9 @@ impl Net {
     }
 
     fn receipt(&self, rid: &str) -> Value {
-        self.call(json!({"id": 1, "op": "receipt", "request_id": rid}))["receipt"]["state"].clone()
+        self.call(json!({"id": 1, "op": "receipt", "from": "x/codex:a", "request_id": rid}))
+            ["receipt"]["state"]
+            .clone()
     }
 
     fn session(&self, key: &str) -> Option<Value> {

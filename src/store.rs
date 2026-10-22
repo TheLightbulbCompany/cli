@@ -7,12 +7,13 @@ CREATE TABLE IF NOT EXISTS sessions (
     birth_micros INTEGER, cwd TEXT, title TEXT, status TEXT, seen_at INTEGER
 );
 CREATE TABLE IF NOT EXISTS messages (
-    id TEXT PRIMARY KEY, request_id TEXT UNIQUE, from_key TEXT, to_key TEXT,
+    id TEXT PRIMARY KEY, request_id TEXT, from_key TEXT, to_key TEXT,
     kind TEXT DEFAULT 'message', thread TEXT, hops INTEGER DEFAULT 0, origin TEXT,
-    body TEXT, sent_at INTEGER
+    body TEXT, sent_at INTEGER, UNIQUE (from_key, request_id)
 );
 CREATE TABLE IF NOT EXISTS receipts (
-    request_id TEXT PRIMARY KEY, state TEXT, reason TEXT, updated_at INTEGER
+    from_key TEXT, request_id TEXT, state TEXT, reason TEXT, updated_at INTEGER,
+    PRIMARY KEY (from_key, request_id)
 );
 CREATE TABLE IF NOT EXISTS mailbox (
     id INTEGER PRIMARY KEY, to_key TEXT, message_id TEXT, queued_at INTEGER, expires_at INTEGER
@@ -20,7 +21,7 @@ CREATE TABLE IF NOT EXISTS mailbox (
 CREATE TABLE IF NOT EXISTS team (
     id TEXT PRIMARY KEY, name TEXT, founder_key TEXT, created_at INTEGER
 );
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;
 ";
 
 #[derive(Debug, Clone, PartialEq)]
@@ -71,6 +72,12 @@ pub struct Store {
 impl Store {
     pub fn open(path: &Path) -> rusqlite::Result<Store> {
         let conn = Connection::open(path)?;
+        // v1 keyed requests globally; v2 keys them by sender. Recreate (the mailbox points at messages).
+        if conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))? == 1 {
+            conn.execute_batch(
+                "DROP TABLE messages; DROP TABLE receipts; DELETE FROM mailbox; PRAGMA user_version = 2;",
+            )?;
+        }
         conn.execute_batch(SCHEMA)?;
         Ok(Store { conn })
     }
@@ -210,5 +217,36 @@ mod tests {
         store.put_message(&message).unwrap();
         assert_eq!(store.message("m1").unwrap(), Some(message));
         assert_eq!(store.message("missing").unwrap(), None);
+    }
+
+    #[test]
+    fn a_v1_database_is_recreated_with_per_sender_request_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let old = Connection::open(&path).unwrap();
+        old.execute_batch(
+            "CREATE TABLE messages (id TEXT PRIMARY KEY, request_id TEXT UNIQUE);
+             CREATE TABLE receipts (request_id TEXT PRIMARY KEY);
+             CREATE TABLE mailbox (id INTEGER PRIMARY KEY, to_key TEXT, message_id TEXT, queued_at INTEGER, expires_at INTEGER);
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
+        drop(old);
+        let store = Store::open(&path).unwrap();
+        let mut m = Message {
+            id: "m1".into(),
+            request_id: "r".into(),
+            from_key: "a".into(),
+            to_key: "b".into(),
+            kind: "message".into(),
+            thread: None,
+            hops: 0,
+            origin: None,
+            body: "x".into(),
+            sent_at: 1,
+        };
+        store.put_message(&m).unwrap();
+        (m.id, m.from_key) = ("m2".into(), "c".into());
+        store.put_message(&m).unwrap(); // same request_id, other sender
     }
 }

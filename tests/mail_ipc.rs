@@ -78,14 +78,14 @@ async fn send_wakes_a_waiting_inbox_and_the_receipt_walks_to_delivered() {
     let r = call(
         &mut l,
         &mut w,
-        json!({"id": 3, "op": "receipt", "request_id": "r1"}),
+        json!({"id": 3, "op": "receipt", "from": "x/codex:a", "request_id": "r1"}),
     )
     .await;
     assert_eq!(r["receipt"]["state"], "delivered");
     let r = call(
         &mut l,
         &mut w,
-        json!({"id": 4, "op": "receipt", "request_id": "nope"}),
+        json!({"id": 4, "op": "receipt", "from": "x/codex:a", "request_id": "nope"}),
     )
     .await;
     assert_eq!(r["error"], "not_found");

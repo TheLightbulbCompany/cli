@@ -96,6 +96,7 @@ fn live(store: &Store, key: &str) -> bool {
 /// Writes `state` only if it is later than the stored one.
 fn advance(
     conn: &Connection,
+    from: &str,
     request_id: &str,
     state: State,
     reason: Option<&str>,
@@ -103,8 +104,8 @@ fn advance(
 ) -> Result<()> {
     let old = conn
         .query_row(
-            "SELECT state FROM receipts WHERE request_id = ?1",
-            [request_id],
+            "SELECT state FROM receipts WHERE from_key = ?1 AND request_id = ?2",
+            [from, request_id],
             |r| r.get::<_, String>(0),
         )
         .optional()?;
@@ -115,26 +116,26 @@ fn advance(
         if state == State::Read {
             // `updated_at` stays the delivery time: the hops trigger window runs on it.
             conn.execute(
-                "UPDATE receipts SET state = 'read' WHERE request_id = ?1",
-                [request_id],
+                "UPDATE receipts SET state = 'read' WHERE from_key = ?1 AND request_id = ?2",
+                [from, request_id],
             )?;
         } else {
             conn.execute(
-                "INSERT OR REPLACE INTO receipts VALUES (?1, ?2, ?3, ?4)",
-                params![request_id, state.name(), reason, now as i64],
+                "INSERT OR REPLACE INTO receipts VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![from, request_id, state.name(), reason, now as i64],
             )?;
         }
     }
     Ok(())
 }
 
-/// The stored receipt for `request_id`, with `where_` worked out from the recipient's liveness now.
-pub fn receipt(store: &Store, request_id: &str) -> Result<Option<Receipt>> {
+/// The stored receipt for `from`'s `request_id`, with `where_` worked out from the recipient's liveness now.
+pub fn receipt(store: &Store, from: &Key, request_id: &str) -> Result<Option<Receipt>> {
     let conn = store.conn();
     let row = conn
         .query_row(
-            "SELECT state, reason FROM receipts WHERE request_id = ?1",
-            [request_id],
+            "SELECT state, reason FROM receipts WHERE from_key = ?1 AND request_id = ?2",
+            [&from.0, request_id],
             |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
         )
         .optional()?;
@@ -145,8 +146,8 @@ pub fn receipt(store: &Store, request_id: &str) -> Result<Option<Receipt>> {
     let where_ = if state == State::Stored {
         let to: Option<String> = conn
             .query_row(
-                "SELECT to_key FROM messages WHERE request_id = ?1",
-                [request_id],
+                "SELECT to_key FROM messages WHERE from_key = ?1 AND request_id = ?2",
+                [&from.0, request_id],
                 |r| r.get(0),
             )
             .optional()?;
@@ -169,8 +170,14 @@ pub fn receipt(store: &Store, request_id: &str) -> Result<Option<Receipt>> {
     }))
 }
 
-fn refuse(conn: &Connection, request_id: &str, reason: &str, now: u64) -> Result<Receipt> {
-    advance(conn, request_id, State::Refused, Some(reason), now)?;
+fn refuse(
+    conn: &Connection,
+    from: &Key,
+    request_id: &str,
+    reason: &str,
+    now: u64,
+) -> Result<Receipt> {
+    advance(conn, &from.0, request_id, State::Refused, Some(reason), now)?;
     Ok(Receipt {
         request_id: request_id.into(),
         state: State::Refused,
@@ -213,8 +220,8 @@ pub fn send(
     }
     if let Some((old_to, old_text)) = conn
         .query_row(
-            "SELECT to_key, body FROM messages WHERE request_id = ?1",
-            [request_id],
+            "SELECT to_key, body FROM messages WHERE from_key = ?1 AND request_id = ?2",
+            [&from.0, request_id],
             |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
         )
         .optional()?
@@ -228,13 +235,13 @@ pub fn send(
                 where_: None,
             });
         }
-        return Ok(receipt(store, request_id)?.ok_or("message without a receipt")?);
+        return Ok(receipt(store, from, request_id)?.ok_or("message without a receipt")?);
     }
-    if let Some(r) = receipt(store, request_id)? {
+    if let Some(r) = receipt(store, from, request_id)? {
         return Ok(r); // an earlier refusal; no message row to compare
     }
     if text.len() > MAX_TEXT {
-        return refuse(conn, request_id, "too_long", now);
+        return refuse(conn, from, request_id, "too_long", now);
     }
     let since = now.saturating_sub(LOOP_WINDOW_S) as i64;
     let recent: u32 = conn.query_row(
@@ -243,15 +250,16 @@ pub fn send(
         |r| r.get(0),
     )?;
     if recent >= LOOP_LIMIT {
-        return refuse(conn, request_id, "loop", now);
+        return refuse(conn, from, request_id, "loop", now);
     }
 
     let id = ulid::Ulid::generate().to_string();
     let parent: Option<(String, Option<String>, i64)> = match reply_to {
         Some(r) => conn
             .query_row(
-                "SELECT id, thread, hops FROM messages WHERE id = ?1 OR request_id = ?1",
-                [r],
+                "SELECT id, thread, hops FROM messages WHERE id = ?1 OR (request_id = ?1 AND to_key = ?2) \
+                 ORDER BY id = ?1 DESC, rowid DESC LIMIT 1",
+                params![r, from.0],
                 |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?)),
             )
             .optional()?,
@@ -265,7 +273,7 @@ pub fn send(
             let trigger: Option<(String, Option<String>, i64, String)> = conn
                 .query_row(
                     "SELECT m.id, m.thread, m.hops, m.from_key FROM messages m \
-                     JOIN receipts r ON r.request_id = m.request_id \
+                     JOIN receipts r ON r.from_key = m.from_key AND r.request_id = m.request_id \
                      WHERE m.to_key = ?1 AND r.state IN ('delivered', 'read') AND r.updated_at > ?2 \
                      ORDER BY r.updated_at DESC, m.rowid DESC LIMIT 1",
                     params![from.0, since],
@@ -298,9 +306,9 @@ pub fn send(
         "INSERT INTO mailbox (to_key, message_id, queued_at, expires_at) VALUES (?1, ?2, ?3, ?4)",
         params![to.0, id, now as i64, (now + HOLD_S) as i64],
     )?;
-    advance(&tx, request_id, State::Stored, None, now)?;
+    advance(&tx, &from.0, request_id, State::Stored, None, now)?;
     tx.commit()?;
-    Ok(receipt(store, request_id)?.ok_or("receipt missing after write")?)
+    Ok(receipt(store, from, request_id)?.ok_or("receipt missing after write")?)
 }
 
 /// The messages waiting for `to`, oldest first; each becomes `delivered` and leaves the mailbox.
@@ -317,7 +325,7 @@ pub fn take(store: &Store, to: &Key, now: u64) -> Result<Vec<Message>> {
     let mut out = vec![];
     for (row_id, message_id) in rows {
         if let Some(m) = store.message(&message_id)? {
-            advance(&tx, &m.request_id, State::Delivered, None, now)?;
+            advance(&tx, &m.from_key, &m.request_id, State::Delivered, None, now)?;
             out.push(m);
         }
         tx.execute("DELETE FROM mailbox WHERE id = ?1", [row_id])?;
@@ -328,7 +336,14 @@ pub fn take(store: &Store, to: &Key, now: u64) -> Result<Vec<Message>> {
 
 pub fn mark_read(store: &Store, message_id: &str, now: u64) -> Result<()> {
     if let Some(m) = store.message(message_id)? {
-        advance(store.conn(), &m.request_id, State::Read, None, now)?;
+        advance(
+            store.conn(),
+            &m.from_key,
+            &m.request_id,
+            State::Read,
+            None,
+            now,
+        )?;
     }
     Ok(())
 }
@@ -337,15 +352,15 @@ pub fn mark_read(store: &Store, message_id: &str, now: u64) -> Result<()> {
 pub fn expire(store: &Store, now: u64) -> Result<()> {
     let conn = store.conn();
     let tx = conn.unchecked_transaction()?;
-    let due: Vec<String> = {
+    let due: Vec<(String, String)> = {
         let mut stmt = tx.prepare(
-            "SELECT m.request_id FROM mailbox b JOIN messages m ON m.id = b.message_id WHERE b.expires_at < ?1",
+            "SELECT m.from_key, m.request_id FROM mailbox b JOIN messages m ON m.id = b.message_id WHERE b.expires_at < ?1",
         )?;
-        let rows = stmt.query_map([now as i64], |r| r.get(0))?;
+        let rows = stmt.query_map([now as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
         rows.collect::<rusqlite::Result<_>>()?
     };
-    for request_id in due {
-        advance(&tx, &request_id, State::Expired, None, now)?;
+    for (from, request_id) in due {
+        advance(&tx, &from, &request_id, State::Expired, None, now)?;
     }
     tx.execute("DELETE FROM mailbox WHERE expires_at < ?1", [now as i64])?;
     tx.commit()?;
@@ -386,7 +401,15 @@ mod tests {
     }
 
     fn state(store: &Store, rid: &str) -> State {
-        receipt(store, rid).unwrap().unwrap().state
+        let from: String = store
+            .conn()
+            .query_row(
+                "SELECT from_key FROM receipts WHERE request_id = ?1",
+                [rid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        receipt(store, &Key(from), rid).unwrap().unwrap().state
     }
 
     #[test]
@@ -409,7 +432,7 @@ mod tests {
         mark_read(&s, &got[0].id, 103).unwrap();
         assert_eq!(state(&s, "r1"), State::Read);
         // never backwards
-        advance(s.conn(), "r1", State::Stored, None, 104).unwrap();
+        advance(s.conn(), "m/codex:a", "r1", State::Stored, None, 104).unwrap();
         assert_eq!(state(&s, "r1"), State::Read);
     }
 
@@ -472,7 +495,7 @@ mod tests {
                 (State::Refused, Some("bad_request_id")),
                 "{rid:?}"
             );
-            assert!(receipt(&s, rid).unwrap().is_none());
+            assert!(receipt(&s, &k("a"), rid).unwrap().is_none());
         }
         assert_eq!(
             send(&s, &k("a"), &k("b"), "x", "Ok.id_1-2", None, 1)
@@ -706,5 +729,32 @@ mod tests {
         take(&s, &k("b"), 1000).unwrap();
         send(&s, &k("b"), &k("c"), "y", "r2", None, 1500).unwrap();
         assert_eq!(thread_hops(&s, "r2").2, 1);
+    }
+
+    #[test]
+    fn two_senders_may_reuse_the_same_request_id() {
+        let (_d, s) = setup();
+        let r1 = send(&s, &k("a"), &k("c"), "from a", "req-1", None, 1).unwrap();
+        let r2 = send(&s, &k("b"), &k("c"), "from b", "req-1", None, 1).unwrap();
+        assert_eq!((r1.state, r2.state), (State::Stored, State::Stored));
+        // each sender's retry is idempotent within itself; a mismatch is only against its own
+        assert_eq!(
+            send(&s, &k("b"), &k("c"), "from b", "req-1", None, 2).unwrap(),
+            r2
+        );
+        let r = send(&s, &k("a"), &k("c"), "from b", "req-1", None, 2).unwrap();
+        assert_eq!(r.reason.as_deref(), Some("request_id_reused"));
+        // receipts are separate: reading a's message leaves b's delivered
+        take(&s, &k("c"), 3).unwrap();
+        let a_id: String = s
+            .conn()
+            .query_row("SELECT id FROM messages WHERE from_key = 'a'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        mark_read(&s, &a_id, 4).unwrap();
+        let got = |f: &str| receipt(&s, &k(f), "req-1").unwrap().unwrap().state;
+        assert_eq!((got("a"), got("b")), (State::Read, State::Delivered));
+        assert!(receipt(&s, &k("c"), "req-1").unwrap().is_none());
     }
 }
