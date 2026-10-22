@@ -279,8 +279,10 @@ fn pass(
                     link.is_some_and(|(lh, l)| {
                         l.signer == e.signer
                             && anc[h.as_str()].contains(lh)
+                            // Every removal the link does not descend from ends it; an
+                            // admission it already knew of stands.
                             && removals.iter().all(|rh| {
-                                !anc[rh.as_str()].contains(lh) || anc[rh.as_str()].contains(&h)
+                                anc[lh.as_str()].contains(rh) || anc[rh.as_str()].contains(&h)
                             })
                     })
                 };
@@ -388,9 +390,9 @@ fn pass(
             Kind::Admit | Kind::Link | Kind::Admin | Kind::Transfer => {}
         }
     }
-    // Live links: unused, and no removal descends from them.
+    // Live links: unused, and descended from every removal (a removal it did not see ends it).
     for (lh, l) in links.into_values() {
-        if !used_once.contains(&lh) && !removals.iter().any(|rh| anc[rh.as_str()].contains(&lh)) {
+        if !used_once.contains(&lh) && removals.iter().all(|rh| anc[lh.as_str()].contains(rh)) {
             r.links.insert(l.ticket_id.clone(), l);
         }
     }
@@ -923,6 +925,33 @@ mod tests {
         let r = replay(&[g, ab, by_founder, m1, m2, pr]);
         assert_eq!(r.members[&b.key].person_id, "p1");
         assert_eq!(r.members[&b.key].proof.as_deref(), Some("t2"));
+    }
+
+    #[test]
+    fn link_concurrent_with_a_removal_is_ended() {
+        // Admin A removes X without having seen the links: both end. P's admission through
+        // its link that the removal knew of stands; one concurrent with it drops.
+        let (f, a, x, p, c, d) = (id(), id(), id(), id(), id(), id());
+        let g = genesis(&f);
+        let [aa0, aa] = admit_admin(&f, &g, &a);
+        let ax = admit(&f, &aa, &x.key, "m"); // `admit_admin` names A "x"
+        let ap = admit(&f, &ax, &p.key, "p");
+        let lf = link_with(&f, &ap, "tf", false);
+        let lp = link_with(&p, &lf, "tp", false);
+        let pc = admit_via(&p, &lp, &c.key, "c", "tp");
+        let rx = member(&a, &ap, Kind::Remove, &x.key);
+        let base = vec![g, aa0, aa, ax, ap, lf, lp.clone()];
+        let r = replay(&[base.clone(), vec![pc, rx]].concat());
+        assert!(!r.members.contains_key(&x.key));
+        assert!(!r.members.contains_key(&c.key));
+        assert!(r.links.is_empty());
+        // The removal descends from P's admission of D: D stands, the link still ends.
+        let pd = admit_via(&p, &lp, &d.key, "d", "tp");
+        let rx2 = member(&a, &pd, Kind::Remove, &x.key);
+        let r = replay(&[base, vec![pd, rx2]].concat());
+        assert!(r.members.contains_key(&d.key));
+        assert!(!r.members.contains_key(&x.key));
+        assert!(r.links.is_empty());
     }
 
     #[test]
