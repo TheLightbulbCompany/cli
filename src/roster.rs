@@ -323,7 +323,9 @@ fn pass(
                     e.body.get("role").and_then(Value::as_str),
                     None | Some("member")
                 );
-                if (elevated || via_link()) && !collides && role_ok && own_person(e) {
+                // A link's signer admits only computers; a cloud member needs an admin.
+                let kind_ok = elevated || e.text("kind") != "cloud";
+                if (elevated || via_link()) && kind_ok && !collides && role_ok && own_person(e) {
                     r.members.insert(target, new_member(e, Role::Member));
                     if let Some((lh, _)) = link.filter(|(_, l)| l.once) {
                         used_once.insert(lh.clone());
@@ -389,9 +391,10 @@ fn pass(
                 }
             }
             // Only a computer member mints links, under its own `<short>.` prefix, and a
-            // `ticket_id` names one link ever.
+            // `ticket_id` names one link ever; an `open` one only the founder and admins.
             Kind::Link
                 if computer
+                    && (elevated || e.text("mode") != "open")
                     && e.text("ticket_id")
                         .strip_prefix(signer.short.as_str())
                         .is_some_and(|rest| rest.len() > 1 && rest.starts_with('.')) =>
@@ -1163,5 +1166,40 @@ mod tests {
         assert!(!r.members.contains_key(&y.key));
         assert!(!r.members.contains_key(&e.key));
         assert!(r.links.is_empty());
+    }
+
+    #[test]
+    fn member_open_link_and_elevated_or_cloud_admits_are_dropped() {
+        let (f, x, c, k, m, z) = (id(), id(), id(), id(), id(), id());
+        let g = genesis(&f);
+        let ax = admit(&f, &g, &x.key, "x");
+        // Member X: an open link is dropped, an ask link stands.
+        let (open_id, ask_id) = (tid(&x, "open"), tid(&x, "ask"));
+        let mut lo = link_with(&x, &ax, &open_id, false);
+        lo.body["mode"] = json!("open");
+        let lo = op(&x, &ax, Kind::Link, lo.body);
+        let la = link_with(&x, &lo, &ask_id, false);
+        // Through its own link X admits a computer, but neither a cloud member nor an admin.
+        let xc = admit_via(&x, &la, &c.key, "c", &ask_id);
+        let mut kb = admit_body(&k.key, "k");
+        kb["kind"] = json!("cloud");
+        kb["ticket_id"] = json!(ask_id);
+        let xk = op(&x, &xc, Kind::Admit, kb);
+        let mut mb = admit_body(&m.key, "m");
+        mb["role"] = json!("admin");
+        mb["ticket_id"] = json!(ask_id);
+        let xm = op(&x, &xk, Kind::Admit, mb.clone());
+        // The founder may admit a cloud member, but not an admin either.
+        let mut zb = admit_body(&z.key, "z");
+        zb["kind"] = json!("cloud");
+        let fz = op(&f, &xm, Kind::Admit, zb);
+        let fm = op(&f, &fz, Kind::Admit, mb);
+        let r = replay(&[g, ax, lo, la, xc, xk, xm, fz, fm]);
+        assert!(!r.links.contains_key(&open_id));
+        assert!(r.links.contains_key(&ask_id));
+        assert!(r.members.contains_key(&c.key));
+        assert!(!r.members.contains_key(&k.key));
+        assert!(!r.members.contains_key(&m.key));
+        assert_eq!(r.members[&z.key].kind, MemberKind::Cloud);
     }
 }

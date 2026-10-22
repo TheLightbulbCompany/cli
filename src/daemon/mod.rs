@@ -178,6 +178,8 @@ pub async fn run(dir: &Path) -> Result<()> {
         dialog_answers: Mutex::new(Some(answers)),
         admissions: Mutex::default(),
     });
+    // No join connection outlives a restart: its open requests are over.
+    daemon.store.lock().unwrap().expire_joins(i64::MAX)?;
     tokio::spawn(crate::admission::route(daemon.clone()));
     let net = net::Net::start(daemon.clone()).await?;
     ipc::serve(listener, daemon).await;

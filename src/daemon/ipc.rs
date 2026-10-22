@@ -192,6 +192,10 @@ async fn handle(
             _ => Response::err(id, BAD_REQUEST),
         },
         "inbox" => inbox(id, &req.body, daemon, peer).await,
+        // An agent fed a hostile link must not move this computer into another network.
+        "team.join" if !peer_pid.is_some_and(super::net_ops::person_only) => {
+            refused(id, "not_a_person")
+        }
         "team.join" => crate::admission::join(id, &req.body, daemon).await,
         // `mark_read {key}` -> `{}`: `key`'s session took a step (an MCP tool call), so the mail
         // delivered to it before now has been seen.

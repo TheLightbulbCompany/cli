@@ -35,8 +35,12 @@ fn invite(e: &Env, mode: &str) -> String {
     r["ticket"].as_str().unwrap().into()
 }
 
+/// `team.join` is person-only: asked from a detached process.
 fn join(e: &Env, ticket: &str, name: &str) -> Value {
-    e.ask(json!({"id": 1, "op": "team.join", "ticket": ticket, "name": name, "kind": "computer"}))
+    person(
+        e,
+        json!({"id": 1, "op": "team.join", "ticket": ticket, "name": name, "kind": "computer"}),
+    )
 }
 
 fn refused(r: &Value, reason: &str) {
@@ -62,14 +66,38 @@ fn requests(e: &Env) -> Vec<Value> {
         .clone()
 }
 
-/// `req` from a person: a detached `nc`.
+/// `req` from a person: one line over the socket from a detached `perl`, which returns as
+/// soon as the answer arrives.
 fn person(e: &Env, req: Value) -> Value {
     let sock = e.state.path().join("sock");
-    let nc = e.detached(
-        &["nc", "-w", "1", "-U", sock.to_str().unwrap()],
+    let script = "my $s = IO::Socket::UNIX->new(Peer => $ARGV[0]) or die $!; \
+                  print $s scalar <STDIN>; print scalar <$s>;";
+    let o = e.detached(
+        &[
+            "/usr/bin/perl",
+            "-MIO::Socket::UNIX",
+            "-e",
+            script,
+            sock.to_str().unwrap(),
+        ],
         &format!("{req}\n"),
     );
-    serde_json::from_slice(&nc.stdout).unwrap()
+    serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{}{}", out(&o), err(&o)))
+}
+
+fn rows(e: &Env) -> Vec<String> {
+    rusqlite::Connection::open(e.state.path().join("state.db"))
+        .unwrap()
+        .prepare("SELECT state FROM join_requests ORDER BY id")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+fn wait_s(s: u64) -> (&'static str, String) {
+    ("LIGHTBULB_NETWORK_DEBUG_JOIN_WAIT_S", s.to_string())
 }
 
 fn identity() -> Identity {
@@ -165,8 +193,10 @@ fn ask_ticket_admits_only_after_allow() {
     // A second answer finds nothing open.
     let o = a.detached(&[EXE, "decline", "J1"], "");
     assert!(!o.status.success());
-    let r = a.detached(&[EXE, "approve", "J9"], "");
-    assert!(!r.status.success());
+    assert_eq!(err(&o), "J1 was already answered or withdrawn.\n");
+    let o = a.detached(&[EXE, "approve", "J9"], "");
+    assert!(!o.status.success());
+    assert_eq!(err(&o), "No join request J9.\n");
 }
 
 #[test]
@@ -297,8 +327,7 @@ async fn sixth_open_request_for_one_inviter_is_refused() {
 async fn abandoned_requests_expire_and_free_the_limit() {
     let a = Env::new();
     // The 600 s wait, shortened.
-    let wait = ("LIGHTBULB_NETWORK_DEBUG_JOIN_WAIT_S", "3".to_string());
-    a.daemon(false, "", &[dialog(""), wait]);
+    a.daemon(false, "", &[dialog(""), wait_s(3)]);
     let t = ticket::decode(&invite(&a, "reusable")).unwrap();
     let mut held = vec![];
     for i in 0..5 {
@@ -311,15 +340,7 @@ async fn abandoned_requests_expire_and_free_the_limit() {
     }
     until(2, "two expired on close", || requests(&a).len() == 3);
     until(10, "the rest expired", || requests(&a).is_empty());
-    let states: Vec<String> = rusqlite::Connection::open(a.state.path().join("state.db"))
-        .unwrap()
-        .prepare("SELECT state FROM join_requests ORDER BY id")
-        .unwrap()
-        .query_map([], |r| r.get(0))
-        .unwrap()
-        .map(Result::unwrap)
-        .collect();
-    assert_eq!(states, ["expired"; 5]);
+    assert_eq!(rows(&a), ["expired"; 5]);
     let _sixth = Played::ask(&a, &t, "c5").await;
     until(5, "a sixth is accepted", || {
         requests(&a).first().is_some_and(|r| r["id"] == "J6")
@@ -353,7 +374,10 @@ fn cloud_candidate_without_bridge_proof_is_refused() {
     a.daemon(false, "", &[dialog("Allow")]);
     let t = invite(&a, "reusable");
     b.daemon(false, "", &[peers(&[&a])]);
-    let r = b.ask(json!({"id": 1, "op": "team.join", "ticket": t, "name": "bot", "kind": "cloud"}));
+    let r = person(
+        &b,
+        json!({"id": 1, "op": "team.join", "ticket": t, "name": "bot", "kind": "cloud"}),
+    );
     refused(&r, "unsupported");
     assert_eq!(members(&a), 1);
 }
@@ -415,4 +439,82 @@ fn bad_link_and_unreachable_texts() {
         "No one from this network is online right now. Ask them to open their laptop, then run the same command again. Your key is ready; nothing was lost.\n"
     );
     refused(&join(&b, "nonsense", "bob"), "bad_ticket");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn candidate_with_a_bad_signature_is_dropped() {
+    let a = Env::new();
+    a.daemon(false, "", &[dialog("Allow")]);
+    let t = ticket::decode(&invite(&a, "reusable")).unwrap();
+    // `candidate` is the peer, but the name was changed after signing.
+    let me = identity();
+    let mut v =
+        serde_json::to_value(admission::request(&me, &t, "carol", "mbp", "computer")).unwrap();
+    v["name"] = json!("mallory");
+    let req: Frame = serde_json::from_value(v).unwrap();
+    let mut p = Played::send(&a, &me, &req).await;
+    let got = p.recv().await;
+    assert!(got.is_err(), "answered: {got:?}");
+    assert!(rows(&a).is_empty());
+    assert_eq!(members(&a), 1);
+}
+
+#[test]
+fn unanswered_request_is_waiting_and_asks_no_one_else() {
+    let (f, x, c) = (Env::new(), Env::new(), Env::new());
+    seed_pair(&f, &x);
+    x.daemon(false, "", &[dialog(""), wait_s(2)]);
+    f.daemon(false, "", &[peers(&[&x]), dialog(""), wait_s(2)]);
+    let t = invite(&x, "reusable");
+    c.daemon(false, "", &[peers(&[&x, &f]), wait_s(2)]);
+    let r = join(&c, &t, "carol");
+    assert_eq!(r["state"], "waiting", "{r}");
+    assert_eq!(rows(&x), ["expired"]);
+    assert!(rows(&f).is_empty(), "the second member was asked");
+    assert_eq!(members(&c), 1);
+}
+
+#[test]
+fn admitted_candidate_that_lost_the_roster_rejoins() {
+    let (a, b) = (Env::new(), Env::new());
+    a.daemon(false, "", &[dialog("Allow")]);
+    let t = invite(&a, "reusable");
+    b.daemon(false, "", &[peers(&[&a])]);
+    assert_eq!(join(&b, &t, "bob")["state"], "admitted");
+    let log = roster::entries(&a.store()).unwrap().len();
+    // B loses its roster: back to a solo network.
+    b.ask(json!({"id": 1, "op": "shutdown"}));
+    until(10, "B stops", || !b.state.path().join("sock").exists());
+    b.store().clear_roster().unwrap();
+    b.daemon(false, "", &[peers(&[&a])]);
+    assert_eq!(members(&b), 1);
+    let r = join(&b, &t, "bob");
+    assert_eq!(r["state"], "admitted", "{r}");
+    assert_eq!(
+        roster::entries(&a.store()).unwrap().len(),
+        log,
+        "nothing written"
+    );
+    until(5, "B has the team", || {
+        members(&b) == 2 && b.heads() == a.heads()
+    });
+}
+
+#[test]
+fn team_join_is_person_only() {
+    let (a, b) = (Env::new(), Env::new());
+    a.daemon(false, "", &[dialog("Allow")]);
+    let t = invite(&a, "reusable");
+    // B's daemon takes this test process for an agent.
+    let me = std::process::id();
+    let birth = lightbulb_network::os::process(me).unwrap().birth_micros;
+    let pin = ("LIGHTBULB_NETWORK_HOOK_CALLER", format!("{me}:{birth}"));
+    b.daemon(false, "", &[peers(&[&a]), pin]);
+    let r = b.ask(json!({"id": 1, "op": "team.join", "ticket": t, "name": "bob"}));
+    assert_eq!(
+        (r["error"].as_str(), r["reason"].as_str()),
+        (Some("bad_request"), Some("not_a_person")),
+        "{r}"
+    );
+    assert_eq!((members(&a), members(&b)), (1, 1));
 }
