@@ -218,24 +218,6 @@ impl Store {
             .optional()
     }
 
-    /// Creates the solo team on first start (a Plan A stub); returns `(id, name)`.
-    pub fn ensure_team(
-        &self,
-        id: &str,
-        name: &str,
-        created_at: i64,
-    ) -> rusqlite::Result<(String, String)> {
-        self.conn.execute(
-            "INSERT OR IGNORE INTO team VALUES (?1, ?2, ?1, ?3)",
-            params![id, name, created_at],
-        )?;
-        self.conn.query_row(
-            "SELECT id, name FROM team WHERE founder_key = ?1",
-            [id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-    }
-
     /// Rewrites the Plan A `team` row from the roster.
     pub fn set_team(&self, id: &str, name: &str, founder: &str, at: i64) -> rusqlite::Result<()> {
         self.conn.execute_batch("DELETE FROM team")?;
@@ -244,6 +226,35 @@ impl Store {
             params![id, name, founder, at],
         )?;
         Ok(())
+    }
+
+    /// Records a link minted here. A once link (`hashed`) keeps only its secret's hash.
+    pub fn put_link(
+        &self,
+        ticket_id: &str,
+        secret: &str,
+        hashed: Option<&str>,
+        mode: &str,
+        expires_at: i64,
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO team_link VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+            params![
+                ticket_id,
+                hashed.is_none().then_some(secret),
+                hashed,
+                mode,
+                hashed.is_some(),
+                expires_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Forgets the team: every roster entry and every link minted here.
+    pub fn clear_roster(&self) -> rusqlite::Result<()> {
+        self.conn
+            .execute_batch("DELETE FROM roster; DELETE FROM team_link;")
     }
 }
 

@@ -2,23 +2,14 @@
 
 use lightbulb_network::os;
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::net::UnixStream;
+use std::io::{BufRead, BufReader};
 use std::process::{Command, Output, Stdio};
 
-struct Env {
-    state: tempfile::TempDir,
-    home: tempfile::TempDir,
-}
+mod common;
+
+use common::{err, out, Env};
 
 impl Env {
-    fn new() -> Env {
-        Env {
-            state: tempfile::tempdir().unwrap(),
-            home: tempfile::tempdir().unwrap(),
-        }
-    }
-
     fn cmd(&self, args: &[&str]) -> Command {
         let mut c = Command::new(env!("CARGO_BIN_EXE_lightbulb-network"));
         c.args(args)
@@ -33,15 +24,6 @@ impl Env {
 
     fn run(&self, args: &[&str]) -> Output {
         self.cmd(args).output().unwrap()
-    }
-
-    /// One daemon request on a fresh connection (the CLI starts the daemon on first use).
-    fn ask(&self, body: Value) -> Value {
-        let mut s = UnixStream::connect(self.state.path().join("sock")).unwrap();
-        writeln!(s, "{body}").unwrap();
-        let mut line = String::new();
-        BufReader::new(s).read_line(&mut line).unwrap();
-        serde_json::from_str(&line).unwrap()
     }
 
     /// Starts the daemon and registers the test process as a codex session.
@@ -60,23 +42,6 @@ impl Env {
             .unwrap()
             .to_string()
     }
-}
-
-impl Drop for Env {
-    fn drop(&mut self) {
-        if let Ok(mut s) = UnixStream::connect(self.state.path().join("sock")) {
-            let _ = writeln!(s, r#"{{"id":1,"op":"shutdown"}}"#);
-            let _ = s.read(&mut [0; 64]);
-        }
-    }
-}
-
-fn out(o: &Output) -> String {
-    String::from_utf8_lossy(&o.stdout).into_owned()
-}
-
-fn err(o: &Output) -> String {
-    String::from_utf8_lossy(&o.stderr).into_owned()
 }
 
 #[test]

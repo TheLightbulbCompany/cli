@@ -2,6 +2,7 @@
 //! `daemon --install/--uninstall`, the `lightbulb` alias, and forwarding to the Lightbulb app.
 //! Each is a client of the daemon, like the hook.
 
+use crate::daemon::net_ops::Invite;
 use crate::hook::{self, Conn};
 use crate::{daemon, paths, setup, Result};
 use serde_json::{json, Value};
@@ -239,44 +240,42 @@ pub fn receipt(request_id: &str, from: Option<String>) -> Result<i32> {
 
 // ---- team -------------------------------------------------------------------------------
 
+/// Prints the text `texts` maps `r`'s error code to (`"{verb}: {code}"` for any other code);
+/// returns the exit code 1.
+fn refuse(r: &Value, texts: &[(&str, String)], verb: &str) -> Result<i32> {
+    let code = r["error"].as_str().unwrap_or_default();
+    match texts.iter().find(|(c, _)| *c == code) {
+        Some((_, text)) => eprintln!("{text}"),
+        None => eprintln!("{verb}: {code}"),
+    }
+    Ok(1)
+}
+
 /// `invite [--new|--once|--open]`: this computer's invite line.
-pub fn invite(new: bool, once: bool, open: bool) -> Result<i32> {
-    if open && session_identity() {
+pub fn invite(mode: Invite) -> Result<i32> {
+    if mode == Invite::Open && session_identity() {
         eprintln!("invite --open is for people at a terminal");
         return Ok(1);
     }
-    let mode = match (new, once, open) {
-        (true, ..) => "new",
-        (_, true, _) => "once",
-        (.., true) => "open",
-        _ => "reusable",
-    };
     let r = connect()?.call("team.invite", json!({ "mode": mode }))?;
-    match r["error"].as_str() {
-        None => {}
-        Some("not_admin") => {
-            eprintln!("Only the founder and admins can make an open link.");
-            return Ok(1);
-        }
-        Some(_) => {
-            return Err(format!(
-                "invite: {}",
-                r["reason"].as_str().unwrap_or(&r["error"].to_string())
-            )
-            .into())
-        }
+    if r["ok"] != true {
+        let text = "Only the founder and admins can make an open link.".to_string();
+        return refuse(&r, &[("not_admin", text)], "invite");
     }
     let line = r["line"].as_str().unwrap_or_default();
-    if once {
-        let at = utc(r["expires_at"].as_i64().unwrap_or_default());
-        println!("One-time invite, expires {at}: {line}");
-    } else if open {
-        println!("Anyone with this link joins without asking. Use it only with people you trust.");
-        println!("{line}");
-    } else if r["replaced"] == true {
-        println!("Old link stopped working. New link: {line}");
-    } else {
-        println!("{line}");
+    match mode {
+        Invite::Once => {
+            let at = utc(r["expires_at"].as_i64().unwrap_or_default());
+            println!("One-time invite, expires {at}: {line}");
+        }
+        Invite::Open => {
+            println!(
+                "Anyone with this link joins without asking. Use it only with people you trust."
+            );
+            println!("{line}");
+        }
+        _ if r["replaced"] == true => println!("Old link stopped working. New link: {line}"),
+        _ => println!("{line}"),
     }
     Ok(0)
 }
@@ -301,47 +300,43 @@ pub fn team() -> Result<i32> {
 /// `admin <name> [--founder]`.
 pub fn admin(name: &str, founder: bool) -> Result<i32> {
     let r = connect()?.call("team.admin", json!({ "member": name, "founder": founder }))?;
-    let Some(code) = r["error"].as_str() else {
-        let n = r["name"].as_str().unwrap_or(name);
-        if founder {
-            println!("{n} is now the founder.");
-        } else {
-            println!("{n} can now remove members.");
-        }
-        return Ok(0);
-    };
-    eprintln!(
-        "{}",
-        match code {
-            "not_founder" => "Only the founder can make admins.".to_string(),
-            "not_found" => format!("No member called {name}."),
-            _ => format!("admin: {code}"),
-        }
-    );
-    Ok(1)
+    if r["ok"] != true {
+        let texts = [
+            (
+                "not_founder",
+                "Only the founder can make admins.".to_string(),
+            ),
+            ("not_found", format!("No member called {name}.")),
+        ];
+        return refuse(&r, &texts, "admin");
+    }
+    let n = r["name"].as_str().unwrap_or(name);
+    if founder {
+        println!("{n} is now the founder.");
+    } else {
+        println!("{n} can now remove members.");
+    }
+    Ok(0)
 }
 
 /// `remove <name>`.
 pub fn remove(name: &str) -> Result<i32> {
     let r = connect()?.call("team.remove", json!({ "member": name }))?;
-    let Some(code) = r["error"].as_str() else {
-        let n = r["name"].as_str().unwrap_or(name);
-        let line = r["line"].as_str().unwrap_or_default();
-        println!("Removed {n}. New connections and new mail from it are blocked. The invite link was replaced: {line}");
-        return Ok(0);
-    };
-    eprintln!(
-        "{}",
-        match code {
-            "not_admin" => format!(
-                "Only the founder and admins can remove computers. Ask {}.",
-                r["founder"].as_str().unwrap_or("the founder")
+    if r["ok"] != true {
+        let ask = r["founder"].as_str().unwrap_or("the founder");
+        let texts = [
+            (
+                "not_admin",
+                format!("Only the founder and admins can remove computers. Ask {ask}."),
             ),
-            "not_found" => format!("No member called {name}."),
-            _ => format!("remove: {code}"),
-        }
-    );
-    Ok(1)
+            ("not_found", format!("No member called {name}.")),
+        ];
+        return refuse(&r, &texts, "remove");
+    }
+    let n = r["name"].as_str().unwrap_or(name);
+    let line = r["line"].as_str().unwrap_or_default();
+    println!("Removed {n}. New connections and new mail from it are blocked. The invite link was replaced: {line}");
+    Ok(0)
 }
 
 /// `leave`: after a yes, this computer leaves its team and is on its own network again. The
@@ -362,17 +357,12 @@ pub fn leave() -> Result<i32> {
         return Ok(0);
     }
     let r = conn.call("team.leave", json!({}))?;
-    match r["error"].as_str() {
-        None => {
-            println!("Left \"{name}\". This computer is on its own network again.");
-            Ok(0)
-        }
-        Some("founder_must_transfer") => {
-            eprintln!("You are the founder. Name a new founder first: lightbulb-network admin <name> --founder");
-            Ok(1)
-        }
-        Some(code) => Err(format!("leave: {code}").into()),
+    if r["ok"] != true {
+        let text = "You are the founder. Name a new founder first: lightbulb-network admin <name> --founder";
+        return refuse(&r, &[("founder_must_transfer", text.to_string())], "leave");
     }
+    println!("Left \"{name}\". This computer is on its own network again.");
+    Ok(0)
 }
 
 /// `secs` as `YYYY-MM-DD HH:MM UTC`.

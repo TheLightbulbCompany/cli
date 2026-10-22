@@ -69,7 +69,8 @@ impl Entry {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Ordered by authority: `Member < Admin < Founder`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     Member,
@@ -111,6 +112,8 @@ pub struct Link {
 pub struct Roster {
     pub team_id: String,
     pub team_name: String,
+    /// The genesis entry's stamp.
+    pub created_at: i64,
     pub members: BTreeMap<String, Member>,
     pub heads: Vec<String>,
     pub links: BTreeMap<String, Link>,
@@ -119,6 +122,10 @@ pub struct Roster {
 }
 
 impl Roster {
+    pub fn founder(&self) -> Option<&Member> {
+        self.members.values().find(|m| m.role == Role::Founder)
+    }
+
     pub fn by_short(&self, short: &str) -> Option<&Member> {
         self.members.values().find(|m| m.short == short)
     }
@@ -235,6 +242,7 @@ fn pass(
             if e.parents.is_empty() && is_genesis(e) {
                 r.team_id = h.clone();
                 r.team_name = e.text("team_name").to_string();
+                r.created_at = e.at;
                 r.members
                     .insert(e.signer.clone(), new_member(e, Role::Founder));
             }

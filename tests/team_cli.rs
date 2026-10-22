@@ -1,33 +1,25 @@
 //! The team verbs against the built binary: `invite`, `remove`, `leave`, and the roster the
 //! daemon keeps across restarts.
 
+use lightbulb_network::daemon::net_ops;
 use lightbulb_network::identity::Identity;
 use lightbulb_network::os;
 use lightbulb_network::roster::{self, Entry, Kind};
 use lightbulb_network::store::Store;
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, ExitStatus, Output};
 use std::time::{Duration, Instant};
 
-struct Env {
-    state: tempfile::TempDir,
-    home: tempfile::TempDir,
-    /// `LIGHTBULB_NETWORK_HOOK_CALLER` for the daemon: the process it treats as an agent.
-    pin: Option<String>,
-}
+mod common;
+
+use common::{err, out, Env};
+
+const EXE: &str = env!("CARGO_BIN_EXE_lightbulb-network");
 
 impl Env {
-    fn new() -> Env {
-        Env {
-            state: tempfile::tempdir().unwrap(),
-            home: tempfile::tempdir().unwrap(),
-            pin: None,
-        }
-    }
-
     /// A daemon that takes this test process for an agent.
     fn pinned() -> Env {
         let birth = os::process(std::process::id()).unwrap().birth_micros;
@@ -72,21 +64,6 @@ impl Env {
         }
     }
 
-    fn run_with(&self, args: &[&str], stdin: &str) -> Output {
-        let exe = env!("CARGO_BIN_EXE_lightbulb-network");
-        self.detached(&[[exe].as_slice(), args].concat(), stdin)
-    }
-
-    /// One daemon request from a person (a detached `nc`).
-    fn ask_as_person(&self, body: Value) -> Value {
-        let sock = self.state.path().join("sock");
-        let o = self.detached(
-            &["nc", "-w", "1", "-U", sock.to_str().unwrap()],
-            &format!("{body}\n"),
-        );
-        serde_json::from_slice(&o.stdout).unwrap()
-    }
-
     /// Seeds a two-member team "acme" before the daemon starts: this computer and aden's,
     /// founded by this computer or (`member`) by aden, admitting this one as "me".
     fn seed(&self, member: bool) {
@@ -97,14 +74,7 @@ impl Env {
         } else {
             (&me, &aden, "prasiddha", "aden")
         };
-        let g = Entry::signed(
-            f,
-            vec![],
-            Kind::Admit,
-            json!({"member": f.key, "name": f_name, "computer": "mac", "person_id": f.key,
-                   "kind": "computer", "role": "founder", "ticket_id": "", "team_name": "acme"}),
-            1,
-        );
+        let g = net_ops::genesis(f, f_name, "mac", "acme", 1);
         let a = Entry::signed(
             f,
             vec![g.hash()],
@@ -118,16 +88,9 @@ impl Env {
         roster::accept(&store, &a, 10).unwrap();
     }
 
+    /// The binary with `args`, run by a person (`detached`).
     fn run(&self, args: &[&str]) -> Output {
-        self.run_with(args, "")
-    }
-
-    fn ask(&self, body: Value) -> Value {
-        let mut s = UnixStream::connect(self.state.path().join("sock")).unwrap();
-        writeln!(s, "{body}").unwrap();
-        let mut line = String::new();
-        BufReader::new(s).read_line(&mut line).unwrap();
-        serde_json::from_str(&line).unwrap()
+        self.detached(&[[EXE].as_slice(), args].concat(), "")
     }
 
     fn team_id(&self) -> String {
@@ -149,23 +112,6 @@ impl Env {
     fn entries(&self) -> Vec<Entry> {
         roster::entries(&Store::open(&self.state.path().join("state.db")).unwrap()).unwrap()
     }
-}
-
-impl Drop for Env {
-    fn drop(&mut self) {
-        if let Ok(mut s) = UnixStream::connect(self.state.path().join("sock")) {
-            let _ = writeln!(s, r#"{{"id":1,"op":"shutdown"}}"#);
-            let _ = s.read(&mut [0; 64]);
-        }
-    }
-}
-
-fn out(o: &Output) -> String {
-    String::from_utf8_lossy(&o.stdout).into_owned()
-}
-
-fn err(o: &Output) -> String {
-    String::from_utf8_lossy(&o.stderr).into_owned()
 }
 
 const LINE: &str = "Join the Lightbulb network: https://thelightbulb.company/j/#";
@@ -204,7 +150,14 @@ fn non_admin_remove_prints_exact_text() {
     assert!(team.contains("acme") && team.contains("aden"), "{team}");
     assert_eq!(e.entries().len(), 2, "no genesis over a joined team");
     // An open link is for the founder and admins.
-    let r = e.ask_as_person(json!({"id": 1, "op": "team.invite", "mode": "open"}));
+    // From a person: a detached `nc`.
+    let sock = e.state.path().join("sock");
+    let req = json!({"id": 1, "op": "team.invite", "mode": "open"});
+    let nc = e.detached(
+        &["nc", "-w", "1", "-U", sock.to_str().unwrap()],
+        &format!("{req}\n"),
+    );
+    let r: Value = serde_json::from_slice(&nc.stdout).unwrap();
     assert_eq!(r["error"], "not_admin", "{r}");
     assert_eq!(e.entries().len(), 2);
 }
@@ -251,11 +204,11 @@ fn leave_locally_recreates_a_solo_network() {
     let e = Env::new();
     let link = out(&e.run(&["invite"]));
     let id = e.team_id();
-    let no = e.run_with(&["leave"], "n\n");
+    let no = e.detached(&[EXE, "leave"], "n\n");
     assert!(no.status.success());
     assert_eq!(e.team_id(), id);
 
-    let o = e.run_with(&["leave"], "y\n");
+    let o = e.detached(&[EXE, "leave"], "y\n");
     assert!(o.status.success(), "{}", err(&o));
     assert_eq!(
         out(&o),
@@ -279,7 +232,7 @@ fn founder_admin_remove_and_leave_texts() {
     let e = Env::new();
     e.seed(false);
 
-    let o = e.run_with(&["leave"], "y\n");
+    let o = e.detached(&[EXE, "leave"], "y\n");
     assert_eq!(o.status.code(), Some(1));
     assert_eq!(
         err(&o).trim(),
@@ -326,7 +279,7 @@ fn founder_whose_only_other_member_is_cloud_can_leave() {
     // A cloud member can be neither admin nor founder.
     let o = e.run(&["admin", "bridge"]);
     assert_eq!(o.status.code(), Some(1), "{}", out(&o));
-    let o = e.run_with(&["leave"], "y\n");
+    let o = e.detached(&[EXE, "leave"], "y\n");
     assert!(o.status.success(), "{}", err(&o));
     assert_eq!(e.entries().len(), 1);
 }

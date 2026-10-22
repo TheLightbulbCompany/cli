@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use lightbulb_network::daemon::net_ops::Invite;
 use lightbulb_network::{cli, daemon, hook, mcp, paths, setup};
 use std::ffi::OsString;
 use std::io::{Read, Write};
@@ -159,7 +160,12 @@ fn main() -> lightbulb_network::Result<()> {
         Command::Listen { name, once } => exit(cli::listen(&name, once)?),
         Command::Receipt { request_id, from } => exit(cli::receipt(&request_id, from)?),
         Command::Doctor => exit(cli::doctor()?),
-        Command::Invite { new, once, open } => exit(cli::invite(new, once, open)?),
+        Command::Invite { new, once, open } => exit(cli::invite(match (new, once, open) {
+            (true, ..) => Invite::New,
+            (_, true, _) => Invite::Once,
+            (.., true) => Invite::Open,
+            _ => Invite::Reusable,
+        })?),
         Command::Team => exit(cli::team()?),
         Command::Admin { name, founder } => exit(cli::admin(&name, founder)?),
         Command::Remove { name } => exit(cli::remove(&name)?),

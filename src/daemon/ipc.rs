@@ -47,10 +47,16 @@ impl Response {
     }
 
     pub fn err(id: u64, code: &str) -> Response {
+        Response::err_with(id, code, json!({}))
+    }
+
+    /// An `error` response carrying `extra`'s fields beside the code.
+    pub fn err_with(id: u64, code: &str, mut extra: Value) -> Response {
+        extra["error"] = code.into();
         Response {
             id,
             ok: false,
-            body: json!({ "error": code }),
+            body: extra,
         }
     }
 }
@@ -137,7 +143,7 @@ async fn handle(
                     "version": env!("CARGO_PKG_VERSION"),
                     "protocol": PROTOCOL,
                     "member_key_short": daemon.identity.short,
-                    "team": { "id": t.team_id, "name": t.team_name },
+                    "team": { "id": t.roster.team_id, "name": t.roster.team_name },
                     "sessions": live_count(daemon),
                 }),
             )
@@ -235,11 +241,7 @@ fn owner_process(daemon: &Daemon, key: &str) -> rusqlite::Result<Option<Proc>> {
 }
 
 pub(super) fn refused(id: u64, reason: &str) -> Response {
-    Response {
-        id,
-        ok: false,
-        body: json!({ "error": BAD_REQUEST, "reason": reason }),
-    }
+    Response::err_with(id, BAD_REQUEST, json!({ "reason": reason }))
 }
 
 /// `end {key, caller?, if_gone?}` -> `{ended}`: deletes the session row; its mail stays for

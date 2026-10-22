@@ -7,7 +7,7 @@ use crate::identity::Identity;
 use crate::roster::{self, Entry, Kind, MemberKind, Role, Roster};
 use crate::store::Store;
 use crate::{os, ticket};
-use rusqlite::params;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 pub const NOT_ADMIN: &str = "not_admin";
@@ -15,12 +15,70 @@ pub const NOT_FOUNDER: &str = "not_founder";
 pub const NOT_MEMBER: &str = "not_member";
 pub const FOUNDER_MUST_TRANSFER: &str = "founder_must_transfer";
 
+/// `team.invite`'s `mode`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Invite {
+    /// This member's live link, minted when it has none.
+    #[default]
+    Reusable,
+    /// A new link in place of the live one.
+    New,
+    /// A link for one join.
+    Once,
+    /// A link whose joins need no Allow (founder and admins).
+    Open,
+}
+
+impl Invite {
+    fn link_mode(self) -> &'static str {
+        if self == Invite::Open {
+            "open"
+        } else {
+            "ask"
+        }
+    }
+
+    fn once(self) -> bool {
+        self == Invite::Once
+    }
+}
+
+/// Who may run a team op: a person at the socket (not an agent), and at least `min_role`
+/// (`None`: anyone, even a computer the team removed).
+struct Gate {
+    person_only: bool,
+    min_role: Option<Role>,
+}
+
+fn gate(op: &str, invite: Invite) -> Gate {
+    let (person_only, min_role) = match op {
+        "team.remove" => (true, Some(Role::Admin)),
+        "team.admin" => (true, Some(Role::Founder)),
+        "team.leave" => (true, None),
+        "team.invite" if invite == Invite::Open => (true, Some(Role::Admin)),
+        "team.invite" => (false, Some(Role::Member)),
+        _ => (false, None),
+    };
+    Gate {
+        person_only,
+        min_role,
+    }
+}
+
 pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, peer_pid: Option<u32>) -> Response {
     if op.starts_with("team.") {
+        let invite = if op == "team.invite" {
+            match serde_json::from_value::<Option<Invite>>(body["mode"].clone()) {
+                Ok(i) => i.unwrap_or_default(),
+                Err(_) => return Response::err(id, BAD_REQUEST),
+            }
+        } else {
+            Invite::default()
+        };
+        let gate = gate(op, invite);
         // Governance and open links need a person at the socket, before any authority check.
-        let governs = matches!(op, "team.remove" | "team.admin" | "team.leave")
-            || (op == "team.invite" && body["mode"] == "open");
-        if governs && !peer_pid.is_some_and(person_only) {
+        if gate.person_only && !peer_pid.is_some_and(person_only) {
             return refused(id, "not_a_person");
         }
         let mut team = daemon.team.lock().unwrap();
@@ -32,7 +90,7 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, peer_pid: Option
             store: &store,
             now: super::ipc::now() as i64,
         };
-        return match ops.run(op, body) {
+        return match ops.run(op, body, invite, gate.min_role) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("{op}: {e}");
@@ -57,38 +115,25 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, peer_pid: Option
     }
 }
 
-/// The genesis of a solo network: this computer, the founder of a team called `team_name`.
-/// Stamped after `after` so a new network never repeats an old one's `team_id`.
-pub(super) fn genesis(
-    store: &Store,
-    me: &Identity,
-    computer: &str,
-    team_name: &str,
-    now: i64,
-    after: i64,
-) -> crate::Result<()> {
-    let body = json!({"member": me.key, "name": super::user_name(), "computer": computer,
+/// The genesis of a solo network: `me`, called `name`, the founder of a team `team_name`.
+pub fn genesis(me: &Identity, name: &str, computer: &str, team_name: &str, at: i64) -> Entry {
+    let body = json!({"member": me.key, "name": name, "computer": computer,
         "person_id": me.key, "kind": "computer", "role": "founder", "ticket_id": "",
         "team_name": team_name});
-    let e = Entry::signed(me, vec![], Kind::Admit, body, now.max(after + 1));
-    roster::accept(store, &e, now)?;
-    Ok(())
+    Entry::signed(me, vec![], Kind::Admit, body, at)
 }
 
-/// The stored roster, replayed into `team` and Plan A's `team` row.
-pub(super) fn reload(store: &Store, team: &mut TeamState, now: i64) -> crate::Result<Roster> {
-    let r = roster::replay(&roster::entries(store)?);
-    let founder = r.members.values().find(|m| m.role == Role::Founder);
-    store.set_team(
-        &r.team_id,
-        &r.team_name,
-        founder.map_or("", |m| m.key.as_str()),
-        now,
-    )?;
-    team.team_id = r.team_id.clone();
-    team.team_name = r.team_name.clone();
-    team.heads = r.heads.clone();
-    Ok(r)
+/// Rewrites Plan A's `team` row from `new` when its id, name or founder differs from `old`'s.
+pub(super) fn sync_team_row(store: &Store, old: &Roster, new: &Roster) -> crate::Result<()> {
+    fn row(r: &Roster) -> (&str, &str, &str) {
+        let founder = r.founder().map_or("", |m| m.key.as_str());
+        (&r.team_id, &r.team_name, founder)
+    }
+    let (id, name, founder) = row(new);
+    if row(old) != (id, name, founder) {
+        store.set_team(id, name, founder, new.created_at)?;
+    }
+    Ok(())
 }
 
 /// One team op, under the `team` then `store` locks.
@@ -101,12 +146,30 @@ struct TeamOps<'a> {
 }
 
 impl TeamOps<'_> {
-    fn run(mut self, op: &str, body: &Value) -> crate::Result<Response> {
+    fn run(
+        mut self,
+        op: &str,
+        body: &Value,
+        invite: Invite,
+        min_role: Option<Role>,
+    ) -> crate::Result<Response> {
         let id = self.id;
-        let r = roster::replay(&roster::entries(self.store)?);
-        let me_key = self.daemon.identity.key.clone();
+        let identity = &self.daemon.identity;
+        let me_key = identity.key.clone();
+        let r = &self.team.roster;
         // `None` once this computer is no longer in the roster (removed by someone else).
         let role = r.members.get(&me_key).map(|m| m.role);
+        if role < min_role {
+            return Ok(match min_role {
+                Some(Role::Founder) => Response::err(id, NOT_FOUNDER),
+                Some(Role::Admin) => Response::err_with(
+                    id,
+                    NOT_ADMIN,
+                    json!({"founder": r.founder().map(|m| &m.name)}),
+                ),
+                _ => Response::err(id, NOT_MEMBER),
+            });
+        }
         let target = || {
             let who = body["member"].as_str()?;
             r.members.get(who).cloned().or_else(|| {
@@ -127,45 +190,35 @@ impl TeamOps<'_> {
             // `team.invite {mode}` -> `{ticket, line, app_link, expires_at, replaced}`. `reusable`
             // (and `open`) reprint this member's live link of that mode, minting one if none.
             "team.invite" => {
-                let mode = body["mode"].as_str().unwrap_or("reusable");
-                if !matches!(mode, "reusable" | "new" | "once" | "open") {
-                    return Ok(Response::err(id, BAD_REQUEST));
-                }
-                let open = mode == "open";
-                if role.is_none() {
-                    return Ok(Response::err(id, NOT_MEMBER));
-                }
-                if open && role == Some(Role::Member) {
-                    return Ok(Response::err(id, NOT_ADMIN));
-                }
-                let link_mode = if open { "open" } else { "ask" };
-                let live = r.links.values().find(|l| {
-                    l.signer == me_key && !l.once && l.mode == link_mode && l.expires_at > self.now
-                });
+                let mode = invite.link_mode();
+                let live = r
+                    .links
+                    .values()
+                    .find(|l| {
+                        !invite.once()
+                            && l.signer == me_key
+                            && !l.once
+                            && l.mode == mode
+                            && l.expires_at > self.now
+                    })
+                    .cloned();
+                let replaced = invite == Invite::New && live.is_some();
                 let t = match live {
-                    Some(l) if mode == "reusable" || open => ticket::sign(
-                        &self.daemon.identity,
-                        &r,
-                        l.ticket_id.clone(),
-                        l.secret.clone(),
-                        link_mode,
-                        l.expires_at,
-                    ),
-                    _ => self.new_link(&r, link_mode, mode == "once")?,
+                    Some(l) if invite != Invite::New => {
+                        ticket::sign(identity, r, l.ticket_id, l.secret, mode, l.expires_at)
+                    }
+                    _ => self.new_link(mode, invite.once())?,
                 };
+                let s = ticket::encode(&t);
                 Response::ok(
                     id,
-                    json!({"ticket": ticket::encode(&t), "line": ticket::line(&t),
-                        "app_link": ticket::app_link(&t), "expires_at": t.expires_at,
-                        "replaced": mode == "new" && live.is_some()}),
+                    json!({"line": ticket::join_line(&s), "app_link": ticket::app_link(&s),
+                        "ticket": s, "expires_at": t.expires_at, "replaced": replaced}),
                 )
             }
             // `team.admin {member, founder}` -> `{member, name}`: an admin, or (`founder`) the
             // founder in our place.
             "team.admin" => {
-                if role != Some(Role::Founder) {
-                    return Ok(Response::err(id, NOT_FOUNDER));
-                }
                 let Some(t) = target() else {
                     return Ok(Response::err(id, NOT_FOUND));
                 };
@@ -184,22 +237,14 @@ impl TeamOps<'_> {
             // `team.remove {member}` -> `{name, line}`: the removal ends every live link, so a
             // new one follows it.
             "team.remove" => {
-                if role.is_none_or(|r| r == Role::Member) {
-                    let founder = r.members.values().find(|m| m.role == Role::Founder);
-                    return Ok(Response {
-                        id,
-                        ok: false,
-                        body: json!({"error": NOT_ADMIN, "founder": founder.map(|m| &m.name)}),
-                    });
-                }
                 let Some(t) = target() else {
                     return Ok(Response::err(id, NOT_FOUND));
                 };
                 if t.key == me_key || t.role == Role::Founder {
                     return Ok(Response::err(id, BAD_REQUEST));
                 }
-                let (_, after) = self.write(Kind::Remove, json!({"member": t.key}))?;
-                let link = self.new_link(&after, "ask", false)?;
+                self.write(Kind::Remove, json!({"member": t.key}))?;
+                let link = self.new_link("ask", false)?;
                 Response::ok(id, json!({"name": t.name, "line": ticket::line(&link)}))
             }
             // `team.leave {}` -> `{name}`: leaves, then starts this computer's solo network.
@@ -213,61 +258,69 @@ impl TeamOps<'_> {
                 if role == Some(Role::Founder) && others && !admin {
                     return Ok(Response::err(id, FOUNDER_MUST_TRANSFER));
                 }
-                // ponytail: kept in a local only; Task 8 sends it to peers before the wipe.
-                let _leave = match role {
-                    Some(_) => Some(self.write(Kind::Leave, json!({"member": me_key}))?.0),
-                    None => None,
-                };
-                let root_at = roster::entries(self.store)?
-                    .iter()
-                    .find(|e| e.parents.is_empty())
-                    .map_or(0, |e| e.at);
-                self.store
-                    .conn()
-                    .execute_batch("DELETE FROM roster; DELETE FROM team_link;")?;
-                genesis(
-                    self.store,
-                    &self.daemon.identity,
+                let (name, root_at) = (r.team_name.clone(), r.created_at);
+                // ponytail: the `leave` entry `write` returns is dropped; Task 8 sends it to
+                // peers before the wipe.
+                if role.is_some() {
+                    self.write(Kind::Leave, json!({"member": me_key}))?;
+                }
+                self.store.clear_roster()?;
+                // Stamped after the old root, so the new network never repeats its `team_id`.
+                let user = super::user_name();
+                let g = genesis(
+                    identity,
+                    &user,
                     &self.team.config.computer,
-                    &super::user_name(),
-                    self.now,
-                    root_at,
-                )?;
-                reload(self.store, self.team, self.now)?;
-                Response::ok(id, json!({"name": r.team_name}))
+                    &user,
+                    self.now.max(root_at + 1),
+                );
+                roster::accept(self.store, &g, self.now)?;
+                self.install(roster::replay(&[g]))?;
+                Response::ok(id, json!({"name": name}))
             }
             _ => Response::err(id, UNKNOWN_OP),
         })
     }
 
-    /// Signs `kind` over the current heads and applies it: the entry and the roster after it.
-    fn write(&mut self, kind: Kind, body: Value) -> crate::Result<(Entry, Roster)> {
+    /// Signs `kind` over the current heads and accepts it; the one replay after it becomes
+    /// the cached roster. Returns the entry.
+    fn write(&mut self, kind: Kind, body: Value) -> crate::Result<Entry> {
         let e = Entry::signed(
             &self.daemon.identity,
-            self.team.heads.clone(),
+            self.team.roster.heads.clone(),
             kind,
             body,
             self.now,
         );
         roster::accept(self.store, &e, self.now)?;
-        Ok((e, reload(self.store, self.team, self.now)?))
+        self.install(roster::replay(&roster::entries(self.store)?))?;
+        Ok(e)
     }
 
-    /// Mints a link of `mode` (signed into the roster, recorded in `team_link`): its ticket.
-    fn new_link(&mut self, r: &Roster, mode: &str, once: bool) -> crate::Result<ticket::Ticket> {
-        let (t, hashed) = ticket::mint(&self.daemon.identity, r, mode, once, self.now);
-        self.write(Kind::Link, ticket::link_body(&t, &hashed))?;
-        // A once link's secret is kept only as its hash.
-        self.store.conn().execute(
-            "INSERT INTO team_link VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
-            params![
-                t.ticket_id,
-                hashed.is_none().then_some(&t.secret),
-                hashed,
-                mode,
-                once,
-                t.expires_at
-            ],
+    /// Makes `new` the cached roster, rewriting Plan A's `team` row if it changed.
+    fn install(&mut self, new: Roster) -> crate::Result<()> {
+        sync_team_row(self.store, &self.team.roster, &new)?;
+        self.team.roster = new;
+        Ok(())
+    }
+
+    /// Mints a link of `mode` off the cached roster (signed into the roster, recorded in
+    /// `team_link`): its ticket.
+    fn new_link(&mut self, mode: &str, once: bool) -> crate::Result<ticket::Ticket> {
+        let (t, hashed) = ticket::mint(
+            &self.daemon.identity,
+            &self.team.roster,
+            mode,
+            once,
+            self.now,
+        );
+        self.write(Kind::Link, ticket::link_body(&t, hashed.as_deref()))?;
+        self.store.put_link(
+            &t.ticket_id,
+            &t.secret,
+            hashed.as_deref(),
+            mode,
+            t.expires_at,
         )?;
         Ok(t)
     }

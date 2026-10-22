@@ -94,8 +94,8 @@ pub fn sign(
 }
 
 /// The `link` entry body for `t`; `hashed` is `mint`'s second value.
-pub fn link_body(t: &Ticket, hashed: &Option<String>) -> Value {
-    json!({"ticket_id": t.ticket_id, "secret": hashed.as_ref().unwrap_or(&t.secret),
+pub fn link_body(t: &Ticket, hashed: Option<&str>) -> Value {
+    json!({"ticket_id": t.ticket_id, "secret": hashed.unwrap_or(&t.secret),
            "mode": t.mode, "once": hashed.is_some(), "expires_at": t.expires_at})
 }
 
@@ -148,12 +148,17 @@ pub fn verify(t: &Ticket, roster: &Roster) -> Result<()> {
 
 /// The join line a person pastes.
 pub fn line(t: &Ticket) -> String {
-    format!("{LINE}{WEB}{}", encode(t))
+    join_line(&encode(t))
 }
 
-/// The link the Lightbulb app opens.
-pub fn app_link(t: &Ticket) -> String {
-    format!("{APP}{}", encode(t))
+/// The join line for an `encode`d ticket.
+pub fn join_line(encoded: &str) -> String {
+    format!("{LINE}{WEB}{encoded}")
+}
+
+/// The link the Lightbulb app opens, for an `encode`d ticket.
+pub fn app_link(encoded: &str) -> String {
+    format!("{APP}{encoded}")
 }
 
 #[cfg(test)]
@@ -186,7 +191,13 @@ mod tests {
         );
         let before = replay(&[g.clone(), ax.clone()]);
         let (t, hashed) = mint(&x, &before, mode, once, 100);
-        let l = Entry::signed(&x, vec![ax.hash()], Kind::Link, link_body(&t, &hashed), 3);
+        let l = Entry::signed(
+            &x,
+            vec![ax.hash()],
+            Kind::Link,
+            link_body(&t, hashed.as_deref()),
+            3,
+        );
         let r = replay(&[g, ax, l]);
         (f, x, r, t)
     }
@@ -196,7 +207,7 @@ mod tests {
         let (_, x, r, t) = team("ask", false);
         let bare = encode(&t);
         let web = format!("{WEB}{bare}");
-        for s in [bare.clone(), line(&t), web, app_link(&t)] {
+        for s in [bare.clone(), line(&t), web, app_link(&bare)] {
             assert_eq!(decode(&s).unwrap(), t);
         }
         verify(&t, &r).unwrap();

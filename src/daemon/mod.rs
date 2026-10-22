@@ -22,9 +22,8 @@ use tokio::sync::{broadcast, Notify};
 
 /// The team this computer is in, and its settings: replaced at runtime (join, leave, reload).
 pub struct TeamState {
-    pub team_id: String,
-    pub team_name: String,
-    pub heads: Vec<String>,
+    /// The replayed roster, replaced by every write (`net_ops`), never replayed per op.
+    pub roster: roster::Roster,
     pub config: Config,
 }
 
@@ -123,17 +122,17 @@ pub async fn run(dir: &Path) -> Result<()> {
     let store = Store::open(&dir.join("state.db"))?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
     // The solo network's genesis, written once: a computer that has a roster keeps it.
-    if roster::entries(&store)?.is_empty() {
-        let (_, name) = store.ensure_team(&identity.key, &user_name(), now)?;
-        net_ops::genesis(&store, &identity, &config.computer, &name, now, 0)?;
+    let mut entries = roster::entries(&store)?;
+    if entries.is_empty() {
+        let g = net_ops::genesis(&identity, &user_name(), &config.computer, &user_name(), now);
+        roster::accept(&store, &g, now)?;
+        entries.push(g);
     }
-    let mut team = TeamState {
-        team_id: String::new(),
-        team_name: String::new(),
-        heads: vec![],
+    let team = TeamState {
+        roster: roster::replay(&entries),
         config,
     };
-    net_ops::reload(&store, &mut team, now)?;
+    net_ops::sync_team_row(&store, &roster::Roster::default(), &team.roster)?;
 
     // We hold the lock, so any socket file left behind is stale.
     let sock = dir.join(paths::SOCKET);
