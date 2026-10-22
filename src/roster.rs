@@ -84,7 +84,7 @@ pub enum MemberKind {
     Cloud,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Member {
     pub key: String,
     pub short: String,
@@ -279,6 +279,7 @@ fn pass(
                     link.is_some_and(|(lh, l)| {
                         l.signer == e.signer
                             && anc[h.as_str()].contains(lh)
+                            && !retired(&links, anc, lh, l, |n| anc[h.as_str()].contains(n))
                             // Every removal the link does not descend from ends it; an
                             // admission it already knew of stands.
                             && removals.iter().all(|rh| {
@@ -361,8 +362,14 @@ fn pass(
                     }
                 }
             }
-            // Only a computer member mints links, and a `ticket_id` names one link ever.
-            Kind::Link if computer && !e.text("ticket_id").is_empty() => {
+            // Only a computer member mints links, under its own `<short>.` prefix, and a
+            // `ticket_id` names one link ever.
+            Kind::Link
+                if computer
+                    && e.text("ticket_id")
+                        .strip_prefix(signer.short.as_str())
+                        .is_some_and(|rest| rest.len() > 1 && rest.starts_with('.')) =>
+            {
                 links
                     .entry(e.text("ticket_id").to_string())
                     .or_insert_with(|| {
@@ -390,13 +397,36 @@ fn pass(
             Kind::Admit | Kind::Link | Kind::Admin | Kind::Transfer => {}
         }
     }
-    // Live links: unused, and descended from every removal (a removal it did not see ends it).
-    for (lh, l) in links.into_values() {
-        if !used_once.contains(&lh) && removals.iter().all(|rh| anc[lh.as_str()].contains(rh)) {
-            r.links.insert(l.ticket_id.clone(), l);
+    // Live links: unused, not retired, and descended from every removal (a removal it did not
+    // see ends it).
+    for (lh, l) in links.values() {
+        if !used_once.contains(lh)
+            && !retired(&links, anc, lh, l, |_| true)
+            && removals.iter().all(|rh| anc[lh.as_str()].contains(rh))
+        {
+            r.links.insert(l.ticket_id.clone(), l.clone());
         }
     }
     (r, applied)
+}
+
+/// Whether reusable link `l` (entry `lh`) is ended by a newer reusable link of its signer in
+/// the same mode: one descended from it that `seen` holds. Once links never end or are ended.
+fn retired(
+    links: &BTreeMap<String, (String, Link)>,
+    anc: &BTreeMap<&str, HashSet<String>>,
+    lh: &str,
+    l: &Link,
+    seen: impl Fn(&str) -> bool,
+) -> bool {
+    !l.once
+        && links.values().any(|(nh, n)| {
+            !n.once
+                && n.signer == l.signer
+                && n.mode == l.mode
+                && anc[nh.as_str()].contains(lh)
+                && seen(nh)
+        })
 }
 
 /// Removes `target` (never the founder) by removal `h`; whether it was removed.
@@ -540,6 +570,11 @@ mod tests {
 
     fn member(by: &Identity, parent: &Entry, kind: Kind, who: &str) -> Entry {
         op(by, parent, kind, json!({ "member": who }))
+    }
+
+    /// `by`'s ticket id `t`: prefixed by its signer's short, as replay requires.
+    fn tid(by: &Identity, t: &str) -> String {
+        format!("{}.{t}", by.short)
     }
 
     fn link_with(by: &Identity, parent: &Entry, ticket: &str, once: bool) -> Entry {
@@ -725,7 +760,7 @@ mod tests {
         let g = genesis(&f);
         let ak = admit_cloud(&f, &g, &k, "bridge", &f.key);
         let pk = member(&f, &ak, Kind::Admin, &k.key);
-        let lk = link_with(&k, &pk, "tk", false);
+        let lk = link_with(&k, &pk, &tid(&k, "tk"), false);
         let kd = admit(&k, &lk, &d.key, "d"); // an admin, but a cloud one
         let r = replay(&[g, ak, pk, lk, kd]);
         assert_eq!(r.members[&k.key].role, Role::Admin);
@@ -742,8 +777,8 @@ mod tests {
         let g = genesis(&f);
         let ax = admit(&f, &g, &x.key, "x");
         let fork = admit_cloud(&f, &ax, &m, "m", &y.key);
-        let lx = link_with(&x, &fork, "t", false);
-        let xy = admit_via(&x, &lx, &y.key, "y", "t");
+        let lx = link_with(&x, &fork, &tid(&x, "t"), false);
+        let xy = admit_via(&x, &lx, &y.key, "y", &tid(&x, "t"));
         let ym = member(&y, &xy, Kind::Remove, &m.key);
         // M's own entry is concurrent with Y's (stale) removal of M: it must stand.
         let mp = op(
@@ -794,15 +829,16 @@ mod tests {
         let g = genesis(&f);
         let ax = admit(&f, &g, &x.key, "x");
         let az = admit(&f, &ax, &z.key, "z");
-        let lx = link_with(&x, &az, "t", false);
-        let lz = link_with(&z, &lx, "t", true);
-        let zp = admit_via(&z, &lz, &p.key, "p", "t");
-        let xc = admit_via(&x, &zp, &c.key, "c", "t");
+        let t = tid(&x, "t");
+        let lx = link_with(&x, &az, &t, false);
+        let lz = link_with(&z, &lx, &t, true);
+        let zp = admit_via(&z, &lz, &p.key, "p", &t);
+        let xc = admit_via(&x, &zp, &c.key, "c", &t);
         let r = replay(&[g, ax, az, lx, lz, zp, xc]);
         assert!(!r.members.contains_key(&p.key));
         assert!(r.members.contains_key(&c.key));
-        assert_eq!(r.links["t"].signer, x.key);
-        assert!(!r.links["t"].once);
+        assert_eq!(r.links[&t].signer, x.key);
+        assert!(!r.links[&t].once);
     }
 
     #[test]
@@ -810,9 +846,10 @@ mod tests {
         let (f, x, c, d) = (id(), id(), id(), id());
         let g = genesis(&f);
         let ax = admit(&f, &g, &x.key, "x");
-        let l = link_with(&x, &ax, "t1", true);
-        let xc = admit_via(&x, &l, &c.key, "c", "t1");
-        let fd = admit_via(&f, &l, &d.key, "d", "t1");
+        let t = tid(&x, "t1");
+        let l = link_with(&x, &ax, &t, true);
+        let xc = admit_via(&x, &l, &c.key, "c", &t);
+        let fd = admit_via(&f, &l, &d.key, "d", &t);
         let mut log = vec![g, ax, l, xc, fd];
         let r = replay(&log);
         assert_eq!(
@@ -936,17 +973,31 @@ mod tests {
         let [aa0, aa] = admit_admin(&f, &g, &a);
         let ax = admit(&f, &aa, &x.key, "m"); // `admit_admin` names A "x"
         let ap = admit(&f, &ax, &p.key, "p");
-        let lf = link_with(&f, &ap, "tf", false);
-        let lp = link_with(&p, &lf, "tp", false);
-        let pc = admit_via(&p, &lp, &c.key, "c", "tp");
+        let lf = link_with(&f, &ap, &tid(&f, "tf"), false);
+        let tp = tid(&p, "tp");
+        let lp = link_with(&p, &lf, &tp, false);
+        let pc = admit_via(&p, &lp, &c.key, "c", &tp);
         let rx = member(&a, &ap, Kind::Remove, &x.key);
-        let base = vec![g, aa0, aa, ax, ap, lf, lp.clone()];
-        let r = replay(&[base.clone(), vec![pc, rx]].concat());
+        let base = vec![g, aa0, aa, ax, ap.clone(), lf.clone(), lp.clone()];
+        let r = replay(&[base.clone(), vec![pc.clone(), rx]].concat());
+        assert!(!r.members.contains_key(&x.key));
+        assert!(!r.members.contains_key(&c.key));
+        assert!(r.links.is_empty());
+        // The same removal behind entries that sort after the links and C's admission: the
+        // first pass admits C, and only the removal reaching it through `known` drops it.
+        let late = [&lf, &lp, &pc]
+            .into_iter()
+            .max_by_key(|e| e.hash())
+            .unwrap();
+        let m1 = op_after(&f, &ap, Kind::Meta, json!({}), late);
+        let m2 = op(&f, &m1, Kind::Meta, json!({}));
+        let rx_deep = member(&a, &m2, Kind::Remove, &x.key);
+        let r = replay(&[base.clone(), vec![pc, m1, m2, rx_deep]].concat());
         assert!(!r.members.contains_key(&x.key));
         assert!(!r.members.contains_key(&c.key));
         assert!(r.links.is_empty());
         // The removal descends from P's admission of D: D stands, the link still ends.
-        let pd = admit_via(&p, &lp, &d.key, "d", "tp");
+        let pd = admit_via(&p, &lp, &d.key, "d", &tp);
         let rx2 = member(&a, &pd, Kind::Remove, &x.key);
         let r = replay(&[base, vec![pd, rx2]].concat());
         assert!(r.members.contains_key(&d.key));
@@ -955,21 +1006,61 @@ mod tests {
     }
 
     #[test]
+    fn link_with_foreign_ticket_prefix_is_dropped() {
+        let (f, x, c) = (id(), id(), id());
+        let g = genesis(&f);
+        let ax = admit(&f, &g, &x.key, "x");
+        let t = tid(&f, "t");
+        let lx = link_with(&x, &ax, &t, false);
+        let xc = admit_via(&x, &lx, &c.key, "c", &t);
+        let bare = link_with(&x, &xc, "t", false);
+        let r = replay(&[g, ax, lx, xc, bare]);
+        assert!(r.links.is_empty());
+        assert!(!r.members.contains_key(&c.key));
+    }
+
+    #[test]
+    fn new_link_retires_the_signers_old_link() {
+        // X's second reusable link ends its first: an admission through the first that saw
+        // the second drops, one before it stands; X's once link and F's link live on.
+        let (f, x, c, d) = (id(), id(), id(), id());
+        let g = genesis(&f);
+        let ax = admit(&f, &g, &x.key, "x");
+        let (t1, t2, t3, tf) = (tid(&x, "1"), tid(&x, "2"), tid(&x, "3"), tid(&f, "f"));
+        let lf = link_with(&f, &ax, &tf, false);
+        let l1 = link_with(&x, &lf, &t1, false);
+        let lo = link_with(&x, &l1, &t3, true);
+        let xc = admit_via(&x, &lo, &c.key, "c", &t1);
+        let l2 = link_with(&x, &xc, &t2, false);
+        let xd = admit_via(&x, &l2, &d.key, "d", &t1);
+        let r = replay(&[g, ax, lf, l1, lo, xc, l2, xd]);
+        assert!(r.members.contains_key(&c.key));
+        assert!(!r.members.contains_key(&d.key));
+        let mut live: Vec<&String> = r.links.keys().collect();
+        live.sort();
+        let mut want = vec![&t2, &t3, &tf];
+        want.sort();
+        assert_eq!(live, want);
+    }
+
+    #[test]
     fn inviter_may_admit_through_its_own_link_only() {
         let (f, x, y, c, d, e) = (id(), id(), id(), id(), id(), id());
         let g = genesis(&f);
         let ax = admit(&f, &g, &x.key, "x");
         let ay = admit(&f, &ax, &y.key, "y");
-        let lx = link_with(&x, &ay, "tx", false);
-        let lf = link_with(&f, &lx, "tf", false);
-        let xc = admit_via(&x, &lf, &c.key, "c", "tx");
-        let xd = admit_via(&x, &xc, &d.key, "d", "tf");
+        let (tx, tf) = (tid(&x, "tx"), tid(&f, "tf"));
+        let lx = link_with(&x, &ay, &tx, false);
+        let lf = link_with(&f, &lx, &tf, false);
+        let xc = admit_via(&x, &lf, &c.key, "c", &tx);
+        let xd = admit_via(&x, &xc, &d.key, "d", &tf);
         let mut log = vec![g, ax, ay, lx, lf, xc, xd];
         let before = replay(&log);
-        assert_eq!(before.links.keys().collect::<Vec<_>>(), ["tf", "tx"]);
-        assert_eq!(before.links["tx"].signer, x.key);
+        assert_eq!(before.links.len(), 2);
+        assert_eq!(before.links[&tx].signer, x.key);
+        assert_eq!(before.links[&tf].signer, f.key);
         let ry = member(&f, log.last().unwrap(), Kind::Remove, &y.key);
-        let xe = admit_via(&x, &ry, &e.key, "e", "tx");
+        let xe = admit_via(&x, &ry, &e.key, "e", &tx);
         log.extend([ry, xe]);
         let r = replay(&log);
         assert!(r.members.contains_key(&c.key));
