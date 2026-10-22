@@ -1,11 +1,21 @@
-//! What the CLI test files share: a temp state dir and HOME, and a daemon shut down on drop.
-//! ponytail: only `cli.rs` and `team_cli.rs` use it; the other test files keep their own copies.
+//! What the CLI and network test files share: a temp state dir and HOME, a daemon shut down
+//! on drop, a person's shell (`detached`), and a two-member team seeded before start.
+//! ponytail: only `cli.rs`, `team_cli.rs` and `net_two.rs` use it; the other test files keep
+//! their own copies.
 #![allow(dead_code)]
 
-use serde_json::Value;
+use lightbulb_network::daemon::net_ops;
+use lightbulb_network::identity::Identity;
+use lightbulb_network::roster::{self, Entry, Kind};
+use lightbulb_network::store::Store;
+use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
-use std::process::Output;
+use std::os::unix::process::ExitStatusExt;
+use std::process::{Command, ExitStatus, Output, Stdio};
+use std::time::{Duration, Instant};
+
+pub const EXE: &str = env!("CARGO_BIN_EXE_lightbulb-network");
 
 pub struct Env {
     pub state: tempfile::TempDir,
@@ -31,6 +41,103 @@ impl Env {
         BufReader::new(s).read_line(&mut line).unwrap();
         serde_json::from_str(&line).unwrap()
     }
+
+    pub fn identity(&self) -> Identity {
+        Identity::load_or_create(self.state.path()).unwrap()
+    }
+
+    pub fn store(&self) -> Store {
+        Store::open(&self.state.path().join("state.db")).unwrap()
+    }
+
+    /// Starts `lightbulb-network daemon` on this state dir with `config` as `config.toml` and
+    /// `env` set, and waits until it answers.
+    pub fn daemon(&self, config: &str, env: &[(&str, String)]) {
+        std::fs::write(self.state.path().join("config.toml"), config).unwrap();
+        let log = std::fs::File::create(self.state.path().join("daemon.log")).unwrap();
+        let mut c = Command::new(EXE);
+        c.arg("daemon")
+            .env("LIGHTBULB_NETWORK_HOME", self.state.path())
+            .env("LIGHTBULB_NETWORK_CLAUDE_HOME", self.home.path())
+            .env("LIGHTBULB_NETWORK_NO_LAUNCHCTL", "1")
+            .env("HOME", self.home.path())
+            .env("USER", "prasiddha")
+            .env_remove("LIGHTBULB_NETWORK_PEERS")
+            .env_remove("LIGHTBULB_NETWORK_DEBUG_PROTOCOL")
+            .envs(env.iter().map(|(k, v)| (k, v)))
+            .stdin(Stdio::null())
+            .stdout(log.try_clone().unwrap())
+            .stderr(log);
+        let mut child = c.spawn().unwrap();
+        let ping = || {
+            UnixStream::connect(self.state.path().join("sock")).is_ok_and(|mut s| {
+                let mut line = String::new();
+                writeln!(s, r#"{{"id":0,"op":"ping"}}"#).is_ok()
+                    && BufReader::new(s).read_line(&mut line).is_ok()
+                    && line.contains("\"ok\":true")
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ping() {
+            assert!(child.try_wait().unwrap().is_none(), "the daemon exited");
+            assert!(Instant::now() < deadline, "the daemon did not start");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::spawn(move || child.wait());
+    }
+
+    pub fn status(&self) -> Value {
+        self.ask(json!({"id": 1, "op": "status"}))
+    }
+
+    pub fn heads(&self) -> Value {
+        self.ask(json!({"id": 1, "op": "team.get"}))["heads"].clone()
+    }
+
+    /// `<member key>@127.0.0.1:<port>`: this running daemon, for `LIGHTBULB_NETWORK_PEERS`.
+    pub fn peer_arg(&self) -> String {
+        format!(
+            "{}@127.0.0.1:{}",
+            self.identity().key,
+            self.status()["port"]
+        )
+    }
+
+    /// Runs `argv` reparented to launchd, so no agent is above it even when the tests run
+    /// under one: the daemon sees a person, as at a terminal.
+    pub fn detached(&self, argv: &[&str], stdin: &str) -> Output {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("in"), stdin).unwrap();
+        let script =
+            r#"( "$@" <"$D/in" >"$D/out" 2>"$D/err"; echo $? >"$D/c"; mv "$D/c" "$D/code" ) &"#;
+        let mut c = Command::new("/bin/sh");
+        c.args(["-c", script, "sh"])
+            .args(argv)
+            .env("D", d.path())
+            .env("LIGHTBULB_NETWORK_HOME", self.state.path())
+            .env("LIGHTBULB_NETWORK_CLAUDE_HOME", self.home.path())
+            .env("LIGHTBULB_NETWORK_NO_LAUNCHCTL", "1")
+            .env("HOME", self.home.path())
+            .env("USER", "prasiddha")
+            .env_remove("LIGHTBULB_NETWORK_HOOK_CALLER");
+        if let Some(pin) = &self.pin {
+            c.env("LIGHTBULB_NETWORK_HOOK_CALLER", pin);
+        }
+        assert!(c.status().unwrap().success());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let code = loop {
+            if let Ok(c) = std::fs::read_to_string(d.path().join("code")) {
+                break c.trim().parse::<i32>().unwrap();
+            }
+            assert!(Instant::now() < deadline, "{argv:?} did not finish");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        Output {
+            status: ExitStatus::from_raw(code << 8),
+            stdout: std::fs::read(d.path().join("out")).unwrap(),
+            stderr: std::fs::read(d.path().join("err")).unwrap(),
+        }
+    }
 }
 
 impl Drop for Env {
@@ -39,6 +146,36 @@ impl Drop for Env {
             let _ = writeln!(s, r#"{{"id":1,"op":"shutdown"}}"#);
             let _ = s.read(&mut [0; 64]);
         }
+    }
+}
+
+/// The same team in both stores before either daemon starts: `a` founds "acme" (computer
+/// "mac") and admits `b` as "bob" (computer "mbp"). Returns `[genesis, admit]`.
+pub fn seed_pair(a: &Env, b: &Env) -> [Entry; 2] {
+    let (ia, ib) = (a.identity(), b.identity());
+    let g = net_ops::genesis(&ia, "prasiddha", "mac", "acme", 1);
+    let admit = Entry::signed(
+        &ia,
+        vec![g.hash()],
+        Kind::Admit,
+        json!({"member": ib.key, "name": "bob", "computer": "mbp", "person_id": ib.key,
+               "kind": "computer", "role": "member"}),
+        2,
+    );
+    for env in [a, b] {
+        let store = env.store();
+        roster::accept(&store, &g, 10).unwrap();
+        roster::accept(&store, &admit, 10).unwrap();
+    }
+    [g, admit]
+}
+
+/// Polls `f` every 20 ms until it holds; panics after `secs`.
+pub fn until(secs: u64, what: &str, mut f: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while !f() {
+        assert!(Instant::now() < deadline, "timed out: {what}");
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 

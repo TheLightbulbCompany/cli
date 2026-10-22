@@ -137,6 +137,23 @@ async fn handle(
         "ping" => Response::ok(id, json!({})),
         "status" => {
             let t = daemon.team.lock().unwrap();
+            let me = &daemon.identity.key;
+            let members = &t.roster.members;
+            let total = members.keys().filter(|k| *k != me).count();
+            let online = daemon.peers.online().len();
+            // `<computer> needs an update (protocol <theirs>, yours <ours>)`
+            let needs_update: Vec<String> = daemon
+                .peers
+                .outdated()
+                .into_iter()
+                .filter_map(|(k, theirs)| {
+                    let computer = &members.get(&k)?.computer;
+                    let ours = crate::net::protocol();
+                    Some(format!(
+                        "{computer} needs an update (protocol {theirs}, yours {ours})"
+                    ))
+                })
+                .collect();
             Response::ok(
                 id,
                 json!({
@@ -145,6 +162,10 @@ async fn handle(
                     "member_key_short": daemon.identity.short,
                     "team": { "id": t.roster.team_id, "name": t.roster.team_name },
                     "sessions": live_count(daemon),
+                    "peers": { "online": online, "total": total },
+                    "relay": "off",
+                    "port": daemon.peers.port.get(),
+                    "needs_update": needs_update,
                 }),
             )
         }
@@ -357,7 +378,7 @@ fn live_count(daemon: &Daemon) -> usize {
     live_sessions(daemon).len()
 }
 
-pub(super) fn now() -> u64 {
+pub(crate) fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())

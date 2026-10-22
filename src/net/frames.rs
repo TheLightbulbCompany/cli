@@ -1,0 +1,198 @@
+//! The wire: one `Frame` per message, a u32 big-endian length then that many bytes of JSON
+//! tagged by `t`, at most 1 MiB. The one definition of every frame later tasks send.
+
+use crate::daemon::Daemon;
+use crate::roster::{Entry, Member};
+use crate::Result;
+use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+pub const MAX_FRAME: usize = 1 << 20;
+
+/// A session as a peer publishes it (Task 7).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Remote {
+    pub session_id: String,
+    pub agent: String,
+    pub repo: Option<String>,
+    pub branch: Option<String>,
+    pub folder: String,
+    pub status: String,
+    pub doing: Option<String>,
+    pub tier: String,
+    pub title: Option<String>,
+}
+
+/// Transient frames carry no `sig`: the QUIC handshake authenticates the peer.
+/// ponytail: sign envelopes if they are ever forwarded.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "t", rename_all = "snake_case")]
+pub enum Frame {
+    Hello {
+        protocol: u32,
+        heads: Vec<String>,
+    },
+    /// Each entry carries its own `sig`.
+    Roster {
+        entries: Vec<Entry>,
+        more: bool,
+    },
+    Presence {
+        member: String,
+        seq: u32,
+        sessions: Vec<Remote>,
+        known: Vec<String>,
+        kept: Vec<String>,
+    },
+    Envelope {
+        id: String,
+        /// The sender's id, the one the receiving agent sees.
+        request_id: String,
+        kind: String,
+        from: String,
+        to: String,
+        reply_to: Option<String>,
+        thread: Option<String>,
+        hops: u32,
+        body: String,
+        files: Vec<String>,
+        sent_at: i64,
+    },
+    Ack {
+        id: String,
+        state: String,
+        reason: Option<String>,
+    },
+    Receipt {
+        id: String,
+        state: String,
+        reason: Option<String>,
+    },
+    HoldNotice {
+        hold_id: String,
+        target_session: String,
+        from: String,
+        from_label_parts: Vec<String>,
+        preview: String,
+        created_at: i64,
+    },
+    Decision {
+        hold_id: String,
+        holding_member: String,
+        verdict: String,
+        scope: String,
+        nonce: String,
+        decided_at: i64,
+        sig: String,
+    },
+    JoinRequest {
+        ticket: String,
+        secret_proof: String,
+        candidate: String,
+        name: String,
+        computer: String,
+        kind: String,
+        proof: Option<String>,
+        sig: String,
+    },
+    JoinDecision {
+        ticket_id: String,
+        candidate: String,
+        verdict: String,
+        reason: Option<String>,
+        sig: String,
+    },
+    ShareGrant {
+        grant_id: String,
+        session: String,
+        viewer: String,
+        input: bool,
+        expires_at: i64,
+        granter: String,
+        sig: String,
+    },
+    Stream {
+        grant_id: String,
+        session: String,
+        seq: u32,
+        /// Base64, at most 65 536 bytes decoded.
+        bytes: String,
+    },
+}
+
+impl Frame {
+    /// The `t` tag, for logs.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Frame::Hello { .. } => "hello",
+            Frame::Roster { .. } => "roster",
+            Frame::Presence { .. } => "presence",
+            Frame::Envelope { .. } => "envelope",
+            Frame::Ack { .. } => "ack",
+            Frame::Receipt { .. } => "receipt",
+            Frame::HoldNotice { .. } => "hold_notice",
+            Frame::Decision { .. } => "decision",
+            Frame::JoinRequest { .. } => "join_request",
+            Frame::JoinDecision { .. } => "join_decision",
+            Frame::ShareGrant { .. } => "share_grant",
+            Frame::Stream { .. } => "stream",
+        }
+    }
+}
+
+pub async fn write(send: &mut (impl AsyncWrite + Unpin), f: &Frame) -> Result<()> {
+    let body = serde_json::to_vec(f)?;
+    if body.len() > MAX_FRAME {
+        return Err(format!("a {} frame of {} bytes", f.kind(), body.len()).into());
+    }
+    send.write_all(&(body.len() as u32).to_be_bytes()).await?;
+    send.write_all(&body).await?;
+    Ok(())
+}
+
+pub async fn read(recv: &mut (impl AsyncRead + Unpin)) -> Result<Frame> {
+    let len = recv.read_u32().await? as usize;
+    if len > MAX_FRAME {
+        return Err(format!("a frame of {len} bytes").into());
+    }
+    let mut body = vec![0; len];
+    recv.read_exact(&mut body).await?;
+    Ok(serde_json::from_slice(&body)?)
+}
+
+/// The one per-frame check on what a member sends. `roster` entries are checked by
+/// `roster::accept` itself; Tasks 7, 8 and 14 add the rules for the frames they serve, and
+/// until then every other kind is dropped.
+pub fn from_peer_ok(f: &Frame, _peer: &Member, _daemon: &Daemon) -> bool {
+    matches!(f, Frame::Hello { .. } | Frame::Roster { .. })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn frames_round_trip_and_cap_at_one_mib() {
+        let (mut a, mut b) = tokio::io::duplex(1 << 21);
+        let hello = Frame::Hello {
+            protocol: 1,
+            heads: vec!["h".into()],
+        };
+        write(&mut a, &hello).await.unwrap();
+        assert_eq!(read(&mut b).await.unwrap(), hello);
+        let wire = serde_json::to_value(&hello).unwrap();
+        assert_eq!(wire["t"], "hello");
+        let big = Frame::Stream {
+            grant_id: String::new(),
+            session: String::new(),
+            seq: 0,
+            bytes: "x".repeat(MAX_FRAME),
+        };
+        assert!(write(&mut a, &big).await.is_err());
+        // A length past the cap is refused before its body is read.
+        a.write_all(&((MAX_FRAME as u32) + 1).to_be_bytes())
+            .await
+            .unwrap();
+        assert!(read(&mut b).await.is_err());
+    }
+}

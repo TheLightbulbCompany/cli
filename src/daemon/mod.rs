@@ -5,7 +5,7 @@ use crate::agents::{claude, codex};
 use crate::config::Config;
 use crate::identity::Identity;
 use crate::sessions::{self, Key, Tier};
-use crate::{cli, frame, mail, paths, roster, store::Store, Result};
+use crate::{cli, frame, mail, net, paths, roster, store::Store, Result};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions, Permissions};
@@ -44,6 +44,8 @@ pub struct Daemon {
     pub mailbox_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Keys whose last push failed (more recently than one succeeded).
     pub push_failed: Mutex<HashSet<String>>,
+    /// The member connections (`net`).
+    pub peers: net::Peers,
 }
 
 impl Daemon {
@@ -157,8 +159,11 @@ pub async fn run(dir: &Path) -> Result<()> {
         mail: Notify::new(),
         mailbox_locks: Mutex::default(),
         push_failed: Mutex::default(),
+        peers: net::Peers::default(),
     });
+    let net = net::Net::start(daemon.clone()).await?;
     ipc::serve(listener, daemon).await;
+    net.close().await;
     let _ = fs::remove_file(&sock);
     Ok(()) // `lock` drops here, after the socket is gone.
 }

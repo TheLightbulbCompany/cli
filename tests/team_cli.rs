@@ -9,15 +9,11 @@ use lightbulb_network::store::Store;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::os::unix::process::ExitStatusExt;
-use std::process::{Command, ExitStatus, Output};
-use std::time::{Duration, Instant};
+use std::process::Output;
 
 mod common;
 
-use common::{err, out, Env};
-
-const EXE: &str = env!("CARGO_BIN_EXE_lightbulb-network");
+use common::{err, out, Env, EXE};
 
 impl Env {
     /// A daemon that takes this test process for an agent.
@@ -26,42 +22,6 @@ impl Env {
         let mut e = Env::new();
         e.pin = Some(format!("{}:{birth}", std::process::id()));
         e
-    }
-
-    /// Runs `argv` reparented to launchd, so no agent is above it even when the tests run
-    /// under one: the daemon sees a person, as at a terminal.
-    fn detached(&self, argv: &[&str], stdin: &str) -> Output {
-        let d = tempfile::tempdir().unwrap();
-        std::fs::write(d.path().join("in"), stdin).unwrap();
-        let script =
-            r#"( "$@" <"$D/in" >"$D/out" 2>"$D/err"; echo $? >"$D/c"; mv "$D/c" "$D/code" ) &"#;
-        let mut c = Command::new("/bin/sh");
-        c.args(["-c", script, "sh"])
-            .args(argv)
-            .env("D", d.path())
-            .env("LIGHTBULB_NETWORK_HOME", self.state.path())
-            .env("LIGHTBULB_NETWORK_CLAUDE_HOME", self.home.path())
-            .env("LIGHTBULB_NETWORK_NO_LAUNCHCTL", "1")
-            .env("HOME", self.home.path())
-            .env("USER", "prasiddha")
-            .env_remove("LIGHTBULB_NETWORK_HOOK_CALLER");
-        if let Some(pin) = &self.pin {
-            c.env("LIGHTBULB_NETWORK_HOOK_CALLER", pin);
-        }
-        assert!(c.status().unwrap().success());
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let code = loop {
-            if let Ok(c) = std::fs::read_to_string(d.path().join("code")) {
-                break c.trim().parse::<i32>().unwrap();
-            }
-            assert!(Instant::now() < deadline, "{argv:?} did not finish");
-            std::thread::sleep(Duration::from_millis(20));
-        };
-        Output {
-            status: ExitStatus::from_raw(code << 8),
-            stdout: std::fs::read(d.path().join("out")).unwrap(),
-            stderr: std::fs::read(d.path().join("err")).unwrap(),
-        }
     }
 
     /// Seeds a two-member team "acme" before the daemon starts: this computer and aden's,

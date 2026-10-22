@@ -136,6 +136,21 @@ pub(super) fn sync_team_row(store: &Store, old: &Roster, new: &Roster) -> crate:
     Ok(())
 }
 
+/// The one post-write hook, for local writes and entries from peers alike: makes `new` the
+/// cached roster, rewrites Plan A's `team` row if it changed, and tells `net` (which closes
+/// the connections of members gone, dials new ones and pushes the change).
+pub fn install(
+    daemon: &Daemon,
+    team: &mut TeamState,
+    store: &Store,
+    new: Roster,
+) -> crate::Result<()> {
+    sync_team_row(store, &team.roster, &new)?;
+    team.roster = new;
+    daemon.peers.changed.notify_one();
+    Ok(())
+}
+
 /// One team op, under the `team` then `store` locks.
 struct TeamOps<'a> {
     id: u64,
@@ -302,11 +317,8 @@ impl TeamOps<'_> {
         Ok(e)
     }
 
-    /// Makes `new` the cached roster, rewriting Plan A's `team` row if it changed.
     fn install(&mut self, new: Roster) -> crate::Result<()> {
-        sync_team_row(self.store, &self.team.roster, &new)?;
-        self.team.roster = new;
-        Ok(())
+        install(self.daemon, self.team, self.store, new)
     }
 
     /// Mints a link of `mode` off the cached roster (signed into the roster, recorded in

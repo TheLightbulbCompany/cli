@@ -130,6 +130,11 @@ impl Roster {
         self.members.values().find(|m| m.short == short)
     }
 
+    /// Whether `hash` is one of the replayed entries.
+    pub fn knows(&self, hash: &str) -> bool {
+        self.parents.contains_key(hash)
+    }
+
     /// Every entry `hash` descends from, itself excluded.
     pub fn ancestors(&self, hash: &str) -> HashSet<String> {
         let mut seen = HashSet::new();
@@ -490,6 +495,37 @@ fn new_member(e: &Entry, role: Role) -> Member {
         proof: e.body["proof"].as_str().map(str::to_string),
         key,
     }
+}
+
+/// `entries` with every entry after its parents (lowest hash first among those ready); an
+/// entry whose parent is missing is left out.
+pub fn ordered(entries: Vec<Entry>) -> Vec<Entry> {
+    let mut by_hash: BTreeMap<String, Entry> = entries.into_iter().map(|e| (e.hash(), e)).collect();
+    let mut waiting: BTreeMap<String, usize> = BTreeMap::new();
+    let mut children: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (h, e) in &by_hash {
+        waiting.insert(h.clone(), e.parents.len());
+        for p in &e.parents {
+            children.entry(p.clone()).or_default().push(h.clone());
+        }
+    }
+    let mut ready: BTreeSet<String> = waiting
+        .iter()
+        .filter(|(_, n)| **n == 0)
+        .map(|(h, _)| h.clone())
+        .collect();
+    let mut out = Vec::new();
+    while let Some(h) = ready.pop_first() {
+        for c in children.remove(&h).into_iter().flatten() {
+            let n = waiting.get_mut(&c).expect("a child is an entry");
+            *n -= 1;
+            if *n == 0 {
+                ready.insert(c);
+            }
+        }
+        out.push(by_hash.remove(&h).expect("ready entries are held"));
+    }
+    out
 }
 
 /// Every stored entry.

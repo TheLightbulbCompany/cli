@@ -47,7 +47,7 @@ impl Identity {
             }
             Err(e) => return Err(e.into()),
         };
-        let key = BASE32.encode(signing.verifying_key().as_bytes());
+        let key = key_of(signing.verifying_key().as_bytes());
         Ok(Identity {
             short: key[..12].to_string(),
             key,
@@ -61,13 +61,20 @@ impl Identity {
     }
 }
 
+/// The member key of the 32 public-key bytes `pk`.
+pub fn key_of(pk: &[u8; 32]) -> String {
+    BASE32.encode(pk)
+}
+
+/// The 32 public-key bytes member key `key` spells, if it is one.
+pub fn key_bytes(key: &str) -> Option<[u8; 32]> {
+    BASE32.decode(key.as_bytes()).ok()?.try_into().ok()
+}
+
 /// Whether `sig` is `key`'s signature over `v` (its own `sig` field left out).
 pub fn verify(key: &str, v: &Value, sig: &str) -> bool {
     // `BASE32` is lowercase only: an uppercase spelling is another (invalid) key.
-    let key = BASE32
-        .decode(key.as_bytes())
-        .ok()
-        .and_then(|k| VerifyingKey::from_bytes(&k.try_into().ok()?).ok());
+    let key = key_bytes(key).and_then(|k| VerifyingKey::from_bytes(&k).ok());
     let sig = BASE64URL_NOPAD
         .decode(sig.as_bytes())
         .ok()

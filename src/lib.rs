@@ -8,6 +8,7 @@ pub mod hook;
 pub mod identity;
 pub mod mail;
 pub mod mcp;
+pub mod net;
 pub mod os;
 pub mod paths;
 pub mod roster;
