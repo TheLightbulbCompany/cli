@@ -129,6 +129,18 @@ fn advance(
     Ok(())
 }
 
+/// Who `from`'s message `request_id` was stored for; `None` when it stored nothing.
+pub fn recipient(store: &Store, from: &Key, request_id: &str) -> Result<Option<String>> {
+    Ok(store
+        .conn()
+        .query_row(
+            "SELECT to_key FROM messages WHERE from_key = ?1 AND request_id = ?2",
+            [&from.0, request_id],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
 /// The stored receipt for `from`'s `request_id`, with `where_` worked out from the recipient's liveness now.
 pub fn receipt(store: &Store, from: &Key, request_id: &str) -> Result<Option<Receipt>> {
     let conn = store.conn();
@@ -144,14 +156,7 @@ pub fn receipt(store: &Store, from: &Key, request_id: &str) -> Result<Option<Rec
     };
     let state = State::parse(&state)?;
     let where_ = if state == State::Stored {
-        let to: Option<String> = conn
-            .query_row(
-                "SELECT to_key FROM messages WHERE from_key = ?1 AND request_id = ?2",
-                [&from.0, request_id],
-                |r| r.get(0),
-            )
-            .optional()?;
-        to.map(|to| {
+        recipient(store, from, request_id)?.map(|to| {
             if live(store, &to) {
                 "recipient"
             } else {
@@ -186,7 +191,8 @@ fn refuse(
     })
 }
 
-/// Stores `text` for `to`. Thread and hops: with `reply_to` (a message id or request id the store
+/// Stores `text` for `to`; with no `to`, for the sender of the `reply_to` message (refused
+/// `no_recipient`, nothing stored, when that is unknown). Thread and hops: with `reply_to` (a message id or request id the store
 /// knows) the message takes that message's thread and its hops + 1. Without it, the trigger is the
 /// message delivered (or read) TO `from` most recently, if that was within `LOOP_WINDOW_S`: hops = trigger.hops + 1, and
 /// the thread is the trigger's if `to` is the trigger's sender, else a new one. No trigger: hops 0,
@@ -198,7 +204,7 @@ fn refuse(
 pub fn send(
     store: &Store,
     from: &Key,
-    to: &Key,
+    to: Option<&Key>,
     text: &str,
     request_id: &str,
     reply_to: Option<&str>,
@@ -218,6 +224,33 @@ pub fn send(
             where_: None,
         });
     }
+    // The message this answers: a message id, or a request id `from` received.
+    let parent: Option<(String, Option<String>, i64, String)> = match reply_to {
+        Some(r) => conn
+            .query_row(
+                "SELECT id, thread, hops, from_key FROM messages WHERE id = ?1 OR (request_id = ?1 AND to_key = ?2) \
+                 ORDER BY id = ?1 DESC, rowid DESC LIMIT 1",
+                params![r, from.0],
+                |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?, x.get(3)?)),
+            )
+            .optional()?,
+        None => None,
+    };
+    // No recipient named: the reply goes to whoever sent the parent.
+    let to = match (to, &parent) {
+        (Some(t), _) => t.clone(),
+        (None, Some((_, _, _, sender))) => Key(sender.clone()),
+        (None, None) => {
+            // Not persisted: a later message may make this reply_to known.
+            return Ok(Receipt {
+                request_id: request_id.into(),
+                state: State::Refused,
+                reason: Some("no_recipient".into()),
+                where_: None,
+            });
+        }
+    };
+    let to = &to;
     if let Some((old_to, old_text)) = conn
         .query_row(
             "SELECT to_key, body FROM messages WHERE from_key = ?1 AND request_id = ?2",
@@ -254,19 +287,8 @@ pub fn send(
     }
 
     let id = ulid::Ulid::generate().to_string();
-    let parent: Option<(String, Option<String>, i64)> = match reply_to {
-        Some(r) => conn
-            .query_row(
-                "SELECT id, thread, hops FROM messages WHERE id = ?1 OR (request_id = ?1 AND to_key = ?2) \
-                 ORDER BY id = ?1 DESC, rowid DESC LIMIT 1",
-                params![r, from.0],
-                |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?)),
-            )
-            .optional()?,
-        None => None,
-    };
     let (thread, hops) = match parent {
-        Some((pid, thread, hops)) => (thread.unwrap_or(pid), hops + 1),
+        Some((pid, thread, hops, _)) => (thread.unwrap_or(pid), hops + 1),
         None => {
             // The trigger: the newest message delivered to `from` in the window. Hops carry on
             // from it even when the work is forwarded to a third session.
@@ -463,7 +485,16 @@ mod tests {
     fn send_stores_then_take_delivers_then_mark_read() {
         let (_d, s) = setup();
         register(&s, "m/codex:b", true);
-        let r = send(&s, &k("m/codex:a"), &k("m/codex:b"), "hi", "r1", None, 100).unwrap();
+        let r = send(
+            &s,
+            &k("m/codex:a"),
+            Some(&k("m/codex:b")),
+            "hi",
+            "r1",
+            None,
+            100,
+        )
+        .unwrap();
         assert_eq!(
             (r.state, r.where_.as_deref()),
             (State::Stored, Some("recipient"))
@@ -484,20 +515,46 @@ mod tests {
     }
 
     #[test]
+    fn a_reply_without_a_recipient_goes_to_the_parents_sender() {
+        let (_d, s) = setup();
+        send(
+            &s,
+            &k("m/terminal"),
+            Some(&k("m/codex:b")),
+            "q",
+            "r1",
+            None,
+            1,
+        )
+        .unwrap();
+        take(&s, &k("m/codex:b"), 2).unwrap();
+        let r = send(&s, &k("m/codex:b"), None, "a", "r2", Some("r1"), 3).unwrap();
+        assert_eq!(r.state, State::Stored);
+        assert_eq!(take(&s, &k("m/terminal"), 4).unwrap()[0].body, "a");
+        // No recipient and nothing to answer: refused, nothing stored.
+        let r = send(&s, &k("m/codex:b"), None, "a", "r3", Some("nope"), 5).unwrap();
+        assert_eq!(
+            (r.state, r.reason.as_deref()),
+            (State::Refused, Some("no_recipient"))
+        );
+        assert!(receipt(&s, &k("m/codex:b"), "r3").unwrap().is_none());
+    }
+
+    #[test]
     fn thirteenth_send_in_ten_minutes_is_refused_with_loop() {
         let (_d, s) = setup();
         let t = 1000;
         for i in 0..12 {
-            let r = send(&s, &k("a"), &k("b"), "x", &format!("r{i}"), None, t).unwrap();
+            let r = send(&s, &k("a"), Some(&k("b")), "x", &format!("r{i}"), None, t).unwrap();
             assert_eq!(r.state, State::Stored);
         }
-        let r = send(&s, &k("a"), &k("b"), "x", "r12", None, t + 599).unwrap();
+        let r = send(&s, &k("a"), Some(&k("b")), "x", "r12", None, t + 599).unwrap();
         assert_eq!(
             (r.state, r.reason.as_deref()),
             (State::Refused, Some("loop"))
         );
         assert_eq!(state(&s, "r12"), State::Refused);
-        let r = send(&s, &k("a"), &k("b"), "x", "r13", None, t + 600).unwrap();
+        let r = send(&s, &k("a"), Some(&k("b")), "x", "r13", None, t + 600).unwrap();
         assert_eq!(r.state, State::Stored);
     }
 
@@ -507,25 +564,52 @@ mod tests {
         let big = "x".repeat(MAX_TEXT + 1);
         // 11 accepted, then many refusals: none may push the 12th/13th over early.
         for i in 0..11 {
-            send(&s, &k("a"), &k("b"), "x", &format!("r{i}"), None, 1000).unwrap();
+            send(
+                &s,
+                &k("a"),
+                Some(&k("b")),
+                "x",
+                &format!("r{i}"),
+                None,
+                1000,
+            )
+            .unwrap();
         }
         for i in 0..5 {
-            let r = send(&s, &k("a"), &k("b"), &big, &format!("big{i}"), None, 1001).unwrap();
+            let r = send(
+                &s,
+                &k("a"),
+                Some(&k("b")),
+                &big,
+                &format!("big{i}"),
+                None,
+                1001,
+            )
+            .unwrap();
             assert_eq!(r.reason.as_deref(), Some("too_long"));
         }
         assert_eq!(
-            send(&s, &k("a"), &k("b"), "x", "r11", None, 1002)
+            send(&s, &k("a"), Some(&k("b")), "x", "r11", None, 1002)
                 .unwrap()
                 .state,
             State::Stored
         );
         for i in 0..5 {
-            let r = send(&s, &k("a"), &k("b"), "x", &format!("loop{i}"), None, 1003).unwrap();
+            let r = send(
+                &s,
+                &k("a"),
+                Some(&k("b")),
+                "x",
+                &format!("loop{i}"),
+                None,
+                1003,
+            )
+            .unwrap();
             assert_eq!(r.reason.as_deref(), Some("loop"));
         }
         // Only the 12 accepted count: at 1600 they are all outside the window.
         assert_eq!(
-            send(&s, &k("a"), &k("b"), "x", "after", None, 1600)
+            send(&s, &k("a"), Some(&k("b")), "x", "after", None, 1600)
                 .unwrap()
                 .state,
             State::Stored
@@ -536,7 +620,7 @@ mod tests {
     fn a_request_id_with_other_characters_is_refused() {
         let (_d, s) = setup();
         for rid in ["a\"b", "a\nb", "a b", "é"] {
-            let r = send(&s, &k("a"), &k("b"), "x", rid, None, 1).unwrap();
+            let r = send(&s, &k("a"), Some(&k("b")), "x", rid, None, 1).unwrap();
             assert_eq!(
                 (r.state, r.reason.as_deref()),
                 (State::Refused, Some("bad_request_id")),
@@ -545,7 +629,7 @@ mod tests {
             assert!(receipt(&s, &k("a"), rid).unwrap().is_none());
         }
         assert_eq!(
-            send(&s, &k("a"), &k("b"), "x", "Ok.id_1-2", None, 1)
+            send(&s, &k("a"), Some(&k("b")), "x", "Ok.id_1-2", None, 1)
                 .unwrap()
                 .state,
             State::Stored
@@ -556,14 +640,14 @@ mod tests {
     fn a_refused_request_id_stays_refused_on_retry() {
         let (_d, s) = setup();
         let big = "x".repeat(MAX_TEXT + 1);
-        send(&s, &k("a"), &k("b"), &big, "r1", None, 1).unwrap();
-        let r = send(&s, &k("a"), &k("b"), "short now", "r1", None, 2).unwrap();
+        send(&s, &k("a"), Some(&k("b")), &big, "r1", None, 1).unwrap();
+        let r = send(&s, &k("a"), Some(&k("b")), "short now", "r1", None, 2).unwrap();
         assert_eq!(
             (r.state, r.reason.as_deref()),
             (State::Refused, Some("too_long"))
         );
         assert_eq!(
-            send(&s, &k("a"), &k("b"), "short now", "r2", None, 3)
+            send(&s, &k("a"), Some(&k("b")), "short now", "r2", None, 3)
                 .unwrap()
                 .state,
             State::Stored
@@ -573,7 +657,7 @@ mod tests {
     #[test]
     fn unknown_reply_to_falls_back_to_the_default_thread_rule() {
         let (_d, s) = setup();
-        send(&s, &k("b"), &k("a"), "first", "r1", None, 1).unwrap();
+        send(&s, &k("b"), Some(&k("a")), "first", "r1", None, 1).unwrap();
         take(&s, &k("a"), 1).unwrap();
         let first: String = s
             .conn()
@@ -583,7 +667,16 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        send(&s, &k("a"), &k("b"), "re", "r2", Some("no-such-id"), 2).unwrap();
+        send(
+            &s,
+            &k("a"),
+            Some(&k("b")),
+            "re",
+            "r2",
+            Some("no-such-id"),
+            2,
+        )
+        .unwrap();
         let (t, h): (String, i64) = s
             .conn()
             .query_row(
@@ -599,7 +692,7 @@ mod tests {
     fn mail_for_a_gone_session_expires_after_24h() {
         let (_d, s) = setup();
         register(&s, "b", false);
-        let r = send(&s, &k("a"), &k("b"), "x", "r1", None, 1000).unwrap();
+        let r = send(&s, &k("a"), Some(&k("b")), "x", "r1", None, 1000).unwrap();
         assert_eq!(
             (r.state, r.where_.as_deref()),
             (State::Stored, Some("mailbox"))
@@ -614,10 +707,37 @@ mod tests {
     #[test]
     fn mail_for_a_name_address_never_expires() {
         let (_d, s) = setup();
-        send(&s, &k("m/terminal"), &k("m/bob"), "x", "r1", None, 1000).unwrap();
+        send(
+            &s,
+            &k("m/terminal"),
+            Some(&k("m/bob")),
+            "x",
+            "r1",
+            None,
+            1000,
+        )
+        .unwrap();
         // Another member's name, or a name outside the listen rule, keeps the 24 h hold.
-        send(&s, &k("m/terminal"), &k("n/bob"), "x", "r2", None, 1000).unwrap();
-        send(&s, &k("m/terminal"), &k("m/b ob"), "x", "r3", None, 1000).unwrap();
+        send(
+            &s,
+            &k("m/terminal"),
+            Some(&k("n/bob")),
+            "x",
+            "r2",
+            None,
+            1000,
+        )
+        .unwrap();
+        send(
+            &s,
+            &k("m/terminal"),
+            Some(&k("m/b ob")),
+            "x",
+            "r3",
+            None,
+            1000,
+        )
+        .unwrap();
         expire(&s, 1000 + 100 * HOLD_S).unwrap();
         assert_eq!(state(&s, "r1"), State::Stored);
         assert_eq!(state(&s, "r2"), State::Expired);
@@ -629,7 +749,7 @@ mod tests {
     fn resumed_session_gets_the_mail_that_waited() {
         let (_d, s) = setup();
         register(&s, "b", false);
-        send(&s, &k("a"), &k("b"), "wait for me", "r1", None, 1000).unwrap();
+        send(&s, &k("a"), Some(&k("b")), "wait for me", "r1", None, 1000).unwrap();
         register(&s, "b", true);
         let got = take(&s, &k("b"), 1000 + HOLD_S - 1).unwrap();
         assert_eq!(got.len(), 1);
@@ -639,13 +759,13 @@ mod tests {
     #[test]
     fn same_request_id_returns_same_receipt_and_mismatch_is_refused() {
         let (_d, s) = setup();
-        let first = send(&s, &k("a"), &k("b"), "x", "r1", None, 1).unwrap();
+        let first = send(&s, &k("a"), Some(&k("b")), "x", "r1", None, 1).unwrap();
         assert_eq!(
-            send(&s, &k("a"), &k("b"), "x", "r1", None, 2).unwrap(),
+            send(&s, &k("a"), Some(&k("b")), "x", "r1", None, 2).unwrap(),
             first
         );
         for (to, text) in [("c", "x"), ("b", "y")] {
-            let r = send(&s, &k("a"), &k(to), text, "r1", None, 3).unwrap();
+            let r = send(&s, &k("a"), Some(&k(to)), text, "r1", None, 3).unwrap();
             assert_eq!(
                 (r.state, r.reason.as_deref()),
                 (State::Refused, Some("request_id_reused"))
@@ -653,10 +773,10 @@ mod tests {
         }
         assert_eq!(state(&s, "r1"), State::Stored);
         let big = "x".repeat(MAX_TEXT + 1);
-        let r = send(&s, &k("a"), &k("b"), &big, "r2", None, 4).unwrap();
+        let r = send(&s, &k("a"), Some(&k("b")), &big, "r2", None, 4).unwrap();
         assert_eq!(r.reason.as_deref(), Some("too_long"));
         assert!(
-            send(&s, &k("a"), &k("b"), "x", &"r".repeat(129), None, 4)
+            send(&s, &k("a"), Some(&k("b")), "x", &"r".repeat(129), None, 4)
                 .unwrap()
                 .state
                 == State::Refused
@@ -667,7 +787,7 @@ mod tests {
     fn reply_sets_thread_from_the_message_it_answers() {
         let (_d, s) = setup();
         let (a, b) = (k("a"), k("b"));
-        send(&s, &a, &b, "q", "r1", None, 1).unwrap();
+        send(&s, &a, Some(&b), "q", "r1", None, 1).unwrap();
         let m1 = s
             .conn()
             .query_row(
@@ -678,9 +798,9 @@ mod tests {
             .unwrap();
         assert_eq!(m1.0, m1.1, "first message opens its own thread");
         // b answers by request id: same thread, one hop deeper
-        send(&s, &b, &a, "ans", "r2", Some("r1"), 2).unwrap();
+        send(&s, &b, Some(&a), "ans", "r2", Some("r1"), 2).unwrap();
         // c answers by message id
-        send(&s, &a, &b, "more", "r3", Some(&m1.0), 3).unwrap();
+        send(&s, &a, Some(&b), "more", "r3", Some(&m1.0), 3).unwrap();
         let rows: Vec<(String, i64)> = ["r2", "r3"]
             .iter()
             .map(|rid| {
@@ -696,7 +816,7 @@ mod tests {
         assert_eq!(rows, vec![(m1.1.clone(), 1), (m1.1.clone(), 1)]);
         // no reply_to: the trigger is the newest message delivered to a (r2, from b)
         take(&s, &a, 3).unwrap();
-        send(&s, &a, &b, "follow", "r4", None, 4).unwrap();
+        send(&s, &a, Some(&b), "follow", "r4", None, 4).unwrap();
         let (t, h): (String, i64) = s
             .conn()
             .query_row(
@@ -707,7 +827,7 @@ mod tests {
             .unwrap();
         assert_eq!((t, h), (m1.1.clone(), 2));
         // trigger came from someone else: a fresh thread, hops still carry on
-        send(&s, &a, &k("z"), "hello", "r5", None, 5).unwrap();
+        send(&s, &a, Some(&k("z")), "hello", "r5", None, 5).unwrap();
         let (id, t): (String, String) = s
             .conn()
             .query_row(
@@ -740,9 +860,9 @@ mod tests {
     #[test]
     fn forwarding_without_reply_to_keeps_hop_ancestry() {
         let (_d, s) = setup();
-        send(&s, &k("a"), &k("b"), "do it", "r1", None, 1).unwrap();
+        send(&s, &k("a"), Some(&k("b")), "do it", "r1", None, 1).unwrap();
         take(&s, &k("b"), 2).unwrap();
-        send(&s, &k("b"), &k("c"), "you do it", "r2", None, 3).unwrap();
+        send(&s, &k("b"), Some(&k("c")), "you do it", "r2", None, 3).unwrap();
         let (id, thread, hops) = thread_hops(&s, "r2");
         assert_eq!((hops, thread == id), (1, true));
         assert_ne!(thread, thread_hops(&s, "r1").1);
@@ -751,9 +871,9 @@ mod tests {
     #[test]
     fn a_reply_without_reply_to_to_the_trigger_sender_keeps_its_thread() {
         let (_d, s) = setup();
-        send(&s, &k("a"), &k("b"), "do it", "r1", None, 1).unwrap();
+        send(&s, &k("a"), Some(&k("b")), "do it", "r1", None, 1).unwrap();
         take(&s, &k("b"), 2).unwrap();
-        send(&s, &k("b"), &k("a"), "done", "r2", None, 3).unwrap();
+        send(&s, &k("b"), Some(&k("a")), "done", "r2", None, 3).unwrap();
         let (_, thread, hops) = thread_hops(&s, "r2");
         assert_eq!((thread, hops), (thread_hops(&s, "r1").1, 1));
     }
@@ -761,13 +881,13 @@ mod tests {
     #[test]
     fn an_old_delivery_is_no_trigger() {
         let (_d, s) = setup();
-        send(&s, &k("a"), &k("b"), "x", "r1", None, 1).unwrap();
+        send(&s, &k("a"), Some(&k("b")), "x", "r1", None, 1).unwrap();
         take(&s, &k("b"), 100).unwrap();
         mark_read(&s, &thread_hops(&s, "r1").0, 150).unwrap();
         send(
             &s,
             &k("b"),
-            &k("c"),
+            Some(&k("c")),
             "y",
             "r2",
             None,
@@ -779,31 +899,40 @@ mod tests {
             1,
             "inside the window, even after read"
         );
-        send(&s, &k("b"), &k("c"), "z", "r3", None, 100 + LOOP_WINDOW_S).unwrap();
+        send(
+            &s,
+            &k("b"),
+            Some(&k("c")),
+            "z",
+            "r3",
+            None,
+            100 + LOOP_WINDOW_S,
+        )
+        .unwrap();
         assert_eq!(thread_hops(&s, "r3").2, 0, "delivery 600 s ago is out");
     }
 
     #[test]
     fn a_message_taken_long_after_sending_is_still_a_trigger() {
         let (_d, s) = setup();
-        send(&s, &k("a"), &k("b"), "x", "r1", None, 1).unwrap();
+        send(&s, &k("a"), Some(&k("b")), "x", "r1", None, 1).unwrap();
         take(&s, &k("b"), 1000).unwrap();
-        send(&s, &k("b"), &k("c"), "y", "r2", None, 1500).unwrap();
+        send(&s, &k("b"), Some(&k("c")), "y", "r2", None, 1500).unwrap();
         assert_eq!(thread_hops(&s, "r2").2, 1);
     }
 
     #[test]
     fn two_senders_may_reuse_the_same_request_id() {
         let (_d, s) = setup();
-        let r1 = send(&s, &k("a"), &k("c"), "from a", "req-1", None, 1).unwrap();
-        let r2 = send(&s, &k("b"), &k("c"), "from b", "req-1", None, 1).unwrap();
+        let r1 = send(&s, &k("a"), Some(&k("c")), "from a", "req-1", None, 1).unwrap();
+        let r2 = send(&s, &k("b"), Some(&k("c")), "from b", "req-1", None, 1).unwrap();
         assert_eq!((r1.state, r2.state), (State::Stored, State::Stored));
         // each sender's retry is idempotent within itself; a mismatch is only against its own
         assert_eq!(
-            send(&s, &k("b"), &k("c"), "from b", "req-1", None, 2).unwrap(),
+            send(&s, &k("b"), Some(&k("c")), "from b", "req-1", None, 2).unwrap(),
             r2
         );
-        let r = send(&s, &k("a"), &k("c"), "from b", "req-1", None, 2).unwrap();
+        let r = send(&s, &k("a"), Some(&k("c")), "from b", "req-1", None, 2).unwrap();
         assert_eq!(r.reason.as_deref(), Some("request_id_reused"));
         // receipts are separate: reading a's message leaves b's delivered
         take(&s, &k("c"), 3).unwrap();

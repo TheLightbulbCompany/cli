@@ -451,3 +451,22 @@ fn the_server_advertises_its_installed_name() {
     // mcp_named asserts serverInfo.name on initialize.
     net.mcp_named(&me(), Some("lightbulb-network"));
 }
+
+#[test]
+fn send_message_with_reply_to_alone_answers_the_sender() {
+    let net = Net::new();
+    let key = net.register("claude", "c1", &me());
+    net.send("x/terminal", &key, "question", "q1");
+    let mut m = net.mcp(&me());
+    assert!(!m.tool("check_inbox", json!({})).error);
+    let out = m.tool(
+        "send_message",
+        json!({"request_id": "a1", "text": "answer", "reply_to": "q1"}),
+    );
+    assert!(!out.error, "{}", out.text);
+    let r = net.call(json!({"id": 1, "op": "inbox", "key": "x/terminal"}));
+    assert_eq!(r["messages"][0]["text"], "answer", "{r}");
+    // Neither a recipient nor a reply_to: refused.
+    let out = m.tool("send_message", json!({"request_id": "a2", "text": "t"}));
+    assert!(out.error, "{}", out.text);
+}

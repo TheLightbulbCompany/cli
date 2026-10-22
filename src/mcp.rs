@@ -60,8 +60,9 @@ struct SendArgs {
     /// A new [A-Za-z0-9._-]{1,128} string; reuse it only to retry this send.
     request_id: String,
     text: String,
-    /// The recipient, a session_id from find_sessions.
-    session_id: String,
+    /// The recipient, a session_id from find_sessions. Optional with reply_to: the reply then
+    /// goes to whoever sent that message.
+    session_id: Option<String>,
     /// The requestId of the message this answers.
     reply_to: Option<String>,
     /// Not supported here.
@@ -305,6 +306,9 @@ impl Server {
         };
         if a.files.is_some() || a.notify.is_some() {
             return code("unsupported");
+        }
+        if a.session_id.is_none() && a.reply_to.is_none() {
+            return code("bad_request");
         }
         let r = ask(
             "send",

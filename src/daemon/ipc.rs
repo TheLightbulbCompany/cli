@@ -338,42 +338,46 @@ pub(super) fn now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// `send {from, to, text, request_id, reply_to?}` -> `{receipt}`. `to` follows
+/// `send {from, to?, text, request_id, reply_to?}` -> `{receipt}`; `to` may be left out only
+/// with `reply_to` (the reply goes to the parent's sender). `to` follows
 /// `sessions::qualify` (a bare name is this member's; anything else, groups included, is
 /// refused with reason `bad_address`). Mail for a Claude or Codex session is then pushed into
 /// it (`super::deliver`), if its tier is `push`.
 fn send(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
-    let (Some(from), Some(to), Some(text), Some(rid)) = (
+    let (Some(from), Some(text), Some(rid)) = (
         body["from"].as_str(),
-        body["to"].as_str(),
         body["text"].as_str(),
         body["request_id"].as_str(),
     ) else {
         return Response::err(id, BAD_REQUEST);
     };
-    let Some(to) = sessions::qualify(&daemon.member_key_short, to) else {
-        return refused(id, "bad_address");
-    };
-    let to = to.as_str();
     let reply_to = body["reply_to"].as_str();
-    let sent = mail::send(
-        &daemon.store.lock().unwrap(),
-        &Key(from.into()),
-        &Key(to.into()),
-        text,
-        rid,
-        reply_to,
-        now(),
-    );
+    let to = match body["to"].as_str() {
+        Some(t) => match sessions::qualify(&daemon.member_key_short, t) {
+            Some(t) => Some(Key(t)),
+            None => return refused(id, "bad_address"),
+        },
+        None if reply_to.is_some() => None,
+        None => return Response::err(id, BAD_REQUEST),
+    };
+    let from = Key(from.into());
+    let (sent, to) = {
+        let store = daemon.store.lock().unwrap();
+        let sent = mail::send(&store, &from, to.as_ref(), text, rid, reply_to, now());
+        (sent, mail::recipient(&store, &from, rid).ok().flatten())
+    };
     match sent {
         Ok(receipt) => {
             if receipt.state == mail::State::Stored {
                 daemon.mail.notify_waiters();
-                if matches!(
-                    frame::Sender::of("", to),
-                    frame::Sender::Agent("claude" | "codex")
-                ) {
-                    tokio::spawn(super::deliver(daemon.clone(), Key(to.into())));
+                let push = |t: &String| {
+                    matches!(
+                        frame::Sender::of("", t),
+                        frame::Sender::Agent("claude" | "codex")
+                    )
+                };
+                if let Some(to) = to.filter(push) {
+                    tokio::spawn(super::deliver(daemon.clone(), Key(to)));
                 }
             }
             Response::ok(id, json!({ "receipt": receipt }))
