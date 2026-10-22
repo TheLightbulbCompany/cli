@@ -1,9 +1,9 @@
 //! Newline-delimited JSON over the daemon's Unix socket.
 
 use super::Daemon;
-use crate::mail;
 use crate::sessions::{self, Key};
 use crate::store;
+use crate::{frame, mail};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -139,11 +139,17 @@ async fn handle(line: &str, daemon: &Daemon, subscribed: &mut bool) -> Response 
         "register" => register(id, &req.body, daemon),
         "sessions" => Response::ok(id, json!({ "sessions": live_sessions(daemon) })),
         "end" => match req.body["key"].as_str() {
-            Some(key) => match daemon.store.lock().unwrap().delete_session(key) {
-                Ok(true) => Response::ok(id, json!({})),
-                Ok(false) => Response::err(id, NOT_FOUND),
-                Err(_) => Response::err(id, INTERNAL),
-            },
+            Some(key) => {
+                let store = daemon.store.lock().unwrap();
+                match (
+                    mail::discard(&store, &Key(key.into()), now()),
+                    store.delete_session(key),
+                ) {
+                    (Ok(()), Ok(true)) => Response::ok(id, json!({})),
+                    (Ok(()), Ok(false)) => Response::err(id, NOT_FOUND),
+                    _ => Response::err(id, INTERNAL),
+                }
+            }
             None => Response::err(id, BAD_REQUEST),
         },
         "send" => send(id, &req.body, daemon),
@@ -156,7 +162,7 @@ async fn handle(line: &str, daemon: &Daemon, subscribed: &mut bool) -> Response 
             None => Response::err(id, BAD_REQUEST),
         },
         "inbox" => inbox(id, &req.body, daemon).await,
-        "hook" | "tool" => Response::err(id, UNSUPPORTED),
+        "tool" => Response::err(id, UNSUPPORTED),
         _ => Response::err(id, UNKNOWN_OP),
     }
 }
@@ -169,13 +175,32 @@ struct Register {
     birth_micros: u64,
     cwd: String,
     title: Option<String>,
+    status: Option<String>,
 }
 
-/// `register {session}` upserts by key as `idle`; the daemon supplies the member prefix.
+const PROVIDERS: [&str; 4] = ["claude", "codex", "cursor", "grok"];
+
+/// `register {session: {provider, conversation, pid, birth_micros, cwd, title?, status?}}`
+/// upserts by key; the daemon supplies the member prefix. `status` is `idle` (default) or
+/// `busy` (stored as live); `conversation` is `[A-Za-z0-9._-]{1,128}`.
 fn register(id: u64, body: &Value, daemon: &Daemon) -> Response {
     let Ok(r) = serde_json::from_value::<Register>(body["session"].clone()) else {
         return Response::err(id, BAD_REQUEST);
     };
+    let status = match r.status.as_deref() {
+        None | Some("idle") => "idle",
+        Some("busy") => "live",
+        Some(_) => return Response::err(id, BAD_REQUEST),
+    };
+    if !PROVIDERS.contains(&r.provider.as_str())
+        || !(1..=128).contains(&r.conversation.len())
+        || !r
+            .conversation
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+    {
+        return Response::err(id, BAD_REQUEST);
+    }
     let key = Key::new(&daemon.member_key_short, &r.provider, &r.conversation);
     let row = store::Session {
         key: key.0.clone(),
@@ -185,7 +210,7 @@ fn register(id: u64, body: &Value, daemon: &Daemon) -> Response {
         birth_micros: i64::try_from(r.birth_micros).ok(),
         cwd: r.cwd,
         title: r.title,
-        status: "idle".into(),
+        status: status.into(),
         seen_at: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs() as i64),
@@ -243,7 +268,29 @@ fn send(id: u64, body: &Value, daemon: &Daemon) -> Response {
     }
 }
 
-/// `inbox {key, wait_secs?}` -> `{messages}`: takes (and so delivers) what waits for `key`;
+/// Who a message is from, for its frame. The frame reads only the provider, which the key
+/// carries (`<member>/<provider>:<conversation>`), so the sender need not be live.
+fn sender(key: &str) -> sessions::Session {
+    let provider = key
+        .split_once('/')
+        .and_then(|(_, rest)| rest.split_once(':'))
+        .map_or("", |(p, _)| p);
+    sessions::Session {
+        key: Key(key.into()),
+        provider: provider.into(),
+        conversation: String::new(),
+        pid: 0,
+        birth_micros: 0,
+        cwd: String::new(),
+        title: None,
+        doing: None,
+        status: sessions::Status::Gone,
+        tier: sessions::Tier::Pull,
+    }
+}
+
+/// `inbox {key, wait_secs?}` -> `{messages}`, each with `framed`, the text as the agent
+/// is shown it (`frame::peer`): takes (and so delivers) what waits for `key`;
 /// with `wait_secs` (at most 600) it first waits for something to arrive.
 async fn inbox(id: u64, body: &Value, daemon: &Daemon) -> Response {
     let Some(key) = body["key"].as_str().map(|k| Key(k.into())) else {
@@ -272,7 +319,8 @@ async fn inbox(id: u64, body: &Value, daemon: &Daemon) -> Response {
                     .map(|m| {
                         json!({ "id": m.id, "request_id": m.request_id, "from": m.from_key,
                             "to": m.to_key, "kind": m.kind, "thread": m.thread, "hops": m.hops,
-                            "text": m.body, "sent_at": m.sent_at })
+                            "text": m.body, "sent_at": m.sent_at,
+                            "framed": frame::peer(&sender(&m.from_key), None, &m.request_id, &m.body) })
                     })
                     .collect();
                 return Response::ok(id, json!({ "messages": messages }));

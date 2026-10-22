@@ -333,6 +333,25 @@ pub fn mark_read(store: &Store, message_id: &str, now: u64) -> Result<()> {
     Ok(())
 }
 
+/// Everything waiting for `to` leaves the mailbox as `expired` (its session ended).
+pub fn discard(store: &Store, to: &Key, now: u64) -> Result<()> {
+    let conn = store.conn();
+    let tx = conn.unchecked_transaction()?;
+    let due: Vec<String> = {
+        let mut stmt = tx.prepare(
+            "SELECT m.request_id FROM mailbox b JOIN messages m ON m.id = b.message_id WHERE b.to_key = ?1",
+        )?;
+        let rows = stmt.query_map([&to.0], |r| r.get(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for request_id in due {
+        advance(&tx, &request_id, State::Expired, Some("session_ended"), now)?;
+    }
+    tx.execute("DELETE FROM mailbox WHERE to_key = ?1", [&to.0])?;
+    tx.commit()?;
+    Ok(())
+}
+
 /// Mail that waited past `HOLD_S` becomes `expired` and leaves the mailbox.
 pub fn expire(store: &Store, now: u64) -> Result<()> {
     let conn = store.conn();

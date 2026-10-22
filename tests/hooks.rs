@@ -1,0 +1,226 @@
+//! `hook <agent> <event>` run as the agents run it: the built binary, a fixture on stdin.
+//! The caller is pinned with LIGHTBULB_NETWORK_HOOK_CALLER (debug builds only), since the
+//! test runner is not an agent.
+
+use lightbulb_network::{os, paths};
+use serde_json::{json, Value};
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
+use std::time::Duration;
+
+const EXE: &str = env!("CARGO_BIN_EXE_lightbulb-network");
+
+struct Net {
+    dir: tempfile::TempDir,
+    claude: tempfile::TempDir,
+    daemon: Child,
+}
+
+impl Net {
+    fn new() -> Net {
+        let dir = tempfile::tempdir().unwrap();
+        let claude = tempfile::tempdir().unwrap();
+        let daemon = Command::new(EXE)
+            .arg("daemon")
+            .env(paths::HOME_ENV, dir.path())
+            .env("LIGHTBULB_NETWORK_CLAUDE_HOME", claude.path())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let net = Net {
+            dir,
+            claude,
+            daemon,
+        };
+        for _ in 0..50 {
+            if UnixStream::connect(net.dir.path().join(paths::SOCKET)).is_ok() {
+                return net;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("daemon socket never came up");
+    }
+
+    fn call(&self, req: Value) -> Value {
+        let mut s = UnixStream::connect(self.dir.path().join(paths::SOCKET)).unwrap();
+        s.write_all(format!("{req}\n").as_bytes()).unwrap();
+        let mut line = String::new();
+        BufReader::new(s).read_line(&mut line).unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+
+    fn key(&self, provider: &str, conversation: &str) -> String {
+        let short = self.call(json!({"id": 1, "op": "status"}))["member_key_short"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        format!("{short}/{provider}:{conversation}")
+    }
+
+    fn send(&self, to: &str, text: &str, rid: &str) {
+        let r = self.call(json!({"id": 1, "op": "send", "from": "x/codex:a", "to": to,
+            "text": text, "request_id": rid}));
+        assert_eq!(r["receipt"]["state"], "stored", "{r}");
+    }
+
+    fn receipt(&self, rid: &str) -> Value {
+        self.call(json!({"id": 1, "op": "receipt", "request_id": rid}))["receipt"]["state"].clone()
+    }
+
+    fn session(&self, key: &str) -> Option<Value> {
+        self.call(json!({"id": 1, "op": "sessions"}))["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["key"] == key)
+            .cloned()
+    }
+
+    /// Runs the hook with `tests/fixtures/hooks/<fixture>.json` on stdin; returns stdout.
+    fn hook(&self, agent: &str, event: &str, fixture: &str) -> String {
+        let me = os::process(std::process::id()).unwrap();
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/hooks")
+            .join(format!("{fixture}.json"));
+        let mut child = Command::new(EXE)
+            .args(["hook", agent, event])
+            .env(paths::HOME_ENV, self.dir.path())
+            .env("LIGHTBULB_NETWORK_CLAUDE_HOME", self.claude.path())
+            .env(
+                "LIGHTBULB_NETWORK_HOOK_CALLER",
+                format!("{}:{}", me.pid, me.birth_micros),
+            )
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&std::fs::read(path).unwrap())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "a hook must always exit 0");
+        assert!(
+            out.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    }
+}
+
+impl Drop for Net {
+    fn drop(&mut self) {
+        let _ = UnixStream::connect(self.dir.path().join(paths::SOCKET))
+            .and_then(|mut s| s.write_all(b"{\"id\":0,\"op\":\"shutdown\"}\n"));
+        let _ = self.daemon.wait();
+    }
+}
+
+fn frame_of(text: &str) -> String {
+    format!("[Lightbulb teammate contribution from Your Codex {{\"requestId\":\"{text}\"}}]\nReply with send_message(reply_to=\"{text}\") to answer this message.\n\nbody {text}")
+}
+
+#[test]
+fn stop_hook_hands_waiting_mail_to_grok_as_block_decision() {
+    let net = Net::new();
+    assert_eq!(net.hook("grok", "session-start", "grok-session-start"), "");
+    let key = net.key("grok", "019a0000-0000-7000-8000-0000000000f1");
+    assert!(net.session(&key).is_some());
+    net.send(&key, "body r1", "r1");
+
+    // A stop that is not the end of a turn is ignored and leaves the mail.
+    assert_eq!(net.hook("grok", "stop", "grok-stop-shutdown"), "");
+    assert_eq!(net.receipt("r1"), "stored");
+
+    let out: Value = serde_json::from_str(&net.hook("grok", "stop", "grok-stop")).unwrap();
+    assert_eq!(out, json!({"decision": "block", "reason": frame_of("r1")}));
+    assert_eq!(net.receipt("r1"), "delivered");
+    assert_eq!(net.session(&key).unwrap()["status"], "idle");
+}
+
+#[test]
+fn session_end_removes_the_record_and_its_mail() {
+    let net = Net::new();
+    net.hook("claude", "session-start", "claude-session-start");
+    let key = net.key("claude", "00000000-0000-4000-8000-0000000000c1");
+    assert!(net.session(&key).is_some());
+    net.send(&key, "body r1", "r1");
+
+    assert_eq!(net.hook("claude", "session-end", "claude-session-end"), "");
+    assert!(net.session(&key).is_none());
+    assert_eq!(net.receipt("r1"), "expired");
+    // The same conversation coming back finds an empty mailbox.
+    assert_eq!(
+        net.hook("claude", "session-start", "claude-session-start"),
+        ""
+    );
+}
+
+#[test]
+fn claude_post_tool_use_prints_additional_context_with_the_frame() {
+    let net = Net::new();
+    assert_eq!(
+        net.hook("claude", "session-start", "claude-session-start"),
+        ""
+    );
+    let key = net.key("claude", "00000000-0000-4000-8000-0000000000c1");
+    net.send(&key, "body r1", "r1");
+    let out: Value =
+        serde_json::from_str(&net.hook("claude", "post-tool-use", "claude-post-tool-use")).unwrap();
+    assert_eq!(
+        out,
+        json!({"hookSpecificOutput": {"hookEventName": "PostToolUse",
+            "additionalContext": frame_of("r1")}})
+    );
+    assert_eq!(net.session(&key).unwrap()["status"], "live");
+    // Drained: the next tool event prints nothing.
+    assert_eq!(
+        net.hook("claude", "post-tool-use", "claude-post-tool-use"),
+        ""
+    );
+}
+
+#[test]
+fn cursor_stop_prints_followup_message() {
+    let net = Net::new();
+    assert_eq!(
+        net.hook("cursor", "session-start", "cursor-session-start"),
+        ""
+    );
+    let key = net.key("cursor", "5c1e0000-0000-4000-8000-0000000000e1");
+    net.send(&key, "body r1", "r1");
+    net.send(&key, "body r2", "r2");
+    let out: Value = serde_json::from_str(&net.hook("cursor", "stop", "cursor-stop")).unwrap();
+    assert_eq!(
+        out,
+        json!({"followup_message": format!("{}\n\n{}", frame_of("r1"), frame_of("r2"))})
+    );
+}
+
+#[test]
+fn register_refuses_a_bad_conversation_id() {
+    let net = Net::new();
+    let reg = |provider: &str, conversation: &str, status: &str| {
+        net.call(
+            json!({"id": 1, "op": "register", "session": {"provider": provider,
+            "conversation": conversation, "pid": 1, "birth_micros": 1, "cwd": "/",
+            "status": status}}),
+        )
+    };
+    assert_eq!(reg("grok", "a b", "idle")["error"], "bad_request");
+    assert_eq!(reg("grok", "", "idle")["error"], "bad_request");
+    assert_eq!(
+        reg("grok", &"a".repeat(129), "idle")["error"],
+        "bad_request"
+    );
+    assert_eq!(reg("vim", "ok", "idle")["error"], "bad_request");
+    assert_eq!(reg("grok", "ok", "asleep")["error"], "bad_request");
+    assert_eq!(reg("grok", "o.k_-1", "busy")["ok"], true);
+}

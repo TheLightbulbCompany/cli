@@ -44,7 +44,7 @@ async fn ipc_answers_ping_and_rejects_unknown_op() {
         json!({"id": 2, "ok": false, "error": "unknown_op"})
     );
     assert_eq!(
-        call(&mut lines, &mut w, json!({"id": 3, "op": "hook"})).await,
+        call(&mut lines, &mut w, json!({"id": 3, "op": "tool"})).await,
         json!({"id": 3, "ok": false, "error": "unsupported"})
     );
     assert_eq!(
