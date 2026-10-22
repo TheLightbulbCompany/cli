@@ -175,3 +175,52 @@ async fn mail_arriving_after_a_waiting_inbox_hung_up_stays_in_the_mailbox() {
     assert_eq!(got["messages"][0]["text"], "kept", "{got}");
     call(&mut l, &mut w, json!({"id": 4, "op": "shutdown"})).await;
 }
+
+#[tokio::test]
+async fn send_qualifies_a_bare_name_and_refuses_bad_addresses() {
+    let dir = tempfile::tempdir().unwrap();
+    let claude_home = tempfile::tempdir().unwrap();
+    std::env::set_var("LIGHTBULB_NETWORK_CLAUDE_HOME", claude_home.path());
+    let home = dir.path().to_path_buf();
+    tokio::spawn(async move { daemon::run(&home).await.unwrap() });
+    let (mut l, mut w) = connect(&dir.path().join(paths::SOCKET)).await;
+    let short = call(&mut l, &mut w, json!({"id": 1, "op": "status"})).await["member_key_short"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let send = |to: &str, rid: &str| {
+        json!({"id": 2, "op": "send", "from": "x/claude:a", "to": to, "text": "hi",
+            "request_id": rid})
+    };
+    let r = call(&mut l, &mut w, send("desk", "n1")).await;
+    assert_eq!(r["receipt"]["state"], "stored", "{r}");
+    let got = call(
+        &mut l,
+        &mut w,
+        json!({"id": 3, "op": "inbox", "key": format!("{short}/desk")}),
+    )
+    .await;
+    assert_eq!(got["messages"][0]["to"], format!("{short}/desk"), "{got}");
+    for (i, bad) in [
+        "*",
+        &format!("{short}/*"),
+        "a b",
+        "x/",
+        "/desk",
+        "x/nope:c",
+        "x/codex:",
+        "x/codex:a b",
+        "x/y/z",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let r = call(&mut l, &mut w, send(bad, &format!("b{i}"))).await;
+        assert_eq!(
+            (r["error"].as_str(), r["reason"].as_str()),
+            (Some("bad_request"), Some("bad_address")),
+            "{bad}: {r}"
+        );
+    }
+    call(&mut l, &mut w, json!({"id": 4, "op": "shutdown"})).await;
+}

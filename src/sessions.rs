@@ -17,6 +17,35 @@ impl Key {
     }
 }
 
+pub const PROVIDERS: [&str; 4] = ["claude", "codex", "cursor", "grok"];
+
+/// `[A-Za-z0-9._-]{1,max}`.
+pub fn word(s: &str, max: usize) -> bool {
+    (1..=max).contains(&s.len())
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+}
+
+/// A name address's name (`listen --as`): `[A-Za-z0-9._-]{1,64}`.
+pub fn valid_name(s: &str) -> bool {
+    word(s, 64)
+}
+
+/// The one address grammar: `to` as `<member>/<provider>:<conversation>` or `<member>/<name>`,
+/// a bare name taken as `member`'s. `None` for anything else (groups included).
+pub fn qualify(member: &str, to: &str) -> Option<String> {
+    if valid_name(to) {
+        return Some(format!("{member}/{to}"));
+    }
+    let (m, rest) = to.split_once('/')?;
+    let ok = valid_name(m)
+        && match rest.split_once(':') {
+            Some((p, c)) => PROVIDERS.contains(&p) && word(c, 128),
+            None => valid_name(rest),
+        };
+    ok.then(|| to.to_string())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {

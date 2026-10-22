@@ -118,12 +118,6 @@ pub fn send(
     }
     let mut conn = connect()?;
     let short = conn.member()?;
-    // A bare name is one of this member's name addresses.
-    let target = &if target.contains('/') || group {
-        target.to_string()
-    } else {
-        format!("{short}/{target}")
-    };
     let from = from.unwrap_or_else(|| format!("{short}/terminal"));
     let rid = request_id.unwrap_or_else(|| ulid::Ulid::generate().to_string());
     let targets: Vec<(String, String)> = if group {
@@ -170,12 +164,7 @@ pub fn send(
 }
 
 pub fn listen(name: &str, once: bool) -> Result<i32> {
-    if name.is_empty()
-        || name.len() > 64
-        || !name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
-    {
+    if !crate::sessions::valid_name(name) {
         return Err("--as takes [A-Za-z0-9._-], 1 to 64 characters".into());
     }
     let mut backoff = 1;

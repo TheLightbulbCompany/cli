@@ -264,8 +264,6 @@ struct Register {
     executable: Option<String>,
 }
 
-const PROVIDERS: [&str; 4] = ["claude", "codex", "cursor", "grok"];
-
 /// `register {session: {provider, conversation, pid, birth_micros, cwd, title?, status?, executable?}, caller?}`
 /// upserts by key; the daemon supplies the member prefix. A key whose row names another
 /// live process is refused (`bad_request`, reason `owned_by_live_process`). `status` is `idle` (default) or
@@ -279,12 +277,7 @@ fn register(id: u64, body: &Value, daemon: &Daemon) -> Response {
         Some("busy") => "live",
         Some(_) => return Response::err(id, BAD_REQUEST),
     };
-    if !PROVIDERS.contains(&r.provider.as_str())
-        || !(1..=128).contains(&r.conversation.len())
-        || !r
-            .conversation
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+    if !sessions::PROVIDERS.contains(&r.provider.as_str()) || !sessions::word(&r.conversation, 128)
     {
         return Response::err(id, BAD_REQUEST);
     }
@@ -345,8 +338,10 @@ pub(super) fn now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// `send {from, to, text, request_id, reply_to?}` -> `{receipt}`. Mail for a Claude or Codex
-/// session is then pushed into it (`super::deliver`), if its tier is `push`.
+/// `send {from, to, text, request_id, reply_to?}` -> `{receipt}`. `to` follows
+/// `sessions::qualify` (a bare name is this member's; anything else, groups included, is
+/// refused with reason `bad_address`). Mail for a Claude or Codex session is then pushed into
+/// it (`super::deliver`), if its tier is `push`.
 fn send(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
     let (Some(from), Some(to), Some(text), Some(rid)) = (
         body["from"].as_str(),
@@ -356,6 +351,10 @@ fn send(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
     ) else {
         return Response::err(id, BAD_REQUEST);
     };
+    let Some(to) = sessions::qualify(&daemon.member_key_short, to) else {
+        return refused(id, "bad_address");
+    };
+    let to = to.as_str();
     let reply_to = body["reply_to"].as_str();
     let sent = mail::send(
         &daemon.store.lock().unwrap(),

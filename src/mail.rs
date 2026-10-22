@@ -292,13 +292,7 @@ pub fn send(
     // This member's own name address (`<member>/<name>`, the `listen --as` character rule) is a
     // person's mailbox and never expires; any other non-session address keeps the hold.
     let own_name = match (from.0.split_once('/'), to.0.split_once('/')) {
-        (Some((a, _)), Some((b, name))) => {
-            a == b
-                && (1..=64).contains(&name.len())
-                && name
-                    .bytes()
-                    .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
-        }
+        (Some((a, _)), Some((b, name))) => a == b && sessions::valid_name(name),
         _ => false,
     };
     let expires = if own_name {
