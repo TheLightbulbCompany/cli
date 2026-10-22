@@ -1,5 +1,4 @@
 //! The frame an agent sees around a delivered message, and defang for the body.
-//! Header strings mirror the monorepo's `apps/desktop/src-tauri/src/local_sessions.rs`.
 
 use crate::sessions::Session;
 use serde_json::json;

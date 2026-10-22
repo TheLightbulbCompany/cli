@@ -1,6 +1,5 @@
-//! Push into Claude Code: a user frame written to the session's messaging socket (the
-//! `messagingSocketPath` of `~/.claude/sessions/<pid>.json`). Adapted from the monorepo's
-//! `apps/desktop/src-tauri/src/local_sessions/claude.rs` (`connect`, `send`, `sender_handle`).
+//! Push into Claude Code: a user frame written to Claude Code's per-session messaging socket
+//! (the `messagingSocketPath` of `~/.claude/sessions/<pid>.json`).
 
 use super::PushError;
 use crate::os;

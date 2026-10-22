@@ -1,8 +1,7 @@
 //! Push into Codex: `<daemon codex> queue --thread <id> --message <text>` queues a turn into the
 //! thread. Only threads served by Codex's shared app-server daemon are pushed, through that
 //! daemon's own binary: queueing into a `--no-daemon` or ChatGPT-app thread would add a second
-//! writer. Adapted from the monorepo's `apps/desktop/src-tauri/src/local_sessions/codex.rs`
-//! (`send`, `queued_id`, `daemon_program`/`serves_many_in`) and `local_sessions.rs` (`native_output`).
+//! writer.
 
 use super::PushError;
 use crate::sessions::Session;
