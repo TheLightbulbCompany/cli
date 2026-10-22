@@ -10,6 +10,7 @@ pub mod mail;
 pub mod mcp;
 pub mod os;
 pub mod paths;
+pub mod roster;
 pub mod sessions;
 pub mod setup;
 pub mod store;
