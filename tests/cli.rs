@@ -318,12 +318,9 @@ fn daemon_install_writes_the_plist_and_alias_without_touching_a_foreign_file() {
 }
 
 #[test]
-fn leave_and_doctor() {
-    let e = Env::new();
-    let o = e.run(&["leave"]);
-    assert!(o.status.success());
-    assert_eq!(out(&o).trim(), "This computer is on no network yet.");
+fn doctor_reports_what_is_missing() {
     // Nothing is installed in the temp home: doctor reports it and exits 1.
+    let e = Env::new();
     let d = e.run(&["doctor"]);
     assert_eq!(d.status.code(), Some(1));
     assert!(out(&d).contains("alias: missing") && out(&d).contains("daemon: missing"));

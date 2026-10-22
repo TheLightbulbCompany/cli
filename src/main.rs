@@ -61,7 +61,29 @@ enum Command {
     },
     /// Check the daemon, state permissions, agent wiring, alias and launchd job.
     Doctor,
-    /// Leave the network.
+    /// Print this computer's invite line (the reusable link, unless a flag says otherwise).
+    Invite {
+        /// Replace the reusable link; the old one stops working.
+        #[arg(long, conflicts_with_all = ["once", "open"])]
+        new: bool,
+        /// A link for one join, valid 24 hours.
+        #[arg(long, conflicts_with = "open")]
+        once: bool,
+        /// A link whose joins need no Allow (founder and admins).
+        #[arg(long)]
+        open: bool,
+    },
+    /// Show the team and its members.
+    Team,
+    /// Make a member an admin (founder only), or with --founder the founder in your place.
+    Admin {
+        name: String,
+        #[arg(long)]
+        founder: bool,
+    },
+    /// Remove a member (founder and admins); the invite link is replaced.
+    Remove { name: String },
+    /// Leave the team; this computer is on its own network again.
     Leave,
     #[command(external_subcommand)]
     External(Vec<OsString>),
@@ -137,7 +159,11 @@ fn main() -> lightbulb_network::Result<()> {
         Command::Listen { name, once } => exit(cli::listen(&name, once)?),
         Command::Receipt { request_id, from } => exit(cli::receipt(&request_id, from)?),
         Command::Doctor => exit(cli::doctor()?),
-        Command::Leave => cli::leave(),
+        Command::Invite { new, once, open } => exit(cli::invite(new, once, open)?),
+        Command::Team => exit(cli::team()?),
+        Command::Admin { name, founder } => exit(cli::admin(&name, founder)?),
+        Command::Remove { name } => exit(cli::remove(&name)?),
+        Command::Leave => exit(cli::leave()?),
         Command::External(args) => exit(cli::forward(args)?),
         Command::Mcp { server_name } => mcp::run(server_name)?,
         Command::Setup {

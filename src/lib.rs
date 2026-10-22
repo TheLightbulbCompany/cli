@@ -14,5 +14,6 @@ pub mod roster;
 pub mod sessions;
 pub mod setup;
 pub mod store;
+pub mod ticket;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;

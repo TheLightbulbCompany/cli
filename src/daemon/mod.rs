@@ -5,7 +5,7 @@ use crate::agents::{claude, codex};
 use crate::config::Config;
 use crate::identity::Identity;
 use crate::sessions::{self, Key, Tier};
-use crate::{cli, frame, mail, paths, store::Store, Result};
+use crate::{cli, frame, mail, paths, roster, store::Store, Result};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions, Permissions};
@@ -122,7 +122,18 @@ pub async fn run(dir: &Path) -> Result<()> {
     let config = Config::load(dir)?;
     let store = Store::open(&dir.join("state.db"))?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
-    let (team_id, team_name) = store.ensure_team(&identity.key, &user_name(), now)?;
+    // The solo network's genesis, written once: a computer that has a roster keeps it.
+    if roster::entries(&store)?.is_empty() {
+        let (_, name) = store.ensure_team(&identity.key, &user_name(), now)?;
+        net_ops::genesis(&store, &identity, &config.computer, &name, now, 0)?;
+    }
+    let mut team = TeamState {
+        team_id: String::new(),
+        team_name: String::new(),
+        heads: vec![],
+        config,
+    };
+    net_ops::reload(&store, &mut team, now)?;
 
     // We hold the lock, so any socket file left behind is stale.
     let sock = dir.join(paths::SOCKET);
@@ -137,12 +148,7 @@ pub async fn run(dir: &Path) -> Result<()> {
     let daemon = Arc::new(Daemon {
         store: Mutex::new(store),
         identity,
-        team: Mutex::new(TeamState {
-            team_id,
-            team_name,
-            heads: vec![],
-            config,
-        }),
+        team: Mutex::new(team),
         claude_home: std::env::var_os("LIGHTBULB_NETWORK_CLAUDE_HOME")
             .map(PathBuf::from)
             .or_else(dirs::home_dir)

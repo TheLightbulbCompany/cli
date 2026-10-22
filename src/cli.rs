@@ -7,6 +7,7 @@ use crate::{daemon, paths, setup, Result};
 use serde_json::{json, Value};
 use std::ffi::OsString;
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -236,8 +237,162 @@ pub fn receipt(request_id: &str, from: Option<String>) -> Result<i32> {
     }
 }
 
-pub fn leave() {
-    println!("This computer is on no network yet.");
+// ---- team -------------------------------------------------------------------------------
+
+/// `invite [--new|--once|--open]`: this computer's invite line.
+pub fn invite(new: bool, once: bool, open: bool) -> Result<i32> {
+    if open && session_identity() {
+        eprintln!("invite --open is for people at a terminal");
+        return Ok(1);
+    }
+    let mode = match (new, once, open) {
+        (true, ..) => "new",
+        (_, true, _) => "once",
+        (.., true) => "open",
+        _ => "reusable",
+    };
+    let r = connect()?.call("team.invite", json!({ "mode": mode }))?;
+    match r["error"].as_str() {
+        None => {}
+        Some("not_admin") => {
+            eprintln!("Only the founder and admins can make an open link.");
+            return Ok(1);
+        }
+        Some(_) => {
+            return Err(format!(
+                "invite: {}",
+                r["reason"].as_str().unwrap_or(&r["error"].to_string())
+            )
+            .into())
+        }
+    }
+    let line = r["line"].as_str().unwrap_or_default();
+    if once {
+        let at = utc(r["expires_at"].as_i64().unwrap_or_default());
+        println!("One-time invite, expires {at}: {line}");
+    } else if open {
+        println!("Anyone with this link joins without asking. Use it only with people you trust.");
+        println!("{line}");
+    } else if r["replaced"] == true {
+        println!("Old link stopped working. New link: {line}");
+    } else {
+        println!("{line}");
+    }
+    Ok(0)
+}
+
+/// `team`: the team's name and members.
+pub fn team() -> Result<i32> {
+    let t = ask(&mut connect()?, "team.get", json!({}))?;
+    println!("{}", t["name"].as_str().unwrap_or_default());
+    for m in t["members"].as_array().into_iter().flatten() {
+        let f = |k: &str| m[k].as_str().map(cell).unwrap_or_default();
+        println!(
+            "  {}  {}  {}  {}",
+            f("name"),
+            f("computer"),
+            f("role"),
+            f("short")
+        );
+    }
+    Ok(0)
+}
+
+/// `admin <name> [--founder]`.
+pub fn admin(name: &str, founder: bool) -> Result<i32> {
+    let r = connect()?.call("team.admin", json!({ "member": name, "founder": founder }))?;
+    let Some(code) = r["error"].as_str() else {
+        let n = r["name"].as_str().unwrap_or(name);
+        if founder {
+            println!("{n} is now the founder.");
+        } else {
+            println!("{n} can now remove members.");
+        }
+        return Ok(0);
+    };
+    eprintln!(
+        "{}",
+        match code {
+            "not_founder" => "Only the founder can make admins.".to_string(),
+            "not_found" => format!("No member called {name}."),
+            _ => format!("admin: {code}"),
+        }
+    );
+    Ok(1)
+}
+
+/// `remove <name>`.
+pub fn remove(name: &str) -> Result<i32> {
+    let r = connect()?.call("team.remove", json!({ "member": name }))?;
+    let Some(code) = r["error"].as_str() else {
+        let n = r["name"].as_str().unwrap_or(name);
+        let line = r["line"].as_str().unwrap_or_default();
+        println!("Removed {n}. New connections and new mail from it are blocked. The invite link was replaced: {line}");
+        return Ok(0);
+    };
+    eprintln!(
+        "{}",
+        match code {
+            "not_admin" => format!(
+                "Only the founder and admins can remove computers. Ask {}.",
+                r["founder"].as_str().unwrap_or("the founder")
+            ),
+            "not_found" => format!("No member called {name}."),
+            _ => format!("remove: {code}"),
+        }
+    );
+    Ok(1)
+}
+
+/// `leave`: after a yes, this computer leaves its team and is on its own network again. The
+/// service keeps running.
+pub fn leave() -> Result<i32> {
+    let mut conn = connect()?;
+    let name = ask(&mut conn, "team.get", json!({}))?["name"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    print!(
+        "Leave \"{name}\"? Your computer stops connecting. Mail already stored here stays. [y/N] "
+    );
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    if !matches!(answer.trim(), "y" | "Y" | "yes") {
+        return Ok(0);
+    }
+    let r = conn.call("team.leave", json!({}))?;
+    match r["error"].as_str() {
+        None => {
+            println!("Left \"{name}\". This computer is on its own network again.");
+            Ok(0)
+        }
+        Some("founder_must_transfer") => {
+            eprintln!("You are the founder. Name a new founder first: lightbulb-network admin <name> --founder");
+            Ok(1)
+        }
+        Some(code) => Err(format!("leave: {code}").into()),
+    }
+}
+
+/// `secs` as `YYYY-MM-DD HH:MM UTC`.
+fn utc(secs: i64) -> String {
+    // Days to a civil date (Howard Hinnant's `civil_from_days`).
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02} UTC",
+        rem / 3600,
+        rem % 3600 / 60
+    )
 }
 
 /// Hands an unowned subcommand to the Lightbulb app's binary (replacing this process), or says
@@ -454,4 +609,14 @@ pub fn doctor() -> Result<i32> {
         line("launchd", loaded);
     }
     Ok(i32::from(missing))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn utc_formats_a_unix_time() {
+        assert_eq!(super::utc(0), "1970-01-01 00:00 UTC");
+        assert_eq!(super::utc(1_792_728_600), "2026-10-23 04:10 UTC");
+        assert_eq!(super::utc(951_782_400), "2000-02-29 00:00 UTC");
+    }
 }

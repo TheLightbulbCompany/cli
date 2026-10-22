@@ -60,10 +60,8 @@ async fn ipc_answers_ping_and_rejects_unknown_op() {
     assert_eq!(status["protocol"], 1);
     assert_eq!(status["sessions"], 0);
     assert_eq!(status["member_key_short"].as_str().unwrap().len(), 12);
-    assert!(status["team"]["id"]
-        .as_str()
-        .unwrap()
-        .starts_with(status["member_key_short"].as_str().unwrap()));
+    // The team id is the solo network's genesis hash.
+    assert_eq!(status["team"]["id"].as_str().unwrap().len(), 64);
 
     // A subscriber sees the shutdown event; the daemon exits cleanly.
     let (mut sub_lines, mut sub_w) = connect(dir.path()).await;

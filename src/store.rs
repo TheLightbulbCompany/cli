@@ -234,6 +234,16 @@ impl Store {
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
     }
+
+    /// Rewrites the Plan A `team` row from the roster.
+    pub fn set_team(&self, id: &str, name: &str, founder: &str, at: i64) -> rusqlite::Result<()> {
+        self.conn.execute_batch("DELETE FROM team")?;
+        self.conn.execute(
+            "INSERT INTO team VALUES (?1, ?2, ?3, ?4)",
+            params![id, name, founder, at],
+        )?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -234,7 +234,7 @@ fn owner_process(daemon: &Daemon, key: &str) -> rusqlite::Result<Option<Proc>> {
     )
 }
 
-fn refused(id: u64, reason: &str) -> Response {
+pub(super) fn refused(id: u64, reason: &str) -> Response {
     Response {
         id,
         ok: false,
