@@ -283,10 +283,6 @@ pub fn install_alias(home: &Path, exe: &Path) -> Result<String> {
     }
 }
 
-fn alias_present(home: &Path) -> bool {
-    fs::read_link(home.join(".local/bin/lightbulb")).is_ok_and(|t| t == canonical(home))
-}
-
 fn launchctl(args: &[&str]) -> bool {
     Command::new("launchctl")
         .args(args)
@@ -415,7 +411,13 @@ pub fn doctor() -> Result<i32> {
             println!("{agent}: not installed");
         }
     }
-    line("alias", alias_present(&home));
+    let alias = home.join(".local/bin/lightbulb");
+    match fs::read_link(&alias) {
+        Ok(t) if t == canonical(&home) => line("alias", true),
+        // Someone else's file or link at our alias path is theirs, not a gap in ours.
+        _ if alias.symlink_metadata().is_ok() => println!("alias: not ours (left alone)"),
+        _ => line("alias", false),
+    }
     if cfg!(target_os = "macos") {
         let loaded = if use_launchctl() {
             launchctl(&[

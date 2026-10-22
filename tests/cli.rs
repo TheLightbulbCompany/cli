@@ -328,3 +328,14 @@ fn leave_and_doctor() {
     assert_eq!(d.status.code(), Some(1));
     assert!(out(&d).contains("alias: missing") && out(&d).contains("daemon: missing"));
 }
+
+#[test]
+fn doctor_reports_a_foreign_alias_as_not_ours_not_missing() {
+    let e = Env::new();
+    let bin = e.home.path().join(".local/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::os::unix::fs::symlink("/usr/bin/true", bin.join("lightbulb")).unwrap();
+    let d = out(&e.run(&["doctor"]));
+    assert!(d.contains("alias: not ours (left alone)"), "{d}");
+    assert!(!d.contains("alias: missing"), "{d}");
+}
