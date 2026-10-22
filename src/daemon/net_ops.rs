@@ -159,6 +159,11 @@ impl TeamOps<'_> {
         let r = &self.team.roster;
         // `None` once this computer is no longer in the roster (removed by someone else).
         let role = r.members.get(&me_key).map(|m| m.role);
+        // Membership first: a computer the team no longer holds is `not_member` for any op
+        // with a minimum role.
+        if min_role.is_some() && role.is_none() {
+            return Ok(Response::err(id, NOT_MEMBER));
+        }
         if role < min_role {
             return Ok(match min_role {
                 Some(Role::Founder) => Response::err(id, NOT_FOUNDER),
