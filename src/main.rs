@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use lightbulb_network::{daemon, hook, paths};
+use lightbulb_network::{daemon, hook, mcp, paths};
 use std::io::{Read, Write};
 
 #[derive(Parser)]
@@ -20,6 +20,10 @@ enum Command {
     /// Always exits 0; errors go to stderr.
     /// Debug builds only: LIGHTBULB_NETWORK_HOOK_CALLER=<pid>:<birth_micros> names the calling agent (tests).
     Hook { agent: String, event: String },
+    /// Run the stdio MCP server an agent talks to (find_sessions, send_message, ...).
+    ///
+    /// Debug builds only: LIGHTBULB_NETWORK_HOOK_CALLER=<pid>:<birth_micros> names the calling agent (tests).
+    Mcp,
 }
 
 fn main() -> lightbulb_network::Result<()> {
@@ -37,6 +41,7 @@ fn main() -> lightbulb_network::Result<()> {
         Command::Daemon => {
             tokio::runtime::Runtime::new()?.block_on(daemon::run(&paths::state_dir()))?
         }
+        Command::Mcp => mcp::run()?,
         Command::Hook { agent, event } => {
             let mut stdin = String::new();
             let ran = std::io::stdin()

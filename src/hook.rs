@@ -128,7 +128,7 @@ pub fn run(agent: &str, event: &str, stdin: &str) -> Result<Option<String>> {
     let Some(h) = normalize(agent, event, &serde_json::from_str(stdin)?) else {
         return Ok(None);
     };
-    let caller = calling_agent(agent);
+    let caller = calling_agent(Some(agent));
     if h.event == Event::SessionEnd {
         // The agent may have exited before its SessionEnd hook ran, so the caller check
         // can fail; then the daemon ends the row only if its recorded process is gone too.
@@ -185,11 +185,12 @@ pub fn run(agent: &str, event: &str, stdin: &str) -> Result<Option<String>> {
     Ok(Some(output(&h, &framed.join("\n\n")).to_string()))
 }
 
-fn proc_json(p: &Process) -> Value {
+pub(crate) fn proc_json(p: &Process) -> Value {
     json!({ "pid": p.pid, "birth_micros": p.birth_micros })
 }
 
-fn calling_agent(agent: &str) -> std::result::Result<Process, CallerError> {
+/// The agent process this runs for: `agent`'s, or with `None` any agent's (the MCP server).
+pub(crate) fn calling_agent(agent: Option<&str>) -> std::result::Result<Process, CallerError> {
     #[cfg(debug_assertions)]
     {
         if let Some((pid, birth)) = std::env::var(CALLER_ENV)
@@ -205,7 +206,10 @@ fn calling_agent(agent: &str) -> std::result::Result<Process, CallerError> {
             });
         }
     }
-    caller::identify(agent)
+    match agent {
+        Some(a) => caller::identify(a),
+        None => caller::identify_any(),
+    }
 }
 
 /// One blocking connection to the daemon.

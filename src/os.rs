@@ -26,6 +26,17 @@ pub fn process(pid: u32) -> Result<Process> {
     })
 }
 
+/// This computer's host name; empty when the OS will not say.
+pub fn hostname() -> String {
+    let mut buf = [0u8; 256];
+    // SAFETY: the buffer length is passed alongside the pointer.
+    if unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } != 0 {
+        return String::new();
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    String::from_utf8_lossy(&buf[..end]).into_owned()
+}
+
 struct Info {
     ppid: u32,
     birth_micros: u64,

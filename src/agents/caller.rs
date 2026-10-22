@@ -39,6 +39,19 @@ pub fn classify(path: &Path) -> Option<&'static str> {
 
 /// The process of `agent` that ran this hook.
 pub fn identify(agent: &str) -> Result<Process, CallerError> {
+    identify_in(agent, &ancestors()?)
+}
+
+/// The agent process above this one, whichever agent it is (the MCP server's caller).
+pub fn identify_any() -> Result<Process, CallerError> {
+    first_program(&ancestors()?)
+        .filter(|p| classify(&p.executable).is_some())
+        .cloned()
+        .ok_or(CallerError::NotThatAgent)
+}
+
+/// This process's ancestors, nearest first, up to and including the first non-shell.
+fn ancestors() -> Result<Vec<Process>, CallerError> {
     let mut chain = vec![];
     let mut pid = std::process::id();
     loop {
@@ -47,17 +60,18 @@ pub fn identify(agent: &str) -> Result<Process, CallerError> {
         pid = p.pid;
         chain.push(p);
         if done {
-            break;
+            return Ok(chain);
         }
     }
-    identify_in(agent, &chain)
+}
+
+fn first_program(ancestors: &[Process]) -> Option<&Process> {
+    ancestors.iter().find(|p| !skipped(&p.executable))
 }
 
 /// `identify` over a given ancestor list, nearest first.
 pub fn identify_in(agent: &str, ancestors: &[Process]) -> Result<Process, CallerError> {
-    ancestors
-        .iter()
-        .find(|p| !skipped(&p.executable))
+    first_program(ancestors)
         .filter(|p| classify(&p.executable) == Some(agent))
         .cloned()
         .ok_or(CallerError::NotThatAgent)
@@ -150,5 +164,6 @@ mod tests {
     fn identify_walks_the_real_tree() {
         // The test runner is no agent.
         assert_eq!(identify("grok"), Err(CallerError::NotThatAgent));
+        assert_eq!(identify_any(), Err(CallerError::NotThatAgent));
     }
 }

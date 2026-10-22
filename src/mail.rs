@@ -334,6 +334,16 @@ pub fn take(store: &Store, to: &Key, now: u64) -> Result<Vec<Message>> {
     Ok(out)
 }
 
+/// How many messages wait for `to`, without taking them.
+pub fn unread(store: &Store, to: &Key, now: u64) -> Result<u64> {
+    let n: i64 = store.conn().query_row(
+        "SELECT COUNT(*) FROM mailbox WHERE to_key = ?1 AND expires_at >= ?2",
+        params![to.0, now as i64],
+        |r| r.get(0),
+    )?;
+    Ok(n as u64)
+}
+
 pub fn mark_read(store: &Store, message_id: &str, now: u64) -> Result<()> {
     if let Some(m) = store.message(message_id)? {
         advance(

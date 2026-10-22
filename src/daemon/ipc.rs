@@ -154,6 +154,15 @@ async fn handle(line: &str, daemon: &Daemon, subscribed: &mut bool) -> Response 
             _ => Response::err(id, BAD_REQUEST),
         },
         "inbox" => inbox(id, &req.body, daemon).await,
+        // `unread {key}` -> `{unread}`: how many messages wait for `key`; takes nothing.
+        "unread" => match req.body["key"].as_str() {
+            Some(key) => match mail::unread(&daemon.store.lock().unwrap(), &Key(key.into()), now())
+            {
+                Ok(n) => Response::ok(id, json!({ "unread": n })),
+                Err(_) => Response::err(id, INTERNAL),
+            },
+            None => Response::err(id, BAD_REQUEST),
+        },
         "tool" => Response::err(id, UNSUPPORTED),
         _ => Response::err(id, UNKNOWN_OP),
     }
