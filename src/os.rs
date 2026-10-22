@@ -1,0 +1,115 @@
+//! Process facts the engine needs: who started when, and from where.
+
+use crate::Result;
+use std::path::PathBuf;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Process {
+    pub pid: u32,
+    /// Start time, microseconds since the Unix epoch. With the pid it names one
+    /// process for good: a reused pid has a different birth.
+    pub birth_micros: u64,
+    pub executable: PathBuf,
+}
+
+/// The parent of `pid`.
+pub fn parent(pid: u32) -> Result<Process> {
+    process(imp::info(pid)?.ppid)
+}
+
+pub fn process(pid: u32) -> Result<Process> {
+    let info = imp::info(pid)?;
+    Ok(Process {
+        pid,
+        birth_micros: info.birth_micros,
+        executable: imp::executable(pid)?,
+    })
+}
+
+struct Info {
+    ppid: u32,
+    birth_micros: u64,
+}
+
+#[cfg(target_os = "macos")]
+mod imp {
+    use super::Info;
+    use crate::Result;
+    use std::ffi::{c_void, OsStr};
+    use std::mem::{size_of, MaybeUninit};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::PathBuf;
+
+    pub fn info(pid: u32) -> Result<Info> {
+        let mut b = MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+        let size = size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        // SAFETY: the buffer is `size` bytes and proc_pidinfo writes at most that.
+        let n = unsafe {
+            libc::proc_pidinfo(
+                pid as libc::c_int,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                b.as_mut_ptr().cast::<c_void>(),
+                size,
+            )
+        };
+        if n != size {
+            return Err(format!("no process {pid}").into());
+        }
+        // SAFETY: the kernel filled the whole struct (n == size).
+        let b = unsafe { b.assume_init() };
+        Ok(Info {
+            ppid: b.pbi_ppid,
+            birth_micros: b.pbi_start_tvsec * 1_000_000 + b.pbi_start_tvusec,
+        })
+    }
+
+    pub fn executable(pid: u32) -> Result<PathBuf> {
+        let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+        // SAFETY: the buffer length is passed alongside the pointer.
+        let n = unsafe {
+            libc::proc_pidpath(
+                pid as libc::c_int,
+                buf.as_mut_ptr().cast(),
+                buf.len() as u32,
+            )
+        };
+        if n <= 0 {
+            return Err(format!("no executable path for {pid}").into());
+        }
+        Ok(PathBuf::from(OsStr::from_bytes(&buf[..n as usize])))
+    }
+}
+
+// ponytail: Linux (/proc/<pid>/stat + btime) is not written; the crate builds, lookups fail.
+#[cfg(not(target_os = "macos"))]
+mod imp {
+    use super::Info;
+    use crate::Result;
+    use std::path::PathBuf;
+
+    pub fn info(_pid: u32) -> Result<Info> {
+        Err("process lookup is only implemented on macOS".into())
+    }
+
+    pub fn executable(_pid: u32) -> Result<PathBuf> {
+        Err("process lookup is only implemented on macOS".into())
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn own_process_and_parent_are_found() {
+        let me = process(std::process::id()).unwrap();
+        assert!(me.birth_micros > 0);
+        assert!(me.executable.is_absolute());
+        assert_eq!(
+            parent(me.pid).unwrap().pid,
+            std::os::unix::process::parent_id()
+        );
+        assert!(process(999_999).is_err());
+    }
+}

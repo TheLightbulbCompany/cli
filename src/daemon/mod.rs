@@ -9,7 +9,7 @@ use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -22,6 +22,8 @@ pub struct Daemon {
     pub member_key_short: String,
     pub team_id: String,
     pub team_name: String,
+    /// Where Claude Code's `.claude/` lives: `$LIGHTBULB_NETWORK_CLAUDE_HOME`, else the home dir.
+    pub claude_home: PathBuf,
     /// Pushed to every `subscribe`d connection as `{"event": ...}` frames.
     pub events: broadcast::Sender<Value>,
     pub shutdown: Notify,
@@ -69,6 +71,10 @@ pub async fn run(dir: &Path) -> Result<()> {
         member_key_short: team_key[..12].to_string(),
         team_id,
         team_name,
+        claude_home: std::env::var_os("LIGHTBULB_NETWORK_CLAUDE_HOME")
+            .map(PathBuf::from)
+            .or_else(dirs::home_dir)
+            .ok_or("no home directory")?,
         events: broadcast::channel(256).0,
         shutdown: Notify::new(),
     });

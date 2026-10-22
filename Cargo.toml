@@ -15,6 +15,7 @@ clap = { version = "4", features = ["derive"] }
 data-encoding = "2"
 dirs = "6"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+libc = "0.2"
 rand = "0.8"
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

@@ -413,6 +413,7 @@ dependencies = [
  "data-encoding",
  "dirs",
  "ed25519-dalek",
+ "libc",
  "rand",
  "rusqlite",
  "serde",

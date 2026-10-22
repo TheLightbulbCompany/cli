@@ -50,6 +50,20 @@ pub struct Message {
     pub sent_at: i64,
 }
 
+fn row_session(r: &rusqlite::Row) -> rusqlite::Result<Session> {
+    Ok(Session {
+        key: r.get("key")?,
+        provider: r.get("provider")?,
+        conversation: r.get("conversation")?,
+        pid: r.get("pid")?,
+        birth_micros: r.get("birth_micros")?,
+        cwd: r.get("cwd")?,
+        title: r.get("title")?,
+        status: r.get("status")?,
+        seen_at: r.get("seen_at")?,
+    })
+}
+
 pub struct Store {
     conn: Connection,
 }
@@ -81,20 +95,21 @@ impl Store {
 
     pub fn session(&self, key: &str) -> rusqlite::Result<Option<Session>> {
         self.conn
-            .query_row("SELECT * FROM sessions WHERE key = ?1", [key], |r| {
-                Ok(Session {
-                    key: r.get("key")?,
-                    provider: r.get("provider")?,
-                    conversation: r.get("conversation")?,
-                    pid: r.get("pid")?,
-                    birth_micros: r.get("birth_micros")?,
-                    cwd: r.get("cwd")?,
-                    title: r.get("title")?,
-                    status: r.get("status")?,
-                    seen_at: r.get("seen_at")?,
-                })
-            })
+            .query_row("SELECT * FROM sessions WHERE key = ?1", [key], row_session)
             .optional()
+    }
+
+    pub fn sessions(&self) -> rusqlite::Result<Vec<Session>> {
+        let mut stmt = self.conn.prepare("SELECT * FROM sessions")?;
+        let rows = stmt.query_map([], row_session)?;
+        rows.collect()
+    }
+
+    pub fn delete_session(&self, key: &str) -> rusqlite::Result<bool> {
+        Ok(self
+            .conn
+            .execute("DELETE FROM sessions WHERE key = ?1", [key])?
+            > 0)
     }
 
     pub fn put_message(&self, m: &Message) -> rusqlite::Result<()> {

@@ -30,6 +30,8 @@ async fn call(
 async fn ipc_answers_ping_and_rejects_unknown_op() {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().to_path_buf();
+    // No Claude sessions to discover: keep `status.sessions` off the real ~/.claude.
+    std::env::set_var("LIGHTBULB_NETWORK_CLAUDE_HOME", dir.path());
     let daemon = tokio::spawn(async move { daemon::run(&home).await.unwrap() });
     let (mut lines, mut w) = connect(dir.path()).await;
 
