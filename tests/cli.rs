@@ -195,6 +195,16 @@ fn listen_receives_a_message_addressed_to_the_name() {
 }
 
 #[test]
+fn send_to_a_bare_name_reaches_listen() {
+    let e = Env::new();
+    e.session();
+    let o = e.run(&["send", "carol", "bare hello", "--request-id", "b1"]);
+    assert_eq!(out(&o).trim(), "stored b1", "{}", err(&o));
+    let o = e.run(&["listen", "--as", "carol", "--once"]);
+    assert!(out(&o).contains("bare hello"), "{}", err(&o));
+}
+
+#[test]
 fn listen_once_prints_a_framed_message() {
     let e = Env::new();
     e.session();
@@ -254,6 +264,9 @@ fn daemon_install_writes_the_plist_and_alias_without_touching_a_foreign_file() {
     let o = e.run(&["daemon", "--install"]);
     assert!(o.status.success(), "{}", err(&o));
     assert!(out(&o).contains("not ours; left alone"), "{}", out(&o));
+    // Under NO_LAUNCHCTL the line records the sequence a real run performs.
+    assert!(out(&o).contains("would run: bootout gui/"), "{}", out(&o));
+    assert!(out(&o).contains("; bootstrap gui/") && out(&o).contains("; kickstart -k gui/"));
     assert_eq!(
         std::fs::read_to_string(bin.join("lightbulb")).unwrap(),
         "mine"

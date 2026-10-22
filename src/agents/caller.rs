@@ -50,6 +50,18 @@ pub fn identify_any() -> Result<Process, CallerError> {
         .ok_or(CallerError::NotThatAgent)
 }
 
+/// Whether the walk up from here ended at a real program that is not an agent, and not at
+/// pid 1 (a detached command reparented to launchd shows nothing about who started it) or a
+/// failed lookup. Only then is a person at a terminal the likely caller.
+// ponytail: this gate stops accidents, not a hostile agent (same-uid ceiling: it can detach,
+// rename a wrapper, or edit this binary's environment).
+pub fn walked_to_a_person() -> bool {
+    ancestors().is_ok_and(|chain| {
+        chain.last().is_some_and(|top| top.pid > 1)
+            && first_program(&chain).is_some_and(|p| classify(&p.executable).is_none())
+    })
+}
+
 /// This process's ancestors, nearest first, up to and including the first non-shell.
 fn ancestors() -> Result<Vec<Process>, CallerError> {
     let mut chain = vec![];

@@ -6,14 +6,19 @@ use std::path::PathBuf;
 pub const HOME_ENV: &str = "LIGHTBULB_NETWORK_HOME";
 pub const SOCKET: &str = "sock";
 
-/// `~/.lightbulb/network` (or `$LIGHTBULB_NETWORK_HOME`), created with mode 0700.
-pub fn state_dir() -> PathBuf {
-    let dir = match std::env::var_os(HOME_ENV) {
+/// `~/.lightbulb/network` (or `$LIGHTBULB_NETWORK_HOME`), not created.
+pub fn state_path() -> PathBuf {
+    match std::env::var_os(HOME_ENV) {
         Some(d) => PathBuf::from(d),
         None => dirs::home_dir()
             .expect("no home directory")
             .join(".lightbulb/network"),
-    };
+    }
+}
+
+/// `state_path`, created with mode 0700.
+pub fn state_dir() -> PathBuf {
+    let dir = state_path();
     DirBuilder::new()
         .recursive(true)
         .mode(0o700)

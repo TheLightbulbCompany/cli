@@ -103,9 +103,12 @@ pub fn who(as_json: bool) -> Result<i32> {
     Ok(0)
 }
 
-/// Whether this invocation speaks as a session: the env names one, or an agent is above us.
+/// Whether this invocation may be a session: the env names one, an agent is above us, or the
+/// ancestry could not be walked to a person (fails closed).
 fn session_identity() -> bool {
-    std::env::var_os(SESSION_ENV).is_some() || hook::calling_agent(None).is_ok()
+    std::env::var_os(SESSION_ENV).is_some()
+        || hook::calling_agent(None).is_ok()
+        || !crate::agents::caller::walked_to_a_person()
 }
 
 pub fn send(
@@ -122,6 +125,12 @@ pub fn send(
     }
     let mut conn = connect()?;
     let short = member(&mut conn)?;
+    // A bare name is one of this member's name addresses.
+    let target = &if target.contains('/') || group {
+        target.to_string()
+    } else {
+        format!("{short}/{target}")
+    };
     let from = from.unwrap_or_else(|| format!("{short}/terminal"));
     let rid = request_id.unwrap_or_else(|| ulid::Ulid::generate().to_string());
     let targets: Vec<(String, String)> = if group {
@@ -176,9 +185,28 @@ pub fn listen(name: &str, once: bool) -> Result<i32> {
     {
         return Err("--as takes [A-Za-z0-9._-], 1 to 64 characters".into());
     }
+    let mut backoff = 1;
+    loop {
+        // A daemon error (it restarted, say) reconnects with a 1 s to 10 s backoff.
+        match listen_on(&key_for(name)?, once) {
+            Ok(()) => return Ok(0),
+            Err(e) => {
+                eprintln!("listen: {e}; retrying in {backoff} s");
+                std::thread::sleep(Duration::from_secs(backoff));
+                backoff = (backoff * 2).min(10);
+            }
+        }
+    }
+}
+
+fn key_for(name: &str) -> Result<String> {
+    Ok(format!("{}/{name}", member(&mut connect()?)?))
+}
+
+/// One connection's worth of listening; `Ok` only for `--once` done.
+fn listen_on(key: &str, once: bool) -> Result<()> {
     let mut conn = connect()?;
     conn.wait_up_to(Duration::from_secs(90))?;
-    let key = format!("{}/{name}", member(&mut conn)?);
     loop {
         let r = ask(&mut conn, "inbox", json!({ "key": key, "wait_secs": 60 }))?;
         let messages = r["messages"].as_array().cloned().unwrap_or_default();
@@ -186,7 +214,7 @@ pub fn listen(name: &str, once: bool) -> Result<i32> {
             println!("{}", m["framed"].as_str().unwrap_or_default());
         }
         if once && !messages.is_empty() {
-            return Ok(0);
+            return Ok(());
         }
     }
 }
@@ -302,32 +330,42 @@ fn plist(exe: &Path, log: &Path) -> String {
     )
 }
 
-pub fn daemon_install() -> Result<i32> {
+/// Installs the alias (printing its line) and the launchd job.
+pub fn daemon_install(exe: &Path) -> Result<i32> {
     if !cfg!(target_os = "macos") {
         eprintln!("not supported yet");
         return Ok(1);
     }
     let home = home()?;
-    println!(
-        "{}",
-        install_alias(&home, &std::env::current_exe()?.canonicalize()?)?
-    );
+    println!("{}", install_alias(&home, exe)?);
     let path = plist_path(&home);
     fs::create_dir_all(path.parent().unwrap())?;
     fs::write(
         &path,
         plist(&canonical(&home), &paths::state_dir().join("daemon.log")),
     )?;
+    // Replace any loaded job so an update restarts it: bootout (result ignored), bootstrap,
+    // and `kickstart -k` if bootstrap fails.
+    let uid = unsafe { libc::getuid() };
+    let (domain, service, file) = (
+        format!("gui/{uid}"),
+        format!("gui/{uid}/{LABEL}"),
+        path.to_string_lossy().into_owned(),
+    );
+    let sequence = format!("bootout {service}; bootstrap {domain} {file}; kickstart -k {service}");
     if use_launchctl() {
-        let target = format!("gui/{}", unsafe { libc::getuid() });
-        let file = path.to_string_lossy();
-        // `bootstrap` fails when the job is already loaded: that is fine.
-        if !launchctl(&["bootstrap", &target, &file]) && !launchctl(&["load", "-w", &file]) {
+        launchctl(&["bootout", &service]);
+        let up = launchctl(&["bootstrap", &domain, &file])
+            || launchctl(&["load", "-w", &file])
+            || launchctl(&["kickstart", "-k", &service]);
+        if !up {
             println!("launchd: could not load {}", path.display());
             return Ok(1);
         }
+        println!("launchd: {LABEL}");
+    } else {
+        println!("launchd: {LABEL} (launchctl skipped; would run: {sequence})");
     }
-    println!("launchd: {LABEL}");
     Ok(0)
 }
 
@@ -369,7 +407,7 @@ pub fn doctor() -> Result<i32> {
             .is_ok_and(|r| r["ok"] == true),
     );
     let mode = |p: &Path| fs::metadata(p).map(|m| m.permissions().mode() & 0o777).ok();
-    let dir = paths::state_dir();
+    let dir = paths::state_path();
     line("state dir", mode(&dir) == Some(0o700));
     line("socket", mode(&dir.join(paths::SOCKET)) == Some(0o600));
     for (agent, dot) in [

@@ -289,8 +289,19 @@ pub fn send(
             }
         }
     };
-    // A name address (`<member>/<name>`, no `:`) is a person's mailbox and never expires.
-    let expires = if to.0.split_once('/').is_some_and(|(_, r)| !r.contains(':')) {
+    // This member's own name address (`<member>/<name>`, the `listen --as` character rule) is a
+    // person's mailbox and never expires; any other non-session address keeps the hold.
+    let own_name = match (from.0.split_once('/'), to.0.split_once('/')) {
+        (Some((a, _)), Some((b, name))) => {
+            a == b
+                && (1..=64).contains(&name.len())
+                && name
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
+        }
+        _ => false,
+    };
+    let expires = if own_name {
         i64::MAX
     } else {
         (now + HOLD_S) as i64
@@ -609,9 +620,14 @@ mod tests {
     #[test]
     fn mail_for_a_name_address_never_expires() {
         let (_d, s) = setup();
-        send(&s, &k("a"), &k("m/bob"), "x", "r1", None, 1000).unwrap();
+        send(&s, &k("m/terminal"), &k("m/bob"), "x", "r1", None, 1000).unwrap();
+        // Another member's name, or a name outside the listen rule, keeps the 24 h hold.
+        send(&s, &k("m/terminal"), &k("n/bob"), "x", "r2", None, 1000).unwrap();
+        send(&s, &k("m/terminal"), &k("m/b ob"), "x", "r3", None, 1000).unwrap();
         expire(&s, 1000 + 100 * HOLD_S).unwrap();
         assert_eq!(state(&s, "r1"), State::Stored);
+        assert_eq!(state(&s, "r2"), State::Expired);
+        assert_eq!(state(&s, "r3"), State::Expired);
         assert_eq!(take(&s, &k("m/bob"), 1000 + 100 * HOLD_S).unwrap().len(), 1);
     }
 

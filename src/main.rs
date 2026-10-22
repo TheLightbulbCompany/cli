@@ -108,7 +108,9 @@ fn main() -> lightbulb_network::Result<()> {
     };
     match cli.command {
         Command::Version => println!("lightbulb-network {}", env!("CARGO_PKG_VERSION")),
-        Command::Daemon { install: true, .. } => exit(cli::daemon_install()?),
+        Command::Daemon { install: true, .. } => exit(cli::daemon_install(
+            &std::env::current_exe()?.canonicalize()?,
+        )?),
         Command::Daemon {
             uninstall: true, ..
         } => exit(cli::daemon_uninstall()?),
@@ -152,10 +154,11 @@ fn main() -> lightbulb_network::Result<()> {
                 println!("{}", agent.line());
             }
             if !remove {
-                println!("{}", cli::install_alias(&home, &executable)?);
-                // The launchd job needs the canonical copy `install_alias` just made.
+                // The alias line prints once; the job needs the canonical copy it makes.
                 if cfg!(target_os = "macos") {
-                    cli::daemon_install()?;
+                    exit(cli::daemon_install(&executable)?);
+                } else {
+                    println!("{}", cli::install_alias(&home, &executable)?);
                 }
             }
         }
