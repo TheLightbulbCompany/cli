@@ -75,12 +75,20 @@ impl Env {
         let log = std::fs::File::create(self.state.path().join("daemon.log")).unwrap();
         let mut c = self.base_cmd(Command::new(EXE));
         c.arg("daemon")
+            // No real dialog on the screen of whoever runs the tests: unanswered, unless a test
+            // asks for an answer (`dialog`) or a fake `osascript`.
+            .env("LIGHTBULB_CONNECT_DIALOG", "")
             .env_remove("LIGHTBULB_CONNECT_PEERS")
             .env_remove("LIGHTBULB_CONNECT_DEBUG_PROTOCOL")
             .envs(env.iter().map(|(k, v)| (k, v)))
-            .stdin(Stdio::null())
-            .stdout(log.try_clone().unwrap())
-            .stderr(log);
+            .stdin(Stdio::null());
+        if env
+            .iter()
+            .any(|(k, _)| *k == "LIGHTBULB_CONNECT_DEBUG_OSASCRIPT")
+        {
+            c.env_remove("LIGHTBULB_CONNECT_DIALOG");
+        }
+        c.stdout(log.try_clone().unwrap()).stderr(log);
         let mut child = c.spawn().unwrap();
         let ping = || {
             UnixStream::connect(self.state.path().join("sock")).is_ok_and(|mut s| {
@@ -221,7 +229,7 @@ pub fn seed_pair(a: &Env, b: &Env) -> [Entry; 2] {
         let key = other.identity().key;
         policy::set(
             &env.store(),
-            "people",
+            None,
             &key,
             policy::Verdict::Accept,
             "local",

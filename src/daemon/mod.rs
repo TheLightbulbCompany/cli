@@ -166,7 +166,7 @@ pub async fn run(dir: &Path) -> Result<()> {
 
     let latest = crate::presence::load(&store);
     let peers = net::Peers::default();
-    let (dialogs, answers) = dialog::Queue::new("/usr/bin/osascript".into());
+    let (dialogs, answers) = dialog::Queue::new(peers.knobs().osascript.clone());
     dialogs.set_knob(peers.knobs().dialog.clone());
     let daemon = Arc::new(Daemon {
         store: Mutex::new(store),

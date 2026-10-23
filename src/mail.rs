@@ -730,8 +730,16 @@ pub fn mark_read_for(store: &Store, to: &Key, now: u64) -> Result<()> {
     Ok(())
 }
 
+/// Marks message `message_id` read if it reached its recipient (`stored` or `delivered`); a
+/// `held` one changes only by its person's answer or its expiry.
 pub fn mark_read(store: &Store, message_id: &str, now: u64) -> Result<()> {
-    if let Some(m) = store.message(message_id)? {
+    let Some(m) = store.message(message_id)? else {
+        return Ok(());
+    };
+    let from = Key(m.from_key.clone());
+    let reached = receipt(store, &from, &m.request_id)?
+        .is_some_and(|r| matches!(r.state, State::Stored | State::Delivered));
+    if reached {
         advance(
             store.conn(),
             &m.from_key,
@@ -1288,7 +1296,7 @@ mod tests {
 
     /// This computer allows `peer_mail`'s person.
     fn allow_p(s: &Store) {
-        policy::set(s, "people", "pkey", Verdict::Accept, "local", 0).unwrap();
+        policy::set(s, None, "pkey", Verdict::Accept, "local", 0).unwrap();
     }
 
     #[test]

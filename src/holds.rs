@@ -166,12 +166,16 @@ pub fn by_message(store: &Store, message_id: &str) -> Result<Option<Hold>> {
     .pop())
 }
 
-/// The first 160 characters of `text` as one defanged, printable line.
+/// The first 160 characters of `text` as one printable, defanged line: what cannot be shown
+/// goes first, so nothing hidden can shield a forged prefix from `defang`.
 fn preview(text: &str) -> String {
-    defang(text)
+    let shown: String = text
+        .chars()
+        .filter(|c| matches!(c, '\n' | '\t') || label::printable(*c))
+        .collect();
+    defang(&shown)
         .chars()
         .map(|c| if matches!(c, '\n' | '\t') { ' ' } else { c })
-        .filter(|c| label::printable(*c))
         .take(160)
         .collect()
 }
@@ -191,8 +195,7 @@ fn agent(session: &str) -> String {
     }
 }
 
-/// The dialog text for `h` (and what its `approvals` record keeps).
-// ponytail: worked out again at answer time, so a roster rename in between shows in the record.
+/// The dialog text for `h`.
 pub fn text(store: &Store, roster: &Roster, me: &str, h: &Hold) -> Result<String> {
     let quote = preview(&h.message.body);
     let agent = agent(&h.target_session);
@@ -211,6 +214,46 @@ pub fn text(store: &Store, roster: &Roster, me: &str, h: &Hold) -> Result<String
     Ok(format!(
         "{who} wants to message your {agent}{folder}.\n\"{quote}\""
     ))
+}
+
+/// `h`'s dialog: its text and buttons (`Always allow` only for a cloud sender).
+pub fn dialog(
+    store: &Store,
+    roster: &Roster,
+    me: &str,
+    h: &Hold,
+) -> Result<(String, Vec<&'static str>)> {
+    let mut buttons = vec!["Decline", "Allow"];
+    if always_scope(roster, me, h).is_some() {
+        buttons.push("Always allow");
+    }
+    Ok((text(store, roster, me, h)?, buttons))
+}
+
+/// Keeps `text` as what hold `id` showed: its `approvals` row, unanswered until `answer`.
+pub fn remember_shown(store: &Store, id: i64, text: &str) -> Result<()> {
+    let record = json!({ "text": text }).to_string();
+    store.conn().execute(
+        "INSERT INTO approvals (hold_id, record) SELECT ?1, ?2 WHERE NOT EXISTS \
+         (SELECT 1 FROM approvals WHERE hold_id = ?1)",
+        params![id, record],
+    )?;
+    Ok(())
+}
+
+/// What hold `id` showed (`remember_shown`), if it was shown.
+fn shown_text(store: &Store, id: i64) -> Result<Option<String>> {
+    let record: Option<String> = store
+        .conn()
+        .query_row(
+            "SELECT record FROM approvals WHERE hold_id = ?1 AND verdict IS NULL",
+            [id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(record
+        .and_then(|r| serde_json::from_str::<Value>(&r).ok())
+        .and_then(|v| v["text"].as_str().map(String::from)))
 }
 
 /// What "Always allow" means for `h`'s sender: `OwnCloud` for my workspace's member, `CloudOf`
@@ -282,7 +325,11 @@ pub fn answer(
     if !fits {
         return Ok(Err(BAD_REQUEST));
     }
-    let shown = text(store, roster, &me.key, &h)?;
+    // The text the person saw; one never shown (no dialog yet) is what it would show now.
+    let shown = match shown_text(store, id)? {
+        Some(t) => t,
+        None => text(store, roster, &me.key, &h)?,
+    };
     let verdict = if allow { "allow" } else { "decline" };
     let tx = store.conn().unchecked_transaction()?;
     let state = if allow { "allowed" } else { "declined" };
@@ -303,12 +350,14 @@ pub fn answer(
                 None,
                 now as u64,
             )?;
-            let pid = from.map_or("", |f| f.person_id.as_str());
-            match scope {
-                Scope::Once => {}
-                Scope::Person => policy::set(store, "people", pid, Verdict::Accept, by, now)?,
-                Scope::CloudOf => policy::set(store, "cloud_of", pid, Verdict::Accept, by, now)?,
-                Scope::OwnCloud => policy::set_switch(store, true, by, now)?,
+            // `Person`, `CloudOf` and `OwnCloud` all allow the sender's person, in the table
+            // its kind reads (my own workspace's member: the switch).
+            if let (Some(f), false) = (from, scope == Scope::Once) {
+                let ws = roster
+                    .members
+                    .get(&me.key)
+                    .and_then(|m| m.workspace.as_deref());
+                policy::set(store, ws, &f.person_id, Verdict::Accept, by, now)?;
             }
         } else {
             let (f, rid) = (&m.from_key, &m.request_id);
@@ -326,6 +375,9 @@ pub fn answer(
     let mut record = json!({"hold": h.name(), "verdict": verdict, "scope": scope, "by": by,
         "nonce": nonce, "decided_at": now, "member": me.key, "text": shown});
     record["sig"] = me.sign(&record).into();
+    store
+        .conn()
+        .execute("DELETE FROM approvals WHERE hold_id = ?1", [id])?;
     store.conn().execute(
         "INSERT INTO approvals VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
@@ -390,18 +442,19 @@ pub fn expire(store: &Store, now: i64) -> Result<Vec<i64>> {
 /// The daemon's side of a new hold: subscribers get `held`, the person a dialog.
 pub fn shown(d: &Daemon, roster: &Roster, store: &Store, h: &Hold) {
     let me = &d.identity.key;
-    let Ok(text) = text(store, roster, me, h) else {
-        return;
+    let (text, buttons) = match dialog(store, roster, me, h) {
+        Ok(t) => t,
+        Err(e) => return eprintln!("hold {}: {e}", h.name()),
     };
-    let mut buttons = vec!["Decline", "Allow"];
-    if always_scope(roster, me, h).is_some() {
-        buttons.push("Always allow");
+    if let Err(e) = remember_shown(store, h.id, &text) {
+        return eprintln!("hold {}: {e}", h.name());
     }
+    // No preview: subscribers include agents.
     let _ = d
         .events
         .send(json!({"event": "held", "id": h.name(), "kind": h.kind,
         "target_session": h.target_session, "from": h.from_session,
-        "label": sender(roster, me, h), "preview": preview(&h.message.body)}));
+        "label": sender(roster, me, h)}));
     d.dialogs.show(
         &h.name(),
         dialog::args("Lightbulb Connect", &text, &buttons),
@@ -474,9 +527,9 @@ pub fn on_dialog(d: &Arc<Daemon>, n: i64, button: &str) {
 }
 
 /// The hold and policy ops: `holds`, `hold.get`, `hold.answer`, `hold.file`, `policy.get`,
-/// `policy.set` (all but `holds` and `policy.get` person-only).
+/// `policy.set` (all but `policy.get` person-only: previews are a teammate's text).
 pub fn op(id: u64, op: &str, body: &Value, d: &Arc<Daemon>, peer_pid: Option<u32>) -> Response {
-    let person = matches!(op, "hold.get" | "hold.answer" | "hold.file" | "policy.set");
+    let person = op != "policy.get";
     if person && !peer_pid.is_some_and(net_ops::person_only) {
         return refused(id, "not_a_person");
     }
@@ -567,33 +620,35 @@ fn run(id: u64, op: &str, body: &Value, d: &Arc<Daemon>) -> Result<Response> {
             }
             let team = d.team.lock().unwrap();
             let store = d.store.lock().unwrap();
-            let h = file_permission(
-                &store,
-                &session.unwrap_or_default(),
-                prompt,
-                ipc::now() as i64,
-            )?;
+            let session = session.unwrap_or_default();
+            if store.session(&session)?.is_none() {
+                return Ok(refused(id, "unknown_session"));
+            }
+            let h = file_permission(&store, &session, prompt, ipc::now() as i64)?;
             shown(d, &team.roster, &store, &h);
             Response::ok(id, json!({ "hold": h.name() }))
         }
         "policy.get" => Response::ok(id, json!(Policy::load(&d.store.lock().unwrap())?)),
-        // `policy.set {person_id, scope: people|cloud_of, value}` or
-        // `{agents_send_without_asking}` -> the policy.
+        // `policy.set {person_id, value: accept|hold|refuse}` or `{agents_send_without_asking}`
+        // -> the policy. A `ws:<id>` person is `cloud_of` (my own workspace: the switch),
+        // anyone else `people`.
         "policy.set" => {
+            let team = d.team.lock().unwrap();
             let store = d.store.lock().unwrap();
             let now = ipc::now() as i64;
             if let Some(on) = body["agents_send_without_asking"].as_bool() {
                 policy::set_switch(&store, on, "local", now)?;
             } else {
                 let value = serde_json::from_value::<Verdict>(body["value"].clone());
-                let (Some(pid), Some(scope), Ok(v)) =
-                    (body["person_id"].as_str(), body["scope"].as_str(), value)
-                else {
+                let (Some(pid), Ok(v)) = (body["person_id"].as_str(), value) else {
                     return Ok(Response::err(id, BAD_REQUEST));
                 };
-                if policy::set(&store, scope, pid, v, "local", now).is_err() {
-                    return Ok(Response::err(id, BAD_REQUEST));
-                }
+                let ws = team
+                    .roster
+                    .members
+                    .get(me)
+                    .and_then(|m| m.workspace.as_deref());
+                policy::set(&store, ws, pid, v, "local", now)?;
             }
             Response::ok(id, json!(Policy::load(&store)?))
         }

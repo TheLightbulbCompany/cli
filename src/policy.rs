@@ -1,5 +1,5 @@
-//! Whether another member's message may reach a session here: `people` (by `person_id`),
-//! `cloud_of` (by a workspace's `person_id`, for cloud members), and
+//! Whether another member's message may reach a session here: `people` (computer members'
+//! `person_id`s), `cloud_of` (a workspace's `ws:<id>`, for cloud members), and
 //! `agents_send_without_asking` (my own workspace's member). One `policy` row each.
 
 use crate::roster::{Member, MemberKind};
@@ -69,12 +69,25 @@ impl Policy {
     }
 }
 
-/// Writes `people[pid]` or `cloud_of[pid]` (`scope`) as `v`, set by `by`. `cloud_of` takes no
-/// `refuse`.
-pub fn set(store: &Store, scope: &str, pid: &str, v: Verdict, by: &str, now: i64) -> Result<()> {
-    if !matches!(scope, "people" | "cloud_of") || (scope == "cloud_of" && v == Verdict::Refuse) {
-        return Err(format!("no policy {scope} = {v:?}").into());
+/// Writes `v` for person `pid`, in the one place its kind reads: my own workspace's
+/// `ws:<my_workspace>` is the switch (on only for `accept`), another workspace's `ws:<id>` is
+/// `cloud_of`, anyone else `people`.
+pub fn set(
+    store: &Store,
+    my_workspace: Option<&str>,
+    pid: &str,
+    v: Verdict,
+    by: &str,
+    now: i64,
+) -> Result<()> {
+    if my_workspace.is_some_and(|w| pid.strip_prefix("ws:") == Some(w)) {
+        return set_switch(store, v == Verdict::Accept, by, now);
     }
+    let scope = if pid.starts_with("ws:") {
+        "cloud_of"
+    } else {
+        "people"
+    };
     let value = serde_json::to_value(v)?;
     put(
         store,
@@ -117,8 +130,8 @@ pub fn is_my_workspace(me: &Member, from: &Member) -> bool {
 }
 
 /// The verdict on member `from`'s message to a session of `me`: my own person accepts; my
-/// workspace's member follows the switch; anyone else what `people` (a cloud member: `cloud_of`,
-/// then `people`) says for its `person_id`, else hold.
+/// workspace's member follows the switch; another cloud member what `cloud_of` says for its
+/// `person_id`, a computer what `people` says; else hold.
 pub fn decide(p: &Policy, me: &Member, from: &Member) -> Verdict {
     if from.person_id == me.person_id {
         return Verdict::Accept;
@@ -129,13 +142,11 @@ pub fn decide(p: &Policy, me: &Member, from: &Member) -> Verdict {
             false => Verdict::Hold,
         };
     }
-    let pid = &from.person_id;
-    let cloud = (from.kind == MemberKind::Cloud).then(|| p.cloud_of.get(pid));
-    cloud
-        .flatten()
-        .or(p.people.get(pid))
-        .copied()
-        .unwrap_or(Verdict::Hold)
+    let table = match from.kind {
+        MemberKind::Cloud => &p.cloud_of,
+        MemberKind::Computer => &p.people,
+    };
+    table.get(&from.person_id).copied().unwrap_or(Verdict::Hold)
 }
 
 #[cfg(test)]
@@ -179,6 +190,9 @@ mod tests {
         p.cloud_of.insert("ws:w2".into(), Verdict::Accept);
         assert_eq!(decide(&p, &me, &aden), Verdict::Refuse);
         assert_eq!(decide(&p, &me, &other_ws), Verdict::Accept);
+        // Each kind reads its own table only.
+        p.people.insert("ws:w2".into(), Verdict::Refuse);
+        assert_eq!(decide(&p, &me, &other_ws), Verdict::Accept);
         p.people.insert("p-me".into(), Verdict::Refuse);
         assert_eq!(decide(&p, &me, &my_laptop), Verdict::Accept, "own person");
     }
@@ -187,14 +201,18 @@ mod tests {
     fn policy_round_trips_through_the_store() {
         let d = tempfile::tempdir().unwrap();
         let s = Store::open(&d.path().join("state.db")).unwrap();
-        set(&s, "people", "p1", Verdict::Accept, "local", 1).unwrap();
-        set(&s, "cloud_of", "ws:w", Verdict::Hold, "bridge", 1).unwrap();
-        set_switch(&s, true, "local", 1).unwrap();
-        assert!(set(&s, "cloud_of", "ws:w", Verdict::Refuse, "local", 1).is_err());
+        let mine = Some("w1");
+        set(&s, mine, "p1", Verdict::Accept, "local", 1).unwrap();
+        set(&s, mine, "ws:w", Verdict::Hold, "bridge", 1).unwrap();
+        set(&s, mine, "ws:w1", Verdict::Accept, "local", 1).unwrap();
         let p = Policy::load(&s).unwrap();
         assert_eq!(p.people["p1"], Verdict::Accept);
         assert_eq!(p.cloud_of["ws:w"], Verdict::Hold);
-        assert!(p.agents_send_without_asking);
+        assert!(!p.people.contains_key("ws:w"));
+        assert!(p.agents_send_without_asking, "my workspace is the switch");
+        assert!(!p.cloud_of.contains_key("ws:w1"));
         assert_eq!(p.set_by["cloud_of:ws:w"], "bridge");
+        set(&s, mine, "ws:w1", Verdict::Hold, "local", 2).unwrap();
+        assert!(!Policy::load(&s).unwrap().agents_send_without_asking);
     }
 }

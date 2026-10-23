@@ -25,6 +25,7 @@ use iroh::endpoint::{presets, Connection, VarInt};
 use iroh::{Endpoint, EndpointAddr, PublicKey, SecretKey};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, Notify};
@@ -59,11 +60,15 @@ pub struct Knobs {
     /// How long a join request waits for its person (600 s), or
     /// `LIGHTBULB_CONNECT_DEBUG_JOIN_WAIT_S`.
     pub join_wait: Duration,
+    /// The program dialogs run: `/usr/bin/osascript`, or `LIGHTBULB_CONNECT_DEBUG_OSASCRIPT`.
+    pub osascript: PathBuf,
     /// `LIGHTBULB_CONNECT_DEBUG_DROP_ACKS=1`: every `ack` that arrives is dropped.
     drop_acks: bool,
     /// How long the outbox keeps trying (`outbox::TTL_S`), or `LIGHTBULB_CONNECT_DEBUG_OUTBOX_S`.
     outbox_s: u64,
 }
+
+const OSASCRIPT: &str = "/usr/bin/osascript";
 
 impl Knobs {
     #[cfg(debug_assertions)]
@@ -92,6 +97,8 @@ impl Knobs {
             join_wait: var("LIGHTBULB_CONNECT_DEBUG_JOIN_WAIT_S")
                 .and_then(|v| v.parse().ok())
                 .map_or(JOIN_WAIT, Duration::from_secs),
+            osascript: var("LIGHTBULB_CONNECT_DEBUG_OSASCRIPT")
+                .map_or(OSASCRIPT.into(), Into::into),
             drop_acks: var("LIGHTBULB_CONNECT_DEBUG_DROP_ACKS").is_some_and(|v| v == "1"),
             outbox_s: var("LIGHTBULB_CONNECT_DEBUG_OUTBOX_S")
                 .and_then(|v| v.parse().ok())
@@ -107,6 +114,7 @@ impl Knobs {
             gate_pause: None,
             dialog: None,
             join_wait: JOIN_WAIT,
+            osascript: OSASCRIPT.into(),
             drop_acks: false,
             outbox_s: outbox::TTL_S,
         }

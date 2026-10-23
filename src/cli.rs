@@ -467,14 +467,14 @@ pub fn held() -> Result<i32> {
 }
 
 /// `policy [<person> accept|hold|refuse]`: lists the policy (rows the bridge set marked so),
-/// or sets `people[<person>]`.
+/// or sets `<person>` (a `ws:<id>` workspace in `cloud_of`, anyone else in `people`).
 pub fn policy(person: Option<String>, value: Option<String>) -> Result<i32> {
     let mut conn = connect()?;
     let p = match (person, value) {
         (Some(pid), Some(v)) => ask(
             &mut conn,
             "policy.set",
-            json!({"person_id": pid, "scope": "people", "value": v}),
+            json!({"person_id": pid, "value": v}),
         )?,
         (None, None) => ask(&mut conn, "policy.get", json!({}))?,
         _ => {
