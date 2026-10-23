@@ -673,12 +673,15 @@ impl Net {
         let d = &self.0.daemon;
         let mut tick = tokio::time::interval(REDIAL);
         loop {
+            // A close wins over a ready tick, so no round writes the loopback file back after
+            // `close` withdrew it.
             let changed = tokio::select! {
+                biased;
+                _ = self.0.endpoint.closed() => return,
                 _ = tick.tick() => false,
                 _ = d.peers.changed.notified() => true,
-                _ = self.0.endpoint.closed() => return,
             };
-            if d.peers.lan.get() == Some(&true) {
+            if d.peers.lan.get() == Some(&true) && !self.0.endpoint.is_closed() {
                 local::publish(&d.identity.key, d.peers.port.get().copied().unwrap_or(0));
             }
             let to_dial = self.refresh(changed);
@@ -1406,21 +1409,25 @@ mod local {
         ok.then(|| OURS.get_or_init(|| d).clone())
     }
 
-    /// `127.0.0.1:<port> <pid>`, mode 0600.
+    /// `127.0.0.1:<port> <pid>`, mode 0600, written beside it and renamed into place, so a
+    /// reader never sees it empty or half written.
     pub fn publish(key: &str, port: u16) {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
         let Some(d) = dir() else {
             return;
         };
+        let pid = std::process::id();
+        let tmp = d.join(format!(".{key}.{pid}.tmp"));
         let f = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .mode(0o600)
-            .open(d.join(key));
-        if let Ok(mut f) = f {
-            let _ = write!(f, "127.0.0.1:{port} {}", std::process::id());
+            .open(&tmp);
+        let written = f.and_then(|mut f| write!(f, "127.0.0.1:{port} {pid}"));
+        if written.is_err() || std::fs::rename(&tmp, d.join(key)).is_err() {
+            let _ = std::fs::remove_file(&tmp);
         }
     }
 
