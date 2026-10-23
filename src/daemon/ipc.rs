@@ -379,12 +379,20 @@ fn register(id: u64, body: &Value, daemon: &Daemon) -> Response {
 }
 
 /// Writes `row`, and wakes the presence sender when that changes what it publishes: a new
-/// (or revived) row, or another folder, process or executable.
+/// (or revived) row, or another folder, process, executable, status or title.
 fn put_row(daemon: &Daemon, store: &store::Store, row: &store::Session) -> crate::Result<()> {
     let old = store.session(&row.key)?;
     store.put_session(row)?;
-    let same =
-        |o: &store::Session| (&o.cwd, o.pid, &o.executable) == (&row.cwd, row.pid, &row.executable);
+    let fields = |r: &store::Session| {
+        (
+            r.cwd.clone(),
+            r.pid,
+            r.executable.clone(),
+            r.status.clone(),
+            r.title.clone(),
+        )
+    };
+    let same = |o: &store::Session| fields(o) == fields(row);
     if !old.as_ref().is_some_and(same) {
         daemon.presence.notify_one();
     }

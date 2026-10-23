@@ -115,6 +115,8 @@ pub fn who(as_json: bool, all: bool) -> Result<i32> {
                 .iter()
                 .map(|(_, f)| match *f {
                     "doing" => text("doing").or(text("title")),
+                    // A teammate's session has no folder here: its repo instead.
+                    "cwd" => text("cwd").or(text("repo")),
                     f => text(f),
                 })
                 .map(Option::unwrap_or_default)

@@ -99,8 +99,18 @@ async fn each_member_sees_the_whole_directory() {
         assert_eq!(theirs[field], want, "{field}: {theirs}");
     }
     // The query matches person, computer, agent, repo, folder and session id, any case.
-    assert_eq!(ids(&directory(&a, Some("MBP"))), vec![kb.clone()]);
-    assert_eq!(ids(&directory(&a, Some("api"))), vec![ka.clone()]);
+    // (A random member key may itself contain the query: only such an id may join.)
+    let only = |q: &str, want: &str| {
+        let got = ids(&directory(&a, Some(q)));
+        assert!(got.iter().any(|g| g == want), "{q}: {got:?}");
+        let q = q.to_lowercase();
+        assert!(
+            got.iter().all(|g| g == want || g.contains(&q)),
+            "{q}: {got:?}"
+        );
+    };
+    only("MBP", &kb);
+    only("api", &ka);
     assert!(directory(&a, Some("nothing-matches")).is_empty());
 
     // A change on B reaches A: a new session, then an ended one.

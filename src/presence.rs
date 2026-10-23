@@ -11,6 +11,7 @@ use crate::store::Store;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -196,10 +197,21 @@ pub fn for_hello(d: &Daemon) -> Frame {
         *d.built.lock().unwrap() = Some(f.clone());
         f
     });
-    if let Frame::Presence { seq, .. } = &mut f {
-        *seq = ipc::now_ms();
-    }
+    stamp(&mut f);
     f
+}
+
+/// The last `seq` sent: each send's is later, even within one millisecond.
+static LAST_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// `f`'s `seq` set to now, or just past the last sent.
+fn stamp(f: &mut Frame) {
+    if let Frame::Presence { seq, .. } = f {
+        let now = ipc::now_ms();
+        let next = |last: u64| now.max(last + 1);
+        let last = LAST_SEQ.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |l| Some(next(l)));
+        *seq = next(last.unwrap_or_else(|l| l));
+    }
 }
 
 /// The sender: on a local change (`Daemon::presence`, coalesced over 250 ms) or every 5 s,
@@ -220,7 +232,7 @@ pub async fn run(d: Arc<Daemon>) {
         }
         built_at = Some(Instant::now());
         let d2 = d.clone();
-        let Ok(f) = tokio::task::spawn_blocking(move || build(&d2, ipc::now_ms())).await else {
+        let Ok(mut f) = tokio::task::spawn_blocking(move || build(&d2, 0)).await else {
             continue;
         };
         let unchanged = d
@@ -233,6 +245,8 @@ pub async fn run(d: Arc<Daemon>) {
         if unchanged && sent_at.is_some_and(|at| at.elapsed() < RESEND) {
             continue;
         }
+        // Stamped at send, after the store: a later send (here or a hello's) carries a later seq.
+        stamp(&mut f);
         for m in d.peers.online() {
             let _ = d.peers.send(&m, f.clone());
         }
