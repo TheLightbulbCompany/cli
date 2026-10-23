@@ -3,7 +3,7 @@ use std::path::Path;
 
 /// Migration `i` takes the db to `user_version` `i + 1`. Forward only; each one only adds
 /// tables or columns, and runs once (in the transaction that moves `user_version`).
-const MIGRATIONS: &[&str] = &[V1, V2, V3];
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4];
 
 const V1: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
@@ -70,6 +70,9 @@ CREATE TABLE IF NOT EXISTS grants (grant_id TEXT PRIMARY KEY, \"grant\" TEXT, ex
 /// A session's end: its row stays a day (`presence`'s `kept`) with `ended_at` set.
 const V3: &str = "ALTER TABLE sessions ADD COLUMN ended_at INTEGER;";
 
+/// The text a hold's dialog showed, which its `approvals` record signs.
+const V4: &str = "ALTER TABLE holds ADD COLUMN shown TEXT;";
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Session {
     pub key: String,
@@ -111,6 +114,22 @@ fn row_session(r: &rusqlite::Row) -> rusqlite::Result<Session> {
         status: r.get("status")?,
         seen_at: r.get("seen_at")?,
         executable: r.get("executable")?,
+    })
+}
+
+/// A `messages` row, read by column name (so `m.*` in a join reads too).
+pub(crate) fn row_message(r: &rusqlite::Row) -> rusqlite::Result<Message> {
+    Ok(Message {
+        id: r.get("id")?,
+        request_id: r.get("request_id")?,
+        from_key: r.get("from_key")?,
+        to_key: r.get("to_key")?,
+        kind: r.get("kind")?,
+        thread: r.get("thread")?,
+        hops: r.get("hops")?,
+        origin: r.get("origin")?,
+        body: r.get("body")?,
+        sent_at: r.get("sent_at")?,
     })
 }
 
@@ -277,20 +296,7 @@ impl Store {
 
     pub fn message(&self, id: &str) -> rusqlite::Result<Option<Message>> {
         self.conn
-            .query_row("SELECT * FROM messages WHERE id = ?1", [id], |r| {
-                Ok(Message {
-                    id: r.get("id")?,
-                    request_id: r.get("request_id")?,
-                    from_key: r.get("from_key")?,
-                    to_key: r.get("to_key")?,
-                    kind: r.get("kind")?,
-                    thread: r.get("thread")?,
-                    hops: r.get("hops")?,
-                    origin: r.get("origin")?,
-                    body: r.get("body")?,
-                    sent_at: r.get("sent_at")?,
-                })
-            })
+            .query_row("SELECT * FROM messages WHERE id = ?1", [id], row_message)
             .optional()
     }
 
@@ -759,7 +765,7 @@ mod tests {
             .unwrap();
         }
         let store = Store::open(&path).unwrap();
-        assert_eq!(user_version(&path), 3);
+        assert_eq!(user_version(&path), MIGRATIONS.len() as i64);
         assert_eq!(store.sessions().unwrap().len(), 1);
         assert!(store.end_session("k", 9).unwrap());
         assert!(!store.end_session("k", 9).unwrap());

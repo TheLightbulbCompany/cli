@@ -630,13 +630,10 @@ fn receive(d: &Arc<Daemon>, key: &str, env: &Frame, tx: &mpsc::UnboundedSender<F
     let short = &peer.short;
     let store = d.store.lock().unwrap();
     let me = &d.identity.short;
-    let fresh = matches!(store.seen_state(&peer.key, id), Ok(None));
     match mail::receive(&store, env, peer, &team.roster, me, ipc::now()) {
-        Ok((state, reason)) => {
-            if fresh && state == State::Held {
-                if let Ok(Some(h)) = holds::by_message(&store, id) {
-                    holds::shown(d, &team.roster, &store, &h);
-                }
+        Ok((state, reason, held)) => {
+            if let Some(h) = held {
+                holds::shown(d, &team.roster, &store, &h);
             }
             eprintln!("net: envelope {id} from {short}: {}", state.name());
             let _ = tx.send(Frame::Ack {

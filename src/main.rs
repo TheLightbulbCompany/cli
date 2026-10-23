@@ -198,14 +198,8 @@ fn main() -> lightbulb_connect::Result<()> {
         Command::Remove { name } => exit(cli::remove(&name)?),
         Command::Leave => exit(cli::leave()?),
         Command::Join { link, name } => exit(cli::join(&link, name)?),
-        Command::Approve { request, always } if request.starts_with('H') => {
-            exit(cli::answer_hold(&request, true, always)?)
-        }
-        Command::Approve { request, .. } => exit(cli::answer_join(&request, true)?),
-        Command::Decline { request } if request.starts_with('H') => {
-            exit(cli::answer_hold(&request, false, false)?)
-        }
-        Command::Decline { request } => exit(cli::answer_join(&request, false)?),
+        Command::Approve { request, always } => exit(cli::answer(&request, true, always)?),
+        Command::Decline { request } => exit(cli::answer(&request, false, false)?),
         Command::Held => exit(cli::held()?),
         Command::Policy { person, value } => exit(cli::policy(person, value)?),
         Command::External(args) => exit(cli::forward(args)?),

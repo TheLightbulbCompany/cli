@@ -227,15 +227,8 @@ pub fn seed_pair(a: &Env, b: &Env) -> [Entry; 2] {
     let seeded = seed_team(a, b);
     for (env, other) in [(a, b), (b, a)] {
         let key = other.identity().key;
-        policy::set(
-            &env.store(),
-            None,
-            &key,
-            policy::Verdict::Accept,
-            "local",
-            1,
-        )
-        .unwrap();
+        let accept = policy::Verdict::Accept;
+        policy::set_person(&env.store(), &key, accept, "local", 1).unwrap();
     }
     seeded
 }

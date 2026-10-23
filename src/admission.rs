@@ -69,10 +69,6 @@ fn words(v: Verdict) -> (&'static str, &'static str) {
 }
 
 /// `J<n>`'s `n`.
-fn parse_jid(id: &str) -> Option<i64> {
-    id.strip_prefix('J')?.parse().ok()
-}
-
 /// A request waiting for its person, and the connection task to tell.
 pub struct Pending {
     req: Request,
@@ -403,21 +399,18 @@ async fn tell(
     conn.close(VarInt::from_u32(0), b"");
 }
 
-/// Routes the person's dialog answers by id: `J<n>` to admission, `H<n>` to holds. `None` (gave up, no GUI)
-/// leaves the request waiting for `approve`/`decline` until its candidate gives up.
+/// Routes the person's dialog answers by id: `J<n>` to admission, `H<n>` to holds. `None`
+/// (gave up, no GUI) leaves the request waiting for `approve`/`decline` until its candidate gives up.
 pub async fn route(d: Arc<Daemon>) {
     let Some(mut answers) = d.dialog_answers.lock().unwrap().take() else {
         return;
     };
     while let Some((id, button)) = answers.recv().await {
-        if let Some(n) = parse_jid(&id) {
-            if let Some(b) = button {
-                answer(&d, n, b == "Allow");
-            }
-        } else if let Some(n) = crate::holds::parse_id(&id) {
-            if let Some(b) = button {
-                crate::holds::on_dialog(&d, n, &b);
-            }
+        let Some(b) = button else { continue };
+        if let Some(n) = dialog::number(&id, 'J') {
+            answer(&d, n, b == "Allow");
+        } else if let Some(n) = dialog::number(&id, 'H') {
+            crate::holds::on_dialog(&d, n, &b);
         } else {
             eprintln!("dialog {id}: nothing waits for it");
         }
@@ -450,7 +443,10 @@ pub fn admit_op(id: u64, body: &Value, d: &Daemon) -> Response {
         Some("decline") => false,
         _ => return Response::err(id, BAD_REQUEST),
     };
-    let Some(n) = body["request"].as_str().and_then(parse_jid) else {
+    let Some(n) = body["request"]
+        .as_str()
+        .and_then(|r| dialog::number(r, 'J'))
+    else {
         return Response::err(id, BAD_REQUEST);
     };
     match answer(d, n, allow) {

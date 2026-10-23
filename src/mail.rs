@@ -1,7 +1,7 @@
 //! Messages, the mailbox, receipts and the loop limit. Time is passed in (`now`, unix seconds).
 
 use crate::net::frames::Frame;
-use crate::policy::{self, Policy, Verdict};
+use crate::policy::{self, Verdict};
 use crate::roster::{Member, MemberKind, Roster};
 use crate::sessions::{self, Key};
 use crate::store::{Message, Store, MSG_RECEIPT};
@@ -439,7 +439,7 @@ pub(crate) fn put(store: &Store, p: &Prepared, origin: Origin, state: State) -> 
 fn answered(store: &Store, p: &Prepared) -> Result<()> {
     if let Some(pid) = &p.reply_to {
         if store.message(pid)?.is_some_and(|m| m.to_key == p.from.0) {
-            mark_read(store, pid, p.sent_at as u64)?;
+            mark_read(store, pid)?;
         }
     }
     Ok(())
@@ -513,7 +513,7 @@ pub fn receive(
     roster: &Roster,
     me: &str,
     now: u64,
-) -> Result<(State, Option<String>)> {
+) -> Result<(State, Option<String>, Option<crate::holds::Hold>)> {
     let Frame::Envelope {
         id,
         request_id,
@@ -530,7 +530,7 @@ pub fn receive(
     else {
         return Err("not an envelope".into());
     };
-    let refused = |r: &str| Ok((State::Refused, Some(r.to_string())));
+    let refused = |r: &str| Ok((State::Refused, Some(r.to_string()), None));
     let address = |a: &str| sessions::qualify("", a).as_deref() == Some(a);
     let ulid = |a: &str| ulid::Ulid::from_string(a).is_ok();
     if !address(from) || sessions::member_of(from) != Some(peer.short.as_str()) {
@@ -555,7 +555,7 @@ pub fn receive(
         return refused("not_member");
     }
     if let Some((state, reason)) = store.seen_state(&peer.key, id)? {
-        return Ok((State::parse(&state)?, reason));
+        return Ok((State::parse(&state)?, reason, None));
     }
     if let Some((old_to, old_body)) = store.sent_as(from, request_id)? {
         if old_to != *to || old_body != *body {
@@ -564,7 +564,7 @@ pub fn receive(
         // The same message under another envelope id: where it is now.
         let sender = Key(from.clone());
         let r = receipt(store, &sender, request_id)?.ok_or("message without a receipt")?;
-        return Ok((r.state, r.reason));
+        return Ok((r.state, r.reason, None));
     }
     // An answer to (or in the thread of) a message this computer sent is at least one hop
     // past it, whatever `hops` the peer claims; only a person (`/terminal`, fenced by the
@@ -587,7 +587,7 @@ pub fn receive(
     }
     // Not in my own roster (removed): nothing is mine to accept.
     let verdict = match roster.by_short(me) {
-        Some(mine) => policy::decide(&Policy::load(store)?, mine, peer),
+        Some(mine) => policy::decide(store, roster, &mine.key, peer)?,
         None => Verdict::Hold,
     };
     if verdict == Verdict::Refuse {
@@ -607,16 +607,16 @@ pub fn receive(
     };
     let tx = store.conn().unchecked_transaction()?;
     // Seen with what the sender is told, so a resend makes no second hold or copy.
-    let state = if verdict == Verdict::Hold {
-        crate::holds::hold(store, &p, &peer.key, now as i64)?;
-        State::Held
+    let (state, held) = if verdict == Verdict::Hold {
+        let h = crate::holds::hold(store, &p, peer, now as i64)?;
+        (State::Held, Some(h))
     } else {
         record(store, &p, Origin::Net(&peer.short), false)?;
-        State::Stored
+        (State::Stored, None)
     };
     store.put_seen(&peer.key, id, state.name(), now as i64)?;
     tx.commit()?;
-    Ok((state, None))
+    Ok((state, None, held))
 }
 
 /// Whether `member`'s latest presence names `address` among its sessions, `known` or `kept`
@@ -730,25 +730,15 @@ pub fn mark_read_for(store: &Store, to: &Key, now: u64) -> Result<()> {
     Ok(())
 }
 
-/// Marks message `message_id` read if it reached its recipient (`stored` or `delivered`); a
-/// `held` one changes only by its person's answer or its expiry.
-pub fn mark_read(store: &Store, message_id: &str, now: u64) -> Result<()> {
-    let Some(m) = store.message(message_id)? else {
-        return Ok(());
-    };
-    let from = Key(m.from_key.clone());
-    let reached = receipt(store, &from, &m.request_id)?
-        .is_some_and(|r| matches!(r.state, State::Stored | State::Delivered));
-    if reached {
-        advance(
-            store.conn(),
-            &m.from_key,
-            &m.request_id,
-            State::Read,
-            None,
-            now,
-        )?;
-    }
+/// Marks message `message_id` read if it reached its recipient (`stored` or `delivered`): a
+/// `held` receipt moves only by its person's answer or its expiry (`holds`).
+pub fn mark_read(store: &Store, message_id: &str) -> Result<()> {
+    // `updated_at` stays the delivery time: the hops trigger window runs on it.
+    store.conn().execute(
+        "UPDATE receipts SET state = 'read' WHERE state IN ('stored', 'delivered') \
+         AND (from_key, request_id) = (SELECT from_key, request_id FROM messages WHERE id = ?1)",
+        [message_id],
+    )?;
     Ok(())
 }
 
@@ -1217,7 +1207,7 @@ mod tests {
         let (_d, s) = setup();
         send(&s, &k("a"), Some(&k("b")), "x", "r1", None, 1).unwrap();
         take(&s, &k("b"), 100).unwrap();
-        mark_read(&s, &thread_hops(&s, "r1").0, 150).unwrap();
+        mark_read(&s, &thread_hops(&s, "r1").0).unwrap();
         send(
             &s,
             &k("b"),
@@ -1296,7 +1286,7 @@ mod tests {
 
     /// This computer allows `peer_mail`'s person.
     fn allow_p(s: &Store) {
-        policy::set(s, None, "pkey", Verdict::Accept, "local", 0).unwrap();
+        policy::set_person(s, "pkey", Verdict::Accept, "local", 0).unwrap();
     }
 
     #[test]
@@ -1306,7 +1296,7 @@ mod tests {
         for (i, to) in ["m/terminal", "m/codex:c"].iter().enumerate() {
             let (peer, roster, env) = peer_mail(to, &format!("r{i}"));
             let got = receive(&s, &env, &peer, &roster, "m", 1000).unwrap();
-            assert_eq!(got, (State::Stored, None));
+            assert_eq!(got, (State::Stored, None, None));
         }
         let later = 1000 + 100 * HOLD_S;
         expire(&s, later).unwrap();
@@ -1330,12 +1320,12 @@ mod tests {
             1000,
         )
         .unwrap();
-        assert_eq!(again(), (State::Refused, Some("declined".into())));
+        assert_eq!(again(), (State::Refused, Some("declined".into()), None));
         // With its message and receipt rows gone, what the sender was told stands.
         s.conn()
             .execute_batch("DELETE FROM messages; DELETE FROM receipts; DELETE FROM mailbox;")
             .unwrap();
-        assert_eq!(again(), (State::Stored, None));
+        assert_eq!(again(), (State::Stored, None, None));
         assert_eq!(
             unread(&s, &k("m/codex:c"), 1001).unwrap(),
             0,
@@ -1364,7 +1354,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        mark_read(&s, &a_id, 4).unwrap();
+        mark_read(&s, &a_id).unwrap();
         let got = |f: &str| receipt(&s, &k(f), "req-1").unwrap().unwrap().state;
         assert_eq!((got("a"), got("b")), (State::Read, State::Delivered));
         assert!(receipt(&s, &k("c"), "req-1").unwrap().is_none());

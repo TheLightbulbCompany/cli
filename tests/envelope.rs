@@ -38,10 +38,21 @@ fn admit(e: &Env, founder: &Identity, parent: &Entry, who: &Identity, cloud: boo
         body["proof"] = json!("p");
         body["person_id"] = json!(format!("ws:{}", who.key));
     }
-    let entry = Entry::signed(founder, vec![parent.hash()], Kind::Admit, body.clone(), 3);
-    assert!(roster::accept(&e.store(), &entry, 10).unwrap());
-    let (pid, accept) = (body["person_id"].as_str().unwrap(), policy::Verdict::Accept);
-    policy::set(&e.store(), None, pid, accept, "local", 1).unwrap();
+    let entry = Entry::signed(founder, vec![parent.hash()], Kind::Admit, body, 3);
+    let store = e.store();
+    assert!(roster::accept(&store, &entry, 10).unwrap());
+    let r = roster::replay(&roster::entries(&store).unwrap());
+    let accept = policy::Verdict::Accept;
+    policy::set(
+        &store,
+        &r,
+        &e.identity().key,
+        &r.members[&who.key],
+        accept,
+        "local",
+        1,
+    )
+    .unwrap();
     entry
 }
 

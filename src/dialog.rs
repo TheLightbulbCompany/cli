@@ -49,6 +49,11 @@ pub fn args(title: &str, text: &str, buttons: &[&str]) -> Vec<String> {
     a
 }
 
+/// Dialog id `<prefix><n>`'s `n` (`J` a join request, `H` a hold).
+pub fn number(id: &str, prefix: char) -> Option<i64> {
+    id.strip_prefix(prefix)?.parse().ok()
+}
+
 /// The button `osascript` printed, or `None` (gave up, or nothing we can read).
 fn answer_of(out: &str) -> Option<String> {
     if out.contains("gave up:true") {

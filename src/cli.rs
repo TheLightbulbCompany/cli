@@ -387,21 +387,41 @@ pub fn join(link: &str, name: Option<String>) -> Result<i32> {
     Ok(1)
 }
 
-/// `approve J<n>` / `decline J<n>`: answers a join request.
-pub fn answer_join(request: &str, allow: bool) -> Result<i32> {
-    let r = connect()?.call(
-        "team.admit",
-        json!({"request": request, "verdict": if allow { "allow" } else { "decline" }}),
-    )?;
+/// `approve <id> [--always]` / `decline <id>`: answers join request `J<n>` or held message
+/// `H<n>`. `--always` (a held message from a cloud member) covers the sender's workspace.
+pub fn answer(request: &str, allow: bool, always: bool) -> Result<i32> {
+    let held = request.starts_with('H');
+    let verdict = if allow { "allow" } else { "decline" };
+    let (op, body, what, gone) = if held {
+        let scope = always.then_some("always");
+        let body = json!({"hold": request, "verdict": verdict, "scope": scope});
+        (
+            "hold.answer",
+            body,
+            "held message",
+            "answered or has expired",
+        )
+    } else {
+        let body = json!({"request": request, "verdict": verdict});
+        ("team.admit", body, "join request", "answered or withdrawn")
+    };
+    let r = connect()?.call(op, body)?;
     if r["ok"] != true {
+        let always_text = "--always is only for messages from a cloud member's agents.";
         let texts = [
             (
                 admission::NOT_OPEN,
-                format!("{request} was already answered or withdrawn."),
+                format!("{request} was already {gone}."),
             ),
-            (ipc::NOT_FOUND, format!("No join request {request}.")),
+            (ipc::NOT_FOUND, format!("No {what} {request}.")),
+            (ipc::BAD_REQUEST, always_text.into()),
         ];
-        return refuse(&r, &texts, if allow { "approve" } else { "decline" });
+        let texts = &texts[..if held { 3 } else { 2 }];
+        return refuse(&r, texts, if allow { "approve" } else { "decline" });
+    }
+    if held {
+        println!("{} {request}.", if allow { "Allowed" } else { "Declined" });
+        return Ok(0);
     }
     let name = r["name"].as_str().unwrap_or_default();
     match r["state"].as_str() {
@@ -415,38 +435,6 @@ pub fn answer_join(request: &str, allow: bool) -> Result<i32> {
             return Ok(1);
         }
     }
-    Ok(0)
-}
-
-/// `approve H<n> [--always]` / `decline H<n>`: answers a held message. `--always` covers the
-/// sender's workspace (`own_cloud` or `cloud_of`, as `hold.get` says), cloud members only.
-pub fn answer_hold(hold: &str, allow: bool, always: bool) -> Result<i32> {
-    let mut conn = connect()?;
-    let mut scope = Value::Null;
-    if always {
-        let h = conn.call("hold.get", json!({ "hold": hold }))?;
-        scope = h["always"].clone();
-        if h["ok"] == true && scope.is_null() {
-            eprintln!("--always is only for messages from a cloud member's agents.");
-            return Ok(1);
-        }
-    }
-    let verdict = if allow { "allow" } else { "decline" };
-    let r = conn.call(
-        "hold.answer",
-        json!({"hold": hold, "verdict": verdict, "scope": scope}),
-    )?;
-    if r["ok"] != true {
-        let texts = [
-            (
-                admission::NOT_OPEN,
-                format!("{hold} was already answered or has expired."),
-            ),
-            (ipc::NOT_FOUND, format!("No held message {hold}.")),
-        ];
-        return refuse(&r, &texts, if allow { "approve" } else { "decline" });
-    }
-    println!("{} {hold}.", if allow { "Allowed" } else { "Declined" });
     Ok(0)
 }
 
