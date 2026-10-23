@@ -456,13 +456,13 @@ fn the_server_advertises_its_installed_name() {
 fn send_message_with_reply_to_alone_answers_the_sender() {
     let net = Net::new();
     let key = net.register("claude", "c1", &me());
-    // The person at this computer's terminal: a reply under another prefix would leave it.
+    // A name mailbox on this computer: a reply under another prefix would leave it.
     let short = net.call(json!({"id": 1, "op": "status"}))["member_key_short"]
         .as_str()
         .unwrap()
         .to_string();
-    let terminal = format!("{short}/terminal");
-    net.send(&terminal, &key, "question", "q1");
+    let desk = format!("{short}/desk");
+    net.send(&desk, &key, "question", "q1");
     let mut m = net.mcp(&me());
     assert!(!m.tool("check_inbox", json!({})).error);
     let out = m.tool(
@@ -470,10 +470,10 @@ fn send_message_with_reply_to_alone_answers_the_sender() {
         json!({"request_id": "a1", "text": "answer", "reply_to": "q1"}),
     );
     assert!(!out.error, "{}", out.text);
-    let r = net.call(json!({"id": 1, "op": "inbox", "key": terminal}));
+    let r = net.call(json!({"id": 1, "op": "inbox", "key": desk}));
     assert_eq!(r["messages"][0]["text"], "answer", "{r}");
     // Answering it marked the question read.
-    let r = net.call(json!({"id": 1, "op": "receipt", "from": terminal, "request_id": "q1"}));
+    let r = net.call(json!({"id": 1, "op": "receipt", "from": desk, "request_id": "q1"}));
     assert_eq!(r["receipt"]["state"], "read", "{r}");
     // Neither a recipient nor a reply_to: refused.
     let out = m.tool("send_message", json!({"request_id": "a2", "text": "t"}));

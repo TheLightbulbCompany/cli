@@ -471,6 +471,7 @@ pub fn receive(
         kind,
         from,
         to,
+        reply_to,
         thread,
         hops,
         body,
@@ -495,6 +496,9 @@ pub fn receive(
         || body.len() > MAX_TEXT
         || !sessions::word(request_id, MAX_REQUEST_ID)
         || ulid::Ulid::from_string(id).is_err()
+        || thread
+            .as_deref()
+            .is_some_and(|t| ulid::Ulid::from_string(t).is_err())
     {
         return refused("unsupported");
     }
@@ -530,7 +534,17 @@ pub fn receive(
         let r = receipt(store, &sender, request_id)?.ok_or("message without a receipt")?;
         return Ok((r.state, r.reason));
     }
-    if i64::from(*hops) >= MAX_HOPS {
+    // An answer to (or in the thread of) a message this computer sent is at least one hop
+    // past it, whatever `hops` the peer claims; only a person (`/terminal`, fenced by the
+    // sending daemon) starts again at 0.
+    let person = sessions::split_addr(from).is_some_and(|(_, rest)| rest == "terminal");
+    let floor: Option<i64> = conn.query_row(
+        "SELECT MAX(hops) + 1 FROM messages WHERE id IN (?1, ?2) AND origin = 'local'",
+        params![reply_to, thread],
+        |r| r.get(0),
+    )?;
+    let hops = i64::from(*hops);
+    if hops >= MAX_HOPS || floor.is_some_and(|f| hops < f && !person) {
         return refused("loop");
     }
     let since = now.saturating_sub(LOOP_WINDOW_S) as i64;
@@ -565,15 +579,25 @@ pub fn receive(
         to_key: to.clone(),
         kind: kind.clone(),
         thread: Some(thread.clone().unwrap_or_else(|| id.clone())),
-        hops: i64::from(*hops),
+        hops,
         origin: Some(format!("net:{}", peer.short)),
         body: body.clone(),
         sent_at: now as i64,
     })?;
+    // A name address (this person's terminal or `listen --as` mailbox) never expires; a
+    // session's mail keeps the hold.
+    let named = sessions::split_addr(to).is_some_and(|(_, rest)| !rest.contains(':'));
+    let expires = if named {
+        i64::MAX
+    } else {
+        (now + HOLD_S) as i64
+    };
     tx.execute(
         "INSERT INTO mailbox (to_key, message_id, queued_at, expires_at) VALUES (?1, ?2, ?3, ?4)",
-        params![to, id, now as i64, (now + HOLD_S) as i64],
+        params![to, id, now as i64, expires],
     )?;
+    // ponytail: only accepted envelopes are seen; Task 9 must record `held` and
+    // `refused declined` here too (with their reason), so a resend cannot make a second hold.
     tx.execute(
         "INSERT INTO seen_ids VALUES (?1, ?2, 'stored', ?3)",
         params![peer.key, id, now as i64],
@@ -1214,6 +1238,45 @@ mod tests {
         take(&s, &k("b"), 1000).unwrap();
         send(&s, &k("b"), Some(&k("c")), "y", "r2", None, 1500).unwrap();
         assert_eq!(thread_hops(&s, "r2").2, 1);
+    }
+
+    #[test]
+    fn a_peers_mail_to_a_name_address_never_expires() {
+        let (_d, s) = setup();
+        let peer = Member {
+            key: "pkey".into(),
+            short: "p".into(),
+            name: "aden".into(),
+            computer: "mbp".into(),
+            person_id: "pkey".into(),
+            role: crate::roster::Role::Member,
+            kind: MemberKind::Computer,
+            admitted_at: 0,
+            proof: None,
+        };
+        let mut roster = Roster::default();
+        roster.members.insert(peer.key.clone(), peer.clone());
+        for (i, to) in ["m/terminal", "m/codex:c"].iter().enumerate() {
+            let env = Frame::Envelope {
+                id: ulid::Ulid::generate().to_string(),
+                request_id: format!("r{i}"),
+                kind: "message".into(),
+                from: "p/codex:a".into(),
+                to: to.to_string(),
+                reply_to: None,
+                thread: None,
+                hops: 0,
+                body: "x".into(),
+                files: vec![],
+                sent_at: 0,
+            };
+            let got = receive(&s, &env, &peer, &roster, "m", 1000).unwrap();
+            assert_eq!(got, (State::Stored, None));
+        }
+        let later = 1000 + 100 * HOLD_S;
+        expire(&s, later).unwrap();
+        assert_eq!(waiting(&s, &k("m/terminal"), later).unwrap().len(), 1);
+        assert!(waiting(&s, &k("m/codex:c"), later).unwrap().is_empty());
     }
 
     #[test]

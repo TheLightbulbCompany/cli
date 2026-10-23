@@ -288,10 +288,8 @@ async fn off_folder_sessions_are_not_published() {
     // Ended with mail waiting: the open one is `known`, the off-folder one nowhere.
     for c in ["o2", "h1"] {
         let to = format!("{sa}/codex:{c}");
-        let r = a.ask(
-            json!({"id": 1, "op": "send", "from": format!("{sa}/terminal"),
-            "to": to, "text": "x", "request_id": format!("r-{c}")}),
-        );
+        let r = a.ask(json!({"id": 1, "op": "send", "from": format!("{sa}/desk"),
+            "to": to, "text": "x", "request_id": format!("r-{c}")}));
         assert_eq!(r["receipt"]["state"], "stored", "{r}");
         let r = a.ask(json!({"id": 1, "op": "end", "key": to}));
         assert_eq!(r["ended"], true, "{r}");

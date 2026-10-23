@@ -13,8 +13,9 @@ use rusqlite::{params, OptionalExtension};
 
 /// How long a message waits for its member.
 pub const TTL_S: u64 = 86_400;
-/// How long a row is kept after a terminal state, and `seen_ids` after arrival.
-const KEEP_S: u64 = 7 * 86_400;
+/// How long a row is kept after a terminal state, and `seen_ids` after arrival: past
+/// `HELD_S`, so a hold answered on its last day still finds its binding.
+const KEEP_S: u64 = mail::HELD_S + 86_400;
 
 /// The rows of messages still `queued`, by receipt.
 const QUEUED: &str = "FROM outbox o JOIN messages m ON m.id = o.message_id \
@@ -146,6 +147,11 @@ pub fn expire(store: &Store, now: u64, ttl: u64) -> Result<()> {
         ),
         [before],
     )?;
+    // Whatever its state (a receipt may be lost on the way): gone once no answer can come.
+    tx.execute(
+        "DELETE FROM outbox WHERE created_at < ?1",
+        [now.saturating_sub(mail::HELD_S + KEEP_S) as i64],
+    )?;
     tx.execute("DELETE FROM seen_ids WHERE seen_at < ?1", [before])?;
     tx.execute(
         "DELETE FROM receipt_out WHERE NOT EXISTS (SELECT 1 FROM seen_ids s \
@@ -252,6 +258,19 @@ mod tests {
         expire(&s, 103 + KEEP_S, TTL_S).unwrap();
         assert!(bound(&s, &id, "b").unwrap());
         expire(&s, 104 + KEEP_S, TTL_S).unwrap();
+        assert!(!bound(&s, &id, "b").unwrap());
+    }
+
+    #[test]
+    fn a_row_left_at_delivered_is_dropped_once_no_answer_can_come() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("state.db")).unwrap();
+        let id = queue(&s, 100);
+        acked(&s, "b", &id, State::Delivered, None, 101).unwrap();
+        let end = 100 + mail::HELD_S + KEEP_S;
+        expire(&s, end, TTL_S).unwrap();
+        assert!(bound(&s, &id, "b").unwrap());
+        expire(&s, end + 1, TTL_S).unwrap();
         assert!(!bound(&s, &id, "b").unwrap());
     }
 

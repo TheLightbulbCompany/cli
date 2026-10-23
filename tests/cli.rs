@@ -7,9 +7,21 @@ use std::process::{Command, Output, Stdio};
 
 mod common;
 
-use common::{err, out, Env};
+use common::{err, out, Env, EXE};
 
 impl Env {
+    /// `lightbulb-network args` as a person at a terminal: detached (so no agent the tests run
+    /// under is above it, which the daemon checks for `<member>/terminal` sends) under a
+    /// program that is neither a shell nor an agent (`perl`), where the CLI's own walk stops.
+    fn person(&self, args: &[&str]) -> Output {
+        let run = "exit(system(@ARGV) >> 8)";
+        let argv: Vec<&str> = ["/usr/bin/perl", "-e", run, EXE]
+            .into_iter()
+            .chain(args.iter().copied())
+            .collect();
+        self.detached(&argv, "")
+    }
+
     fn cmd(&self, args: &[&str]) -> Command {
         let mut c = Command::new(env!("CARGO_BIN_EXE_lightbulb-network"));
         c.args(args)
@@ -65,7 +77,7 @@ fn who_lists_a_registered_session() {
 fn send_from_terminal_to_a_session_prints_stored() {
     let e = Env::new();
     let key = e.session();
-    let o = e.run(&["send", &key, "hello", "there", "--request-id", "r1"]);
+    let o = e.person(&["send", &key, "hello", "there", "--request-id", "r1"]);
     assert!(o.status.success(), "{}", err(&o));
     assert_eq!(out(&o).trim(), "stored r1");
     // The sender was this terminal's name address, and the text kept its spaces.
@@ -74,7 +86,7 @@ fn send_from_terminal_to_a_session_prints_stored() {
     let m = e.ask(json!({"id": 2, "op": "inbox", "key": key}));
     assert_eq!(m["messages"][0]["text"], "hello there");
     // A group from a terminal goes to every live session, one line each.
-    let o = e.run(&["send", "*", "all hands"]);
+    let o = e.person(&["send", "*", "all hands"]);
     let text = out(&o);
     assert_eq!(text.lines().count(), 1, "{text}{}", err(&o));
     assert!(text.starts_with("stored ") && text.trim_end().ends_with(&key));
@@ -125,7 +137,7 @@ fn receipt_prints_the_state() {
     let e = Env::new();
     let key = e.session();
     assert!(e
-        .run(&["send", &key, "hi", "--request-id", "rc1"])
+        .person(&["send", &key, "hi", "--request-id", "rc1"])
         .status
         .success());
     let o = e.run(&["receipt", "rc1"]);
@@ -149,7 +161,7 @@ fn listen_receives_a_message_addressed_to_the_name() {
         .spawn()
         .unwrap();
     // Mail sent before or after the listener attaches both arrive (names never expire).
-    assert!(e.run(&["send", &to, "ping bob"]).status.success());
+    assert!(e.person(&["send", &to, "ping bob"]).status.success());
     // The framed text is several lines: read until the body shows.
     let mut line = String::new();
     let mut lines = BufReader::new(child.stdout.take().unwrap());
@@ -163,7 +175,7 @@ fn listen_receives_a_message_addressed_to_the_name() {
 fn send_to_a_bare_name_reaches_listen() {
     let e = Env::new();
     e.session();
-    let o = e.run(&["send", "carol", "bare hello", "--request-id", "b1"]);
+    let o = e.person(&["send", "carol", "bare hello", "--request-id", "b1"]);
     assert_eq!(out(&o).trim(), "stored b1", "{}", err(&o));
     let o = e.run(&["listen", "--as", "carol", "--once"]);
     assert!(out(&o).contains("bare hello"), "{}", err(&o));
@@ -175,7 +187,7 @@ fn listen_once_prints_a_framed_message() {
     e.session();
     let to = format!("{}/ann", e.short());
     assert!(e
-        .run(&["send", &to, "first", "--request-id", "q1"])
+        .person(&["send", &to, "first", "--request-id", "q1"])
         .status
         .success());
     let o = e.run(&["listen", "--as", "ann", "--once"]);
@@ -306,7 +318,7 @@ fn doctor_reports_a_foreign_alias_as_not_ours_not_missing() {
 fn the_frame_names_the_terminal_and_name_senders() {
     let e = Env::new();
     let key = e.session();
-    assert!(e.run(&["send", &key, "from me"]).status.success());
+    assert!(e.person(&["send", &key, "from me"]).status.success());
     let m = e.ask(json!({"id": 1, "op": "inbox", "key": key}));
     let framed = m["messages"][0]["framed"].as_str().unwrap().to_string();
     assert!(

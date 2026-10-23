@@ -219,7 +219,10 @@ async fn tell(daemon: &Daemon, leave: Entry) -> bool {
         if sent.iter().any(|k| !online.contains(k)) {
             return true;
         }
-        for k in online.difference(&sent.clone()) {
+        for k in &online {
+            if sent.contains(k) {
+                continue;
+            }
             if daemon.peers.send(k, frame.clone()).is_ok() {
                 sent.insert(k.clone());
             }

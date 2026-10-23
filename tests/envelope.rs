@@ -384,12 +384,12 @@ async fn cloud_envelope_from_an_unadvertised_session_is_refused() {
     let ep = endpoint(&c).await;
     let mut p = Peer::dial(&ep, &a).await;
     p.hello(vec![]).await;
-    let friday = format!("{}/friday", c.short);
+    let (friday, atlas) = (format!("{}/friday", c.short), format!("{}/atlas", c.short));
     p.send(&Frame::Presence {
         member: c.key.clone(),
         seq: now_ms(),
         sessions: vec![],
-        known: vec![friday.clone()],
+        known: vec![friday.clone(), atlas.clone()],
         kept: vec![],
     })
     .await;
@@ -402,6 +402,18 @@ async fn cloud_envelope_from_an_unadvertised_session_is_refused() {
     p.send(&envelope(&id, "r2", &friday, &to, "hi")).await;
     assert_eq!(p.ack(&id).await.0, "stored");
     assert_eq!(take_one(&a, &to)["from"], friday.as_str());
+    // A cloud member's principal is the sending session: friday's 13th in ten minutes is a
+    // loop, atlas still gets through.
+    for i in 1..13 {
+        let id = ulid();
+        p.send(&envelope(&id, &format!("f{i}"), &friday, &to, "x"))
+            .await;
+        let want = if i < 12 { "stored" } else { "refused" };
+        assert_eq!(p.ack(&id).await.0, want, "send {i}");
+    }
+    let id = ulid();
+    p.send(&envelope(&id, "a1", &atlas, &to, "x")).await;
+    assert_eq!(p.ack(&id).await.0, "stored");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -445,11 +457,15 @@ async fn fourth_hop_and_thirteenth_send_are_refused_loop() {
     // With reply_to: hops 0, 1, 2, 3 go; the fourth agent reply is refused.
     let (sa, sb) = (session(&a, "a1"), session(&b, "b1"));
     send(&a, &sa, &sb, "h0", "h0", None);
-    let ends = [(&b, &sb, &a, &sa), (&a, &sa, &b, &sb)];
+    let ends = [(&b, &sb, &sa), (&a, &sa, &sb)];
+    let mut first = String::new(); // A's first message, by id
     for hop in 1..=4 {
-        let (me, at, other, there) = ends[(hop - 1) % 2];
+        let (me, at, there) = ends[(hop - 1) % 2];
         let m = take_one(me, at);
         assert_eq!(m["hops"], hop - 1);
+        if hop == 1 {
+            first = m["id"].as_str().unwrap().into();
+        }
         let rid = format!("h{hop}");
         let r = send(
             me,
@@ -467,7 +483,6 @@ async fn fourth_hop_and_thirteenth_send_are_refused_loop() {
                 (Some("refused"), Some("loop"))
             );
         }
-        let _ = other;
     }
 
     // A forward chain without reply_to, through new sessions each time.
@@ -513,6 +528,19 @@ async fn fourth_hop_and_thirteenth_send_are_refused_loop() {
     }
     p.send(&f).await;
     assert_eq!(p.ack(&id).await, ("refused".into(), Some("loop".into())));
+    // An answer to (or in the thread of) A's own message is at least one hop past it.
+    for by_thread in [false, true] {
+        let id = ulid();
+        let mut f = envelope(&id, "low", &format!("{}/codex:d", c.short), &to, "x");
+        if let Frame::Envelope {
+            reply_to, thread, ..
+        } = &mut f
+        {
+            *if by_thread { thread } else { reply_to } = Some(first.clone());
+        }
+        p.send(&f).await;
+        assert_eq!(p.ack(&id).await, ("refused".into(), Some("loop".into())));
+    }
     for i in 0..13 {
         let id = ulid();
         let from = format!("{}/codex:s{i}", c.short);
@@ -529,7 +557,12 @@ async fn fourth_hop_and_thirteenth_send_are_refused_loop() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_person_at_the_terminal_resets_hops_to_zero() {
-    let (a, b) = pair(&[]);
+    // The test process counts as an agent on A (debug pin): only a person speaks as the terminal.
+    let birth = lightbulb_network::os::process(std::process::id())
+        .unwrap()
+        .birth_micros;
+    let pin = format!("{}:{birth}", std::process::id());
+    let (a, b) = pair(&[("LIGHTBULB_NETWORK_HOOK_CALLER", pin)]);
     let (sa, sb) = (session(&a, "a1"), session(&b, "b1"));
     send(&a, &sa, &sb, "q", "r0", None);
     let m = take_one(&b, &sb);
@@ -545,19 +578,47 @@ async fn a_person_at_the_terminal_resets_hops_to_zero() {
     assert_eq!(m["hops"], 1);
     // The person answers in that thread: hop 0 again.
     let terminal = format!("{}/terminal", short(&a));
-    send(
-        &a,
-        &terminal,
-        &sb,
-        "go on",
-        "r2",
-        Some(m["id"].as_str().unwrap()),
+    let req = json!({"id": 1, "op": "send", "from": terminal, "to": sb, "text": "go on",
+        "request_id": "r2", "reply_to": m["id"]});
+    let r = a.ask(req.clone());
+    assert_eq!(
+        (r["error"].as_str(), r["reason"].as_str()),
+        (Some("bad_request"), Some("not_a_person")),
+        "{r}"
     );
+    let r = person(&a, req);
+    assert_eq!(r["receipt"]["state"], "queued", "{r}");
     let m2 = take_one(&b, &sb);
     assert_eq!(
         (m2["hops"].as_i64(), &m2["thread"]),
         (Some(0), &m["thread"])
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wire_refusals_name_their_reason() {
+    let (a, b, _ep, mut p) = a_and_peer_b().await;
+    let (sa, sb) = (session(&a, "a1"), session(&b, "b1"));
+    let id = ulid();
+    p.send(&envelope(&id, "r1", &sb, &sa, "one")).await;
+    assert_eq!(p.ack(&id).await.0, "stored");
+    let refused = |r: &str| ("refused".to_string(), Some(r.to_string()));
+    for (to, text, thread, reason) in [
+        (sa.as_str(), "two", None, "request_id_reused"),
+        ("*", "one", None, "policy"),
+        (&format!("{}/*", short(&a)), "one", None, "policy"),
+        (sb.as_str(), "one", None, "not_member"),
+        (sa.as_str(), "one", Some("not-a-ulid"), "unsupported"),
+    ] {
+        let id = ulid();
+        let mut f = envelope(&id, "r1", &sb, to, text);
+        if let Frame::Envelope { thread: t, .. } = &mut f {
+            *t = thread.map(String::from);
+        }
+        p.send(&f).await;
+        assert_eq!(p.ack(&id).await, refused(reason), "{to} {text}");
+    }
+    assert_eq!(unread(&a, &sa), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

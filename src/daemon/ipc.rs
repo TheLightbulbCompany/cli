@@ -180,6 +180,16 @@ async fn handle(
             Some(key) => end(id, key, &req.body, daemon),
             None => Response::err(id, BAD_REQUEST),
         },
+        // Hops restart at a person: an agent may not speak as one.
+        "send"
+            if req.body["from"]
+                .as_str()
+                .and_then(sessions::split_addr)
+                .is_some_and(|(_, rest)| rest == "terminal")
+                && !peer_pid.is_some_and(super::net_ops::person_only) =>
+        {
+            refused(id, "not_a_person")
+        }
         "send" => send(id, &req.body, daemon),
         "receipt" => match (req.body["from"].as_str(), req.body["request_id"].as_str()) {
             (Some(from), Some(rid)) => {
