@@ -5,6 +5,7 @@ pub mod config;
 pub mod daemon;
 pub mod dialog;
 pub mod doing;
+pub mod embed;
 pub mod frame;
 pub mod holds;
 pub mod hook;

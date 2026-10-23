@@ -16,7 +16,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tokio::net::UnixListener;
 use tokio::sync::{broadcast, Notify};
 
@@ -48,8 +48,9 @@ pub struct Daemon {
     pub push_failed: Mutex<HashSet<String>>,
     /// The member connections (`net`).
     pub peers: net::Peers,
-    /// The person's OS dialogs, one at a time, none while `ui.claim` is live.
-    pub dialogs: dialog::Queue,
+    /// The person's OS dialogs, one at a time, none while `ui.claim` is live. `None` on an
+    /// embedded instance: it never asks anyone.
+    pub dialogs: Option<dialog::Queue>,
     /// `dialogs`' answers, for the task that routes them (admission, holds) to take.
     pub dialog_answers: Mutex<Option<dialog::Answers>>,
     /// The join requests waiting for their person's answer (`admission`).
@@ -64,6 +65,9 @@ pub struct Daemon {
     pub latest: Mutex<HashMap<String, crate::presence::Latest>>,
     /// The open streams (`streams`).
     pub streams: crate::streams::Streams,
+    /// On an embedded (cloud) instance, the sessions it declared (`cloud.sessions.set`), as
+    /// published; `None` on a computer.
+    pub cloud: Option<Mutex<Vec<net::frames::Remote>>>,
 }
 
 impl Daemon {
@@ -76,9 +80,22 @@ impl Daemon {
             .clone()
     }
 
+    /// Queues dialog `id` for the person; an embedded instance asks no one.
+    pub fn show_dialog(&self, id: &str, args: Vec<String>) {
+        if let Some(q) = &self.dialogs {
+            q.show(id, args);
+        }
+    }
+
+    pub fn withdraw_dialog(&self, id: &str) {
+        if let Some(q) = &self.dialogs {
+            q.withdraw(id);
+        }
+    }
+
     /// Whether the Lightbulb app holds a `ui.claim` at `now`.
     pub fn claim_live(&self, now: i64) -> bool {
-        self.dialogs.claim_live(now)
+        self.dialogs.as_ref().is_some_and(|q| q.claim_live(now))
     }
 }
 
@@ -141,22 +158,8 @@ pub async fn run(dir: &Path) -> Result<()> {
     lock.set_len(0)?;
     writeln!(lock, "{}", std::process::id())?;
 
-    let identity = Identity::load_or_create(dir)?;
     let config = Config::load(dir)?;
-    let store = Store::open(&dir.join("state.db"))?;
-    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
-    // The solo network's genesis, written once: a computer that has a roster keeps it.
-    let mut entries = roster::entries(&store)?;
-    if entries.is_empty() {
-        let g = net_ops::genesis(&identity, &user_name(), &config.computer, &user_name(), now);
-        roster::accept(&store, &g, now)?;
-        entries.push(g);
-    }
-    let team = TeamState {
-        roster: roster::replay(&entries),
-        config,
-    };
-    net_ops::sync_team_row(&store, &roster::Roster::default(), &team.roster)?;
+    let (daemon, net) = crate::embed::boot(dir, config, false).await?;
 
     // We hold the lock, so any socket file left behind is stale.
     let sock = dir.join(paths::SOCKET);
@@ -167,40 +170,7 @@ pub async fn run(dir: &Path) -> Result<()> {
     let listener = UnixListener::bind(&sock)?;
     // Briefly wider than 0600 after bind; the 0700 state dir closes that window.
     fs::set_permissions(&sock, Permissions::from_mode(0o600))?;
-
-    let latest = crate::presence::load(&store);
-    let peers = net::Peers::default();
-    let (dialogs, answers) = dialog::Queue::new(peers.knobs().osascript.clone());
-    dialogs.set_knob(peers.knobs().dialog.clone());
-    let daemon = Arc::new(Daemon {
-        dir: dir.to_path_buf(),
-        store: Mutex::new(store),
-        identity,
-        team: Mutex::new(team),
-        claude_home: std::env::var_os("LIGHTBULB_CONNECT_CLAUDE_HOME")
-            .map(PathBuf::from)
-            .or_else(dirs::home_dir)
-            .ok_or("no home directory")?,
-        events: broadcast::channel(256).0,
-        shutdown: Notify::new(),
-        mail: Notify::new(),
-        mailbox_locks: Mutex::default(),
-        push_failed: Mutex::default(),
-        peers,
-        dialogs,
-        dialog_answers: Mutex::new(Some(answers)),
-        admissions: Mutex::default(),
-        joining: tokio::sync::Mutex::new(()),
-        presence: Notify::new(),
-        built: Mutex::default(),
-        latest: Mutex::new(latest),
-        streams: Default::default(),
-    });
-    // No join connection outlives a restart: its open requests are over.
-    daemon.store.lock().unwrap().expire_joins(i64::MAX, now)?;
     tokio::spawn(crate::admission::route(daemon.clone()));
-    tokio::spawn(crate::presence::run(daemon.clone()));
-    let net = net::Net::start(daemon.clone()).await?;
     ipc::serve(listener, daemon).await;
     net.close().await;
     let _ = fs::remove_file(&sock);

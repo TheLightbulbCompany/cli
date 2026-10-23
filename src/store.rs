@@ -160,6 +160,17 @@ impl Store {
         Ok(Store { conn })
     }
 
+    /// A consistent copy of the database at `path` (`VACUUM INTO` a temporary file beside it,
+    /// then renamed over it).
+    pub fn snapshot(&self, path: &Path) -> crate::Result<()> {
+        let tmp = path.with_extension("snapshot-tmp");
+        let _ = std::fs::remove_file(&tmp);
+        let to = tmp.to_str().ok_or("the snapshot path is not UTF-8")?;
+        self.conn.execute("VACUUM INTO ?1", [to])?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
     pub(crate) fn conn(&self) -> &Connection {
         &self.conn
     }
@@ -612,13 +623,15 @@ impl Store {
             .optional()
     }
 
-    /// The messages still `queued` in the outbox since `before` or earlier: `(from, request_id)`.
-    pub fn outbox_stale(&self, before: i64) -> rusqlite::Result<Vec<(String, String)>> {
+    /// The messages still `queued` in the outbox since `before` or earlier: `(from, request_id,
+    /// envelope id)`.
+    pub fn outbox_stale(&self, before: i64) -> rusqlite::Result<Vec<(String, String, String)>> {
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT m.from_key, m.request_id FROM outbox o JOIN messages m ON m.id = o.message_id \
+            "SELECT m.from_key, m.request_id, o.message_id FROM outbox o \
+             JOIN messages m ON m.id = o.message_id \
              {MSG_RECEIPT} WHERE r.state = 'queued' AND o.created_at <= ?1"
         ))?;
-        let rows = stmt.query_map([before], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let rows = stmt.query_map([before], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
         rows.collect()
     }
 

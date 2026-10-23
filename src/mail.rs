@@ -536,7 +536,8 @@ pub fn send(
 /// a `request_id` reused with another text or recipient is `request_id_reused`; `hops` at
 /// `MAX_HOPS` or more, or below one past a message of ours it answers (`hops_ok`), or the
 /// `LOOP_LIMIT`th send in `LOOP_WINDOW_S` from one principal to `to` (the person for a computer
-/// member, the sending session for a cloud member), is `loop`; then `policy::decide`: refused
+/// member, the sending session for a cloud member), is `loop`; then `policy::decide` (on a
+/// workspace member, `policy::cloud_inbound`): refused
 /// `policy`, or kept under a hold (`holds::hold`, `held`, in no mailbox), or stored for `to`
 /// with origin `net:<peer short>`, timed by its arrival (`now`). Held or stored, it is
 /// remembered in `seen_ids`.
@@ -619,8 +620,12 @@ pub fn receive(
     if loop_refused(recent.iter().filter(|r| same_principal(r)).count()) {
         return refused("loop");
     }
-    // Not in my own roster (removed): nothing is mine to accept.
+    // Not in my own roster (removed): nothing is mine to accept. A workspace member has its
+    // own fixed rule.
     let verdict = match roster.by_short(me) {
+        Some(mine) if mine.kind == MemberKind::Cloud => {
+            policy::cloud_inbound(store, mine, peer, from, now)?
+        }
         Some(mine) => policy::decide(store, roster, &mine.key, peer)?,
         None => Verdict::Hold,
     };

@@ -431,14 +431,14 @@ pub fn shown(d: &Daemon, roster: &Roster, store: &Store, h: &Hold) {
         .send(json!({"event": "held", "id": h.name(), "kind": h.kind(),
         "target_session": h.target_session, "from": h.from_session, "label": who}));
     let args = dialog::args("Lightbulb Connect", &text, &buttons);
-    d.dialogs.show(&h.name(), args);
+    d.show_dialog(&h.name(), args);
     eprintln!("hold {}: open", h.name());
 }
 
 /// The daemon's side of a closed hold (`verdict` `allow`, `decline` or `expired`; `by` null for
 /// an expiry): its dialog withdrawn, subscribers told `hold_closed`.
 fn closed(d: &Daemon, h: &Hold, verdict: &str, by: Option<&str>) {
-    d.dialogs.withdraw(&h.name());
+    d.withdraw_dialog(&h.name());
     let event = json!({"event": "hold_closed", "id": h.name(), "by": by, "verdict": verdict});
     let _ = d.events.send(event);
     eprintln!("hold {}: {verdict}", h.name());
@@ -461,7 +461,7 @@ fn answer_here(
     if let Ok(c) = &r {
         closed(d, &c.hold, c.verdict(), Some(by));
         if allow && c.hold.kind() == Kind::Message {
-            ipc::stored(d, &Key(c.hold.message.to_key.clone()));
+            ipc::stored(d, &Key(c.hold.message.to_key.clone()), &c.hold.message.id);
         }
     }
     Ok(r)

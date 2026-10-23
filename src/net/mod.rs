@@ -800,8 +800,13 @@ impl Net {
             let store = d.store.lock().unwrap();
             let state = State::parse(&state).expect("checked by from_peer_ok");
             match outbox::acked(&store, key, &id, state, reason.as_deref(), ipc::now()) {
-                Ok(true) => eprintln!("net: {id} at {short}: {}", state.name()),
-                Ok(false) => {
+                Ok(Some(moved)) => {
+                    eprintln!("net: {id} at {short}: {}", state.name());
+                    if moved {
+                        receipt_changed(d, &id, state.name(), reason.as_deref());
+                    }
+                }
+                Ok(None) => {
                     eprintln!("net: dropped an answer from {short} for {id} (not sent there)")
                 }
                 Err(e) => eprintln!("net: {id} at {short}: {e}"),
@@ -843,11 +848,18 @@ fn receive(d: &Arc<Daemon>, key: &str, env: &Frame, tx: &mpsc::UnboundedSender<F
             });
             if state == State::Stored {
                 drop((store, team));
-                ipc::stored(d, &Key(to.clone()));
+                ipc::stored(d, &Key(to.clone()), id);
             }
         }
         Err(e) => eprintln!("net: dropped envelope {id} from {short}: {e}"),
     }
+}
+
+/// Every subscriber hears that envelope `id`'s receipt moved to `state`.
+fn receipt_changed(d: &Daemon, id: &str, state: &str, reason: Option<&str>) {
+    let e =
+        serde_json::json!({"event": "receipt_changed", "id": id, "state": state, "reason": reason});
+    let _ = d.events.send(e);
 }
 
 /// One flush (`Net::flush_loop`): with `all`, every queued envelope of an online member,
@@ -858,7 +870,9 @@ fn flush(d: &Daemon, all: bool, expire: bool) -> Result<()> {
     let store = d.store.lock().unwrap();
     if expire {
         mail::expire(&store, now)?;
-        outbox::expire(&store, now, d.peers.knobs().outbox_s)?;
+        for id in outbox::expire(&store, now, d.peers.knobs().outbox_s)? {
+            receipt_changed(d, &id, State::Expired.name(), Some("unreachable"));
+        }
         holds::expire_here(d, &store, now as i64)?;
     }
     let due = outbox::due(&store, &online, if all { u64::MAX } else { now })?;

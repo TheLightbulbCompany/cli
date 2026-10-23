@@ -5,7 +5,7 @@ use crate::daemon::{ipc, Daemon};
 use crate::doing::TEXT_MAX;
 use crate::frame::Sender;
 use crate::mail::State;
-use crate::roster::{Entry, Member};
+use crate::roster::{Entry, Member, MemberKind};
 use crate::sessions::Tier;
 use crate::{presence, sessions, Result};
 use serde::{Deserialize, Serialize};
@@ -56,11 +56,22 @@ impl Remote {
     }
 
     /// Whether member `peer_short` may publish this: its session id under that prefix, `agent`
-    /// the id's provider, a known `status` and `tier`, text at most `TEXT_MAX` characters.
-    pub fn valid(&self, peer_short: &str) -> bool {
+    /// the id's provider, a known `status` and `tier`, text at most `TEXT_MAX` characters. A
+    /// `cloud` member's sessions are names (a workspace's agents) with any printable `agent`.
+    pub fn valid(&self, peer_short: &str, cloud: bool) -> bool {
         let short = |t: &str| t.chars().count() <= TEXT_MAX;
+        let agent = match Sender::of(peer_short, &self.session_id) {
+            Sender::Agent(p) => p == self.agent,
+            Sender::Name(_) => {
+                cloud
+                    && !self.agent.is_empty()
+                    && short(&self.agent)
+                    && self.agent.chars().all(crate::label::printable)
+            }
+            Sender::Terminal => false,
+        };
         own(peer_short, &self.session_id)
-            && Sender::of(peer_short, &self.session_id) == Sender::Agent(&self.agent)
+            && agent
             && STATUSES.contains(&self.status.as_str())
             && Tier::ALL.iter().any(|t| t.as_str() == self.tier)
             && short(&self.folder)
@@ -251,7 +262,9 @@ pub fn from_peer_ok(
                 && [sessions.len(), known.len(), kept.len()]
                     .iter()
                     .all(|n| *n <= presence::MAX)
-                && sessions.iter().all(|s| s.valid(&peer.short))
+                && sessions
+                    .iter()
+                    .all(|s| s.valid(&peer.short, peer.kind == MemberKind::Cloud))
                 && known.iter().chain(kept).all(|a| own(&peer.short, a));
             check(ok, "presence")
         }

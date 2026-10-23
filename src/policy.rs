@@ -127,6 +127,46 @@ pub fn decide(store: &Store, roster: &Roster, me: &str, from: &Member) -> Result
     })
 }
 
+/// How long a session this workspace member wrote to may answer it.
+const REPLY_S: u64 = 86_400;
+
+/// The fixed rule on a workspace member (`mine`, an embedded instance) for `from`'s envelope
+/// from session `from_addr` (ruling §4): a computer of its own workspace starts a
+/// conversation; anyone else may only answer, within a day, a session one of its agents wrote
+/// to (its sent mail is the record); everyone else is refused. It never holds.
+pub fn cloud_inbound(
+    store: &Store,
+    mine: &Member,
+    from: &Member,
+    from_addr: &str,
+    now: u64,
+) -> Result<Verdict> {
+    let own = from.kind == MemberKind::Computer
+        && from.workspace.is_some()
+        && from.workspace == mine.workspace;
+    let prefix = format!("{}/", mine.short);
+    let since = now.saturating_sub(REPLY_S) as i64;
+    let wrote = || -> Result<bool> {
+        Ok(store
+            .conn()
+            .prepare(
+                "SELECT 1 FROM messages WHERE to_key = ?1 AND substr(from_key, 1, ?2) = ?3 \
+                 AND sent_at >= ?4",
+            )?
+            .exists(rusqlite::params![
+                from_addr,
+                prefix.len() as i64,
+                prefix,
+                since
+            ])?)
+    };
+    Ok(if own || wrote()? {
+        Verdict::Accept
+    } else {
+        Verdict::Refuse
+    })
+}
+
 /// Writes `v` for `from` in its row (the switch is on only for `accept`), set by `by`.
 pub fn set(
     store: &Store,

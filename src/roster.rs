@@ -368,8 +368,14 @@ fn pass(
                     e.body.get("role").and_then(Value::as_str),
                     None | Some("member")
                 );
-                // A link's signer admits only computers; a cloud member needs an admin.
-                let kind_ok = elevated || e.text("kind") != "cloud";
+                // A link's signer admits only computers; a cloud member needs an admin, and a
+                // workspace has one: on a fork, the first replayed stands.
+                let cloud = e.text("kind") == "cloud";
+                let taken = cloud
+                    && r.members
+                        .values()
+                        .any(|m| m.kind == MemberKind::Cloud && m.person_id == e.text("person_id"));
+                let kind_ok = (elevated || !cloud) && !taken;
                 if (elevated || via_link()) && kind_ok && !collides && role_ok && own_person(e) {
                     r.members.insert(target, new_member(e, Role::Member));
                     if let Some((lh, _)) = link.filter(|(_, l)| l.once) {
@@ -873,6 +879,24 @@ mod tests {
         let r = replay(&[g, ak, pk, lk, kd]);
         assert!(r.links.is_empty());
         assert!(!r.members.contains_key(&d.key));
+    }
+
+    #[test]
+    fn one_cloud_member_per_workspace_even_on_a_fork() {
+        let (f, k1, k2) = (id(), id(), id());
+        let g = genesis(&f);
+        let a1 = admit_cloud(&f, &g, &k1, "ws one", "ws:W1");
+        let a2 = admit_cloud(&f, &g, &k2, "ws two", "ws:W1");
+        let mut log = vec![g, a1, a2];
+        let r = replay(&log);
+        let clouds: Vec<_> = r
+            .members
+            .values()
+            .filter(|m| m.person_id == "ws:W1")
+            .collect();
+        assert_eq!(clouds.len(), 1);
+        log.reverse();
+        assert_eq!(replay(&log).members, r.members);
     }
 
     #[test]

@@ -45,8 +45,8 @@ pub fn sent(store: &Store, id: &str, now: u64) -> Result<()> {
 }
 
 /// `member`'s word on envelope `id`: its receipt moves forward only (`State::later_than`;
-/// `refused` and `expired` final). `false` when the envelope did not go to `member`: the one
-/// binding an `Ack` or `Receipt` is held to.
+/// `refused` and `expired` final). `None` when the envelope did not go to `member`: the one
+/// binding an `Ack` or `Receipt` is held to; else whether the receipt moved (to `state`).
 pub fn acked(
     store: &Store,
     member: &str,
@@ -54,24 +54,28 @@ pub fn acked(
     state: State,
     reason: Option<&str>,
     now: u64,
-) -> Result<bool> {
+) -> Result<Option<bool>> {
     let Some((from, request_id)) = store.outbox_sender(id, member)? else {
-        return Ok(false);
+        return Ok(None);
     };
-    mail::advance(store.conn(), &from, &request_id, state, reason, now)?;
-    Ok(true)
+    let from = crate::sessions::Key(from);
+    let at = |s: &Store| mail::receipt(s, &from, &request_id).map(|r| r.map(|r| r.state));
+    let before = at(store)?;
+    mail::advance(store.conn(), &from.0, &request_id, state, reason, now)?;
+    Ok(Some(at(store)? != before))
 }
 
 /// At `now`: mail queued `ttl` seconds becomes `expired` (`unreachable`); rows a week and a
 /// day past a final state, or past any answer (`HELD_S + KEEP_S` old), and `seen_ids` that
-/// old are dropped.
-pub fn expire(store: &Store, now: u64, ttl: u64) -> Result<()> {
+/// old are dropped. The envelope ids that expired.
+pub fn expire(store: &Store, now: u64, ttl: u64) -> Result<Vec<String>> {
     let tx = store.conn().unchecked_transaction()?;
-    for (from, request_id) in store.outbox_stale(now.saturating_sub(ttl) as i64)? {
+    let stale = store.outbox_stale(now.saturating_sub(ttl) as i64)?;
+    for (from, request_id, _) in &stale {
         mail::advance(
             &tx,
-            &from,
-            &request_id,
+            from,
+            request_id,
             State::Expired,
             Some("unreachable"),
             now,
@@ -80,7 +84,7 @@ pub fn expire(store: &Store, now: u64, ttl: u64) -> Result<()> {
     let ago = |s: u64| now.saturating_sub(s) as i64;
     store.prune_mail(ago(KEEP_S), ago(mail::HELD_S + KEEP_S), ago(KEEP_S))?;
     tx.commit()?;
-    Ok(())
+    Ok(stale.into_iter().map(|(_, _, id)| id).collect())
 }
 
 /// The receipts owed to members: `(member, Receipt frame)`.
@@ -156,7 +160,7 @@ mod tests {
         assert_eq!(due_n(&s, 101), 1);
         sent(&s, &id, 101).unwrap();
         assert_eq!(due_n(&s, 102), 0, "then 2 s");
-        assert!(!acked(&s, "c", &id, State::Read, None, 102).unwrap());
+        assert_eq!(acked(&s, "c", &id, State::Read, None, 102).unwrap(), None);
         assert!(!bound(&s, &id, "c") && bound(&s, &id, "b"));
         for (st, want) in [
             (State::Held, State::Held),
@@ -165,7 +169,8 @@ mod tests {
             (State::Read, State::Read),
             (State::Delivered, State::Read),
         ] {
-            assert!(acked(&s, "b", &id, st, None, 103).unwrap());
+            let moved = state(&s).0 != want;
+            assert_eq!(acked(&s, "b", &id, st, None, 103).unwrap(), Some(moved));
             assert_eq!(state(&s).0, want);
         }
         assert_eq!(due_n(&s, 1_000), 0, "acked: never sent again");

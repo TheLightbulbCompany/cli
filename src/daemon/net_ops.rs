@@ -1,6 +1,6 @@
 //! The network ops, reached from `ipc::handle`'s fallback arm.
 
-use super::ipc::{refused, Response, BAD_REQUEST, INTERNAL, NOT_FOUND, UNKNOWN_OP};
+use super::ipc::{refused, Response, BAD_REQUEST, INTERNAL, NOT_FOUND, UNKNOWN_OP, UNSUPPORTED};
 use super::{Daemon, TeamState};
 use crate::agents::caller;
 use crate::identity::Identity;
@@ -70,6 +70,10 @@ fn gate(op: &str, invite: Invite) -> Gate {
 }
 
 pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, peer_pid: Option<u32>) -> Response {
+    // Retired: a cloud member is removed by an admin like any member.
+    if op == "team.unlink" {
+        return Response::err(id, UNSUPPORTED);
+    }
     if op.starts_with("team.") {
         let invite = if op == "team.invite" {
             match serde_json::from_value::<Option<Invite>>(body["mode"].clone()) {
@@ -125,10 +129,32 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, peer_pid: Option
         "relay.set" => relay_set(id, body, daemon, peer_pid),
         // `ui.claim {}` -> `{lease_s}`: the Lightbulb app shows the person's questions itself;
         // no OS dialog opens until it stops heartbeating.
-        "ui.claim" => {
-            daemon.dialogs.claim(super::ipc::now() as i64);
-            Response::ok(id, json!({ "lease_s": crate::dialog::LEASE_S }))
-        }
+        "ui.claim" => match &daemon.dialogs {
+            Some(q) => {
+                q.claim(super::ipc::now() as i64);
+                Response::ok(id, json!({ "lease_s": crate::dialog::LEASE_S }))
+            }
+            None => Response::err(id, UNSUPPORTED),
+        },
+        "cloud.sessions.set" => cloud_sessions_set(id, body, daemon),
+        // `snapshot {path}` -> `{}`: a consistent copy of `state.db` at `path`.
+        "snapshot" => match body["path"].as_str() {
+            Some(p) => match daemon
+                .store
+                .lock()
+                .unwrap()
+                .snapshot(std::path::Path::new(p))
+            {
+                Ok(()) => Response::ok(id, json!({})),
+                Err(e) => {
+                    eprintln!("snapshot: {e}");
+                    Response::err(id, INTERNAL)
+                }
+            },
+            None => Response::err(id, BAD_REQUEST),
+        },
+        // An instance's settings are its `EmbedOpts`, not the file.
+        "reload" if daemon.cloud.is_some() => Response::err(id, UNSUPPORTED),
         "reload" => match reload(daemon) {
             Ok(()) => Response::ok(id, json!({})),
             Err(e) => {
@@ -144,7 +170,7 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, peer_pid: Option
 /// session under a folder turned off leaves it). Every file the daemon reads at start and may
 /// read again is re-read here.
 pub fn reload(daemon: &Daemon) -> crate::Result<()> {
-    let config = crate::config::Config::load(&crate::paths::state_dir())?;
+    let config = crate::config::Config::load(&daemon.dir)?;
     daemon.team.lock().unwrap().config = config;
     daemon.presence.notify_one();
     Ok(())
@@ -204,9 +230,10 @@ const TELL_WAIT: Duration = Duration::from_secs(5);
 /// online members, waiting up to 5 s for one to take it (it then drops the connection, as to
 /// any computer no longer a member); `told` is false when none did. Then it forgets the team
 /// and starts this computer's solo network. A founder with other computers in the team and
-/// no admin must transfer first.
-pub async fn leave(id: u64, daemon: &Daemon, peer_pid: Option<u32>) -> Response {
-    if !peer_pid.is_some_and(person_only) {
+/// no admin must transfer first. `person`: a person asked (an embedded instance's caller
+/// counts as one: the bridge acts for a workspace admin who confirmed in the app).
+pub async fn leave(id: u64, daemon: &Daemon, person: bool) -> Response {
+    if !person {
         return refused(id, "not_a_person");
     }
     let me = daemon.identity.key.clone();
@@ -315,7 +342,7 @@ pub fn genesis(me: &Identity, name: &str, computer: &str, team_name: &str, at: i
 }
 
 /// Rewrites Plan A's `team` row from `new` when its id, name or founder differs from `old`'s.
-pub(super) fn sync_team_row(store: &Store, old: &Roster, new: &Roster) -> crate::Result<()> {
+pub(crate) fn sync_team_row(store: &Store, old: &Roster, new: &Roster) -> crate::Result<()> {
     fn row(r: &Roster) -> (&str, &str, &str) {
         let founder = r.founder().map_or("", |m| m.key.as_str());
         (&r.team_id, &r.team_name, founder)
@@ -338,6 +365,20 @@ pub fn install(
 ) -> crate::Result<()> {
     sync_team_row(store, &team.roster, &new)?;
     let relay_changed = team.roster.relay != new.relay;
+    // A removal or leave applied in this team (not a team left or joined): every subscriber
+    // hears of each member gone.
+    if team.roster.team_id == new.team_id {
+        for k in team
+            .roster
+            .members
+            .keys()
+            .filter(|k| !new.members.contains_key(*k))
+        {
+            let _ = daemon
+                .events
+                .send(json!({"event": "member_removed", "member": k}));
+        }
+    }
     team.roster = new;
     daemon.peers.changed.notify_one();
     if relay_changed {
@@ -532,6 +573,52 @@ impl TeamOps<'_> {
         )?;
         Ok(t)
     }
+}
+
+/// `cloud.sessions.set {sessions: [{name, agent, title?}]}` -> `{}` (an embedded instance only;
+/// `unsupported` on a computer): the workspace's agents, published as `<short>/<name>` with
+/// `agent` and `title` (at most `presence::MAX`, each name a `valid_name`, once). Answers once
+/// the presence carrying them is queued to every online member, so a `send` from a name just
+/// declared is never refused as unadvertised by a peer the envelope reaches first.
+fn cloud_sessions_set(id: u64, body: &Value, daemon: &Daemon) -> Response {
+    let Some(cloud) = &daemon.cloud else {
+        return Response::err(id, UNSUPPORTED);
+    };
+    let Some(list) = body["sessions"]
+        .as_array()
+        .filter(|l| l.len() <= crate::presence::MAX)
+    else {
+        return Response::err(id, BAD_REQUEST);
+    };
+    let mut out: Vec<crate::net::frames::Remote> = vec![];
+    for s in list {
+        let (Some(name), Some(agent)) = (s["name"].as_str(), s["agent"].as_str()) else {
+            return Response::err(id, BAD_REQUEST);
+        };
+        let session_id = format!("{}/{name}", daemon.identity.short);
+        let title = s["title"].as_str().map(String::from);
+        let r = crate::net::frames::Remote {
+            session_id,
+            agent: agent.into(),
+            repo: None,
+            branch: None,
+            folder: String::new(),
+            status: "idle".into(),
+            doing: None,
+            tier: crate::sessions::Tier::Pull.as_str().into(),
+            title,
+        }
+        .clamp();
+        let fresh = !out.iter().any(|o| o.session_id == r.session_id);
+        let named = crate::sessions::valid_name(name);
+        if !named || !fresh || !r.valid(&daemon.identity.short, true) {
+            return Response::err(id, BAD_REQUEST);
+        }
+        out.push(r);
+    }
+    *cloud.lock().unwrap() = out;
+    crate::presence::publish(daemon);
+    Response::ok(id, json!({}))
 }
 
 /// Whether a person, not an agent, is at the other end of the socket: no process from

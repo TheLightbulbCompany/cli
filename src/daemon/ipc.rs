@@ -4,6 +4,7 @@ use super::Daemon;
 use crate::sessions::{self, Key};
 use crate::store;
 use crate::{admission, frame, label, mail, outbox, presence};
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::os::fd::AsRawFd;
@@ -133,6 +134,25 @@ async fn handle(
         return Response::err(id, BAD_REQUEST);
     };
     match req.op.as_str() {
+        "subscribe" => {
+            *subscribed = true;
+            Response::ok(id, json!({}))
+        }
+        "inbox" => inbox(id, &req.body, daemon, peer).await,
+        op => self::op(id, op, &req.body, daemon, peer_pid).await,
+    }
+}
+
+/// One op, for a socket connection (`peer_pid`: its peer, `None` when the OS will not say) or
+/// an embedded instance's caller (`None`): every person-only op refuses without a person.
+pub async fn op(
+    id: u64,
+    op: &str,
+    body: &Value,
+    daemon: &Arc<Daemon>,
+    peer_pid: Option<u32>,
+) -> Response {
+    match op {
         "ping" => Response::ok(id, json!({})),
         "status" => {
             let t = daemon.team.lock().unwrap();
@@ -171,39 +191,35 @@ async fn handle(
                 }),
             )
         }
-        "subscribe" => {
-            *subscribed = true;
-            Response::ok(id, json!({}))
-        }
         "shutdown" => {
             daemon.shutdown.notify_one();
             Response::ok(id, json!({}))
         }
-        "register" => register(id, &req.body, daemon),
+        "register" => register(id, body, daemon),
         "sessions" => Response::ok(id, json!({ "sessions": live_sessions(daemon) })),
-        "end" => match req.body["key"].as_str() {
-            Some(key) => end(id, key, &req.body, daemon),
+        "end" => match body["key"].as_str() {
+            Some(key) => end(id, key, body, daemon),
             None => Response::err(id, BAD_REQUEST),
         },
         // Hops restart at a person: an agent may not speak as one.
         "send"
-            if req.body["from"].as_str().is_some_and(mail::is_person)
+            if body["from"].as_str().is_some_and(mail::is_person)
                 && !peer_pid.is_some_and(super::net_ops::person_only) =>
         {
             refused(id, "not_a_person")
         }
         "send" => {
-            let mut r = send(id, &req.body, daemon);
-            if let (true, Some(from)) = (r.ok, req.body["from"].as_str()) {
+            let mut r = send(id, body, daemon);
+            if let (true, Some(from)) = (r.ok, body["from"].as_str()) {
                 let from = Key(from.into());
-                if req.body["wait"] == true {
+                if body["wait"] == true {
                     settle(daemon, &from, &mut r.body["receipt"]).await;
                 }
                 annotate(daemon, &from, &mut r.body["receipt"]);
             }
             r
         }
-        "receipt" => match (req.body["from"].as_str(), req.body["request_id"].as_str()) {
+        "receipt" => match (body["from"].as_str(), body["request_id"].as_str()) {
             (Some(from), Some(rid)) => {
                 let from = Key(from.into());
                 let got = mail::receipt(&daemon.store.lock().unwrap(), &from, rid);
@@ -219,10 +235,9 @@ async fn handle(
             }
             _ => Response::err(id, BAD_REQUEST),
         },
-        "inbox" => inbox(id, &req.body, daemon, peer).await,
         // Reads every session's transcript and git files: off the async threads.
         "directory" => {
-            let (d, q) = (daemon.clone(), req.body["query"].as_str().map(String::from));
+            let (d, q) = (daemon.clone(), body["query"].as_str().map(String::from));
             match tokio::task::spawn_blocking(move || presence::directory(&d, q.as_deref())).await {
                 Ok(v) => Response::ok(id, v),
                 Err(_) => Response::err(id, INTERNAL),
@@ -232,10 +247,10 @@ async fn handle(
         "team.join" if !peer_pid.is_some_and(super::net_ops::person_only) => {
             refused(id, "not_a_person")
         }
-        "team.join" => crate::admission::join(id, &req.body, daemon).await,
+        "team.join" => crate::admission::join(id, body, daemon).await,
         // `mark_read {key}` -> `{}`: `key`'s session took a step (an MCP tool call), so the mail
         // delivered to it before now has been seen.
-        "mark_read" => match req.body["key"].as_str() {
+        "mark_read" => match body["key"].as_str() {
             Some(key) => {
                 match mail::mark_read_for(&daemon.store.lock().unwrap(), &Key(key.into()), now()) {
                     Ok(()) => Response::ok(id, json!({})),
@@ -245,7 +260,7 @@ async fn handle(
             None => Response::err(id, BAD_REQUEST),
         },
         // `unread {key}` -> `{unread}`: how many messages wait for `key`; takes nothing.
-        "unread" => match req.body["key"].as_str() {
+        "unread" => match body["key"].as_str() {
             Some(key) => match mail::unread(&daemon.store.lock().unwrap(), &Key(key.into()), now())
             {
                 Ok(n) => Response::ok(id, json!({ "unread": n })),
@@ -253,14 +268,17 @@ async fn handle(
             },
             None => Response::err(id, BAD_REQUEST),
         },
-        "team.leave" => super::net_ops::leave(id, daemon, peer_pid).await,
+        "team.leave" => {
+            let person = peer_pid.is_some_and(super::net_ops::person_only);
+            super::net_ops::leave(id, daemon, person).await
+        }
         "holds" | "hold.get" | "hold.answer" | "hold.file" | "policy.get" | "policy.set" => {
-            crate::holds::op(id, &req.op, &req.body, daemon, peer_pid)
+            crate::holds::op(id, op, body, daemon, peer_pid)
         }
         "share.grant" | "stream.open" | "stream.send" | "stream.close" => {
-            crate::streams::handle(id, &req.op, &req.body, daemon, peer_pid).await
+            crate::streams::handle(id, op, body, daemon, peer_pid).await
         }
-        op => super::net_ops::handle(id, op, &req.body, daemon, peer_pid),
+        op => super::net_ops::handle(id, op, body, daemon, peer_pid),
     }
 }
 
@@ -494,6 +512,29 @@ fn sender_fields(daemon: &Daemon, m: &store::Message) -> Value {
     v
 }
 
+/// One `inbox` record of `m`: who sent it (`sender_fields`), the message, and `framed`, the
+/// text as the agent is shown it (`frame::framed`).
+pub(crate) fn record(daemon: &Daemon, m: &store::Message) -> Value {
+    let mut v = sender_fields(daemon, m);
+    let label = v["label"].as_str().unwrap_or_default();
+    let framed = frame::framed(label, &m.request_id, &m.body);
+    for (k, x) in [
+        ("id", json!(m.id)),
+        ("request_id", json!(m.request_id)),
+        ("from", json!(m.from_key)),
+        ("to", json!(m.to_key)),
+        ("kind", json!(m.kind)),
+        ("thread", json!(m.thread)),
+        ("hops", json!(m.hops)),
+        ("text", json!(m.body)),
+        ("sent_at", json!(m.sent_at)),
+        ("framed", json!(framed)),
+    ] {
+        v[k] = x;
+    }
+    v
+}
+
 pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -535,6 +576,13 @@ fn send(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
         None if reply_to.is_some() => None,
         None => return Response::err(id, BAD_REQUEST),
     };
+    // A workspace member sends only as the agents it declared.
+    if let Some(declared) = &daemon.cloud {
+        let declared = declared.lock().unwrap();
+        if !declared.iter().any(|s| s.session_id == from) {
+            return refused(id, "not_declared");
+        }
+    }
     let from = Key(from.into());
     let team = daemon.team.lock().unwrap();
     let store = daemon.store.lock().unwrap();
@@ -562,11 +610,11 @@ fn send(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
     drop(team);
     let sent = mail::store_local(&store, &p);
     drop(store);
-    let to = p.to;
+    let to = &p.to;
     match sent {
         Ok(receipt) => {
             if receipt.state == mail::State::Stored {
-                stored(daemon, &to);
+                stored(daemon, to, &p.message_id);
             }
             Response::ok(id, json!({ "receipt": receipt }))
         }
@@ -574,10 +622,17 @@ fn send(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
     }
 }
 
-/// Mail was stored for `to` here: a waiting `inbox` looks again, and a Claude or Codex
-/// session is pushed it (`super::deliver`) if its tier is `push`.
-pub(crate) fn stored(daemon: &Arc<Daemon>, to: &Key) {
+/// Mail `id` was stored for `to` here: a waiting `inbox` looks again, a Claude or Codex
+/// session is pushed it (`super::deliver`) if its tier is `push`, and an embedded instance's
+/// caller hears `message {to_session, id}` (`to_session`: the declared name).
+pub(crate) fn stored(daemon: &Arc<Daemon>, to: &Key, id: &str) {
     daemon.mail.notify_waiters();
+    if daemon.cloud.is_some() {
+        if let Some((_, name)) = sessions::split_addr(&to.0) {
+            let e = json!({"event": "message", "to_session": name, "id": id});
+            let _ = daemon.events.send(e);
+        }
+    }
     if matches!(
         frame::Sender::of("", &to.0),
         frame::Sender::Agent("claude" | "codex")
@@ -643,6 +698,15 @@ fn annotate(daemon: &Daemon, from: &Key, r: &mut Value) {
     };
     if let Some(k) = kind {
         r["loop"] = k.into();
+    }
+    let thread: Option<String> = {
+        let store = daemon.store.lock().unwrap();
+        let q = "SELECT thread FROM messages WHERE from_key = ?1 AND request_id = ?2";
+        let row = store.conn().query_row(q, [&from.0, &rid], |r| r.get(0));
+        row.optional().ok().flatten()
+    };
+    if let Some(t) = thread {
+        r["thread"] = t.into();
     }
     let Some((member, to)) = member_for(daemon, from, &rid) else {
         return;
@@ -753,29 +817,7 @@ async fn inbox(
         match taken {
             Err(_) => return Response::err(id, INTERNAL),
             Ok(m) if !m.is_empty() => {
-                let messages: Vec<Value> = m
-                    .iter()
-                    .map(|m| {
-                        let mut v = sender_fields(daemon, m);
-                        let label = v["label"].as_str().unwrap_or_default();
-                        let framed = frame::framed(label, &m.request_id, &m.body);
-                        for (k, x) in [
-                            ("id", json!(m.id)),
-                            ("request_id", json!(m.request_id)),
-                            ("from", json!(m.from_key)),
-                            ("to", json!(m.to_key)),
-                            ("kind", json!(m.kind)),
-                            ("thread", json!(m.thread)),
-                            ("hops", json!(m.hops)),
-                            ("text", json!(m.body)),
-                            ("sent_at", json!(m.sent_at)),
-                            ("framed", json!(framed)),
-                        ] {
-                            v[k] = x;
-                        }
-                        v
-                    })
-                    .collect();
+                let messages: Vec<Value> = m.iter().map(|m| record(daemon, m)).collect();
                 return Response::ok(id, json!({ "messages": messages }));
             }
             Ok(_) => {}

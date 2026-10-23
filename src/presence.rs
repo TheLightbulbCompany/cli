@@ -116,7 +116,17 @@ pub(crate) fn canonical(p: &Path) -> PathBuf {
 /// This computer's presence: its live sessions (newest first), the non-live addresses still
 /// holding mail (`known`, newest mail first) and the kept ones (`kept`, newest first); nothing
 /// whose folder is under `folders_off`, nor an address whose folder it does not know.
+/// An embedded instance's is the sessions it declared (`cloud.sessions.set`), nothing else.
 fn build(d: &Daemon, seq: u64) -> Frame {
+    if let Some(declared) = &d.cloud {
+        return Frame::Presence {
+            member: d.identity.key.clone(),
+            seq,
+            sessions: declared.lock().unwrap().clone(),
+            known: vec![],
+            kept: vec![],
+        };
+    }
     let now = ipc::now();
     let (share, off) = {
         let t = d.team.lock().unwrap();
@@ -224,15 +234,31 @@ fn stamp(f: &mut Frame) {
     }
 }
 
+/// Builds this computer's presence now and queues it to every online member (`cloud.sessions.
+/// set`, which answers only after).
+pub fn publish(d: &Daemon) {
+    let mut f = build(d, 0);
+    *d.built.lock().unwrap() = Some(f.clone());
+    stamp(&mut f);
+    for m in d.peers.online() {
+        let _ = d.peers.send(&m, f.clone());
+    }
+}
+
 /// The sender: on a local change (`Daemon::presence`, coalesced over 250 ms) or every 5 s,
 /// at most once a second and only while a member is online, builds this computer's presence
-/// and sends it to every online member when it changed, and every 60 s regardless.
+/// and sends it to every online member when it changed, and every 60 s regardless. Ends with
+/// the endpoint (started after it).
 pub async fn run(d: Arc<Daemon>) {
+    let Some(ep) = d.peers.endpoint.get().cloned() else {
+        return;
+    };
     let (mut built_at, mut sent_at): (Option<Instant>, Option<Instant>) = (None, None);
     loop {
         tokio::select! {
             _ = d.presence.notified() => tokio::time::sleep(COALESCE).await,
             _ = tokio::time::sleep(TICK) => {}
+            _ = ep.closed() => return,
         }
         if d.peers.online().is_empty() {
             continue;
@@ -369,6 +395,7 @@ fn record(m: &Member, me: &str, s: &Remote, cwd: &str) -> Value {
     json!({
         "session_id": s.session_id,
         "person": m.name,
+        "person_id": m.person_id,
         "person_verified": m.proof.is_some(),
         "computer": m.computer,
         "agent": s.agent,
@@ -386,7 +413,19 @@ fn record(m: &Member, me: &str, s: &Remote, cwd: &str) -> Value {
 /// `directory {query?}` -> `{sessions}`: this computer's sessions, then every member's latest
 /// presence; `query` matches session id, person, computer, agent, repo or folder, any case.
 pub fn directory(d: &Daemon, query: Option<&str>) -> Value {
-    let local = ipc::live_sessions(d);
+    // This computer's, with their folders; an instance's are the sessions it declared.
+    let local: Vec<(Remote, String)> = match &d.cloud {
+        Some(c) => c
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| (r.clone(), String::new()))
+            .collect(),
+        None => ipc::live_sessions(d)
+            .iter()
+            .map(|s| (remote(s, false), s.cwd.clone()))
+            .collect(),
+    };
     let remote_ones = stored(d);
     let (me, own) = {
         let t = d.team.lock().unwrap();
@@ -415,10 +454,9 @@ pub fn directory(d: &Daemon, query: Option<&str>) -> Value {
         })
     };
     let mut out = vec![];
-    for s in &local {
-        let r = remote(s, false);
-        if hit(&own, &r) {
-            out.push(record(&own, &me, &r, &s.cwd));
+    for (r, cwd) in &local {
+        if hit(&own, r) {
+            out.push(record(&own, &me, r, cwd));
         }
     }
     for (m, l) in &remote_ones {
