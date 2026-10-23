@@ -293,7 +293,22 @@ pub fn ensure_running() -> Result<()> {
         }
         return Err("launchd's daemon did not answer within 5 s".into());
     }
-    ensure_running_at(&std::env::current_exe()?, &dir)
+    ensure_running_at(&daemon_exe()?, &dir)
+}
+
+/// The binary a daemon is started from: for the real install (the default state dir) the
+/// canonical one when it exists, never the caller's own: a hook of an old build still running
+/// during an upgrade would otherwise start an old daemon, which then holds the lock against
+/// the new one. A side-by-side state dir (`LIGHTBULB_CONNECT_HOME`) runs the caller's.
+fn daemon_exe() -> Result<PathBuf> {
+    let canonical = dirs::home_dir()
+        .filter(|_| std::env::var_os(paths::HOME_ENV).is_none())
+        .map(|h| cli::canonical(&h))
+        .filter(|p| p.exists());
+    Ok(match canonical {
+        Some(p) => p,
+        None => std::env::current_exe()?,
+    })
 }
 
 /// `ensure_running` for an explicit binary and state dir (tests).

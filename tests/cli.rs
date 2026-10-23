@@ -851,7 +851,7 @@ fn folder_off_hides_sessions_after_reload() {
     assert!(config.to_lowercase().contains(&want), "{config}");
     let o = a.run(&["folder", "/nonexistent/zz", "off"]);
     assert_eq!(o.status.code(), Some(1), "{}{}", out(&o), err(&o));
-    assert_eq!(err(&o).trim(), "no such folder: /nonexistent/zz");
+    assert_eq!(err(&o).trim(), "There is no folder at /nonexistent/zz.");
     // `on` takes it out again however it is spelled.
     let o = a
         .cmd(&["folder", "./sub/", "on"])
@@ -882,4 +882,64 @@ fn folder_off_hides_sessions_after_reload() {
     assert!(o.status.success(), "{}{}", out(&o), err(&o));
     let config = std::fs::read_to_string(a.state.path().join("config.toml")).unwrap();
     assert!(!config.to_lowercase().contains("/gone"), "{config}");
+}
+
+/// With the real install's layout (the default state dir under HOME), a command that starts
+/// the daemon starts it from the canonical binary, not from the binary it runs as: during an
+/// upgrade an old build's hook must not start an old daemon.
+#[test]
+fn the_daemon_starts_from_the_canonical_binary() {
+    let home = tempfile::tempdir().unwrap();
+    let bin = home.path().join(".lightbulb/connect/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let canonical = bin.join("lightbulb-connect");
+    let marker = home.path().join("started");
+    std::fs::write(
+        &canonical,
+        format!(
+            "#!/bin/sh\necho canonical >> '{}'\nexec '{EXE}' \"$@\"\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&canonical, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let o = Command::new(EXE)
+        .arg("who")
+        .env_remove("LIGHTBULB_CONNECT_HOME")
+        .env("HOME", home.path())
+        .env("LIGHTBULB_CONNECT_CLAUDE_HOME", home.path())
+        .env("LIGHTBULB_CONNECT_NO_LAUNCHCTL", "1")
+        .env("LIGHTBULB_CONNECT_DIALOG", "")
+        .env_remove("LIGHTBULB_CONNECT_HOOK_CALLER")
+        .output()
+        .unwrap();
+    let sock = home.path().join(".lightbulb/connect/sock");
+    if let Ok(mut s) = std::os::unix::net::UnixStream::connect(&sock) {
+        use std::io::{Read, Write};
+        let _ = writeln!(s, r#"{{"id":1,"op":"shutdown"}}"#);
+        let _ = s.read(&mut [0; 64]);
+    }
+    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "canonical\n");
+}
+
+/// `daemon --install` (and so `setup`) stops the daemon that runs now, and waits for it to
+/// exit, before it loads the job: a daemon launchd did not start would hold the lock.
+#[test]
+fn install_stops_the_running_daemon_first() {
+    let e = Env::new();
+    assert!(e.run(&["who"]).status.success());
+    let pid: i32 = std::fs::read_to_string(e.state.path().join("daemon.lock"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let o = e.run(&["daemon", "--install"]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert_ne!(
+        unsafe { libc::kill(pid, 0) },
+        0,
+        "the old daemon still runs"
+    );
 }

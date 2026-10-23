@@ -266,3 +266,52 @@ fn a_computer_outside_the_roster_is_told_so() {
     assert_eq!(o.status.code(), Some(1));
     assert_eq!(err(&o).trim(), "This computer is not in the network.");
 }
+
+#[test]
+fn policy_takes_a_teammates_name_and_lists_names() {
+    let e = Env::new();
+    e.seed(false);
+    let o = e.run(&["policy", "aden", "hold"]);
+    assert!(o.status.success(), "{}", err(&o));
+    let team = e.ask(json!({"id": 1, "op": "team.get"}));
+    let aden = team["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["name"] == "aden")
+        .unwrap()
+        .clone();
+    let line = format!(
+        "Messages from aden ({}): held for your Allow.",
+        aden["short"].as_str().unwrap()
+    );
+    assert!(out(&o).contains(&line), "{}", out(&o));
+    // Stored under aden's person id, the one `decide` looks up.
+    let p = e.ask(json!({"id": 1, "op": "policy.get"}));
+    assert_eq!(
+        p["people"][aden["person_id"].as_str().unwrap()],
+        "hold",
+        "{p}"
+    );
+    // By its short too, in any case for the name.
+    assert!(e.run(&["policy", "ADEN", "accept"]).status.success());
+    let short = aden["short"].as_str().unwrap();
+    assert!(e.run(&["policy", short, "refuse"]).status.success());
+    let o = e.run(&["policy", "nobody", "hold"]);
+    assert_eq!(o.status.code(), Some(1));
+    let e2 = err(&o);
+    assert!(
+        e2.starts_with("No teammate called \"nobody\". Teammates: ")
+            && e2.contains("prasiddha")
+            && e2.contains("aden")
+            && e2.trim_end().ends_with("(see lightbulb-connect team)."),
+        "{e2}"
+    );
+    // A workspace id stays as given; any other id no member has is refused by the daemon.
+    assert!(e.run(&["policy", "ws:w1", "accept"]).status.success());
+    let r = common::person(
+        &e,
+        json!({"id": 1, "op": "policy.set", "person_id": "aden", "value": "hold"}),
+    );
+    assert_eq!(r["error"], "not_found", "{r}");
+}

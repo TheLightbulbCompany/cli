@@ -185,12 +185,9 @@ enum Command {
     /// Run by an agent's hook config: `hook <claude|codex|cursor|grok> <session-start|user-prompt-submit|post-tool-use|stop|session-end>`.
     ///
     /// Always exits 0; errors go to stderr.
-    /// Debug builds only: LIGHTBULB_CONNECT_HOOK_CALLER=<pid>:<birth_micros> names the calling agent (tests).
     #[command(hide = true)]
     Hook { agent: String, event: String },
     /// Run the stdio MCP server an agent talks to (find_sessions, send_message, ...).
-    ///
-    /// Debug builds only: LIGHTBULB_CONNECT_HOOK_CALLER=<pid>:<birth_micros> names the calling agent (tests).
     #[command(hide = true)]
     Mcp {
         /// The name this server advertises: the one its MCP entry was installed under.

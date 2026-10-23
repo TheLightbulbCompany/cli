@@ -345,3 +345,49 @@ async fn two_members_on_one_computer_find_each_other() {
     let log = std::fs::read_to_string(a.state.path().join("daemon.log")).unwrap();
     assert_eq!(lan == "blocked", log.contains("Local Network"), "{log}");
 }
+
+/// A removed member is told: its `team` says so, it is on its own network again, and mail it
+/// still had queued for the team is refused (`not_member`) at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn removed_member_is_told() {
+    let (a, b) = (Env::new(), Env::new());
+    seed_pair(&a, &b);
+    // B never hears an ack, so its mail to A stays queued.
+    let drop_acks = ("LIGHTBULB_CONNECT_DEBUG_DROP_ACKS", "1".to_string());
+    b.daemon(true, "", &[drop_acks]);
+    a.daemon(true, "", &[]);
+    until(15, "both online", || {
+        a.status()["peers"]["online"] == 1 && b.status()["peers"]["online"] == 1
+    });
+    let (sa, sb) = (common::session(&a, "a1"), common::session(&b, "b1"));
+    b.send(&sb, &sa, "queued at removal", "r1", None);
+    assert_eq!(b.state(&sb, "r1"), "queued");
+
+    let o = a.detached(&[EXE, "remove", "bob"], "");
+    assert!(o.status.success(), "{}", common::err(&o));
+    until(10, "B is on its own network", || {
+        b.ask(json!({"id": 1, "op": "team.get"}))["members"]
+            .as_array()
+            .is_some_and(|m| m.len() == 1)
+    });
+    let r = b.receipt(&sb, "r1");
+    assert_eq!(
+        (&r["state"], &r["reason"]),
+        (&json!("refused"), &json!("not_member")),
+        "{r}"
+    );
+    let o = b.detached(&[EXE, "team"], "");
+    let text = common::out(&o);
+    let today = &lightbulb_connect::date::utc(common::now_s())[..10];
+    let line = format!(
+        "You were removed from \"acme\" by {} on {today}. This computer is on its own network again.",
+        a.ask(json!({"id": 1, "op": "team.get"}))["members"][0]["name"].as_str().unwrap()
+    );
+    assert!(text.starts_with(&line), "{text}");
+    let log = std::fs::read_to_string(b.state.path().join("daemon.log")).unwrap();
+    assert_eq!(
+        log.matches("net: removed from \"acme\"").count(),
+        1,
+        "{log}"
+    );
+}

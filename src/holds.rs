@@ -658,7 +658,11 @@ fn run(id: u64, op: &str, body: &Value, d: &Arc<Daemon>) -> Result<Response> {
                 let r = &team.roster;
                 match r.members.values().find(|m| m.person_id == pid) {
                     Some(m) => policy::set(&store, r, me, m, v, "local", now)?,
-                    None => policy::set_person(&store, pid, v, "local", now)?,
+                    None if pid.starts_with("ws:") => {
+                        policy::set_person(&store, pid, v, "local", now)?
+                    }
+                    // Nobody `decide` would look up: stored, it would be inert.
+                    None => return Ok(Response::err(id, NOT_FOUND)),
                 }
             }
             Response::ok(id, json!(Policy::load(&store)?))

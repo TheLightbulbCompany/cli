@@ -726,10 +726,18 @@ impl Net {
             }
         };
         if let Some((code, reason)) = refused {
-            conn.close(VarInt::from_u32(code), reason);
             if code == NOT_MEMBER {
                 eprintln!("net: refused {} (not a member)", short(&key));
+                // A removed member that dials in hears of it first (`tell_removed`).
+                let r = d.team.lock().unwrap().roster.clone();
+                let gone = r.log().iter().any(|(_, e)| {
+                    e.kind == roster::Kind::Remove && e.body["member"] == key.as_str()
+                });
+                if gone && !outgoing {
+                    return tell_removed(conn, r).await;
+                }
             }
+            conn.close(VarInt::from_u32(code), reason);
             return;
         }
         let streams = if outgoing {
@@ -781,10 +789,19 @@ impl Net {
                 _ = viewers => {}
             }
         }
+        // A member that refuses us on a live link has likely removed us: dial it again at
+        // once, so its answer (`tell_removed`) comes now, not at the next redial. Only after a
+        // live link, so a member that keeps refusing is not redialed in a loop.
+        let refused = d.peers.speaks_ours(&key, &conn)
+            && matches!(conn.close_reason(), Some(iroh::endpoint::ConnectionError::ApplicationClosed(c))
+                if c.error_code == VarInt::from_u32(NOT_MEMBER));
         d.peers.forget(&key, &conn);
         crate::presence::seen(d, &key);
         conn.close(VarInt::from_u32(0), b"");
         eprintln!("net: disconnected {}", short(&key));
+        if refused && d.team.lock().unwrap().roster.members.contains_key(&key) {
+            Box::pin(self.clone().dial(key)).await;
+        }
     }
 
     /// Handles one frame from `key`; `false` once the peer speaks another protocol.
@@ -1067,6 +1084,32 @@ fn hello(r: &Roster, protocol: u32) -> Frame {
         protocol,
         heads: r.heads.clone(),
     }
+}
+
+/// Answers a removed member's `hello` with the roster pages it lacks, the removal among them,
+/// then refuses it: its install of them tells it it was removed (`net_ops::install`), and it
+/// closes. Its `hello` is awaited 1 s, its close 3 s; the refusal follows whatever happened.
+async fn tell_removed(conn: Connection, r: Roster) {
+    let hello = async {
+        let (send, mut recv) = conn.accept_bi().await.ok()?;
+        match frames::read(&mut recv).await.ok()? {
+            Frame::Hello { heads, .. } => Some((send, heads)),
+            _ => None,
+        }
+    };
+    let told = async {
+        let (mut send, heads) = tokio::time::timeout(Duration::from_secs(1), hello)
+            .await
+            .ok()??;
+        for f in pages(delta(&r, &heads)) {
+            frames::write(&mut send, &f).await.ok()?;
+        }
+        tokio::time::timeout(Duration::from_secs(3), conn.closed())
+            .await
+            .ok()
+    };
+    told.await;
+    conn.close(VarInt::from_u32(NOT_MEMBER), b"not a member");
 }
 
 /// Queues on `tx` the `roster` pages of what `heads` lacks (`memo` keeps them by heads); with
