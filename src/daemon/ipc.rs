@@ -3,7 +3,7 @@
 use super::Daemon;
 use crate::sessions::{self, Key};
 use crate::store;
-use crate::{admission, frame, label, mail, presence};
+use crate::{admission, frame, label, mail, outbox, presence};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::os::fd::AsRawFd;
@@ -183,8 +183,16 @@ async fn handle(
         "send" => send(id, &req.body, daemon),
         "receipt" => match (req.body["from"].as_str(), req.body["request_id"].as_str()) {
             (Some(from), Some(rid)) => {
-                match mail::receipt(&daemon.store.lock().unwrap(), &Key(from.into()), rid) {
-                    Ok(Some(r)) => Response::ok(id, json!({ "receipt": r })),
+                let team = daemon.team.lock().unwrap();
+                let store = daemon.store.lock().unwrap();
+                let from = Key(from.into());
+                match mail::receipt(&store, &from, rid) {
+                    Ok(Some(mut r)) => {
+                        if let Ok(Some(to)) = mail::recipient(&store, &from, rid) {
+                            locate(daemon, &team.roster, &to, &mut r);
+                        }
+                        Response::ok(id, json!({ "receipt": r }))
+                    }
                     Ok(None) => Response::err(id, NOT_FOUND),
                     Err(_) => Response::err(id, INTERNAL),
                 }
@@ -225,6 +233,7 @@ async fn handle(
             },
             None => Response::err(id, BAD_REQUEST),
         },
+        "team.leave" => super::net_ops::leave(id, daemon, peer_pid).await,
         op => super::net_ops::handle(id, op, &req.body, daemon, peer_pid),
     }
 }
@@ -436,11 +445,13 @@ pub fn now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// `send {from, to?, text, request_id, reply_to?}` -> `{receipt}`; `to` may be left out only
-/// with `reply_to` (the reply goes to the parent's sender). `to` follows
+/// `send {from, to?, text, request_id, reply_to?, kind?}` -> `{receipt}`; `to` may be left out
+/// only with `reply_to` (the reply goes to the parent's sender). `to` follows
 /// `sessions::qualify` (a bare name is this member's; anything else, groups included, is
-/// refused with reason `bad_address`). Mail for a Claude or Codex session is then pushed into
-/// it (`super::deliver`), if its tier is `push`.
+/// refused with reason `bad_address`). `kind` is `message` (the default) or `unsupported`.
+/// Mail for a session here is stored, then pushed into a Claude or Codex session
+/// (`super::deliver`) if its tier is `push`; mail under another member's prefix goes to the
+/// outbox (`queued`, `where` that member's computer), `not_member` for a prefix no member has.
 fn send(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
     let (Some(from), Some(text), Some(rid)) = (
         body["from"].as_str(),
@@ -449,6 +460,11 @@ fn send(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
     ) else {
         return Response::err(id, BAD_REQUEST);
     };
+    match body.get("kind") {
+        None | Some(Value::Null) => {}
+        Some(k) if k == "message" => {}
+        Some(_) => return Response::err(id, UNSUPPORTED),
+    }
     let reply_to = body["reply_to"].as_str();
     let to = match body["to"].as_str() {
         Some(t) => match sessions::qualify(&daemon.identity.short, t) {
@@ -459,28 +475,68 @@ fn send(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
         None => return Response::err(id, BAD_REQUEST),
     };
     let from = Key(from.into());
-    let (sent, to) = {
-        let store = daemon.store.lock().unwrap();
-        let sent = mail::send(&store, &from, to.as_ref(), text, rid, reply_to, now());
-        (sent, mail::recipient(&store, &from, rid).ok().flatten())
+    let team = daemon.team.lock().unwrap();
+    let store = daemon.store.lock().unwrap();
+    let prepared = match mail::prepare(&store, &from, to.as_ref(), text, rid, reply_to, now()) {
+        Ok(p) => p,
+        Err(_) => return Response::err(id, INTERNAL),
     };
+    let p = match prepared {
+        Ok(p) => p,
+        Err(mut r) => {
+            if let Ok(Some(to)) = mail::recipient(&store, &from, rid) {
+                locate(daemon, &team.roster, &to, &mut r);
+            }
+            return Response::ok(id, json!({ "receipt": r }));
+        }
+    };
+    let prefix = sessions::split_addr(&p.to.0).map_or("", |(m, _)| m);
+    if prefix != daemon.identity.short {
+        let Some(member) = team.roster.members.values().find(|m| m.short == prefix) else {
+            return Response::err(id, super::net_ops::NOT_MEMBER);
+        };
+        return match outbox::enqueue(&store, p, member) {
+            Ok(r) => {
+                daemon.peers.outbox.notify_one();
+                Response::ok(id, json!({ "receipt": r }))
+            }
+            Err(_) => Response::err(id, INTERNAL),
+        };
+    }
+    drop(team);
+    let sent = mail::store_local(&store, &p);
+    drop(store);
+    let to = p.to;
     match sent {
         Ok(receipt) => {
             if receipt.state == mail::State::Stored {
-                daemon.mail.notify_waiters();
-                let push = |t: &String| {
-                    matches!(
-                        frame::Sender::of("", t),
-                        frame::Sender::Agent("claude" | "codex")
-                    )
-                };
-                if let Some(to) = to.filter(push) {
-                    tokio::spawn(super::deliver(daemon.clone(), Key(to)));
-                }
+                stored(daemon, &to);
             }
             Response::ok(id, json!({ "receipt": receipt }))
         }
         Err(_) => Response::err(id, INTERNAL),
+    }
+}
+
+/// Mail was stored for `to` here: a waiting `inbox` looks again, and a Claude or Codex
+/// session is pushed it (`super::deliver`) if its tier is `push`.
+pub(crate) fn stored(daemon: &Arc<Daemon>, to: &Key) {
+    daemon.mail.notify_waiters();
+    if matches!(
+        frame::Sender::of("", &to.0),
+        frame::Sender::Agent("claude" | "codex")
+    ) {
+        tokio::spawn(super::deliver(daemon.clone(), to.clone()));
+    }
+}
+
+/// A receipt for mail to `to` under another member's prefix is `where` that member's computer.
+fn locate(daemon: &Daemon, roster: &crate::roster::Roster, to: &str, r: &mut mail::Receipt) {
+    let prefix = sessions::split_addr(to).map_or("", |(m, _)| m);
+    if prefix != daemon.identity.short {
+        if let Some(m) = roster.members.values().find(|m| m.short == prefix) {
+            r.where_ = Some(m.computer.clone());
+        }
     }
 }
 

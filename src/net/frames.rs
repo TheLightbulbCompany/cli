@@ -4,6 +4,8 @@
 use crate::daemon::{ipc, Daemon};
 use crate::doing::TEXT_MAX;
 use crate::frame::Sender;
+use crate::mail::State;
+use crate::outbox;
 use crate::roster::{Entry, Member};
 use crate::sessions::Tier;
 use crate::{presence, sessions, Result};
@@ -11,6 +13,16 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const MAX_FRAME: usize = 1 << 20;
+
+/// The reasons a peer may give for `refused`.
+pub const REASONS: [&str; 6] = [
+    "loop",
+    "policy",
+    "declined",
+    "not_member",
+    "request_id_reused",
+    "unsupported",
+];
 
 /// A session as a peer publishes it (Task 7).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -207,11 +219,18 @@ pub async fn read(recv: &mut (impl AsyncRead + Unpin)) -> Result<Frame> {
 /// The one per-frame check on what a member sends. `roster` entries are checked by
 /// `roster::accept` itself. A `presence` is the peer's own: at most `presence::MAX` of each
 /// list, every session `Remote::valid` for it and every address under its prefix, a `seq` at
-/// most a day ahead of now. Tasks 8 and 14 add the rules for the frames they serve, and until
-/// then every other kind is dropped.
-pub fn from_peer_ok(f: &Frame, peer: &Member, _daemon: &Daemon) -> bool {
+/// most a day ahead of now. An `envelope` is checked by `mail::receive`. An `ack` or `receipt`
+/// names a state past `queued` and a known refusal reason, for an envelope that went to this
+/// member (`outbox::bound`). Task 14 adds the rules for the frames it serves, and until then
+/// every other kind is dropped.
+pub fn from_peer_ok(f: &Frame, peer: &Member, daemon: &Daemon) -> bool {
     match f {
-        Frame::Hello { .. } | Frame::Roster { .. } => true,
+        Frame::Hello { .. } | Frame::Roster { .. } | Frame::Envelope { .. } => true,
+        Frame::Ack { id, state, reason } | Frame::Receipt { id, state, reason } => {
+            State::parse(state).is_ok_and(|s| s != State::Queued)
+                && reason.as_deref().is_none_or(|r| REASONS.contains(&r))
+                && outbox::bound(&daemon.store.lock().unwrap(), id, &peer.key).unwrap_or(false)
+        }
         Frame::Presence {
             member,
             seq,

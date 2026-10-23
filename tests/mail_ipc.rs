@@ -145,7 +145,12 @@ async fn mail_arriving_after_a_waiting_inbox_hung_up_stays_in_the_mailbox() {
     tokio::spawn(async move { daemon::run(&home).await.unwrap() });
     let sock = dir.path().join(paths::SOCKET);
     let (mut l, mut w) = connect(&sock).await;
-    let key = "x/codex:gone-reader";
+    // An address here: mail under another member's prefix goes to the outbox.
+    let short = call(&mut l, &mut w, json!({"id": 1, "op": "status"})).await["member_key_short"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let key = format!("{short}/codex:gone-reader");
 
     // A reader waits, then hangs up before anything arrives.
     let (l2, mut w2) = connect(&sock).await;
@@ -234,8 +239,12 @@ async fn a_peer_hanging_up_as_mail_arrives_never_loses_the_message() {
     tokio::spawn(async move { daemon::run(&home).await.unwrap() });
     let sock = dir.path().join(paths::SOCKET);
     let (mut l, mut w) = connect(&sock).await;
+    let short = call(&mut l, &mut w, json!({"id": 1, "op": "status"})).await["member_key_short"]
+        .as_str()
+        .unwrap()
+        .to_string();
     for i in 0..50 {
-        let key = format!("x/codex:race{i}");
+        let key = format!("{short}/codex:race{i}");
         let (r2, mut w2) = connect(&sock).await;
         let req = json!({"id": 1, "op": "inbox", "key": key, "wait_secs": 30});
         w2.write_all(format!("{req}\n").as_bytes()).await.unwrap();

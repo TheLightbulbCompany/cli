@@ -472,6 +472,9 @@ pub fn leave() -> Result<i32> {
         return refuse(&r, &[("founder_must_transfer", text.to_string())], "leave");
     }
     println!("Left \"{name}\". This computer is on its own network again.");
+    if r["told"] == false {
+        println!("Could not tell the team; they will see you gone when you are removed.");
+    }
     Ok(0)
 }
 

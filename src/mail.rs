@@ -1,5 +1,8 @@
 //! Messages, the mailbox, receipts and the loop limit. Time is passed in (`now`, unix seconds).
 
+use crate::net::frames::Frame;
+use crate::policy::{self, Verdict};
+use crate::roster::{Member, MemberKind, Roster};
 use crate::sessions::{self, Key};
 use crate::store::{Message, Store};
 use crate::Result;
@@ -15,6 +18,8 @@ pub const HOLD_S: u64 = 86_400;
 pub const HELD_S: u64 = 604_800;
 pub const MAX_TEXT: usize = 65_536;
 pub const MAX_REQUEST_ID: usize = 128;
+/// A message `MAX_HOPS` agent replies deep is refused `loop`: a person must speak.
+pub const MAX_HOPS: i64 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -29,7 +34,7 @@ pub enum State {
 }
 
 impl State {
-    fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             State::Queued => "queued",
             State::Stored => "stored",
@@ -41,7 +46,7 @@ impl State {
         }
     }
 
-    fn parse(s: &str) -> Result<State> {
+    pub fn parse(s: &str) -> Result<State> {
         Ok(match s {
             "queued" => State::Queued,
             "stored" => State::Stored,
@@ -55,7 +60,7 @@ impl State {
     }
 
     /// Receipts only move to a higher rank.
-    fn rank(self) -> u8 {
+    pub fn rank(self) -> u8 {
         match self {
             State::Queued => 0,
             State::Held => 1,
@@ -93,8 +98,9 @@ fn live(store: &Store, key: &str) -> bool {
         .is_some_and(|(pid, birth)| sessions::alive(pid, birth))
 }
 
-/// Writes `state` only if it is later than the stored one.
-fn advance(
+/// Writes `state` only if it is later than the stored one, and tells the senders of `net:`
+/// mail what changed (`tell_senders`).
+pub(crate) fn advance(
     conn: &Connection,
     from: &str,
     request_id: &str,
@@ -123,6 +129,39 @@ fn advance(
             conn.execute(
                 "INSERT OR REPLACE INTO receipts VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![from, request_id, state.name(), reason, now as i64],
+            )?;
+        }
+        tell_senders(conn)?;
+    }
+    Ok(())
+}
+
+/// Queues a `Receipt` (`receipt_out`) for each message from a peer whose receipt moved past
+/// what its sender was told (`seen_ids.state`), and notes it told them.
+// ponytail: scans every `seen_ids` row (7 days of mail from peers) per state change; key it by
+// message if that grows.
+fn tell_senders(conn: &Connection) -> Result<()> {
+    let rows: Vec<(String, String, String, Option<String>, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT s.sender, s.envelope_id, r.state, r.reason, s.state FROM seen_ids s \
+             JOIN messages m ON m.id = s.envelope_id \
+             JOIN receipts r ON r.from_key = m.from_key AND r.request_id = m.request_id \
+             WHERE r.state != s.state",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for (sender, id, state, reason, told) in rows {
+        if State::parse(&state)?.rank() > State::parse(&told)?.rank() {
+            conn.execute(
+                "INSERT OR REPLACE INTO receipt_out VALUES (?1, ?2, ?3, ?4)",
+                params![sender, id, state, reason],
+            )?;
+            conn.execute(
+                "UPDATE seen_ids SET state = ?3 WHERE sender = ?1 AND envelope_id = ?2",
+                params![sender, id, state],
             )?;
         }
     }
@@ -191,17 +230,36 @@ fn refuse(
     })
 }
 
-/// Stores `text` for `to`; with no `to`, for the sender of the `reply_to` message (refused
-/// `no_recipient`, nothing stored, when that is unknown). Thread and hops: with `reply_to` (a message id or request id the store
-/// knows) the message takes that message's thread and its hops + 1. Without it, the trigger is the
-/// message delivered (or read) TO `from` most recently, if that was within `LOOP_WINDOW_S`: hops = trigger.hops + 1, and
-/// the thread is the trigger's if `to` is the trigger's sender, else a new one. No trigger: hops 0,
-/// new thread. (Forwarding to a third session therefore cannot reset the agent-chain count.)
-/// A `request_id` must match `[A-Za-z0-9._-]{1,128}`, else `Refused` (`bad_request_id`, nothing stored).
-/// Retrying a `request_id` that was accepted returns its receipt; one that was
+/// A message decided and ready to store, here (`send`) or in the outbox (`outbox::enqueue`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Prepared {
+    pub message_id: String,
+    pub from: Key,
+    pub to: Key,
+    pub text: String,
+    pub request_id: String,
+    /// The message this answers (resolved from `reply_to`), by id.
+    pub reply_to: Option<String>,
+    pub thread: String,
+    pub hops: i64,
+    pub kind: String,
+    pub sent_at: u64,
+}
+
+/// Decides `from`'s message `request_id` before anything is stored: `Err` with the receipt
+/// when it is refused or already sent. With no `to`, it goes to the sender of the `reply_to`
+/// message (refused `no_recipient`, nothing stored, when that is unknown). Thread and hops:
+/// with `reply_to` (a message id or request id the store knows) the message takes that
+/// message's thread and its hops + 1. Without it, the trigger is the message delivered (or
+/// read) TO `from` most recently, if that was within `LOOP_WINDOW_S`: hops = trigger.hops + 1,
+/// and the thread is the trigger's if `to` is the trigger's sender, else a new one. No trigger:
+/// hops 0, new thread. (Forwarding to a third session therefore cannot reset the agent-chain
+/// count.) A person at a `/terminal` is always hop 0; hops `MAX_HOPS` or more is refused `loop`.
+/// A `request_id` must match `[A-Za-z0-9._-]{1,128}`, else `Refused` (`bad_request_id`, nothing
+/// stored). Retrying a `request_id` that was accepted returns its receipt; one that was
 /// refused (`loop`, `too_long`) is refused again, whatever text comes with the retry, because a
 /// refusal stores no `to`/`text`. Clients mint a new `request_id` after any refusal.
-pub fn send(
+pub fn prepare(
     store: &Store,
     from: &Key,
     to: Option<&Key>,
@@ -209,20 +267,18 @@ pub fn send(
     request_id: &str,
     reply_to: Option<&str>,
     now: u64,
-) -> Result<Receipt> {
+) -> Result<std::result::Result<Prepared, Receipt>> {
     let conn = store.conn();
-    let ok_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-');
-    if request_id.is_empty()
-        || request_id.len() > MAX_REQUEST_ID
-        || !request_id.chars().all(ok_char)
-    {
-        // Nothing safe to key a receipt on.
-        return Ok(Receipt {
+    let unstored = |reason: &str| {
+        Ok(Err(Receipt {
             request_id: request_id.into(),
             state: State::Refused,
-            reason: Some("bad_request_id".into()),
+            reason: Some(reason.into()),
             where_: None,
-        });
+        }))
+    };
+    if !sessions::word(request_id, MAX_REQUEST_ID) {
+        return unstored("bad_request_id"); // nothing safe to key a receipt on
     }
     // The message this answers: a message id, or a request id `from` received.
     let parent: Option<(String, Option<String>, i64, String)> = match reply_to {
@@ -240,17 +296,9 @@ pub fn send(
     let to = match (to, &parent) {
         (Some(t), _) => t.clone(),
         (None, Some((_, _, _, sender))) => Key(sender.clone()),
-        (None, None) => {
-            // Not persisted: a later message may make this reply_to known.
-            return Ok(Receipt {
-                request_id: request_id.into(),
-                state: State::Refused,
-                reason: Some("no_recipient".into()),
-                where_: None,
-            });
-        }
+        // Not persisted: a later message may make this reply_to known.
+        (None, None) => return unstored("no_recipient"),
     };
-    let to = &to;
     if let Some((old_to, old_text)) = conn
         .query_row(
             "SELECT to_key, body FROM messages WHERE from_key = ?1 AND request_id = ?2",
@@ -261,20 +309,17 @@ pub fn send(
     {
         if old_to != to.0 || old_text != text {
             // Not persisted: the original's receipt must stay as it was.
-            return Ok(Receipt {
-                request_id: request_id.into(),
-                state: State::Refused,
-                reason: Some("request_id_reused".into()),
-                where_: None,
-            });
+            return unstored("request_id_reused");
         }
-        return Ok(receipt(store, from, request_id)?.ok_or("message without a receipt")?);
+        return Ok(Err(
+            receipt(store, from, request_id)?.ok_or("message without a receipt")?
+        ));
     }
     if let Some(r) = receipt(store, from, request_id)? {
-        return Ok(r); // an earlier refusal; no message row to compare
+        return Ok(Err(r)); // an earlier refusal; no message row to compare
     }
     if text.len() > MAX_TEXT {
-        return refuse(conn, from, request_id, "too_long", now);
+        return Ok(Err(refuse(conn, from, request_id, "too_long", now)?));
     }
     let since = now.saturating_sub(LOOP_WINDOW_S) as i64;
     let recent: u32 = conn.query_row(
@@ -283,7 +328,7 @@ pub fn send(
         |r| r.get(0),
     )?;
     if recent >= LOOP_LIMIT {
-        return refuse(conn, from, request_id, "loop", now);
+        return Ok(Err(refuse(conn, from, request_id, "loop", now)?));
     }
 
     let id = ulid::Ulid::generate().to_string();
@@ -311,43 +356,256 @@ pub fn send(
             }
         }
     };
+    let person = sessions::split_addr(&from.0).is_some_and(|(_, rest)| rest == "terminal");
+    let hops = if person { 0 } else { hops };
+    if hops >= MAX_HOPS {
+        return Ok(Err(refuse(conn, from, request_id, "loop", now)?));
+    }
+    Ok(Ok(Prepared {
+        message_id: id,
+        from: from.clone(),
+        to,
+        text: text.into(),
+        request_id: request_id.into(),
+        reply_to: parent.map(|(pid, ..)| pid),
+        thread,
+        hops,
+        kind: "message".into(),
+        sent_at: now,
+    }))
+}
+
+/// Writes `p` as `from`'s message with receipt `state`, in the mailbox until `expires` when
+/// given; answering a message read it. The caller holds a transaction.
+pub(crate) fn record(
+    store: &Store,
+    p: &Prepared,
+    state: State,
+    expires: Option<i64>,
+) -> Result<()> {
+    let tx = store.conn();
+    store.put_message(&Message {
+        id: p.message_id.clone(),
+        request_id: p.request_id.clone(),
+        from_key: p.from.0.clone(),
+        to_key: p.to.0.clone(),
+        kind: p.kind.clone(),
+        thread: Some(p.thread.clone()),
+        hops: p.hops,
+        origin: Some("local".into()),
+        body: p.text.clone(),
+        sent_at: p.sent_at as i64,
+    })?;
+    if let Some(expires) = expires {
+        tx.execute(
+            "INSERT INTO mailbox (to_key, message_id, queued_at, expires_at) VALUES (?1, ?2, ?3, ?4)",
+            params![p.to.0, p.message_id, p.sent_at as i64, expires],
+        )?;
+    }
+    advance(tx, &p.from.0, &p.request_id, state, None, p.sent_at)?;
+    if let Some(pid) = &p.reply_to {
+        if store.message(pid)?.is_some_and(|m| m.to_key == p.from.0) {
+            mark_read(store, pid, p.sent_at)?;
+        }
+    }
+    Ok(())
+}
+
+/// Stores `p` here, in its recipient's mailbox; its receipt.
+pub fn store_local(store: &Store, p: &Prepared) -> Result<Receipt> {
     // This member's own name address (`<member>/<name>`, the `listen --as` character rule) is a
     // person's mailbox and never expires; any other non-session address keeps the hold.
-    let own_name = match (from.0.split_once('/'), to.0.split_once('/')) {
+    let own_name = match (p.from.0.split_once('/'), p.to.0.split_once('/')) {
         (Some((a, _)), Some((b, name))) => a == b && sessions::valid_name(name),
         _ => false,
     };
     let expires = if own_name {
         i64::MAX
     } else {
-        (now + HOLD_S) as i64
+        (p.sent_at + HOLD_S) as i64
     };
+    let tx = store.conn().unchecked_transaction()?;
+    record(store, p, State::Stored, Some(expires))?;
+    tx.commit()?;
+    Ok(receipt(store, &p.from, &p.request_id)?.ok_or("receipt missing after write")?)
+}
+
+/// `prepare`, then `store_local`: Plan A's one-computer send.
+pub fn send(
+    store: &Store,
+    from: &Key,
+    to: Option<&Key>,
+    text: &str,
+    request_id: &str,
+    reply_to: Option<&str>,
+    now: u64,
+) -> Result<Receipt> {
+    match prepare(store, from, to, text, request_id, reply_to, now)? {
+        Ok(p) => store_local(store, &p),
+        Err(r) => Ok(r),
+    }
+}
+
+/// What member `peer`'s envelope `env` becomes on this computer (member prefix `me`), checked
+/// in this order: a `from` outside `peer`'s prefix is dropped unanswered (`Err`); a cloud
+/// member's `from` must be a session of its latest presence (`policy`); a `kind` other than
+/// `message`, any `files`, a body over `MAX_TEXT`, or a malformed id or `request_id` is
+/// `unsupported`; a `to` that is not one address is `policy`, one under another prefix
+/// `not_member`; an envelope seen before gets the state it has now and is not delivered again;
+/// a `request_id` reused with another text or recipient is `request_id_reused`; `hops` at
+/// `MAX_HOPS` or more, or the `LOOP_LIMIT`th send in `LOOP_WINDOW_S` from one principal to
+/// `to` (the person for a computer member, the sending session for a cloud member), is `loop`;
+/// then `policy::decide`. Accepted, it is stored for `to` with origin `net:<peer short>`,
+/// timed by its arrival (`now`), and remembered in `seen_ids`.
+pub fn receive(
+    store: &Store,
+    env: &Frame,
+    peer: &Member,
+    roster: &Roster,
+    me: &str,
+    now: u64,
+) -> Result<(State, Option<String>)> {
+    let Frame::Envelope {
+        id,
+        request_id,
+        kind,
+        from,
+        to,
+        thread,
+        hops,
+        body,
+        files,
+        ..
+    } = env
+    else {
+        return Err("not an envelope".into());
+    };
+    let refused = |r: &str| Ok((State::Refused, Some(r.to_string())));
+    let address = |a: &str| sessions::qualify("", a).as_deref() == Some(a);
+    let prefix = |a: &str| sessions::split_addr(a).map(|(m, _)| m.to_string());
+    if !address(from) || prefix(from).as_deref() != Some(peer.short.as_str()) {
+        return Err("an envelope from outside its member's prefix".into());
+    }
+    let conn = store.conn();
+    if peer.kind == MemberKind::Cloud && !advertised(store, &peer.key, from)? {
+        return refused("policy");
+    }
+    if kind != "message"
+        || !files.is_empty()
+        || body.len() > MAX_TEXT
+        || !sessions::word(request_id, MAX_REQUEST_ID)
+        || ulid::Ulid::from_string(id).is_err()
+    {
+        return refused("unsupported");
+    }
+    if !address(to) {
+        return refused("policy");
+    }
+    if prefix(to).as_deref() != Some(me) {
+        return refused("not_member");
+    }
+    if let Some(seen) = conn
+        .query_row(
+            "SELECT state FROM seen_ids WHERE sender = ?1 AND envelope_id = ?2",
+            [&peer.key, id],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+    {
+        return Ok((State::parse(&seen)?, None));
+    }
+    let sender = Key(from.clone());
+    if let Some((old_to, old_body)) = conn
+        .query_row(
+            "SELECT to_key, body FROM messages WHERE from_key = ?1 AND request_id = ?2",
+            [from, request_id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )
+        .optional()?
+    {
+        if old_to != *to || old_body != *body {
+            return refused("request_id_reused");
+        }
+        // The same message under another envelope id: where it is now.
+        let r = receipt(store, &sender, request_id)?.ok_or("message without a receipt")?;
+        return Ok((r.state, r.reason));
+    }
+    if i64::from(*hops) >= MAX_HOPS {
+        return refused("loop");
+    }
+    let since = now.saturating_sub(LOOP_WINDOW_S) as i64;
+    let recent: Vec<(String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT from_key, origin FROM messages WHERE to_key = ?1 AND sent_at > ?2 \
+             AND origin LIKE 'net:%'",
+        )?;
+        let rows = stmt.query_map(params![to, since], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    let same_principal = |(f, origin): &(String, String)| match peer.kind {
+        MemberKind::Cloud => f == from,
+        MemberKind::Computer => roster.members.values().any(|m| {
+            m.person_id == peer.person_id && origin.strip_prefix("net:") == Some(m.short.as_str())
+        }),
+    };
+    if recent.iter().filter(|r| same_principal(r)).count() >= LOOP_LIMIT as usize {
+        return refused("loop");
+    }
+    match policy::decide(store, peer, to) {
+        Verdict::Accept => {}
+        // ponytail: Task 9 stores the hold and asks the person.
+        Verdict::Hold => return Ok((State::Held, None)),
+        Verdict::Refuse => return refused("policy"),
+    }
     let tx = conn.unchecked_transaction()?;
     store.put_message(&Message {
         id: id.clone(),
-        request_id: request_id.into(),
-        from_key: from.0.clone(),
-        to_key: to.0.clone(),
-        kind: "message".into(),
-        thread: Some(thread),
-        hops,
-        origin: Some("local".into()),
-        body: text.into(),
+        request_id: request_id.clone(),
+        from_key: from.clone(),
+        to_key: to.clone(),
+        kind: kind.clone(),
+        thread: Some(thread.clone().unwrap_or_else(|| id.clone())),
+        hops: i64::from(*hops),
+        origin: Some(format!("net:{}", peer.short)),
+        body: body.clone(),
         sent_at: now as i64,
     })?;
     tx.execute(
         "INSERT INTO mailbox (to_key, message_id, queued_at, expires_at) VALUES (?1, ?2, ?3, ?4)",
-        params![to.0, id, now as i64, expires],
+        params![to, id, now as i64, (now + HOLD_S) as i64],
     )?;
-    advance(&tx, &from.0, request_id, State::Stored, None, now)?;
-    // Answering a message read it.
-    if let Some((pid, ..)) = &parent {
-        if store.message(pid)?.is_some_and(|m| m.to_key == from.0) {
-            mark_read(store, pid, now)?;
-        }
-    }
+    tx.execute(
+        "INSERT INTO seen_ids VALUES (?1, ?2, 'stored', ?3)",
+        params![peer.key, id, now as i64],
+    )?;
+    advance(&tx, from, request_id, State::Stored, None, now)?;
     tx.commit()?;
-    Ok(receipt(store, from, request_id)?.ok_or("receipt missing after write")?)
+    Ok((State::Stored, None))
+}
+
+/// Whether `member`'s latest presence (`peers_sessions`) names `address` among its sessions,
+/// `known` or `kept` addresses.
+fn advertised(store: &Store, member: &str, address: &str) -> Result<bool> {
+    let text: Option<String> = store
+        .conn()
+        .query_row(
+            "SELECT presence FROM peers_sessions WHERE member = ?1",
+            [member],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(match text.and_then(|t| serde_json::from_str(&t).ok()) {
+        Some(Frame::Presence {
+            sessions,
+            known,
+            kept,
+            ..
+        }) => {
+            sessions.iter().any(|s| s.session_id == address)
+                || known.iter().chain(&kept).any(|a| a == address)
+        }
+        _ => false,
+    })
 }
 
 /// The messages waiting for `to`, oldest first; each becomes `delivered` and leaves the mailbox.
@@ -427,7 +685,7 @@ pub fn mark_read_for(store: &Store, to: &Key, now: u64) -> Result<()> {
          AND m.from_key = receipts.from_key AND m.request_id = receipts.request_id)",
         params![to.0, now as i64],
     )?;
-    Ok(())
+    tell_senders(store.conn())
 }
 
 pub fn mark_read(store: &Store, message_id: &str, now: u64) -> Result<()> {

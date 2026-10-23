@@ -4,11 +4,14 @@ use super::ipc::{refused, Response, BAD_REQUEST, INTERNAL, NOT_FOUND, UNKNOWN_OP
 use super::{Daemon, TeamState};
 use crate::agents::caller;
 use crate::identity::Identity;
+use crate::net::frames::Frame;
 use crate::roster::{self, Entry, Kind, MemberKind, Role, Roster};
 use crate::store::Store;
 use crate::{os, ticket};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashSet;
+use std::time::Duration;
 
 pub const NOT_ADMIN: &str = "not_admin";
 pub const NOT_FOUNDER: &str = "not_founder";
@@ -55,7 +58,7 @@ fn gate(op: &str, invite: Invite) -> Gate {
     let (person_only, min_role) = match op {
         "team.remove" => (true, Some(Role::Admin)),
         "team.admin" => (true, Some(Role::Founder)),
-        "team.leave" | "team.admit" => (true, None),
+        "team.admit" => (true, None),
         "team.invite" if invite == Invite::Open => (true, Some(Role::Admin)),
         "team.invite" => (false, Some(Role::Member)),
         _ => (false, None),
@@ -123,6 +126,108 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, peer_pid: Option
             Response::ok(id, json!({ "lease_s": crate::dialog::LEASE_S }))
         }
         _ => Response::err(id, UNKNOWN_OP),
+    }
+}
+
+/// How long `team.leave` waits for a peer to take the `leave` entry.
+const TELL_WAIT: Duration = Duration::from_secs(5);
+
+/// `team.leave {}` -> `{name, told}`: writes this computer's `leave` entry and sends it to the
+/// online members, waiting up to 5 s for one to take it (it then drops the connection, as to
+/// any computer no longer a member); `told` is false when none did. Then it forgets the team
+/// and starts this computer's solo network. A founder with other computers in the team and
+/// no admin must transfer first.
+pub async fn leave(id: u64, daemon: &Daemon, peer_pid: Option<u32>) -> Response {
+    if !peer_pid.is_some_and(person_only) {
+        return refused(id, "not_a_person");
+    }
+    let me = daemon.identity.key.clone();
+    let left = {
+        let mut team = daemon.team.lock().unwrap();
+        let store = daemon.store.lock().unwrap();
+        let r = &team.roster;
+        let role = r.members.get(&me).map(|m| m.role);
+        // Cloud members (a person's bridge) do not keep the founder in.
+        let others = r
+            .members
+            .values()
+            .any(|m| m.key != me && m.kind == MemberKind::Computer);
+        let admin = r.members.values().any(|m| m.role == Role::Admin);
+        if role == Some(Role::Founder) && others && !admin {
+            return Response::err(id, FOUNDER_MUST_TRANSFER);
+        }
+        // Alone (or already removed), there is no one to tell.
+        let tell = role.is_some() && !r.is_solo(&me);
+        let (name, root_at) = (r.team_name.clone(), r.created_at);
+        let now = super::ipc::now() as i64;
+        let leave = json!({"member": me});
+        let entry = match role {
+            Some(_) => write(daemon, &mut team, &store, Kind::Leave, leave, now).map(Some),
+            None => Ok(None),
+        };
+        entry.map(|e| (name, root_at, e.filter(|_| tell)))
+    };
+    let (name, root_at, entry) = match left {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("team.leave: {e}");
+            return Response::err(id, INTERNAL);
+        }
+    };
+    let told = match entry {
+        Some(e) => tell(daemon, e).await,
+        None => true,
+    };
+    let mut team = daemon.team.lock().unwrap();
+    let store = daemon.store.lock().unwrap();
+    let mut solo = || -> crate::Result<()> {
+        store.clear_roster()?;
+        // Stamped after the old root, so the new network never repeats its `team_id`.
+        let user = super::user_name();
+        let now = super::ipc::now() as i64;
+        let g = genesis(
+            &daemon.identity,
+            &user,
+            &team.config.computer,
+            &user,
+            now.max(root_at + 1),
+        );
+        roster::accept(&store, &g, now)?;
+        install(daemon, &mut team, &store, roster::replay(&[g]))
+    };
+    match solo() {
+        Ok(()) => Response::ok(id, json!({"name": name, "told": told})),
+        Err(e) => {
+            eprintln!("team.leave: {e}");
+            Response::err(id, INTERNAL)
+        }
+    }
+}
+
+/// Sends `leave` to every online member (and to any that comes online meanwhile) until one
+/// of them drops its connection, as it does once it has applied it: `false` after
+/// `TELL_WAIT` without that.
+async fn tell(daemon: &Daemon, leave: Entry) -> bool {
+    let frame = Frame::Roster {
+        entries: vec![leave],
+        more: false,
+    };
+    let deadline = tokio::time::Instant::now() + TELL_WAIT;
+    let mut sent: HashSet<String> = HashSet::new();
+    loop {
+        let online: HashSet<String> = daemon.peers.online().into_iter().collect();
+        if sent.iter().any(|k| !online.contains(k)) {
+            return true;
+        }
+        for k in online.difference(&sent.clone()) {
+            if daemon.peers.send(k, frame.clone()).is_ok() {
+                sent.insert(k.clone());
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -312,47 +417,12 @@ impl TeamOps<'_> {
                 let link = self.new_link("ask", false)?;
                 Response::ok(id, json!({"name": t.name, "line": ticket::line(&link)}))
             }
-            // `team.leave {}` -> `{name}`: leaves, then starts this computer's solo network.
-            "team.leave" => {
-                // Cloud members (a person's bridge) do not keep the founder in.
-                let others = r
-                    .members
-                    .values()
-                    .any(|m| m.key != me_key && m.kind == MemberKind::Computer);
-                let admin = r.members.values().any(|m| m.role == Role::Admin);
-                if role == Some(Role::Founder) && others && !admin {
-                    return Ok(Response::err(id, FOUNDER_MUST_TRANSFER));
-                }
-                let (name, root_at) = (r.team_name.clone(), r.created_at);
-                // ponytail: the `leave` entry `write` returns is dropped; Task 8 sends it to
-                // peers before the wipe.
-                if role.is_some() {
-                    self.write(Kind::Leave, json!({"member": me_key}))?;
-                }
-                self.store.clear_roster()?;
-                // Stamped after the old root, so the new network never repeats its `team_id`.
-                let user = super::user_name();
-                let g = genesis(
-                    identity,
-                    &user,
-                    &self.team.config.computer,
-                    &user,
-                    self.now.max(root_at + 1),
-                );
-                roster::accept(self.store, &g, self.now)?;
-                self.install(roster::replay(&[g]))?;
-                Response::ok(id, json!({"name": name}))
-            }
             _ => Response::err(id, UNKNOWN_OP),
         })
     }
 
     fn write(&mut self, kind: Kind, body: Value) -> crate::Result<Entry> {
         write(self.daemon, self.team, self.store, kind, body, self.now)
-    }
-
-    fn install(&mut self, new: Roster) -> crate::Result<()> {
-        install(self.daemon, self.team, self.store, new)
     }
 
     /// Mints a link of `mode` off the cached roster (signed into the roster, recorded in

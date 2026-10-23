@@ -7,13 +7,19 @@
 //! in `roster` pages; after every roster change each side pushes that delta against the
 //! peer's last heads and a fresh `hello`. Applied entries go through `roster::accept` and
 //! the daemon's one install (`net_ops::install`), like a local write.
+//!
+//! Mail: an `envelope` is checked and stored by `mail::receive` and answered with an `ack`;
+//! later changes to it go back as `receipt`s. The sender's outbox (`outbox`) is flushed on
+//! each `hello` and every second.
 
 pub mod frames;
 
 use crate::daemon::{ipc, net_ops, Daemon};
-use crate::identity;
+use crate::mail::{self, State};
 use crate::roster::{self, Entry, Roster};
+use crate::sessions::Key;
 use crate::Result;
+use crate::{identity, outbox};
 use frames::Frame;
 use iroh::endpoint::{presets, Connection, VarInt};
 use iroh::{Endpoint, EndpointAddr, PublicKey, SecretKey};
@@ -53,6 +59,10 @@ pub struct Knobs {
     /// How long a join request waits for its person (600 s), or
     /// `LIGHTBULB_NETWORK_DEBUG_JOIN_WAIT_S`.
     pub join_wait: Duration,
+    /// `LIGHTBULB_NETWORK_DEBUG_DROP_ACKS=1`: every `ack` that arrives is dropped.
+    drop_acks: bool,
+    /// How long the outbox keeps trying (`outbox::TTL_S`), or `LIGHTBULB_NETWORK_DEBUG_OUTBOX_S`.
+    outbox_s: u64,
 }
 
 impl Knobs {
@@ -82,6 +92,10 @@ impl Knobs {
             join_wait: var("LIGHTBULB_NETWORK_DEBUG_JOIN_WAIT_S")
                 .and_then(|v| v.parse().ok())
                 .map_or(JOIN_WAIT, Duration::from_secs),
+            drop_acks: var("LIGHTBULB_NETWORK_DEBUG_DROP_ACKS").is_some_and(|v| v == "1"),
+            outbox_s: var("LIGHTBULB_NETWORK_DEBUG_OUTBOX_S")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(outbox::TTL_S),
         }
     }
 
@@ -93,6 +107,8 @@ impl Knobs {
             gate_pause: None,
             dialog: None,
             join_wait: JOIN_WAIT,
+            drop_acks: false,
+            outbox_s: outbox::TTL_S,
         }
     }
 }
@@ -106,6 +122,8 @@ pub struct Peers {
     pub changed: Notify,
     /// Woken (`notify_waiters`) whenever a member says `hello` in our protocol.
     pub connected: Notify,
+    /// Poked when mail joins the outbox.
+    pub outbox: Notify,
     /// The endpoint's UDP port.
     pub port: OnceLock<u16>,
     /// The endpoint, for the candidate side of a join.
@@ -169,7 +187,7 @@ impl Peers {
         (online, outdated)
     }
 
-    /// Queues `f` on `member`'s connection; fails when it has none (the outbox is Task 8).
+    /// Queues `f` on `member`'s connection; fails when it has none.
     pub fn send(&self, member: &str, f: Frame) -> Result<()> {
         let live = self.live.lock().unwrap();
         match live.get(member) {
@@ -295,6 +313,7 @@ impl Net {
         }));
         tokio::spawn(net.clone().accept_loop());
         tokio::spawn(net.clone().keep_up());
+        tokio::spawn(net.clone().flush_loop());
         Ok(net)
     }
 
@@ -336,6 +355,30 @@ impl Net {
             let to_dial = self.refresh(changed);
             for key in to_dial {
                 tokio::spawn(self.clone().dial(key));
+            }
+        }
+    }
+
+    /// Sends what members are owed: on each `hello` every queued envelope of an online member,
+    /// and every second the envelopes due (`outbox::due`'s per-row backoff) and the receipts
+    /// waiting; expires what waited too long, here and in the outbox.
+    // ponytail: a 1 s poll (two small queries) picks up receipts that mail state changes queue;
+    // wake it from `mail` if that ever shows.
+    async fn flush_loop(self) {
+        let d = &self.0.daemon;
+        loop {
+            // Armed before the flush, so a `hello` during it is not missed.
+            let connected = d.peers.connected.notified();
+            tokio::pin!(connected);
+            connected.as_mut().enable();
+            let all = tokio::select! {
+                _ = &mut connected => true,
+                _ = d.peers.outbox.notified() => false,
+                _ = tokio::time::sleep(Duration::from_secs(1)) => false,
+                _ = self.0.endpoint.closed() => return,
+            };
+            if let Err(e) = flush(d, all) {
+                eprintln!("net: outbox: {e}");
             }
         }
     }
@@ -483,7 +526,7 @@ impl Net {
         let short = peer.short.clone();
         let mut synced = false;
         let mut hello_ok = false;
-        let mut presence = None;
+        let (mut presence, mut envelope, mut answer) = (None, None, None);
         if !frames::from_peer_ok(&f, peer, d) {
             eprintln!("net: dropped a {} frame from {short}", f.kind());
         } else if let Frame::Hello { protocol: p, heads } = f {
@@ -509,6 +552,12 @@ impl Net {
             }
         } else if matches!(f, Frame::Presence { .. }) {
             presence = Some(f);
+        } else if matches!(f, Frame::Envelope { .. }) {
+            envelope = Some(f);
+        } else if matches!(f, Frame::Ack { .. }) && d.peers.knobs().drop_acks {
+            eprintln!("net: dropped an ack from {short} (debug)");
+        } else if let Frame::Ack { id, state, reason } | Frame::Receipt { id, state, reason } = f {
+            answer = Some((id, state, reason));
         }
         // Waiting entries are retried after each sync, and when the roster changed: another
         // connection may have brought their parents.
@@ -526,6 +575,17 @@ impl Net {
             let first = !std::mem::replace(&mut sync.presence_stored, true);
             crate::presence::put(d, key, &p, ipc::now(), first);
         }
+        if let Some(env) = envelope.filter(|_| d.peers.speaks_ours(key, conn)) {
+            receive(d, key, &env, tx);
+        }
+        if let Some((id, state, reason)) = answer {
+            let store = d.store.lock().unwrap();
+            let state = State::parse(&state).expect("checked by from_peer_ok");
+            match outbox::acked(&store, key, &id, state, reason.as_deref(), ipc::now()) {
+                Ok(_) => eprintln!("net: {id} at {short}: {}", state.name()),
+                Err(e) => eprintln!("net: {id} at {short}: {e}"),
+            }
+        }
         if due {
             match apply(d, &mut sync.pending, &short) {
                 Ok(heads) => sync.tried = heads,
@@ -534,6 +594,66 @@ impl Net {
         }
         true
     }
+}
+
+/// Member `key`'s envelope: checked and stored (`mail::receive`), answered with an `ack`.
+/// One whose `from` is not the member's own is dropped unanswered.
+fn receive(d: &Arc<Daemon>, key: &str, env: &Frame, tx: &mpsc::UnboundedSender<Frame>) {
+    let Frame::Envelope { id, to, .. } = env else {
+        return;
+    };
+    let team = d.team.lock().unwrap();
+    let Some(peer) = team.roster.members.get(key) else {
+        return;
+    };
+    let short = &peer.short;
+    let store = d.store.lock().unwrap();
+    let me = &d.identity.short;
+    match mail::receive(&store, env, peer, &team.roster, me, ipc::now()) {
+        Ok((state, reason)) => {
+            eprintln!("net: envelope {id} from {short}: {}", state.name());
+            let _ = tx.send(Frame::Ack {
+                id: id.clone(),
+                state: state.name().into(),
+                reason,
+            });
+            if state == State::Stored {
+                drop((store, team));
+                ipc::stored(d, &Key(to.clone()));
+            }
+        }
+        Err(e) => eprintln!("net: dropped envelope {id} from {short}: {e}"),
+    }
+}
+
+/// One flush (`Net::flush_loop`): with `all`, every queued envelope of an online member,
+/// whatever its backoff.
+fn flush(d: &Daemon, all: bool) -> Result<()> {
+    let now = ipc::now();
+    let online: HashSet<String> = d.peers.online().into_iter().collect();
+    let store = d.store.lock().unwrap();
+    mail::expire(&store, now)?;
+    outbox::expire(&store, now, d.peers.knobs().outbox_s)?;
+    let due = outbox::due(&store, if all { u64::MAX } else { now })?;
+    for (member, f) in due.into_iter().filter(|(m, _)| online.contains(m)) {
+        let Frame::Envelope { id, .. } = &f else {
+            continue;
+        };
+        let id = id.clone();
+        if d.peers.send(&member, f).is_ok() {
+            outbox::sent(&store, &id, now)?;
+        }
+    }
+    for (member, f) in outbox::receipts(&store)? {
+        let Frame::Receipt { id, state, .. } = &f else {
+            continue;
+        };
+        let (id, state) = (id.clone(), state.clone());
+        if online.contains(&member) && d.peers.send(&member, f).is_ok() {
+            outbox::told(&store, &member, &id, &state)?;
+        }
+    }
+    Ok(())
 }
 
 /// Accepts the waiting entries whose parents are known, in order, until none is left that
