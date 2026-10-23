@@ -2,7 +2,7 @@
 //! on change; the latest from each member (in memory, `peers_sessions` its copy across
 //! restarts); and the `directory` op that merges both.
 
-use crate::daemon::{ipc, Daemon};
+use crate::daemon::{ipc, Daemon, Declared};
 use crate::mail;
 use crate::net::frames::{Frame, Remote, STATUSES};
 use crate::roster::{Member, MemberKind, Role, Roster};
@@ -119,7 +119,7 @@ pub(crate) fn canonical(p: &Path) -> PathBuf {
 /// An embedded instance's is the sessions it declared (`declared`).
 fn build(d: &Daemon, seq: u64) -> Frame {
     if let Some(c) = &d.cloud {
-        return declared(d, &c.sessions.lock().unwrap(), seq);
+        return declared(d, &c.declared(), seq);
     }
     let now = ipc::now();
     let (share, off) = {
@@ -230,36 +230,21 @@ fn stamp(f: &mut Frame) {
 
 /// An embedded instance's presence: the sessions it declared (`cloud.sessions.set`), nothing
 /// else.
-fn declared(d: &Daemon, sessions: &[Remote], seq: u64) -> Frame {
+fn declared(d: &Daemon, list: &Declared, seq: u64) -> Frame {
     Frame::Presence {
         member: d.identity.key.clone(),
         seq,
-        sessions: sessions.to_vec(),
+        sessions: list.sessions.to_vec(),
         known: vec![],
         kept: vec![],
     }
 }
 
-/// Builds an instance's presence now and queues it to every online member (`cloud.sessions.
-/// set`, which answers only after): built, stamped and queued under the list's lock, so a
-/// send of an older list (`run`) cannot carry a later seq.
-pub fn publish(d: &Daemon) {
-    let Some(c) = &d.cloud else {
-        return d.presence.notify_one();
-    };
-    let list = c.sessions.lock().unwrap();
-    let mut f = declared(d, &list, 0);
-    *d.built.lock().unwrap() = Some(f.clone());
-    stamp(&mut f);
-    for m in d.peers.online() {
-        let _ = d.peers.send(&m, f.clone());
-    }
-}
-
-/// The sender: on a local change (`Daemon::presence`, coalesced over 250 ms) or every 5 s,
-/// at most once a second and only while a member is online, builds this computer's presence
-/// and sends it to every online member when it changed, and every 60 s regardless. Ends with
-/// the endpoint (started after it).
+/// The sender, the only one: on a local change (`Daemon::presence`, coalesced over 250 ms) or
+/// every 5 s, at most once a second and only while a member is online, builds this computer's
+/// presence and sends it to every online member when it changed, and every 60 s regardless.
+/// On an instance, each pass then reports the declared version it handed on (`Cloud::sent`),
+/// which `cloud.sessions.set` waits for. Ends with the endpoint (started after it).
 pub async fn run(d: Arc<Daemon>) {
     let Some(ep) = d.peers.endpoint.get().cloned() else {
         return;
@@ -271,43 +256,54 @@ pub async fn run(d: Arc<Daemon>) {
             _ = tokio::time::sleep(TICK) => {}
             _ = ep.closed() => return,
         }
-        if d.peers.online().is_empty() {
-            continue;
+        let list = d.cloud.as_ref().map(|c| c.declared());
+        send_once(&d, list.as_ref(), &mut built_at, &mut sent_at).await;
+        if let (Some(c), Some(l)) = (&d.cloud, list) {
+            c.sent.send_replace(l.version);
         }
-        if let Some(at) = built_at {
-            tokio::time::sleep(GAP.saturating_sub(at.elapsed())).await;
-        }
-        built_at = Some(Instant::now());
-        let d2 = d.clone();
-        let Ok(mut f) = tokio::task::spawn_blocking(move || build(&d2, 0)).await else {
-            continue;
-        };
-        // An instance's list may have moved since the build (`publish` sent the new one): only
-        // the list in effect goes out, checked and sent under its lock.
-        let list = d.cloud.as_ref().map(|c| c.sessions.lock().unwrap());
-        if let (Some(l), Frame::Presence { sessions, .. }) = (&list, &f) {
-            if **l != *sessions {
-                continue;
+    }
+}
+
+/// One pass of `run`: an instance's presence is its `list`.
+async fn send_once(
+    d: &Arc<Daemon>,
+    list: Option<&Declared>,
+    built_at: &mut Option<Instant>,
+    sent_at: &mut Option<Instant>,
+) {
+    if d.peers.online().is_empty() {
+        return;
+    }
+    if let Some(at) = *built_at {
+        tokio::time::sleep(GAP.saturating_sub(at.elapsed())).await;
+    }
+    *built_at = Some(Instant::now());
+    let mut f = match list {
+        Some(l) => declared(d, l, 0),
+        None => {
+            let d2 = d.clone();
+            match tokio::task::spawn_blocking(move || build(&d2, 0)).await {
+                Ok(f) => f,
+                Err(_) => return,
             }
         }
-        let unchanged = d
-            .built
-            .lock()
-            .unwrap()
-            .as_ref()
-            .is_some_and(|b| same(b, &f));
-        *d.built.lock().unwrap() = Some(f.clone());
-        if unchanged && sent_at.is_some_and(|at| at.elapsed() < RESEND) {
-            continue;
-        }
-        // Stamped at send, after the store: a later send (here or a hello's) carries a later seq.
-        stamp(&mut f);
-        for m in d.peers.online() {
-            let _ = d.peers.send(&m, f.clone());
-        }
-        drop(list);
-        sent_at = Some(Instant::now());
+    };
+    let unchanged = d
+        .built
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|b| same(b, &f));
+    *d.built.lock().unwrap() = Some(f.clone());
+    if unchanged && sent_at.is_some_and(|at| at.elapsed() < RESEND) {
+        return;
     }
+    // Stamped at send, after the store: a later send (here or a hello's) carries a later seq.
+    stamp(&mut f);
+    for m in d.peers.online() {
+        let _ = d.peers.send(&m, f.clone());
+    }
+    *sent_at = Some(Instant::now());
 }
 
 /// Takes `l` as `member`'s latest unless the one held is as new (`seq`), or always with
@@ -436,9 +432,8 @@ pub fn directory(d: &Daemon, query: Option<&str>) -> Value {
     // This computer's, with their folders; an instance's are the sessions it declared.
     let local: Vec<(Remote, String)> = match &d.cloud {
         Some(c) => c
+            .declared()
             .sessions
-            .lock()
-            .unwrap()
             .iter()
             .map(|r| (r.clone(), String::new()))
             .collect(),

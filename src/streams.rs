@@ -8,7 +8,7 @@
 
 use crate::admission::{signed, signed_by};
 use crate::daemon::ipc::{self, refused, Response, BAD_REQUEST, NOT_FOUND, UNSUPPORTED};
-use crate::daemon::net_ops::{person_only, NOT_MEMBER};
+use crate::daemon::net_ops::NOT_MEMBER;
 use crate::daemon::Daemon;
 use crate::net::frames::{self, Frame};
 use crate::net::short;
@@ -227,10 +227,10 @@ pub async fn handle(
     op: &str,
     body: &Value,
     d: &Arc<Daemon>,
-    peer_pid: Option<u32>,
+    caller: crate::daemon::ipc::Caller,
 ) -> Response {
     match op {
-        "share.grant" if !peer_pid.is_some_and(person_only) => refused(id, "not_a_person"),
+        "share.grant" if !caller.is_person() => refused(id, "not_a_person"),
         "share.grant" => share(id, body, d),
         "stream.open" => open(id, body, d).await,
         "stream.send" => send(id, body, d).await,

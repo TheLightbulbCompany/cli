@@ -91,14 +91,14 @@ struct Request {
     token: Option<String>,
 }
 
-/// What a workspace proof claims, `(sub, workspace id)`, when it is one: `kind` `workspace` and
+/// The workspace a workspace proof claims, when it is one: `kind` `workspace` and
 /// `sub` `ws:<workspace.id>`, at most `MAX_PROOF` bytes (so its `admit` fits an entry).
 // ponytail: read as plain JSON, unverified; Task 13 verifies the signed proof.
-fn workspace_claim(token: Option<&str>) -> Option<(String, String)> {
+fn workspace_claim(token: Option<&str>) -> Option<String> {
     let p: Value = serde_json::from_str(token.filter(|t| t.len() <= MAX_PROOF)?).ok()?;
     let ws = p["workspace"]["id"].as_str().filter(|w| !w.is_empty())?;
     let sub = p["sub"].as_str()?;
-    (p["kind"] == "workspace" && sub == format!("ws:{ws}")).then(|| (sub.into(), ws.into()))
+    (p["kind"] == "workspace" && sub == format!("ws:{ws}")).then(|| ws.into())
 }
 
 /// What a `join_request` proves it holds: hex sha256(secret ‖ candidate).
@@ -289,10 +289,13 @@ fn check(
     let cloud = match req.kind.as_str() {
         "computer" => false,
         "cloud" => {
-            let (sub, _) = workspace_claim(req.token.as_deref()).ok_or(BAD_REQUEST)?;
+            let ws = workspace_claim(req.token.as_deref()).ok_or(BAD_REQUEST)?;
+            let sub = format!("ws:{ws}");
             // One member per workspace.
-            let ms = || r.members.values();
-            if ms().any(|m| m.kind == MemberKind::Cloud && m.person_id == sub) {
+            if r.members
+                .values()
+                .any(|m| m.kind == MemberKind::Cloud && m.person_id == sub)
+            {
                 return Err(NAME_TAKEN);
             }
             true
@@ -335,14 +338,10 @@ fn try_admit(
         "person_id": req.candidate, "kind": "computer", "role": "member",
         "ticket_id": req.ticket.ticket_id});
     // `check` let a cloud candidate in only with a workspace proof.
-    if let Some((sub, ws)) = workspace_claim(req.token.as_deref()).filter(|_| req.kind == "cloud") {
-        for (k, v) in [
-            ("person_id", sub),
-            ("kind", "cloud".into()),
-            ("workspace", ws),
-        ] {
-            body[k] = v.into();
-        }
+    if let Some(ws) = workspace_claim(req.token.as_deref()).filter(|_| req.kind == "cloud") {
+        body["person_id"] = format!("ws:{ws}").into();
+        body["kind"] = "cloud".into();
+        body["workspace"] = ws.into();
         body["proof"] = req.token.clone().into();
     }
     if let Err(e) = net_ops::write(d, team, store, Kind::Admit, body, now) {
@@ -386,7 +385,8 @@ async fn wait(d: &Daemon, conn: &Connection, n: i64, req: Request) -> Option<Ver
     d.admissions.lock().unwrap().insert(n, Pending { req, tx });
     let id = format!("J{n}");
     let buttons = ["Decline", "Allow"];
-    d.show_dialog(&id, dialog::args("Lightbulb Connect", &text, &buttons));
+    d.dialogs
+        .show(&id, dialog::args("Lightbulb Connect", &text, &buttons));
     let gone = tokio::select! {
         v = &mut rx => return v.ok(),
         _ = conn.closed() => true,
@@ -396,7 +396,7 @@ async fn wait(d: &Daemon, conn: &Connection, n: i64, req: Request) -> Option<Ver
     if d.admissions.lock().unwrap().remove(&n).is_none() {
         return rx.await.ok();
     }
-    d.withdraw_dialog(&id);
+    d.dialogs.withdraw(&id);
     let _ = d.store.lock().unwrap().close_join(n, "expired");
     eprintln!("join: J{n} expired");
     (!gone).then_some(Err(NOT_ANSWERED))
@@ -406,7 +406,7 @@ async fn wait(d: &Daemon, conn: &Connection, n: i64, req: Request) -> Option<Ver
 /// or `None` when it is not waiting (answered, or its candidate gone).
 fn answer(d: &Daemon, n: i64, allow: bool) -> Option<(String, Verdict)> {
     let p = d.admissions.lock().unwrap().remove(&n)?;
-    d.withdraw_dialog(&format!("J{n}"));
+    d.dialogs.withdraw(&format!("J{n}"));
     let v = if allow {
         admit(d, n, &p.req)
     } else {
@@ -537,8 +537,10 @@ pub async fn join(id: u64, body: &Value, d: &Arc<Daemon>) -> Response {
         .trim()
         .to_string();
     let kind = body["kind"].as_str().unwrap_or("computer");
-    // Only an embedded instance joins as a workspace's member, and only as that.
-    if (kind == "cloud") != d.cloud.is_some() {
+    // Only an embedded instance joins as a workspace's member, only as that, and with its
+    // proof.
+    let unproven = kind == "cloud" && !body["proof"].is_string();
+    if (kind == "cloud") != d.cloud.is_some() || unproven {
         return Response::err(id, BAD_REQUEST);
     }
     let me = &d.identity.key;

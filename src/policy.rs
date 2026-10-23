@@ -145,7 +145,9 @@ pub fn cloud_inbound(
     let own = from.kind == MemberKind::Computer
         && from.workspace.is_some()
         && from.workspace == mine.workspace;
-    let prefix = format!("{}/", mine.short);
+    // `<short>/` up to `<short>0` (`0` sorts just after `/`): a range, not a function of the
+    // column.
+    let (prefix, end) = (format!("{}/", mine.short), format!("{}0", mine.short));
     let since = now.saturating_sub(REPLY_S) as i64;
     let wrote = || -> Result<bool> {
         Ok(store
@@ -153,15 +155,10 @@ pub fn cloud_inbound(
             .prepare(
                 "SELECT 1 FROM messages m JOIN receipts r ON r.from_key = m.from_key \
                  AND r.request_id = m.request_id WHERE m.to_key = ?1 \
-                 AND substr(m.from_key, 1, ?2) = ?3 AND m.sent_at >= ?4 \
+                 AND m.from_key >= ?2 AND m.from_key < ?3 AND m.sent_at >= ?4 \
                  AND r.state IN ('stored', 'delivered', 'read')",
             )?
-            .exists(rusqlite::params![
-                from_addr,
-                prefix.len() as i64,
-                prefix,
-                since
-            ])?)
+            .exists(rusqlite::params![from_addr, prefix, end, since])?)
     };
     Ok(if own || wrote()? {
         Verdict::Accept

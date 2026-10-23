@@ -48,9 +48,9 @@ pub struct Daemon {
     pub push_failed: Mutex<HashSet<String>>,
     /// The member connections (`net`).
     pub peers: net::Peers,
-    /// The person's OS dialogs, one at a time, none while `ui.claim` is live. `None` on an
-    /// embedded instance: it never asks anyone.
-    pub dialogs: Option<dialog::Queue>,
+    /// The person's OS dialogs, one at a time, none while `ui.claim` is live. An embedded
+    /// instance's answers every dialog "not shown" at once: it asks no one.
+    pub dialogs: dialog::Queue,
     /// `dialogs`' answers, for the task that routes them (admission, holds) to take.
     pub dialog_answers: Mutex<Option<dialog::Answers>>,
     /// The join requests waiting for their person's answer (`admission`).
@@ -77,8 +77,49 @@ pub struct Daemon {
 pub struct Cloud {
     /// The workspace's display name: its solo network's member and team name.
     pub name: String,
-    /// The sessions it declared (`cloud.sessions.set`), as published.
-    pub sessions: Mutex<Vec<net::frames::Remote>>,
+    declared: Mutex<Declared>,
+    /// The last `Declared::version` the presence sender (`presence::run`) handed on.
+    pub sent: tokio::sync::watch::Sender<u64>,
+}
+
+/// The sessions an instance declared (`cloud.sessions.set`), as published; each set is a new
+/// `version`.
+#[derive(Clone, Default)]
+pub struct Declared {
+    pub version: u64,
+    pub sessions: Arc<Vec<net::frames::Remote>>,
+    pub ids: Arc<HashSet<String>>,
+}
+
+impl Cloud {
+    pub fn new(name: String) -> Cloud {
+        Cloud {
+            name,
+            declared: Mutex::default(),
+            sent: tokio::sync::watch::Sender::new(0),
+        }
+    }
+
+    pub fn declared(&self) -> Declared {
+        self.declared.lock().unwrap().clone()
+    }
+
+    /// Whether `addr` is one of the declared sessions.
+    pub fn declares(&self, addr: &str) -> bool {
+        self.declared.lock().unwrap().ids.contains(addr)
+    }
+
+    /// Makes `sessions` the declared list: its version.
+    pub fn set(&self, sessions: Vec<net::frames::Remote>) -> u64 {
+        let mut d = self.declared.lock().unwrap();
+        let ids = sessions.iter().map(|s| s.session_id.clone()).collect();
+        *d = Declared {
+            version: d.version + 1,
+            sessions: Arc::new(sessions),
+            ids: Arc::new(ids),
+        };
+        d.version
+    }
 }
 
 impl Daemon {
@@ -91,22 +132,9 @@ impl Daemon {
             .clone()
     }
 
-    /// Queues dialog `id` for the person; an embedded instance asks no one.
-    pub fn show_dialog(&self, id: &str, args: Vec<String>) {
-        if let Some(q) = &self.dialogs {
-            q.show(id, args);
-        }
-    }
-
-    pub fn withdraw_dialog(&self, id: &str) {
-        if let Some(q) = &self.dialogs {
-            q.withdraw(id);
-        }
-    }
-
     /// Whether the Lightbulb app holds a `ui.claim` at `now`.
     pub fn claim_live(&self, now: i64) -> bool {
-        self.dialogs.as_ref().is_some_and(|q| q.claim_live(now))
+        self.dialogs.claim_live(now)
     }
 }
 

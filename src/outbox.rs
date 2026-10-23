@@ -58,11 +58,8 @@ pub fn acked(
     let Some((from, request_id)) = store.outbox_sender(id, member)? else {
         return Ok(None);
     };
-    let from = crate::sessions::Key(from);
-    let at = |s: &Store| mail::receipt(s, &from, &request_id).map(|r| r.map(|r| r.state));
-    let before = at(store)?;
-    mail::advance(store.conn(), &from.0, &request_id, state, reason, now)?;
-    Ok(Some(at(store)? != before))
+    let moved = mail::advance(store.conn(), &from, &request_id, state, reason, now)?;
+    Ok(Some(moved))
 }
 
 /// At `now`: mail queued `ttl` seconds becomes `expired` (`unreachable`); rows a week and a
@@ -70,21 +67,17 @@ pub fn acked(
 /// old are dropped. The envelope ids that expired.
 pub fn expire(store: &Store, now: u64, ttl: u64) -> Result<Vec<String>> {
     let tx = store.conn().unchecked_transaction()?;
-    let stale = store.outbox_stale(now.saturating_sub(ttl) as i64)?;
-    for (from, request_id, _) in &stale {
-        mail::advance(
-            &tx,
-            from,
-            request_id,
-            State::Expired,
-            Some("unreachable"),
-            now,
-        )?;
+    let mut expired = vec![];
+    for (from, request_id, id) in store.outbox_stale(now.saturating_sub(ttl) as i64)? {
+        let unreachable = Some("unreachable");
+        if mail::advance(&tx, &from, &request_id, State::Expired, unreachable, now)? {
+            expired.push(id);
+        }
     }
     let ago = |s: u64| now.saturating_sub(s) as i64;
     store.prune_mail(ago(KEEP_S), ago(mail::HELD_S + KEEP_S), ago(KEEP_S))?;
     tx.commit()?;
-    Ok(stale.into_iter().map(|(_, _, id)| id).collect())
+    Ok(expired)
 }
 
 /// The receipts owed to members: `(member, Receipt frame)`.

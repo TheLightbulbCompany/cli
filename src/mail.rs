@@ -102,7 +102,7 @@ fn live(store: &Store, key: &str) -> bool {
         .is_some_and(|(pid, birth)| sessions::alive(pid, birth))
 }
 
-/// Writes `state` only if it is later than the stored one.
+/// Writes `state` only if it is later than the stored one: whether it did.
 pub(crate) fn advance(
     conn: &Connection,
     from: &str,
@@ -110,7 +110,7 @@ pub(crate) fn advance(
     state: State,
     reason: Option<&str>,
     now: u64,
-) -> Result<()> {
+) -> Result<bool> {
     let old = conn
         .query_row(
             "SELECT state FROM receipts WHERE from_key = ?1 AND request_id = ?2",
@@ -118,10 +118,11 @@ pub(crate) fn advance(
             |r| r.get::<_, String>(0),
         )
         .optional()?;
-    if match old {
+    let moves = match old {
         Some(o) => state.later_than(State::parse(&o)?),
         None => true,
-    } {
+    };
+    if moves {
         if state == State::Read {
             // `updated_at` stays the delivery time: the hops trigger window runs on it.
             conn.execute(
@@ -135,7 +136,7 @@ pub(crate) fn advance(
             )?;
         }
     }
-    Ok(())
+    Ok(moves)
 }
 
 /// Who `from`'s message `request_id` was stored for; `None` when it stored nothing.
@@ -459,14 +460,9 @@ pub(crate) fn put(store: &Store, p: &Prepared, origin: Origin, state: State) -> 
         m.origin = Some(format!("net:{short}"));
     }
     store.put_message(&m)?;
-    advance(
-        store.conn(),
-        &p.from.0,
-        &p.request_id,
-        state,
-        None,
-        p.sent_at as u64,
-    )
+    let at = p.sent_at as u64;
+    advance(store.conn(), &p.from.0, &p.request_id, state, None, at)?;
+    Ok(())
 }
 
 /// Answering a message read it.
@@ -548,7 +544,7 @@ pub fn receive(
     peer: &Member,
     roster: &Roster,
     me: &str,
-    declared: Option<&[String]>,
+    declared: Option<&std::collections::HashSet<String>>,
     now: u64,
 ) -> Result<Received> {
     let Frame::Envelope {
@@ -603,7 +599,7 @@ pub fn receive(
         let r = receipt(store, &sender, request_id)?.ok_or("message without a receipt")?;
         return Ok(Received::old(r.state, r.reason));
     }
-    if declared.is_some_and(|d| !d.iter().any(|s| s == to)) {
+    if declared.is_some_and(|d| !d.contains(to)) {
         return refused("policy");
     }
     // An answer to (or in the thread of) a message this computer sent is at least one hop

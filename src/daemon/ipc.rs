@@ -4,7 +4,6 @@ use super::Daemon;
 use crate::sessions::{self, Key};
 use crate::store;
 use crate::{admission, frame, label, mail, outbox, presence};
-use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::os::fd::AsRawFd;
@@ -139,21 +138,63 @@ async fn handle(
             Response::ok(id, json!({}))
         }
         "inbox" => inbox(id, &req.body, daemon, peer).await,
-        op => self::op(id, op, &req.body, daemon, peer_pid).await,
+        op => self::op(id, op, &req.body, daemon, Caller::Socket(peer_pid)).await,
     }
 }
 
-/// One op, for a socket connection (`peer_pid`: its peer, `None` when the OS will not say) or
-/// an embedded instance's caller (`None`): every person-only op refuses without a person.
-pub async fn op(
-    id: u64,
-    op: &str,
-    body: &Value,
-    daemon: &Arc<Daemon>,
-    peer_pid: Option<u32>,
-) -> Response {
+/// Who an op comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Caller {
+    /// A socket connection, by its peer's pid (`None` when the OS will not say).
+    Socket(Option<u32>),
+    /// An embedded instance's caller: the bridge.
+    Instance,
+}
+
+impl Caller {
+    /// Whether a person asked: a socket peer with no agent above it. Never an instance's
+    /// caller, but for the ops it may run for the workspace admin who confirmed in the app
+    /// (`team.join`, `team.leave`, `snapshot`), which also take `Caller::Instance`.
+    pub fn is_person(self) -> bool {
+        matches!(self, Caller::Socket(Some(pid)) if super::net_ops::person_only(pid))
+    }
+}
+
+/// What an instance does not do: it mints no link, its settings are its `EmbedOpts`, it asks
+/// no one (`ui.claim`), and it stops by `Instance::shutdown`.
+const NOT_ON_AN_INSTANCE: [&str; 4] = ["team.invite", "reload", "ui.claim", "shutdown"];
+
+/// The fields of an `inbox` record an agent (MCP `check_inbox`) or an instance's caller is
+/// handed.
+pub const INBOX_RECORD: [&str; 11] = [
+    "id",
+    "request_id",
+    "thread",
+    "from",
+    "label",
+    "person",
+    "person_verified",
+    "computer",
+    "text",
+    "framed",
+    "sent_at",
+];
+
+/// One op, from `caller`: every person-only op refuses without a person.
+pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: Caller) -> Response {
+    let instance = caller == Caller::Instance;
+    if instance && NOT_ON_AN_INSTANCE.contains(&op) {
+        return Response::err(id, UNSUPPORTED);
+    }
+    // Admitted for an instance's caller; for a socket, a person only (asked only when needed:
+    // it walks the peer's process tree).
+    let for_a_person = || instance || caller.is_person();
     match op {
         "ping" => Response::ok(id, json!({})),
+        // Events come from `Instance::events`.
+        "subscribe" if instance => Response::ok(id, json!({})),
+        "inbox" if instance => crate::embed::inbox(id, body, daemon),
+        "cloud.sessions.set" => super::net_ops::cloud_sessions_set(id, body, daemon).await,
         "status" => {
             let t = daemon.team.lock().unwrap();
             let me = &daemon.identity.key;
@@ -202,10 +243,7 @@ pub async fn op(
             None => Response::err(id, BAD_REQUEST),
         },
         // Hops restart at a person: an agent may not speak as one.
-        "send"
-            if body["from"].as_str().is_some_and(mail::is_person)
-                && !peer_pid.is_some_and(super::net_ops::person_only) =>
-        {
+        "send" if body["from"].as_str().is_some_and(mail::is_person) && !caller.is_person() => {
             refused(id, "not_a_person")
         }
         "send" => {
@@ -244,9 +282,7 @@ pub async fn op(
             }
         }
         // An agent fed a hostile link must not move this computer into another network.
-        "team.join" if !peer_pid.is_some_and(super::net_ops::person_only) => {
-            refused(id, "not_a_person")
-        }
+        "team.join" if !for_a_person() => refused(id, "not_a_person"),
         "team.join" => crate::admission::join(id, body, daemon).await,
         // `mark_read {key}` -> `{}`: `key`'s session took a step (an MCP tool call), so the mail
         // delivered to it before now has been seen.
@@ -268,17 +304,14 @@ pub async fn op(
             },
             None => Response::err(id, BAD_REQUEST),
         },
-        "team.leave" => {
-            let person = peer_pid.is_some_and(super::net_ops::person_only);
-            super::net_ops::leave(id, daemon, person).await
-        }
+        "team.leave" => super::net_ops::leave(id, daemon, for_a_person()).await,
         "holds" | "hold.get" | "hold.answer" | "hold.file" | "policy.get" | "policy.set" => {
-            crate::holds::op(id, op, body, daemon, peer_pid)
+            crate::holds::op(id, op, body, daemon, caller)
         }
         "share.grant" | "stream.open" | "stream.send" | "stream.close" => {
-            crate::streams::handle(id, op, body, daemon, peer_pid).await
+            crate::streams::handle(id, op, body, daemon, caller).await
         }
-        op => super::net_ops::handle(id, op, body, daemon, peer_pid),
+        op => super::net_ops::handle(id, op, body, daemon, caller),
     }
 }
 
@@ -577,11 +610,8 @@ fn send(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
         None => return Response::err(id, BAD_REQUEST),
     };
     // A workspace member sends only as the agents it declared.
-    if let Some(c) = &daemon.cloud {
-        let declared = c.sessions.lock().unwrap();
-        if !declared.iter().any(|s| s.session_id == from) {
-            return refused(id, "not_declared");
-        }
+    if daemon.cloud.as_ref().is_some_and(|c| !c.declares(from)) {
+        return refused(id, "not_declared");
     }
     let from = Key(from.into());
     let team = daemon.team.lock().unwrap();
@@ -594,15 +624,22 @@ fn send(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
         mail::Prep::Go(p) => p,
         mail::Prep::Done(r) => return Response::ok(id, json!({ "receipt": r })),
     };
+    // The receipt carries the message's thread.
+    let with_thread = |r: mail::Receipt, thread: &str| {
+        let mut r = json!(r);
+        r["thread"] = thread.into();
+        Response::ok(id, json!({ "receipt": r }))
+    };
     let prefix = sessions::member_of(&p.to.0).unwrap_or("");
     if prefix != daemon.identity.short {
         let Some(member) = team.roster.by_short(prefix) else {
             return Response::err(id, super::net_ops::NOT_MEMBER);
         };
+        let thread = p.thread.clone();
         return match outbox::enqueue(&store, p, member) {
             Ok(r) => {
                 daemon.peers.outbox.notify_one();
-                Response::ok(id, json!({ "receipt": r }))
+                with_thread(r, &thread)
             }
             Err(_) => Response::err(id, INTERNAL),
         };
@@ -616,7 +653,7 @@ fn send(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
             if receipt.state == mail::State::Stored {
                 stored(daemon, to, Some(&p.message_id));
             }
-            Response::ok(id, json!({ "receipt": receipt }))
+            with_thread(receipt, &p.thread)
         }
         Err(_) => Response::err(id, INTERNAL),
     }
@@ -698,15 +735,6 @@ fn annotate(daemon: &Daemon, from: &Key, r: &mut Value) {
     };
     if let Some(k) = kind {
         r["loop"] = k.into();
-    }
-    let thread: Option<String> = {
-        let store = daemon.store.lock().unwrap();
-        let q = "SELECT thread FROM messages WHERE from_key = ?1 AND request_id = ?2";
-        let row = store.conn().query_row(q, [&from.0, &rid], |r| r.get(0));
-        row.optional().ok().flatten()
-    };
-    if let Some(t) = thread {
-        r["thread"] = t.into();
     }
     let Some((member, to)) = member_for(daemon, from, &rid) else {
         return;

@@ -4,7 +4,7 @@
 //! raises no dialog; otherwise it is the daemon: `boot` is the one start path both share.
 
 use crate::config::Config;
-use crate::daemon::ipc::{Request, Response, BAD_REQUEST, INTERNAL};
+use crate::daemon::ipc::{Caller, Request, Response, BAD_REQUEST, INTERNAL};
 use crate::daemon::{ipc, net_ops, Cloud, Daemon, TeamState};
 use crate::identity::Identity;
 use crate::roster::{self, MemberKind};
@@ -101,11 +101,11 @@ pub(crate) async fn boot(
     let latest = presence::load(&store);
     let peers = net::Peers::default();
     let (dialogs, answers) = if cloud.is_some() {
-        (None, None)
+        dialog::Queue::headless()
     } else {
         let (q, a) = dialog::Queue::new(peers.knobs().osascript.clone());
         q.set_knob(peers.knobs().dialog.clone());
-        (Some(q), Some(a))
+        (q, a)
     };
     // An instance has no agents of its own to discover: its state dir holds no `.claude`.
     let claude_home = match cloud {
@@ -128,17 +128,14 @@ pub(crate) async fn boot(
         push_failed: Mutex::default(),
         peers,
         dialogs,
-        dialog_answers: Mutex::new(answers),
+        dialog_answers: Mutex::new(Some(answers)),
         admissions: Mutex::default(),
         joining: tokio::sync::Mutex::new(()),
         presence: Default::default(),
         built: Mutex::default(),
         latest: Mutex::new(latest),
         streams: Default::default(),
-        cloud: cloud.map(|name| Cloud {
-            name,
-            sessions: Mutex::default(),
-        }),
+        cloud: cloud.map(Cloud::new),
         home_lock,
     });
     // No join connection outlives a restart: its open requests are over.
@@ -156,24 +153,10 @@ impl Instance {
     /// mail as Task 10's records, read.
     pub async fn call(&self, req: Value) -> Value {
         let id = req["id"].as_u64().unwrap_or(0);
-        let Ok(req) = serde_json::from_value::<Request>(req) else {
-            return json!(Response::err(id, BAD_REQUEST));
-        };
-        let (d, body) = (&self.daemon, &req.body);
-        let r = match req.op.as_str() {
-            "team.join" if body["kind"] != "cloud" || !body["proof"].is_string() => {
-                Response::err(id, BAD_REQUEST)
-            }
-            "team.join" => crate::admission::join(id, body, d).await,
-            "team.leave" => net_ops::leave(id, d, true).await,
-            // The bridge stops an instance with `Instance::shutdown`.
-            "shutdown" => Response::err(id, ipc::UNSUPPORTED),
-            "inbox" => inbox(id, body, d),
-            // Events come from `events`.
-            "subscribe" => Response::ok(id, json!({})),
-            op => ipc::op(id, op, body, d, None).await,
-        };
-        json!(r)
+        json!(match serde_json::from_value::<Request>(req) {
+            Ok(r) => ipc::op(id, &r.op, &r.body, &self.daemon, Caller::Instance).await,
+            Err(_) => Response::err(id, BAD_REQUEST),
+        })
     }
 
     /// Every event a socket subscriber gets (`message`, `held`, `hold_closed`,
@@ -217,23 +200,9 @@ impl Drop for Instance {
     }
 }
 
-/// The fields of Task 10's `inbox` record.
-const RECORD: [&str; 10] = [
-    "id",
-    "request_id",
-    "thread",
-    "from",
-    "label",
-    "person",
-    "person_verified",
-    "computer",
-    "text",
-    "sent_at",
-];
-
 /// `inbox {session}` -> `{messages}`: takes what waits for declared session `session` (a
 /// name), each marked read: the bridge hands it to that agent's turn.
-fn inbox(id: u64, body: &Value, d: &Daemon) -> Response {
+pub(crate) fn inbox(id: u64, body: &Value, d: &Daemon) -> Response {
     let Some(name) = body["session"].as_str().filter(|n| sessions::valid_name(n)) else {
         return Response::err(id, BAD_REQUEST);
     };
@@ -252,10 +221,8 @@ fn inbox(id: u64, body: &Value, d: &Daemon) -> Response {
         .iter()
         .map(|m| {
             let v = ipc::record(d, m);
-            RECORD
-                .iter()
-                .map(|k| (k.to_string(), v[k].clone()))
-                .collect()
+            let keys = ipc::INBOX_RECORD.iter();
+            keys.map(|k| (k.to_string(), v[k].clone())).collect()
         })
         .collect();
     Response::ok(id, json!({ "messages": messages }))

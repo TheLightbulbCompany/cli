@@ -1,6 +1,8 @@
 //! The network ops, reached from `ipc::handle`'s fallback arm.
 
-use super::ipc::{refused, Response, BAD_REQUEST, INTERNAL, NOT_FOUND, UNKNOWN_OP, UNSUPPORTED};
+use super::ipc::{
+    refused, Caller, Response, BAD_REQUEST, INTERNAL, NOT_FOUND, UNKNOWN_OP, UNSUPPORTED,
+};
 use super::{Daemon, TeamState};
 use crate::agents::caller;
 use crate::identity::Identity;
@@ -69,10 +71,9 @@ fn gate(op: &str, invite: Invite) -> Gate {
     }
 }
 
-pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, peer_pid: Option<u32>) -> Response {
+pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, caller: Caller) -> Response {
     // Retired: a cloud member is removed by an admin like any member.
-    // A workspace member never mints a link.
-    if op == "team.unlink" || (op == "team.invite" && daemon.cloud.is_some()) {
+    if op == "team.unlink" {
         return Response::err(id, UNSUPPORTED);
     }
     if op.starts_with("team.") {
@@ -86,7 +87,7 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, peer_pid: Option
         };
         let gate = gate(op, invite);
         // Governance and open links need a person at the socket, before any authority check.
-        if gate.person_only && !peer_pid.is_some_and(person_only) {
+        if gate.person_only && !caller.is_person() {
             return refused(id, "not_a_person");
         }
         match op {
@@ -138,20 +139,16 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, peer_pid: Option
         // `relay.get {}` -> `{urls, source, error}`: the relays in effect and where they came
         // from (`config`, `team`, `lightbulb` or `none`); the snapshot `status` reads too.
         "relay.get" => Response::ok(id, json!(*daemon.peers.relays.lock().unwrap())),
-        "relay.set" => relay_set(id, body, daemon, peer_pid),
+        "relay.set" => relay_set(id, body, daemon, caller),
         // `ui.claim {}` -> `{lease_s}`: the Lightbulb app shows the person's questions itself;
         // no OS dialog opens until it stops heartbeating.
-        "ui.claim" => match &daemon.dialogs {
-            Some(q) => {
-                q.claim(super::ipc::now() as i64);
-                Response::ok(id, json!({ "lease_s": crate::dialog::LEASE_S }))
-            }
-            None => Response::err(id, UNSUPPORTED),
-        },
-        "cloud.sessions.set" => cloud_sessions_set(id, body, daemon),
+        "ui.claim" => {
+            daemon.dialogs.claim(super::ipc::now() as i64);
+            Response::ok(id, json!({ "lease_s": crate::dialog::LEASE_S }))
+        }
         // `snapshot {path}` -> `{}`: a consistent copy of `state.db` at `path` (absolute, outside
-        // the state dir). A person only on a computer: it copies every message out.
-        "snapshot" if daemon.cloud.is_none() && !peer_pid.is_some_and(person_only) => {
+        // the state dir). On a computer a person only: it copies every message out.
+        "snapshot" if !(caller.is_person() || caller == Caller::Instance) => {
             refused(id, "not_a_person")
         }
         "snapshot" => match body["path"].as_str().filter(|p| outside(&daemon.dir, p)) {
@@ -169,8 +166,6 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, peer_pid: Option
             },
             None => Response::err(id, BAD_REQUEST),
         },
-        // An instance's settings are its `EmbedOpts`, not the file.
-        "reload" if daemon.cloud.is_some() => Response::err(id, UNSUPPORTED),
         "reload" => match reload(daemon) {
             Ok(()) => Response::ok(id, json!({})),
             Err(e) => {
@@ -196,8 +191,8 @@ pub fn reload(daemon: &Daemon) -> crate::Result<()> {
 /// `url` clears it); from the founder or an admin, unless `local`, also the roster's
 /// `meta {relay}`, so the whole team adopts it (`team: true`). In effect before the answer.
 /// A person only: it moves where this computer's traffic goes.
-fn relay_set(id: u64, body: &Value, daemon: &Daemon, peer_pid: Option<u32>) -> Response {
-    if !peer_pid.is_some_and(person_only) {
+fn relay_set(id: u64, body: &Value, daemon: &Daemon, caller: Caller) -> Response {
+    if !caller.is_person() {
         return refused(id, "not_a_person");
     }
     let url = body["url"].as_str().unwrap_or_default().trim();
@@ -623,9 +618,10 @@ impl TeamOps<'_> {
 /// `cloud.sessions.set {sessions: [{name, agent, title?}]}` -> `{}` (an embedded instance only;
 /// `unsupported` on a computer): the workspace's agents, published as `<short>/<name>` with
 /// `agent` and `title` (at most `presence::MAX`, each name a `valid_name`, once). Answers once
-/// the presence carrying them is queued to every online member, so a `send` from a name just
-/// declared is never refused as unadvertised by a peer the envelope reaches first.
-fn cloud_sessions_set(id: u64, body: &Value, daemon: &Daemon) -> Response {
+/// the presence sender (`presence::run`) has handed on the presence carrying them (at most
+/// 5 s), so a `send` from a name just declared is never refused as unadvertised by a peer the
+/// envelope reaches first.
+pub async fn cloud_sessions_set(id: u64, body: &Value, daemon: &Daemon) -> Response {
     let Some(cloud) = &daemon.cloud else {
         return Response::err(id, UNSUPPORTED);
     };
@@ -635,15 +631,17 @@ fn cloud_sessions_set(id: u64, body: &Value, daemon: &Daemon) -> Response {
     else {
         return Response::err(id, BAD_REQUEST);
     };
-    let mut out: Vec<crate::net::frames::Remote> = vec![];
+    let mut names = HashSet::new();
+    let mut out = vec![];
     for s in list {
         let (Some(name), Some(agent)) = (s["name"].as_str(), s["agent"].as_str()) else {
             return Response::err(id, BAD_REQUEST);
         };
-        let session_id = format!("{}/{name}", daemon.identity.short);
-        let title = s["title"].as_str().map(String::from);
+        if !crate::sessions::valid_name(name) || !names.insert(name) {
+            return Response::err(id, BAD_REQUEST);
+        }
         let r = crate::net::frames::Remote {
-            session_id,
+            session_id: format!("{}/{name}", daemon.identity.short),
             agent: agent.into(),
             repo: None,
             branch: None,
@@ -651,18 +649,19 @@ fn cloud_sessions_set(id: u64, body: &Value, daemon: &Daemon) -> Response {
             status: "idle".into(),
             doing: None,
             tier: crate::sessions::Tier::Pull.as_str().into(),
-            title,
+            title: s["title"].as_str().map(String::from),
         }
         .clamp();
-        let fresh = !out.iter().any(|o| o.session_id == r.session_id);
-        let named = crate::sessions::valid_name(name);
-        if !named || !fresh || !r.valid(&daemon.identity.short, true) {
+        if !r.valid(&daemon.identity.short, true) {
             return Response::err(id, BAD_REQUEST);
         }
         out.push(r);
     }
-    *cloud.sessions.lock().unwrap() = out;
-    crate::presence::publish(daemon);
+    let mut sent = cloud.sent.subscribe();
+    let version = cloud.set(out);
+    daemon.presence.notify_one();
+    let handed = sent.wait_for(|v| *v >= version);
+    let _ = tokio::time::timeout(Duration::from_secs(5), handed).await;
     Response::ok(id, json!({}))
 }
 

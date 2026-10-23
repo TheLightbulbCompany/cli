@@ -846,10 +846,7 @@ fn receive(d: &Arc<Daemon>, key: &str, env: &Frame, tx: &mpsc::UnboundedSender<F
         });
     };
     // An instance's sessions are the ones it declared: new mail for any other is refused.
-    let declared: Option<Vec<String>> = d.cloud.as_ref().map(|c| {
-        let s = c.sessions.lock().unwrap();
-        s.iter().map(|s| s.session_id.clone()).collect()
-    });
+    let declared = d.cloud.as_ref().map(|c| c.declared().ids);
     let store = d.store.lock().unwrap();
     let me = &d.identity.short;
     let now = ipc::now();

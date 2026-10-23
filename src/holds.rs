@@ -4,8 +4,8 @@
 //! text), one dialog `H<n>` each, a signed `approvals` record per answer.
 
 use crate::admission::NOT_OPEN;
-use crate::daemon::ipc::{self, refused, Response, BAD_REQUEST, INTERNAL, NOT_FOUND};
-use crate::daemon::{net_ops, Daemon};
+use crate::daemon::ipc::{self, refused, Caller, Response, BAD_REQUEST, INTERNAL, NOT_FOUND};
+use crate::daemon::Daemon;
 use crate::frame::{agent_name, defang, Sender};
 use crate::identity::Identity;
 use crate::mail::{self, Origin, Prepared, State};
@@ -431,14 +431,14 @@ pub fn shown(d: &Daemon, roster: &Roster, store: &Store, h: &Hold) {
         .send(json!({"event": "held", "id": h.name(), "kind": h.kind(),
         "target_session": h.target_session, "from": h.from_session, "label": who}));
     let args = dialog::args("Lightbulb Connect", &text, &buttons);
-    d.show_dialog(&h.name(), args);
+    d.dialogs.show(&h.name(), args);
     eprintln!("hold {}: open", h.name());
 }
 
 /// The daemon's side of a closed hold (`verdict` `allow`, `decline` or `expired`; `by` null for
 /// an expiry): its dialog withdrawn, subscribers told `hold_closed`.
 fn closed(d: &Daemon, h: &Hold, verdict: &str, by: Option<&str>) {
-    d.withdraw_dialog(&h.name());
+    d.dialogs.withdraw(&h.name());
     let event = json!({"event": "hold_closed", "id": h.name(), "by": by, "verdict": verdict});
     let _ = d.events.send(event);
     eprintln!("hold {}: {verdict}", h.name());
@@ -489,8 +489,8 @@ pub fn on_dialog(d: &Arc<Daemon>, n: i64, button: &str) {
 
 /// The hold and policy ops: `holds`, `hold.get`, `hold.answer`, `hold.file`, `policy.get`,
 /// `policy.set` (all but `policy.get` person-only: previews are a teammate's text).
-pub fn op(id: u64, op: &str, body: &Value, d: &Arc<Daemon>, peer_pid: Option<u32>) -> Response {
-    if op != "policy.get" && !peer_pid.is_some_and(net_ops::person_only) {
+pub fn op(id: u64, op: &str, body: &Value, d: &Arc<Daemon>, caller: Caller) -> Response {
+    if op != "policy.get" && !caller.is_person() {
         return refused(id, "not_a_person");
     }
     match run(id, op, body, d) {
