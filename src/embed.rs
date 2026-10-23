@@ -159,7 +159,8 @@ impl Instance {
     /// op is refused (`bad_request`, reason `not_a_person`) but `team.join` as the workspace's
     /// cloud member (with its proof) and `team.leave`: the caller is the bridge, acting for a
     /// workspace admin who confirmed in the app. `inbox {session}` takes a declared session's
-    /// mail as Task 10's records, read.
+    /// mail as Task 10's records, read. `app.send`, `app.inbox` and `app.receipt` carry a
+    /// hosted app's call to its person's own computer (`app_send`).
     pub async fn call(&self, req: Value) -> Value {
         let id = req["id"].as_u64().unwrap_or(0);
         json!(match serde_json::from_value::<Request>(req) {
@@ -215,23 +216,23 @@ pub(crate) fn inbox(id: u64, body: &Value, d: &Daemon) -> Response {
     let Some(name) = body["session"].as_str().filter(|n| sessions::valid_name(n)) else {
         return Response::err(id, BAD_REQUEST);
     };
-    let key = Key(format!("{}/{name}", d.identity.short));
+    match take_read(d, &Key(format!("{}/{name}", d.identity.short))) {
+        Ok(messages) => Response::ok(id, json!({ "messages": messages })),
+        Err(_) => Response::err(id, INTERNAL),
+    }
+}
+
+/// Takes what waits for `key`, each marked read, as Task 10's records (`ipc::INBOX_RECORD`).
+pub(crate) fn take_read(d: &Daemon, key: &Key) -> Result<Vec<Value>> {
     let taken = {
         let store = d.store.lock().unwrap();
-        mail::take(&store, &key, ipc::now()).and_then(|m| {
-            m.iter().try_for_each(|m| mail::mark_read(&store, &m.id))?;
-            Ok(m)
-        })
+        let m = mail::take(&store, key, ipc::now())?;
+        m.iter().try_for_each(|m| mail::mark_read(&store, &m.id))?;
+        m
     };
-    let Ok(taken) = taken else {
-        return Response::err(id, INTERNAL);
-    };
-    let messages: Vec<Value> = ipc::records(d, &taken)
-        .into_iter()
-        .map(|v| {
-            let keys = ipc::INBOX_RECORD.iter();
-            keys.map(|k| (k.to_string(), v[k].clone())).collect()
-        })
-        .collect();
-    Response::ok(id, json!({ "messages": messages }))
+    let records = ipc::records(d, &taken).into_iter().map(|v| {
+        let keys = ipc::INBOX_RECORD.iter();
+        keys.map(|k| (k.to_string(), v[k].clone())).collect()
+    });
+    Ok(records.collect())
 }

@@ -14,7 +14,8 @@ pub fn printable(c: char) -> bool {
 }
 
 /// `from`'s label for the reader at member `viewer` (its person is `Roster::person_of`):
-/// `Your Codex`, `You, at the terminal`, `Your desk mailbox` for the reader's own person;
+/// `Your Codex`, `You, at the terminal`, `Your desk mailbox`, `Your Claude` (a hosted app's
+/// `<app>-app` session, `app_send`) for the reader's own person;
 /// `aden's Codex`, `aden, at the terminal`, `aden's desk mailbox` for another's, `✓ Aden
 /// Smith's Codex` when that member's proof is in force (its name);
 /// ` (not verified)` after a member with no proof other than the reader's own computer;
@@ -55,7 +56,11 @@ pub fn render_as(roster: &Roster, viewer: &str, from: &str, declared: Option<&st
     };
     let label = match Sender::of(prefix, from) {
         Sender::Terminal => format!("{who}, at the terminal"),
-        Sender::Name(n) => format!("{possessive} {n} mailbox"),
+        // A hosted app's session on the person's own computer (`app_send`).
+        Sender::Name(n) => match crate::app_send::app_of(n) {
+            Some(app) => format!("{possessive} {}", crate::app_send::app_name(app)),
+            None => format!("{possessive} {n} mailbox"),
+        },
         Sender::Agent(p) => format!("{possessive} {}", agent_name(p)),
     };
     if verified(m, viewer) {
@@ -180,6 +185,21 @@ mod tests {
         );
         assert_eq!(render(&r, &a_pid, "cshort/desk"), "Your desk mailbox");
         assert_eq!(render(&r, &a_pid, "cshort/grok:x"), "Your Grok CLI");
+        // A hosted app's session on a person's own computer.
+        assert_eq!(render(&r, &a_pid, "ashort/claude-app"), "Your Claude");
+        assert_eq!(render(&r, &a_pid, "cshort/muse-app"), "Your Muse");
+        assert_eq!(
+            render(&r, &a_pid, "bshort/chatgpt-app"),
+            "aden's ChatGPT (not verified)"
+        );
+        assert_eq!(
+            render(&r, &a_pid, "dshort/zed-app"),
+            "✓ EveLightbulb 's zed"
+        );
+        assert_eq!(
+            render(&r, &a_pid, "bshort/Zed-app"),
+            "aden's Zed-app mailbox (not verified)"
+        );
         assert_eq!(
             render(&r, &a_pid, "zshort/codex:1"),
             "an unknown member (not verified)"

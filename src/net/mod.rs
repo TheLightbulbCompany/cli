@@ -304,7 +304,7 @@ impl Peers {
     }
 
     /// Counts a dropped frame of `kind` (`status`'s `dropped`).
-    fn dropped(&self, kind: &'static str) {
+    pub(crate) fn dropped(&self, kind: &'static str) {
         *self.dropped.lock().unwrap().entry(kind).or_default() += 1;
     }
 
@@ -860,10 +860,14 @@ impl Net {
 
 /// Member `key`'s envelope: checked and stored (`mail::receive`), answered with an `ack`.
 /// One whose `from` is not the member's own is dropped unanswered.
+/// The `app_*` kinds go to `app_send` instead: no mailbox, hold, hop count or `ack`.
 fn receive(d: &Arc<Daemon>, key: &str, env: &Frame, tx: &mpsc::UnboundedSender<Frame>) {
-    let Frame::Envelope { id, to, .. } = env else {
+    let Frame::Envelope { id, to, kind, .. } = env else {
         return;
     };
+    if crate::app_send::is_app(kind) {
+        return crate::app_send::on_envelope(d, key, env.clone());
+    }
     let team = d.team.lock().unwrap();
     let Some(peer) = team.roster.members.get(key) else {
         return;

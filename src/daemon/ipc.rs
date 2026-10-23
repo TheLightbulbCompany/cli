@@ -196,6 +196,7 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
         "subscribe" if instance => Response::ok(id, json!({})),
         "inbox" if instance => crate::embed::inbox(id, body, daemon),
         "cloud.sessions.set" => super::net_ops::cloud_sessions_set(id, body, daemon).await,
+        "app.send" | "app.inbox" | "app.receipt" => crate::app_send::op(id, op, body, daemon).await,
         "status" => {
             let t = daemon.team.lock().unwrap();
             let me = &daemon.identity.key;
@@ -541,7 +542,11 @@ pub fn now() -> u64 {
 /// Mail for a session here is stored, then pushed into a Claude or Codex session
 /// (`super::deliver`) if its tier is `push`; mail under another member's prefix goes to the
 /// outbox (`queued`, `where` that member's computer), `not_member` for a prefix no member has.
-fn send(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Result<(Key, mail::Receipt), Response> {
+pub(crate) fn send(
+    id: u64,
+    body: &Value,
+    daemon: &Arc<Daemon>,
+) -> Result<(Key, mail::Receipt), Response> {
     let (Some(from), Some(text), Some(rid)) = (
         body["from"].as_str(),
         body["text"].as_str(),
@@ -621,7 +626,7 @@ const SETTLE: Duration = Duration::from_secs(5);
 /// person's name, `you` for this computer's own), `online` (whether that computer is connected
 /// now), `tier` (the session's, from that member's presence) and, while queued, `until` (when
 /// the outbox gives up). Any receipt of a message (not a refusal) carries its `thread`.
-async fn finish(daemon: &Daemon, from: &Key, mut r: mail::Receipt, wait: bool) -> Value {
+pub(crate) async fn finish(daemon: &Daemon, from: &Key, mut r: mail::Receipt, wait: bool) -> Value {
     let thread = daemon
         .store
         .lock()

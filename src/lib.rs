@@ -1,5 +1,6 @@
 pub mod admission;
 pub mod agents;
+pub mod app_send;
 pub mod cli;
 pub mod config;
 pub mod daemon;

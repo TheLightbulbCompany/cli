@@ -609,7 +609,7 @@ pub fn send(
 /// What member `peer`'s envelope `env` becomes on this computer (member prefix `me`), checked
 /// in this order: a `from` outside `peer`'s prefix is dropped unanswered (`Err`); a cloud
 /// member's `from` must be a session of its latest presence (`policy`); a `kind` other than
-/// `message`, any `files`, a body over `MAX_TEXT`, or a malformed id, `thread` or `request_id`
+/// `message` (the `app_*` kinds never reach here: `app_send` takes them first), any `files`, a body over `MAX_TEXT`, or a malformed id, `thread` or `request_id`
 /// is `unsupported`; a `to` that is not one address is `policy`, one under another prefix
 /// `not_member`; an envelope seen before gets the state it has now and is not delivered again;
 /// a `request_id` reused with another text or recipient is `request_id_reused`; `hops` at
