@@ -15,6 +15,65 @@ wires Claude Code, Codex, Cursor and Grok CLI (hooks and a tool server), and sta
 Run the same line again to upgrade. Builds are not yet signed with a Developer ID: a `curl` download is not
 quarantined by Gatekeeper, a browser download would be. `lightbulb-connect setup --remove` takes everything out.
 
+## Quick start: you and a teammate in five minutes
+
+Both of you run the install line above. Then, on your Mac:
+
+```sh
+lightbulb-connect invite
+```
+
+It prints a line that starts `lightbulb-connect join '…'`. Send that whole line to your teammate.
+It contains a web address, but there is no page there yet: they paste the whole line into Terminal,
+with their name added:
+
+```sh
+lightbulb-connect join '<the link you got>' --name sam
+```
+
+A dialog opens on your Mac: `sam (computer "…") wants to join your team using your invite link.`
+Click Allow, or run `lightbulb-connect approve J1` (`lightbulb-connect held` lists the number).
+Their Terminal then says `Connected as sam (…)`. Now each of you can see the other's sessions:
+
+```sh
+lightbulb-connect who --all
+```
+
+From any Claude Code, Codex, Cursor or Grok CLI session, ask the agent: "Use the lightbulb tools to
+find sam's sessions and send their Claude a message." The tools are `find_sessions`,
+`send_message` and `message_receipt`.
+
+The first message from a new person is held until the receiver clicks Allow in a dialog (or runs
+`lightbulb-connect approve H1`). After that, messages from that person go straight through.
+
+Every message gets a receipt. Check one with `lightbulb-connect receipt <id>`:
+
+- `queued`: their Mac is offline; it keeps trying for 24 hours.
+- `held`: waiting for their Allow.
+- `stored`: on their Mac, for the session's next step.
+- `delivered`: the session got it.
+- `refused`: not sent, for example because they declined it.
+
+Three things that catch people out:
+
+- **macOS asks once** to allow lightbulb-connect on the local network. Until you allow it (System
+  Settings > Privacy & Security > Local Network), `lightbulb-connect doctor` shows
+  `Local network        blocked by macOS`. Joins on the same Wi-Fi still work, because the invite
+  link carries your Mac's addresses.
+- **Macs on different networks need a relay.** Run this once on the inviter's Mac; it sets the relay
+  for the whole team:
+
+  ```sh
+  lightbulb-connect relay https://use1-1.relay.n0.iroh.link
+  ```
+
+  That is the iroh project's public relay. It carries encrypted bytes only. A team can run its own.
+- **Restart open agent sessions.** A Claude Code or Codex session that was already open does not see
+  the new tool server until you restart it.
+
+The tool server is named `lightbulb`, or `lightbulb-connect` when another program already uses
+that name. More detail: [docs/usage.md](docs/usage.md).
+
 ## How it fits
 
 Three parts:
