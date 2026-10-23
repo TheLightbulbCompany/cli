@@ -351,3 +351,21 @@ The teammate follows this on Mac B (a different macOS account and person, releas
 10. Run `lightbulb-connect leave` and answer `y`. Confirm that `lightbulb-connect team` lists only you.
 
 A's side records each row with the dialog text, labels and `receipt --json`, then greps both `~/.lightbulb/connect/daemon.log` for the body markers (they must be absent).
+
+## Acceptance fixes (2026-10-23, plan-b 9ba490f, e6a712a, c946668)
+
+**Step 1 must be re-run on the release build** (rows 1–13 and P1–P4, with `lightbulb-connect 0.2.0`). The network rows above ran on a debug build because of F2.
+
+- **F2 (9ba490f, c946668).** Root cause: not `RelayMode::Custom`. In iroh 1.4.1 an empty custom relay map takes the same no-relay path as `Disabled` (`re_stun` sets the direct addresses from the interfaces, and mDNS publishes the same data; traced both ways). Every mDNS send of the daemon got `EHOSTUNREACH`. macOS gives that error to a program that has no Local Network permission. A rebuilt ad-hoc-signed binary is a new program to macOS, so the e864370 binary's grant did not carry over. swarm-discovery logs the error only at `tracing` level, and the daemon does not print that level. The fixes:
+  - Daemons of one user on one Mac find each other over loopback: `/tmp/lightbulb-connect-<uid>/<member key>` holds `127.0.0.1:<port> <pid>`, mode 0600. The daemon removes the file on `shutdown`, SIGTERM and SIGINT, and skips a file whose pid is dead.
+  - A ticket carries the inviter's direct addresses (at most 8 IP literals). `join` dials them.
+  - Every `hello` carries the sender's current addresses. These are kept in `addrs.json`. With them, two Macs on one LAN connect with no relay and no mDNS.
+  - The daemon probes mDNS at start. When macOS refuses it, the log says how to allow it, `status.lan` is `blocked` (or `no network` when no multicast interface is up), and `doctor` shows the fix.
+  - Tests: `net_two::two_members_on_one_computer_find_each_other` and `join::the_ticket_addresses_alone_reach_the_inviter`. mDNS itself cannot run in the test sandbox, which gets the same `EHOSTUNREACH`.
+  - Release check: two 0.2.0 release daemons in temp homes, with no PEERS knob (release has none). `join … --name aden`, then `approve J1` from a detached shell, gave `Connected as aden (mac-b). Team "a": 2 computers online.` Both daemons logged the Local Network refusal, and `status.lan` read `blocked`. Then `remove aden` gave on B: `You were removed from "a" by a on 2026-10-23. This computer is on its own network again.`
+  - For step 2: on each Mac, allow `lightbulb-connect` in System Settings > Privacy & Security > Local Network if `doctor` asks, so that mDNS works too.
+- **F1 (e6a712a, c946668).** `ensure_running` starts the canonical binary for the real install. `setup` and `daemon --install/--uninstall` send `shutdown` and wait for the lock holder's pid to exit. A daemon that does not exit is reported (`The old background service did not stop (pid N). Run: kill N, then lightbulb-connect setup again.`), and no job is installed behind it. The daemon does not check versions at start.
+- **F3.** `policy <name|short|key> <value>` stores the member's person id. More than one match, or no match, gives a sentence. The listing shows `aden (qxcrztez36jw)`. `policy.set` refuses an id that no member has, unless it is a `ws:` id. Your own person is refused. A row stored under a literal name by an older build is marked `old entry`, and `policy <id> forget` deletes it.
+- **F4.** A removed member is told its removal (the `remove` entry and the ancestors it lacks, never a later entry) on its live link or on its next dial. Its queued mail becomes `refused not_member`, it logs one line, and it goes solo. `team` says `You were removed from "<team>" by <name> on <date>. This computer is on its own network again.`
+- Small: version 0.2.0. The debug env name is no longer in the hidden help. `There is no folder at <path>.`
+- Tests: 383 pass, and `fmt` and `clippy -D warnings` are clean. `--test relay`, `--test join` and `--test net_two` each passed 3 times in a row.
