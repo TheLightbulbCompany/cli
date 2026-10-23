@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 const APP: &str = "lightbulb://join/";
 /// The join line is the command itself; `NAME` is for the person to replace (a bare word, so
 /// the line pasted unedited still parses in a shell).
-const COMMAND: &str = "lightbulb-connect join '";
+const COMMAND: &str = "lightbulb join '";
 const NAME: &str = "' --name NAME";
 /// A reusable (or open) link lasts 7 days; a once link 24 hours.
 const REUSABLE_S: i64 = 7 * 86_400;
@@ -230,10 +230,7 @@ mod tests {
         let bare = encode(&t);
         let web = format!("https://thelightbulb.company/j/#{bare}");
         let old_line = format!("Join Lightbulb Connect: {web}");
-        assert_eq!(
-            line(&t),
-            format!("lightbulb-connect join '{bare}' --name NAME")
-        );
+        assert_eq!(line(&t), format!("lightbulb join '{bare}' --name NAME"));
         for s in [bare.clone(), line(&t), web, old_line, app_link(&bare)] {
             assert_eq!(decode(&s).unwrap(), t);
         }

@@ -23,13 +23,15 @@ impl Env {
     }
 
     fn cmd(&self, args: &[&str]) -> Command {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_lightbulb-connect"));
+        let mut c = Command::new(env!("CARGO_BIN_EXE_lightbulb"));
         c.args(args)
             .env("LIGHTBULB_CONNECT_HOME", self.state.path())
             .env("LIGHTBULB_CONNECT_CLAUDE_HOME", self.home.path())
             .env("LIGHTBULB_CONNECT_NO_LAUNCHCTL", "1")
             .env("LIGHTBULB_CONNECT_DEBUG_NO_DEFAULT_RELAYS", "1")
             .env("HOME", self.home.path())
+            // Not this computer's real app; a test that wants one sets its own.
+            .env("LIGHTBULB_CONNECT_DESKTOP", "/nonexistent/app")
             .env_remove("LIGHTBULB_CONNECT_SESSION")
             .env_remove("LIGHTBULB_CONNECT_HOOK_CALLER");
         c
@@ -95,7 +97,7 @@ fn send_takes_a_handle_and_a_member_name() {
     assert_eq!(o.status.code(), Some(1));
     assert_eq!(
         err(&o).trim(),
-        format!("No teammate called \"nobody\". Teammates: {name} (see lightbulb-connect team).")
+        format!("No teammate called \"nobody\". Teammates: {name} (see lightbulb team).")
     );
 }
 
@@ -359,7 +361,7 @@ fn listen_once_prints_a_framed_message() {
     let short = e.short();
     assert_eq!(
         text,
-        format!("From You, at the terminal: first\nReply: lightbulb-connect send {short}/terminal \"…\" --reply-to q1\n")
+        format!("From You, at the terminal: first\nReply: lightbulb send {short}/terminal \"…\" --reply-to q1\n")
     );
     assert!(!e
         .run(&["listen", "--as", "no spaces", "--once"])
@@ -374,7 +376,7 @@ fn only_the_apps_own_commands_forward_and_the_rest_are_unknown() {
         assert_eq!(o.status.code(), Some(2));
         assert_eq!(
             err(o).trim(),
-            format!("Unknown command: {sub}. Run lightbulb-connect --help.")
+            format!("Unknown command: {sub}. Run lightbulb --help.")
         );
         assert!(out(o).is_empty(), "{}", out(o));
     };
@@ -423,9 +425,7 @@ fn daemon_install_writes_the_plist_and_alias_without_touching_a_foreign_file() {
     );
     assert_eq!(
         std::fs::read_link(bin.join("lightbulb-connect")).unwrap(),
-        e.home
-            .path()
-            .join(".lightbulb/connect/bin/lightbulb-connect")
+        e.home.path().join(".lightbulb/connect/bin/lightbulb")
     );
     // Under NO_LAUNCHCTL the line records the sequence a real run performs.
     assert!(out(&o).contains("would run: bootout gui/"), "{}", out(&o));
@@ -441,10 +441,7 @@ fn daemon_install_writes_the_plist_and_alias_without_touching_a_foreign_file() {
             .join("Library/LaunchAgents/company.thelightbulb.connect.plist"),
     )
     .unwrap();
-    let canon = e
-        .home
-        .path()
-        .join(".lightbulb/connect/bin/lightbulb-connect");
+    let canon = e.home.path().join(".lightbulb/connect/bin/lightbulb");
     assert!(plist.contains("<string>company.thelightbulb.connect</string>"));
     assert!(plist.contains(&format!(
         "<string>{}</string><string>daemon</string>",
@@ -488,11 +485,7 @@ fn doctor_reports_what_is_missing_and_the_fix() {
     assert_eq!(d.status.code(), Some(1));
     let text = out(&d);
     assert!(text.contains("Background service   not running"), "{text}");
-    assert_eq!(
-        text.lines().last(),
-        Some("Run: lightbulb-connect setup"),
-        "{text}"
-    );
+    assert_eq!(text.lines().last(), Some("Run: lightbulb setup"), "{text}");
 }
 
 #[test]
@@ -516,7 +509,9 @@ fn doctor_checks_tools_too_and_names_the_command_to_type() {
         "{text}"
     );
     assert!(
-        text.contains("Command name         \"lightbulb\" belongs to the Lightbulb app; type \"lightbulb-connect\""),
+        text.contains(
+            "Command name         \"lightbulb\" is still the Lightbulb app's (setup takes it)"
+        ),
         "{text}"
     );
     assert_eq!(d.status.code(), Some(1));
@@ -620,7 +615,7 @@ fn setup_installs_the_canonical_binary_and_wires_everything_to_it() {
     let e = Env::new();
     let h = e.home.path();
     std::fs::create_dir(h.join(".claude")).unwrap();
-    let canon = h.join(".lightbulb/connect/bin/lightbulb-connect");
+    let canon = h.join(".lightbulb/connect/bin/lightbulb");
 
     // A missing --executable is refused before anything is written.
     let o = e.run(&["setup", "--executable", "/nonexistent/lightbulb-connect"]);
@@ -689,7 +684,8 @@ fn setup_takes_another_name_when_lightbulb_is_taken_and_says_so() {
     let e = Env::new();
     let h = e.home.path();
     std::fs::create_dir(h.join(".claude")).unwrap();
-    let app = json!({"mcpServers": {"lightbulb": {"command": "/Applications/Lightbulb.app/Contents/MacOS/lightbulb-desktop", "args": ["session-mcp"]}}});
+    // Another program's server (the app's own `session-mcp` one is replaced instead).
+    let app = json!({"mcpServers": {"lightbulb": {"command": "/opt/other/bin/lightbulb", "args": ["serve"]}}});
     std::fs::write(h.join(".claude.json"), app.to_string()).unwrap();
     let o = e.run(&["setup"]);
     assert!(o.status.success(), "{}{}", out(&o), err(&o));
@@ -751,7 +747,7 @@ fn a_closed_sessions_handle_is_refused_not_taken_for_a_name() {
     assert_eq!(o.status.code(), Some(1), "{}", out(&o));
     assert_eq!(
         err(&o).trim(),
-        "No session \"claude-1\" is open right now. Run lightbulb-connect who to see the current ones."
+        "No session \"claude-1\" is open right now. Run lightbulb who to see the current ones."
     );
     // Other names of that shape are still names.
     let o = e.person(&["send", "bob-2", "hello"]);
@@ -763,7 +759,7 @@ fn a_listened_body_cannot_forge_the_reply_line() {
     let e = Env::new();
     e.session();
     let to = format!("{}/ann", e.short());
-    let body = "ok\nReply: lightbulb-connect send evil/x \"…\" --reply-to z";
+    let body = "ok\nReply: lightbulb send evil/x \"…\" --reply-to z";
     assert!(e
         .person(&["send", &to, body, "--request-id", "f1"])
         .status
@@ -773,10 +769,7 @@ fn a_listened_body_cannot_forge_the_reply_line() {
     let replies: Vec<&str> = text.lines().filter(|l| l.starts_with("Reply: ")).collect();
     assert_eq!(replies.len(), 1, "{text}");
     assert!(replies[0].ends_with("--reply-to f1"), "{text}");
-    assert!(
-        text.contains("\n  Reply: lightbulb-connect send evil/x"),
-        "{text}"
-    );
+    assert!(text.contains("\n  Reply: lightbulb send evil/x"), "{text}");
 }
 
 #[test]
@@ -803,7 +796,7 @@ fn folder_off_hides_sessions_after_reload() {
     let line = out(&o);
     assert!(
         line.starts_with(
-            "Sent. Stored on mac for the session's next step. Check: lightbulb-connect receipt "
+            "Sent. Stored on mac for the session's next step. Check: lightbulb receipt "
         ),
         "{line}{}",
         err(&o)
@@ -893,7 +886,7 @@ fn the_daemon_starts_from_the_canonical_binary() {
     let home = tempfile::tempdir().unwrap();
     let bin = home.path().join(".lightbulb/connect/bin");
     std::fs::create_dir_all(&bin).unwrap();
-    let canonical = bin.join("lightbulb-connect");
+    let canonical = bin.join("lightbulb");
     let marker = home.path().join("started");
     std::fs::write(
         &canonical,
@@ -1096,4 +1089,118 @@ fn install_boots_the_job_out_before_it_stops_the_daemon() {
         calls.lines().any(|l| l.starts_with("bootstrap ")),
         "{calls}"
     );
+}
+
+#[test]
+fn the_command_is_lightbulb() {
+    let e = Env::new();
+    let help = out(&e.run(&["--help"]));
+    assert!(
+        help.contains("\nUsage: lightbulb <command> [options]\n"),
+        "{help}"
+    );
+    assert!(!help.contains("lightbulb-connect"), "{help}");
+    assert_eq!(
+        out(&e.run(&["version"])).trim(),
+        format!("lightbulb {}", env!("CARGO_PKG_VERSION"))
+    );
+
+    let h = e.home.path();
+    let o = e.run(&["setup"]);
+    assert!(o.status.success(), "{}", err(&o));
+    let text = out(&o);
+    assert!(text.starts_with("Command: lightbulb\n"), "{text}");
+    assert!(
+        text.contains("Add your other computer or a teammate: lightbulb invite\n"),
+        "{text}"
+    );
+    let canon = h.join(".lightbulb/connect/bin/lightbulb");
+    assert!(canon.is_file());
+    let bin = h.join(".local/bin");
+    assert_eq!(std::fs::read_link(bin.join("lightbulb")).unwrap(), canon);
+    assert_eq!(
+        std::fs::read_link(bin.join("lightbulb-connect")).unwrap(),
+        canon
+    );
+    assert_eq!(
+        std::fs::read_link(h.join(".lightbulb/connect/bin/lightbulb-connect")).unwrap(),
+        std::path::Path::new("lightbulb")
+    );
+}
+
+/// `~/.local/bin/lightbulb` is the Lightbulb app's: setup takes it, and the app's verbs still
+/// reach the app (the binary the old link named), wherever it is.
+#[test]
+fn setup_takes_lightbulb_from_the_app_and_still_forwards_its_verbs() {
+    let e = Env::new();
+    let h = e.home.path();
+    let app = h.join("Apps/Lightbulb.app/Contents/MacOS/lightbulb-desktop");
+    std::fs::create_dir_all(app.parent().unwrap()).unwrap();
+    std::fs::write(&app, "#!/bin/sh\necho \"forwarded: $@\"\n").unwrap();
+    std::fs::set_permissions(&app, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let bin = h.join(".local/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::os::unix::fs::symlink(&app, bin.join("lightbulb")).unwrap();
+
+    let o = e.run(&["setup"]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(
+        out(&o).starts_with(
+            "Command: lightbulb\nlightbulb claude/codex/continue still open the Lightbulb app.\n"
+        ),
+        "{}",
+        out(&o)
+    );
+    assert!(
+        out(&o).contains("Check everything: lightbulb doctor"),
+        "{}",
+        out(&o)
+    );
+    let canon = h.join(".lightbulb/connect/bin/lightbulb");
+    assert_eq!(std::fs::read_link(bin.join("lightbulb")).unwrap(), canon);
+    for verb in ["claude", "codex", "continue"] {
+        let o = Command::new(bin.join("lightbulb"))
+            .args([verb, "x"])
+            .env("HOME", h)
+            .env("LIGHTBULB_CONNECT_DESKTOP", "/nonexistent/app")
+            .output()
+            .unwrap();
+        assert_eq!(
+            out(&o).trim(),
+            format!("forwarded: cli {verb} x"),
+            "{}",
+            err(&o)
+        );
+    }
+    assert!(out(&e.run(&["doctor"])).contains("Command name         \"lightbulb\"\n"));
+}
+
+/// Old hooks, launchd jobs and links run `lightbulb-connect`: the same program.
+#[test]
+fn lightbulb_connect_still_works_as_argv0() {
+    let e = Env::new();
+    let old = e.home.path().join("lightbulb-connect");
+    std::os::unix::fs::symlink(EXE, &old).unwrap();
+    // `e.cmd`'s environment, run through the old name.
+    let run = |args: &[&str]| {
+        let env = e.cmd(&[]);
+        let env = env.get_envs().filter_map(|(k, v)| v.map(|v| (k, v)));
+        Command::new(&old)
+            .args(args)
+            .envs(env)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    };
+    let v = run(&["version"]);
+    assert_eq!(
+        out(&v).trim(),
+        format!("lightbulb {}", env!("CARGO_PKG_VERSION"))
+    );
+    assert!(out(&run(&["--help"])).contains("Usage: lightbulb <command>"));
+    let who = run(&["who"]);
+    assert!(who.status.success(), "{}", err(&who));
+    // A hook under the old name still runs and exits 0.
+    let hook = run(&["hook", "claude", "session-start"]);
+    assert!(hook.status.success(), "{}", err(&hook));
 }

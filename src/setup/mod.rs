@@ -70,7 +70,8 @@ pub(crate) struct Ctx<'a> {
 }
 
 /// The MCP server name when `--server-name` is not given, and the one taken instead when an
-/// agent has another program's server under it (the Lightbulb app's, say).
+/// agent has another program's server under it. The Lightbulb app's own session server
+/// (`<app> session-mcp`, `is_app_server`) under it is replaced, not worked around.
 pub const DEFAULT_SERVER: &str = "lightbulb";
 pub const OTHER_SERVER: &str = "lightbulb-connect";
 
@@ -95,9 +96,16 @@ pub fn wired(home: &Path, agent: &str) -> bool {
     fs::read_to_string(home.join(file)).is_ok_and(|t| t.contains(&format!(" hook {agent} ")))
 }
 
-/// `agent`'s MCP server entries under `home`, `(name, command)`; `""` for an entry with no
-/// command (an http server), which is never ours (reads, never writes).
-fn servers(home: &Path, agent: &str) -> Vec<(String, String)> {
+/// Whether an MCP entry's `args` are the Lightbulb app's session server's (`["session-mcp"]`,
+/// as the app itself checks): the one entry setup replaces under the name it wants.
+fn is_app_server<'a>(args: impl IntoIterator<Item = Option<&'a str>>) -> bool {
+    let args: Vec<_> = args.into_iter().collect();
+    args == [Some("session-mcp")]
+}
+
+/// `agent`'s MCP server entries under `home`, `(name, command, the app's server)`; `""` for an
+/// entry with no command (an http server), which is never ours (reads, never writes).
+fn servers(home: &Path, agent: &str) -> Vec<(String, String, bool)> {
     let (file, key) = match agent {
         "claude" => (".claude.json", "mcpServers"),
         "codex" => (".codex/config.toml", "mcp_servers"),
@@ -105,7 +113,7 @@ fn servers(home: &Path, agent: &str) -> Vec<(String, String)> {
         "grok" => (".grok/config.toml", "mcp_servers"),
         _ => return vec![],
     };
-    let read = || -> Option<Vec<(String, String)>> {
+    let read = || -> Option<Vec<(String, String, bool)>> {
         let text = fs::read_to_string(home.join(file)).ok()?;
         Some(if file.ends_with(".toml") {
             let doc: toml_edit::DocumentMut = text.parse().ok()?;
@@ -118,7 +126,7 @@ fn servers(home: &Path, agent: &str) -> Vec<(String, String)> {
             doc.get(key)?
                 .as_table_like()?
                 .iter()
-                .map(|(k, v)| (k.to_string(), command(v)))
+                .map(|(k, v)| (k.to_string(), command(v), toml_app_server(v)))
                 .collect()
         } else {
             let doc: Value = serde_json::from_str(&text).ok()?;
@@ -126,25 +134,38 @@ fn servers(home: &Path, agent: &str) -> Vec<(String, String)> {
             doc[key]
                 .as_object()?
                 .iter()
-                .map(|(k, v)| (k.clone(), command(v)))
+                .map(|(k, v)| (k.clone(), command(v), json_app_server(v)))
                 .collect()
         })
     };
     read().unwrap_or_default()
 }
 
-/// The name of `agent`'s MCP entry under `home` that runs a `lightbulb-connect` binary, if
-/// any (what `doctor` checks; reads, never writes).
+fn json_app_server(v: &Value) -> bool {
+    v["args"]
+        .as_array()
+        .is_some_and(|a| is_app_server(a.iter().map(Value::as_str)))
+}
+
+fn toml_app_server(v: &toml_edit::Item) -> bool {
+    v.get("args")
+        .and_then(toml_edit::Item::as_array)
+        .is_some_and(|a| is_app_server(a.iter().map(toml_edit::Value::as_str)))
+}
+
+/// The name of `agent`'s MCP entry under `home` that runs this program (a `lightbulb` or
+/// `lightbulb-connect` binary that is not the app's server), if any (what `doctor` checks;
+/// reads, never writes).
 pub fn tools(home: &Path, agent: &str) -> Option<String> {
     let ours = |c: &str| {
         Path::new(c)
             .file_name()
-            .is_some_and(|f| f == "lightbulb-connect")
+            .is_some_and(|f| f == "lightbulb" || f == "lightbulb-connect")
     };
     servers(home, agent)
         .into_iter()
-        .find(|(_, c)| ours(c))
-        .map(|(k, _)| k)
+        .find(|(_, c, app)| ours(c) && !app)
+        .map(|(k, ..)| k)
 }
 
 /// `agent`'s state as its files under `home` are (`doctor`).
@@ -231,7 +252,11 @@ pub fn run(home: &Path, executable: &Path, server: Option<&str>, remove: bool) -
         } else {
             // The first name no entry has here, or ours has already.
             let taken = servers(home, name);
-            let free = |n: &&&str| taken.iter().all(|(k, c)| k != **n || *c == exe);
+            let free = |n: &&&str| {
+                taken
+                    .iter()
+                    .all(|(k, c, app)| k != **n || *c == exe || *app)
+            };
             let pick = names.iter().find(free);
             match configure(&ctx(pick.unwrap_or(&names[0])), &mut r) {
                 Err(e) => State::Failed {
@@ -343,11 +368,13 @@ impl Ctx<'_> {
         format!("'{}'", self.exe.replace('\'', "'\\''"))
     }
 
-    /// The owner of a server entry, given its command (`None`: the entry has none).
-    pub fn owner(&self, exists: bool, command: Option<&str>) -> Owner {
+    /// The owner of a server entry, given its command (`None`: the entry has none) and whether
+    /// it is the Lightbulb app's server, which installing replaces (removing leaves it).
+    pub fn owner(&self, exists: bool, command: Option<&str>, app: bool) -> Owner {
         match (exists, command) {
             (false, _) => Owner::Absent,
             (true, Some(c)) if c == self.exe => Owner::Ours,
+            _ if app && !self.remove => Owner::Absent,
             _ => Owner::Foreign,
         }
     }
@@ -567,7 +594,11 @@ pub(crate) fn set_json_server(
         return Err(format!("`{key}` is not an object").into());
     }
     let current = &doc[key][ctx.server];
-    let owner = ctx.owner(!current.is_null(), current["command"].as_str());
+    let owner = ctx.owner(
+        !current.is_null(),
+        current["command"].as_str(),
+        json_app_server(current),
+    );
     match owner {
         Owner::Foreign => return Ok(Owner::Foreign),
         Owner::Ours if ctx.remove => {
@@ -618,12 +649,21 @@ pub(crate) fn set_toml_server(
 ) -> Result<Owner> {
     use toml_edit::Item;
     let current = doc.get("mcp_servers").and_then(|s| s.get(ctx.server));
+    let app = current.is_some_and(toml_app_server);
     let owner = ctx.owner(
         current.is_some(),
         current
             .and_then(|t| t.get("command"))
             .and_then(Item::as_str),
+        app,
     );
+    if app && owner == Owner::Absent {
+        // None of the app's keys (env, timeouts) stay under ours.
+        doc["mcp_servers"]
+            .as_table_like_mut()
+            .expect("has the app's")
+            .remove(ctx.server);
+    }
     match owner {
         Owner::Foreign => return Ok(Owner::Foreign),
         Owner::Ours if ctx.remove => {

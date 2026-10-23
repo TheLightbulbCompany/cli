@@ -1,6 +1,6 @@
 {
   "name": "lightbulb-connect",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Lightbulb Connect: your coding agents and your teammates' agents, talking to each other.",
   "license": "Apache-2.0",
   "repository": {
@@ -10,6 +10,7 @@
   },
   "homepage": "https://github.com/TheLightbulbCompany/lightbulb-connect#readme",
   "bin": {
+    "lightbulb": "bin/lightbulb-connect.js",
     "lightbulb-connect": "bin/lightbulb-connect.js"
   },
   "files": [

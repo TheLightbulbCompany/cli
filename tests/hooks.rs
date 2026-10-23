@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-const EXE: &str = env!("CARGO_BIN_EXE_lightbulb-connect");
+const EXE: &str = env!("CARGO_BIN_EXE_lightbulb");
 
 struct Net {
     dir: tempfile::TempDir,

@@ -24,7 +24,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
 
-pub const EXE: &str = env!("CARGO_BIN_EXE_lightbulb-connect");
+pub const EXE: &str = env!("CARGO_BIN_EXE_lightbulb");
 
 pub struct Env {
     pub state: tempfile::TempDir,

@@ -478,7 +478,7 @@ async fn relay_clear_returns_to_the_default() {
         out(&o),
         "default  the iroh project's public relays (aps1-1.relay.n0.iroh.link, \
          euc1-1.relay.n0.iroh.link, use1-1.relay.n0.iroh.link, usw1-1.relay.n0.iroh.link)\n\
-         Set your own: lightbulb-connect relay <url>\n"
+         Set your own: lightbulb relay <url>\n"
     );
     let o = e.detached(&[EXE, "doctor"], "");
     assert!(

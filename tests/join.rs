@@ -134,7 +134,7 @@ fn ask_ticket_admits_only_after_allow() {
     let o = b.detached(&[EXE, "join", &t], "");
     assert!(!o.status.success());
     let taken = format!(
-        "The name \"prasiddha\" is already used in this network. Try: lightbulb-connect join '{t}' --name prasiddha-2\n"
+        "The name \"prasiddha\" is already used in this network. Try: lightbulb join '{t}' --name prasiddha-2\n"
     );
     assert_eq!(err(&o), taken);
     // Refused at once: it never said it was asking anyone.
@@ -148,7 +148,7 @@ fn ask_ticket_admits_only_after_allow() {
         let o = a.detached(&[EXE, "held"], "");
         assert_eq!(
             out(&o),
-            "J1  bob (mbp) wants to join — lightbulb-connect approve J1\n",
+            "J1  bob (mbp) wants to join — lightbulb approve J1\n",
             "{}",
             err(&o)
         );
@@ -165,7 +165,7 @@ fn ask_ticket_admits_only_after_allow() {
             out(&o),
             "Asking whoever sent the link to allow this computer… (they get a prompt; this waits up to 10 minutes)\n\
              Connected as bob (mbp). Team \"prasiddha\": 2 computers online.\n\
-             Your agents here can now see and message the team's agents. Try: lightbulb-connect who --all\n\
+             Your agents here can now see and message the team's agents. Try: lightbulb who --all\n\
              Until both computers sign in, your other computer counts as another person and its first message needs your Allow.\n"
         );
     });
@@ -376,7 +376,7 @@ fn join_from_a_multi_member_network_is_refused() {
     assert!(!o.status.success());
     assert_eq!(
         err(&o),
-        "You are in \"acme\". Leave it first: lightbulb-connect leave\n"
+        "You are in \"acme\". Leave it first: lightbulb leave\n"
     );
     assert_eq!(b.heads(), heads);
     assert_eq!(members(&c).len(), 1);
@@ -678,7 +678,7 @@ fn an_open_link_join_never_says_asking() {
 fn joins_with(form: fn(&str) -> String) {
     let (a, b, line) = pair("Decline", "open");
     let bare = ticket::encode(&ticket::decode(&line).unwrap());
-    assert_eq!(line, format!("lightbulb-connect join '{bare}' --name NAME"));
+    assert_eq!(line, format!("lightbulb join '{bare}' --name NAME"));
     let o = b.detached(&[EXE, "join", &form(&bare), "--name", "bob"], "");
     assert!(o.status.success(), "{}{}", out(&o), err(&o));
     converged(&a, &b, 2);

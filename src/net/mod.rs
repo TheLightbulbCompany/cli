@@ -604,7 +604,7 @@ impl Net {
             if daemon.peers.lan_status() == "blocked" {
                 eprintln!(
                     "net: macOS refuses this program the local network, so computers on it cannot find this one. \
-                     Allow lightbulb-connect in System Settings > Privacy & Security > Local Network."
+                     Allow lightbulb in System Settings > Privacy & Security > Local Network."
                 );
             }
         }

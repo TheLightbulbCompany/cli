@@ -316,9 +316,10 @@ fn remove_takes_only_our_entries() {
 fn a_foreign_lightbulb_mcp_entry_is_left_alone_and_gets_no_allow_rule() {
     let home = tempfile::tempdir().unwrap();
     let h = home.path();
-    let app = json!({"mcpServers": {"lightbulb": {"type": "stdio", "command": APP, "args": ["session-mcp"]}}});
-    let app_toml =
-        format!("[mcp_servers.lightbulb]\ncommand = \"{APP}\"\nargs = [\"session-mcp\"]\n");
+    // Another program's server (not the app's `session-mcp`, which is replaced: below).
+    let app =
+        json!({"mcpServers": {"lightbulb": {"type": "stdio", "command": APP, "args": ["serve"]}}});
+    let app_toml = format!("[mcp_servers.lightbulb]\ncommand = \"{APP}\"\nargs = [\"serve\"]\n");
     fs::create_dir(h.join(".claude")).unwrap();
     put(h, ".claude.json", &app.to_string());
     put(h, ".cursor/mcp.json", &app.to_string());
@@ -352,6 +353,48 @@ fn a_foreign_lightbulb_mcp_entry_is_left_alone_and_gets_no_allow_rule() {
         }
     }
     assert_eq!(get(h, ".codex/config.toml").trim_end(), app_toml.trim_end());
+}
+
+#[test]
+fn the_apps_session_server_under_lightbulb_is_replaced_by_ours() {
+    let home = tempfile::tempdir().unwrap();
+    let h = home.path();
+    let app = json!({"mcpServers": {"lightbulb": {"command": APP, "args": ["session-mcp"]}}});
+    let app_toml = format!(
+        "[mcp_servers.lightbulb]\ncommand = \"{APP}\"\nargs = [\"session-mcp\"]\nstartup_timeout_sec = 30\n"
+    );
+    fs::create_dir(h.join(".claude")).unwrap();
+    put(h, ".claude.json", &app.to_string());
+    put(h, ".cursor/mcp.json", &app.to_string());
+    put(h, ".codex/config.toml", &app_toml);
+    put(h, ".grok/config.toml", &app_toml);
+    let r = run(h, Path::new(EXE), None, false);
+    for name in ["claude", "codex", "cursor", "grok"] {
+        assert_eq!(
+            agent(&r, name).state,
+            State::Connected("lightbulb".into()),
+            "{name}"
+        );
+        assert_eq!(tools(h, name).as_deref(), Some("lightbulb"), "{name}");
+    }
+    for rel in [".claude.json", ".cursor/mcp.json"] {
+        let servers = &json_at(h, rel)["mcpServers"];
+        assert_eq!(servers["lightbulb"]["command"], EXE, "{rel}");
+        assert_eq!(servers["lightbulb"]["args"], json!(["mcp"]), "{rel}");
+        assert!(servers.get("lightbulb-connect").is_none(), "{rel}");
+    }
+    for rel in [".codex/config.toml", ".grok/config.toml"] {
+        let doc = toml_at(h, rel);
+        let server = &doc["mcp_servers"]["lightbulb"];
+        assert_eq!(server["command"].as_str(), Some(EXE), "{rel}");
+        assert!(server.get("startup_timeout_sec").is_none(), "{rel}");
+    }
+    // Removing takes ours out; the app writes its own again when it next turns sharing on.
+    run(h, Path::new(EXE), None, true);
+    assert!(json_at(h, ".claude.json").get("mcpServers").is_none());
+    // An entry of ours under the new binary's name is found as ours too.
+    run(h, Path::new("/opt/lb/bin/lightbulb"), None, false);
+    assert_eq!(tools(h, "claude").as_deref(), Some("lightbulb"));
 }
 
 #[test]

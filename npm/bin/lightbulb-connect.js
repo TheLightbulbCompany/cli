@@ -7,7 +7,7 @@ const path = require('path');
 const { spawnSync } = require('child_process');
 const { install } = require('../scripts/postinstall');
 
-const bin = path.join(__dirname, '..', 'vendor', 'lightbulb-connect');
+const bin = path.join(__dirname, '..', 'vendor', 'lightbulb');
 
 function run() {
   const r = spawnSync(bin, process.argv.slice(2), { stdio: 'inherit' });

@@ -9,7 +9,7 @@ use std::os::unix::net::UnixStream;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
 
-const EXE: &str = env!("CARGO_BIN_EXE_lightbulb-connect");
+const EXE: &str = env!("CARGO_BIN_EXE_lightbulb");
 const NOTE: &str = "unread message(s) for this session; they arrive at your next step.";
 
 struct Net {

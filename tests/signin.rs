@@ -141,7 +141,7 @@ fn signin_writes_a_merge_and_renews_before_expiry() {
     assert_eq!(
         out(&o),
         "Confirm the code ABCD-EFGH in your browser: https://example.invalid/d?c=ABCD\n\
-         Signed in as Prasiddha. To join your network, run the line your inviter sent: lightbulb-connect join '<ticket>' --name <your name>\n"
+         Signed in as Prasiddha. To join your network, run the line your inviter sent: lightbulb join '<ticket>' --name <your name>\n"
     );
     let id = identity_of(&e);
     assert_eq!(
@@ -267,7 +267,7 @@ fn second_computer_of_same_person_is_admitted_by_the_first() {
         texts(dir.path()),
         [
             "Your new Mac mbp wants to join. Allow?",
-            "Or run: lightbulb-connect approve J1"
+            "Or run: lightbulb approve J1"
         ]
     );
     let ms = members(&f);
@@ -345,7 +345,7 @@ async fn workspace_member_joins_with_a_workspace_proof() {
         texts(dir.path()),
         [
             "Lightbulb workspace \"The Lightbulb Company\" wants to join as a member. Its agents (Friday, Engineering) will appear in your directory, and it will see this network's directory.",
-            "Or run: lightbulb-connect approve J1"
+            "Or run: lightbulb approve J1"
         ]
     );
     let ms = members(&f);

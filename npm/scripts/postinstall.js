@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Downloads the release binary matching this package's version, checks its sha256 and
-// puts it at <package>/vendor/lightbulb-connect. No dependencies: https, crypto and the
+// puts it at <package>/vendor/lightbulb. No dependencies: https, crypto and the
 // system tar (always present on macOS).
 'use strict';
 const fs = require('fs');
@@ -52,9 +52,9 @@ async function install(root = path.join(__dirname, '..')) {
   try {
     const file = path.join(tmp, ASSET);
     fs.writeFileSync(file, tarball);
-    execFileSync('tar', ['-xzf', file, '-C', tmp, 'lightbulb-connect']);
-    const bin = path.join(vendor, 'lightbulb-connect');
-    fs.renameSync(path.join(tmp, 'lightbulb-connect'), bin);
+    execFileSync('tar', ['-xzf', file, '-C', tmp, 'lightbulb']);
+    const bin = path.join(vendor, 'lightbulb');
+    fs.renameSync(path.join(tmp, 'lightbulb'), bin);
     fs.chmodSync(bin, 0o755);
     return bin;
   } finally {
@@ -66,7 +66,7 @@ module.exports = { install };
 
 if (require.main === module) {
   install(process.argv[2] ? path.resolve(process.argv[2]) : undefined).then(
-    () => console.log('Run: lightbulb-connect setup'),
+    () => console.log('Run: lightbulb setup'),
     (err) => {
       console.error(err.plain ? err.message : `Could not install Lightbulb Connect: ${err.message}`);
       process.exit(1);

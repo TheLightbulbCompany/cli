@@ -293,7 +293,7 @@ impl Conn {
 /// What a person is told when the daemon does not answer within `waited`.
 fn no_answer(waited: Duration) -> String {
     format!(
-        "The background service did not answer in {} s. If macOS is asking whether lightbulb-connect may read a folder, click Allow, then try again.",
+        "The background service did not answer in {} s. If macOS is asking whether lightbulb may read a folder, click Allow, then try again.",
         waited.as_secs()
     )
 }
@@ -311,7 +311,7 @@ mod tests {
         };
         conn.wait_up_to(Duration::from_secs(1)).unwrap();
         let e = conn.call("ping", json!({})).unwrap_err().to_string();
-        assert_eq!(e, "The background service did not answer in 1 s. If macOS is asking whether lightbulb-connect may read a folder, click Allow, then try again.");
+        assert_eq!(e, "The background service did not answer in 1 s. If macOS is asking whether lightbulb may read a folder, click Allow, then try again.");
     }
 
     fn hook(provider: &'static str, event: Event) -> Hook {
