@@ -7,6 +7,7 @@ use crate::{admission, frame, label, mail, outbox, presence};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::os::fd::AsRawFd;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::Lines;
@@ -163,6 +164,10 @@ async fn handle(
                     "port": daemon.peers.port.get(),
                     "needs_update": needs_update,
                     "claim_live": daemon.claim_live(now() as i64),
+                    "dropped": {
+                        "grants": daemon.streams.dropped_grants.load(Ordering::Relaxed),
+                        "input": daemon.streams.dropped_input.load(Ordering::Relaxed),
+                    },
                 }),
             )
         }
@@ -251,6 +256,9 @@ async fn handle(
         "team.leave" => super::net_ops::leave(id, daemon, peer_pid).await,
         "holds" | "hold.get" | "hold.answer" | "hold.file" | "policy.get" | "policy.set" => {
             crate::holds::op(id, &req.op, &req.body, daemon, peer_pid)
+        }
+        "share.grant" | "stream.open" | "stream.send" | "stream.close" => {
+            crate::streams::handle(id, &req.op, &req.body, daemon, peer_pid).await
         }
         op => super::net_ops::handle(id, op, &req.body, daemon, peer_pid),
     }

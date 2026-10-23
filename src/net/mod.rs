@@ -26,6 +26,7 @@ use iroh::{Endpoint, EndpointAddr, PublicKey, SecretKey};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, Notify};
@@ -195,6 +196,14 @@ impl Peers {
         }
         outdated.sort();
         (online, outdated)
+    }
+
+    /// `member`'s connection, once it said `hello` in our protocol (`streams` opens on it).
+    pub fn conn(&self, member: &str) -> Option<Connection> {
+        let live = self.live.lock().unwrap();
+        live.get(member)
+            .filter(|l| matches!(l.protocol, Protocol::Ok(_)))
+            .map(|l| l.conn.clone())
     }
 
     /// Queues `f` on `member`'s connection; fails when it has none.
@@ -516,9 +525,16 @@ impl Net {
                     }
                 }
             };
+            // Every stream after the control one is a viewer's (`streams`).
+            let viewers = async {
+                while let Ok((s, r)) = conn.accept_bi().await {
+                    tokio::spawn(crate::streams::accept(d.clone(), key.clone(), s, r));
+                }
+            };
             tokio::select! {
                 _ = writer => {}
                 _ = reader => {}
+                _ = viewers => {}
             }
         }
         d.peers.forget(&key, &conn);
@@ -544,8 +560,11 @@ impl Net {
         let short = peer.short.clone();
         let mut synced = false;
         let mut hello_ok = false;
-        let (mut presence, mut envelope, mut answer) = (None, None, None);
+        let (mut presence, mut envelope, mut answer, mut grant) = (None, None, None, None);
         if !frames::from_peer_ok(&f, peer, d) {
+            if matches!(f, Frame::ShareGrant { .. }) {
+                d.streams.dropped_grants.fetch_add(1, Ordering::Relaxed);
+            }
             eprintln!("net: dropped a {} frame from {short}", f.kind());
         } else if let Frame::Hello { protocol: p, heads } = f {
             // ponytail: a hello costs O(log) under `team`, and a member may send them back to
@@ -572,6 +591,8 @@ impl Net {
             presence = Some(f);
         } else if matches!(f, Frame::Envelope { .. }) {
             envelope = Some(f);
+        } else if matches!(f, Frame::ShareGrant { .. }) {
+            grant = Some(f);
         } else if matches!(f, Frame::Ack { .. }) && d.peers.knobs().drop_acks {
             eprintln!("net: dropped an ack from {short} (debug)");
         } else if let Frame::Ack { id, state, reason } | Frame::Receipt { id, state, reason } = f {
@@ -595,6 +616,11 @@ impl Net {
         }
         if let Some(env) = envelope.filter(|_| d.peers.speaks_ours(key, conn)) {
             receive(d, key, &env, tx);
+        }
+        if let Some(g) = grant.filter(|_| d.peers.speaks_ours(key, conn)) {
+            if let Err(e) = crate::streams::store(&d.store.lock().unwrap(), &g) {
+                eprintln!("net: a share_grant from {short}: {e}");
+            }
         }
         if let Some((id, state, reason)) = answer {
             let store = d.store.lock().unwrap();

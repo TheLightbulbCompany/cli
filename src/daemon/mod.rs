@@ -60,6 +60,8 @@ pub struct Daemon {
     pub built: Mutex<Option<net::frames::Frame>>,
     /// Each member's latest presence (`peers_sessions` is its copy across restarts).
     pub latest: Mutex<HashMap<String, crate::presence::Latest>>,
+    /// The open streams (`streams`).
+    pub streams: crate::streams::Streams,
 }
 
 impl Daemon {
@@ -189,6 +191,7 @@ pub async fn run(dir: &Path) -> Result<()> {
         presence: Notify::new(),
         built: Mutex::default(),
         latest: Mutex::new(latest),
+        streams: Default::default(),
     });
     // No join connection outlives a restart: its open requests are over.
     daemon.store.lock().unwrap().expire_joins(i64::MAX, now)?;

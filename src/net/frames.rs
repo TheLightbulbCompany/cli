@@ -72,7 +72,7 @@ impl Remote {
 
 /// Whether `a` is a well-formed address (`sessions::qualify`, which bounds its parts) under
 /// member `short`'s prefix.
-fn own(short: &str, a: &str) -> bool {
+pub(crate) fn own(short: &str, a: &str) -> bool {
     sessions::qualify(short, a).as_deref() == Some(a)
         && sessions::split_addr(a).is_some_and(|(m, _)| m == short)
 }
@@ -220,9 +220,10 @@ pub async fn read(recv: &mut (impl AsyncRead + Unpin)) -> Result<Frame> {
 /// list, every session `Remote::valid` for it and every address under its prefix, a `seq` at
 /// most a day ahead of now. An `envelope` is checked by `mail::receive`. An `ack` or `receipt`
 /// names a state past `queued`, with a known reason exactly when it is `refused` (that it
-/// is bound to this member is `outbox::acked`'s check). Task 14 adds the rules for the frames
-/// it serves, and until then every other kind is dropped.
-pub fn from_peer_ok(f: &Frame, peer: &Member, _daemon: &Daemon) -> bool {
+/// is bound to this member is `outbox::acked`'s check). A `share_grant` passes
+/// `streams::grant_ok`. A `stream` never rides the control stream. Task 14 adds the rules for
+/// the frames it serves, and until then every other kind is dropped.
+pub fn from_peer_ok(f: &Frame, peer: &Member, daemon: &Daemon) -> bool {
     match f {
         Frame::Hello { .. } | Frame::Roster { .. } | Frame::Envelope { .. } => true,
         Frame::Ack { state, reason, .. } | Frame::Receipt { state, reason, .. } => {
@@ -246,6 +247,9 @@ pub fn from_peer_ok(f: &Frame, peer: &Member, _daemon: &Daemon) -> bool {
                     .all(|n| *n <= presence::MAX)
                 && sessions.iter().all(|s| s.valid(&peer.short))
                 && known.iter().chain(kept).all(|a| own(&peer.short, a))
+        }
+        Frame::ShareGrant { .. } => {
+            crate::streams::grant_ok(f, peer, &daemon.identity.key, ipc::now() as i64)
         }
         _ => false,
     }
