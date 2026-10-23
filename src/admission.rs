@@ -877,7 +877,7 @@ pub async fn join(id: u64, body: &Value, d: &Arc<Daemon>) -> Response {
     {
         let team = d.team.lock().unwrap();
         d.peers
-            .learn(&d.dir, &t.inviter, inviter_addrs, &team.roster);
+            .learn(&d.dir, &t.inviter, inviter_addrs.clone(), &team.roster);
     }
     for m in t.members.iter().filter(|m| *m != me) {
         let Some(mut addr) = d.peers.addr(m) else {
@@ -899,6 +899,15 @@ pub async fn join(id: u64, body: &Value, d: &Arc<Daemon>) -> Response {
             Outcome::Refused(r) => return done("refused", Some(r), "", 0),
             Outcome::Admitted => {
                 eprintln!("join: admitted by {}", net::short(m));
+                // Kept again now the inviter is a member: a roster change while the request
+                // waited pruned what the ticket gave (the inviter was no member then), and
+                // with no relay and no mDNS it is the one way to reach the team.
+                {
+                    let team = d.team.lock().unwrap();
+                    d.peers
+                        .learn(&d.dir, &t.inviter, inviter_addrs.clone(), &team.roster);
+                }
+                d.peers.changed.notify_one();
                 // The dial loop connects to the team; give it a moment for the count.
                 let _ = tokio::time::timeout(Duration::from_secs(5), async {
                     loop {

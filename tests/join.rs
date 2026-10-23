@@ -632,3 +632,44 @@ fn a_forged_ticket_leaves_no_address_behind() {
     let kept = std::fs::read_to_string(b.state.path().join("addrs.json")).unwrap_or_default();
     assert!(!kept.contains("192.0.2.7"), "{kept}");
 }
+
+/// A roster change while an `ask` join waits prunes the ticket's addresses (the inviter is no
+/// member yet); the admission keeps them again, so with no relay and no mDNS the two still
+/// connect.
+#[test]
+fn the_inviters_addresses_survive_a_waiting_join() {
+    let (a, b) = (Env::new(), Env::new());
+    a.daemon(false, &computer("mac"), &[dialog("")]);
+    let t = invite(&a, "reusable");
+    let inviter = a.identity().key;
+    b.daemon(false, &computer("mbp"), &[]);
+    let file = b.state.path().join("addrs.json");
+    std::thread::scope(|s| {
+        let joining = s.spawn(|| join(&b, &t, "bob", "computer"));
+        until(10, "J1 is listed", || requests(&a).len() == 1);
+        // A roster change on B while it waits: a link of its own.
+        invite(&b, "reusable");
+        let kept = std::fs::read_to_string(&file).unwrap_or_default();
+        assert!(!kept.contains(&inviter), "not pruned: {kept}");
+        let o = a.detached(&[EXE, "approve", "J1"], "");
+        assert!(o.status.success(), "{}", err(&o));
+        assert_eq!(joining.join().unwrap()["state"], "admitted");
+    });
+    let kept = std::fs::read_to_string(&file).unwrap();
+    assert!(kept.contains(&inviter), "{kept}");
+    until(15, "both online", || {
+        a.status()["peers"]["online"] == 1 && b.status()["peers"]["online"] == 1
+    });
+}
+
+/// An open link asks no one: `join` never says it is asking.
+#[test]
+fn an_open_link_join_never_says_asking() {
+    let (a, b) = (Env::new(), Env::new());
+    a.daemon(false, &computer("mac"), &[]);
+    let line = invite_open(&a);
+    b.daemon(false, &computer("mbp"), &[peers(&[&a])]);
+    let o = b.detached(&[EXE, "join", &line, "--name", "bob"], "");
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(!out(&o).contains("Asking"), "{}", out(&o));
+}

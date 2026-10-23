@@ -625,19 +625,21 @@ pub fn invite(mode: Invite) -> Result<i32> {
 pub fn join(link: &str, name: Option<String>, kind: &str, proof: Option<String>) -> Result<i32> {
     let name = name.unwrap_or_else(daemon::user_name);
     let mut conn = connect()?;
-    // Said once a member took the ticket and is asking its person (`join_asking`), never
-    // before a ticket it refuses at once.
-    let mut asking = Conn::open()?;
-    asking.call("subscribe", json!({}))?;
-    asking.wait_up_to(Duration::from_secs(660))?;
-    std::thread::spawn(move || {
-        while let Ok(e) = asking.next_line() {
-            if e["event"] == "join_asking" {
-                println!("Asking whoever sent the link to allow this computer… (they get a prompt; this waits up to 10 minutes)");
-                return;
+    // Said once a member took an `ask` ticket and is asking its person (`join_asking`), never
+    // before a ticket it refuses at once, nor for an open link (it asks no one).
+    if crate::ticket::decode(link).is_ok_and(|t| t.mode == "ask") {
+        let mut asking = Conn::open()?;
+        asking.call("subscribe", json!({}))?;
+        asking.wait_up_to(Duration::from_secs(660))?;
+        std::thread::spawn(move || {
+            while let Ok(e) = asking.next_line() {
+                if e["event"] == "join_asking" {
+                    println!("Asking whoever sent the link to allow this computer… (they get a prompt; this waits up to 10 minutes)");
+                    return;
+                }
             }
-        }
-    });
+        });
+    }
     conn.wait_up_to(Duration::from_secs(660))?;
     let r = ask(
         &mut conn,
