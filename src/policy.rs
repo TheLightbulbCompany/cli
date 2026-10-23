@@ -150,14 +150,13 @@ const REPLY_S: u64 = 86_400;
 /// record); everyone else is refused. It never holds.
 pub fn cloud_inbound(
     store: &Store,
+    roster: &Roster,
     mine: &Member,
     from: &Member,
     from_addr: &str,
     now: u64,
 ) -> Result<Verdict> {
-    let own = from.kind == MemberKind::Computer
-        && from.workspace.is_some()
-        && from.workspace == mine.workspace;
+    let own = workspace_computer(roster, &mine.key, &from.key, &from.person_id).is_some();
     // `<short>/` up to `<short>0` (`0` sorts just after `/`): a range, not a function of the
     // column.
     let (prefix, end) = (format!("{}/", mine.short), format!("{}0", mine.short));

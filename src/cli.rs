@@ -27,6 +27,15 @@ pub const APP_VERBS: [&str; 3] = ["claude", "codex", "share"];
 /// Names a session the invocation speaks as (nothing sets it yet).
 const SESSION_ENV: &str = "LIGHTBULB_CONNECT_SESSION";
 
+/// A "(tests)" environment override: read in debug builds only, as `net::Knobs::read` does.
+fn test_env(name: &str) -> Option<std::ffi::OsString> {
+    if cfg!(debug_assertions) {
+        std::env::var_os(name)
+    } else {
+        None
+    }
+}
+
 pub fn home() -> Result<PathBuf> {
     dirs::home_dir().ok_or_else(|| "no home directory".into())
 }
@@ -343,7 +352,7 @@ pub fn who(as_json: bool, all: bool) -> Result<i32> {
 /// Whether this invocation may be a session: the env names one, an agent is above us, or the
 /// ancestry could not be walked to a person (fails closed).
 fn session_identity() -> bool {
-    std::env::var_os(SESSION_ENV).is_some()
+    test_env(SESSION_ENV).is_some()
         || hook::calling_agent(None).is_ok()
         || !crate::agents::caller::walked_to_a_person()
 }
@@ -366,7 +375,7 @@ pub fn send(
     request_id: Option<String>,
 ) -> Result<i32> {
     let group = target == "*" || target.ends_with("/*");
-    let from = from.or_else(|| std::env::var(SESSION_ENV).ok());
+    let from = from.or_else(|| test_env(SESSION_ENV).and_then(|s| s.into_string().ok()));
     let identity = session_identity();
     if group && (from.is_some() || identity) {
         return Err("group sends are for people at a terminal".into());
@@ -893,7 +902,7 @@ pub fn policy(person: Option<String>, value: Option<String>) -> Result<i32> {
         "no"
     };
     println!(
-        "Agents may message teammates without asking you: {on}.{}",
+        "Your workspace's agents may message your sessions without asking: {on}.{}",
         by(crate::policy::SWITCH.into(), None)
     );
     for scope in ["people", "cloud_of"] {
@@ -1065,7 +1074,7 @@ pub fn relay(set: Option<String>, local: bool) -> Result<i32> {
 /// Hands one of the app's verbs to the Lightbulb app's binary as its CLI (`cli` first, as the
 /// app reads it), replacing this process; anything else, or no app, is an unknown command.
 pub fn forward(args: Vec<OsString>) -> Result<i32> {
-    let app = std::env::var_os(DESKTOP_ENV).map_or_else(|| PathBuf::from(DESKTOP), PathBuf::from);
+    let app = test_env(DESKTOP_ENV).map_or_else(|| PathBuf::from(DESKTOP), PathBuf::from);
     let verb = args
         .first()
         .map(|a| a.to_string_lossy().into_owned())
@@ -1140,7 +1149,7 @@ fn launchctl(args: &[&str]) -> bool {
 }
 
 pub(crate) fn use_launchctl() -> bool {
-    std::env::var_os(NO_LAUNCHCTL).is_none()
+    test_env(NO_LAUNCHCTL).is_none()
 }
 
 /// Asks launchd to start the installed job if it is not running; whether launchctl agreed.

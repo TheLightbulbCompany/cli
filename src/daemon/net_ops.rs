@@ -190,6 +190,7 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, caller: Caller) 
         },
         // `ui.claim {}` -> `{lease_s}`: the Lightbulb app shows the person's questions itself;
         // no OS dialog opens until it stops heartbeating.
+        "ui.claim" if !caller.is_person() => refused(id, "not_a_person"),
         "ui.claim" => {
             daemon.dialogs.claim(super::ipc::now() as i64);
             Response::ok(id, json!({ "lease_s": crate::dialog::LEASE_S }))

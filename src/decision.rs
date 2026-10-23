@@ -344,10 +344,7 @@ pub fn accept(
     let Some(mine) = roster.members.get(&me.key) else {
         return Ok(None);
     };
-    if roster
-        .my_workspace_member(mine)
-        .is_none_or(|w| w.key != signer.key)
-    {
+    if !crate::policy::my_workspace(roster, &me.key, &signer.key, None) {
         return Ok(None);
     }
     if !admission::signed_by(&signer.key, f) {

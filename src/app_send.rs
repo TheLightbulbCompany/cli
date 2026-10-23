@@ -431,12 +431,11 @@ fn online_computers(d: &Daemon, person: &str) -> Vec<(String, String, String)> {
     let mut out: Vec<_> = {
         let team = d.team.lock().unwrap();
         let r = &team.roster;
-        let ws = r
-            .members
-            .get(&d.identity.key)
-            .and_then(|m| m.workspace.as_ref());
         (r.computers_of(person).into_iter())
-            .filter(|m| ws.is_some() && m.workspace.as_ref() == ws && d.peers.is_online(&m.key))
+            .filter(|m| {
+                policy::workspace_computer(r, &d.identity.key, &m.key, person).is_some()
+                    && d.peers.is_online(&m.key)
+            })
             .map(|m| (m.key.clone(), m.short.clone(), m.computer.clone()))
             .collect()
     };

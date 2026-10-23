@@ -118,10 +118,12 @@ pub(crate) async fn boot(
     // An instance has no agents of its own to discover: its state dir holds no `.claude`.
     let claude_home = match cloud {
         Some(_) => dir.to_path_buf(),
-        None => std::env::var_os("LIGHTBULB_CONNECT_CLAUDE_HOME")
-            .map(PathBuf::from)
-            .or_else(dirs::home_dir)
-            .ok_or("no home directory")?,
+        None => (cfg!(debug_assertions)
+            .then(|| std::env::var_os("LIGHTBULB_CONNECT_CLAUDE_HOME"))
+            .flatten())
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)
+        .ok_or("no home directory")?,
     };
     let daemon = Arc::new(Daemon {
         dir: dir.to_path_buf(),

@@ -769,7 +769,7 @@ pub fn receive(
     // own fixed rule.
     let verdict = match roster.by_short(me) {
         Some(mine) if mine.kind == MemberKind::Cloud => {
-            policy::cloud_inbound(store, mine, peer, from, now)?
+            policy::cloud_inbound(store, roster, mine, peer, from, now)?
         }
         Some(mine) => policy::decide(store, roster, &mine.key, peer)?,
         None => Verdict::Hold,
