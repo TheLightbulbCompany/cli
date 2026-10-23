@@ -9,18 +9,21 @@
 //! issuer's `relays.json` and `relays.json.minisig`, verified against one of two compiled-in
 //! minisign keys and accepted only whole, cached in the state dir with its signature and
 //! refetched at most daily; the cached copy serves while a fetch fails. None at all: direct
-//! only. Every relay URL, from any source, passes `valid` (https only) or is ignored.
+//! only. Every relay URL, from any source, passes `parse` (https only) or is ignored.
+//!
+//! What is known of our list (`State`) is read from disk and verified once, at start; after
+//! that only a fetch changes it (and writes the files), so `list` is a pure function.
 //!
 //! The fetch uses `ureq`: blocking, small and rustls-only; it runs on a blocking thread,
 //! where `reqwest::blocking` would start a second runtime per fetch.
 
-use crate::config::Config;
 use crate::Result;
+use iroh::RelayUrl;
 use minisign_verify::{PublicKey, Signature};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 pub const FILE: &str = "relays.json";
 pub const SIG_FILE: &str = "relays.json.minisig";
@@ -31,6 +34,8 @@ pub const FLOOR_FILE: &str = "relays.floor";
 pub const MAX_RELAYS: usize = 8;
 /// A cached list younger than this is used without asking the issuer.
 const FRESH: Duration = Duration::from_secs(86_400);
+/// A failed fetch is tried again after this.
+const RETRY: Duration = Duration::from_secs(3_600);
 /// The most a relay list (or its signature) may be.
 const MAX_BYTES: u64 = 64 * 1024;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -58,174 +63,161 @@ pub enum Source {
     None,
 }
 
-/// The relays in effect, and why our list was refused, when it was.
+/// The relays in effect, and (for ours) why our list was refused, until a fetch succeeds.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct List {
-    pub urls: Vec<String>,
+    pub urls: Vec<RelayUrl>,
     pub source: Source,
     pub error: Option<String>,
-    /// This list came with a fetch attempt (its `error` is then that fetch's outcome).
-    #[serde(skip)]
-    pub fetched: bool,
 }
 
-/// Whether `url` may be a relay: `https` with a host and no userinfo, query or fragment.
-/// `http` only in debug builds (the tests' loopback relay): a plain-TCP relay would show
-/// member keys and who talks to whom on the path.
-pub fn valid(url: &str) -> bool {
-    let Ok(u) = url.parse::<iroh::RelayUrl>() else {
-        return false;
-    };
+/// What is known of our list: the verified cache, the rollback floor, the last fetch.
+#[derive(Clone, Debug, Default)]
+pub struct State {
+    /// The verified list, its `expires_at`, and when it was fetched (the file's mtime).
+    pub cache: Option<(Vec<RelayUrl>, i64, SystemTime)>,
+    /// The newest `expires_at` verified here (`FLOOR_FILE`, or the cache's).
+    pub floor: i64,
+    /// Why the cache or the last fetch was refused; cleared by a fetch that succeeds.
+    pub last_fetch_error: Option<String>,
+    pub last_fetch_at: Option<Instant>,
+}
+
+/// `url` as a relay when it may be one: `https` with a host and no userinfo, query or
+/// fragment. `http` only in debug builds (the tests' loopback relay): a plain-TCP relay
+/// would show member keys and who talks to whom on the path.
+pub fn parse(url: &str) -> Option<RelayUrl> {
+    let u: RelayUrl = url.trim().parse().ok()?;
     let scheme = u.scheme() == "https" || (cfg!(debug_assertions) && u.scheme() == "http");
-    scheme
+    let ok = scheme
         && u.host_str().is_some_and(|h| !h.is_empty())
         && u.username().is_empty()
         && u.password().is_none()
         && u.query().is_none()
-        && u.fragment().is_none()
+        && u.fragment().is_none();
+    ok.then_some(u)
 }
 
-/// `new` as it replaces `old` in effect: our list's error stays until a fetch ends it (a tick
-/// without a fetch knows nothing new about the issuer).
-pub fn merge(old: &List, mut new: List) -> List {
-    let ours = matches!(new.source, Source::Lightbulb | Source::None);
-    if ours && !new.fetched && new.error.is_none() {
-        new.error = old.error.clone();
-    }
-    new
-}
-
-#[derive(Deserialize)]
-struct Signed {
-    v: u32,
-    relays: Vec<String>,
-    expires_at: i64,
-}
-
-/// The relays for `config` and the team's own `team` (the roster's `meta {relay}`; see the
-/// module doc). With `fetch`, a cache older than
-/// a day (or none) is first refreshed from `config.issuer`; without, the network is not used.
-/// `keys` are the trusted public keys (`KEYS`, or the debug knob's).
-pub fn list(
-    dir: &Path,
-    config: &Config,
-    team: &Option<String>,
-    keys: &[String],
-    fetch: bool,
-) -> List {
-    let own = |v: &Option<String>, source| {
-        let u = v.as_deref().map(str::trim).filter(|u| !u.is_empty())?;
-        if !valid(u) {
-            warn_once(u);
-            return None;
-        }
-        Some(List {
-            urls: vec![u.to_string()],
+/// The relays for `config_relay` (`config.toml: relay`), then the team's own `team` (the
+/// roster's `meta {relay}`), then ours (`state`). An empty or invalid setting is skipped.
+pub fn list(config_relay: &Option<String>, team: &Option<String>, state: &State) -> List {
+    let own = |v: &Option<String>| v.as_deref().and_then(parse);
+    let (urls, source) = if let Some(u) = own(config_relay) {
+        (vec![u], Source::Config)
+    } else if let Some(u) = own(team) {
+        (vec![u], Source::Team)
+    } else {
+        let urls = state
+            .cache
+            .as_ref()
+            .map(|c| c.0.clone())
+            .unwrap_or_default();
+        let source = if urls.is_empty() {
+            Source::None
+        } else {
+            Source::Lightbulb
+        };
+        let error = state.last_fetch_error.clone();
+        return List {
+            urls,
             source,
-            ..List::default()
-        })
+            error,
+        };
     };
-    if let Some(l) = own(&config.relay, Source::Config).or_else(|| own(team, Source::Team)) {
-        return l;
+    List {
+        urls,
+        source,
+        error: None,
     }
-    let cached = cached(dir, keys);
-    if let Ok((_, at)) = &cached {
-        raise_floor(dir, *at);
-    }
-    let fresh = fs::metadata(dir.join(FILE))
-        .and_then(|m| m.modified())
-        .is_ok_and(|t| t.elapsed().is_ok_and(|e| e < FRESH));
-    let mut fetched = None;
-    if fetch && !fresh {
-        match refresh(dir, &config.issuer, keys) {
-            Ok(got) => fetched = Some(Ok(got)),
-            Err(e) => {
-                eprintln!("relay: fetching {}: {e}", config.issuer);
-                fetched = Some(Err(e));
+}
+
+impl State {
+    /// The state in `dir`: its cache verified against `keys` once.
+    pub fn load(dir: &Path, keys: &[String]) -> State {
+        let floor_file = fs::read_to_string(dir.join(FLOOR_FILE)).unwrap_or_default();
+        let mut s = State {
+            cache: None,
+            floor: floor_file.trim().parse().unwrap_or_default(),
+            ..State::default()
+        };
+        let read = (
+            fs::read(dir.join(FILE)),
+            fs::read_to_string(dir.join(SIG_FILE)),
+        );
+        if let (Ok(body), Ok(sig)) = read {
+            match verify(&body, &sig, keys) {
+                Ok((urls, at)) => {
+                    let mtime = fs::metadata(dir.join(FILE)).and_then(|m| m.modified());
+                    s.floor = s.floor.max(at);
+                    s.cache = Some((urls, at, mtime.unwrap_or(SystemTime::UNIX_EPOCH)));
+                }
+                Err(e) => s.last_fetch_error = Some(format!("{FILE}: {e}")),
             }
         }
+        s
     }
-    let (got, error) = match (fetched, cached) {
-        (Some(Ok(got)), _) => (Some(got), None),
-        // A failed fetch: the cached copy serves, and the failure is said.
-        (Some(Err(e)), Ok(c)) => (Some(c), Some(e.to_string())),
-        (Some(Err(e)), Err(_)) => (None, Some(e.to_string())),
-        (None, Ok(c)) => (Some(c), None),
-        (None, Err(e)) => (None, e),
-    };
-    let fetched = fetch && !fresh;
-    match got {
-        Some((urls, _)) if !urls.is_empty() => List {
-            urls,
-            source: Source::Lightbulb,
-            error,
-            fetched,
-        },
-        _ => List {
-            error,
-            fetched,
-            ..List::default()
-        },
-    }
-}
 
-/// Logs an invalid relay setting once per value (it is ignored: the next source serves).
-fn warn_once(url: &str) {
-    static WARNED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-    let mut w = WARNED.lock().unwrap();
-    if !w.iter().any(|u| u == url) {
-        eprintln!("relay: ignored {url:?} (not an https relay URL)");
-        w.push(url.to_string());
-    }
-}
-
-fn floor(dir: &Path) -> i64 {
-    let text = fs::read_to_string(dir.join(FLOOR_FILE)).unwrap_or_default();
-    text.trim().parse().unwrap_or(i64::MIN)
-}
-
-fn raise_floor(dir: &Path, at: i64) {
-    if at > floor(dir) {
-        let mut r = crate::setup::AgentReport::default();
-        let path = dir.join(FLOOR_FILE);
-        if let Err(e) = crate::setup::write(&path, &at.to_string(), false, &mut r) {
-            eprintln!("relay: {FLOOR_FILE}: {e}");
+    /// Fetches ours from `issuer` when ours is in effect (`config_relay` and `team` unset:
+    /// otherwise nothing of ours is contacted) and due: the cache is a day old (or none) and
+    /// no fetch was tried this hour. Blocking. Whether it fetched.
+    pub fn fetch_if_due(
+        &mut self,
+        dir: &Path,
+        issuer: &str,
+        (config_relay, team): (&Option<String>, &Option<String>),
+        keys: &[String],
+    ) -> bool {
+        let ours = [config_relay, team]
+            .iter()
+            .all(|v| v.as_deref().and_then(parse).is_none());
+        let stale = (self.cache.as_ref()).is_none_or(|c| !c.2.elapsed().is_ok_and(|e| e < FRESH));
+        let retry = self.last_fetch_at.is_none_or(|t| t.elapsed() >= RETRY);
+        if !(ours && stale && retry) {
+            return false;
         }
+        self.last_fetch_at = Some(Instant::now());
+        match self.refresh(dir, issuer, keys) {
+            Ok(()) => self.last_fetch_error = None,
+            Err(e) => {
+                eprintln!("relay: fetching {issuer}: {e}");
+                self.last_fetch_error = Some(e.to_string());
+            }
+        }
+        true
     }
-}
 
-/// The cached list and its `expires_at`; `Err(None)` when there is none, `Err(Some(why))`
-/// when it does not verify.
-fn cached(dir: &Path, keys: &[String]) -> std::result::Result<(Vec<String>, i64), Option<String>> {
-    let (Ok(body), Ok(sig)) = (
-        fs::read(dir.join(FILE)),
-        fs::read_to_string(dir.join(SIG_FILE)),
-    ) else {
-        return Err(None);
-    };
-    parse(&body, &sig, keys).map_err(|e| Some(format!("{FILE}: {e}")))
-}
-
-/// Fetches `{issuer}/relays.json` and its signature; on a list that verifies and expires no
-/// earlier than the newest one verified here (`FLOOR_FILE`: no rollback), caches both.
-fn refresh(dir: &Path, issuer: &str, keys: &[String]) -> Result<(Vec<String>, i64)> {
-    let base = issuer.trim_end_matches('/');
-    let text = |url: String| -> Result<String> {
-        Ok(String::from_utf8(get(&url)?).map_err(|_| "not text")?)
-    };
-    let body = text(format!("{base}/{FILE}"))?;
-    let sig = text(format!("{base}/{SIG_FILE}"))?;
-    let got = parse(body.as_bytes(), &sig, keys)?;
-    if got.1 < floor(dir) {
-        return Err("older than the cached list".into());
+    /// Fetches `{issuer}/relays.json` and its signature; on a list that verifies and expires no
+    /// earlier than the floor (no rollback), caches both and raises the floor.
+    fn refresh(&mut self, dir: &Path, issuer: &str, keys: &[String]) -> Result<()> {
+        let mut r = crate::setup::AgentReport::default();
+        // A cache placed by hand raised the floor only in memory: kept, whatever the fetch.
+        if self.cache.is_some() {
+            crate::setup::write(
+                &dir.join(FLOOR_FILE),
+                &self.floor.to_string(),
+                false,
+                &mut r,
+            )?;
+        }
+        let base = issuer.trim_end_matches('/');
+        let text = |url: String| -> Result<String> {
+            Ok(String::from_utf8(get(&url)?).map_err(|_| "not text")?)
+        };
+        let body = text(format!("{base}/{FILE}"))?;
+        let sig = text(format!("{base}/{SIG_FILE}"))?;
+        let (urls, at) = verify(body.as_bytes(), &sig, keys)?;
+        if at < self.floor {
+            return Err("older than the cached list".into());
+        }
+        // A crash between the two leaves a pair that does not verify: refetched next time.
+        crate::setup::write(&dir.join(FILE), &body, false, &mut r)?;
+        crate::setup::write(&dir.join(SIG_FILE), &sig, false, &mut r)?;
+        crate::setup::write(&dir.join(FLOOR_FILE), &at.to_string(), false, &mut r)?;
+        eprintln!("relay: fetched {} relays from {issuer}", urls.len());
+        self.floor = at;
+        self.cache = Some((urls, at, SystemTime::now()));
+        Ok(())
     }
-    // A crash between the two leaves a pair that does not verify: refetched next time.
-    let mut r = crate::setup::AgentReport::default();
-    crate::setup::write(&dir.join(FILE), &body, false, &mut r)?;
-    crate::setup::write(&dir.join(SIG_FILE), &sig, false, &mut r)?;
-    raise_floor(dir, got.1);
-    eprintln!("relay: fetched {} relays from {issuer}", got.0.len());
-    Ok(got)
 }
 
 fn get(url: &str) -> Result<Vec<u8>> {
@@ -248,13 +240,10 @@ fn get(url: &str) -> Result<Vec<u8>> {
         .map_err(|e| e.to_string())?)
 }
 
-/// The relays of `body` when `sig` is a minisign signature of it by one of `keys`, and the
-/// whole body is a valid list: refused whole otherwise, never a partial list.
-pub fn verify(body: &[u8], sig: &str, keys: &[String]) -> Result<Vec<String>> {
-    parse(body, sig, keys).map(|(urls, _)| urls)
-}
-
-fn parse(body: &[u8], sig: &str, keys: &[String]) -> Result<(Vec<String>, i64)> {
+/// The relays of `body` and its `expires_at`, when `sig` is a minisign signature of it by one
+/// of `keys` and the whole body is a valid list (at most `MAX_RELAYS`, each one `parse`s):
+/// refused whole otherwise, never a partial list.
+pub fn verify(body: &[u8], sig: &str, keys: &[String]) -> Result<(Vec<RelayUrl>, i64)> {
     let sig = Signature::decode(sig).map_err(|_| "no signature")?;
     let signed = keys
         .iter()
@@ -263,10 +252,18 @@ fn parse(body: &[u8], sig: &str, keys: &[String]) -> Result<(Vec<String>, i64)> 
         return Err("bad signature".into());
     }
     let l: Signed = serde_json::from_slice(body).map_err(|_| "not a relay list")?;
-    if l.v != 1 || l.relays.len() > MAX_RELAYS || !l.relays.iter().all(|u| valid(u)) {
-        return Err("not a relay list".into());
+    let urls: Option<Vec<RelayUrl>> = l.relays.iter().map(|u| parse(u)).collect();
+    match urls {
+        Some(urls) if l.v == 1 && urls.len() <= MAX_RELAYS => Ok((urls, l.expires_at)),
+        _ => Err("not a relay list".into()),
     }
-    Ok((l.relays, l.expires_at))
+}
+
+#[derive(Deserialize)]
+struct Signed {
+    v: u32,
+    relays: Vec<String>,
+    expires_at: i64,
 }
 
 #[cfg(test)]
@@ -275,59 +272,59 @@ mod tests {
 
     #[test]
     fn config_then_team_win_and_no_list_is_direct_only() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut config = Config {
-            issuer: "http://127.0.0.1:9/connect".into(),
-            ..Config::default()
-        };
-        let mut team = Some("https://team.example".into());
-        config.relay = Some("https://mine.example".into());
-        let l = list(dir.path(), &config, &team, &[], true);
+        let u = |s: &str| Some(s.to_string());
+        let mut s = State::default();
+        let l = list(&u("https://mine.example"), &u("https://team.example"), &s);
         assert_eq!(
             (l.source, l.urls),
-            (Source::Config, vec!["https://mine.example".into()])
+            (Source::Config, vec![parse("https://mine.example").unwrap()])
         );
-        // An empty value is none (`relay --clear`).
-        config.relay = Some(String::new());
-        let l = list(dir.path(), &config, &team, &[], true);
-        assert_eq!(l.source, Source::Team);
-        team = Some(" ".into());
-        // Ours: the issuer is down and nothing is cached.
-        let l = list(dir.path(), &config, &team, &[], true);
+        // An empty value is none (`relay --clear`); an invalid one is skipped.
+        assert_eq!(
+            list(&u(""), &u("https://team.example"), &s).source,
+            Source::Team
+        );
+        assert_eq!(
+            list(&u("ftp://mine.example"), &u("https://t.example"), &s).source,
+            Source::Team
+        );
+        assert_eq!(list(&None, &u("garbage"), &s), List::default());
+        // Ours: the issuer is down and nothing is cached; the error stays until a fetch ends it.
+        let dir = tempfile::tempdir().unwrap();
+        assert!(s.fetch_if_due(
+            dir.path(),
+            "http://127.0.0.1:9/connect",
+            (&None, &None),
+            &[]
+        ));
+        let l = list(&None, &None, &s);
         assert_eq!((l.source, l.urls.len()), (Source::None, 0));
         assert!(l.error.is_some());
-        // A tick without a fetch keeps that error; only a fetch's outcome replaces it.
-        let tick = list(dir.path(), &config, &team, &[], false);
-        assert_eq!(tick, List::default());
-        assert_eq!(merge(&l, tick).error, l.error);
-        let mut team_list = list(
+        // Retried only after an hour; with a relay of our own, never.
+        assert!(!s.fetch_if_due(
             dir.path(),
-            &config,
-            &Some("https://t.example".into()),
-            &[],
-            false,
-        );
-        team_list = merge(&l, team_list);
-        assert_eq!((team_list.source, team_list.error), (Source::Team, None));
-        // An invalid setting is ignored: the next source serves.
-        config.relay = Some("ftp://mine.example".into());
-        let l = list(
+            "http://127.0.0.1:9/connect",
+            (&None, &None),
+            &[]
+        ));
+        let mut s = State::default();
+        assert!(!s.fetch_if_due(
             dir.path(),
-            &config,
-            &Some("https://t.example".into()),
-            &[],
-            false,
-        );
-        assert_eq!(l.source, Source::Team);
-        let l = list(dir.path(), &config, &Some("garbage".into()), &[], false);
-        assert_eq!((l.source, l.urls.len()), (Source::None, 0));
+            "http://127.0.0.1:9/connect",
+            (&u("https://t.example"), &None),
+            &[]
+        ));
+        assert_eq!(list(&u("https://t.example"), &None, &s).error, None);
     }
 
     #[test]
     fn only_https_relay_urls_are_valid() {
-        assert!(valid("https://relay.example"));
-        assert!(valid("https://relay.example:443/"));
-        assert_eq!(valid("http://127.0.0.1:3340"), cfg!(debug_assertions));
+        assert!(parse("https://relay.example").is_some());
+        assert!(parse("https://relay.example:443/").is_some());
+        assert_eq!(
+            parse("http://127.0.0.1:3340").is_some(),
+            cfg!(debug_assertions)
+        );
         for bad in [
             "ftp://relay.example",
             "file:///etc/passwd",
@@ -339,7 +336,7 @@ mod tests {
             "relay.example",
             "",
         ] {
-            assert!(!valid(bad), "{bad}");
+            assert!(parse(bad).is_none(), "{bad}");
         }
     }
 }

@@ -518,10 +518,8 @@ pub async fn join(id: u64, body: &Value, d: &Arc<Daemon>) -> Response {
             continue;
         };
         // The inviter's relay, before this computer knows its own list (an https one only).
-        if crate::relay::valid(&t.relay_hint) {
-            if let Ok(u) = t.relay_hint.parse() {
-                addr = addr.with_relay_url(u);
-            }
+        if let Some(u) = crate::relay::parse(&t.relay_hint) {
+            addr = addr.with_relay_url(u);
         }
         let Ok(Ok(conn)) = tokio::time::timeout(STEP, ep.connect(addr, JOIN_ALPN)).await else {
             eprintln!("join: dial {} failed", net::short(m));

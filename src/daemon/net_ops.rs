@@ -120,7 +120,7 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, peer_pid: Option
             }),
         ),
         // `relay.get {}` -> `{urls, source, error}`: the relays in effect and where they came
-        // from (`config`, `team`, `lightbulb` or `none`).
+        // from (`config`, `team`, `lightbulb` or `none`); the snapshot `status` reads too.
         "relay.get" => Response::ok(id, json!(*daemon.peers.relays.lock().unwrap())),
         "relay.set" => relay_set(id, body, daemon, peer_pid),
         // `ui.claim {}` -> `{lease_s}`: the Lightbulb app shows the person's questions itself;
@@ -159,40 +159,17 @@ fn relay_set(id: u64, body: &Value, daemon: &Daemon, peer_pid: Option<u32>) -> R
         return refused(id, "not_a_person");
     }
     let url = body["url"].as_str().unwrap_or_default().trim();
-    if !url.is_empty() && !crate::relay::valid(url) {
+    if !url.is_empty() && crate::relay::parse(url).is_none() {
         return Response::err(id, BAD_REQUEST);
     }
     let mut team = daemon.team.lock().unwrap();
     let store = daemon.store.lock().unwrap();
     let me = &daemon.identity.key;
-    let elevated = team
-        .roster
-        .members
-        .get(me)
-        .is_some_and(|m| m.role >= Role::Admin)
-        && body["local"] != true;
-    let now = super::ipc::now() as i64;
-    let mut set = || -> crate::Result<()> {
-        crate::config::Config::set(&daemon.dir, "relay", url)?;
-        team.config.relay = Some(url.to_string());
-        if elevated {
-            write(
-                daemon,
-                &mut team,
-                &store,
-                Kind::Meta,
-                json!({"relay": url}),
-                now,
-            )?;
-        }
-        Ok(())
-    };
-    match set() {
+    let role = team.roster.members.get(me).map(|m| m.role);
+    let elevated = role >= Some(Role::Admin) && body["local"] != true;
+    match set_relay(daemon, &mut team, &store, url, elevated) {
         Ok(()) => {
-            let t = &team;
-            daemon
-                .peers
-                .set_relays(&daemon.dir, &t.config, &t.roster.relay);
+            daemon.peers.relays_changed(&team);
             eprintln!("relay.set: {url:?} (team: {elevated})");
             Response::ok(id, json!({"team": elevated}))
         }
@@ -201,6 +178,23 @@ fn relay_set(id: u64, body: &Value, daemon: &Daemon, peer_pid: Option<u32>) -> R
             Response::err(id, INTERNAL)
         }
     }
+}
+
+/// `config.toml: relay` = `url`, here and on disk; with `team`, the roster's `meta {relay}`.
+fn set_relay(
+    daemon: &Daemon,
+    team: &mut TeamState,
+    store: &Store,
+    url: &str,
+    meta: bool,
+) -> crate::Result<()> {
+    crate::config::Config::set(&daemon.dir, "relay", url)?;
+    team.config.relay = Some(url.to_string());
+    if meta {
+        let now = super::ipc::now() as i64;
+        write(daemon, team, store, Kind::Meta, json!({"relay": url}), now)?;
+    }
+    Ok(())
 }
 
 /// How long `team.leave` waits for a peer to take the `leave` entry.
@@ -347,9 +341,7 @@ pub fn install(
     team.roster = new;
     daemon.peers.changed.notify_one();
     if relay_changed {
-        daemon
-            .peers
-            .set_relays(&daemon.dir, &team.config, &team.roster.relay);
+        daemon.peers.relays_changed(team);
     }
     Ok(())
 }

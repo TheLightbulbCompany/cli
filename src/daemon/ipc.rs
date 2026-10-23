@@ -141,6 +141,7 @@ async fn handle(
             let total = members.keys().filter(|k| *k != me).count();
             let ours = daemon.peers.knobs().protocol;
             let (online, direct, outdated) = daemon.peers.status();
+            let (relay, relay_error) = daemon.peers.relay_status();
             // `<computer> needs an update (protocol <theirs>, yours <ours>)`
             let needs_update: Vec<String> = outdated
                 .into_iter()
@@ -160,9 +161,9 @@ async fn handle(
                     "team": { "id": t.roster.team_id, "name": t.roster.team_name },
                     "sessions": live_count(daemon),
                     "peers": { "online": online, "direct": direct, "total": total },
-                    "relay": daemon.peers.relay_state(),
+                    "relay": relay,
                     // Why our relay list was refused (or could not be fetched), when it was.
-                    "relay_error": daemon.peers.relays.lock().unwrap().error,
+                    "relay_error": relay_error,
                     "port": daemon.peers.port.get(),
                     "needs_update": needs_update,
                     "claim_live": daemon.claim_live(now() as i64),

@@ -41,6 +41,19 @@ fn sign(kp: &minisign::KeyPair, body: &[u8]) -> String {
         .to_string()
 }
 
+/// `url` as the engine writes it (`RelayUrl`'s form: a trailing `/`).
+fn canon(url: &str) -> String {
+    relay::parse(url).unwrap().to_string()
+}
+
+/// What the engine makes of the list in `dir` once a fetch from `issuer` was due: our list
+/// (no relay of its own set).
+fn ours_after_fetch(dir: &std::path::Path, issuer: &str, keys: &[String]) -> relay::List {
+    let mut s = relay::State::load(dir, keys);
+    assert!(s.fetch_if_due(dir, issuer, (&None, &None), keys));
+    relay::list(&None, &None, &s)
+}
+
 fn list_body(relays: &[&str]) -> Vec<u8> {
     list_at(relays, 4_000_000_000)
 }
@@ -168,9 +181,15 @@ fn unsigned_or_partial_relay_list_is_refused() {
     let keys = vec![kp.pk.to_base64()];
     let body = list_body(&["https://r1.example", "https://r2.example"]);
     let sig = sign(&kp, &body);
+    let urls: Vec<String> = relay::verify(&body, &sig, &keys)
+        .unwrap()
+        .0
+        .iter()
+        .map(|u| u.to_string())
+        .collect();
     assert_eq!(
-        relay::verify(&body, &sig, &keys).unwrap(),
-        ["https://r1.example", "https://r2.example"]
+        urls,
+        [canon("https://r1.example"), canon("https://r2.example")]
     );
     // No signature, a signature by another key, a body cut short, a body changed: refused
     // whole, never a partial list.
@@ -189,6 +208,7 @@ fn unsigned_or_partial_relay_list_is_refused() {
     assert_eq!(
         relay::verify(&eight, &sign(&kp, &eight), &keys)
             .unwrap()
+            .0
             .len(),
         8
     );
@@ -237,7 +257,7 @@ async fn team_relay_from_meta_replaces_ours() {
     until(10, "both online", || online(&a) && online(&b));
     let got = |e: &Env| e.ask(json!({"id": 1, "op": "relay.get"}));
     until(10, "A fetched ours", || got(&a)["source"] == "lightbulb");
-    assert_eq!(got(&a)["urls"], json!([ours]));
+    assert_eq!(got(&a)["urls"], json!([canon(ours)]));
     assert!(a_hits.load(Ordering::SeqCst) >= 2);
     assert_eq!(got(&b)["source"], "lightbulb");
 
@@ -254,18 +274,18 @@ async fn team_relay_from_meta_replaces_ours() {
     assert_eq!(got(&a)["source"], "config");
     let t = a.ask(json!({"id": 1, "op": "team.invite"}));
     let ticket = lightbulb_connect::ticket::decode(t["ticket"].as_str().unwrap()).unwrap();
-    assert_eq!(ticket.relay_hint, team_relay);
+    assert_eq!(ticket.relay_hint, canon(&team_relay));
     until(10, "B adopts the team's relay", || {
         got(&b)["source"] == "team"
     });
-    assert_eq!(got(&b)["urls"], json!([team_relay]));
+    assert_eq!(got(&b)["urls"], json!([canon(&team_relay)]));
     until(30, "B reaches the team's relay", || {
         b.status()["relay"] == "ok"
     });
     // A teammate's ticket carries the relay in effect.
     let t = b.ask(json!({"id": 1, "op": "team.invite"}));
     let ticket = lightbulb_connect::ticket::decode(t["ticket"].as_str().unwrap()).unwrap();
-    assert_eq!(ticket.relay_hint, team_relay);
+    assert_eq!(ticket.relay_hint, canon(&team_relay));
     assert_eq!(b_hits.load(Ordering::SeqCst), 0, "B contacted our issuer");
     // `--local`: the founder's own relay only; the team keeps its relay.
     let mine = "http://127.0.0.1:2";
@@ -274,28 +294,24 @@ async fn team_relay_from_meta_replaces_ours() {
         json!({"id": 1, "op": "relay.set", "url": mine, "local": true}),
     );
     assert_eq!(r["team"], false, "{r}");
-    assert_eq!(got(&a)["urls"], json!([mine]));
+    assert_eq!(got(&a)["urls"], json!([canon(mine)]));
     std::thread::sleep(Duration::from_millis(500));
-    assert_eq!(got(&b)["urls"], json!([team_relay]));
+    assert_eq!(got(&b)["urls"], json!([canon(&team_relay)]));
 
     // With a team relay, even a stale cache contacts nothing of ours.
     let roster =
         lightbulb_connect::roster::replay(&lightbulb_connect::roster::entries(&b.store()).unwrap());
     let stale = tempfile::tempdir().unwrap();
-    let config = Config {
-        issuer: b_issuer.clone(),
-        ..Config::default()
-    };
-    let l = relay::list(
-        stale.path(),
-        &config,
-        &roster.relay,
-        &[kp.pk.to_base64()],
-        true,
-    );
+    let keys = [kp.pk.to_base64()];
+    let mut s = relay::State::load(stale.path(), &keys);
+    assert!(!s.fetch_if_due(stale.path(), &b_issuer, (&None, &roster.relay), &keys));
+    let l = relay::list(&None, &roster.relay, &s);
     assert_eq!(
         (l.source, l.urls),
-        (relay::Source::Team, vec![team_relay.clone()])
+        (
+            relay::Source::Team,
+            vec![relay::parse(&team_relay).unwrap()]
+        )
     );
     assert_eq!(
         b_hits.load(Ordering::SeqCst),
@@ -305,7 +321,7 @@ async fn team_relay_from_meta_replaces_ours() {
 
     // `relay` alone prints the list and its source.
     let o = a.detached(&[EXE, "relay"], "");
-    assert_eq!(out(&o), format!("config  {mine}\n"));
+    assert_eq!(out(&o), format!("config  {}\n", canon(mine)));
     // An agent may not move the team's traffic.
     let r: Value = a.ask(json!({"id": 1, "op": "relay.set", "url": "http://x"}));
     assert_eq!(r["reason"], "not_a_person", "{r}");
@@ -318,19 +334,15 @@ fn an_older_list_or_a_tampered_cache_is_refused() {
     let newer = list_at(&["https://new.example"], 4_000_000_000);
     let older = list_at(&["https://old.example"], 3_000_000_000);
     let (iss, hits) = issuer(older.clone(), sign(&kp, &older));
-    let config = Config {
-        issuer: iss,
-        ..Config::default()
-    };
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path();
     std::fs::write(d.join("relays.json"), &newer).unwrap();
     std::fs::write(d.join("relays.json.minisig"), sign(&kp, &newer)).unwrap();
     age(d);
     // The issuer serves an older (validly signed) list: refused, the cached one serves.
-    let l = relay::list(d, &config, &None, &keys, true);
+    let l = ours_after_fetch(d, &iss, &keys);
     assert!(hits.load(Ordering::SeqCst) >= 1);
-    assert_eq!(l.urls, ["https://new.example"]);
+    assert_eq!(l.urls, [relay::parse("https://new.example").unwrap()]);
     assert!(
         l.error.as_deref().is_some_and(|e| e.contains("older")),
         "{l:?}"
@@ -339,7 +351,7 @@ fn an_older_list_or_a_tampered_cache_is_refused() {
     // still refused, and nothing is in effect.
     std::fs::write(d.join("relays.json"), &older).unwrap();
     age(d);
-    let l = relay::list(d, &config, &None, &keys, true);
+    let l = ours_after_fetch(d, &iss, &keys);
     assert_eq!((l.source, l.urls.len()), (relay::Source::None, 0), "{l:?}");
     assert!(l.error.is_some());
 }
@@ -359,7 +371,7 @@ async fn a_joiner_reaches_the_inviter_through_the_relay_hint_alone() {
     let t = r["ticket"].as_str().unwrap().to_string();
     assert_eq!(
         lightbulb_connect::ticket::decode(&t).unwrap().relay_hint,
-        url
+        canon(&url)
     );
     c.daemon(false, "", &[relay_only()]);
     assert_eq!(c.status()["relay"], "none");

@@ -220,7 +220,9 @@ fn main() -> lightbulb_connect::Result<()> {
         Command::Held => exit(cli::held()?),
         Command::Policy { person, value } => exit(cli::policy(person, value)?),
         Command::Folder { path, state } => exit(cli::folder(&path, state == "on")?),
-        Command::Relay { url, clear, local } => exit(cli::relay(url, clear, local)?),
+        Command::Relay { url, clear, local } => {
+            exit(cli::relay(clear.then(String::new).or(url), local)?)
+        }
         Command::External(args) => exit(cli::forward(args)?),
         Command::Mcp { server_name } => mcp::run(server_name)?,
         Command::Setup {
