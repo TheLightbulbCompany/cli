@@ -23,9 +23,9 @@ Both of you run the install line above. Then, on your Mac:
 lightbulb-connect invite
 ```
 
-It prints the join command: `lightbulb-connect join '<ticket>' --name <their name>` (and, on its
-own line, a `lightbulb://join/…` link for the Lightbulb app). Send that command to your teammate.
-They paste it into Terminal with their name in place of `<their name>`:
+It prints the join command: `lightbulb-connect join '<ticket>' --name NAME` (and, on its own
+line, a `lightbulb://join/…` link for the Lightbulb app). Send that command to your teammate.
+They paste it into Terminal with their name in place of `NAME`:
 
 ```sh
 lightbulb-connect join '<ticket>' --name sam

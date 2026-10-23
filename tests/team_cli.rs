@@ -83,12 +83,12 @@ fn invite_parts(o: &std::process::Output) -> (String, String) {
     let text = out(o);
     let (notice, rest) = text.split_once(HEADER).unwrap_or_else(|| panic!("{text}"));
     let lines: Vec<&str> = rest.lines().collect();
-    let [line, app] = lines[..] else {
+    let [line, "Replace NAME with the name they go by.", app] = lines[..] else {
         panic!("{text}")
     };
     let ticket = line
         .strip_prefix(LINE)
-        .and_then(|t| t.strip_suffix("' --name <their name>"))
+        .and_then(|t| t.strip_suffix("' --name NAME"))
         .unwrap_or_else(|| panic!("{text}"));
     assert_eq!(app, format!("lightbulb://join/{ticket}"), "{text}");
     (notice.to_string(), line.to_string())

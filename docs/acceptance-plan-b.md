@@ -342,7 +342,7 @@ The teammate follows this on Mac B (a different macOS account and person, releas
 1. Run the install line: `curl -fsSL https://github.com/TheLightbulbCompany/lightbulb-connect/releases/latest/download/install.sh | sh`. It installs `~/.lightbulb/connect/bin/lightbulb-connect`, runs `setup` (one line per agent and `Lightbulb Connect is on.`) and starts the background service.
 2. Run `lightbulb-connect doctor`, which must show `Relay                default` and end with `All good.` (If `~/.local/bin` is not on PATH, use the full path.)
 3. Quit and restart Claude Code and Codex. An open session does not load the new tool server. The tool server is named **`lightbulb-connect`**.
-4. In a plain Terminal (not inside an agent), paste the command A's `invite` printed (`lightbulb-connect join '<ticket>' --name <their name>`), with your name in place of `<their name>`. Wait for `Connected as <you> (<your computer>) …`. A clicks Allow, or runs `lightbulb-connect approve J<n>`.
+4. In a plain Terminal (not inside an agent), paste the command A's `invite` printed (`lightbulb-connect join '<ticket>' --name NAME`), with your name in place of `NAME`. Wait for `Connected as <you> (<your computer>) …`. A clicks Allow, or runs `lightbulb-connect approve J<n>`.
 5. Run `lightbulb-connect who --all`. A's sessions are listed with A's name and computer.
 6. In Claude Code, say: "Use the lightbulb-connect tools: find the sessions of `<A's name>` and send their Claude `ping from B` with send_message." Then: "read its receipt with message_receipt". Text the receipt to A. It reads `held` until A allows it.
 7. After A says "allowed", send a second message from Codex the same way. Confirm the receipt reads `stored` or later, without A doing anything.

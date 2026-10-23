@@ -35,6 +35,8 @@ pub const FLOOR_FILE: &str = "relays.floor";
 pub const MAX_RELAYS: usize = 8;
 /// A cached list younger than this is used without asking the issuer.
 const FRESH: Duration = Duration::from_secs(86_400);
+/// Why a fetch failed when the issuer has no `relays.json` (404): not reported.
+const UNPUBLISHED: &str = "no relay list published";
 /// A failed fetch is tried again after this.
 pub const RETRY: Duration = Duration::from_secs(3_600);
 
@@ -185,7 +187,7 @@ impl State {
         match self.refresh(dir, issuer, keys) {
             Ok(()) => self.last_fetch_error = None,
             // No list published (yet): the default serves, and nobody needs to hear about it.
-            Err(e) if e.to_string().ends_with(" answered 404") => {
+            Err(e) if e.to_string() == UNPUBLISHED => {
                 if cfg!(debug_assertions) {
                     eprintln!("relay: fetching {issuer}: {e}");
                 }
@@ -216,7 +218,11 @@ impl State {
         let text = |url: String| -> Result<String> {
             Ok(String::from_utf8(crate::http::get(&url)?).map_err(|_| "not text")?)
         };
-        let body = text(format!("{base}/{FILE}"))?;
+        // Only `relays.json` itself missing is quiet: a list without its signature is ours to fix.
+        let body = text(format!("{base}/{FILE}")).map_err(|e| match e.to_string() {
+            s if s.ends_with(" answered 404") => UNPUBLISHED.into(),
+            _ => e,
+        })?;
         let sig = text(format!("{base}/{SIG_FILE}"))?;
         let (urls, at) = verify(body.as_bytes(), &sig, keys)?;
         if at < self.floor {

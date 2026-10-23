@@ -384,16 +384,28 @@ async fn a_joiner_reaches_the_inviter_through_the_relay_hint_alone() {
 
 /// An issuer that answers 404 to everything: no list of ours published.
 fn issuer_404() -> String {
+    issuer_missing(|_| true)
+}
+
+/// An issuer that answers 404 to the request lines `missing` picks, else an empty 200.
+fn issuer_missing(missing: fn(&str) -> bool) -> String {
     let l = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let url = format!("http://{}/connect", l.local_addr().unwrap());
     std::thread::spawn(move || {
         for s in l.incoming().flatten() {
             let mut r = BufReader::new(&s);
+            let mut line = String::new();
+            r.read_line(&mut line).unwrap_or_default();
             while r.read_line(&mut String::new()).is_ok_and(|n| n > 2) {}
+            let status = if missing(&line) {
+                "404 Not Found"
+            } else {
+                "200 OK"
+            };
             let mut s = &s;
             let _ = write!(
                 s,
-                "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                "HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
             );
         }
     });
@@ -423,6 +435,12 @@ fn default_relays_are_used_when_nothing_is_configured() {
     let dir = tempfile::tempdir().unwrap();
     let l = ours_after_fetch(dir.path(), &issuer_404(), &[]);
     assert_eq!((l.source, l.error), (relay::Source::Default, None));
+    // The list without its signature (404 on the .minisig only) is our mistake: reported.
+    let dir = tempfile::tempdir().unwrap();
+    let iss = issuer_missing(|line| line.contains("relays.json.minisig"));
+    let l = ours_after_fetch(dir.path(), &iss, &[]);
+    assert_eq!(l.source, relay::Source::Default);
+    assert!(l.error.is_some_and(|e| e.contains("404")));
 }
 
 #[test]

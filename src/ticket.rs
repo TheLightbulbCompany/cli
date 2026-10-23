@@ -9,9 +9,10 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 const APP: &str = "lightbulb://join/";
-/// The join line is the command itself; `--name <their name>` is for the person to replace.
+/// The join line is the command itself; `NAME` is for the person to replace (a bare word, so
+/// the line pasted unedited still parses in a shell).
 const COMMAND: &str = "lightbulb-connect join '";
-const NAME: &str = "' --name <their name>";
+const NAME: &str = "' --name NAME";
 /// A reusable (or open) link lasts 7 days; a once link 24 hours.
 const REUSABLE_S: i64 = 7 * 86_400;
 const ONCE_S: i64 = 86_400;
@@ -231,7 +232,7 @@ mod tests {
         let old_line = format!("Join Lightbulb Connect: {web}");
         assert_eq!(
             line(&t),
-            format!("lightbulb-connect join '{bare}' --name <their name>")
+            format!("lightbulb-connect join '{bare}' --name NAME")
         );
         for s in [bare.clone(), line(&t), web, old_line, app_link(&bare)] {
             assert_eq!(decode(&s).unwrap(), t);

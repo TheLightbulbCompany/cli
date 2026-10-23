@@ -613,11 +613,12 @@ pub fn invite(mode: Invite) -> Result<i32> {
     }
     println!("Send this line to the person (or paste it on your other computer):");
     println!("{line}");
+    println!("Replace NAME with the name they go by.");
     println!("{}", r["app_link"].as_str().unwrap_or_default());
     Ok(0)
 }
 
-/// `join '<link>' [--name <n>]`: joins the network `link` invites to, waiting up to 600 s
+/// `join '<ticket>' [--name <n>]`: joins the network the join line `link` is for, waiting up to 600 s
 /// for its person to allow it. Hidden: `--kind cloud --proof <jws>`, a workspace member (the
 /// bridge joins in process; this is for tests and ops).
 pub fn join(link: &str, name: Option<String>, kind: &str, proof: Option<String>) -> Result<i32> {

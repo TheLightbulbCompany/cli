@@ -678,10 +678,7 @@ fn an_open_link_join_never_says_asking() {
 fn joins_with(form: fn(&str) -> String) {
     let (a, b, line) = pair("Decline", "open");
     let bare = ticket::encode(&ticket::decode(&line).unwrap());
-    assert_eq!(
-        line,
-        format!("lightbulb-connect join '{bare}' --name <their name>")
-    );
+    assert_eq!(line, format!("lightbulb-connect join '{bare}' --name NAME"));
     let o = b.detached(&[EXE, "join", &form(&bare), "--name", "bob"], "");
     assert!(o.status.success(), "{}{}", out(&o), err(&o));
     converged(&a, &b, 2);
