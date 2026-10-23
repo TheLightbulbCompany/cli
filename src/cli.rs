@@ -1,5 +1,5 @@
 //! The person-facing commands: `who`, `send`, `listen`, `receipt`, `doctor`, `leave`,
-//! `daemon --install/--uninstall`, the `lightbulb` alias, and forwarding to the Lightbulb app.
+//! `daemon --install/--uninstall`, and the `lightbulb` alias.
 //! Each is a client of the daemon, like the hook.
 
 use crate::daemon::ipc;
@@ -7,11 +7,9 @@ use crate::daemon::net_ops::Invite;
 use crate::hook::{self, Conn};
 use crate::{admission, daemon, http, label, paths, proof, setup, Result};
 use serde_json::{json, Value};
-use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::{symlink, PermissionsExt};
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -19,11 +17,6 @@ use std::time::Duration;
 pub const LABEL: &str = "company.thelightbulb.connect";
 /// Set to skip every `launchctl` call (tests).
 const NO_LAUNCHCTL: &str = "LIGHTBULB_CONNECT_NO_LAUNCHCTL";
-/// Overrides where the Lightbulb app's binary is looked for (tests).
-const DESKTOP_ENV: &str = "LIGHTBULB_CONNECT_DESKTOP";
-const DESKTOP: &str = "/Applications/Lightbulb.app/Contents/MacOS/lightbulb-desktop";
-/// The Lightbulb app's own CLI verbs that this program does not own: `forward` hands them on.
-pub const APP_VERBS: [&str; 3] = ["claude", "codex", "share"];
 /// Names a session the invocation speaks as (nothing sets it yet).
 const SESSION_ENV: &str = "LIGHTBULB_CONNECT_SESSION";
 
@@ -41,47 +34,7 @@ pub fn home() -> Result<PathBuf> {
 }
 
 pub fn canonical(home: &Path) -> PathBuf {
-    home.join(".lightbulb/connect/bin/lightbulb-connect")
-}
-
-/// legacy (Plan A install): the names `setup --remove` still cleans up.
-pub const LEGACY_LABEL: &str = "company.thelightbulb.network";
-
-/// legacy (Plan A install): the old canonical binary.
-pub fn legacy_canonical(home: &Path) -> PathBuf {
-    home.join(".lightbulb/network/bin/lightbulb-network")
-}
-
-/// legacy (Plan A install): stops the old daemon (its socket, then its launchd job) and
-/// removes the job and the old binary.
-pub fn legacy_uninstall(home: &Path) -> Result<()> {
-    if cfg!(target_os = "macos") {
-        // A bootout alone leaves a daemon whose job is already gone running.
-        if let Ok(mut s) = legacy_socket(home) {
-            let _ = s.set_read_timeout(Some(Duration::from_secs(1)));
-            let _ = writeln!(s, r#"{{"id":1,"op":"shutdown"}}"#);
-            let _ = std::io::Read::read(&mut s, &mut [0; 64]);
-        }
-        if use_launchctl() {
-            let target = format!("gui/{}/{LEGACY_LABEL}", unsafe { libc::getuid() });
-            launchctl(&["bootout", &target]);
-        }
-        let plist = home
-            .join("Library/LaunchAgents")
-            .join(format!("{LEGACY_LABEL}.plist"));
-        for path in [plist, legacy_canonical(home)] {
-            match fs::remove_file(&path) {
-                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
-                _ => {}
-            }
-        }
-    }
-    Ok(())
-}
-
-/// legacy (Plan A install): a connection to the old daemon, when one is running.
-fn legacy_socket(home: &Path) -> std::io::Result<std::os::unix::net::UnixStream> {
-    std::os::unix::net::UnixStream::connect(home.join(".lightbulb/network/sock"))
+    home.join(".lightbulb/connect/bin/lightbulb")
 }
 
 pub(crate) fn plist_path(home: &Path) -> PathBuf {
@@ -113,10 +66,7 @@ fn refusal(r: &Value) -> String {
         "not_a_person" => "Run this from your own terminal, not from an agent.".into(),
         "not_admin" => "Only the founder and admins can do that.".into(),
         "name_taken" => "That name is taken by your other computer's session.".into(),
-        c => format!(
-            "Lightbulb Connect could not do that ({}).",
-            c.replace('_', " ")
-        ),
+        c => format!("Lightbulb could not do that ({}).", c.replace('_', " ")),
     }
 }
 
@@ -124,59 +74,27 @@ fn refusal(r: &Value) -> String {
 #[derive(Clone, Copy, PartialEq)]
 enum Link {
     Ours,
-    App,
+    /// A link to something else.
     Other,
+    /// A regular file (or anything not a link).
+    File,
     Missing,
 }
 
-/// `~/.local/bin`'s two command names: `lightbulb` (`short`) and `lightbulb-connect`.
-#[derive(Clone, Copy)]
-struct Alias {
-    short: Link,
-    full: Link,
-}
-
-impl Alias {
-    fn read(home: &Path) -> Alias {
-        let link = |name: &str| {
-            let path = home.join(".local/bin").join(name);
-            match fs::read_link(&path) {
-                Ok(t) if t == canonical(home) => Link::Ours,
-                Ok(t) if t.to_string_lossy().contains("Lightbulb.app") => Link::App,
-                _ if path.symlink_metadata().is_ok() => Link::Other,
-                _ => Link::Missing,
-            }
-        };
-        Alias {
-            short: link("lightbulb"),
-            full: link("lightbulb-connect"),
-        }
-    }
-
-    /// The command name to type.
-    fn command(self) -> &'static str {
-        if self.short == Link::Ours {
-            "lightbulb"
-        } else {
-            "lightbulb-connect"
-        }
-    }
-
-    /// Who has `lightbulb` when it is not ours.
-    fn short_owner(self) -> &'static str {
-        if self.short == Link::App {
-            "the Lightbulb app"
-        } else {
-            "another program"
-        }
+/// Who has `~/.local/bin/lightbulb`.
+fn short_link(home: &Path) -> Link {
+    let path = home.join(".local/bin/lightbulb");
+    match fs::read_link(&path) {
+        Ok(t) if t == canonical(home) => Link::Ours,
+        Ok(_) => Link::Other,
+        _ if path.symlink_metadata().is_ok() => Link::File,
+        _ => Link::Missing,
     }
 }
 
-/// The command name that runs this program here: `lightbulb` when that link is ours, else
-/// `lightbulb-connect` (the Lightbulb app may own `lightbulb`). Read once per process.
+/// The command name to type.
 pub fn command() -> &'static str {
-    static COMMAND: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
-    COMMAND.get_or_init(|| home().map_or("lightbulb-connect", |h| Alias::read(&h).command()))
+    "lightbulb"
 }
 
 /// `addr` as the daemon takes it: a `who` handle (`codex-1`) as its session id (refused when
@@ -668,7 +586,7 @@ pub fn join(link: &str, name: Option<String>, kind: &str, proof: Option<String>)
         ),
         (_, Some(admission::UNREACHABLE)) => "No one from this network is online right now. Ask them to open their laptop, then run the same command again. Your key is ready; nothing was lost.".to_string(),
         (_, Some(admission::DECLINED)) => "Your request to join was declined.".to_string(),
-        (_, Some(admission::BAD_NAME)) => "That name has characters Lightbulb Connect cannot show. Use letters, numbers, spaces and punctuation.".to_string(),
+        (_, Some(admission::BAD_NAME)) => "That name has characters Lightbulb cannot show. Use letters, numbers, spaces and punctuation.".to_string(),
         (_, Some(admission::YOUR_COMPUTER_OFFLINE)) => "Open your other computer, then run the same command again.".to_string(),
         (_, Some(admission::BAD_TICKET)) => "This invite link does not work. Ask for a new one.".to_string(),
         (_, Some(admission::EXPIRED_TICKET)) => "This invite link has expired. Ask for a new one.".to_string(),
@@ -1223,31 +1141,11 @@ fn relay_host(url: &str) -> String {
     host.trim_end_matches('/').trim_end_matches('.').to_string()
 }
 
-/// Hands one of the app's verbs to the Lightbulb app's binary as its CLI (`cli` first, as the
-/// app reads it), replacing this process; anything else, or no app, is an unknown command.
-pub fn forward(args: Vec<OsString>) -> Result<i32> {
-    let app = test_env(DESKTOP_ENV).map_or_else(|| PathBuf::from(DESKTOP), PathBuf::from);
-    let verb = args
-        .first()
-        .map(|a| a.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    if !APP_VERBS.contains(&verb.as_str()) || !app.exists() {
-        eprintln!(
-            "Unknown command: {}. Run {} --help.",
-            cell(&verb),
-            command()
-        );
-        return Ok(2);
-    }
-    Err(Command::new(app).arg("cli").args(args).exec().into())
-}
-
 // ---- alias and launchd ------------------------------------------------------------------
 
 /// Puts this executable at the canonical path (unless it is already there with the same
-/// bytes), the `~/.local/bin/lightbulb-connect` symlink at that, and `~/.local/bin/lightbulb`
-/// when that name is free. Returns the command name to type, one line. A regular file or a
-/// foreign symlink at either path is left alone.
+/// bytes) and `~/.local/bin/lightbulb` at that, replacing any link there; a regular file there
+/// is left alone. Returns what to say.
 pub fn install_alias(home: &Path, exe: &Path) -> Result<String> {
     let canon = canonical(home);
     if exe != canon {
@@ -1264,33 +1162,38 @@ pub fn install_alias(home: &Path, exe: &Path) -> Result<String> {
             fs::rename(&tmp, &canon)?;
         }
     }
-    for name in ["lightbulb-connect", "lightbulb"] {
-        link(&home.join(".local/bin").join(name), &canon)?;
+    let short = home.join(".local/bin/lightbulb");
+    match short_link(home) {
+        Link::File => Ok("~/.local/bin/lightbulb belongs to another program and was left alone; put ~/.lightbulb/connect/bin on your PATH to type lightbulb.".into()),
+        Link::Ours => Ok(command_lines(home)),
+        _ => {
+            relink(&short, &canon)?;
+            Ok(command_lines(home))
+        }
     }
-    let alias = Alias::read(home);
-    Ok(match (alias.short, alias.full) {
-        (Link::Ours, _) => "Command: lightbulb (or lightbulb-connect)".into(),
-        (_, Link::Ours) => format!(
-            "Command: lightbulb-connect (\"lightbulb\" belongs to {})",
-            alias.short_owner()
-        ),
-        _ => format!(
-            "Command: {} (lightbulb and lightbulb-connect in ~/.local/bin belong to other programs)",
-            canon.display()
-        ),
-    })
 }
 
-/// Makes `path` a symlink to `canon` unless something is there already.
-fn link(path: &Path, canon: &Path) -> Result<()> {
-    match fs::symlink_metadata(path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir_all(path.parent().unwrap())?;
-            Ok(symlink(canon, path)?)
-        }
-        Err(e) => Err(e.into()),
-        Ok(_) => Ok(()),
+/// `Command: lightbulb`, plus the PATH line when `~/.local/bin` is not on this shell's PATH
+/// (a fresh Mac: the curl install lands there, and nothing else puts it on PATH).
+fn command_lines(home: &Path) -> String {
+    let bin = home.join(".local/bin");
+    let on_path =
+        std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d == bin));
+    if on_path {
+        "Command: lightbulb".into()
+    } else {
+        "Command: lightbulb\nAdd this line to your shell profile (~/.zshrc), then open a new terminal: export PATH=\"$HOME/.local/bin:$PATH\"".into()
     }
+}
+
+/// Makes `path` a symlink to `target`, replacing whatever is there (atomically: a link made
+/// beside it is renamed over it).
+fn relink(path: &Path, target: &Path) -> Result<()> {
+    fs::create_dir_all(path.parent().unwrap())?;
+    let tmp = path.with_extension("lightbulb-tmp");
+    let _ = fs::remove_file(&tmp);
+    symlink(target, &tmp)?;
+    Ok(fs::rename(&tmp, path)?)
 }
 
 fn launchctl(args: &[&str]) -> bool {
@@ -1448,7 +1351,7 @@ pub fn daemon_uninstall() -> Result<i32> {
         .and_then(|h| state.strip_prefix(h).ok().map(|p| Path::new("~").join(p)))
         .unwrap_or(state);
     println!(
-        "Lightbulb Connect is off. Your settings and messages are kept in {}.",
+        "Lightbulb is off. Your settings and messages are kept in {}.",
         shown.display()
     );
     Ok(0)
@@ -1487,7 +1390,7 @@ pub fn doctor() -> Result<i32> {
         row("Relay", true, &state, "", "");
     }
     if up && call("status").is_some_and(|r| r["lan"] == "blocked") {
-        let fix = "Allow lightbulb-connect in System Settings > Privacy & Security > Local Network";
+        let fix = "Allow lightbulb in System Settings > Privacy & Security > Local Network";
         row("Local network", false, "", "blocked by macOS", fix);
     }
     if cfg!(target_os = "macos") {
@@ -1525,28 +1428,19 @@ pub fn doctor() -> Result<i32> {
         let ok = matches!(r.state, setup::State::NotInstalled) || r.connected();
         row(&r.product(), ok, r.short(), r.short(), &setup);
     }
-    let alias = Alias::read(&home);
-    let short_taken = format!(
-        "\"lightbulb\" belongs to {}; type \"lightbulb-connect\"",
-        alias.short_owner()
-    );
-    let named = match (alias.short, alias.full) {
-        (Link::Ours, _) => Some("\"lightbulb\""),
-        (Link::Missing, Link::Ours) => Some("\"lightbulb-connect\""),
-        (_, Link::Ours) => Some(short_taken.as_str()),
-        _ => None,
+    let named = match short_link(&home) {
+        Link::Ours => Ok("\"lightbulb\""),
+        Link::File => Ok("~/.local/bin/lightbulb is another program's; put ~/.lightbulb/connect/bin on your PATH"),
+        Link::Other => Err("\"lightbulb\" is a link to another program (run setup)"),
+        Link::Missing => Err("not installed"),
     };
     row(
         "Command name",
-        named.is_some(),
+        named.is_ok(),
         named.unwrap_or_default(),
-        "not installed",
+        named.err().unwrap_or_default(),
         &setup,
     );
-    if legacy_socket(&home).is_ok() {
-        let fix = format!("Run: {cmd} setup --remove, then {cmd} setup");
-        row("Old version", false, "", "still running", &fix);
-    }
     for (name, state, _) in &rows {
         println!("{name:<20} {state}");
     }
@@ -1596,18 +1490,10 @@ pub fn setup(
         }
     };
     if remove {
-        // legacy (Plan A install): its hook and MCP entries name the old binary.
-        let old = setup::run(&home, &legacy_canonical(&home), server.as_deref(), true);
-        for a in report
-            .agents
-            .iter()
-            .chain(&old.agents)
-            .filter(|a| !a.wrote.is_empty())
-        {
+        for a in report.agents.iter().filter(|a| !a.wrote.is_empty()) {
             println!("{}: removed", a.product());
             files(a);
         }
-        legacy_uninstall(&home)?;
         return if cfg!(target_os = "macos") {
             daemon_uninstall()
         } else {

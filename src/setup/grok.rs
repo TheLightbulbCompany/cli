@@ -1,4 +1,4 @@
-//! Grok CLI: hooks in our own `~/.grok/hooks/lightbulb-connect.json` (Claude-shaped), and
+//! Grok CLI: hooks in our own `~/.grok/hooks/lightbulb.json` (Claude-shaped), and
 //! `[mcp_servers.<name>]` plus `permission.allow = ["MCPTool(<name>__*)"]` in
 //! `~/.grok/config.toml`. Written from those files' formats and the Grok CLI manual.
 
@@ -12,14 +12,11 @@ pub(super) fn configure(ctx: &Ctx, r: &mut AgentReport) -> Result<Owner> {
     let dir = ctx.home.join(".grok");
     // Grok loads every `*.json` in `hooks/`, so this file is ours alone: written whole,
     // deleted on remove, never backed up.
-    let hooks = dir.join("hooks/lightbulb-connect.json");
+    let hooks = dir.join("hooks/lightbulb.json");
     if ctx.remove {
-        // legacy (Plan A install): the old hook file name.
-        for file in [hooks, dir.join("hooks/lightbulb-network.json")] {
-            if file.exists() {
-                fs::remove_file(&file)?;
-                r.wrote.push(file);
-            }
+        if hooks.exists() {
+            fs::remove_file(&hooks)?;
+            r.wrote.push(hooks);
         }
     } else {
         let mut doc = json!({});

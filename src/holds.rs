@@ -470,7 +470,7 @@ pub fn shown(d: &Daemon, roster: &Roster, store: &Store, h: &Hold) {
         .send(json!({"event": "held", "id": h.name(), "kind": h.kind(),
         "target_session": h.target_session, "from": h.from_session, "label": who}));
     crate::decision::notify(d, roster, store, h, &who);
-    let args = dialog::args("Lightbulb Connect", &text, &buttons);
+    let args = dialog::args("Lightbulb", &text, &buttons);
     d.dialogs.show(&h.name(), args);
     eprintln!("hold {}: open", h.name());
 }

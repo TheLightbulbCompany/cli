@@ -491,10 +491,8 @@ async fn wait(d: &Daemon, gone: impl Future, n: i64, req: Request) -> Option<Ver
         },
     );
     let buttons = ["Decline", "Allow"];
-    d.dialogs.show(
-        &format!("J{n}"),
-        dialog::args("Lightbulb Connect", &text, &buttons),
-    );
+    d.dialogs
+        .show(&format!("J{n}"), dialog::args("Lightbulb", &text, &buttons));
     answered(d, n, rx, gone, d.peers.knobs().join_wait).await
 }
 

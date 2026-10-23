@@ -1,11 +1,11 @@
 //! The team verbs against the built binary: `invite`, `remove`, `leave`, and the roster the
 //! daemon keeps across restarts.
 
-use lightbulb_connect::daemon::net_ops;
-use lightbulb_connect::identity::Identity;
-use lightbulb_connect::os;
-use lightbulb_connect::roster::{self, Entry, Kind};
-use lightbulb_connect::store::Store;
+use lightbulb::daemon::net_ops;
+use lightbulb::identity::Identity;
+use lightbulb::os;
+use lightbulb::roster::{self, Entry, Kind};
+use lightbulb::store::Store;
 use serde_json::json;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -74,7 +74,7 @@ impl Env {
     }
 }
 
-const LINE: &str = "lightbulb-connect join '";
+const LINE: &str = "lightbulb join '";
 const HEADER: &str = "Send this line to the person (or paste it on your other computer):\n";
 
 /// What `invite` printed before its header (a notice, or nothing), and the join command
@@ -134,7 +134,7 @@ fn non_admin_remove_prints_exact_text() {
     );
     assert!(team.contains("  aden · "), "{team}");
     assert!(
-        team.ends_with("Invite someone: lightbulb-connect invite\n"),
+        team.ends_with("Invite someone: lightbulb invite\n"),
         "{team}"
     );
     assert_eq!(e.entries().len(), 2, "no genesis over a joined team");
@@ -218,7 +218,7 @@ fn founder_admin_remove_and_leave_texts() {
     assert_eq!(o.status.code(), Some(1));
     assert_eq!(
         err(&o).trim(),
-        "You are the founder. Name a new founder first: lightbulb-connect admin <name> --founder"
+        "You are the founder. Name a new founder first: lightbulb admin <name> --founder"
     );
     assert_eq!(
         out(&e.run(&["admin", "ADEN"])),
@@ -251,7 +251,7 @@ fn founder_whose_only_other_member_is_cloud_can_leave() {
         Kind::Admit,
         json!({"member": bridge.key, "name": "bridge", "computer": "cloud", "person_id": "ws:W1",
                "kind": "cloud", "role": "member",
-               "proof": common::issuer::workspace_proof(&bridge.key, "W1", "bridge", &[], lightbulb_connect::daemon::ipc::now() as i64)}),
+               "proof": common::issuer::workspace_proof(&bridge.key, "W1", "bridge", &[], lightbulb::daemon::ipc::now() as i64)}),
         2,
     );
     roster::accept(
@@ -318,7 +318,7 @@ fn policy_takes_a_teammates_name_and_lists_names() {
         e2.starts_with("No teammate called \"nobody\". Teammates: ")
             && e2.contains("prasiddha")
             && e2.contains("aden")
-            && e2.trim_end().ends_with("(see lightbulb-connect team)."),
+            && e2.trim_end().ends_with("(see lightbulb team)."),
         "{e2}"
     );
     // A workspace id stays as given; any other id no member has is refused by the daemon.

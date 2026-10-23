@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Downloads the release binary matching this package's version, checks its sha256 and
-// puts it at <package>/vendor/lightbulb-connect. No dependencies: https, crypto and the
+// puts it at <package>/vendor/lightbulb. No dependencies: https, crypto and the
 // system tar (always present on macOS).
 'use strict';
 const fs = require('fs');
@@ -9,13 +9,13 @@ const https = require('https');
 const crypto = require('crypto');
 const { execFileSync } = require('child_process');
 
-const REPO = 'TheLightbulbCompany/lightbulb-connect';
-const ASSET = 'lightbulb-connect-macos-arm64.tar.gz';
+const REPO = 'TheLightbulbCompany/cli';
+const ASSET = 'lightbulb-macos-arm64.tar.gz';
 
 function get(url, redirects = 5) {
   return new Promise((resolve, reject) => {
     https
-      .get(url, { headers: { 'User-Agent': 'lightbulb-connect-npm' } }, (res) => {
+      .get(url, { headers: { 'User-Agent': 'lightbulb-cli-npm' } }, (res) => {
         if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location && redirects > 0) {
           res.resume();
           return resolve(get(new URL(res.headers.location, url).toString(), redirects - 1));
@@ -35,11 +35,11 @@ function get(url, redirects = 5) {
 
 async function install(root = path.join(__dirname, '..')) {
   if (process.platform !== 'darwin' || process.arch !== 'arm64') {
-    throw Object.assign(new Error('Lightbulb Connect needs an Apple-silicon Mac for now.'), { plain: true });
+    throw Object.assign(new Error('Lightbulb needs an Apple-silicon Mac for now.'), { plain: true });
   }
   const { version } = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
   const base = `https://github.com/${REPO}/releases/download/v${version}`;
-  console.log('Downloading Lightbulb Connect…');
+  console.log('Downloading Lightbulb…');
   const [tarball, sums] = await Promise.all([get(`${base}/${ASSET}`), get(`${base}/${ASSET}.sha256`)]);
   const want = sums.toString('utf8').trim().split(/\s+/)[0].toLowerCase();
   const got = crypto.createHash('sha256').update(tarball).digest('hex');
@@ -52,9 +52,9 @@ async function install(root = path.join(__dirname, '..')) {
   try {
     const file = path.join(tmp, ASSET);
     fs.writeFileSync(file, tarball);
-    execFileSync('tar', ['-xzf', file, '-C', tmp, 'lightbulb-connect']);
-    const bin = path.join(vendor, 'lightbulb-connect');
-    fs.renameSync(path.join(tmp, 'lightbulb-connect'), bin);
+    execFileSync('tar', ['-xzf', file, '-C', tmp, 'lightbulb']);
+    const bin = path.join(vendor, 'lightbulb');
+    fs.renameSync(path.join(tmp, 'lightbulb'), bin);
     fs.chmodSync(bin, 0o755);
     return bin;
   } finally {
@@ -66,9 +66,9 @@ module.exports = { install };
 
 if (require.main === module) {
   install(process.argv[2] ? path.resolve(process.argv[2]) : undefined).then(
-    () => console.log('Run: lightbulb-connect setup'),
+    () => console.log('Run: lightbulb setup'),
     (err) => {
-      console.error(err.plain ? err.message : `Could not install Lightbulb Connect: ${err.message}`);
+      console.error(err.plain ? err.message : `Could not install Lightbulb: ${err.message}`);
       process.exit(1);
     }
   );

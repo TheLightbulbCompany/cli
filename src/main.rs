@@ -1,16 +1,16 @@
 use clap::{Parser, Subcommand};
-use lightbulb_connect::daemon::net_ops::Invite;
-use lightbulb_connect::{cli, daemon, hook, mcp, paths, setup};
+use lightbulb::daemon::net_ops::Invite;
+use lightbulb::{cli, daemon, hook, mcp, paths, setup};
 use std::ffi::OsString;
 use std::io::{Read, Write};
 
 /// The top-level help: the person's commands in groups (`hook`, `mcp` and `daemon` are the
 /// agents' and launchd's, so not listed; they are still accepted).
 const HELP: &str = "\
-Lightbulb Connect lets your coding agents message each other: on this computer, on your other
+Lightbulb lets your coding agents message each other: on this computer, on your other
 computers and on your teammates'.
 
-Usage: lightbulb-connect <command> [options]
+Usage: lightbulb <command> [options]
 
 Getting started:
   setup     Connect Claude Code, Codex, Cursor and Grok CLI here and start the background service
@@ -36,14 +36,11 @@ Team:
   policy    Who may message your sessions without asking
   folder    Show or hide the sessions in a folder from your teammates: folder <path> on|off
 
-The Lightbulb app:
-  claude, codex, share   Run by the Lightbulb app, when it is installed
-
-Run lightbulb-connect <command> --help for its options; lightbulb-connect --version for the version.
+Run lightbulb <command> --help for its options; lightbulb --version for the version.
 ";
 
 #[derive(Parser)]
-#[command(name = "lightbulb-connect", version, help_template = HELP)]
+#[command(name = "lightbulb", bin_name = "lightbulb", version, help_template = HELP)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -203,11 +200,11 @@ enum Command {
         #[arg(long)]
         remove: bool,
         /// The engine binary the hooks, MCP entries and launchd job run (default: the canonical
-        /// copy, ~/.lightbulb/connect/bin/lightbulb-connect, which setup installs from this one).
+        /// copy, ~/.lightbulb/connect/bin/lightbulb, which setup installs from this one).
         #[arg(long)]
         executable: Option<std::path::PathBuf>,
         /// The MCP server entry's name, also used in Cursor's and Grok's allow rules (default:
-        /// lightbulb, or lightbulb-connect where another program has that name).
+        /// lightbulb).
         #[arg(long)]
         server_name: Option<String>,
         /// Also list the files each agent's setup changed.
@@ -231,7 +228,7 @@ fn main() {
     }
 }
 
-fn run() -> lightbulb_connect::Result<()> {
+fn run() -> lightbulb::Result<()> {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         // A hook must never fail its agent, even on bad arguments.
@@ -242,7 +239,7 @@ fn run() -> lightbulb_connect::Result<()> {
         Err(e) => e.exit(),
     };
     match cli.command {
-        Command::Version => println!("lightbulb-connect {}", env!("CARGO_PKG_VERSION")),
+        Command::Version => println!("lightbulb {}", env!("CARGO_PKG_VERSION")),
         Command::Daemon { install: true, .. } => exit(cli::daemon_install()?),
         Command::Daemon {
             uninstall: true, ..
@@ -296,7 +293,14 @@ fn run() -> lightbulb_connect::Result<()> {
         Command::Relay { url, clear, local } => {
             exit(cli::relay(clear.then(String::new).or(url), local)?)
         }
-        Command::External(args) => exit(cli::forward(args)?),
+        Command::External(args) => {
+            let verb = args
+                .first()
+                .map(|a| a.to_string_lossy())
+                .unwrap_or_default();
+            eprintln!("Unknown command: {verb}. Run lightbulb --help.");
+            exit(2)
+        }
         Command::Mcp { server_name } => mcp::run(server_name)?,
         Command::Setup {
             remove,
@@ -317,10 +321,7 @@ fn run() -> lightbulb_connect::Result<()> {
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    let _ = writeln!(
-                        std::io::stderr(),
-                        "lightbulb-connect hook {agent} {event}: {e}"
-                    );
+                    let _ = writeln!(std::io::stderr(), "lightbulb hook {agent} {event}: {e}");
                 }
             }
         }

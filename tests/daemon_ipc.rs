@@ -1,4 +1,4 @@
-use lightbulb_connect::{daemon, paths};
+use lightbulb::{daemon, paths};
 use serde_json::{json, Value};
 use std::path::Path;
 use std::time::Duration;
@@ -61,8 +61,8 @@ async fn ipc_answers_ping_and_rejects_unknown_op() {
     assert_eq!(status["sessions"], 0);
     assert_eq!(status["member_key_short"].as_str().unwrap().len(), 12);
     // The team id is the solo network's genesis hash.
-    let store = lightbulb_connect::store::Store::open(&dir.path().join("state.db")).unwrap();
-    let entries = lightbulb_connect::roster::entries(&store).unwrap();
+    let store = lightbulb::store::Store::open(&dir.path().join("state.db")).unwrap();
+    let entries = lightbulb::roster::entries(&store).unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(status["team"]["id"], entries[0].hash());
 
@@ -93,7 +93,7 @@ async fn ipc_answers_ping_and_rejects_unknown_op() {
 #[tokio::test]
 async fn two_ensure_running_calls_leave_one_daemon() {
     let dir = tempfile::tempdir().unwrap();
-    let exe = Path::new(env!("CARGO_BIN_EXE_lightbulb-connect"));
+    let exe = Path::new(env!("CARGO_BIN_EXE_lightbulb"));
     let calls: Vec<_> = (0..2)
         .map(|_| {
             let d = dir.path().to_path_buf();
@@ -132,7 +132,7 @@ async fn two_ensure_running_calls_leave_one_daemon() {
 #[tokio::test]
 async fn ensure_running_right_after_shutdown_starts_a_new_daemon() {
     let dir = tempfile::tempdir().unwrap();
-    let exe = Path::new(env!("CARGO_BIN_EXE_lightbulb-connect"));
+    let exe = Path::new(env!("CARGO_BIN_EXE_lightbulb"));
     let d = dir.path().to_path_buf();
     tokio::task::spawn_blocking(move || daemon::ensure_running_at(exe, &d).unwrap())
         .await
@@ -161,7 +161,7 @@ async fn ensure_running_right_after_shutdown_starts_a_new_daemon() {
 #[tokio::test]
 async fn ensure_running_respawns_when_a_dying_daemon_holds_the_lock() {
     let dir = tempfile::tempdir().unwrap();
-    let exe = Path::new(env!("CARGO_BIN_EXE_lightbulb-connect"));
+    let exe = Path::new(env!("CARGO_BIN_EXE_lightbulb"));
     let lock = std::fs::File::create(dir.path().join("daemon.lock")).unwrap();
     lock.try_lock().unwrap();
     let d = dir.path().to_path_buf();
@@ -180,7 +180,7 @@ async fn ensure_running_respawns_when_a_dying_daemon_holds_the_lock() {
 async fn a_lock_loser_waits_and_takes_over() {
     let dir = tempfile::tempdir().unwrap();
     let start = || {
-        std::process::Command::new(env!("CARGO_BIN_EXE_lightbulb-connect"))
+        std::process::Command::new(env!("CARGO_BIN_EXE_lightbulb"))
             .arg("daemon")
             .env("LIGHTBULB_CONNECT_DEBUG_NO_DEFAULT_RELAYS", "1")
             .env(paths::HOME_ENV, dir.path())

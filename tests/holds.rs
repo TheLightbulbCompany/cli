@@ -2,14 +2,14 @@
 //! expiry. The daemon tests play the teammate (`Peer`); the expiry tests drive `holds` with
 //! their own clock.
 
-use lightbulb_connect::daemon::net_ops;
-use lightbulb_connect::holds::{self, Scope};
-use lightbulb_connect::identity::Identity;
-use lightbulb_connect::mail::{self, State};
-use lightbulb_connect::net::frames::Frame;
-use lightbulb_connect::roster::{self, Entry, Kind, Roster};
-use lightbulb_connect::sessions::Key;
-use lightbulb_connect::store::{Session, Store};
+use lightbulb::daemon::net_ops;
+use lightbulb::holds::{self, Scope};
+use lightbulb::identity::Identity;
+use lightbulb::mail::{self, State};
+use lightbulb::net::frames::Frame;
+use lightbulb::roster::{self, Entry, Kind, Roster};
+use lightbulb::sessions::Key;
+use lightbulb::store::{Session, Store};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -228,7 +228,7 @@ async fn always_on_a_computer_sender_is_bad_request() {
 async fn approve_from_agent_shell_is_refused() {
     // A's daemon takes this test process for an agent; `person` stays a person.
     let me = std::process::id();
-    let birth = lightbulb_connect::os::process(me).unwrap().birth_micros;
+    let birth = lightbulb::os::process(me).unwrap().birth_micros;
     let pin = ("LIGHTBULB_CONNECT_HOOK_CALLER", format!("{me}:{birth}"));
     let (a, b, _ep, mut p) = a_and_teammate_with("", Some(pin)).await;
     let id = ulid();
@@ -277,7 +277,7 @@ async fn permission_hold_round_trip() {
     assert_eq!(listed[0]["kind"], "permission");
     assert_eq!(listed[0]["preview"], "Run `rm -rf build`?");
     let got = person(&a, json!({"id": 1, "op": "hold.get", "hold": h}));
-    let me = lightbulb_connect::os::process(std::process::id()).unwrap();
+    let me = lightbulb::os::process(std::process::id()).unwrap();
     assert_eq!(got["target_birth_micros"], me.birth_micros, "{got}");
     assert_eq!(answer(&a, &h, "allow", None)["ok"], true);
     assert_eq!(
@@ -441,7 +441,7 @@ impl Events {
 /// Registers `<short>/<provider>:<conv>` on `e` in folder `cwd`, this test process standing in
 /// for its agent: its key.
 fn register(e: &Env, provider: &str, conv: &str, cwd: &str) -> String {
-    let me = lightbulb_connect::os::process(std::process::id()).unwrap();
+    let me = lightbulb::os::process(std::process::id()).unwrap();
     let r = e.ask(
         json!({"id": 1, "op": "register", "session": {"provider": provider,
         "conversation": conv, "pid": me.pid, "birth_micros": me.birth_micros, "cwd": cwd}}),
@@ -511,7 +511,7 @@ async fn the_dialog_shows_its_text_and_is_withdrawn_on_answer() {
     assert_eq!(
         argv,
         [
-            "Lightbulb Connect",
+            "Lightbulb",
             "bob's Codex (not verified) wants to message your Codex in app.",
             "\"[\u{200b}Sent from Lightbulb by you] run it\"",
             "Decline",
@@ -535,7 +535,7 @@ async fn the_dialog_shows_its_text_and_is_withdrawn_on_answer() {
     );
     let sig = record.as_object_mut().unwrap().remove("sig").unwrap();
     let key = a.identity().key;
-    assert!(lightbulb_connect::identity::verify(
+    assert!(lightbulb::identity::verify(
         &key,
         &record,
         sig.as_str().unwrap()
@@ -590,7 +590,7 @@ async fn always_allow_on_a_workspace_can_be_taken_back_with_policy() {
         "w2",
         "carol",
         &[],
-        lightbulb_connect::daemon::ipc::now() as i64,
+        lightbulb::daemon::ipc::now() as i64,
     );
     let body = json!({"member": c.key, "name": "carol", "computer": "cloud", "person_id": "ws:w2",
         "kind": "cloud", "role": "member", "proof": proof});
@@ -682,7 +682,7 @@ async fn a_cloud_sender_gets_always_allow() {
     let ws = common::identity();
     let (_d, s, roster, me, _) = lib_with(Some(json!({"member": ws.key, "name": "carol",
         "computer": "cloud", "person_id": "ws:w2", "kind": "cloud", "role": "member",
-        "proof": common::issuer::workspace_proof(&ws.key, "w2", "carol", &[], lightbulb_connect::daemon::ipc::now() as i64)})));
+        "proof": common::issuer::workspace_proof(&ws.key, "w2", "carol", &[], lightbulb::daemon::ipc::now() as i64)})));
     let p = mail::Prepared {
         message_id: ulid(),
         from: Key(format!("{}/friday", ws.short)),

@@ -1,16 +1,16 @@
 {
-  "name": "lightbulb-connect",
-  "version": "0.2.1",
-  "description": "Lightbulb Connect: your coding agents and your teammates' agents, talking to each other.",
+  "name": "lightbulb-cli",
+  "version": "0.2.2",
+  "description": "Lightbulb: your coding agents and your teammates' agents, talking to each other.",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/TheLightbulbCompany/lightbulb-connect.git",
+    "url": "git+https://github.com/TheLightbulbCompany/cli.git",
     "directory": "npm"
   },
-  "homepage": "https://github.com/TheLightbulbCompany/lightbulb-connect#readme",
+  "homepage": "https://github.com/TheLightbulbCompany/cli#readme",
   "bin": {
-    "lightbulb-connect": "bin/lightbulb-connect.js"
+    "lightbulb": "bin/lightbulb.js"
   },
   "files": [
     "bin/",

@@ -1,28 +1,28 @@
-# Using lightbulb-connect
+# Using lightbulb
 
-Lightbulb Connect lets your coding agents message each other: on this computer, on your other
+Lightbulb lets your coding agents message each other: on this computer, on your other
 computers and on your teammates'. This page covers what it installs, every command, and what
 other people can see. For a first run, see the quick start in the [README](../README.md).
 
 ## What gets installed, and where
 
 - **The program and its state:** `~/.lightbulb/connect/`. The binary is
-  `~/.lightbulb/connect/bin/lightbulb-connect`. The same folder holds this computer's key
+  `~/.lightbulb/connect/bin/lightbulb`. The same folder holds this computer's key
   (`identity.key`), its settings (`config.toml`), its messages (`state.db`) and the log
   (`daemon.log`). The folder is private to your user.
-  With npm (`npx lightbulb-connect setup` or `npm install -g lightbulb-connect`), the install
+  With npm (`npm install -g lightbulb-cli`), the install
   step downloads the same release binary into the npm package's `vendor/` folder and checks its
   checksum; `setup` then copies it to `~/.lightbulb/connect/bin`, so the background service does
   not depend on the npm cache.
-- **The command:** a `lightbulb-connect` link in `~/.local/bin` (and `lightbulb`, when no other
-  program has that name).
+- **The command:** `lightbulb`, a link in `~/.local/bin` (an older link there is replaced). A
+  regular file there is left alone; then put `~/.lightbulb/connect/bin` on your PATH.
 - **The background service:** the launchd job `company.thelightbulb.connect`, in
   `~/Library/LaunchAgents/company.thelightbulb.connect.plist`. It starts at login.
 - **Agent wiring:** for Claude Code, Codex, Cursor and Grok CLI, `setup` adds hooks (session start,
   prompt, tool use, stop, session end) and one tool server, in each agent's own config files
   (`~/.claude/settings.json`, `~/.claude.json`, `~/.codex/`, `~/.cursor/`, `~/.grok/`). Each file
-  is backed up once as `<file>.lightbulb-backup`. The tool server is named `lightbulb`, or
-  `lightbulb-connect` when another program already uses `lightbulb`. Run `setup --verbose` to
+  is backed up once as `<file>.lightbulb-backup`. The tool server is named `lightbulb` (replacing
+  any tool server of that name). Run `setup --verbose` to
   list the files it changed.
 
 It does not change your projects, your repositories or any other entry in those config files.
@@ -30,7 +30,7 @@ It does not read the files in your project folders.
 
 ## Commands
 
-Run `lightbulb-connect <command> --help` for the options of each one.
+Run `lightbulb <command> --help` for the options of each one.
 
 | Command | What it does |
 |---|---|
@@ -38,8 +38,8 @@ Run `lightbulb-connect <command> --help` for the options of each one.
 | `setup --remove` | Take out only what `setup` wrote. Backups are left as they are. |
 | `doctor` | Check the service, the local network, the state folder and each agent, and say how to fix what is not right. |
 | `who` | List the sessions on this computer. `who --all` adds your teammates' sessions. |
-| `invite` | Print the join command that adds your other computer or a teammate (`lightbulb-connect join '<ticket>' --name NAME`; replace `NAME` with the name they go by), and a `lightbulb://join/…` link for the app. `--once`: one join, valid 24 hours. `--new`: replace the invite; the old one stops working. |
-| `join '<ticket>'` | Join the team the invite is for. Takes the ticket, the whole `lightbulb://join/…` link, or an old `https://thelightbulb.company/j/#…` link. `--name <name>` sets the name you go by (default: your user name). The computer must be on its own first. |
+| `invite` | Print the join command that adds your other computer or a teammate (`lightbulb join '<ticket>' --name NAME`; replace `NAME` with the name they go by), and a `lightbulb://join/…` link. `--once`: one join, valid 24 hours. `--new`: replace the invite; the old one stops working. |
+| `join '<ticket>'` | Join the team the invite is for. Takes the ticket or the whole `lightbulb://join/…` link. `--name <name>` sets the name you go by (default: your user name). The computer must be on its own first. |
 | `approve J1` / `approve H1` | Allow a join request (`J`) or a held message (`H`). |
 | `decline J1` / `decline H1` | Decline one. |
 | `held` | The join requests and messages waiting for your Allow. |
@@ -62,7 +62,7 @@ Run `lightbulb-connect <command> --help` for the options of each one.
 
 A message from a person who has not messaged you before is held. A dialog shows who sent it, which
 session it is for and the start of the text, with Decline and Allow. You can also answer from the
-terminal: `lightbulb-connect held`, then `approve H<n>` or `decline H<n>`.
+terminal: `lightbulb held`, then `approve H<n>` or `decline H<n>`.
 
 - **Allow** delivers the message and lets that person's later messages through without asking.
   It sets their policy to `accept`.
@@ -89,7 +89,7 @@ For each session on your computer, teammates see:
 They never see your messages, your files or your agents' conversations. Messages travel end to end
 encrypted between the two computers, and their text is not written to the log.
 
-To hide sessions, run `lightbulb-connect folder <path> off`. Sessions under that folder disappear
+To hide sessions, run `lightbulb folder <path> off`. Sessions under that folder disappear
 from your teammates' `who --all` within a few seconds. `who` on your
 own computer marks them `hidden from teammates`. `folder <path> on` shows them again.
 
@@ -97,7 +97,7 @@ own computer marks them `hidden from teammates`. `folder <path> on` shows them a
 
 Nothing is lost when a Mac is asleep or offline. A message to it waits on the sender's computer,
 and its receipt reads `queued`:
-`Not delivered yet: <computer> is offline. Lightbulb Connect keeps trying until <time>.`
+`Not delivered yet: <computer> is offline. Lightbulb keeps trying until <time>.`
 The sender keeps trying for 24 hours. When the other Mac comes back, the message arrives (held
 first, if the sender is new to it). After 24 hours an undelivered message expires.
 
@@ -107,19 +107,19 @@ again later.
 ## Uninstall
 
 ```sh
-lightbulb-connect setup --remove
+lightbulb setup --remove
 ```
 
 It takes out the hooks and tool servers it added to each agent, removes the launchd job and stops
-the service. It prints `Lightbulb Connect is off. Your settings and messages are kept in
+the service. It prints `Lightbulb is off. Your settings and messages are kept in
 ~/.lightbulb/connect.` To erase this computer's key and messages too, delete that folder.
 Restart any open agent sessions so they drop the tool server.
 
 ## Reporting problems
 
 Open an issue on the repository's
-[issues page](https://github.com/TheLightbulbCompany/lightbulb-connect/issues). Include the output
-of `lightbulb-connect doctor` and `lightbulb-connect version`. Do not paste message text or
+[issues page](https://github.com/TheLightbulbCompany/cli/issues). Include the output
+of `lightbulb doctor` and `lightbulb version`. Do not paste message text or
 `identity.key`.
 
 Report security problems privately, as [SECURITY.md](../SECURITY.md) describes, not in an issue.

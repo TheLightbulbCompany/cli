@@ -1,4 +1,4 @@
-use lightbulb_connect::{daemon, paths};
+use lightbulb::{daemon, paths};
 use serde_json::{json, Value};
 use std::path::Path;
 use std::time::Duration;

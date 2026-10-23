@@ -3,10 +3,10 @@
 //! member itself, with that member's key, over its own iroh endpoint.
 
 use iroh::Endpoint;
-use lightbulb_connect::identity::Identity;
-use lightbulb_connect::net::frames::{self, Frame};
-use lightbulb_connect::net::{ALPN, PROTOCOL};
-use lightbulb_connect::roster::{self, Entry, Kind};
+use lightbulb::identity::Identity;
+use lightbulb::net::frames::{self, Frame};
+use lightbulb::net::{ALPN, PROTOCOL};
+use lightbulb::roster::{self, Entry, Kind};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::time::Duration;
@@ -388,7 +388,7 @@ async fn removed_member_is_told() {
     );
     let o = b.detached(&[EXE, "team"], "");
     let text = common::out(&o);
-    let today = &lightbulb_connect::date::utc(common::now_s())[..10];
+    let today = &lightbulb::date::utc(common::now_s())[..10];
     let line = format!(
         "You were removed from \"acme\" by {} on {today}. This computer is on its own network again.",
         a.ask(json!({"id": 1, "op": "team.get"}))["members"][0]["name"].as_str().unwrap()
@@ -443,8 +443,7 @@ async fn loopback_file_is_withdrawn_on_sigterm() {
     let a = Env::new();
     a.daemon(true, "", &[]);
     let uid = unsafe { libc::getuid() };
-    let file =
-        std::path::PathBuf::from(format!("/tmp/lightbulb-connect-{uid}")).join(a.identity().key);
+    let file = std::path::PathBuf::from(format!("/tmp/lightbulb-{uid}")).join(a.identity().key);
     let pid: i32 = std::fs::read_to_string(a.state.path().join("daemon.lock"))
         .unwrap()
         .trim()
@@ -472,14 +471,14 @@ async fn removed_member_hears_its_removal_and_nothing_after() {
     let o = a.detached(&[EXE, "remove", "bob"], "");
     assert!(o.status.success(), "{}", common::err(&o));
     let later = common::invite(&a, "reusable");
-    let later = lightbulb_connect::ticket::decode(&later).unwrap().ticket_id;
+    let later = lightbulb::ticket::decode(&later).unwrap().ticket_id;
     // And a member admitted after the removal: carol, through an open link (no dialog).
     let open = common::person(&a, json!({"id": 1, "op": "team.invite", "mode": "open"}));
     let c = Env::new();
     c.daemon(false, "", &[common::peers(&[&a])]);
     let r = common::person(
         &c,
-        json!({"id": 1, "op": "team.join", "ticket": open["line"], "name": "carol", "kind": "computer"}),
+        json!({"id": 1, "op": "team.join", "ticket": open["ticket"], "name": "carol", "kind": "computer"}),
     );
     assert_eq!(r["state"], "admitted", "{r}");
     let carol = c.identity().key;
@@ -512,8 +511,7 @@ async fn loopback_file_is_kept_fresh() {
     let a = Env::new();
     a.daemon(true, "", &[]);
     let uid = unsafe { libc::getuid() };
-    let file =
-        std::path::PathBuf::from(format!("/tmp/lightbulb-connect-{uid}")).join(a.identity().key);
+    let file = std::path::PathBuf::from(format!("/tmp/lightbulb-{uid}")).join(a.identity().key);
     let text = std::fs::read_to_string(&file).unwrap();
     std::fs::remove_file(&file).unwrap();
     common::invite(&a, "reusable");

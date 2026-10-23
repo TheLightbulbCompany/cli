@@ -3,7 +3,7 @@
 //! an agent. That override is compiled out of release builds, so `cargo test --release`
 //! fails the pinned tests here; run them in a debug build.
 
-use lightbulb_connect::{os, paths};
+use lightbulb::{os, paths};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-const EXE: &str = env!("CARGO_BIN_EXE_lightbulb-connect");
+const EXE: &str = env!("CARGO_BIN_EXE_lightbulb");
 
 struct Net {
     dir: tempfile::TempDir,

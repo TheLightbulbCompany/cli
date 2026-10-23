@@ -3,11 +3,11 @@
 //! refused on the same person's other computer, and an `off` folder is never published.
 
 use iroh::Endpoint;
-use lightbulb_connect::daemon::{ipc, net_ops};
-use lightbulb_connect::identity::Identity;
-use lightbulb_connect::net::frames::{Frame, Remote};
-use lightbulb_connect::os;
-use lightbulb_connect::roster::{self, Entry, Kind};
+use lightbulb::daemon::{ipc, net_ops};
+use lightbulb::identity::Identity;
+use lightbulb::net::frames::{Frame, Remote};
+use lightbulb::os;
+use lightbulb::roster::{self, Entry, Kind};
 use serde_json::{json, Value};
 
 mod common;
@@ -17,7 +17,7 @@ use common::{Env, Peer, EXE};
 
 /// `p` as `folder` writes it to `folders_off`: resolved, lowercased on macOS.
 fn stored_off(p: &std::path::Path) -> String {
-    let r = lightbulb_connect::presence::resolved(p)
+    let r = lightbulb::presence::resolved(p)
         .to_str()
         .unwrap()
         .to_string();
@@ -247,7 +247,7 @@ async fn kept_name_is_refused_on_the_persons_other_computer() {
             "user_p",
             "Prasiddha",
             None,
-            lightbulb_connect::daemon::ipc::now() as i64,
+            lightbulb::daemon::ipc::now() as i64,
         )
     };
     let merge = Entry::signed(
@@ -313,7 +313,7 @@ async fn off_folder_sessions_are_not_published() {
     let sa = a.short();
     let (open, hidden) = (
         open.to_str().unwrap().to_string(),
-        lightbulb_connect::presence::resolved(&root.path().join("alias/proj"))
+        lightbulb::presence::resolved(&root.path().join("alias/proj"))
             .to_str()
             .unwrap()
             .to_string(),
@@ -395,7 +395,7 @@ fn a_discovered_claude_session_keeps_its_hooks_folder() {
         .to_string(),
     )
     .unwrap();
-    let resolved = lightbulb_connect::presence::resolved(&raw);
+    let resolved = lightbulb::presence::resolved(&raw);
     let r = register(&a, "claude", "s1", resolved.to_str().unwrap());
     let key = r["key"]
         .as_str()
@@ -450,7 +450,7 @@ fn a_session_refused_under_an_off_folder_is_not_discovered_either() {
     // (its cwd names the folder through the link).
     std::thread::sleep(std::time::Duration::from_millis(2500));
     assert!(sees(&b, &key));
-    let resolved = lightbulb_connect::presence::resolved(&raw);
+    let resolved = lightbulb::presence::resolved(&raw);
     let r = register(&a, "claude", "s2", resolved.to_str().unwrap());
     assert_eq!(r["ignored"], true, "{r}");
     // At once (the register wakes the sender: under 2 s), not at a later 5 s tick or a restart.

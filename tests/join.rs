@@ -10,19 +10,19 @@ use common::{
 };
 use iroh::endpoint::{presets, Connection, RecvStream, SendStream};
 use iroh::{Endpoint, SecretKey};
-use lightbulb_connect::admission;
-use lightbulb_connect::identity::Identity;
-use lightbulb_connect::net::frames::{self, Frame};
-use lightbulb_connect::net::JOIN_ALPN;
-use lightbulb_connect::roster;
-use lightbulb_connect::ticket::{self, Ticket};
+use lightbulb::admission;
+use lightbulb::identity::Identity;
+use lightbulb::net::frames::{self, Frame};
+use lightbulb::net::JOIN_ALPN;
+use lightbulb::roster;
+use lightbulb::ticket::{self, Ticket};
 use serde_json::{json, Value};
 use std::time::Duration;
 
-/// An open link's join line: person-only.
+/// An open link's ticket: person-only.
 fn invite_open(e: &Env) -> String {
     let r = person(e, json!({"id": 1, "op": "team.invite", "mode": "open"}));
-    r["line"].as_str().unwrap_or_else(|| panic!("{r}")).into()
+    r["ticket"].as_str().unwrap_or_else(|| panic!("{r}")).into()
 }
 
 /// `team.join` (person-only) as `name`, a member of `kind`.
@@ -134,7 +134,7 @@ fn ask_ticket_admits_only_after_allow() {
     let o = b.detached(&[EXE, "join", &t], "");
     assert!(!o.status.success());
     let taken = format!(
-        "The name \"prasiddha\" is already used in this network. Try: lightbulb-connect join '{t}' --name prasiddha-2\n"
+        "The name \"prasiddha\" is already used in this network. Try: lightbulb join '{t}' --name prasiddha-2\n"
     );
     assert_eq!(err(&o), taken);
     // Refused at once: it never said it was asking anyone.
@@ -148,7 +148,7 @@ fn ask_ticket_admits_only_after_allow() {
         let o = a.detached(&[EXE, "held"], "");
         assert_eq!(
             out(&o),
-            "J1  bob (mbp) wants to join — lightbulb-connect approve J1\n",
+            "J1  bob (mbp) wants to join — lightbulb approve J1\n",
             "{}",
             err(&o)
         );
@@ -165,7 +165,7 @@ fn ask_ticket_admits_only_after_allow() {
             out(&o),
             "Asking whoever sent the link to allow this computer… (they get a prompt; this waits up to 10 minutes)\n\
              Connected as bob (mbp). Team \"prasiddha\": 2 computers online.\n\
-             Your agents here can now see and message the team's agents. Try: lightbulb-connect who --all\n\
+             Your agents here can now see and message the team's agents. Try: lightbulb who --all\n\
              Until both computers sign in, your other computer counts as another person and its first message needs your Allow.\n"
         );
     });
@@ -333,11 +333,14 @@ fn link_replaced_on_removal_no_longer_joins() {
     let t = invite(&a, "reusable");
     let o = a.detached(&[EXE, "remove", "bob"], "");
     assert!(o.status.success(), "{}", err(&o));
+    // "send this line instead: lightbulb join '<ticket>' --name NAME" -> the ticket.
     let line = out(&o)
-        .split("send this line instead: ")
+        .split("send this line instead: lightbulb join '")
         .nth(1)
         .unwrap()
-        .trim()
+        .split('\'')
+        .next()
+        .unwrap()
         .to_string();
     c.daemon(false, "", &[peers(&[&a])]);
     refused(&join(&c, &t, "carol", "computer"), "bad_ticket");
@@ -376,7 +379,7 @@ fn join_from_a_multi_member_network_is_refused() {
     assert!(!o.status.success());
     assert_eq!(
         err(&o),
-        "You are in \"acme\". Leave it first: lightbulb-connect leave\n"
+        "You are in \"acme\". Leave it first: lightbulb leave\n"
     );
     assert_eq!(b.heads(), heads);
     assert_eq!(members(&c).len(), 1);
@@ -487,7 +490,7 @@ fn team_join_is_person_only() {
     let t = invite(&a, "reusable");
     // B's daemon takes this test process for an agent.
     let me = std::process::id();
-    let birth = lightbulb_connect::os::process(me).unwrap().birth_micros;
+    let birth = lightbulb::os::process(me).unwrap().birth_micros;
     let pin = ("LIGHTBULB_CONNECT_HOOK_CALLER", format!("{me}:{birth}"));
     b.daemon(false, "", &[peers(&[&a]), pin]);
     let r = b.ask(json!({"id": 1, "op": "team.join", "ticket": t, "name": "bob"}));
@@ -565,7 +568,7 @@ async fn an_unprintable_name_is_refused_as_bad_name() {
     assert_eq!(o.status.code(), Some(1));
     assert_eq!(
         err(&o),
-        "That name has characters Lightbulb Connect cannot show. Use letters, numbers, spaces and punctuation.\n"
+        "That name has characters Lightbulb cannot show. Use letters, numbers, spaces and punctuation.\n"
     );
 }
 
@@ -593,7 +596,7 @@ async fn the_ticket_addresses_alone_reach_the_inviter() {
 
 #[test]
 fn bad_ticket_addresses_are_refused() {
-    use lightbulb_connect::net::parse_addrs;
+    use lightbulb::net::parse_addrs;
     let ok = |v: &[&str]| parse_addrs(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
     assert!(ok(&["192.168.0.2:4000", "[fe80::1]:4000"]).is_some());
     assert!(ok(&["169.254.1.1:9"]).is_some(), "link-local stays");
@@ -676,9 +679,8 @@ fn an_open_link_join_never_says_asking() {
 
 /// `join` (the CLI) with the open link's ticket written as `form` makes: admitted.
 fn joins_with(form: fn(&str) -> String) {
-    let (a, b, line) = pair("Decline", "open");
-    let bare = ticket::encode(&ticket::decode(&line).unwrap());
-    assert_eq!(line, format!("lightbulb-connect join '{bare}' --name NAME"));
+    let (a, b, bare) = pair("Decline", "open");
+    assert!(ticket::decode(&bare).is_ok());
     let o = b.detached(&[EXE, "join", &form(&bare), "--name", "bob"], "");
     assert!(o.status.success(), "{}{}", out(&o), err(&o));
     converged(&a, &b, 2);
@@ -692,9 +694,4 @@ fn join_takes_the_bare_ticket() {
 #[test]
 fn join_takes_the_app_link() {
     joins_with(|t| format!("lightbulb://join/{t}"));
-}
-
-#[test]
-fn join_takes_the_old_web_link() {
-    joins_with(|t| format!("https://thelightbulb.company/j/#{t}"));
 }

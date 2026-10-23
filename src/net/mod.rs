@@ -33,8 +33,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, Notify};
 
-pub const ALPN: &[u8] = b"lightbulb-connect/1";
-pub const JOIN_ALPN: &[u8] = b"lightbulb-connect/join/1";
+pub const ALPN: &[u8] = b"lightbulb/1";
+pub const JOIN_ALPN: &[u8] = b"lightbulb/join/1";
 pub const PROTOCOL: u32 = 1;
 
 /// A `roster` page closes before the next entry would take it past this (half the frame cap).
@@ -604,7 +604,7 @@ impl Net {
             if daemon.peers.lan_status() == "blocked" {
                 eprintln!(
                     "net: macOS refuses this program the local network, so computers on it cannot find this one. \
-                     Allow lightbulb-connect in System Settings > Privacy & Security > Local Network."
+                     Allow lightbulb in System Settings > Privacy & Security > Local Network."
                 );
             }
         }
@@ -1440,7 +1440,7 @@ mod local {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     use std::path::PathBuf;
 
-    /// `/tmp/lightbulb-connect-<uid>`, if it is ours (a directory, not a link, mode 0700),
+    /// `/tmp/lightbulb-<uid>`, if it is ours (a directory, not a link, mode 0700),
     /// kept once it was; one log line the first time it is not.
     fn dir() -> Option<PathBuf> {
         static OURS: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
@@ -1449,7 +1449,7 @@ mod local {
             return Some(d.clone());
         }
         let uid = unsafe { libc::getuid() };
-        let d = PathBuf::from(format!("/tmp/lightbulb-connect-{uid}"));
+        let d = PathBuf::from(format!("/tmp/lightbulb-{uid}"));
         let _ = std::fs::DirBuilder::new().mode(0o700).create(&d);
         let m = std::fs::symlink_metadata(&d).ok();
         let ok = m.is_some_and(|m| m.is_dir() && m.uid() == uid && m.mode() & 0o077 == 0);

@@ -2,10 +2,10 @@
 //! acks and later receipts, and `leave` told to a peer. Each test runs real daemons; a test
 //! that needs to hand-build frames plays one member itself over its own endpoint (`Peer`).
 
-use lightbulb_connect::identity::Identity;
-use lightbulb_connect::net::frames::Frame;
-use lightbulb_connect::policy;
-use lightbulb_connect::roster::{self, Entry};
+use lightbulb::identity::Identity;
+use lightbulb::net::frames::Frame;
+use lightbulb::policy;
+use lightbulb::roster::{self, Entry};
 use serde_json::json;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -35,7 +35,7 @@ fn admit(e: &Env, founder: &Identity, parent: &Entry, who: &Identity, cloud: boo
             &who.key,
             "carol",
             &[],
-            lightbulb_connect::daemon::ipc::now() as i64,
+            lightbulb::daemon::ipc::now() as i64,
         );
         extra["proof"] = json!(proof);
         extra["person_id"] = json!(format!("ws:{}", who.key));
@@ -520,7 +520,7 @@ async fn fourth_hop_and_thirteenth_send_are_refused_loop() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_person_at_the_terminal_resets_hops_to_zero() {
     // The test process counts as an agent on A (debug pin): only a person speaks as the terminal.
-    let birth = lightbulb_connect::os::process(std::process::id())
+    let birth = lightbulb::os::process(std::process::id())
         .unwrap()
         .birth_micros;
     let pin = format!("{}:{birth}", std::process::id());

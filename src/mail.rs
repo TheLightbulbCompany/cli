@@ -206,7 +206,7 @@ pub fn receipt_note(r: &Value, person: Option<&ForPerson>) -> Option<String> {
                 "is offline"
             };
             format!(
-                "Not delivered yet: {computer} {why}. Lightbulb Connect keeps trying until {}.{check}",
+                "Not delivered yet: {computer} {why}. Lightbulb keeps trying until {}.{check}",
                 until()
             )
         }

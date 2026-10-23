@@ -2,14 +2,14 @@
 //! The calling agent is pinned with LIGHTBULB_CONNECT_HOOK_CALLER (debug builds only),
 //! since the test runner is not an agent.
 
-use lightbulb_connect::{os, paths};
+use lightbulb::{os, paths};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Lines, Write};
 use std::os::unix::net::UnixStream;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
 
-const EXE: &str = env!("CARGO_BIN_EXE_lightbulb-connect");
+const EXE: &str = env!("CARGO_BIN_EXE_lightbulb");
 const NOTE: &str = "unread message(s) for this session; they arrive at your next step.";
 
 struct Net {
@@ -454,7 +454,7 @@ fn a_failed_push_brings_the_unread_note_back() {
 fn the_server_advertises_its_installed_name() {
     let net = Net::new();
     // mcp_named asserts serverInfo.name on initialize.
-    net.mcp_named(&me(), Some("lightbulb-connect"));
+    net.mcp_named(&me(), Some("work-tools"));
 }
 
 #[test]
@@ -802,7 +802,7 @@ fn loop_refusals_name_their_limit_here_and_on_a_teammate() {
 
 #[test]
 fn check_inbox_defangs_a_teammate_name_and_verifies_this_computer() {
-    use lightbulb_connect::{daemon::net_ops, policy, roster};
+    use lightbulb::{daemon::net_ops, policy, roster};
     let (a, b) = (common::Env::new(), common::Env::new());
     let (ia, ib) = (a.identity(), b.identity());
     let g = net_ops::genesis(&ia, "prasiddha", "mac", "acme", 1);

@@ -10,13 +10,13 @@ pub mod issuer;
 
 use iroh::endpoint::{presets, Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, PublicKey, SecretKey};
-use lightbulb_connect::daemon::net_ops;
-use lightbulb_connect::identity::{self, Identity};
-use lightbulb_connect::net::frames::{self, Frame, Remote};
-use lightbulb_connect::net::{ALPN, PROTOCOL};
-use lightbulb_connect::policy;
-use lightbulb_connect::roster::{self, Entry, Kind};
-use lightbulb_connect::store::Store;
+use lightbulb::daemon::net_ops;
+use lightbulb::identity::{self, Identity};
+use lightbulb::net::frames::{self, Frame, Remote};
+use lightbulb::net::{ALPN, PROTOCOL};
+use lightbulb::policy;
+use lightbulb::roster::{self, Entry, Kind};
+use lightbulb::store::Store;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -24,7 +24,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
 
-pub const EXE: &str = env!("CARGO_BIN_EXE_lightbulb-connect");
+pub const EXE: &str = env!("CARGO_BIN_EXE_lightbulb");
 
 pub struct Env {
     pub state: tempfile::TempDir,
@@ -70,7 +70,7 @@ impl Env {
         Store::open(&self.state.path().join("state.db")).unwrap()
     }
 
-    /// Starts `lightbulb-connect daemon` on this state dir with `lan` (mDNS) and `config` as
+    /// Starts `lightbulb daemon` on this state dir with `lan` (mDNS) and `config` as
     /// `config.toml`, and `env` set, and waits until it answers.
     /// Unless `config` names an issuer, a closed port's: no test reaches ours (nor fetches our
     /// relay list).
@@ -282,7 +282,7 @@ pub async fn instance(
     issuer: &str,
     snapshot: Option<&std::path::Path>,
     knobs: &[(&str, String)],
-) -> lightbulb_connect::Result<lightbulb_connect::embed::Instance> {
+) -> lightbulb::Result<lightbulb::embed::Instance> {
     let _one = STARTING.lock().await;
     let knobs: Vec<(&str, String)> = [peers(envs)]
         .into_iter()
@@ -291,14 +291,14 @@ pub async fn instance(
     for (k, v) in &knobs {
         std::env::set_var(k, v);
     }
-    let opts = lightbulb_connect::embed::EmbedOpts {
+    let opts = lightbulb::embed::EmbedOpts {
         kind: roster::MemberKind::Cloud,
         relay: None,
         issuer: issuer.into(),
         snapshot: snapshot.map(std::path::Path::to_path_buf),
         name: name.into(),
     };
-    let i = lightbulb_connect::embed::start(home, opts).await;
+    let i = lightbulb::embed::start(home, opts).await;
     for (k, _) in &knobs {
         std::env::remove_var(k);
     }
@@ -306,7 +306,7 @@ pub async fn instance(
 }
 
 /// Instance `i`'s answer to `op` with `body`.
-pub async fn call(i: &lightbulb_connect::embed::Instance, op: &str, body: Value) -> Value {
+pub async fn call(i: &lightbulb::embed::Instance, op: &str, body: Value) -> Value {
     let mut req = body;
     req["id"] = 1.into();
     req["op"] = op.into();
@@ -314,7 +314,7 @@ pub async fn call(i: &lightbulb_connect::embed::Instance, op: &str, body: Value)
 }
 
 /// Waits (up to 10 s) until instance `i` has `n` members online.
-pub async fn online(i: &lightbulb_connect::embed::Instance, n: u64) {
+pub async fn online(i: &lightbulb::embed::Instance, n: u64) {
     for _ in 0..500 {
         if call(i, "status", json!({})).await["peers"]["online"] == n {
             return;
@@ -325,10 +325,7 @@ pub async fn online(i: &lightbulb_connect::embed::Instance, n: u64) {
 }
 
 /// `who` played by the test, dialing instance `i` on the member ALPN, `hello` sent.
-pub async fn dial_instance(
-    i: &lightbulb_connect::embed::Instance,
-    who: &Identity,
-) -> (Peer, Endpoint) {
+pub async fn dial_instance(i: &lightbulb::embed::Instance, who: &Identity) -> (Peer, Endpoint) {
     let key = call(i, "identity.get", json!({})).await["member_key"].clone();
     let port = call(i, "status", json!({})).await["port"].as_u64().unwrap();
     let key = PublicKey::from_bytes(&identity::key_bytes(key.as_str().unwrap()).unwrap()).unwrap();

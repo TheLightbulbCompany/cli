@@ -2,7 +2,7 @@
 mod common;
 
 use common::{script, until};
-use lightbulb_connect::dialog::{args, Queue};
+use lightbulb::dialog::{args, Queue};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
