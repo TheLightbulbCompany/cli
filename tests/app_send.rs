@@ -767,3 +767,41 @@ async fn app_send_counts_toward_the_persons_limit() {
     );
     i.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_inbox_answer_lost_with_its_connection_leaves_the_mail_unread() {
+    let w = world();
+    w.run(&[&w.a]);
+    let q = w.q();
+    let app = format!("{}/claude-app", w.a.short());
+    let big = "x".repeat(60_000);
+    for n in 0..3 {
+        w.b.send(&q, &app, &format!("{n}{big}"), &format!("q{n}"), None);
+    }
+    until(10, "stored on A", || {
+        (0..3).all(|n| w.b.state(&q, &format!("q{n}")) == "stored")
+    });
+    // W1's member, played with a small receive window it never reads: A's answer cannot be
+    // written whole before the connection closes.
+    let iw1 = w.w1_identity();
+    let tc = iroh::endpoint::QuicTransportConfig::builder()
+        .stream_receive_window(iroh::endpoint::VarInt::from_u32(16 * 1024))
+        .build();
+    let ep = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .secret_key(iroh::SecretKey::from_bytes(&iw1.signing.to_bytes()))
+        .transport_config(tc)
+        .bind()
+        .await
+        .unwrap();
+    let mut p = Peer::dial(&ep, &w.a).await;
+    p.hello(vec![]).await;
+    let from = format!("{}/claude-app", iw1.short);
+    let body = json!({"app": "claude", "for_person": P});
+    p.send(&app_frame("app_inbox", &from, &app, body)).await;
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    p.conn.close(0u32.into(), b"");
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    let waiting = format!("SELECT COUNT(*) FROM mailbox WHERE to_key = '{app}'");
+    assert_eq!(count(&db(&w.a), &waiting), 3);
+    assert!((0..3).all(|n| w.b.state(&q, &format!("q{n}")) == "stored"));
+}

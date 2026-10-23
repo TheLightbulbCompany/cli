@@ -47,6 +47,8 @@ const KINDS: [(&str, &str); 3] = [
 /// `frames::MAX_FRAME`), and the newest waiting rows rendered for it.
 const INBOX_BUDGET: usize = 256 * 1024;
 const INBOX_ROWS: usize = 200;
+/// The most one record alone may take: escaped at most twice over, it still fits a frame.
+const LONE_MAX: usize = frames::MAX_FRAME / 2 - 4096;
 /// The error codes a computer's answer may carry; any other reads `internal`.
 const ERRORS: [&str; 4] = [BAD_REQUEST, NOT_FOUND, NOT_MEMBER, INTERNAL];
 
@@ -241,7 +243,9 @@ async fn serve(
     let Some(done) = d.peers.send_written(&key, f) else {
         return eprintln!("app: no connection to {} for the answer", short(&key));
     };
-    if written.is_empty() || tokio::time::timeout(WAIT, done).await.is_err() {
+    // Only a write that went through: a connection that ends first drops `done` unfired.
+    let wrote = matches!(tokio::time::timeout(WAIT, done).await, Ok(Ok(())));
+    if written.is_empty() || !wrote {
         return;
     }
     let store = d.store.lock().unwrap();
@@ -264,13 +268,19 @@ fn inbox(d: &Daemon, mine: &Key) -> crate::Result<(Vec<Value>, bool, Vec<String>
     for (m, v) in newest.iter().zip(ipc::records(d, &newest)) {
         let r = ipc::inbox_record(&v);
         let n = r.to_string().len();
-        // ponytail: a record alone over the budget (control characters escape six times) is
-        // never handed over this way; it stays in the mailbox for its session, unflagged.
-        if n > INBOX_BUDGET {
-            continue;
-        }
-        if size + n > INBOX_BUDGET {
+        // A record alone may use the frame (its JSON is escaped once more into it). ponytail:
+        // one past that (control characters escape six times) is never handed over this way;
+        // it stays in the mailbox, and `more` says something is left.
+        let cap = if records.is_empty() {
+            LONE_MAX
+        } else {
+            INBOX_BUDGET
+        };
+        if size + n > cap {
             more = true;
+            if records.is_empty() {
+                continue;
+            }
             break;
         }
         size += n;
@@ -305,9 +315,9 @@ fn message_id(d: &Daemon, from: &Key, r: &Value) -> Option<String> {
 /// `app.send {for_person, app, to, text, request_id, reply_to?}` -> `{request_id, state,
 /// reason, limit, thread, tier, computer}`, asked of one computer at a time, each given
 /// `WAIT`, a silent one probed (`PROBE`) before the next sends. `app.inbox {for_person, app}`
-/// -> `{records, more}` (every online computer's, by `sent_at`; one that answers an error is
-/// skipped like a silent one) and `app.receipt {for_person, app, request_id}` -> the receipt
-/// (the first computer that knows it) ask them all at once. The person's online computers in
+/// -> `{records, more}` (every online computer's, by `sent_at`) and `app.receipt {for_person,
+/// app, request_id}` -> the receipt (the first computer that knows it) ask them all at once;
+/// an answer with an error (but `not_found` for a receipt) is skipped like silence. The person's online computers in
 /// this workspace, newest presence first; none -> `no_computer_online`, also for a
 /// `for_person` outside the workspace (no membership oracle). An instance's ops only.
 pub(crate) async fn op(id: u64, op: &str, body: &Value, d: &Arc<Daemon>) -> Response {
@@ -371,8 +381,8 @@ pub(crate) async fn op(id: u64, op: &str, body: &Value, d: &Arc<Daemon>) -> Resp
         asks.spawn(async move { (ask(&d, &key, f, WAIT).await, computer) });
     }
     let (mut records, mut more, mut answered) = (vec![], false, false);
-    while let Some(Ok((got, computer))) = asks.join_next().await {
-        let Some(v) = got else {
+    while let Some(r) = asks.join_next().await {
+        let Ok((Some(v), computer)) = r else {
             continue;
         };
         let err = v["error"].as_str();
@@ -382,13 +392,14 @@ pub(crate) async fn op(id: u64, op: &str, body: &Value, d: &Arc<Daemon>) -> Resp
                 records.extend(v["records"].as_array().cloned().unwrap_or_default());
                 more |= v["more"] == true;
             }
-        } else if err != Some(NOT_FOUND) {
+        } else if err.is_none() {
             // The rest end within `WAIT` and clear their own waiters.
             asks.detach_all();
             return answer(id, v, computer);
-        } else {
+        } else if err == Some(NOT_FOUND) {
             answered = true;
         }
+        // Any other error is no answer: a slower computer may hold the receipt.
     }
     match (answered, kind) {
         (false, _) => none(),
