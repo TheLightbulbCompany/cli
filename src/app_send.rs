@@ -9,9 +9,9 @@
 //! `app_receipt_query {app, request_id, for_person}`. Answers, computer to member, `reply_to`
 //! the request's envelope id: `app_receipt {app, request_id, id, state, reason, limit, thread,
 //! tier}` or `{app, request_id, error, reason?}`, and `app_inbox_result {app, records, more}`
-//! or `{app, error}`. An inbox answer holds the newest records within `INBOX_BUDGET` bytes;
-//! they are marked read only once the answer was written to the stream, the rest stay unread
-//! and `more` says so. Logs carry ids, apps and shorts, never text.
+//! or `{app, error}`. An inbox answer holds the newest records (of the newest `INBOX_ROWS`)
+//! within `INBOX_BUDGET` bytes; they are marked read only once the answer was written to the
+//! stream, the rest stay unread and `more` says so. Logs carry ids, apps and shorts, never text.
 //!
 //! Fallback ceiling: a computer that sent but whose answer is lost is asked once more
 //! (`app_receipt_query`, `PROBE`) before the next computer sends; if that probe is lost too,
@@ -21,32 +21,37 @@
 
 use crate::daemon::ipc::{self, Response, BAD_REQUEST, INTERNAL, NOT_FOUND, UNSUPPORTED};
 use crate::daemon::net_ops::NOT_MEMBER;
-use crate::daemon::{Cloud, Daemon};
-use crate::mail;
-use crate::net::frames::{self, Frame, MAX_FRAME};
+use crate::daemon::Daemon;
+use crate::net::frames::{self, Frame};
 use crate::net::short;
-use crate::roster::MemberKind;
 use crate::sessions::Key;
+use crate::{mail, policy};
 use serde_json::{json, Value};
 use std::cmp::Reverse;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 /// How long the member waits for one computer before it asks the next.
 const WAIT: Duration = Duration::from_secs(10);
-pub const NO_COMPUTER_ONLINE: &str = "no_computer_online";
-const NO_COMPUTER_TEXT: &str = "none of your computers is online right now";
-const REQUESTS: [&str; 3] = ["app_send", "app_inbox", "app_receipt_query"];
 /// The probe of a computer that did not answer an `app_send`: did it send?
 const PROBE: Duration = Duration::from_secs(3);
-/// An inbox answer's records, at most (well under `frames::MAX_FRAME`).
+pub const NO_COMPUTER_ONLINE: &str = "no_computer_online";
+const NO_COMPUTER_TEXT: &str = "none of your computers is online right now";
+/// Each request kind, and the kind that answers it.
+const KINDS: [(&str, &str); 3] = [
+    ("app_send", "app_receipt"),
+    ("app_inbox", "app_inbox_result"),
+    ("app_receipt_query", "app_receipt"),
+];
+/// An inbox answer's records, at most (escaped once more into the frame: well under
+/// `frames::MAX_FRAME`), and the newest waiting rows rendered for it.
 const INBOX_BUDGET: usize = 256 * 1024;
+const INBOX_ROWS: usize = 200;
 /// The error codes a computer's answer may carry; any other reads `internal`.
 const ERRORS: [&str; 4] = [BAD_REQUEST, NOT_FOUND, NOT_MEMBER, INTERNAL];
 
 /// A request out (`Cloud::apps`): the computer asked, the answer kind expected, and where the
-/// answer goes.
+/// answer goes. Kept apart from admission's `Pending::Forwarded` (another key and check).
 pub type Waiter = (String, &'static str, tokio::sync::oneshot::Sender<Value>);
 
 /// Whether an envelope of `kind` is this module's (every `app_*`, known or not).
@@ -77,6 +82,11 @@ pub fn app_name(app: &str) -> &str {
     }
 }
 
+/// The answer kind of request `kind`, when it is one.
+fn answer_kind(kind: &str) -> Option<&'static str> {
+    KINDS.iter().find(|(r, _)| *r == kind).map(|(_, a)| *a)
+}
+
 fn envelope(kind: &str, from: String, to: String, reply_to: Option<String>, body: Value) -> Frame {
     let id = ulid::Ulid::generate().to_string();
     Frame::Envelope {
@@ -94,19 +104,16 @@ fn envelope(kind: &str, from: String, to: String, reply_to: Option<String>, body
     }
 }
 
-/// The answer kind to request `kind`.
-fn answer_kind(kind: &str) -> &'static str {
-    if kind == "app_inbox" {
-        "app_inbox_result"
-    } else {
-        "app_receipt"
-    }
+/// `app_receipt_query`'s body.
+fn receipt_query(app: &str, request_id: &Value, person: &str) -> Value {
+    json!({"app": app, "request_id": request_id, "for_person": person})
 }
 
-/// Member `key`'s `app_*` envelope: on a computer a request, served when it comes from this
-/// computer's own workspace's member (in force) for this computer's person; on an instance an
-/// answer of the kind asked, from the computer asked. Its `from` must be one of the member's
-/// own addresses. Anything else is dropped unanswered (counted under `status.dropped.app`).
+/// Member `key`'s `app_*` envelope, its `from` one of the member's own addresses: on a
+/// computer a request, served when it comes from this computer's own workspace's member (in
+/// force) for this computer's person (`policy::my_workspace`); on an instance an answer of the
+/// kind asked, from the computer asked. Anything else is dropped unanswered (counted under
+/// `status.dropped.app`).
 pub(crate) fn on_envelope(d: &Arc<Daemon>, key: &str, env: Frame) {
     let Frame::Envelope {
         id,
@@ -120,20 +127,41 @@ pub(crate) fn on_envelope(d: &Arc<Daemon>, key: &str, env: Frame) {
         return;
     };
     let body: Value = serde_json::from_str(&body).unwrap_or_default();
-    let own = {
+    let (own, trusted) = {
         let team = d.team.lock().unwrap();
-        let peer = team.roster.members.get(key);
-        peer.is_some_and(|p| frames::own(&p.short, &from))
+        let r = &team.roster;
+        let own = r
+            .members
+            .get(key)
+            .is_some_and(|p| frames::own(&p.short, &from));
+        let person = body["for_person"].as_str().unwrap_or("\0");
+        (
+            own,
+            policy::my_workspace(r, &d.identity.key, key, Some(person)),
+        )
     };
     let served = own
-        && match &d.cloud {
-            Some(cloud) => answered(cloud, key, &kind, reply_to.as_deref(), body),
-            None if REQUESTS.contains(&kind.as_str()) && trusted(d, key, &body) => {
+        && match (&d.cloud, answer_kind(&kind)) {
+            (Some(cloud), None) => {
+                let mut apps = cloud.apps.lock().unwrap();
+                let r = reply_to.unwrap_or_default();
+                match apps.remove(&r) {
+                    Some((asked, want, tx)) if asked == key && want == kind => {
+                        tx.send(body).is_ok()
+                    }
+                    Some(w) => {
+                        apps.insert(r, w);
+                        false
+                    }
+                    None => false,
+                }
+            }
+            (None, Some(answer)) if trusted => {
                 let (d, key, id) = (d.clone(), key.to_string(), id.clone());
-                tokio::spawn(serve(d, key, id, from, kind, body));
+                tokio::spawn(serve(d, key, id, from, kind, answer, body));
                 true
             }
-            None => false,
+            _ => false,
         };
     if !served {
         d.peers.dropped("app");
@@ -142,154 +170,114 @@ pub(crate) fn on_envelope(d: &Arc<Daemon>, key: &str, env: Frame) {
     }
 }
 
-/// Whether `key` is this computer's own workspace's member and `body.for_person` its person.
-fn trusted(d: &Daemon, key: &str, body: &Value) -> bool {
-    let team = d.team.lock().unwrap();
-    let Some(me) = team.roster.members.get(&d.identity.key) else {
-        return false;
-    };
-    team.roster
-        .my_workspace_member(me)
-        .is_some_and(|w| w.key == key)
-        && body["for_person"].as_str() == Some(me.person_id.as_str())
-}
-
-/// The waiting request `reply_to` (asked of `key`, answered by `kind`) takes `body`.
-fn answered(cloud: &Cloud, key: &str, kind: &str, reply_to: Option<&str>, body: Value) -> bool {
-    let Some(r) = reply_to else {
-        return false;
-    };
-    let mut apps = cloud.apps.lock().unwrap();
-    if apps
-        .get(r)
-        .is_none_or(|(asked, want, _)| asked != key || *want != kind)
-    {
-        return false;
-    }
-    apps.remove(r)
-        .is_some_and(|(_, _, tx)| tx.send(body).is_ok())
-}
-
-/// One trusted request, `id` from `from`: answered on the connection it came over.
-async fn serve(d: Arc<Daemon>, key: String, id: String, from: String, kind: String, body: Value) {
+/// One trusted request `kind` (answered by `answer`), `id` from `from`: answered on the
+/// connection it came over.
+async fn serve(
+    d: Arc<Daemon>,
+    key: String,
+    id: String,
+    from: String,
+    kind: String,
+    answer: &'static str,
+    body: Value,
+) {
     let app = body["app"].as_str().unwrap_or_default();
     let mine = Key(format!("{}/{app}-app", d.identity.short));
     let mut out = json!({ "app": app });
     if kind != "app_inbox" {
         out["request_id"] = body["request_id"].clone();
     }
-    let reply =
-        |answer: Value| envelope(answer_kind(&kind), mine.0.clone(), from, Some(id), answer);
-    if kind == "app_inbox" && valid_slug(app) {
-        return inbox(&d, &key, &mine, out, reply).await;
-    }
-    let answer = if !valid_slug(app) {
-        error(out, BAD_REQUEST)
-    } else if kind == "app_send" {
-        let req = json!({"from": mine.0, "to": body["to"], "text": body["text"],
-            "request_id": body["request_id"], "reply_to": body["reply_to"]});
-        match ipc::send(0, &req, &d) {
-            Ok((from, r)) => {
-                let to = r.to.clone();
-                let r = ipc::finish(&d, &from, r, true).await;
-                let msg = message_id(&d, &from, &r);
-                if let (Some(id), Some(to)) = (&msg, to) {
-                    eprintln!("app: {app} sent {id}");
-                    let e = json!({"event": "app_sent", "id": id, "app": app, "to": to});
-                    let _ = d.events.send(e);
-                }
-                receipt(out, &r, msg)
+    // Held while an inbox answer is out: a second one would read the same rows.
+    let _held = match kind.as_str() {
+        "app_inbox" => Some(d.key_lock(&mine.0).lock_owned().await),
+        _ => None,
+    };
+    let mut written = vec![];
+    let out = match kind.as_str() {
+        _ if !valid_slug(app) => error(out, BAD_REQUEST),
+        "app_inbox" => match inbox(&d, &mine) {
+            Ok((records, more, ids)) => {
+                written = ids;
+                json!({ "app": app, "records": records, "more": more })
             }
-            Err(e) => {
-                out["reason"] = e.body["reason"].clone();
-                error(out, e.body["error"].as_str().unwrap_or(INTERNAL))
-            }
-        }
-    } else {
-        let rid = body["request_id"].as_str().unwrap_or_default();
-        let got = mail::receipt(&d.store.lock().unwrap(), &mine, rid);
-        match got {
-            Ok(Some(r)) => {
-                let r = ipc::finish(&d, &mine, r, false).await;
-                let msg = message_id(&d, &mine, &r);
-                receipt(out, &r, msg)
-            }
-            Ok(None) => error(out, NOT_FOUND),
             Err(_) => error(out, INTERNAL),
+        },
+        "app_send" => {
+            let req = json!({"from": mine.0, "to": body["to"], "text": body["text"],
+                "request_id": body["request_id"], "reply_to": body["reply_to"]});
+            match ipc::send(0, &req, &d) {
+                Ok((from, r)) => {
+                    let to = r.to.clone();
+                    let r = ipc::finish(&d, &from, r, true).await;
+                    let msg = message_id(&d, &from, &r);
+                    if let (Some(id), Some(to)) = (&msg, to) {
+                        eprintln!("app: {app} sent {id}");
+                        let e = json!({"event": "app_sent", "id": id, "app": app, "to": to});
+                        let _ = d.events.send(e);
+                    }
+                    receipt(out, &r, msg)
+                }
+                Err(e) => {
+                    out["reason"] = e.body["reason"].clone();
+                    error(out, e.body["error"].as_str().unwrap_or(INTERNAL))
+                }
+            }
+        }
+        _ => {
+            let rid = body["request_id"].as_str().unwrap_or_default();
+            let got = mail::receipt(&d.store.lock().unwrap(), &mine, rid);
+            match got {
+                Ok(Some(r)) => {
+                    let r = ipc::finish(&d, &mine, r, false).await;
+                    let msg = message_id(&d, &mine, &r);
+                    receipt(out, &r, msg)
+                }
+                Ok(None) => error(out, NOT_FOUND),
+                Err(_) => error(out, INTERNAL),
+            }
         }
     };
-    if d.peers.send(&key, reply(answer)).is_err() {
-        eprintln!("app: no connection to {} for the answer", short(&key));
-    }
-}
-
-/// `app_inbox`: the newest records of `mine`'s mailbox within `INBOX_BUDGET`, each taken and
-/// marked read once the answer was written; `more` when any are left.
-async fn inbox(
-    d: &Daemon,
-    key: &str,
-    mine: &Key,
-    mut out: Value,
-    reply: impl FnOnce(Value) -> Frame,
-) {
-    let waiting = mail::waiting(&d.store.lock().unwrap(), mine, ipc::now());
-    let Ok(mut waiting) = waiting else {
-        let _ = d.peers.send(key, reply(error(out, INTERNAL)));
-        return;
+    let f = envelope(answer, mine.0.clone(), from, Some(id), out);
+    let Some(done) = d.peers.send_written(&key, f) else {
+        return eprintln!("app: no connection to {} for the answer", short(&key));
     };
-    waiting.reverse();
-    let all = ipc::records(d, &waiting);
-    let mut records = vec![];
-    let mut size = 0;
-    for v in &all {
-        let r: serde_json::Map<String, Value> = (ipc::INBOX_RECORD.iter())
-            .map(|k| (k.to_string(), v[*k].clone()))
-            .collect();
-        size += Value::Object(r.clone()).to_string().len();
-        // The newest always goes, so one large record cannot stall the rest behind it.
-        if size > INBOX_BUDGET && !records.is_empty() {
-            break;
-        }
-        records.push(Value::Object(r));
-    }
-    let mut n = records.len();
-    out["records"] = records.into();
-    out["more"] = (n < all.len()).into();
-    let mut f = reply(out.clone());
-    // ponytail: a record whose JSON alone passes the frame cap (control characters escape six
-    // times) is never handed over this way; it stays in the mailbox for its session.
-    if serde_json::to_vec(&f).map_or(true, |b| b.len() > MAX_FRAME) {
-        n = 0;
-        out["records"] = json!([]);
-        out["more"] = true.into();
-        f = reply_again(&f, &out);
-    }
-    let Some(rx) = d.peers.send_written(key, f.clone()) else {
-        return;
-    };
-    let Frame::Envelope { id, .. } = &f else {
-        return;
-    };
-    if tokio::time::timeout(WAIT, rx).await.is_err() {
-        d.peers.unwritten(id);
+    if written.is_empty() || tokio::time::timeout(WAIT, done).await.is_err() {
         return;
     }
     let store = d.store.lock().unwrap();
-    for m in &waiting[..n] {
-        let taken = mail::take_one(&store, mine, &m.id, ipc::now());
-        if let Err(e) = taken.and_then(|_| mail::mark_read(&store, &m.id)) {
-            eprintln!("app: marking {} read: {e}", m.id);
+    for m in &written {
+        let taken = mail::take_one(&store, &mine, m, ipc::now());
+        if let Err(e) = taken.and_then(|_| mail::mark_read(&store, m)) {
+            eprintln!("app: marking {m} read: {e}");
         }
     }
 }
 
-/// Envelope `f` with body `out` instead.
-fn reply_again(f: &Frame, out: &Value) -> Frame {
-    let mut f = f.clone();
-    if let Frame::Envelope { body, .. } = &mut f {
-        *body = out.to_string();
+/// `mine`'s newest waiting records (of the newest `INBOX_ROWS`) within `INBOX_BUDGET`, newest
+/// first: the records, whether others are left, and their message ids (to mark read once
+/// written).
+fn inbox(d: &Daemon, mine: &Key) -> crate::Result<(Vec<Value>, bool, Vec<String>)> {
+    let waiting = mail::waiting(&d.store.lock().unwrap(), mine, ipc::now())?;
+    let mut more = waiting.len() > INBOX_ROWS;
+    let newest: Vec<_> = waiting.into_iter().rev().take(INBOX_ROWS).collect();
+    let (mut records, mut ids, mut size) = (vec![], vec![], 0);
+    for (m, v) in newest.iter().zip(ipc::records(d, &newest)) {
+        let r = ipc::inbox_record(&v);
+        let n = r.to_string().len();
+        // ponytail: a record alone over the budget (control characters escape six times) is
+        // never handed over this way; it stays in the mailbox for its session, unflagged.
+        if n > INBOX_BUDGET {
+            continue;
+        }
+        if size + n > INBOX_BUDGET {
+            more = true;
+            break;
+        }
+        size += n;
+        records.push(r);
+        ids.push(m.id.clone());
     }
-    f
+    Ok((records, more, ids))
 }
 
 fn error(mut out: Value, code: &str) -> Value {
@@ -299,7 +287,7 @@ fn error(mut out: Value, code: &str) -> Value {
 
 /// `out` with receipt `r`'s fields (as `ipc::finish` gives it) and the message's `id`.
 fn receipt(mut out: Value, r: &Value, id: Option<String>) -> Value {
-    for k in ["state", "reason", "limit", "thread", "tier"] {
+    for k in ipc::RECEIPT_FIELDS {
         out[k] = r[k].clone();
     }
     out["id"] = id.into();
@@ -315,17 +303,17 @@ fn message_id(d: &Daemon, from: &Key, r: &Value) -> Option<String> {
 }
 
 /// `app.send {for_person, app, to, text, request_id, reply_to?}` -> `{request_id, state,
-/// reason, limit, thread, tier, computer}`; `app.inbox {for_person, app}` -> `{records, more}`
-/// (every online computer's, by `sent_at`; one that answers an error is skipped like a silent
-/// one); `app.receipt {for_person, app, request_id}` -> the receipt (the first computer that
-/// knows it). Asked of the person's online computers in this workspace, newest presence first,
-/// each given `WAIT`; a computer silent on an `app_send` is probed (`PROBE`) before the next
-/// one sends. None -> `no_computer_online`, also for a `for_person` outside the workspace (no
-/// membership oracle). An instance's ops only.
+/// reason, limit, thread, tier, computer}`, asked of one computer at a time, each given
+/// `WAIT`, a silent one probed (`PROBE`) before the next sends. `app.inbox {for_person, app}`
+/// -> `{records, more}` (every online computer's, by `sent_at`; one that answers an error is
+/// skipped like a silent one) and `app.receipt {for_person, app, request_id}` -> the receipt
+/// (the first computer that knows it) ask them all at once. The person's online computers in
+/// this workspace, newest presence first; none -> `no_computer_online`, also for a
+/// `for_person` outside the workspace (no membership oracle). An instance's ops only.
 pub(crate) async fn op(id: u64, op: &str, body: &Value, d: &Arc<Daemon>) -> Response {
-    let Some(cloud) = &d.cloud else {
+    if d.cloud.is_none() {
         return Response::err(id, UNSUPPORTED);
-    };
+    }
     let (Some(person), Some(app)) = (
         body["for_person"].as_str(),
         body["app"].as_str().filter(|a| valid_slug(a)),
@@ -342,64 +330,69 @@ pub(crate) async fn op(id: u64, op: &str, body: &Value, d: &Arc<Daemon>) -> Resp
         ),
         "app.receipt" if str_of("request_id") => (
             "app_receipt_query",
-            json!({"app": app, "request_id": body["request_id"], "for_person": person}),
+            receipt_query(app, &body["request_id"], person),
         ),
         "app.inbox" => ("app_inbox", json!({"app": app, "for_person": person})),
         _ => return Response::err(id, BAD_REQUEST),
     };
-    let (mut records, mut more) = (vec![], false);
-    let mut asked_any = false;
-    for (key, short, computer) in online_computers(d, person) {
+    let request = |short: &str, kind: &str, req: &Value| {
         let (from, to) = (
             format!("{}/{app}-app", d.identity.short),
             format!("{short}/{app}-app"),
         );
-        let ask_as = |kind, req: &Value, wait| {
-            let f = envelope(kind, from.clone(), to.clone(), None, req.clone());
-            ask(d, cloud, &key, f, wait)
-        };
-        let mut got = ask_as(kind, &req, WAIT).await;
-        if got.is_none() && kind == "app_send" {
-            // It may have sent and lost the answer: only a `not_found` lets the next one send.
-            let probe = json!({"app": app, "request_id": req["request_id"], "for_person": person});
-            got = ask_as("app_receipt_query", &probe, PROBE)
-                .await
-                .filter(|v| v["error"] != NOT_FOUND);
+        envelope(kind, from, to, None, req.clone())
+    };
+    let none = || {
+        let text = json!({ "message": NO_COMPUTER_TEXT });
+        Response::err_with(id, NO_COMPUTER_ONLINE, text)
+    };
+    let computers = online_computers(d, person);
+    if kind == "app_send" {
+        for (key, short, computer) in computers {
+            let mut got = ask(d, &key, request(&short, kind, &req), WAIT).await;
+            if got.is_none() {
+                // It may have sent and lost the answer: only `not_found` lets the next send.
+                let probe = receipt_query(app, &req["request_id"], person);
+                let f = request(&short, "app_receipt_query", &probe);
+                got = ask(d, &key, f, PROBE)
+                    .await
+                    .filter(|v| v["error"] != NOT_FOUND);
+            }
+            if let Some(v) = got {
+                return answer(id, v, computer);
+            }
         }
-        let Some(mut v) = got else {
+        return none();
+    }
+    // Reads: every computer at once.
+    let mut asks = tokio::task::JoinSet::new();
+    for (key, short, computer) in computers {
+        let (d, f) = (d.clone(), request(&short, kind, &req));
+        asks.spawn(async move { (ask(&d, &key, f, WAIT).await, computer) });
+    }
+    let (mut records, mut more, mut answered) = (vec![], false, false);
+    while let Some(Ok((got, computer))) = asks.join_next().await {
+        let Some(v) = got else {
             continue;
         };
-        let err = v["error"]
-            .as_str()
-            .map(|e| *ERRORS.iter().find(|k| **k == e).unwrap_or(&INTERNAL));
-        if op == "app.inbox" {
+        let err = v["error"].as_str();
+        if kind == "app_inbox" {
             if err.is_none() {
-                asked_any = true;
+                answered = true;
                 records.extend(v["records"].as_array().cloned().unwrap_or_default());
                 more |= v["more"] == true;
             }
-            continue;
+        } else if err != Some(NOT_FOUND) {
+            // The rest end within `WAIT` and clear their own waiters.
+            asks.detach_all();
+            return answer(id, v, computer);
+        } else {
+            answered = true;
         }
-        asked_any = true;
-        if op == "app.receipt" && err == Some(NOT_FOUND) {
-            continue;
-        }
-        if let Some(e) = err {
-            return Response::err_with(id, e, json!({ "reason": v["reason"] }));
-        }
-        for k in ["app", "id"] {
-            v.as_object_mut().map(|o| o.remove(k));
-        }
-        v["computer"] = computer.into();
-        return Response::ok(id, v);
     }
-    match (asked_any, op) {
-        (false, _) => Response::err_with(
-            id,
-            NO_COMPUTER_ONLINE,
-            json!({ "message": NO_COMPUTER_TEXT }),
-        ),
-        (true, "app.inbox") => {
+    match (answered, kind) {
+        (false, _) => none(),
+        (true, "app_inbox") => {
             records.sort_by_key(|r| r["sent_at"].as_i64());
             Response::ok(id, json!({ "records": records, "more": more }))
         }
@@ -407,43 +400,49 @@ pub(crate) async fn op(id: u64, op: &str, body: &Value, d: &Arc<Daemon>) -> Resp
     }
 }
 
+/// A computer's receipt answer `v` as the op answers it: its error (one of `ERRORS`, else
+/// `internal`), or the receipt with the `computer` that sent it.
+fn answer(id: u64, mut v: Value, computer: String) -> Response {
+    if let Some(e) = v["error"].as_str() {
+        let e = if ERRORS.contains(&e) { e } else { INTERNAL };
+        return Response::err_with(id, e, json!({ "reason": v["reason"] }));
+    }
+    for k in ["app", "id"] {
+        v.as_object_mut().map(|o| o.remove(k));
+    }
+    v["computer"] = computer.into();
+    Response::ok(id, v)
+}
+
 /// `(key, short, computer)` of `person`'s computers in this instance's workspace that are
 /// online, newest presence first.
 fn online_computers(d: &Daemon, person: &str) -> Vec<(String, String, String)> {
-    // Before `team`: the presences' own lock.
-    let seqs: HashMap<String, u64> = (d.latest.lock().unwrap().iter())
-        .map(|(k, l)| (k.clone(), l.seq))
-        .collect();
-    let team = d.team.lock().unwrap();
-    let members = &team.roster.members;
-    let Some(ws) = members
-        .get(&d.identity.key)
-        .and_then(|m| m.workspace.clone())
-    else {
-        return vec![];
+    let mut out: Vec<_> = {
+        let team = d.team.lock().unwrap();
+        let r = &team.roster;
+        let ws = r
+            .members
+            .get(&d.identity.key)
+            .and_then(|m| m.workspace.as_ref());
+        (r.computers_of(person).into_iter())
+            .filter(|m| ws.is_some() && m.workspace.as_ref() == ws && d.peers.is_online(&m.key))
+            .map(|m| (m.key.clone(), m.short.clone(), m.computer.clone()))
+            .collect()
     };
-    let mut out: Vec<_> = members
-        .values()
-        .filter(|m| {
-            m.kind == MemberKind::Computer
-                && m.person_id == person
-                && m.workspace.as_deref() == Some(ws.as_str())
-                && d.peers.is_online(&m.key)
-        })
-        .map(|m| (m.key.clone(), m.short.clone(), m.computer.clone()))
-        .collect();
-    out.sort_by_key(|(k, ..)| Reverse(seqs.get(k).copied().unwrap_or(0)));
+    // After `team`: the presences' own lock.
+    let latest = d.latest.lock().unwrap();
+    out.sort_by_key(|(k, ..)| Reverse(latest.get(k).map_or(0, |l| l.seq)));
     out
 }
 
 /// Sends request `f` to computer `key` and waits up to `wait` for its answer.
-async fn ask(d: &Daemon, cloud: &Cloud, key: &str, f: Frame, wait: Duration) -> Option<Value> {
-    let Frame::Envelope { id, kind, .. } = &f else {
+async fn ask(d: &Daemon, key: &str, f: Frame, wait: Duration) -> Option<Value> {
+    let (cloud, Frame::Envelope { id, kind, .. }) = (d.cloud.as_ref()?, &f) else {
         return None;
     };
     let (id, kind) = (id.clone(), kind.clone());
     let (tx, rx) = tokio::sync::oneshot::channel();
-    let waiter = (key.to_string(), answer_kind(&kind), tx);
+    let waiter = (key.to_string(), answer_kind(&kind)?, tx);
     cloud.apps.lock().unwrap().insert(id.clone(), waiter);
     let got = match d.peers.send(key, f) {
         Ok(()) => tokio::time::timeout(wait, rx)

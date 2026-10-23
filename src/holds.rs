@@ -249,7 +249,7 @@ pub fn always_scope(roster: &Roster, me: &str, h: &Hold) -> Option<Scope> {
     if h.kind() != Kind::Message || from.kind != MemberKind::Cloud {
         return None;
     }
-    Some(if policy::my_workspace(roster, me, from) {
+    Some(if policy::my_workspace(roster, me, &from.key, None) {
         Scope::OwnCloud
     } else {
         Scope::CloudOf

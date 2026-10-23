@@ -273,13 +273,7 @@ fn share(id: u64, body: &Value, d: &Daemon) -> Response {
         if !r.members.contains_key(viewer) {
             return Response::err(id, NOT_MEMBER);
         }
-        if input
-            && r.members
-                .get(&me.key)
-                .and_then(|m| r.my_workspace_member(m))
-                .map(|m| m.key.as_str())
-                != Some(viewer)
-        {
+        if input && !crate::policy::my_workspace(r, &me.key, viewer, None) {
             return Response::err(id, UNSUPPORTED);
         }
     }
@@ -377,12 +371,7 @@ pub async fn accept(d: Arc<Daemon>, viewer: String, mut send: SendStream, mut re
         if !r.members.contains_key(&viewer) {
             return;
         }
-        let own = r
-            .members
-            .get(&me.key)
-            .and_then(|m| r.my_workspace_member(m))
-            .map(|m| &m.key)
-            == Some(&viewer);
+        let own = crate::policy::my_workspace(r, &me.key, &viewer, None);
         (r.same_person_computer(&me.key, &viewer), own)
     };
     let first = tokio::time::timeout(OPEN_WAIT, frames::read(&mut recv)).await;

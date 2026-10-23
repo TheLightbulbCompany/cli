@@ -155,8 +155,6 @@ pub struct Peers {
     pub disconnected: Notify,
     /// Woken (`notify_waiters`) whenever a member answers for mail sent it (`outbox::acked`).
     pub acked: Notify,
-    /// Envelopes whose sender waits to hear they were written (`send_written`), by id.
-    written: Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>,
     /// The endpoint's UDP port.
     pub port: OnceLock<u16>,
     /// The endpoint, for the candidate side of a join.
@@ -171,10 +169,13 @@ pub struct Peers {
     pub relay_changed: Notify,
 }
 
+/// A connection's outgoing frames, each with whoever waits to hear it was written.
+type Tx = mpsc::UnboundedSender<(Frame, Option<tokio::sync::oneshot::Sender<()>>)>;
+
 struct Link {
     conn: Connection,
     // ponytail: unbounded; only members get a queue, bound it if one shows up growing.
-    tx: mpsc::UnboundedSender<Frame>,
+    tx: Tx,
     /// The member key that dialed this connection.
     dialer: String,
     protocol: Protocol,
@@ -298,47 +299,23 @@ impl Peers {
 
     /// Queues `f` on `member`'s connection; fails when it has none.
     pub fn send(&self, member: &str, f: Frame) -> Result<()> {
-        match self.ok_link(member, |l| l.tx.send(f).is_ok()) {
+        match self.ok_link(member, |l| l.tx.send((f, None)).is_ok()) {
             Some(true) => Ok(()),
             Some(false) => Err("connection closed".into()),
             None => Err("not connected".into()),
         }
     }
 
-    /// `send` envelope `f`, and hear once it was written to the stream (`app_send`: mail is
-    /// marked read only then). `None` when it could not be queued. The caller drops the entry
-    /// (`unwritten`) if it gives up waiting.
+    /// `send` `f`, and hear once it was written to the stream (`app_send` marks mail read
+    /// only then); `None` when it could not be queued.
     pub(crate) fn send_written(
         &self,
         member: &str,
         f: Frame,
     ) -> Option<tokio::sync::oneshot::Receiver<()>> {
-        let Frame::Envelope { id, .. } = &f else {
-            return None;
-        };
-        let (id, (tx, rx)) = (id.clone(), tokio::sync::oneshot::channel());
-        self.written.lock().unwrap().insert(id.clone(), tx);
-        if self.send(member, f).is_err() {
-            self.unwritten(&id);
-            return None;
-        }
-        Some(rx)
-    }
-
-    /// Forgets `send_written`'s waiter for envelope `id`.
-    pub(crate) fn unwritten(&self, id: &str) {
-        self.written.lock().unwrap().remove(id);
-    }
-
-    /// Frame `f` was written: its `send_written` waiter hears it.
-    fn wrote(&self, f: &Frame) {
-        if let Frame::Envelope { id, kind, .. } = f {
-            if crate::app_send::is_app(kind) {
-                if let Some(tx) = self.written.lock().unwrap().remove(id) {
-                    let _ = tx.send(());
-                }
-            }
-        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let queued = self.ok_link(member, |l| l.tx.send((f, Some(tx))).is_ok());
+        queued.unwrap_or(false).then_some(rx)
     }
 
     /// Counts a dropped frame of `kind` (`status`'s `dropped`).
@@ -349,14 +326,7 @@ impl Peers {
     /// Takes `conn` (dialed by `dialer`) as `key`'s connection, unless the one held wins: of
     /// two connections, the one the lower member key dialed; of two dialed by the same side,
     /// the newer. The loser is closed.
-    fn adopt(
-        &self,
-        key: &str,
-        me: &str,
-        conn: &Connection,
-        dialer: &str,
-        tx: &mpsc::UnboundedSender<Frame>,
-    ) -> bool {
+    fn adopt(&self, key: &str, me: &str, conn: &Connection, dialer: &str, tx: &Tx) -> bool {
         let lower = key.min(me);
         let mut live = self.live.lock().unwrap();
         if let Some(old) = live.get(key) {
@@ -654,7 +624,7 @@ impl Net {
                     continue;
                 };
                 push_delta(&l.tx, r, heads, &mut memo, true);
-                let _ = l.tx.send(hello(r, protocol));
+                let _ = l.tx.send((hello(r, protocol), None));
                 // After the push the peer holds all of ours: the next change sends only itself.
                 l.protocol = Protocol::Ok(r.heads.clone());
             }
@@ -707,7 +677,7 @@ impl Net {
                 }
                 if d.peers.adopt(&key, me, &conn, dialer, &tx) {
                     // The first frame, written once the stream is open.
-                    let _ = tx.send(hello(&team.roster, d.peers.knobs().protocol));
+                    let _ = tx.send((hello(&team.roster, d.peers.knobs().protocol), None));
                     None
                 } else {
                     Some((SUPERSEDED, b"superseded"))
@@ -729,11 +699,13 @@ impl Net {
         if let Ok((mut send, mut recv)) = streams {
             eprintln!("net: connected {}", short(&key));
             let writer = async {
-                while let Some(f) = rx.recv().await {
+                while let Some((f, done)) = rx.recv().await {
                     if frames::write(&mut send, &f).await.is_err() {
                         return;
                     }
-                    d.peers.wrote(&f);
+                    if let Some(done) = done {
+                        let _ = done.send(());
+                    }
                 }
             };
             let reader = async {
@@ -781,7 +753,7 @@ impl Net {
         conn: &Connection,
         f: Frame,
         sync: &mut Incoming,
-        tx: &mpsc::UnboundedSender<Frame>,
+        tx: &Tx,
     ) -> bool {
         let d = &self.0.daemon;
         let team = d.team.lock().unwrap();
@@ -851,7 +823,7 @@ impl Net {
         if hello_ok {
             let (d, tx) = (d.clone(), tx.clone());
             tokio::task::spawn_blocking(move || {
-                let _ = tx.send(crate::presence::for_hello(&d));
+                let _ = tx.send((crate::presence::for_hello(&d), None));
             });
         }
         if let Some(p) = presence.filter(|_| d.peers.speaks_ours(key, conn)) {
@@ -900,7 +872,7 @@ impl Net {
 /// Member `key`'s envelope: checked and stored (`mail::receive`), answered with an `ack`.
 /// One whose `from` is not the member's own is dropped unanswered.
 /// The `app_*` kinds go to `app_send` instead: no mailbox, hold, hop count or `ack`.
-fn receive(d: &Arc<Daemon>, key: &str, env: &Frame, tx: &mpsc::UnboundedSender<Frame>) {
+fn receive(d: &Arc<Daemon>, key: &str, env: &Frame, tx: &Tx) {
     let Frame::Envelope { id, to, kind, .. } = env else {
         return;
     };
@@ -913,12 +885,13 @@ fn receive(d: &Arc<Daemon>, key: &str, env: &Frame, tx: &mpsc::UnboundedSender<F
     };
     let short = &peer.short;
     let ack = |state: State, reason: Option<String>, limit: Option<String>| {
-        let _ = tx.send(Frame::Ack {
+        let ack = Frame::Ack {
             id: id.clone(),
             state: state.name().into(),
             reason,
             limit,
-        });
+        };
+        let _ = tx.send((ack, None));
     };
     // An instance's sessions are the ones it declared: new mail for any other is refused.
     let declared = d.cloud.as_ref().map(|c| c.declared().ids);
@@ -1051,7 +1024,7 @@ fn hello(r: &Roster, protocol: u32) -> Frame {
 /// Queues on `tx` the `roster` pages of what `heads` lacks (`memo` keeps them by heads); with
 /// `quiet`, nothing when that is nothing.
 fn push_delta(
-    tx: &mpsc::UnboundedSender<Frame>,
+    tx: &Tx,
     r: &Roster,
     heads: &[String],
     memo: &mut HashMap<Vec<String>, Vec<Frame>>,
@@ -1066,7 +1039,7 @@ fn push_delta(
         }
     });
     for f in frames.iter() {
-        let _ = tx.send(f.clone());
+        let _ = tx.send((f.clone(), None));
     }
 }
 

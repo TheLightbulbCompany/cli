@@ -84,19 +84,20 @@ impl Policy {
     }
 }
 
-/// Whether `from` is the cloud member of my (member `me`'s) own workspace.
-pub fn my_workspace(roster: &Roster, me: &str, from: &Member) -> bool {
-    roster
-        .members
-        .get(me)
-        .and_then(|m| roster.my_workspace_member(m))
-        .is_some_and(|w| w.key == from.key)
+/// Whether member key `from` is the cloud member, in force, of my (member `me`'s) own
+/// workspace (`Roster::my_workspace_member`), and, with `for_person`, that is my person: the
+/// one check behind the switch, input grants and app sends.
+pub fn my_workspace(roster: &Roster, me: &str, from: &str, for_person: Option<&str>) -> bool {
+    roster.members.get(me).is_some_and(|m| {
+        for_person.is_none_or(|p| p == m.person_id)
+            && roster.my_workspace_member(m).is_some_and(|w| w.key == from)
+    })
 }
 
 /// `from`'s row, by its kind: my workspace's member is the switch, another cloud member
 /// `cloud_of[pid]`, a computer `people[pid]`.
 fn row<'a>(roster: &Roster, me: &str, from: &'a Member) -> (&'static str, &'a str) {
-    if my_workspace(roster, me, from) {
+    if my_workspace(roster, me, &from.key, None) {
         (SWITCH, "")
     } else if from.kind == MemberKind::Cloud {
         (CLOUD_OF, &from.person_id)

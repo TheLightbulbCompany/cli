@@ -181,6 +181,17 @@ pub const INBOX_RECORD: [&str; 11] = [
     "sent_at",
 ];
 
+/// `v` (an `inbox` record from `records`) cut to `INBOX_RECORD`.
+pub fn inbox_record(v: &Value) -> Value {
+    INBOX_RECORD
+        .iter()
+        .map(|k| (k.to_string(), v[k].clone()))
+        .collect()
+}
+
+/// The fields of a receipt (`finish`) an app's answer carries (`app_send`).
+pub const RECEIPT_FIELDS: [&str; 5] = ["state", "reason", "limit", "thread", "tier"];
+
 /// One op, from `caller`: every person-only op refuses without a person.
 pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: Caller) -> Response {
     let instance = caller == Caller::Instance;

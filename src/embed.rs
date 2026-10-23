@@ -230,9 +230,8 @@ pub(crate) fn take_read(d: &Daemon, key: &Key) -> Result<Vec<Value>> {
         m.iter().try_for_each(|m| mail::mark_read(&store, &m.id))?;
         m
     };
-    let records = ipc::records(d, &taken).into_iter().map(|v| {
-        let keys = ipc::INBOX_RECORD.iter();
-        keys.map(|k| (k.to_string(), v[k].clone())).collect()
-    });
-    Ok(records.collect())
+    Ok(ipc::records(d, &taken)
+        .iter()
+        .map(ipc::inbox_record)
+        .collect())
 }

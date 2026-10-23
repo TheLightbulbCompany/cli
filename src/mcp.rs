@@ -367,10 +367,7 @@ impl Server {
                     .map(|m| m.as_slice())
                     .unwrap_or_default()
                     .iter()
-                    .map(|m| {
-                        let keep = crate::daemon::ipc::INBOX_RECORD.iter();
-                        keep.map(|k| (k.to_string(), m[k].clone())).collect()
-                    })
+                    .map(crate::daemon::ipc::inbox_record)
                     .collect();
                 Self::done(&call, json!({ "messages": messages })).await
             }

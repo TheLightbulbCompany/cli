@@ -8,11 +8,10 @@
 
 mod common;
 
-use common::{admit, call, endpoint, identity, now_s, person_proof, until, Env, Peer};
+use common::{admit, call, endpoint, identity, now_s, online, person_proof, until, Env, Peer};
 use lightbulb_connect::embed::Instance;
-use lightbulb_connect::identity::{key_bytes, Identity};
+use lightbulb_connect::identity::Identity;
 use lightbulb_connect::net::frames::{self, Frame};
-use lightbulb_connect::net::ALPN;
 use lightbulb_connect::policy::{self, Verdict};
 use lightbulb_connect::roster::{self, Entry, Kind};
 use lightbulb_connect::store::Store;
@@ -136,16 +135,6 @@ impl World {
     fn w1_identity(&self) -> Identity {
         Identity::load_or_create(self.w1.path()).unwrap()
     }
-}
-
-async fn online(i: &Instance, n: u64) {
-    for _ in 0..500 {
-        if call(i, "status", json!({})).await["peers"]["online"] == n {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("{n} online");
 }
 
 async fn ok(i: &Instance, op: &str, body: Value) -> Value {
@@ -328,17 +317,7 @@ async fn second_computer_is_tried_when_the_first_does_not_answer() {
 /// `who` played by the test as a computer of `i`'s, with the newest presence, once `i` has
 /// `online` members online.
 async fn as_newest_computer(i: &Instance, who: &Identity, online_n: u64) -> (Peer, iroh::Endpoint) {
-    let me = ok(i, "identity.get", json!({})).await;
-    let port = ok(i, "status", json!({})).await["port"].as_u64().unwrap();
-    let key = me["member_key"].as_str().unwrap();
-    let key = iroh::PublicKey::from_bytes(&key_bytes(key).unwrap()).unwrap();
-    let addr =
-        iroh::EndpointAddr::new(key).with_ip_addr(format!("127.0.0.1:{port}").parse().unwrap());
-    let ep = endpoint(who).await;
-    let conn = ep.connect(addr, ALPN).await.unwrap();
-    let (send, recv) = conn.open_bi().await.unwrap();
-    let mut p = Peer { conn, send, recv };
-    p.hello(vec![]).await;
+    let (mut p, ep) = common::dial_instance(i, who).await;
     let seq = now_s() as u64 * 1000 + 3_600_000;
     p.send(&common::presence_with(&who.key, seq, vec![])).await;
     online(i, online_n).await;

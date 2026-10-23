@@ -312,6 +312,34 @@ pub async fn call(i: &lightbulb_connect::embed::Instance, op: &str, body: Value)
     i.call(req).await
 }
 
+/// Waits (up to 10 s) until instance `i` has `n` members online.
+pub async fn online(i: &lightbulb_connect::embed::Instance, n: u64) {
+    for _ in 0..500 {
+        if call(i, "status", json!({})).await["peers"]["online"] == n {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("{n} online");
+}
+
+/// `who` played by the test, dialing instance `i` on the member ALPN, `hello` sent.
+pub async fn dial_instance(
+    i: &lightbulb_connect::embed::Instance,
+    who: &Identity,
+) -> (Peer, Endpoint) {
+    let key = call(i, "identity.get", json!({})).await["member_key"].clone();
+    let port = call(i, "status", json!({})).await["port"].as_u64().unwrap();
+    let key = PublicKey::from_bytes(&identity::key_bytes(key.as_str().unwrap()).unwrap()).unwrap();
+    let addr = EndpointAddr::new(key).with_ip_addr(format!("127.0.0.1:{port}").parse().unwrap());
+    let ep = endpoint(who).await;
+    let conn = ep.connect(addr, ALPN).await.unwrap();
+    let (send, recv) = conn.open_bi().await.unwrap();
+    let mut p = Peer { conn, send, recv };
+    p.hello(vec![]).await;
+    (p, ep)
+}
+
 /// `<short>/codex:<conv>` on `e`.
 pub fn session(e: &Env, conv: &str) -> String {
     format!("{}/codex:{conv}", e.short())

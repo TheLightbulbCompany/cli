@@ -387,26 +387,12 @@ async fn seeded(snapshot: Option<&Path>) -> (tempfile::TempDir, Instance, [Playe
     }
     drop(store);
     let i = start(home.path(), &[], snapshot).await;
-    let port = ok(&i, "status", json!({})).await["port"].as_u64().unwrap();
-    let key = iroh::PublicKey::from_bytes(&key_bytes(&w.key).unwrap()).unwrap();
-    let addr =
-        iroh::EndpointAddr::new(key).with_ip_addr(format!("127.0.0.1:{port}").parse().unwrap());
     let mut out = vec![];
     for id in [ia, ib, ic] {
-        let ep = endpoint(&id).await;
-        let conn = ep.connect(addr.clone(), ALPN).await.unwrap();
-        let (send, recv) = conn.open_bi().await.unwrap();
-        let mut p = Peer { conn, send, recv };
-        p.hello(vec![]).await;
+        let (p, ep) = common::dial_instance(&i, &id).await;
         out.push((id, p, ep));
     }
-    for _ in 0..250 {
-        if ok(&i, "status", json!({})).await["peers"]["online"] == 3 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert_eq!(ok(&i, "status", json!({})).await["peers"]["online"], 3);
+    common::online(&i, 3).await;
     (home, i, out.try_into().ok().unwrap())
 }
 
