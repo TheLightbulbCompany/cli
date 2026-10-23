@@ -233,19 +233,36 @@ pub fn seed_pair(a: &Env, b: &Env) -> [Entry; 2] {
     seeded
 }
 
+/// `who` admitted by `by` after `parent` as `name` (its computer too), a computer member of
+/// its own person, with `extra`'s fields over those.
+pub fn admit(by: &Identity, parent: &Entry, who: &Identity, name: &str, extra: Value) -> Entry {
+    let mut body = json!({"member": who.key, "name": name, "computer": name,
+        "person_id": who.key, "kind": "computer", "role": "member"});
+    for (k, v) in extra.as_object().expect("an object") {
+        body[k] = v.clone();
+    }
+    Entry::signed(by, vec![parent.hash()], Kind::Admit, body, 2)
+}
+
+/// `<short>/codex:<conv>` on `e`.
+pub fn session(e: &Env, conv: &str) -> String {
+    format!("{}/codex:{conv}", e.short())
+}
+
+/// Unix seconds.
+pub fn now_s() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
 /// The same team in both stores before either daemon starts: `a` founds "acme" (computer
 /// "mac") and admits `b` as "bob" (computer "mbp"). Returns `[genesis, admit]`.
 pub fn seed_team(a: &Env, b: &Env) -> [Entry; 2] {
     let (ia, ib) = (a.identity(), b.identity());
     let g = net_ops::genesis(&ia, "prasiddha", "mac", "acme", 1);
-    let admit = Entry::signed(
-        &ia,
-        vec![g.hash()],
-        Kind::Admit,
-        json!({"member": ib.key, "name": "bob", "computer": "mbp", "person_id": ib.key,
-               "kind": "computer", "role": "member"}),
-        2,
-    );
+    let admit = admit(&ia, &g, &ib, "bob", json!({"computer": "mbp"}));
     for env in [a, b] {
         let store = env.store();
         roster::accept(&store, &g, 10).unwrap();

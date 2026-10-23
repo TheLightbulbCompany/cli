@@ -109,13 +109,14 @@ pub fn request(id: &Identity, t: &Ticket, name: &str, computer: &str, kind: &str
     )
 }
 
-fn signed(id: &Identity, f: Frame) -> Frame {
+/// `f` with its `sig`: `id`'s signature over it (`sig` left out).
+pub fn signed(id: &Identity, f: Frame) -> Frame {
     let mut v = serde_json::to_value(&f).expect("a frame serializes");
     v["sig"] = id.sign(&v).into();
     serde_json::from_value(v).expect("the same frame")
 }
 
-fn signed_by(key: &str, f: &Frame) -> bool {
+pub(crate) fn signed_by(key: &str, f: &Frame) -> bool {
     let v = serde_json::to_value(f).expect("a frame serializes");
     identity::verify(key, &v, v["sig"].as_str().unwrap_or_default())
 }

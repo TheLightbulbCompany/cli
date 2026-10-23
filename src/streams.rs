@@ -1,112 +1,159 @@
 //! Streams: a viewer watching a session's live bytes over its own bidirectional QUIC stream
-//! (not the control stream), opened by `Stream {grant_id, session, seq: 0, bytes: ""}` and
-//! echoed back by the owner when it accepts. The owner accepts the same person's computers
+//! (not the control stream), opened by `opener` and echoed back by the owner when it accepts;
+//! a refusal resets the stream with `REFUSED`. The owner accepts the same person's computers
 //! and the viewers a live `share_grant` it signed names; it drops every viewer→owner frame
 //! after the opener, except on an `input` grant to the person's own workspace member, where
-//! they become `stream_input` events. QUIC flow control is the backpressure. Logs carry ids
-//! and sizes, never the bytes.
+//! they become `stream_input` events. One task per stream writes and reads it; QUIC flow
+//! control is the backpressure. Logs carry ids and sizes, never the bytes.
 
+use crate::admission::{signed, signed_by};
 use crate::daemon::ipc::{self, refused, Response, BAD_REQUEST, NOT_FOUND, UNSUPPORTED};
 use crate::daemon::net_ops::{person_only, NOT_MEMBER};
 use crate::daemon::Daemon;
-use crate::identity::{self, Identity};
 use crate::net::frames::{self, Frame};
 use crate::net::short;
-use crate::roster::{Member, MemberKind};
+use crate::roster::Member;
 use crate::store::Store;
-use data_encoding::BASE64;
-use iroh::endpoint::{RecvStream, SendStream, VarInt};
-use rusqlite::params;
+use iroh::endpoint::{ReadError, RecvStream, SendStream, VarInt};
+use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::sync::{mpsc, oneshot};
+use tokio::time::Instant;
 
 pub const NO_GRANT: &str = "no_grant";
 pub const UNREACHABLE: &str = "unreachable";
 /// A grant ends at most this far ahead.
 pub const GRANT_MAX_S: i64 = 7 * 86_400;
+/// Clock skew allowed on an inbound grant's end, past `GRANT_MAX_S`.
+const SKEW_S: i64 = 300;
 /// An owner's chunk, decoded.
 pub const CHUNK_MAX: usize = 65_536;
 /// A viewer's input frame, decoded.
 pub const INPUT_MAX: usize = 4_096;
 /// How long either end waits for the other's opener.
 const OPEN_WAIT: Duration = Duration::from_secs(10);
-/// Clock skew allowed on an inbound grant's end, past `GRANT_MAX_S`.
-const SKEW_S: i64 = 300;
+/// The reset code of a refused stream (the viewer reads `no_grant`).
+pub const REFUSED: u32 = 1;
+/// The reset code of a stream past `ACCEPTS` (the viewer reads `unreachable`).
+pub const BUSY: u32 = 2;
+/// Streams one connection may have waiting for their opener (`net`).
+pub const ACCEPTS: usize = 8;
+/// Why a stream ended at its grant's end: its record stays, so the next send says `no_grant`.
+const ENDED: &str = "the grant ended";
 
-/// The open streams, and what was dropped.
+/// The open streams, and the viewer frames dropped.
 #[derive(Default)]
 pub struct Streams {
     open: Mutex<HashMap<String, Open>>,
-    /// Inbound grants that failed a check.
-    pub dropped_grants: AtomicU64,
     /// Viewer→owner frames not taken as input.
     pub dropped_input: AtomicU64,
 }
 
+/// What this end is to a stream.
+#[derive(Clone, Copy, PartialEq)]
+enum Role {
+    /// It owns the session and sends; `input` takes the viewer's frames; the stream ends at
+    /// `expires_at` (its grant's end; `None` for the same person).
+    Owner {
+        expires_at: Option<i64>,
+        input: bool,
+    },
+    /// It watches.
+    Viewer,
+}
+
+impl Role {
+    /// What `stream.send` may write, decoded.
+    fn cap(self) -> usize {
+        match self {
+            Role::Owner { .. } => CHUNK_MAX,
+            Role::Viewer => INPUT_MAX,
+        }
+    }
+
+    fn expired(self, now: i64) -> bool {
+        matches!(self, Role::Owner { expires_at: Some(e), .. } if e <= now)
+    }
+}
+
 struct Open {
-    grant_id: String,
     session: String,
     /// The member at the other end.
     peer: String,
-    /// This end owns the session (it sends; the other end watches).
-    owner: bool,
-    /// The grant's end (owner side, `None` for the same person).
-    expires_at: Option<i64>,
-    /// The stream's write half and the last `seq` written.
-    send: Arc<tokio::sync::Mutex<(SendStream, u32)>>,
-    /// The task reading the other end (`register` starts it).
-    reader: Option<tokio::task::AbortHandle>,
-    /// Set by `shut`: a send waiting on flow control gives up and resets the stream.
-    closed: tokio::sync::watch::Sender<bool>,
+    role: Role,
+    /// Chunks for the stream's task to write.
+    tx: mpsc::Sender<String>,
+    /// Dropped (with this `Open`) to close the stream, even mid-write.
+    _stop: oneshot::Sender<()>,
 }
 
-/// `f` (a `share_grant`) with its `sig` set: `id`'s signature over it without `t` or `sig`.
-pub fn signed(id: &Identity, mut f: Frame) -> Frame {
-    let s = id.sign(&signed_part(&f));
-    if let Frame::ShareGrant { sig, .. } = &mut f {
-        *sig = s;
+/// A stream's first frame, and the owner's echo of it.
+pub fn opener(grant_id: &str, session: &str) -> Frame {
+    Frame::Stream {
+        grant_id: grant_id.into(),
+        session: session.into(),
+        seq: 0,
+        bytes: String::new(),
     }
-    f
 }
 
-fn signed_part(f: &Frame) -> Value {
-    let mut v = serde_json::to_value(f).expect("a frame serializes");
-    if let Some(m) = v.as_object_mut() {
-        m.remove("t");
-    }
-    v
-}
-
-/// The inbound grant checks, all before storing: signed by `granter`, which is the peer, for
-/// a session under the peer's prefix, naming this computer (`me`) as the viewer, ending in
-/// the future and at most 7 days (and 5 minutes of clock skew) ahead.
-pub fn grant_ok(f: &Frame, peer: &Member, me: &str, now: i64) -> bool {
+/// Whether grant `f` names `session` (under the granter's prefix), `viewer` and `granter`:
+/// the check that fails, if one does.
+fn allows(f: &Frame, session: &str, viewer: &str, granter: &str) -> Result<(), &'static str> {
     let Frame::ShareGrant {
-        grant_id,
-        session,
-        viewer,
-        expires_at,
-        granter,
-        sig,
+        session: s,
+        viewer: v,
+        granter: g,
         ..
     } = f
     else {
-        return false;
+        return Err("not a grant");
     };
-    ulid::Ulid::from_string(grant_id).is_ok()
-        && *granter == peer.key
-        && identity::verify(granter, &signed_part(f), sig)
-        && frames::own(&peer.short, session)
-        && viewer == me
-        && *expires_at > now
-        && *expires_at <= now + GRANT_MAX_S + SKEW_S // the granter's clock may run ahead
+    if g != granter {
+        Err("granter")
+    } else if s != session || !frames::own(short(granter), session) {
+        Err("session")
+    } else if v != viewer {
+        Err("viewer")
+    } else {
+        Ok(())
+    }
 }
 
-/// Stores grant `f` (a first copy wins: a grant id is never overwritten).
-pub fn store(store: &Store, f: &Frame) -> crate::Result<()> {
+/// The inbound grant checks, all before storing: from the peer, for a session under its
+/// prefix, naming this computer (`me`), signed by the peer, ending in the future and at most
+/// 7 days (and 5 minutes of clock skew) ahead.
+pub fn grant_ok(f: &Frame, peer: &Member, me: &str, now: i64) -> Result<(), &'static str> {
+    let Frame::ShareGrant {
+        grant_id,
+        session,
+        expires_at,
+        ..
+    } = f
+    else {
+        return Err("not a grant");
+    };
+    if ulid::Ulid::from_string(grant_id).is_err() {
+        return Err("grant_id");
+    }
+    allows(f, session, me, &peer.key)?;
+    if !signed_by(&peer.key, f) {
+        return Err("sig");
+    }
+    // The granter's clock may run ahead.
+    if *expires_at <= now || *expires_at > now + GRANT_MAX_S + SKEW_S {
+        return Err("expires_at");
+    }
+    Ok(())
+}
+
+/// Stores grant `f` (a first copy wins: a grant id is never overwritten), pruning the
+/// expired ones.
+pub fn store(store: &Store, f: &Frame, now: i64) -> crate::Result<()> {
     let Frame::ShareGrant {
         grant_id,
         expires_at,
@@ -115,23 +162,55 @@ pub fn store(store: &Store, f: &Frame) -> crate::Result<()> {
     else {
         return Ok(());
     };
-    store.conn().execute(
+    let conn = store.conn();
+    conn.execute("DELETE FROM grants WHERE expires_at <= ?1", [now])?;
+    conn.execute(
         "INSERT OR IGNORE INTO grants (grant_id, \"grant\", expires_at) VALUES (?1, ?2, ?3)",
         params![grant_id, serde_json::to_string(f)?, expires_at],
     )?;
     Ok(())
 }
 
-/// The first live grant `pred` holds for; the expired ones are pruned first.
-// ponytail: a scan of every live grant; index by (session, viewer) if grants pile up.
-fn live(store: &Store, now: i64, pred: impl Fn(&Frame) -> bool) -> Option<Frame> {
-    let conn = store.conn();
-    let _ = conn.execute("DELETE FROM grants WHERE expires_at <= ?1", [now]);
-    let mut q = conn.prepare("SELECT \"grant\" FROM grants").ok()?;
-    let rows: Vec<String> = q.query_map([], |r| r.get(0)).ok()?.flatten().collect();
-    rows.iter()
-        .filter_map(|g| serde_json::from_str(g).ok())
-        .find(|f| pred(f))
+/// The live grant `grant_id`.
+fn by_id(store: &Store, grant_id: &str, now: i64) -> Option<Frame> {
+    let q = "SELECT \"grant\" FROM grants WHERE grant_id = ?1 AND expires_at > ?2";
+    let g: Option<String> = store
+        .conn()
+        .query_row(q, params![grant_id, now], |r| r.get(0))
+        .optional()
+        .ok()?;
+    serde_json::from_str(&g?).ok()
+}
+
+/// The id of a live grant `granter` gave `viewer` for `session`.
+fn grant_for(
+    store: &Store,
+    session: &str,
+    viewer: &str,
+    granter: &str,
+    now: i64,
+) -> Option<String> {
+    let q = "SELECT grant_id FROM grants WHERE expires_at > ?1
+        AND json_extract(\"grant\", '$.session') = ?2 AND json_extract(\"grant\", '$.viewer') = ?3
+        AND json_extract(\"grant\", '$.granter') = ?4";
+    store
+        .conn()
+        .query_row(q, params![now, session, viewer, granter], |r| r.get(0))
+        .optional()
+        .ok()?
+}
+
+/// The decoded length of base64 `s`, if it is base64 (alphabet and padding; no decode).
+fn decoded_len(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    let pad = b.iter().rev().take_while(|c| **c == b'=').count();
+    let body = &b[..b.len() - pad];
+    let ok = b.len().is_multiple_of(4)
+        && pad <= 2
+        && body
+            .iter()
+            .all(|c| c.is_ascii_alphanumeric() || *c == b'+' || *c == b'/');
+    ok.then(|| b.len() / 4 * 3 - pad)
 }
 
 fn event(d: &Daemon, v: Value) {
@@ -152,13 +231,8 @@ pub async fn handle(
         "stream.open" => open(id, body, d).await,
         "stream.send" => send(id, body, d).await,
         _ => match body["stream_id"].as_str() {
-            Some(sid) => match d.streams.take(sid) {
-                Some(o) => {
-                    shut(d, sid, o);
-                    Response::ok(id, json!({}))
-                }
-                None => Response::err(id, NOT_FOUND),
-            },
+            Some(sid) if d.streams.close(sid) => Response::ok(id, json!({})),
+            Some(_) => Response::err(id, NOT_FOUND),
             None => Response::err(id, BAD_REQUEST),
         },
     }
@@ -215,7 +289,7 @@ fn share(id: u64, body: &Value, d: &Daemon) -> Response {
     if d.peers.send(viewer, f.clone()).is_err() {
         return Response::err(id, UNREACHABLE);
     }
-    if let Err(e) = store(&d.store.lock().unwrap(), &f) {
+    if let Err(e) = store(&d.store.lock().unwrap(), &f, now) {
         eprintln!("streams: grant {grant_id}: {e}");
         return Response::err(id, ipc::INTERNAL);
     }
@@ -224,14 +298,14 @@ fn share(id: u64, body: &Value, d: &Daemon) -> Response {
 }
 
 /// `stream.open {session}` -> `{stream_id}` (viewer side): a stream to `session`'s member,
-/// on a stored live grant naming this computer, or as the same person's computer.
+/// on a stored live grant naming this computer, or as the same person's computer. A refusal
+/// is `no_grant`; no answer in 10 s, or a lost connection, `unreachable`.
 async fn open(id: u64, body: &Value, d: &Arc<Daemon>) -> Response {
     let Some(session) = body["session"].as_str() else {
         return Response::err(id, BAD_REQUEST);
     };
     let me = &d.identity.key;
-    let now = ipc::now() as i64;
-    let (owner, grant_id) = {
+    let (owner, same) = {
         let team = d.team.lock().unwrap();
         let r = &team.roster;
         let prefix = crate::sessions::member_of(session).unwrap_or("");
@@ -244,19 +318,14 @@ async fn open(id: u64, body: &Value, d: &Arc<Daemon>) -> Response {
         if o.key == *me {
             return Response::err(id, BAD_REQUEST);
         }
-        let same = r
-            .members
-            .get(me)
-            .is_some_and(|m| m.kind == MemberKind::Computer && m.person_id == o.person_id);
-        let grant = live(&d.store.lock().unwrap(), now, |f| {
-            matches!(f, Frame::ShareGrant { session: s, viewer, granter, .. }
-                if s == session && viewer == me && *granter == o.key)
-        });
-        match grant {
-            Some(Frame::ShareGrant { grant_id, .. }) => (o.key.clone(), grant_id),
-            _ if same => (o.key.clone(), String::new()),
-            _ => return Response::err(id, NO_GRANT),
-        }
+        (o.key.clone(), r.same_person_computer(&o.key, me))
+    };
+    let now = ipc::now() as i64;
+    let grant = grant_for(&d.store.lock().unwrap(), session, me, &owner, now);
+    let grant_id = match grant {
+        Some(g) => g,
+        None if same => String::new(),
+        None => return Response::err(id, NO_GRANT),
     };
     let Some(conn) = d.peers.conn(&owner) else {
         return Response::err(id, UNREACHABLE);
@@ -264,39 +333,43 @@ async fn open(id: u64, body: &Value, d: &Arc<Daemon>) -> Response {
     let Ok((mut send, mut recv)) = conn.open_bi().await else {
         return Response::err(id, UNREACHABLE);
     };
-    let opener = Frame::Stream {
-        grant_id: grant_id.clone(),
-        session: session.into(),
-        seq: 0,
-        bytes: String::new(),
-    };
-    if frames::write(&mut send, &opener).await.is_err() {
+    if frames::write(&mut send, &opener(&grant_id, session))
+        .await
+        .is_err()
+    {
         return Response::err(id, UNREACHABLE);
     }
-    // The owner echoes the opener when it accepts, and drops the stream when it does not.
     match tokio::time::timeout(OPEN_WAIT, frames::read(&mut recv)).await {
         Ok(Ok(Frame::Stream { seq: 0, .. })) => {}
-        // Connected but silent: not a refusal.
-        Err(_) => return Response::err(id, UNREACHABLE),
-        Ok(_) => return Response::err(id, NO_GRANT),
+        Ok(Err(e)) if reset_code(&*e) == Some(REFUSED) => return Response::err(id, NO_GRANT),
+        _ => return Response::err(id, UNREACHABLE),
     }
-    let o = Open {
-        grant_id,
-        session: session.into(),
-        peer: owner,
-        owner: false,
-        expires_at: None,
-        send: Arc::new(tokio::sync::Mutex::new((send, 0))),
-        reader: None,
-        closed: Default::default(),
-    };
-    let sid = register(d, o, recv, false);
+    let sid = register(d, session, &owner, Role::Viewer, &grant_id, (send, recv));
     Response::ok(id, json!({ "stream_id": sid }))
 }
 
+/// The code a read error carries when the other end reset the stream.
+fn reset_code(e: &(dyn std::error::Error + 'static)) -> Option<u32> {
+    let io = e.downcast_ref::<std::io::Error>()?;
+    match io.get_ref()?.downcast_ref::<ReadError>()? {
+        ReadError::Reset(code) => u32::try_from(code.into_inner()).ok(),
+        _ => None,
+    }
+}
+
 /// A stream `viewer` opened to this computer (`net` hands over every stream after the
-/// control one): accepted or dropped, by the rule at the top.
+/// control one): accepted or refused, by the rule at the top.
 pub async fn accept(d: Arc<Daemon>, viewer: String, mut send: SendStream, mut recv: RecvStream) {
+    let me = &d.identity;
+    let (same, own) = {
+        let team = d.team.lock().unwrap();
+        let r = &team.roster;
+        if !r.members.contains_key(&viewer) {
+            return;
+        }
+        let own = r.my_workspace_member(&me.key).map(|m| &m.key) == Some(&viewer);
+        (r.same_person_computer(&me.key, &viewer), own)
+    };
     let first = tokio::time::timeout(OPEN_WAIT, frames::read(&mut recv)).await;
     let Ok(Ok(Frame::Stream {
         grant_id,
@@ -311,63 +384,44 @@ pub async fn accept(d: Arc<Daemon>, viewer: String, mut send: SendStream, mut re
         );
         return;
     };
-    let me = &d.identity;
     let now = ipc::now() as i64;
-    let decision = {
-        let team = d.team.lock().unwrap();
-        let r = &team.roster;
-        let mine = r.members.get(&me.key);
-        match r.members.get(&viewer) {
-            _ if !frames::own(&me.short, &session) => None,
-            None => None,
-            Some(v)
-                if v.kind == MemberKind::Computer
-                    && mine.is_some_and(|m| m.person_id == v.person_id) =>
-            {
-                Some((None, false))
-            }
-            Some(_) => live(&d.store.lock().unwrap(), now, |f| {
-                matches!(f, Frame::ShareGrant { grant_id: g, session: s, viewer: v, granter, .. }
-                    if *g == grant_id && *s == session && *v == viewer && *granter == me.key)
+    let granted = || match by_id(&d.store.lock().unwrap(), &grant_id, now)? {
+        g @ Frame::ShareGrant {
+            input, expires_at, ..
+        } => {
+            allows(&g, &session, &viewer, &me.key).ok()?;
+            Some(Role::Owner {
+                expires_at: Some(expires_at),
+                input: input && own,
             })
-            .and_then(|f| match f {
-                Frame::ShareGrant {
-                    input, expires_at, ..
-                } => {
-                    let own = r.my_workspace_member(&me.key).map(|m| &m.key) == Some(&viewer);
-                    Some((Some(expires_at), input && own))
-                }
-                _ => None,
-            }),
         }
+        _ => None,
     };
-    let Some((expires_at, input)) = decision else {
+    let role = if !frames::own(&me.short, &session) {
+        None
+    } else if same {
+        Some(Role::Owner {
+            expires_at: None,
+            input: false,
+        })
+    } else {
+        granted()
+    };
+    let Some(role) = role else {
+        let _ = send.reset(VarInt::from_u32(REFUSED));
         eprintln!(
             "streams: refused a stream from {} ({NO_GRANT})",
             short(&viewer)
         );
-        return; // dropping the stream tells the viewer
+        return;
     };
-    let echo = Frame::Stream {
-        grant_id: grant_id.clone(),
-        session: session.clone(),
-        seq: 0,
-        bytes: String::new(),
-    };
-    if frames::write(&mut send, &echo).await.is_err() {
+    if frames::write(&mut send, &opener(&grant_id, &session))
+        .await
+        .is_err()
+    {
         return;
     }
-    let o = Open {
-        grant_id,
-        session: session.clone(),
-        peer: viewer.clone(),
-        owner: true,
-        expires_at,
-        send: Arc::new(tokio::sync::Mutex::new((send, 0))),
-        reader: None,
-        closed: Default::default(),
-    };
-    let sid = register(&d, o, recv, input);
+    let sid = register(&d, &session, &viewer, role, &grant_id, (send, recv));
     eprintln!("streams: {sid} opened to {}", short(&viewer));
     event(
         &d,
@@ -375,157 +429,177 @@ pub async fn accept(d: Arc<Daemon>, viewer: String, mut send: SendStream, mut re
     );
 }
 
-/// Keeps `o` under a new stream id, closing the one it replaces (one per session and
-/// viewer), and starts reading the other end.
-fn register(d: &Arc<Daemon>, mut o: Open, recv: RecvStream, input: bool) -> String {
+/// Keeps the stream under a new id, closing the one it replaces (one per session and viewer),
+/// and starts its task.
+fn register(
+    d: &Arc<Daemon>,
+    session: &str,
+    peer: &str,
+    role: Role,
+    grant_id: &str,
+    halves: (SendStream, RecvStream),
+) -> String {
     let sid = ulid::Ulid::generate().to_string();
+    let (tx, rx) = mpsc::channel(1);
+    let (stop, stopped) = oneshot::channel();
+    let viewer = role == Role::Viewer;
     let mut open = d.streams.open.lock().unwrap();
-    let old: Vec<String> = open
-        .iter()
-        .filter(|(_, x)| x.session == o.session && x.peer == o.peer && x.owner == o.owner)
-        .map(|(k, _)| k.clone())
-        .collect();
-    for k in old {
-        if let Some(x) = open.remove(&k) {
-            shut(d, &k, x);
-        }
-    }
-    let reader = pump(d.clone(), sid.clone(), recv, o.owner, input, o.expires_at);
-    o.reader = Some(tokio::spawn(reader).abort_handle());
+    // Dropping the one it replaces closes it.
+    // ponytail: a scan of every open stream per open; key by (session, peer) if they pile up.
+    open.retain(|_, o| {
+        !(o.session == session && o.peer == peer && (o.role == Role::Viewer) == viewer)
+    });
+    let o = Open {
+        session: session.into(),
+        peer: peer.into(),
+        role,
+        tx,
+        _stop: stop,
+    };
     open.insert(sid.clone(), o);
+    let ends = (grant_id.to_string(), session.to_string());
+    tokio::spawn(run(d.clone(), sid.clone(), role, ends, halves, rx, stopped));
     sid
 }
 
-/// Reads the other end until it closes: on the viewer side the owner's chunks become
-/// `stream` events; on the owner side the viewer's frames become `stream_input` on an input
-/// grant, and are dropped (and counted) otherwise; a frame past the grant's end closes it.
-async fn pump(
+/// One stream's task: writes the chunks `stream.send` queues (`seq` from 1, at QUIC's pace)
+/// and reads the other end, until a close (the `Open` dropped: finished, or reset mid-write),
+/// the grant's end, or the other end goes. Then it says `stream_closed`.
+async fn run(
     d: Arc<Daemon>,
     sid: String,
-    mut recv: RecvStream,
-    owner: bool,
-    input: bool,
-    expires_at: Option<i64>,
+    role: Role,
+    (grant_id, session): (String, String),
+    (mut send, mut recv): (SendStream, RecvStream),
+    mut rx: mpsc::Receiver<String>,
+    mut stop: oneshot::Receiver<()>,
 ) {
-    while let Ok(f) = frames::read(&mut recv).await {
-        if owner && expires_at.is_some_and(|e| e <= ipc::now() as i64) {
-            eprintln!("streams: {sid}: the grant ended");
-            break;
+    let end = match role {
+        Role::Owner {
+            expires_at: Some(e),
+            ..
+        } => Some(Instant::now() + Duration::from_secs((e - ipc::now() as i64).max(0) as u64)),
+        _ => None,
+    };
+    let ended = async move {
+        match end {
+            Some(t) => tokio::time::sleep_until(t).await,
+            None => std::future::pending().await,
         }
-        let Frame::Stream { seq, bytes, .. } = f else {
-            if owner {
-                d.streams.dropped_input.fetch_add(1, Ordering::Relaxed);
-                eprintln!("streams: {sid}: dropped a {} frame", f.kind());
+    };
+    tokio::pin!(ended);
+    let writer = async {
+        let mut seq = 0;
+        loop {
+            tokio::select! {
+                _ = &mut stop => break "closed",
+                _ = &mut ended => break ENDED,
+                chunk = rx.recv() => {
+                    let Some(bytes) = chunk else { break "closed" };
+                    seq += 1;
+                    let f = Frame::Stream {
+                        grant_id: grant_id.clone(),
+                        session: session.clone(),
+                        seq,
+                        bytes,
+                    };
+                    tokio::select! {
+                        r = frames::write(&mut send, &f) => if r.is_err() { break "the other end went" },
+                        _ = &mut stop => {
+                            let _ = send.reset(VarInt::from_u32(0));
+                            break "closed";
+                        }
+                        _ = &mut ended => {
+                            let _ = send.reset(VarInt::from_u32(0));
+                            break ENDED;
+                        }
+                    }
+                }
             }
-            continue;
-        };
-        let size = BASE64.decode(bytes.as_bytes()).map(|b| b.len());
-        if !owner {
-            if size.is_ok_and(|n| n <= CHUNK_MAX) {
-                event(
-                    &d,
-                    json!({"event": "stream", "stream_id": sid, "seq": seq, "data_b64": bytes}),
-                );
-            }
-        } else if input && size.is_ok_and(|n| n <= INPUT_MAX) {
-            event(
-                &d,
-                json!({"event": "stream_input", "stream_id": sid, "seq": seq, "data_b64": bytes}),
-            );
-        } else {
-            d.streams.dropped_input.fetch_add(1, Ordering::Relaxed);
-            eprintln!(
-                "streams: {sid}: dropped a viewer frame ({} bytes)",
-                bytes.len()
-            );
         }
+    };
+    let reader = async {
+        while let Ok(f) = frames::read(&mut recv).await {
+            on_frame(&d, &sid, role, f);
+        }
+        "the other end went"
+    };
+    let why = tokio::select! {
+        w = writer => w,
+        r = reader => r,
+    };
+    let _ = send.finish();
+    if why != ENDED {
+        d.streams.close(&sid);
     }
-    if let Some(mut o) = d.streams.take(&sid) {
-        o.reader = None; // this task
-        shut(&d, &sid, o);
-    }
+    eprintln!("streams: {sid} closed ({why})");
+    event(&d, json!({"event": "stream_closed", "stream_id": sid}));
 }
 
-/// Closes `o` (its stream finished, its reader stopped) and says so. A send in flight holds
-/// the write half: told by `closed`, it gives up and resets the stream.
-fn shut(d: &Daemon, sid: &str, o: Open) {
-    if let Some(r) = o.reader {
-        r.abort();
+/// A frame from the other end: the owner's chunk becomes `stream` on the viewer side; on
+/// the owner side the viewer's becomes `stream_input` on an input grant, and anything else
+/// is dropped and counted.
+fn on_frame(d: &Daemon, sid: &str, role: Role, f: Frame) {
+    let (name, cap) = match role {
+        Role::Viewer => (Some("stream"), CHUNK_MAX),
+        Role::Owner { input: true, .. } => (Some("stream_input"), INPUT_MAX),
+        Role::Owner { .. } => (None, 0),
+    };
+    match f {
+        Frame::Stream { seq, bytes, .. }
+            if name.is_some() && decoded_len(&bytes).is_some_and(|n| n <= cap) =>
+        {
+            event(
+                d,
+                json!({"event": name, "stream_id": sid, "seq": seq, "data_b64": bytes}),
+            );
+        }
+        _ if role != Role::Viewer => {
+            d.streams.dropped_input.fetch_add(1, Ordering::Relaxed);
+            eprintln!("streams: {sid}: dropped a viewer {} frame", f.kind());
+        }
+        _ => {}
     }
-    o.closed.send_replace(true);
-    if let Ok(mut s) = o.send.try_lock() {
-        let _ = s.0.finish();
-    }
-    eprintln!("streams: {sid} closed");
-    event(d, json!({"event": "stream_closed", "stream_id": sid}));
 }
 
 impl Streams {
-    fn take(&self, sid: &str) -> Option<Open> {
-        self.open.lock().unwrap().remove(sid)
+    /// Closes stream `sid` (its task finishes, or resets, it and says so); `false` if none.
+    pub fn close(&self, sid: &str) -> bool {
+        self.open.lock().unwrap().remove(sid).is_some()
     }
 }
 
-/// `stream.send {stream_id, data_b64}` -> `{seq}`: a chunk on an open stream, at most 64 KB
-/// decoded from the owner and 4 KB from a viewer. Past its grant's end the owner's stream is
-/// closed instead (`no_grant`).
+/// `stream.send {stream_id, data_b64}` -> `{}`: a chunk on an open stream, at most 64 KB
+/// decoded from the owner and 4 KB from a viewer, written in order by the stream's task;
+/// this waits while the stream is behind. On a stream its grant's end closed, `no_grant`.
 async fn send(id: u64, body: &Value, d: &Arc<Daemon>) -> Response {
     let (Some(sid), Some(data)) = (body["stream_id"].as_str(), body["data_b64"].as_str()) else {
         return Response::err(id, BAD_REQUEST);
     };
-    let Ok(bytes) = BASE64.decode(data.as_bytes()) else {
+    let Some(n) = decoded_len(data) else {
         return Response::err(id, BAD_REQUEST);
     };
-    let now = ipc::now() as i64;
-    let (half, grant_id, session, cap, expired, mut closed) = {
-        let open = d.streams.open.lock().unwrap();
-        let Some(o) = open.get(sid) else {
-            return Response::err(id, NOT_FOUND);
-        };
-        let cap = if o.owner { CHUNK_MAX } else { INPUT_MAX };
-        let expired = o.expires_at.is_some_and(|e| e <= now);
-        let (g, s) = (o.grant_id.clone(), o.session.clone());
-        (o.send.clone(), g, s, cap, expired, o.closed.subscribe())
+    let found = d
+        .streams
+        .open
+        .lock()
+        .unwrap()
+        .get(sid)
+        .map(|o| (o.tx.clone(), o.role));
+    let Some((tx, role)) = found else {
+        return Response::err(id, NOT_FOUND);
     };
-    if bytes.len() > cap {
+    if n > role.cap() {
         return Response::err(id, BAD_REQUEST);
     }
-    if expired {
-        if let Some(o) = d.streams.take(sid) {
-            shut(d, sid, o);
-        }
-        return Response::err(id, NO_GRANT);
+    if tx.send(data.into()).await.is_ok() {
+        return Response::ok(id, json!({}));
     }
-    let write = async {
-        let mut s = half.lock().await;
-        s.1 += 1;
-        let f = Frame::Stream {
-            grant_id,
-            session,
-            seq: s.1,
-            bytes: data.into(),
-        };
-        // QUIC flow control: this waits while the other end is behind.
-        frames::write(&mut s.0, &f).await.map(|()| s.1)
+    d.streams.close(sid);
+    let code = if role.expired(ipc::now() as i64) {
+        NO_GRANT
+    } else {
+        NOT_FOUND
     };
-    let sent = tokio::select! {
-        r = write => Some(r),
-        _ = closed.wait_for(|c| *c) => None,
-    };
-    match sent {
-        Some(Ok(seq)) => Response::ok(id, json!({ "seq": seq })),
-        Some(Err(_)) => {
-            if let Some(o) = d.streams.take(sid) {
-                shut(d, sid, o);
-            }
-            Response::err(id, UNREACHABLE)
-        }
-        // Closed while waiting: the half-written stream is reset, not finished.
-        None => {
-            if let Ok(mut s) = half.try_lock() {
-                let _ = s.0.reset(VarInt::from_u32(0));
-            }
-            Response::err(id, NOT_FOUND)
-        }
-    }
+    Response::err(id, code)
 }

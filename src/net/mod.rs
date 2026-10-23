@@ -26,7 +26,6 @@ use iroh::{Endpoint, EndpointAddr, PublicKey, SecretKey};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, Notify};
@@ -139,6 +138,8 @@ pub struct Peers {
     pub port: OnceLock<u16>,
     /// The endpoint, for the candidate side of a join.
     pub endpoint: OnceLock<Endpoint>,
+    /// Frames dropped by `frames::from_peer_ok`, by kind.
+    pub dropped: Mutex<std::collections::BTreeMap<&'static str, u64>>,
 }
 
 struct Link {
@@ -198,23 +199,31 @@ impl Peers {
         (online, outdated)
     }
 
-    /// `member`'s connection, once it said `hello` in our protocol (`streams` opens on it).
-    pub fn conn(&self, member: &str) -> Option<Connection> {
+    /// `f` on `member`'s link, once it said `hello` in our protocol.
+    fn ok_link<R>(&self, member: &str, f: impl FnOnce(&Link) -> R) -> Option<R> {
         let live = self.live.lock().unwrap();
         live.get(member)
             .filter(|l| matches!(l.protocol, Protocol::Ok(_)))
-            .map(|l| l.conn.clone())
+            .map(f)
+    }
+
+    /// `member`'s connection (`streams` opens on it).
+    pub fn conn(&self, member: &str) -> Option<Connection> {
+        self.ok_link(member, |l| l.conn.clone())
     }
 
     /// Queues `f` on `member`'s connection; fails when it has none.
     pub fn send(&self, member: &str, f: Frame) -> Result<()> {
-        let live = self.live.lock().unwrap();
-        match live.get(member) {
-            Some(l) if matches!(l.protocol, Protocol::Ok(_)) => {
-                l.tx.send(f).map_err(|_| "connection closed".into())
-            }
-            _ => Err("not connected".into()),
+        match self.ok_link(member, |l| l.tx.send(f).is_ok()) {
+            Some(true) => Ok(()),
+            Some(false) => Err("connection closed".into()),
+            None => Err("not connected".into()),
         }
+    }
+
+    /// Counts a dropped frame of `kind` (`status`'s `dropped`).
+    fn dropped(&self, kind: &'static str) {
+        *self.dropped.lock().unwrap().entry(kind).or_default() += 1;
     }
 
     /// Takes `conn` (dialed by `dialer`) as `key`'s connection, unless the one held wins: of
@@ -525,10 +534,20 @@ impl Net {
                     }
                 }
             };
-            // Every stream after the control one is a viewer's (`streams`).
+            // Every stream after the control one is a viewer's (`streams`); at most
+            // `streams::ACCEPTS` wait for their opener at once, the rest are reset.
+            let accepts = Arc::new(tokio::sync::Semaphore::new(crate::streams::ACCEPTS));
             let viewers = async {
-                while let Ok((s, r)) = conn.accept_bi().await {
-                    tokio::spawn(crate::streams::accept(d.clone(), key.clone(), s, r));
+                while let Ok((mut s, r)) = conn.accept_bi().await {
+                    let Ok(permit) = accepts.clone().try_acquire_owned() else {
+                        let _ = s.reset(VarInt::from_u32(crate::streams::BUSY));
+                        continue;
+                    };
+                    let (d, key) = (d.clone(), key.clone());
+                    tokio::spawn(async move {
+                        crate::streams::accept(d, key, s, r).await;
+                        drop(permit);
+                    });
                 }
             };
             tokio::select! {
@@ -561,11 +580,9 @@ impl Net {
         let mut synced = false;
         let mut hello_ok = false;
         let (mut presence, mut envelope, mut answer, mut grant) = (None, None, None, None);
-        if !frames::from_peer_ok(&f, peer, d) {
-            if matches!(f, Frame::ShareGrant { .. }) {
-                d.streams.dropped_grants.fetch_add(1, Ordering::Relaxed);
-            }
-            eprintln!("net: dropped a {} frame from {short}", f.kind());
+        if let Err(why) = frames::from_peer_ok(&f, peer, d) {
+            d.peers.dropped(f.kind());
+            eprintln!("net: dropped a {} frame from {short} ({why})", f.kind());
         } else if let Frame::Hello { protocol: p, heads } = f {
             // ponytail: a hello costs O(log) under `team`, and a member may send them back to
             // back; rate-limit per connection if one does.
@@ -618,7 +635,7 @@ impl Net {
             receive(d, key, &env, tx);
         }
         if let Some(g) = grant.filter(|_| d.peers.speaks_ours(key, conn)) {
-            if let Err(e) = crate::streams::store(&d.store.lock().unwrap(), &g) {
+            if let Err(e) = crate::streams::store(&d.store.lock().unwrap(), &g, ipc::now() as i64) {
                 eprintln!("net: a share_grant from {short}: {e}");
             }
         }

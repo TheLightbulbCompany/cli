@@ -5,21 +5,17 @@
 use lightbulb_connect::identity::Identity;
 use lightbulb_connect::net::frames::Frame;
 use lightbulb_connect::policy;
-use lightbulb_connect::roster::{self, Entry, Kind};
+use lightbulb_connect::roster::{self, Entry};
 use serde_json::json;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod common;
 
 use common::{
-    endpoint, err, identity, out, pair, peers, person, remote, seed_pair, sees, ulid, until,
+    endpoint, err, identity, out, pair, peers, person, remote, seed_pair, sees, session, ulid,
+    until,
 };
 use common::{Env, Peer, EXE};
-
-/// `<short>/codex:<conv>` on `e`.
-fn session(e: &Env, conv: &str) -> String {
-    format!("{}/codex:{conv}", e.short())
-}
 
 fn wait_state(e: &Env, from: &str, rid: &str, want: &str) {
     until(10, &format!("{rid} reads {want}"), || {
@@ -31,14 +27,13 @@ fn wait_state(e: &Env, from: &str, rid: &str, want: &str) {
 /// `cloud`) a cloud member of workspace `ws:<key>` with an opaque proof, signed by the founder
 /// `founder`; `e` already allows carol's mail (`people` or `cloud_of` accept).
 fn admit(e: &Env, founder: &Identity, parent: &Entry, who: &Identity, cloud: bool) -> Entry {
-    let mut body = json!({"member": who.key, "name": "carol", "computer": "cmac",
-        "person_id": who.key, "kind": "computer", "role": "member"});
+    let mut extra = json!({"computer": "cmac"});
     if cloud {
-        body["kind"] = json!("cloud");
-        body["proof"] = json!("p");
-        body["person_id"] = json!(format!("ws:{}", who.key));
+        extra["kind"] = json!("cloud");
+        extra["proof"] = json!("p");
+        extra["person_id"] = json!(format!("ws:{}", who.key));
     }
-    let entry = Entry::signed(founder, vec![parent.hash()], Kind::Admit, body, 3);
+    let entry = common::admit(founder, parent, who, "carol", extra);
     let store = e.store();
     assert!(roster::accept(&store, &entry, 10).unwrap());
     let r = roster::replay(&roster::entries(&store).unwrap());

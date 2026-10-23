@@ -4,30 +4,26 @@
 
 use iroh::endpoint::{RecvStream, SendStream};
 use iroh::Endpoint;
+use lightbulb_connect::admission::signed;
 use lightbulb_connect::daemon::net_ops;
 use lightbulb_connect::identity::Identity;
 use lightbulb_connect::net::frames::{self, Frame};
-use lightbulb_connect::roster::{self, Entry, Kind};
+use lightbulb_connect::roster::{self, Entry};
 use lightbulb_connect::streams;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 mod common;
 
-use common::{endpoint, identity, pair, peers, person, start_pair, ulid, until, Env, Peer};
+use common::{admit, endpoint, identity, now_s as now, pair, peers, person, session};
+use common::{start_pair, ulid, until, Env, Peer};
 
-fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64
-}
-
-fn session(e: &Env) -> String {
-    format!("{}/codex:c1", e.short())
+/// The session every test streams: `c1` on `e`.
+fn c1(e: &Env) -> String {
+    session(e, "c1")
 }
 
 fn b64(s: &[u8]) -> String {
@@ -74,8 +70,8 @@ impl Sub {
 
     /// Whether an `event` arrives within `ms`.
     fn any(&self, event: &str, ms: u64) -> bool {
-        let deadline = std::time::Instant::now() + Duration::from_millis(ms);
-        while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
+        let deadline = Instant::now() + Duration::from_millis(ms);
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
             match self.0.recv_timeout(left) {
                 Ok(v) if v["event"] == event => return true,
                 Ok(_) => {}
@@ -109,17 +105,8 @@ fn send(e: &Env, stream_id: &str, data: &[u8]) -> Value {
 }
 
 fn dropped(e: &Env, what: &str) -> u64 {
-    e.status()["dropped"][what].as_u64().unwrap()
-}
-
-/// `who` admitted by `by` under `parent`, with `body`'s fields over a computer member's.
-fn admit(by: &Identity, parent: &Entry, who: &Identity, name: &str, extra: Value) -> Entry {
-    let mut body = json!({"member": who.key, "name": name, "computer": name,
-        "person_id": who.key, "kind": "computer", "role": "member"});
-    for (k, v) in extra.as_object().unwrap() {
-        body[k] = v.clone();
-    }
-    Entry::signed(by, vec![parent.hash()], Kind::Admit, body, 2)
+    // A kind nothing of was dropped is absent.
+    e.status()["dropped"][what].as_u64().unwrap_or(0)
 }
 
 fn seed(envs: &[&Env], entries: &[Entry]) {
@@ -152,7 +139,7 @@ fn same_person() -> (Env, Env) {
 async fn same_person_opens_without_grant() {
     let (a, b) = same_person();
     let (sa, sb) = (Sub::new(&a), Sub::new(&b));
-    let viewer_id = open(&b, &session(&a));
+    let viewer_id = open(&b, &c1(&a));
     let opened = sa.next("stream_opened");
     assert_eq!(opened["viewer"], b.identity().key);
     let owner_id = opened["stream_id"].as_str().unwrap();
@@ -174,7 +161,7 @@ async fn same_person_opens_without_grant() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn teammate_without_grant_gets_no_grant() {
     let (a, b) = pair(&[]);
-    let r = b.ask(json!({"id": 1, "op": "stream.open", "session": session(&a)}));
+    let r = b.ask(json!({"id": 1, "op": "stream.open", "session": c1(&a)}));
     assert_eq!(r["error"], "no_grant", "{r}");
 }
 
@@ -245,14 +232,14 @@ async fn deliver(
     let (ep, mut peer) = join(&m, &b).await;
     peer.send(&make(&a, &b.identity(), &m)).await;
     until(10, "B drops or stores the grant", || {
-        dropped(&b, "grants") + stored_grants(&b) as u64 == 1
+        dropped(&b, "share_grant") + stored_grants(&b) as u64 == 1
     });
     (b, a, (ep, peer))
 }
 
 async fn assert_dropped(make: impl FnOnce(&Identity, &Identity, &Identity) -> Frame) {
     let (b, a, _m) = deliver(make).await;
-    assert_eq!((dropped(&b, "grants"), stored_grants(&b)), (1, 0));
+    assert_eq!((dropped(&b, "share_grant"), stored_grants(&b)), (1, 0));
     let r =
         b.ask(json!({"id": 1, "op": "stream.open", "session": format!("{}/codex:c1", a.short)}));
     assert_eq!(r["error"], "no_grant", "{r}");
@@ -266,7 +253,7 @@ fn own_session(id: &Identity) -> String {
 async fn forged_grant_for_another_members_session_is_dropped() {
     // Only the session's prefix is wrong: M grants A's session.
     assert_dropped(|a, b, m| {
-        streams::signed(
+        signed(
             m,
             unsigned_grant(own_session(a), &b.key, &m.key, now() + 3600),
         )
@@ -278,7 +265,7 @@ async fn forged_grant_for_another_members_session_is_dropped() {
 async fn grant_with_a_bad_signature_is_dropped() {
     assert_dropped(|_, b, m| {
         let g = unsigned_grant(own_session(m), &b.key, &m.key, now() + 3600);
-        streams::signed(&identity(), g)
+        signed(&identity(), g)
     })
     .await;
 }
@@ -287,7 +274,7 @@ async fn grant_with_a_bad_signature_is_dropped() {
 async fn grant_relayed_by_another_member_is_dropped() {
     // A's own, validly signed grant to B, but M is the one who sends it.
     assert_dropped(|a, b, _| {
-        streams::signed(
+        signed(
             a,
             unsigned_grant(own_session(a), &b.key, &a.key, now() + 3600),
         )
@@ -298,7 +285,7 @@ async fn grant_relayed_by_another_member_is_dropped() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn grant_naming_another_viewer_is_dropped() {
     assert_dropped(|a, _, m| {
-        streams::signed(
+        signed(
             m,
             unsigned_grant(own_session(m), &a.key, &m.key, now() + 3600),
         )
@@ -310,17 +297,15 @@ async fn grant_naming_another_viewer_is_dropped() {
 async fn grant_ending_past_seven_days_is_dropped() {
     assert_dropped(|_, b, m| {
         let end = now() + 8 * 86_400;
-        streams::signed(m, unsigned_grant(own_session(m), &b.key, &m.key, end))
+        signed(m, unsigned_grant(own_session(m), &b.key, &m.key, end))
     })
     .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn expired_grant_is_dropped() {
-    assert_dropped(|_, b, m| {
-        streams::signed(m, unsigned_grant(own_session(m), &b.key, &m.key, now() - 1))
-    })
-    .await;
+    assert_dropped(|_, b, m| signed(m, unsigned_grant(own_session(m), &b.key, &m.key, now() - 1)))
+        .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -328,13 +313,13 @@ async fn valid_grant_is_stored_and_a_silent_owner_is_unreachable() {
     let mut m_session = String::new();
     let (b, _, _m) = deliver(|_, b, m| {
         m_session = own_session(m);
-        streams::signed(
+        signed(
             m,
             unsigned_grant(own_session(m), &b.key, &m.key, now() + 3600),
         )
     })
     .await;
-    assert_eq!((dropped(&b, "grants"), stored_grants(&b)), (0, 1));
+    assert_eq!((dropped(&b, "share_grant"), stored_grants(&b)), (0, 1));
     // M never answers the stream: after 10 s that is `unreachable`, not a refusal.
     let r = b.ask(json!({"id": 1, "op": "stream.open", "session": m_session}));
     assert_eq!(r["error"], "unreachable", "{r}");
@@ -345,9 +330,9 @@ async fn granted_viewer_receives_bytes_in_order_until_expiry() {
     let (a, b) = pair(&[]);
     let (sa, sb) = (Sub::new(&a), Sub::new(&b));
     let expires_at = now() + 4;
-    let r = grant(&a, &session(&a), &b.identity().key, false, expires_at);
+    let r = grant(&a, &c1(&a), &b.identity().key, false, expires_at);
     assert_eq!(r["ok"], true, "{r}");
-    let viewer_id = open(&b, &session(&a));
+    let viewer_id = open(&b, &c1(&a));
     let owner_id: String = sa.next("stream_opened")["stream_id"]
         .as_str()
         .unwrap()
@@ -365,7 +350,7 @@ async fn granted_viewer_receives_bytes_in_order_until_expiry() {
     std::thread::sleep(Duration::from_secs((expires_at - now() + 1).max(0) as u64));
     assert_eq!(send(&a, &owner_id, b"late")["error"], "no_grant");
     assert_eq!(sb.next("stream_closed")["stream_id"], viewer_id);
-    let r = b.ask(json!({"id": 1, "op": "stream.open", "session": session(&a)}));
+    let r = b.ask(json!({"id": 1, "op": "stream.open", "session": c1(&a)}));
     assert_eq!(r["error"], "no_grant", "{r}");
 }
 
@@ -373,9 +358,9 @@ async fn granted_viewer_receives_bytes_in_order_until_expiry() {
 async fn viewer_bytes_never_reach_the_owner() {
     let (a, b) = pair(&[]);
     let sa = Sub::new(&a);
-    let r = grant(&a, &session(&a), &b.identity().key, false, now() + 600);
+    let r = grant(&a, &c1(&a), &b.identity().key, false, now() + 600);
     assert_eq!(r["ok"], true, "{r}");
-    let viewer_id = open(&b, &session(&a));
+    let viewer_id = open(&b, &c1(&a));
     sa.next("stream_opened");
     assert_eq!(send(&b, &viewer_id, b"rm -rf /")["ok"], true);
     until(10, "A drops the viewer's frame", || {
@@ -415,12 +400,12 @@ async fn own_bridge_input_grant_delivers_viewer_frames() {
 
     let sa = Sub::new(&a);
     for viewer in [&i_f.key, &other.key] {
-        let r = grant(&a, &session(&a), viewer, true, now() + 600);
+        let r = grant(&a, &c1(&a), viewer, true, now() + 600);
         assert_eq!(r["error"], "unsupported", "{r}");
     }
-    let r = grant(&a, &session(&a), &ic.key, true, now() + 600);
+    let r = grant(&a, &c1(&a), &ic.key, true, now() + 600);
     assert_eq!(r["ok"], true, "{r}");
-    let viewer_id = open(&c, &session(&a));
+    let viewer_id = open(&c, &c1(&a));
     let owner_id = sa.next("stream_opened")["stream_id"].clone();
     assert_eq!(send(&c, &viewer_id, b"ls\n")["ok"], true);
     let got = sa.next("stream_input");
@@ -435,7 +420,7 @@ async fn own_bridge_input_grant_delivers_viewer_frames() {
 async fn chunk_over_64k_is_bad_request() {
     let (a, b) = same_person();
     let sa = Sub::new(&a);
-    open(&b, &session(&a));
+    open(&b, &c1(&a));
     let owner_id: String = sa.next("stream_opened")["stream_id"]
         .as_str()
         .unwrap()
@@ -455,13 +440,9 @@ async fn raw_open(
     session: &str,
 ) -> Result<(SendStream, RecvStream), bool> {
     let (mut s, mut r) = peer.conn.open_bi().await.unwrap();
-    let opener = Frame::Stream {
-        grant_id: grant_id.into(),
-        session: session.into(),
-        seq: 0,
-        bytes: String::new(),
-    };
-    frames::write(&mut s, &opener).await.unwrap();
+    frames::write(&mut s, &streams::opener(grant_id, session))
+        .await
+        .unwrap();
     match tokio::time::timeout(Duration::from_secs(5), frames::read(&mut r)).await {
         Ok(Ok(Frame::Stream { seq: 0, .. })) => Ok((s, r)),
         Ok(_) => Err(true),
@@ -490,7 +471,7 @@ async fn owner_and(m_extra: impl FnOnce(&Identity) -> Value) -> (Env, Identity, 
 async fn owner_refuses_a_stream_without_a_grant() {
     let (a, _m, (_ep, peer)) = owner_and(|_| json!({})).await;
     let sa = Sub::new(&a);
-    assert_eq!(raw_open(&peer, "", &session(&a)).await.err(), Some(true));
+    assert_eq!(raw_open(&peer, "", &c1(&a)).await.err(), Some(true));
     assert!(!sa.any("stream_opened", 300));
 }
 
@@ -509,13 +490,10 @@ async fn owner_refuses_another_viewers_grant() {
     a.daemon(false, "", &[peers(&[&b])]);
     until(10, "A and B online", || a.status()["peers"]["online"] == 1);
     let (_ep, peer) = join(&m, &a).await;
-    let r = grant(&a, &session(&a), &b.identity().key, false, now() + 600);
+    let r = grant(&a, &c1(&a), &b.identity().key, false, now() + 600);
     let grant_id = r["grant_id"].as_str().unwrap();
     let sa = Sub::new(&a);
-    assert_eq!(
-        raw_open(&peer, grant_id, &session(&a)).await.err(),
-        Some(true)
-    );
+    assert_eq!(raw_open(&peer, grant_id, &c1(&a)).await.err(), Some(true));
     assert!(!sa.any("stream_opened", 300));
 }
 
@@ -524,7 +502,7 @@ async fn owner_refuses_a_cloud_member_with_my_person_id() {
     let (a, _m, (_ep, peer)) =
         owner_and(|a| json!({"kind": "cloud", "person_id": a.key, "proof": "p"})).await;
     let sa = Sub::new(&a);
-    assert_eq!(raw_open(&peer, "", &session(&a)).await.err(), Some(true));
+    assert_eq!(raw_open(&peer, "", &c1(&a)).await.err(), Some(true));
     assert!(!sa.any("stream_opened", 300));
 }
 
@@ -534,11 +512,11 @@ async fn input_stream(secs: i64) -> (Env, (Endpoint, Peer), SendStream, RecvStre
     let (a, m, j) =
         owner_and(|_| json!({"kind": "cloud", "person_id": "ws:test", "proof": "p"})).await;
     let end = now() + secs;
-    let r = grant(&a, &session(&a), &m.key, true, end);
+    let r = grant(&a, &c1(&a), &m.key, true, end);
     assert_eq!(r["ok"], true, "{r}");
     let sa = Sub::new(&a);
     let grant_id = r["grant_id"].as_str().unwrap();
-    let (s, rv) = raw_open(&j.1, grant_id, &session(&a)).await.unwrap();
+    let (s, rv) = raw_open(&j.1, grant_id, &c1(&a)).await.unwrap();
     sa.next("stream_opened");
     (a, j, s, rv, sa, end)
 }
@@ -546,7 +524,7 @@ async fn input_stream(secs: i64) -> (Env, (Endpoint, Peer), SendStream, RecvStre
 fn input(a: &Env, seq: u32, n: usize) -> Frame {
     Frame::Stream {
         grant_id: String::new(),
-        session: session(a),
+        session: c1(a),
         seq,
         bytes: b64(&vec![b'x'; n]),
     }
@@ -572,7 +550,8 @@ async fn owner_caps_input_at_4k_and_counts_other_frames() {
 async fn expired_input_grant_never_raises_input() {
     let (a, _j, mut s, _r, sa, end) = input_stream(3).await;
     std::thread::sleep(Duration::from_secs((end - now() + 1).max(0) as u64));
-    frames::write(&mut s, &input(&a, 1, 2)).await.unwrap();
+    // The owner closed the stream at the grant's end, so this write may be refused.
+    let _ = frames::write(&mut s, &input(&a, 1, 2)).await;
     loop {
         let v =
             sa.0.recv_timeout(Duration::from_secs(10))
@@ -589,7 +568,7 @@ async fn close_unblocks_a_send_waiting_on_flow_control() {
     // M is the owner's own computer (no grant needed) and never reads its stream.
     let (a, _m, (_ep, peer)) = owner_and(|a| json!({"person_id": a.key, "proof": "t"})).await;
     let sa = Sub::new(&a);
-    let (_s, _r) = raw_open(&peer, "", &session(&a)).await.unwrap();
+    let (_s, _r) = raw_open(&peer, "", &c1(&a)).await.unwrap();
     let owner_id: String = sa.next("stream_opened")["stream_id"]
         .as_str()
         .unwrap()

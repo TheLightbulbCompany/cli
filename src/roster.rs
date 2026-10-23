@@ -149,6 +149,14 @@ impl Roster {
             .find(|m| m.kind == MemberKind::Cloud && m.person_id == pid)
     }
 
+    /// Whether `b` is a computer member of `a`'s person.
+    pub fn same_person_computer(&self, a: &str, b: &str) -> bool {
+        match (self.members.get(a), self.members.get(b)) {
+            (Some(a), Some(b)) => b.kind == MemberKind::Computer && a.person_id == b.person_id,
+            _ => false,
+        }
+    }
+
     pub fn founder(&self) -> Option<&Member> {
         self.members.values().find(|m| m.role == Role::Founder)
     }

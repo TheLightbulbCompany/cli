@@ -164,10 +164,7 @@ async fn handle(
                     "port": daemon.peers.port.get(),
                     "needs_update": needs_update,
                     "claim_live": daemon.claim_live(now() as i64),
-                    "dropped": {
-                        "grants": daemon.streams.dropped_grants.load(Ordering::Relaxed),
-                        "input": daemon.streams.dropped_input.load(Ordering::Relaxed),
-                    },
+                    "dropped": dropped(daemon),
                 }),
             )
         }
@@ -455,6 +452,13 @@ pub(crate) fn live_sessions(daemon: &Daemon) -> Vec<sessions::Session> {
         }
     }
     all
+}
+
+/// `status`'s `dropped`: frames `from_peer_ok` dropped, by kind, and viewer `input` frames.
+fn dropped(daemon: &Daemon) -> Value {
+    let mut v = json!(*daemon.peers.dropped.lock().unwrap());
+    v["input"] = daemon.streams.dropped_input.load(Ordering::Relaxed).into();
+    v
 }
 
 fn live_count(daemon: &Daemon) -> usize {

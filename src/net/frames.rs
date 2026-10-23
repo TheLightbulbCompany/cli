@@ -222,16 +222,22 @@ pub async fn read(recv: &mut (impl AsyncRead + Unpin)) -> Result<Frame> {
 /// names a state past `queued`, with a known reason exactly when it is `refused` (that it
 /// is bound to this member is `outbox::acked`'s check). A `share_grant` passes
 /// `streams::grant_ok`. A `stream` never rides the control stream. Task 14 adds the rules for
-/// the frames it serves, and until then every other kind is dropped.
-pub fn from_peer_ok(f: &Frame, peer: &Member, daemon: &Daemon) -> bool {
+/// the frames it serves, and until then every other kind is dropped. `Err` names the check.
+pub fn from_peer_ok(
+    f: &Frame,
+    peer: &Member,
+    daemon: &Daemon,
+) -> std::result::Result<(), &'static str> {
+    let check = |ok: bool, why| if ok { Ok(()) } else { Err(why) };
     match f {
-        Frame::Hello { .. } | Frame::Roster { .. } | Frame::Envelope { .. } => true,
+        Frame::Hello { .. } | Frame::Roster { .. } | Frame::Envelope { .. } => Ok(()),
         Frame::Ack { state, reason, .. } | Frame::Receipt { state, reason, .. } => {
             let refused = state == "refused";
-            State::parse(state).is_ok_and(|s| s != State::Queued)
+            let ok = State::parse(state).is_ok_and(|s| s != State::Queued)
                 && reason
                     .as_deref()
-                    .map_or(!refused, |r| refused && REASONS.contains(&r))
+                    .map_or(!refused, |r| refused && REASONS.contains(&r));
+            check(ok, "state")
         }
         Frame::Presence {
             member,
@@ -240,18 +246,19 @@ pub fn from_peer_ok(f: &Frame, peer: &Member, daemon: &Daemon) -> bool {
             known,
             kept,
         } => {
-            *member == peer.key
+            let ok = *member == peer.key
                 && *seq <= ipc::now_ms() + 86_400_000
                 && [sessions.len(), known.len(), kept.len()]
                     .iter()
                     .all(|n| *n <= presence::MAX)
                 && sessions.iter().all(|s| s.valid(&peer.short))
-                && known.iter().chain(kept).all(|a| own(&peer.short, a))
+                && known.iter().chain(kept).all(|a| own(&peer.short, a));
+            check(ok, "presence")
         }
         Frame::ShareGrant { .. } => {
             crate::streams::grant_ok(f, peer, &daemon.identity.key, ipc::now() as i64)
         }
-        _ => false,
+        _ => Err("not served"),
     }
 }
 
