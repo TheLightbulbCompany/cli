@@ -208,8 +208,15 @@ async fn kept_name_is_refused_on_the_persons_other_computer() {
     let (a, b) = (Env::new(), Env::new());
     let (ia, ib) = (a.identity(), b.identity());
     let g = net_ops::genesis(&ia, "prasiddha", "mac", "acme", 1);
-    let proof =
-        |k: &str| common::issuer::computer_proof(k, "user_p", "Prasiddha", None, common::now_s());
+    let proof = |k: &str| {
+        common::issuer::computer_proof(
+            k,
+            "user_p",
+            "Prasiddha",
+            None,
+            lightbulb_connect::daemon::ipc::now() as i64,
+        )
+    };
     let merge = Entry::signed(
         &ia,
         vec![g.hash()],

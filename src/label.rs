@@ -37,17 +37,18 @@ pub fn render_as(roster: &Roster, viewer: &str, from: &str, declared: Option<&st
         let named = p.agents.iter().find(|a| a.eq_ignore_ascii_case(rest));
         let agent = declared.or(named.map(String::as_str)).unwrap_or(rest);
         let space = p.workspace.as_ref().map_or("", |w| w.name.as_str());
+        // The agent may be the presence's, so it is cut; the proof's text is (`proof::parse`).
         return format!(
             "{} · {}",
             shown(agent, 32, "an agent"),
-            shown(space, 64, "a workspace")
+            shown(space, usize::MAX, "a workspace")
         );
     }
     let (who, possessive) = if m.person_id == roster.person_of(viewer) {
         ("You".to_string(), "Your".to_string())
     } else {
         let name = match &m.proof {
-            Some(p) => format!("✓ {}", shown(&p.name, 64, "a member")),
+            Some(p) => format!("✓ {}", shown(&p.name, usize::MAX, "a member")),
             None => name(m),
         };
         (name.clone(), format!("{name}'s"))
@@ -75,14 +76,15 @@ pub fn name(m: &Member) -> String {
     shown(&m.name, usize::MAX, "a member")
 }
 
-/// `s` as display text: at most `max` characters, without the characters that could pass for
-/// the frame header's delimiters; `none` when nothing is left.
+/// `s`'s `printable` characters, at most `max` of them.
+pub fn plain(s: &str, max: usize) -> String {
+    s.chars().filter(|c| printable(*c)).take(max).collect()
+}
+
+/// `s` as display text (`plain`), without the characters that could pass for the frame
+/// header's delimiters; `none` when nothing is left.
 fn shown(s: &str, max: usize, none: &str) -> String {
-    let s: String = s
-        .chars()
-        .filter(|c| printable(*c) && !matches!(c, '{' | '}' | '[' | ']'))
-        .take(max)
-        .collect();
+    let s = plain(&s.replace(['{', '}', '[', ']'], ""), max);
     if s.trim().is_empty() {
         none.to_string()
     } else {
@@ -119,8 +121,6 @@ mod tests {
             name: "The Lightbulb Company".into(),
         });
         Proof {
-            iss: "test".into(),
-            kid: "k".into(),
             iat: 0,
             exp: 1,
             sub: "s".into(),

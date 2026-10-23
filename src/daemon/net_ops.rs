@@ -140,10 +140,8 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, peer_pid: Option
         "identity.device_start" => {
             let computer = daemon.team.lock().unwrap().config.computer.clone();
             let at = super::ipc::now() as i64;
-            Response::ok(
-                id,
-                crate::proof::start_body(&daemon.identity, &computer, at),
-            )
+            let body = json!({"member_key": daemon.identity.key, "computer": computer, "at": at});
+            Response::ok(id, daemon.identity.signed(body))
         }
         // `identity.proof {proof}` -> `{name, person_id, solo}`: this computer's sign-in proof,
         // written to the roster (`proof::record`), person-only; `bad_request` when it does not

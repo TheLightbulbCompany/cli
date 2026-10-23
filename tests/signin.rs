@@ -4,7 +4,10 @@
 mod common;
 
 use common::issuer::{computer_proof, workspace_proof};
-use common::{computer, dialog, err, now_s, out, peers, person, seed_pair, until, Env, EXE};
+use common::{
+    computer, dialog, err, invite, members, out, peers, person, seed_pair, until, Env, EXE,
+};
+use lightbulb_connect::daemon::ipc;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, TcpListener};
@@ -44,7 +47,7 @@ fn issuer() -> (String, Asked) {
             let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
             let path = line.split(' ').nth(1).unwrap_or_default().to_string();
             log.lock().unwrap().push((path.clone(), body.clone()));
-            let proof = |k: &str| computer_proof(k, "user_1", "Prasiddha", None, now_s());
+            let proof = |k: &str| computer_proof(k, "user_1", "Prasiddha", None, ipc::now() as i64);
             let (status, answer) = if path.ends_with("/device/start") {
                 key = body["member_key"].as_str().unwrap_or_default().into();
                 let a = json!({"device_code": "D1", "user_code": "ABCD-EFGH",
@@ -64,8 +67,8 @@ fn issuer() -> (String, Asked) {
                 let bytes = data_encoding::BASE64URL_NOPAD.decode(payload.as_bytes());
                 let mut c: Value =
                     serde_json::from_slice(&bytes.unwrap_or_default()).unwrap_or_default();
-                c["iat"] = json!(now_s());
-                c["exp"] = json!(now_s() + 86_400);
+                c["iat"] = json!(ipc::now() as i64);
+                c["exp"] = json!(ipc::now() as i64 + 86_400);
                 ("200 OK", json!({"proof": common::issuer::mint(&c)}))
             } else {
                 ("404 Not Found", json!({}))
@@ -88,7 +91,7 @@ fn identity_of(e: &Env) -> Value {
 
 /// `e` signs in as `sub` with a proof minted here (`identity.proof`).
 fn sign_in(e: &Env, sub: &str, ws: Option<(&str, &str)>) {
-    let token = computer_proof(&e.identity().key, sub, "Prasiddha", ws, now_s());
+    let token = computer_proof(&e.identity().key, sub, "Prasiddha", ws, ipc::now() as i64);
     let r = person(e, json!({"id": 1, "op": "identity.proof", "proof": token}));
     assert_eq!(r["ok"], true, "{r}");
 }
@@ -109,16 +112,6 @@ fn allowing(dir: &Path) -> (&'static str, String) {
 fn texts(dir: &Path) -> Vec<String> {
     let t = std::fs::read_to_string(dir.join("texts")).unwrap_or_default();
     t.lines().map(String::from).collect()
-}
-
-fn invite(e: &Env) -> String {
-    let r = e.ask(json!({"id": 1, "op": "team.invite"}));
-    r["ticket"].as_str().unwrap_or_else(|| panic!("{r}")).into()
-}
-
-fn members(e: &Env) -> Vec<Value> {
-    let r = e.ask(json!({"id": 1, "op": "team.get"}));
-    r["members"].as_array().unwrap().clone()
 }
 
 fn member<'a>(ms: &'a [Value], key: &str) -> &'a Value {
@@ -157,7 +150,7 @@ fn signin_writes_a_merge_and_renews_before_expiry() {
     assert_eq!(path, "/connect/device/start");
     assert_eq!(start["member_key"], me);
     assert!(
-        (start["at"].as_i64().unwrap() - now_s()).abs() < 60,
+        (start["at"].as_i64().unwrap() - ipc::now() as i64).abs() < 60,
         "{start}"
     );
     let sig = start["sig"].as_str().unwrap();
@@ -170,11 +163,17 @@ fn signin_writes_a_merge_and_renews_before_expiry() {
     let e = Env::new();
     e.daemon(false, &format!("issuer = \"{url}\"\n"), &[fast]);
     let me = e.identity().key;
-    let old = computer_proof(&me, "user_1", "Prasiddha", None, now_s() - 21 * 3600);
+    let old = computer_proof(
+        &me,
+        "user_1",
+        "Prasiddha",
+        None,
+        ipc::now() as i64 - 21 * 3600,
+    );
     let r = person(&e, json!({"id": 1, "op": "identity.proof", "proof": old}));
     assert_eq!(r["ok"], true, "{r}");
     until(10, "renewed", || {
-        identity_of(&e)["expires_at"].as_i64().unwrap() > now_s() + 23 * 3600
+        identity_of(&e)["expires_at"].as_i64().unwrap() > ipc::now() as i64 + 23 * 3600
     });
     let asked = asked.lock().unwrap();
     let (path, body) = asked.iter().find(|(p, _)| p.ends_with("refresh")).unwrap();
@@ -193,18 +192,18 @@ fn a_proof_for_another_computer_or_person_is_refused() {
     let r = person(
         &e,
         json!({"id": 1, "op": "identity.proof",
-        "proof": computer_proof(&other.key, "user_1", "P", None, now_s())}),
+        "proof": computer_proof(&other.key, "user_1", "P", None, ipc::now() as i64)}),
     );
     assert_eq!(r["error"], "bad_request", "{r}");
     // A person is never a `ws:` id (it would make this computer the workspace's).
-    let ws = computer_proof(&e.identity().key, "ws:W1", "P", None, now_s());
+    let ws = computer_proof(&e.identity().key, "ws:W1", "P", None, ipc::now() as i64);
     let r = person(&e, json!({"id": 1, "op": "identity.proof", "proof": ws}));
     assert_eq!(r["error"], "bad_request", "{r}");
     sign_in(&e, "user_1", None);
     let r = person(
         &e,
         json!({"id": 1, "op": "identity.proof",
-        "proof": computer_proof(&e.identity().key, "user_2", "P", None, now_s())}),
+        "proof": computer_proof(&e.identity().key, "user_2", "P", None, ipc::now() as i64)}),
     );
     assert_eq!(
         (&r["error"], &r["reason"]),
@@ -222,7 +221,13 @@ fn an_agent_cannot_sign_this_computer_in() {
     let birth = lightbulb_connect::os::process(me).unwrap().birth_micros;
     let pin = ("LIGHTBULB_CONNECT_HOOK_CALLER", format!("{me}:{birth}"));
     e.daemon(false, "", &[pin]);
-    let token = computer_proof(&e.identity().key, "user_evil", "Mallory", None, now_s());
+    let token = computer_proof(
+        &e.identity().key,
+        "user_evil",
+        "Mallory",
+        None,
+        ipc::now() as i64,
+    );
     for op in [
         json!({"id": 1, "op": "identity.proof", "proof": token}),
         json!({"id": 1, "op": "identity.device_start"}),
@@ -248,7 +253,7 @@ fn second_computer_of_same_person_is_admitted_by_the_first() {
     f.daemon(false, "", &[peers(&[&a]), dialog("Decline")]);
     until(10, "F and A online", || f.status()["peers"]["online"] == 1);
     sign_in(&a, "user_bob", None);
-    let t = invite(&f);
+    let t = invite(&f, "reusable");
     b.daemon(false, &computer("mbp"), &[peers(&[&f])]);
     sign_in(&b, "user_bob", None);
     // `bob` is A's name: the same person's computer may go by it.
@@ -289,7 +294,7 @@ fn founder_and_workspace() -> (Env, Env, tempfile::TempDir, String) {
     let (f, w) = (Env::new(), Env::new());
     let dir = tempfile::tempdir().unwrap();
     f.daemon(false, &computer("mac"), &[allowing(dir.path())]);
-    let t = invite(&f);
+    let t = invite(&f, "reusable");
     w.daemon(false, &computer("cloud"), &[peers(&[&f])]);
     (f, w, dir, t)
 }
@@ -303,7 +308,7 @@ fn workspace_member_joins_with_a_workspace_proof() {
         "W1",
         "The Lightbulb Company",
         &["Friday", "Engineering"],
-        now_s(),
+        ipc::now() as i64,
     );
     let o = w.detached(&[EXE, "join", &t, "--kind", "cloud", "--proof", &proof], "");
     assert!(o.status.success(), "{}{}", out(&o), err(&o));
@@ -330,7 +335,7 @@ fn workspace_member_renews_its_workspace_proof() {
     let (f, w) = (Env::new(), Env::new());
     let dir = tempfile::tempdir().unwrap();
     f.daemon(false, &computer("mac"), &[allowing(dir.path())]);
-    let t = invite(&f);
+    let t = invite(&f, "reusable");
     let fast = ("LIGHTBULB_CONNECT_DEBUG_OUTBOX_S", "1".to_string());
     let config = format!("issuer = \"{url}\"\n{}", computer("cloud"));
     w.daemon(false, &config, &[peers(&[&f]), fast]);
@@ -340,14 +345,15 @@ fn workspace_member_renews_its_workspace_proof() {
         "W1",
         "The Lightbulb Company",
         &["Friday"],
-        now_s() - 21 * 3600,
+        ipc::now() as i64 - 21 * 3600,
     );
     let o = w.detached(&[EXE, "join", &t, "--kind", "cloud", "--proof", &old], "");
     assert!(o.status.success(), "{}{}", out(&o), err(&o));
     until(10, "renewed on F", || {
         let ms = members(&f);
         let m = member(&ms, &wk);
-        m["proof"]["iat"].as_i64().unwrap() > now_s() - 60 && m["proof"]["kind"] == "workspace"
+        m["proof"]["iat"].as_i64().unwrap() > ipc::now() as i64 - 60
+            && m["proof"]["kind"] == "workspace"
     });
     assert_eq!(member(&members(&f), &wk)["person_id"], "ws:W1");
 }
@@ -357,7 +363,7 @@ fn workspace_member_renews_its_workspace_proof() {
 fn second_member_for_one_workspace_is_refused() {
     let (f, w, _dir, t) = founder_and_workspace();
     // Another name, so only the one-member-per-`sub` rule can refuse the second.
-    let proof = |k: &str, name: &str| workspace_proof(k, "W1", name, &[], now_s());
+    let proof = |k: &str, name: &str| workspace_proof(k, "W1", name, &[], ipc::now() as i64);
     let o = w.detached(
         &[
             EXE,
@@ -389,7 +395,13 @@ fn second_member_for_one_workspace_is_refused() {
 fn computer_proof_cannot_join_as_cloud() {
     let (f, w, dir, t) = founder_and_workspace();
     let ws = Some(("W1", "The Lightbulb Company"));
-    let proof = computer_proof(&w.identity().key, "user_1", "Prasiddha", ws, now_s());
+    let proof = computer_proof(
+        &w.identity().key,
+        "user_1",
+        "Prasiddha",
+        ws,
+        ipc::now() as i64,
+    );
     let r = person(
         &w,
         json!({"id": 1, "op": "team.join", "ticket": t, "kind": "cloud", "proof": proof}),

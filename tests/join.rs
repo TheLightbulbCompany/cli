@@ -5,7 +5,8 @@
 mod common;
 
 use common::{
-    addr, computer, dialog, err, identity, out, peers, person, seed_pair, until, wait_s, Env, EXE,
+    addr, computer, dialog, err, identity, invite, members, out, peers, person, seed_pair, until,
+    wait_s, Env, EXE,
 };
 use iroh::endpoint::{presets, Connection, RecvStream, SendStream};
 use iroh::{Endpoint, SecretKey};
@@ -17,12 +18,6 @@ use lightbulb_connect::roster;
 use lightbulb_connect::ticket::{self, Ticket};
 use serde_json::{json, Value};
 use std::time::Duration;
-
-fn invite(e: &Env, mode: &str) -> String {
-    let r = e.ask(json!({"id": 1, "op": "team.invite", "mode": mode}));
-    assert_eq!(r["ok"], true, "{r}");
-    r["ticket"].as_str().unwrap().into()
-}
 
 /// An open link's join line: person-only.
 fn invite_open(e: &Env) -> String {
@@ -55,7 +50,7 @@ fn pair(button: &str, mode: &str) -> (Env, Env, String) {
 /// Both list `n` members, with the same heads.
 fn converged(a: &Env, b: &Env, n: usize) {
     until(5, "both converge", || {
-        members(a) == n && members(b) == n && a.heads() == b.heads()
+        members(a).len() == n && members(b).len() == n && a.heads() == b.heads()
     });
 }
 
@@ -65,13 +60,6 @@ fn refused(r: &Value, reason: &str) {
         (Some("refused"), Some(reason)),
         "{r}"
     );
-}
-
-fn members(e: &Env) -> usize {
-    e.ask(json!({"id": 1, "op": "team.get"}))["members"]
-        .as_array()
-        .unwrap()
-        .len()
 }
 
 fn requests(e: &Env) -> Vec<Value> {
@@ -126,7 +114,7 @@ impl Played {
         Played::send(
             env,
             &id,
-            &admission::request(&id, t, name, "mbp", "computer"),
+            &admission::request(&id, t, name, "mbp", "computer", None),
         )
         .await
     }
@@ -156,7 +144,7 @@ fn ask_ticket_admits_only_after_allow() {
         assert_eq!(r["id"], "J1");
         assert_eq!(r["candidate"], b.identity().key);
         assert_eq!((&r["name"], &r["computer"]), (&json!("bob"), &json!("mbp")));
-        assert_eq!((members(&a), members(&b)), (1, 1));
+        assert_eq!((members(&a).len(), members(&b).len()), (1, 1));
         let o = a.detached(&[EXE, "approve", "J1"], "");
         assert!(o.status.success(), "{}", err(&o));
         let o = joining.join().unwrap();
@@ -182,7 +170,7 @@ fn decline_refuses_and_writes_nothing() {
     let heads = a.heads();
     refused(&join(&b, &t, "bob", "computer"), "declined");
     assert_eq!(a.heads(), heads);
-    assert_eq!((members(&a), members(&b)), (1, 1));
+    assert_eq!((members(&a).len(), members(&b).len()), (1, 1));
     assert!(requests(&a).is_empty());
 }
 
@@ -205,7 +193,7 @@ fn forged_open_mode_is_refused() {
         &join(&b, &ticket::encode(&t), "bob", "computer"),
         "bad_ticket",
     );
-    assert_eq!((members(&a), members(&b)), (1, 1));
+    assert_eq!((members(&a).len(), members(&b).len()), (1, 1));
 }
 
 #[test]
@@ -221,12 +209,12 @@ fn once_ticket_admits_once() {
     );
     c1.daemon(false, "", &[peers(&[&x])]);
     assert_eq!(join(&c1, &t, "carol", "computer")["state"], "admitted");
-    until(5, "F converges", || members(&f) == 3);
+    until(5, "F converges", || members(&f).len() == 3);
     x.ask(json!({"id": 1, "op": "shutdown"}));
     // The inviter is offline: C2 reaches only F.
     c2.daemon(false, "", &[peers(&[&f])]);
     refused(&join(&c2, &t, "dave", "computer"), "bad_ticket");
-    assert_eq!(members(&f), 3);
+    assert_eq!(members(&f).len(), 3);
 }
 
 #[test]
@@ -252,7 +240,7 @@ fn forged_ticket_from_another_members_link_is_refused() {
         &join(&c, &ticket::encode(&forged), "carol", "computer"),
         "bad_ticket",
     );
-    assert_eq!((members(&f), members(&x)), (2, 2));
+    assert_eq!((members(&f).len(), members(&x).len()), (2, 2));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -262,12 +250,12 @@ async fn candidate_field_must_be_the_peer_key() {
     let t = ticket::decode(&invite(&a, "reusable")).unwrap();
     // Signed by `other`, naming `other`, sent over `me`'s endpoint.
     let (me, other) = (identity(), identity());
-    let req = admission::request(&other, &t, "carol", "mbp", "computer");
+    let req = admission::request(&other, &t, "carol", "mbp", "computer", None);
     let mut p = Played::send(&a, &me, &req).await;
     let got = p.recv().await;
     assert!(got.is_err(), "answered: {got:?}");
     assert!(requests(&a).is_empty());
-    assert_eq!(members(&a), 1);
+    assert_eq!(members(&a).len(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -333,7 +321,7 @@ fn link_replaced_on_removal_no_longer_joins() {
         .to_string();
     c.daemon(false, "", &[peers(&[&a])]);
     refused(&join(&c, &t, "carol", "computer"), "bad_ticket");
-    assert_eq!(members(&a), 1);
+    assert_eq!(members(&a).len(), 1);
     // The link that replaced it does.
     assert_eq!(join(&c, &line, "carol", "computer")["state"], "admitted");
 }
@@ -342,7 +330,7 @@ fn link_replaced_on_removal_no_longer_joins() {
 fn cloud_candidate_without_bridge_proof_is_refused() {
     let (a, b, t) = pair("Allow", "reusable");
     refused(&join(&b, &t, "bot", "cloud"), "unsupported");
-    assert_eq!(members(&a), 1);
+    assert_eq!(members(&a).len(), 1);
 }
 
 #[test]
@@ -363,7 +351,7 @@ fn join_from_a_multi_member_network_is_refused() {
         "You are in \"acme\". Leave it first: lightbulb-connect leave\n"
     );
     assert_eq!(b.heads(), heads);
-    assert_eq!(members(&c), 1);
+    assert_eq!(members(&c).len(), 1);
 }
 
 #[test]
@@ -377,11 +365,11 @@ fn non_admin_inviter_admits_its_own_invitee_with_no_admin_online() {
     let r = join(&c, &t, "carol", "computer");
     assert_eq!(r["state"], "admitted", "{r}");
     assert_eq!(r["team"], "acme");
-    assert_eq!(members(&x), 3);
+    assert_eq!(members(&x).len(), 3);
     // The founder comes back and converges.
     f.daemon(false, "", &[peers(&[&x])]);
     until(5, "F converges", || {
-        members(&f) == 3 && f.heads() == x.heads()
+        members(&f).len() == 3 && f.heads() == x.heads()
     });
 }
 
@@ -411,15 +399,17 @@ async fn candidate_with_a_bad_signature_is_dropped() {
     let t = ticket::decode(&invite(&a, "reusable")).unwrap();
     // `candidate` is the peer, but the name was changed after signing.
     let me = identity();
-    let mut v =
-        serde_json::to_value(admission::request(&me, &t, "carol", "mbp", "computer")).unwrap();
+    let mut v = serde_json::to_value(admission::request(
+        &me, &t, "carol", "mbp", "computer", None,
+    ))
+    .unwrap();
     v["name"] = json!("mallory");
     let req: Frame = serde_json::from_value(v).unwrap();
     let mut p = Played::send(&a, &me, &req).await;
     let got = p.recv().await;
     assert!(got.is_err(), "answered: {got:?}");
     assert!(rows(&a).is_empty());
-    assert_eq!(members(&a), 1);
+    assert_eq!(members(&a).len(), 1);
 }
 
 #[test]
@@ -434,7 +424,7 @@ fn unanswered_request_is_waiting_and_asks_no_one_else() {
     assert_eq!(r["state"], "waiting", "{r}");
     assert_eq!(rows(&x), ["expired"]);
     assert!(rows(&f).is_empty(), "the second member was asked");
-    assert_eq!(members(&c), 1);
+    assert_eq!(members(&c).len(), 1);
 }
 
 #[test]
@@ -447,7 +437,7 @@ fn admitted_candidate_that_lost_the_roster_rejoins() {
     until(10, "B stops", || !b.state.path().join("sock").exists());
     b.store().clear_roster().unwrap();
     b.daemon(false, &computer("mbp"), &[peers(&[&a])]);
-    assert_eq!(members(&b), 1);
+    assert_eq!(members(&b).len(), 1);
     let r = join(&b, &t, "bob", "computer");
     assert_eq!(r["state"], "admitted", "{r}");
     assert_eq!(
@@ -474,7 +464,7 @@ fn team_join_is_person_only() {
         (Some("bad_request"), Some("not_a_person")),
         "{r}"
     );
-    assert_eq!((members(&a), members(&b)), (1, 1));
+    assert_eq!((members(&a).len(), members(&b).len()), (1, 1));
 }
 
 #[test]

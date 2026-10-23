@@ -39,12 +39,13 @@ pub struct Latest {
     pub kept: Vec<String>,
 }
 
-/// The `agent` a member's latest presence declares for its session `from` (a workspace
-/// member's: `Friday`).
-pub fn declared_agent(d: &Daemon, from: &str) -> Option<String> {
+/// The `agent` every member's latest presence declares, by session id (a workspace member's:
+/// `Friday`). One look per batch of labels.
+pub fn declared_agents(d: &Daemon) -> HashMap<String, String> {
     let latest = d.latest.lock().unwrap();
-    let mut all = latest.values().flat_map(|l| &l.sessions);
-    all.find(|s| s.session_id == from).map(|s| s.agent.clone())
+    let all = latest.values().flat_map(|l| &l.sessions);
+    all.map(|s| (s.session_id.clone(), s.agent.clone()))
+        .collect()
 }
 
 /// The stored presences, by member (read at daemon start).

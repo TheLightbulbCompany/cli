@@ -35,8 +35,13 @@ fn admit(e: &Env, founder: &Identity, parent: &Entry, who: &Identity, cloud: boo
         "person_id": who.key, "kind": "computer", "role": "member"});
     if cloud {
         body["kind"] = json!("cloud");
-        let proof =
-            common::issuer::workspace_proof(&who.key, &who.key, "carol", &[], common::now_s());
+        let proof = common::issuer::workspace_proof(
+            &who.key,
+            &who.key,
+            "carol",
+            &[],
+            lightbulb_connect::daemon::ipc::now() as i64,
+        );
         body["proof"] = json!(proof);
         body["person_id"] = json!(format!("ws:{}", who.key));
     }

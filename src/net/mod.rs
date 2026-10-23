@@ -389,7 +389,7 @@ impl Net {
         let d = &self.0.daemon;
         let every = Duration::from_secs(d.peers.knobs().outbox_s.clamp(1, 60));
         let mut expired_at: Option<std::time::Instant> = None;
-        let renew_at = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let mut renew_at = 0;
         loop {
             // Armed before the flush, so a `hello` during it is not missed.
             let connected = d.peers.connected.notified();
@@ -404,7 +404,7 @@ impl Net {
             let expire = expired_at.is_none_or(|t| t.elapsed() >= every);
             if expire {
                 expired_at = Some(std::time::Instant::now());
-                crate::proof::tick(d, &renew_at);
+                crate::proof::tick(d, &mut renew_at);
             }
             if let Err(e) = flush(d, all, expire) {
                 eprintln!("net: outbox: {e}");

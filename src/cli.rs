@@ -5,7 +5,7 @@
 use crate::daemon::ipc;
 use crate::daemon::net_ops::Invite;
 use crate::hook::{self, Conn};
-use crate::{admission, daemon, paths, setup, Result};
+use crate::{admission, daemon, http, label, paths, proof, setup, Result};
 use serde_json::{json, Value};
 use std::ffi::OsString;
 use std::fs;
@@ -443,15 +443,18 @@ const SIGNIN_WAIT: Duration = Duration::from_secs(900);
 /// then `device/token` until it answers), the proof written to the roster (`identity.proof`).
 pub fn signin() -> Result<i32> {
     let issuer = crate::config::Config::load(&paths::state_dir())?.issuer;
-    let mut conn = connect()?;
-    let r = conn.call("identity.device_start", json!({}))?;
-    if r["reason"] == "not_a_person" {
-        eprintln!("Sign in from your own terminal, not from an agent.");
+    let start = connect()?.call("identity.device_start", json!({}))?;
+    if start["ok"] != true {
+        match start["reason"].as_str().or(start["error"].as_str()) {
+            Some("not_a_person") => eprintln!("Sign in from your own terminal, not from an agent."),
+            reason => eprintln!("signin: {}", reason.unwrap_or("failed")),
+        }
         return Ok(1);
     }
-    let start = json!({"member_key": r["member_key"], "computer": r["computer"], "at": r["at"],
-        "sig": r["sig"]});
-    let (status, s) = crate::proof::post(&crate::proof::route(&issuer, "device/start"), &start)?;
+    let body = json!({"member_key": start["member_key"], "computer": start["computer"],
+        "at": start["at"], "sig": start["sig"]});
+    let post = |path: &str, body: &Value| http::post_json(&proof::route(&issuer, path), body);
+    let (status, s) = post("device/start", &body)?;
     let (Some(code), Some(uri)) = (
         s["device_code"].as_str(),
         s["verification_uri_complete"].as_str(),
@@ -462,46 +465,42 @@ pub fn signin() -> Result<i32> {
         return Ok(1);
     };
     // The issuer's words, as plain text: `config.toml` (its URL) is the agent's to write.
-    let shown = |t: &str, max: usize| -> String {
-        t.chars()
-            .filter(|c| crate::label::printable(*c))
-            .take(max)
-            .collect()
-    };
-    let user_code = shown(s["user_code"].as_str().unwrap_or_default(), 32);
+    let user_code = label::plain(s["user_code"].as_str().unwrap_or_default(), 32);
     println!(
         "Confirm the code {user_code} in your browser: {}",
-        shown(uri, 512)
+        label::plain(uri, 512)
     );
     // A person at a terminal gets the browser (an https page only; debug: the tests' http);
     // a script reads the line above.
     let web = uri.starts_with("https://") || (cfg!(debug_assertions) && uri.starts_with("http://"));
     if web
-        && uri.chars().all(crate::label::printable)
+        && uri.chars().all(label::printable)
         && std::io::IsTerminal::is_terminal(&std::io::stdout())
     {
         let _ = Command::new("open").arg(uri).status();
     }
     let every = Duration::from_secs(s["interval"].as_u64().unwrap_or(5).clamp(1, 60));
     let deadline = std::time::Instant::now() + SIGNIN_WAIT;
-    let token = loop {
-        let (status, t) = crate::proof::post(
-            &crate::proof::route(&issuer, "device/token"),
-            &json!({"device_code": code}),
-        )?;
-        match (status, t["proof"].as_str()) {
-            (200, Some(p)) => break p.to_string(),
-            (200, None) if t["pending"] == true && std::time::Instant::now() < deadline => {}
-            (410, _) | (200, None) => {
-                eprintln!("This sign-in code expired. Run the same command again.");
-                return Ok(1);
-            }
+    let mut token = None;
+    while token.is_none() && std::time::Instant::now() < deadline {
+        let (status, t) = post("device/token", &json!({"device_code": code}))?;
+        match status {
+            200 if t["pending"] == true => std::thread::sleep(every),
+            // A proof, or (neither) nothing more to wait for.
+            200 => match t["proof"].as_str() {
+                Some(p) => token = Some(p.to_string()),
+                None => break,
+            },
+            410 => break,
             _ => {
                 eprintln!("Sign-in failed (the issuer answered {status}). Try again later.");
                 return Ok(1);
             }
         }
-        std::thread::sleep(every);
+    }
+    let Some(token) = token else {
+        eprintln!("This sign-in code expired. Run the same command again.");
+        return Ok(1);
     };
     // A fresh connection: the first may have sat idle through the wait.
     let r = connect()?.call("identity.proof", json!({ "proof": token }))?;
@@ -513,7 +512,8 @@ pub fn signin() -> Result<i32> {
         eprintln!("The issuer's answer did not verify for this computer. Try again later.");
         return Ok(1);
     }
-    let name = shown(r["name"].as_str().unwrap_or_default(), 64);
+    // `proof::parse` let only plain text in.
+    let name = r["name"].as_str().unwrap_or_default();
     if r["solo"] == true {
         println!("Signed in as {name}. To join your network, paste its join line: lightbulb-connect join '<link>'");
     } else {

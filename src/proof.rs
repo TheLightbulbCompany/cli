@@ -4,16 +4,14 @@
 //! `admit`'s `proof`). Also the issuer's HTTP calls (`post`) and the daemon's renewal (`tick`).
 
 use crate::daemon::{ipc, net_ops, Daemon};
-use crate::identity::Identity;
+use crate::http;
 use crate::roster::{Kind, MemberKind};
 use crate::Result;
 use data_encoding::BASE64URL_NOPAD;
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 /// A token past this is refused unread (its `admit` must fit a roster entry).
 pub const MAX_TOKEN: usize = 4096;
@@ -25,10 +23,6 @@ pub const RENEW_AT_S: i64 = 20 * 3600;
 const RETRY_S: i64 = 3600;
 /// How far ahead of our clock an issuer may stamp `iat` (clock skew).
 const IAT_SKEW_S: i64 = 300;
-/// Every issuer call: connect, then read, each at most this.
-const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
-/// An issuer answer past this is refused.
-const MAX_BODY: u64 = 64 * 1024;
 
 /// The issuer's public keys by `kid`: prod `p1`, prod `p2` and `dev` (the dev backend's).
 // replaced at the key ceremony (Plan C): throwaway keys whose private halves were never kept,
@@ -93,10 +87,6 @@ pub struct ProofWorkspace {
 /// A verified proof's claims (and the token they came from, never serialized or logged).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Proof {
-    pub iss: String,
-    /// From the header.
-    #[serde(default)]
-    pub kid: String,
     pub iat: i64,
     pub exp: i64,
     pub sub: String,
@@ -147,7 +137,6 @@ pub fn parse(token: &str, member_key: &str) -> Result<Proof> {
     key.verify_strict(format!("{h}.{p}").as_bytes(), &sig)
         .map_err(|_| "proof has a bad signature")?;
     let mut c: Proof = serde_json::from_slice(&b64(p)?)?;
-    c.kid = kid.to_string();
     c.token = token.to_string();
     let ws_ok = match c.kind {
         ProofKind::Workspace => c
@@ -190,52 +179,16 @@ pub fn verify(token: &str, member_key: &str, now: i64) -> Result<Proof> {
     Ok(c)
 }
 
-/// `POST url` with JSON `body`: the status and the JSON answer (`null` when it is none).
-/// https only in release builds (debug: the tests' loopback issuer), no redirects, 10 s to
-/// connect and to read, at most 64 KiB.
-pub fn post(url: &str, body: &Value) -> Result<(u16, Value)> {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_connect(Some(HTTP_TIMEOUT))
-        .timeout_recv_response(Some(HTTP_TIMEOUT))
-        .timeout_recv_body(Some(HTTP_TIMEOUT))
-        .https_only(!cfg!(debug_assertions))
-        .max_redirects(0)
-        .http_status_as_error(false)
-        .build()
-        .into();
-    let mut r = agent
-        .post(url)
-        .header("content-type", "application/json")
-        .send(body.to_string())
-        .map_err(|e| e.to_string())?;
-    let status = r.status().as_u16();
-    let text = r
-        .body_mut()
-        .with_config()
-        .limit(MAX_BODY)
-        .read_to_string()
-        .map_err(|e| e.to_string())?;
-    Ok((status, serde_json::from_str(&text).unwrap_or(Value::Null)))
-}
-
 /// `{issuer}/<path>`.
 pub fn route(issuer: &str, path: &str) -> String {
     format!("{}/{path}", issuer.trim_end_matches('/'))
 }
 
-/// `proof/refresh`'s body: `{proof, at, sig}`, `sig` by this computer's key over `{proof, at}`.
-pub fn refresh_body(id: &Identity, token: &str, at: i64) -> Value {
-    let mut v = json!({"proof": token, "at": at});
-    // `sign` is over `identity::canonical` of the object without `sig`.
-    v["sig"] = id.sign(&v).into();
-    v
-}
-
 /// On the daemon's 60 s timer: drops expired proofs from the cached roster (their badge and
 /// workspace), and once this computer's own proof is `RENEW_AT_S` old asks the issuer for a
 /// new one (off the async threads), writing it as a `proof` entry; a failure tries again
-/// hourly. `retry_at`: no call before it.
-pub fn tick(d: &Arc<Daemon>, retry_at: &Arc<AtomicI64>) {
+/// hourly. `retry_at`: no call before it (a renewal's new `iat` ends the calls).
+pub fn tick(d: &Arc<Daemon>, retry_at: &mut i64) {
     let now = ipc::now() as i64;
     let (token, issuer) = {
         let mut team = d.team.lock().unwrap();
@@ -244,44 +197,33 @@ pub fn tick(d: &Arc<Daemon>, retry_at: &Arc<AtomicI64>) {
         let Some(p) = own.and_then(|m| m.proof.as_ref()) else {
             return;
         };
-        if now < p.iat + RENEW_AT_S || now < retry_at.load(Ordering::SeqCst) {
+        if now < p.iat + RENEW_AT_S || now < *retry_at {
             return;
         }
         (p.token.clone(), team.config.issuer.clone())
     };
-    // Pessimistic: no second call while this one runs.
-    retry_at.store(now + RETRY_S, Ordering::SeqCst);
-    let (d, retry_at) = (d.clone(), retry_at.clone());
-    tokio::task::spawn_blocking(move || match renew(&d, &token, &issuer, now) {
-        Ok(kid) => {
-            retry_at.store(0, Ordering::SeqCst);
-            eprintln!("proof: renewed (kid {kid})");
+    // No second call while this one runs, nor for an hour after a failure.
+    *retry_at = now + RETRY_S;
+    let d = d.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = renew(&d, &token, &issuer, now) {
+            eprintln!("proof: renewal failed, retrying in an hour: {e}");
         }
-        Err(e) => eprintln!("proof: renewal failed, retrying in an hour: {e}"),
     });
 }
 
-/// One renewal: `proof/refresh`, the answer verified, then written. Its `kid`.
-fn renew(d: &Daemon, token: &str, issuer: &str, now: i64) -> Result<String> {
-    let body = refresh_body(&d.identity, token, now);
-    let (status, v) = post(&route(issuer, "proof/refresh"), &body)?;
+/// One renewal: `proof/refresh` (`{proof, at, sig}`, signed by this computer's key over
+/// `{proof, at}`), its answer recorded (`record` verifies it).
+fn renew(d: &Daemon, token: &str, issuer: &str, now: i64) -> Result<()> {
+    let body = d.identity.signed(json!({"proof": token, "at": now}));
+    let (status, v) = http::post_json(&route(issuer, "proof/refresh"), &body)?;
     let new = v["proof"].as_str().filter(|_| status == 200);
-    let new = new.ok_or_else(|| format!("issuer answered {status}"))?;
-    let kid = verify(new, &d.identity.key, ipc::now() as i64)?.kid;
-    record(d, new)?;
-    Ok(kid)
+    record(d, new.ok_or_else(|| format!("issuer answered {status}"))?)?;
+    Ok(())
 }
 
 /// `record`'s refusal of a proof for another person than this computer's.
 pub const OTHER_PERSON: &str = "proof is for another person";
-
-/// `device/start`'s body: `{member_key, computer, at, sig}`, `sig` by `id` over the rest, so
-/// the issuer starts a flow only for the holder of the key it will name.
-pub fn start_body(id: &Identity, computer: &str, at: i64) -> Value {
-    let mut v = json!({"member_key": id.key, "computer": computer, "at": at});
-    v["sig"] = id.sign(&v).into();
-    v
-}
 
 /// `identity.proof`'s write: `merge` while this computer's `person_id` is its own key, else a
 /// `proof` renewal. The kind must be the member's own: `computer`, or `workspace` on the
@@ -307,7 +249,7 @@ pub fn record(d: &Daemon, token: &str) -> Result<Proof> {
         return Err(OTHER_PERSON.into());
     };
     net_ops::write(d, &mut team, &store, kind, body, now)?;
-    eprintln!("proof: recorded (kid {}, sub {})", c.kid, c.sub);
+    eprintln!("proof: recorded (sub {})", c.sub);
     Ok(c)
 }
 
@@ -333,7 +275,12 @@ mod tests {
     fn proof_verifies_offline_and_rejects_wrong_computer_or_expired() {
         let t = issuer::mint(&claims("k1"));
         let p = verify(&t, "k1", NOW + 10).unwrap();
-        assert_eq!((p.sub.as_str(), p.kid.as_str()), ("user_1", TEST_ISSUER.0));
+        assert_eq!(p.sub, "user_1");
+        let header = BASE64URL_NOPAD
+            .decode(t.split('.').next().unwrap().as_bytes())
+            .unwrap();
+        let header: Value = serde_json::from_slice(&header).unwrap();
+        assert_eq!(header["kid"], TEST_ISSUER.0);
         assert_eq!(p.workspace.unwrap().id, "W1");
         assert!(verify(&t, "k2", NOW).is_err(), "another computer");
         assert!(verify(&t, "k1", NOW + 86_401).is_err(), "expired");

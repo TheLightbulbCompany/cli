@@ -11,7 +11,7 @@ use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 /// How far ahead of our clock an entry may be stamped.
 const MAX_SKEW_S: i64 = 86_400;
@@ -186,17 +186,12 @@ impl Roster {
             .find(|m| m.kind == MemberKind::Cloud && m.person_id == ws)
     }
 
-    /// Person `person`'s computer members, first admitted first (replay order).
+    /// Person `person`'s computer members, first admitted first.
     pub fn computers_of(&self, person: &str) -> Vec<&Member> {
         let mut ms: Vec<&Member> = (self.members.values())
             .filter(|m| m.kind == MemberKind::Computer && m.person_id == person)
             .collect();
-        let at = |m: &Member| {
-            self.log
-                .iter()
-                .position(|(_, e)| e.kind == Kind::Admit && e.text("member") == m.key)
-        };
-        ms.sort_by_key(|m| at(m));
+        ms.sort_by_key(|m| (m.admitted_at, &m.key));
         ms
     }
 
@@ -273,19 +268,26 @@ pub fn replay(entries: &[Entry]) -> Roster {
     // ahead of its own position. `known` only grows, so this settles within one pass per
     // removal. ponytail: the cap (#removes + 1) is a safety only.
     let cap = by_hash.values().filter(|e| e.kind == Kind::Remove).count() + 1;
+    // Each proof verified once, not once per pass.
+    let proofs: HashMap<&str, Proof> = by_hash
+        .iter()
+        .filter_map(|(h, e)| Some((h.as_str(), proven(e)?)))
+        .collect();
+    let pass =
+        |known: &BTreeSet<String>, graph: Roster| pass(&by_hash, &anc, &proofs, known, graph);
     let mut known = BTreeSet::new();
-    let (mut r, mut applied) = pass(&by_hash, &anc, &known, graph.clone());
+    let (mut r, mut applied) = pass(&known, graph.clone());
     for _ in 1..cap {
         if applied.is_subset(&known) {
             break;
         }
         known.extend(applied.iter().cloned());
-        (r, applied) = pass(&by_hash, &anc, &known, graph.clone());
+        (r, applied) = pass(&known, graph.clone());
     }
     // A known removal whose signer's admission no longer survives is stale: replay once more
     // knowing only the removals that still apply, and keep that if it agrees with itself.
     if applied != known {
-        let (exact, again) = pass(&by_hash, &anc, &applied, graph);
+        let (exact, again) = pass(&applied, graph);
         if again == applied {
             r = exact;
         }
@@ -295,10 +297,12 @@ pub fn replay(entries: &[Entry]) -> Roster {
 }
 
 /// One replay in which the `known` removals drop their targets' concurrent entries ahead of
-/// their own position; returns the roster and the removals it applied.
+/// their own position; returns the roster and the removals it applied. `proofs`: each entry's
+/// verified `proof`.
 fn pass(
     by_hash: &BTreeMap<String, &Entry>,
     anc: &BTreeMap<&str, HashSet<String>>,
+    proofs: &HashMap<&str, Proof>,
     known: &BTreeSet<String>,
     mut r: Roster,
 ) -> (Roster, BTreeSet<String>) {
@@ -334,13 +338,14 @@ fn pass(
             }
         }
         let e = by_hash[&h];
+        let claims = proofs.get(h.as_str());
         if r.team_id.is_empty() {
-            if e.parents.is_empty() && is_genesis(e) {
+            if e.parents.is_empty() && is_genesis(e, claims) {
                 r.team_id = h.clone();
                 r.team_name = e.text("team_name").to_string();
                 r.created_at = e.at;
                 r.members
-                    .insert(e.signer.clone(), new_member(e, Role::Founder));
+                    .insert(e.signer.clone(), new_member(e, Role::Founder, claims));
             }
             continue;
         }
@@ -395,11 +400,9 @@ fn pass(
                     continue;
                 }
                 let cloud = e.text("kind") == "cloud";
-                let claims = proven(e);
                 // Another computer of a signed-in person: admitted by one of that person's.
-                let same_person =
-                    !cloud && claims.is_some() && signer.person_id == e.text("person_id");
                 let same = (!cloud && claims.is_some()).then(|| e.text("person_id"));
+                let same_person = same.is_some_and(|p| signer.person_id == p);
                 let collides = r.collides(e.text("name"), &target, same).is_some();
                 let role_ok = matches!(
                     e.body.get("role").and_then(Value::as_str),
@@ -408,8 +411,9 @@ fn pass(
                 // A link's signer admits only computers; a cloud member needs an admin.
                 let kind_ok = elevated || !cloud;
                 let authorised = elevated || via_link() || same_person;
-                if authorised && kind_ok && !collides && role_ok && own_person(e) {
-                    r.members.insert(target, new_member(e, Role::Member));
+                if authorised && kind_ok && !collides && role_ok && own_person(e, claims) {
+                    r.members
+                        .insert(target, new_member(e, Role::Member, claims));
                     if let Some((lh, _)) = link.filter(|(_, l)| l.once) {
                         used_once.insert(lh.clone());
                     }
@@ -418,19 +422,19 @@ fn pass(
             // Sign-in: the computer's own, once, to the person its proof names.
             Kind::Merge => {
                 let m = r.members.get_mut(&target);
-                let p = proven(e).filter(|p| p.kind == ProofKind::Computer);
+                let p = claims.filter(|p| p.kind == ProofKind::Computer);
                 if let (Some(m), Some(p)) = (m, p) {
                     let to_own = target == e.signer && m.kind == MemberKind::Computer;
                     if to_own && m.person_id == m.key && p.sub == e.text("person_id") {
                         m.person_id = p.sub.clone();
-                        m.prove(p);
+                        m.prove(p.clone());
                     }
                 }
             }
             // A renewal: a proof of the member's own person and kind.
             Kind::Proof => {
                 let m = r.members.get_mut(&target).filter(|_| target == e.signer);
-                if let (Some(m), Some(p)) = (m, proven(e)) {
+                if let (Some(m), Some(p)) = (m, claims) {
                     let kind = match m.kind {
                         MemberKind::Computer => ProofKind::Computer,
                         MemberKind::Cloud => ProofKind::Workspace,
@@ -438,7 +442,7 @@ fn pass(
                     // The newest stands, whatever order a fork replays in.
                     let newer = m.proof.as_ref().is_none_or(|c| p.iat >= c.iat);
                     if p.sub == m.person_id && p.kind == kind && newer {
-                        m.prove(p);
+                        m.prove(p.clone());
                     }
                 }
             }
@@ -572,9 +576,9 @@ fn take(
 /// An `admit` names the member's own key as its `person_id`, or the `sub` of its verified
 /// proof (the one way to claim another id); a cloud member's needs a `workspace` proof, a
 /// computer's a `computer` one when it has any.
-fn own_person(e: &Entry) -> bool {
+fn own_person(e: &Entry, claims: Option<&Proof>) -> bool {
     let cloud = e.text("kind") == "cloud";
-    match proven(e) {
+    match claims {
         Some(p) => p.sub == e.text("person_id") && (p.kind == ProofKind::Workspace) == cloud,
         None => !cloud && e.text("person_id") == e.text("member"),
     }
@@ -586,15 +590,15 @@ fn proven(e: &Entry) -> Option<Proof> {
     proof::parse(token, e.text("member")).ok()
 }
 
-fn is_genesis(e: &Entry) -> bool {
+fn is_genesis(e: &Entry, claims: Option<&Proof>) -> bool {
     e.kind == Kind::Admit
-        && own_person(e)
+        && own_person(e, claims)
         && e.text("role") == "founder"
         && e.text("member") == e.signer
         && e.signer.get(..12).is_some()
 }
 
-fn new_member(e: &Entry, role: Role) -> Member {
+fn new_member(e: &Entry, role: Role, claims: Option<&Proof>) -> Member {
     let key = e.text("member").to_string();
     let person_id = match e.text("person_id") {
         "" => key.clone(),
@@ -615,8 +619,8 @@ fn new_member(e: &Entry, role: Role) -> Member {
         workspace: None,
         key,
     };
-    if let Some(p) = proven(e) {
-        m.prove(p);
+    if let Some(p) = claims {
+        m.prove(p.clone());
     }
     m
 }

@@ -450,7 +450,7 @@ fn live_count(daemon: &Daemon) -> usize {
 /// `m`'s sender as this computer's agents are told it (`label::sender`).
 pub(crate) fn sender_label(daemon: &Daemon, m: &store::Message) -> String {
     let from = label::from(&daemon.identity.short, m);
-    let declared = presence::declared_agent(daemon, &from);
+    let declared = presence::declared_agents(daemon).remove(&from);
     let team = daemon.team.lock().unwrap();
     let me = (daemon.identity.key.as_str(), daemon.identity.short.as_str());
     label::sender(&team.roster, me, m, declared.as_deref())
@@ -616,12 +616,7 @@ async fn settle(daemon: &Daemon, from: &Key, mut r: mail::Receipt, member: &str)
 fn records(daemon: &Daemon, messages: &[store::Message]) -> Vec<Value> {
     let (key, short) = (&daemon.identity.key, &daemon.identity.short);
     // Before `team`: the presences' own lock.
-    let declared: HashMap<String, String> = (messages.iter())
-        .filter_map(|m| {
-            let from = label::from(short, m);
-            Some((from.clone(), presence::declared_agent(daemon, &from)?))
-        })
-        .collect();
+    let declared = presence::declared_agents(daemon);
     let team = daemon.team.lock().unwrap();
     let mut senders: HashMap<String, Value> = HashMap::new();
     messages

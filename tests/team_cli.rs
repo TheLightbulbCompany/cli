@@ -221,7 +221,7 @@ fn founder_whose_only_other_member_is_cloud_can_leave() {
         Kind::Admit,
         json!({"member": bridge.key, "name": "bridge", "computer": "cloud", "person_id": "ws:W1",
                "kind": "cloud", "role": "member",
-               "proof": common::issuer::workspace_proof(&bridge.key, "W1", "bridge", &[], common::now_s())}),
+               "proof": common::issuer::workspace_proof(&bridge.key, "W1", "bridge", &[], lightbulb_connect::daemon::ipc::now() as i64)}),
         2,
     );
     roster::accept(

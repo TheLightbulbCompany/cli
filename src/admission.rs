@@ -101,35 +101,61 @@ pub struct Request {
     name: String,
     computer: String,
     kind: String,
-    /// The candidate's sign-in proof (`kind=workspace` for a cloud member).
-    token: Option<String>,
+    /// The candidate's sign-in proof (`kind=workspace` for a cloud member), verified once when
+    /// the request came in: `Err` when it does not verify.
+    claims: Option<Result<Proof, ()>>,
 }
 
-/// `req`'s proof, verified at `now` for its candidate: `None` without one, `Some(Err)` when it
-/// does not verify.
-fn claims(req: &Request, now: i64) -> Option<crate::Result<Proof>> {
-    let t = req.token.as_deref()?;
-    Some(proof::verify(t, &req.candidate, now))
+impl Request {
+    /// The request in join frame `f` (verifying its proof now), when it is one and its ticket
+    /// decodes; that the candidate signed it is the caller's check.
+    fn from_frame(f: &Frame) -> Option<Request> {
+        let Frame::JoinRequest {
+            ticket,
+            secret_proof,
+            candidate,
+            name,
+            computer,
+            kind,
+            proof,
+            ..
+        } = f
+        else {
+            return None;
+        };
+        let now = ipc::now() as i64;
+        Some(Request {
+            ticket: ticket::decode(ticket).ok()?,
+            proof: secret_proof.clone(),
+            candidate: candidate.clone(),
+            name: name.clone(),
+            computer: computer.clone(),
+            kind: kind.clone(),
+            claims: (proof.as_deref()).map(|t| proof::verify(t, candidate, now).map_err(|_| ())),
+        })
+    }
+
+    /// The verified proof, if any.
+    fn verified(&self) -> Option<&Proof> {
+        self.claims.as_ref()?.as_ref().ok()
+    }
 }
 
 /// The person `req`'s verified computer proof names, when one of `r`'s computers is theirs:
 /// the candidate is that person's new computer.
-fn same_person(r: &Roster, req: &Request, now: i64) -> Option<String> {
-    let c = claims(req, now)?.ok()?;
-    (req.kind == "computer" && c.kind == ProofKind::Computer && !r.computers_of(&c.sub).is_empty())
-        .then_some(c.sub)
+fn same_person<'a>(r: &Roster, req: &'a Request) -> Option<&'a str> {
+    let c = req.verified().filter(|c| c.kind == ProofKind::Computer)?;
+    let theirs = |m: &crate::roster::Member| m.kind == MemberKind::Computer && m.person_id == c.sub;
+    (req.kind == "computer" && r.members.values().any(theirs)).then_some(c.sub.as_str())
 }
 
-/// The admission dialog's text for a workspace proof: from the proof alone.
+/// The admission dialog's text for a workspace proof: from the proof alone (`proof::parse`
+/// let only plain text in).
 pub fn workspace_prompt(c: &Proof) -> String {
-    let clean = |s: &str| -> String { s.chars().filter(|c| crate::label::printable(*c)).collect() };
-    let ws = c
-        .workspace
-        .as_ref()
-        .map_or(String::new(), |w| clean(&w.name));
-    let mut agents: Vec<String> = c.agents.iter().take(3).map(|a| clean(a)).collect();
+    let ws = c.workspace.as_ref().map_or("", |w| w.name.as_str());
+    let mut agents: Vec<&str> = c.agents.iter().take(3).map(String::as_str).collect();
     if c.agents.len() > 3 {
-        agents.push("…".into());
+        agents.push("…");
     }
     let them = if agents.is_empty() {
         String::new()
@@ -141,18 +167,15 @@ pub fn workspace_prompt(c: &Proof) -> String {
     )
 }
 
-/// What the person is asked about `req`, as plain text (`label::printable`).
-fn prompt(r: &Roster, req: &Request, now: i64) -> String {
-    let text = match claims(req, now).and_then(|c| c.ok()) {
-        Some(c) if c.kind == ProofKind::Workspace => workspace_prompt(&c),
-        _ if same_person(r, req, now).is_some() => {
+/// What the person is asked about `req`: plain text (`check` let only that in).
+fn prompt(r: &Roster, req: &Request) -> String {
+    match req.verified() {
+        Some(c) if c.kind == ProofKind::Workspace => workspace_prompt(c),
+        _ if same_person(r, req).is_some() => {
             format!("Your new Mac {} wants to join. Allow?", req.computer)
         }
         _ => format!("{} wants to join your network", req.name),
-    };
-    text.chars()
-        .filter(|c| crate::label::printable(*c))
-        .collect()
+    }
 }
 
 /// What a `join_request` proves it holds: hex sha256(secret ‖ candidate).
@@ -160,13 +183,8 @@ pub fn proof(secret: &str, candidate: &str) -> String {
     HEXLOWER.encode(&Sha256::digest(format!("{secret}{candidate}").as_bytes()))
 }
 
-/// `id`'s signed `join_request` for ticket `t`.
-pub fn request(id: &Identity, t: &Ticket, name: &str, computer: &str, kind: &str) -> Frame {
-    request_with(id, t, name, computer, kind, None)
-}
-
-/// `request`, carrying the candidate's sign-in proof `token`.
-pub fn request_with(
+/// `id`'s signed `join_request` for ticket `t`, carrying its sign-in proof `token`.
+pub fn request(
     id: &Identity,
     t: &Ticket,
     name: &str,
@@ -191,8 +209,7 @@ pub fn request_with(
 
 /// `f` with its `sig`: `id`'s signature over it (`sig` left out).
 pub fn signed(id: &Identity, f: Frame) -> Frame {
-    let mut v = serde_json::to_value(&f).expect("a frame serializes");
-    v["sig"] = id.sign(&v).into();
+    let v = id.signed(serde_json::to_value(&f).expect("a frame serializes"));
     serde_json::from_value(v).expect("the same frame")
 }
 
@@ -217,22 +234,11 @@ pub async fn serve(d: Arc<Daemon>, conn: Connection) {
         return;
     };
     let genuine = signed_by(&peer, &f);
-    let raw = f.clone();
-    let Frame::JoinRequest {
-        ticket,
-        secret_proof,
-        candidate,
-        name,
-        computer,
-        kind,
-        proof: token,
-        ..
-    } = f
-    else {
+    let Frame::JoinRequest { candidate, .. } = &f else {
         conn.close(VarInt::from_u32(0), b"");
         return;
     };
-    if candidate != peer || !genuine {
+    if *candidate != peer || !genuine {
         eprintln!(
             "join: dropped a forged join request from {}",
             net::short(&peer)
@@ -240,11 +246,11 @@ pub async fn serve(d: Arc<Daemon>, conn: Connection) {
         conn.close(VarInt::from_u32(0), b"");
         return;
     }
-    let Ok(ticket) = ticket::decode(&ticket) else {
+    let Some(req) = Request::from_frame(&f) else {
         eprintln!("join: refused {} ({BAD_TICKET})", net::short(&peer));
         return tell(&d, &conn, send, "", &peer, Err(BAD_TICKET)).await;
     };
-    let ticket_id = ticket.ticket_id.clone();
+    let ticket_id = req.ticket.ticket_id.clone();
     // Admitted already (its roster lost on the way): the roster again, nothing written.
     if d.team.lock().unwrap().roster.members.contains_key(&peer) {
         eprintln!(
@@ -253,23 +259,11 @@ pub async fn serve(d: Arc<Daemon>, conn: Connection) {
         );
         return tell(&d, &conn, send, &ticket_id, &peer, Ok(())).await;
     }
-    let req = Request {
-        ticket,
-        proof: secret_proof,
-        candidate,
-        name,
-        computer,
-        kind,
-        token,
-    };
-    let gone = async {
-        conn.closed().await;
-    };
     let verdict = match open(&d, &req) {
-        Err(FORWARD) => forward(&d, &conn, raw, &req).await,
+        Err(FORWARD) => forward(&d, &conn, f, &req).await,
         Err(r) => Some(Err(r)),
         Ok((_, Some(v))) => Some(v),
-        Ok((n, None)) => wait(&d, gone, n, req).await,
+        Ok((n, None)) => wait(&d, conn.closed(), n, req).await,
     };
     let Some(verdict) = verdict else {
         return conn.close(VarInt::from_u32(0), b"");
@@ -304,7 +298,7 @@ fn open(d: &Daemon, req: &Request) -> Result<(i64, Option<Verdict>), &'static st
     // A cloud candidate, and a person's new computer, always wait for an Allow.
     let ask = req.ticket.mode != "open"
         || req.kind == "cloud"
-        || same_person(&team.roster, req, now).is_some();
+        || same_person(&team.roster, req).is_some();
     let n = store.put_join(&row(req, now)).map_err(fail)?;
     eprintln!("join: J{n} open for {}", net::short(&req.candidate));
     if ask {
@@ -359,22 +353,22 @@ fn check(
         _ => return Err(UNSUPPORTED),
     };
     // Decided from the proof, never from what the request says of itself.
-    let c = match claims(req, now) {
+    let c = match &req.claims {
         None if cloud => return Err(UNSUPPORTED),
         None => None,
         Some(Ok(c)) if (c.kind == ProofKind::Workspace) == cloud => Some(c),
         Some(_) if cloud => return Err(UNSUPPORTED),
         Some(_) => return Err(BAD_REQUEST),
     };
-    let name = match c.as_ref().and_then(|c| c.workspace.as_ref()) {
+    let name = match c.and_then(|c| c.workspace.as_ref()) {
         Some(w) if cloud => w.name.as_str(),
         _ => req.name.as_str(),
     };
     if !fits(name) || !fits(&req.computer) {
         return Err(BAD_REQUEST);
     }
-    let same = same_person(r, req, now);
-    match r.collides(name, &req.candidate, same.as_deref()) {
+    let same = same_person(r, req);
+    match r.collides(name, &req.candidate, same) {
         Some(Collision::Name) => return Err(NAME_TAKEN),
         Some(Collision::Key) => return Err(KEY_COLLISION),
         None => {}
@@ -395,9 +389,13 @@ fn check(
     Ok(link.once)
 }
 
-/// A name or computer name: trimmed, 1-64 characters, no control characters.
+/// A name or computer name: trimmed, 1-64 characters, all `label::printable` (so the dialog
+/// shows it as is).
 fn fits(s: &str) -> bool {
-    !s.is_empty() && s.trim() == s && s.chars().count() <= 64 && !s.chars().any(char::is_control)
+    !s.is_empty()
+        && s.trim() == s
+        && s.chars().count() <= 64
+        && s.chars().all(crate::label::printable)
 }
 
 /// Writes request `n`'s checked `admit`; for a `once` link, marks it used here.
@@ -413,13 +411,13 @@ fn try_admit(
     let mut body = json!({"member": req.candidate, "name": req.name, "computer": req.computer,
         "person_id": req.candidate, "kind": req.kind, "role": "member",
         "ticket_id": req.ticket.ticket_id});
-    // `check` verified it: the person (or `ws:<id>`) it names, and a workspace's own name.
-    if let Some(Ok(c)) = claims(req, now) {
+    // `check` took it: the person (or `ws:<id>`) it names, and a workspace's own name.
+    if let Some(c) = req.verified() {
         if let Some(w) = c.workspace.as_ref().filter(|_| req.kind == "cloud") {
             body["name"] = w.name.clone().into();
         }
-        body["person_id"] = c.sub.into();
-        body["proof"] = req.token.clone().into();
+        body["person_id"] = c.sub.clone().into();
+        body["proof"] = c.token.clone().into();
     }
     if let Err(e) = net_ops::write(d, team, store, Kind::Admit, body, now) {
         eprintln!("join: J{n}: {e}");
@@ -457,7 +455,7 @@ fn admit(d: &Daemon, n: i64, req: &Request) -> Verdict {
 /// candidate is gone.
 async fn wait(d: &Daemon, gone: impl Future, n: i64, req: Request) -> Option<Verdict> {
     let (tx, rx) = oneshot::channel();
-    let text = prompt(&d.team.lock().unwrap().roster, &req, ipc::now() as i64);
+    let text = prompt(&d.team.lock().unwrap().roster, &req);
     // Before the dialog: a headless one answers at once.
     d.admissions.lock().unwrap().insert(
         n,
@@ -562,8 +560,7 @@ async fn forward(d: &Daemon, conn: &Connection, raw: Frame, req: &Request) -> Op
     let now = ipc::now() as i64;
     let to = {
         let t = d.team.lock().unwrap();
-        let person = same_person(&t.roster, req, now)?;
-        let ms = t.roster.computers_of(&person);
+        let ms = t.roster.computers_of(same_person(&t.roster, req)?);
         ms.into_iter()
             .map(|m| m.key.clone())
             .find(|k| d.peers.is_online(k))
@@ -671,32 +668,8 @@ pub async fn from_member(d: Arc<Daemon>, from: String, f: Frame) {
 
 /// The request in a forwarded `join_request`, when its candidate signed it, and its ticket id.
 fn forwarded(f: &Frame) -> Option<(Request, String)> {
-    let Frame::JoinRequest {
-        ticket,
-        secret_proof,
-        candidate,
-        name,
-        computer,
-        kind,
-        proof,
-        ..
-    } = f
-    else {
-        return None;
-    };
-    let ticket = ticket::decode(ticket)
-        .ok()
-        .filter(|_| signed_by(candidate, f))?;
-    let id = ticket.ticket_id.clone();
-    let req = Request {
-        ticket,
-        proof: secret_proof.clone(),
-        candidate: candidate.clone(),
-        name: name.clone(),
-        computer: computer.clone(),
-        kind: kind.clone(),
-        token: proof.clone(),
-    };
+    let req = Request::from_frame(f).filter(|r| signed_by(&r.candidate, f))?;
+    let id = req.ticket.ticket_id.clone();
     Some((req, id))
 }
 
@@ -826,7 +799,7 @@ pub async fn join(id: u64, body: &Value, d: &Arc<Daemon>) -> Response {
         let own = t.roster.members.get(me).and_then(|m| m.proof.as_ref());
         own.map(|p| p.token.clone())
     });
-    let req = request_with(&d.identity, &t, &name, &computer, kind, token.as_deref());
+    let req = request(&d.identity, &t, &name, &computer, kind, token.as_deref());
     // The last listed member's refusal, when every reachable one refused.
     let mut last = None;
     for m in t.members.iter().filter(|m| *m != me) {

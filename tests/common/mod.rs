@@ -241,12 +241,17 @@ pub fn seed_pair(a: &Env, b: &Env) -> [Entry; 2] {
     seeded
 }
 
-/// Unix seconds.
-pub fn now_s() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64
+/// `e`'s invite link of `mode` (`team.invite`): its ticket.
+pub fn invite(e: &Env, mode: &str) -> String {
+    let r = e.ask(json!({"id": 1, "op": "team.invite", "mode": mode}));
+    assert_eq!(r["ok"], true, "{r}");
+    r["ticket"].as_str().unwrap().into()
+}
+
+/// `e`'s members (`team.get`).
+pub fn members(e: &Env) -> Vec<Value> {
+    let r = e.ask(json!({"id": 1, "op": "team.get"}));
+    r["members"].as_array().unwrap().clone()
 }
 
 /// The same team in both stores before either daemon starts: `a` founds "acme" (computer
