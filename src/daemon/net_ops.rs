@@ -141,7 +141,8 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, peer_pid: Option
 /// read again is re-read here. Not person-only: `config.toml` is the agent's to write anyway.
 pub fn reload(daemon: &Daemon) -> crate::Result<()> {
     let config = crate::config::Config::load(&crate::paths::state_dir())?;
-    if daemon.team.lock().unwrap().set_config(config) {
+    let off = super::canonical_off(&config);
+    if daemon.team.lock().unwrap().set_config(config, off) {
         daemon.presence.notify_one();
     }
     Ok(())

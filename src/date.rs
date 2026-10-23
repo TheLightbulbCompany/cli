@@ -25,10 +25,13 @@ pub fn local_time(secs: i64) -> String {
     let tm = |t: i64| {
         // SAFETY: `tm` is plain data, and `localtime_r` writes only the one we pass it.
         let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-        unsafe { libc::localtime_r(&(t as libc::time_t), &mut tm) };
-        tm
+        let ok = !unsafe { libc::localtime_r(&(t as libc::time_t), &mut tm) }.is_null();
+        ok.then_some(tm)
     };
-    let (t, today) = (tm(secs), tm(crate::daemon::ipc::now() as i64));
+    // No local time to be had (an out-of-range time): UTC says it truthfully.
+    let (Some(t), Some(today)) = (tm(secs), tm(crate::daemon::ipc::now() as i64)) else {
+        return utc(secs);
+    };
     let hm = format!("{:02}:{:02}", t.tm_hour, t.tm_min);
     if (t.tm_year, t.tm_yday) == (today.tm_year, today.tm_yday) {
         hm

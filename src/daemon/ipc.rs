@@ -366,7 +366,9 @@ fn register(id: u64, body: &Value, daemon: &Daemon) -> Response {
     let me = caller.unwrap_or((r.pid, r.birth_micros));
     let key = Key::new(&daemon.identity.short, &r.provider, &r.conversation);
     // A folder turned off is not shown to anyone: its sessions are not registered at all.
-    if presence::hidden(&daemon.team.lock().unwrap().off, &r.cwd) {
+    // `hidden` canonicalises the cwd: a syscall, so never under the team lock.
+    let off = daemon.team.lock().unwrap().off.clone();
+    if presence::hidden(&off, &r.cwd) {
         return Response::ok(id, json!({ "key": key, "ignored": true }));
     }
     let mut store = daemon.store.lock().unwrap();

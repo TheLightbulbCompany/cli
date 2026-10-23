@@ -31,17 +31,23 @@ pub struct TeamState {
 }
 
 impl TeamState {
-    /// Takes `config` (and its canonical `off`); whether it changed.
-    pub fn set_config(&mut self, config: Config) -> bool {
-        let changed = self.config != config;
-        self.off = config
-            .folders_off
-            .iter()
-            .map(|o| crate::presence::canonical(o))
-            .collect();
+    /// Takes `config` and its canonical `off` (computed before the lock: `canonical` is a
+    /// syscall); whether either changed (a folder may resolve anew with the file unchanged).
+    pub fn set_config(&mut self, config: Config, off: Vec<PathBuf>) -> bool {
+        let changed = self.config != config || self.off != off;
+        self.off = off;
         self.config = config;
         changed
     }
+}
+
+/// `config.folders_off`, each `presence::canonical`: `TeamState::set_config`'s `off`.
+pub fn canonical_off(config: &Config) -> Vec<PathBuf> {
+    config
+        .folders_off
+        .iter()
+        .map(|o| crate::presence::canonical(o))
+        .collect()
 }
 
 /// What every connection handler shares.
@@ -170,7 +176,8 @@ pub async fn run(dir: &Path) -> Result<()> {
         config: Config::default(),
         off: vec![],
     };
-    team.set_config(config);
+    let off = canonical_off(&config);
+    team.set_config(config, off);
     net_ops::sync_team_row(&store, &roster::Roster::default(), &team.roster)?;
 
     // We hold the lock, so any socket file left behind is stale.
