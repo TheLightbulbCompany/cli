@@ -15,7 +15,7 @@ use crate::net::short;
 use crate::roster::{Member, MemberKind};
 use crate::store::Store;
 use data_encoding::BASE64;
-use iroh::endpoint::{RecvStream, SendStream};
+use iroh::endpoint::{RecvStream, SendStream, VarInt};
 use rusqlite::params;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -33,6 +33,8 @@ pub const CHUNK_MAX: usize = 65_536;
 pub const INPUT_MAX: usize = 4_096;
 /// How long either end waits for the other's opener.
 const OPEN_WAIT: Duration = Duration::from_secs(10);
+/// Clock skew allowed on an inbound grant's end, past `GRANT_MAX_S`.
+const SKEW_S: i64 = 300;
 
 /// The open streams, and what was dropped.
 #[derive(Default)]
@@ -57,6 +59,8 @@ struct Open {
     send: Arc<tokio::sync::Mutex<(SendStream, u32)>>,
     /// The task reading the other end (`register` starts it).
     reader: Option<tokio::task::AbortHandle>,
+    /// Set by `shut`: a send waiting on flow control gives up and resets the stream.
+    closed: tokio::sync::watch::Sender<bool>,
 }
 
 /// `f` (a `share_grant`) with its `sig` set: `id`'s signature over it without `t` or `sig`.
@@ -78,7 +82,7 @@ fn signed_part(f: &Frame) -> Value {
 
 /// The inbound grant checks, all before storing: signed by `granter`, which is the peer, for
 /// a session under the peer's prefix, naming this computer (`me`) as the viewer, ending in
-/// the future and at most 7 days ahead.
+/// the future and at most 7 days (and 5 minutes of clock skew) ahead.
 pub fn grant_ok(f: &Frame, peer: &Member, me: &str, now: i64) -> bool {
     let Frame::ShareGrant {
         grant_id,
@@ -98,7 +102,7 @@ pub fn grant_ok(f: &Frame, peer: &Member, me: &str, now: i64) -> bool {
         && frames::own(&peer.short, session)
         && viewer == me
         && *expires_at > now
-        && *expires_at <= now + GRANT_MAX_S
+        && *expires_at <= now + GRANT_MAX_S + SKEW_S // the granter's clock may run ahead
 }
 
 /// Stores grant `f` (a first copy wins: a grant id is never overwritten).
@@ -272,7 +276,9 @@ async fn open(id: u64, body: &Value, d: &Arc<Daemon>) -> Response {
     // The owner echoes the opener when it accepts, and drops the stream when it does not.
     match tokio::time::timeout(OPEN_WAIT, frames::read(&mut recv)).await {
         Ok(Ok(Frame::Stream { seq: 0, .. })) => {}
-        _ => return Response::err(id, NO_GRANT),
+        // Connected but silent: not a refusal.
+        Err(_) => return Response::err(id, UNREACHABLE),
+        Ok(_) => return Response::err(id, NO_GRANT),
     }
     let o = Open {
         grant_id,
@@ -282,6 +288,7 @@ async fn open(id: u64, body: &Value, d: &Arc<Daemon>) -> Response {
         expires_at: None,
         send: Arc::new(tokio::sync::Mutex::new((send, 0))),
         reader: None,
+        closed: Default::default(),
     };
     let sid = register(d, o, recv, false);
     Response::ok(id, json!({ "stream_id": sid }))
@@ -358,6 +365,7 @@ pub async fn accept(d: Arc<Daemon>, viewer: String, mut send: SendStream, mut re
         expires_at,
         send: Arc::new(tokio::sync::Mutex::new((send, 0))),
         reader: None,
+        closed: Default::default(),
     };
     let sid = register(&d, o, recv, input);
     eprintln!("streams: {sid} opened to {}", short(&viewer));
@@ -382,18 +390,33 @@ fn register(d: &Arc<Daemon>, mut o: Open, recv: RecvStream, input: bool) -> Stri
             shut(d, &k, x);
         }
     }
-    o.reader =
-        Some(tokio::spawn(pump(d.clone(), sid.clone(), recv, o.owner, input)).abort_handle());
+    let reader = pump(d.clone(), sid.clone(), recv, o.owner, input, o.expires_at);
+    o.reader = Some(tokio::spawn(reader).abort_handle());
     open.insert(sid.clone(), o);
     sid
 }
 
 /// Reads the other end until it closes: on the viewer side the owner's chunks become
 /// `stream` events; on the owner side the viewer's frames become `stream_input` on an input
-/// grant, and are dropped (and counted) otherwise.
-async fn pump(d: Arc<Daemon>, sid: String, mut recv: RecvStream, owner: bool, input: bool) {
+/// grant, and are dropped (and counted) otherwise; a frame past the grant's end closes it.
+async fn pump(
+    d: Arc<Daemon>,
+    sid: String,
+    mut recv: RecvStream,
+    owner: bool,
+    input: bool,
+    expires_at: Option<i64>,
+) {
     while let Ok(f) = frames::read(&mut recv).await {
+        if owner && expires_at.is_some_and(|e| e <= ipc::now() as i64) {
+            eprintln!("streams: {sid}: the grant ended");
+            break;
+        }
         let Frame::Stream { seq, bytes, .. } = f else {
+            if owner {
+                d.streams.dropped_input.fetch_add(1, Ordering::Relaxed);
+                eprintln!("streams: {sid}: dropped a {} frame", f.kind());
+            }
             continue;
         };
         let size = BASE64.decode(bytes.as_bytes()).map(|b| b.len());
@@ -417,20 +440,22 @@ async fn pump(d: Arc<Daemon>, sid: String, mut recv: RecvStream, owner: bool, in
             );
         }
     }
-    if d.streams.take(&sid).is_some() {
-        eprintln!("streams: {sid} closed by the other end");
-        event(&d, json!({"event": "stream_closed", "stream_id": sid}));
+    if let Some(mut o) = d.streams.take(&sid) {
+        o.reader = None; // this task
+        shut(&d, &sid, o);
     }
 }
 
-/// Closes `o` (its stream finished, its reader stopped) and says so.
+/// Closes `o` (its stream finished, its reader stopped) and says so. A send in flight holds
+/// the write half: told by `closed`, it gives up and resets the stream.
 fn shut(d: &Daemon, sid: &str, o: Open) {
     if let Some(r) = o.reader {
         r.abort();
     }
+    o.closed.send_replace(true);
     if let Ok(mut s) = o.send.try_lock() {
         let _ = s.0.finish();
-    } // a write in flight holds it: the last clone's drop finishes the stream
+    }
     eprintln!("streams: {sid} closed");
     event(d, json!({"event": "stream_closed", "stream_id": sid}));
 }
@@ -452,7 +477,7 @@ async fn send(id: u64, body: &Value, d: &Arc<Daemon>) -> Response {
         return Response::err(id, BAD_REQUEST);
     };
     let now = ipc::now() as i64;
-    let (half, grant_id, session, cap, expired) = {
+    let (half, grant_id, session, cap, expired, mut closed) = {
         let open = d.streams.open.lock().unwrap();
         let Some(o) = open.get(sid) else {
             return Response::err(id, NOT_FOUND);
@@ -460,7 +485,7 @@ async fn send(id: u64, body: &Value, d: &Arc<Daemon>) -> Response {
         let cap = if o.owner { CHUNK_MAX } else { INPUT_MAX };
         let expired = o.expires_at.is_some_and(|e| e <= now);
         let (g, s) = (o.grant_id.clone(), o.session.clone());
-        (o.send.clone(), g, s, cap, expired)
+        (o.send.clone(), g, s, cap, expired, o.closed.subscribe())
     };
     if bytes.len() > cap {
         return Response::err(id, BAD_REQUEST);
@@ -471,22 +496,36 @@ async fn send(id: u64, body: &Value, d: &Arc<Daemon>) -> Response {
         }
         return Response::err(id, NO_GRANT);
     }
-    let mut s = half.lock().await;
-    s.1 += 1;
-    let seq = s.1;
-    let f = Frame::Stream {
-        grant_id,
-        session,
-        seq,
-        bytes: data.into(),
+    let write = async {
+        let mut s = half.lock().await;
+        s.1 += 1;
+        let f = Frame::Stream {
+            grant_id,
+            session,
+            seq: s.1,
+            bytes: data.into(),
+        };
+        // QUIC flow control: this waits while the other end is behind.
+        frames::write(&mut s.0, &f).await.map(|()| s.1)
     };
-    // QUIC flow control: this waits while the other end is behind.
-    if frames::write(&mut s.0, &f).await.is_err() {
-        drop(s);
-        if let Some(o) = d.streams.take(sid) {
-            shut(d, sid, o);
+    let sent = tokio::select! {
+        r = write => Some(r),
+        _ = closed.wait_for(|c| *c) => None,
+    };
+    match sent {
+        Some(Ok(seq)) => Response::ok(id, json!({ "seq": seq })),
+        Some(Err(_)) => {
+            if let Some(o) = d.streams.take(sid) {
+                shut(d, sid, o);
+            }
+            Response::err(id, UNREACHABLE)
         }
-        return Response::err(id, UNREACHABLE);
+        // Closed while waiting: the half-written stream is reset, not finished.
+        None => {
+            if let Ok(mut s) = half.try_lock() {
+                let _ = s.0.reset(VarInt::from_u32(0));
+            }
+            Response::err(id, NOT_FOUND)
+        }
     }
-    Response::ok(id, json!({ "seq": seq }))
 }
