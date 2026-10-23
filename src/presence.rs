@@ -80,15 +80,8 @@ pub fn my_person(d: &Daemon, r: &Roster) -> String {
 }
 
 /// `s` as published: `folder` is `cwd`'s last part, or all of it with `share_paths`; repo and
-/// branch as its hook reported them (never read here: see `Daemon::git`).
-fn remote(d: &Daemon, s: &Session, share_paths: bool) -> Remote {
-    let (repo, branch) = d
-        .git
-        .lock()
-        .unwrap()
-        .get(&s.key.0)
-        .cloned()
-        .unwrap_or_default();
+/// branch as its hook reported them.
+fn remote(s: &Session, share_paths: bool) -> Remote {
     let folder = if share_paths {
         s.cwd.clone()
     } else {
@@ -100,8 +93,8 @@ fn remote(d: &Daemon, s: &Session, share_paths: bool) -> Remote {
     Remote {
         session_id: s.key.0.clone(),
         agent: s.provider.clone(),
-        repo,
-        branch,
+        repo: s.repo.clone(),
+        branch: s.branch.clone(),
         folder,
         status: STATUSES[usize::from(s.status != Status::Live)].into(),
         doing: s.doing.clone(),
@@ -111,67 +104,37 @@ fn remote(d: &Daemon, s: &Session, share_paths: bool) -> Remote {
     .clamp()
 }
 
-/// Whether `cwd` is under one of `off` (`folders_off`, each `canonical`).
+/// Whether `cwd` is under one of `off` (`folders_off`, each `canonical`). A string compare, no
+/// filesystem call: a hook reports its cwd resolved (`resolved`), in the agent's process,
+/// which has the folder access the person gave it.
 pub(crate) fn hidden(off: &[PathBuf], cwd: &str) -> bool {
-    !off.is_empty() && {
-        let cwd = canonical_cwd(cwd);
-        off.iter().any(|o| cwd.starts_with(o))
-    }
+    let cwd = lower(PathBuf::from(cwd));
+    off.iter().any(|o| cwd.starts_with(o))
 }
 
-/// `canonical(cwd)`, cached, resolved on its own thread and waited for at most 1 s (macOS may
-/// hold a stat under a session's folder for a privacy prompt). Until it is resolved, the path
-/// as given (lowercased on macOS), so a hidden folder named as `folders_off` names it still
-/// matches. ponytail: the cache is never pruned or refreshed (one entry per cwd seen).
-fn canonical_cwd(cwd: &str) -> PathBuf {
-    static CACHE: std::sync::Mutex<Option<HashMap<String, PathBuf>>> = std::sync::Mutex::new(None);
-    let cached = |c: &str| {
-        CACHE
-            .lock()
-            .unwrap()
-            .get_or_insert_default()
-            .get(c)
-            .cloned()
-    };
-    if let Some(p) = cached(cwd) {
-        return p;
-    }
-    let (tx, rx) = std::sync::mpsc::channel();
-    let owned = cwd.to_string();
-    std::thread::spawn(move || {
-        let p = canonical(Path::new(&owned));
-        CACHE
-            .lock()
-            .unwrap()
-            .get_or_insert_default()
-            .insert(owned, p.clone());
-        let _ = tx.send(p);
-    });
-    rx.recv_timeout(Duration::from_secs(1)).unwrap_or_else(|_| {
-        let p = PathBuf::from(cwd);
-        if cfg!(target_os = "macos") {
-            PathBuf::from(cwd.to_lowercase())
-        } else {
-            p
-        }
-    })
-}
-
-/// `p` resolved (symlinks, `..`); a path that does not exist (a deleted folder) is its nearest
-/// existing parent resolved, then the rest as given. Lowercased on macOS, whose volumes ignore case.
-pub(crate) fn canonical(p: &Path) -> PathBuf {
-    let p = p
-        .ancestors()
-        .find_map(|a| {
-            let rest = p.strip_prefix(a).ok()?;
-            Some(std::fs::canonicalize(a).ok()?.join(rest))
-        })
-        .unwrap_or_else(|| p.to_path_buf());
+/// `p` lowercased on macOS, whose volumes ignore case.
+fn lower(p: PathBuf) -> PathBuf {
     if cfg!(target_os = "macos") {
         PathBuf::from(p.to_string_lossy().to_lowercase())
     } else {
         p
     }
+}
+
+/// `p` resolved (symlinks, `..`); a path that does not exist (a deleted folder) is its nearest
+/// existing parent resolved, then the rest as given.
+pub fn resolved(p: &Path) -> PathBuf {
+    p.ancestors()
+        .find_map(|a| {
+            let rest = p.strip_prefix(a).ok()?;
+            Some(std::fs::canonicalize(a).ok()?.join(rest))
+        })
+        .unwrap_or_else(|| p.to_path_buf())
+}
+
+/// `resolved`, lowercased on macOS: how `folders_off` holds a folder.
+pub(crate) fn canonical(p: &Path) -> PathBuf {
+    lower(resolved(p))
 }
 
 /// This computer's presence: its live sessions (newest first), the non-live addresses still
@@ -224,7 +187,7 @@ fn build(d: &Daemon, seq: u64) -> Frame {
     Frame::Presence {
         member: d.identity.key.clone(),
         seq,
-        sessions: live.iter().map(|s| remote(d, s, share)).collect(),
+        sessions: live.iter().map(|s| remote(s, share)).collect(),
         known,
         kept,
     }
@@ -489,9 +452,12 @@ pub fn directory(d: &Daemon, query: Option<&str>) -> Value {
     let key = &d.identity.key;
     let mut out = vec![];
     for s in &local {
-        let r = remote(d, s, false);
+        let r = remote(s, false);
         if hit(&own, &r, &s.cwd) {
-            out.push(record(&own, &me, &r, &s.cwd, true, true));
+            let mut v = record(&own, &me, &r, &s.cwd, true, true);
+            // `who --all`'s name for it (the MCP server leaves it out).
+            v["handle"] = s.handle.clone().into();
+            out.push(v);
         }
     }
     for (m, l) in &remote_ones {
@@ -499,11 +465,6 @@ pub fn directory(d: &Daemon, query: Option<&str>) -> Value {
         for r in l.sessions.iter().filter(|r| hit(m, r, "")) {
             out.push(record(m, &me, r, "", verified, up));
         }
-    }
-    // `who --all`'s handles (the MCP server leaves them out).
-    for r in &mut out {
-        let (id, agent) = (r["session_id"].as_str(), r["agent"].as_str());
-        r["handle"] = ipc::handle_of(d, id.unwrap_or_default(), agent.unwrap_or_default()).into();
     }
     json!({ "sessions": out })
 }

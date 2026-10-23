@@ -530,16 +530,20 @@ fn run(id: u64, op: &str, body: &Value, d: &Arc<Daemon>) -> Result<Response> {
     let me = &d.identity.key;
     let hold_id = body["hold"].as_str().and_then(|s| dialog::number(s, 'H'));
     Ok(match op {
-        // `holds {}` -> `{holds: [{id, kind, target_session, from, label, preview, created_at}]}`
+        // `holds {}` -> `{holds: [{id, kind, target_session, from, label, verified, preview,
+        // created_at}]}` (`verified` as the label says it)
         "holds" => {
             let team = d.team.lock().unwrap();
             let store = d.store.lock().unwrap();
             let list: Vec<Value> = open(&store)?
                 .iter()
                 .map(|h| {
+                    let from = sessions::member_of(&h.from_session).unwrap_or_default();
+                    let m = team.roster.by_short(from);
                     json!({"id": h.name(), "kind": h.kind(), "target_session": h.target_session,
                         "from": h.from_session,
                         "label": label::render(&team.roster, me, &h.from_session),
+                        "verified": m.is_some_and(|m| label::verified(m, me)),
                         "preview": preview(&h.message.body), "created_at": h.created_at})
                 })
                 .collect();

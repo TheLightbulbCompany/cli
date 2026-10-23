@@ -176,7 +176,19 @@ async fn handle(
             Response::ok(id, json!({}))
         }
         "register" => register(id, &req.body, daemon),
-        "sessions" => Response::ok(id, json!({ "sessions": live_sessions(daemon) })),
+        // `sessions {handle?}`: with a handle, the live session of it (`not_found` when none
+        // is; `bad_request` for a string that is no handle, which is a name).
+        "sessions" => match req.body["handle"].as_str() {
+            None => Response::ok(id, json!({ "sessions": live_sessions(daemon) })),
+            Some(h) if !is_handle(h) => Response::err(id, BAD_REQUEST),
+            Some(h) => match live_sessions(daemon)
+                .into_iter()
+                .find(|s| s.handle.as_deref() == Some(h))
+            {
+                Some(s) => Response::ok(id, json!({ "sessions": [s] })),
+                None => Response::err(id, NOT_FOUND),
+            },
+        },
         "end" => match req.body["key"].as_str() {
             Some(key) => end(id, key, &req.body, daemon),
             None => Response::err(id, BAD_REQUEST),
@@ -369,9 +381,7 @@ fn register(id: u64, body: &Value, daemon: &Daemon) -> Response {
     let me = caller.unwrap_or((r.pid, r.birth_micros));
     let key = Key::new(&daemon.identity.short, &r.provider, &r.conversation);
     // A folder turned off is not shown to anyone: its sessions are not registered at all.
-    // `hidden` canonicalises the cwd: a syscall, so never under the team lock.
-    let off = daemon.team.lock().unwrap().off.clone();
-    if presence::hidden(&off, &r.cwd) {
+    if presence::hidden(&daemon.team.lock().unwrap().off, &r.cwd) {
         return Response::ok(id, json!({ "key": key, "ignored": true }));
     }
     let mut store = daemon.store.lock().unwrap();
@@ -390,22 +400,21 @@ fn register(id: u64, body: &Value, daemon: &Daemon) -> Response {
         Ok(_) => {}
         Err(_) => return Response::err(id, INTERNAL),
     }
-    // Shown to teammates: plain text, cut to 256 characters, whatever the caller sent.
+    // Shown to teammates: plain text, cut to 256 characters, whatever the caller sent. A hook
+    // reads them only at a session's start and each prompt: absent, the stored ones stay.
     let clamp = |s: Option<String>| {
         s.map(|s| crate::label::plain(&s, 256))
             .filter(|s| !s.is_empty())
     };
-    let git = (clamp(r.repo), clamp(r.branch));
-    if daemon
-        .git
-        .lock()
-        .unwrap()
-        .insert(key.0.clone(), git.clone())
-        != Some(git)
-    {
-        daemon.presence.notify_one();
-    }
-    handle_of(daemon, &key.0, &r.provider);
+    let reported = ["repo", "branch"]
+        .iter()
+        .any(|f| body["session"].get(f).is_some());
+    let (repo, branch) = if reported {
+        (clamp(r.repo), clamp(r.branch))
+    } else {
+        let old = store.session(&key.0).ok().flatten();
+        old.map_or((None, None), |o| (o.repo, o.branch))
+    };
     let row = store::Session {
         key: key.0.clone(),
         provider: r.provider,
@@ -419,8 +428,8 @@ fn register(id: u64, body: &Value, daemon: &Daemon) -> Response {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs() as i64),
         executable: r.executable,
-        repo: None,
-        branch: None,
+        repo,
+        branch,
         handle: None,
     };
     // Every hook event registers: mail delivered before it has been seen.
@@ -442,6 +451,8 @@ fn put_row(daemon: &Daemon, store: &store::Store, row: &store::Session) -> crate
             r.executable.clone(),
             r.status.clone(),
             r.title.clone(),
+            r.repo.clone(),
+            r.branch.clone(),
         )
     };
     let same = |o: &store::Session| fields(o) == fields(row);
@@ -461,27 +472,14 @@ pub(crate) fn live_sessions(daemon: &Daemon) -> Vec<sessions::Session> {
         if s.tier == sessions::Tier::Push && failed.contains(&s.key.0) {
             s.tier = sessions::Tier::NextStep;
         }
-        s.handle = Some(handle_of(daemon, &s.key.0, &s.provider));
     }
     all
 }
 
-/// Session `key`'s `who` handle: `<agent>-<n>`, numbered per agent in the order this daemon
-/// life first sees each session; the same for its whole life.
-pub(crate) fn handle_of(daemon: &Daemon, key: &str, agent: &str) -> String {
-    let mut handles = daemon.handles.lock().unwrap();
-    if let Some(h) = handles.get(key) {
-        return h.clone();
-    }
-    let mut base: String = agent.chars().filter(char::is_ascii_alphanumeric).collect();
-    base.make_ascii_lowercase();
-    if base.is_empty() {
-        base = "agent".into();
-    }
-    let taken = |h: &&String| h.rsplit_once('-').is_some_and(|(b, _)| b == base);
-    let h = format!("{base}-{}", handles.values().filter(taken).count() + 1);
-    handles.insert(key.into(), h.clone());
-    h
+/// Whether `s` is a `who` handle: `<provider>-<n>`.
+fn is_handle(s: &str) -> bool {
+    s.rsplit_once('-')
+        .is_some_and(|(p, n)| sessions::PROVIDERS.contains(&p) && n.parse::<u32>().is_ok())
 }
 
 fn live_count(daemon: &Daemon) -> usize {

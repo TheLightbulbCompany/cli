@@ -197,7 +197,7 @@ fn git_in(cwd: &Path) -> Option<(Option<String>, Option<String>)> {
 
 /// Receipt `r` with its `note`, when it has one.
 fn with_note(mut r: Value) -> Value {
-    if let Some(n) = mail::receipt_note(&r) {
+    if let Some(n) = mail::receipt_note(&r, None) {
         r["note"] = n.into();
     }
     r

@@ -103,9 +103,14 @@ pub struct Session {
     /// that serves the thread. `tier` is `push` exactly when this is set.
     #[serde(skip)]
     pub push_via: Option<PathBuf>,
-    /// The short name `who` shows and `send` takes (`codex-1`), set by the daemon.
+    /// The short name `who` shows and `send` takes (`codex-1`): its row's place (`store`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handle: Option<String>,
+    /// Its repo and branch as its hook read them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
 }
 
 /// Alive means the pid exists AND was born at `birth_micros`; a reused pid is not the session.
@@ -139,7 +144,9 @@ fn from_row(r: &store::Session, home: &Path) -> Option<Session> {
             Tier::NextStep
         },
         push_via,
-        handle: None,
+        handle: r.handle.clone(),
+        repo: r.repo.clone(),
+        branch: r.branch.clone(),
         provider,
         conversation,
         pid,
@@ -213,6 +220,8 @@ pub fn scan_claude(home: &Path, member_short: &str) -> Vec<Session> {
             },
             push_via: socket,
             handle: None,
+            repo: None,
+            branch: None,
         });
     }
     out
@@ -227,11 +236,24 @@ pub fn all(rows: &[store::Session], home: &Path, member_short: &str) -> Vec<Sess
             Some(s) => {
                 *s = Session {
                     title: found.title.or(s.title.take()),
+                    handle: s.handle.take(),
+                    repo: s.repo.take(),
+                    branch: s.branch.take(),
                     ..found
                 }
             }
             None => out.push(found),
         }
+    }
+    // A session never registered has no row: numbered after the rows of its provider.
+    let n = |h: &str| h.rsplit_once('-')?.1.parse::<usize>().ok();
+    let mut next = (rows.iter().filter(|r| r.provider == "claude"))
+        .filter_map(|r| n(r.handle.as_deref()?))
+        .max()
+        .unwrap_or(0);
+    for s in out.iter_mut().filter(|s| s.handle.is_none()) {
+        next += 1;
+        s.handle = Some(format!("{}-{next}", s.provider));
     }
     out.retain(|s| s.status != Status::Gone);
     for s in &mut out {

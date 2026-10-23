@@ -151,18 +151,24 @@ pub fn run(agent: &str, event: &str, stdin: &str) -> Result<Option<String>> {
     };
     daemon::ensure_running()?;
     let mut conn = Conn::open()?;
-    // Read here, in the agent's process, which has the folder access the person gave it.
-    let (repo, branch) = crate::mcp::git(&h.cwd);
     let status = match h.event {
         Event::UserPromptSubmit | Event::PostToolUse => "busy",
         _ => "idle",
     };
+    // Read here, in the agent's process, which has the folder access the person gave it: the
+    // folder resolved (what `folders_off` is matched against) and, at a session's start and
+    // each prompt, its repo and branch (absent otherwise: the daemon keeps the last).
+    let cwd = crate::presence::resolved(std::path::Path::new(&h.cwd));
+    let mut session = json!({ "provider": h.provider, "conversation": h.conversation,
+        "pid": me.pid, "birth_micros": me.birth_micros, "cwd": cwd, "status": status,
+        "executable": me.executable });
+    if matches!(h.event, Event::SessionStart | Event::UserPromptSubmit) {
+        let (repo, branch) = crate::mcp::git(&h.cwd);
+        (session["repo"], session["branch"]) = (repo.into(), branch.into());
+    }
     let r = conn.call(
         "register",
-        json!({ "session": { "provider": h.provider, "conversation": h.conversation,
-            "pid": me.pid, "birth_micros": me.birth_micros, "cwd": h.cwd, "status": status,
-            "executable": me.executable, "repo": repo, "branch": branch },
-            "caller": proc_json(&me) }),
+        json!({ "session": session, "caller": proc_json(&me) }),
     )?;
     let key = r["key"].clone();
     if !key.is_string() {

@@ -36,6 +36,9 @@ Team:
   policy    Who may message your sessions without asking
   folder    Show or hide the sessions in a folder from your teammates: folder <path> on|off
 
+The Lightbulb app:
+  claude, codex, share   Run by the Lightbulb app, when it is installed
+
 Run lightbulb-connect <command> --help for its options; lightbulb-connect --version for the version.
 ";
 

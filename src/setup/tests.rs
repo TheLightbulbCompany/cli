@@ -70,7 +70,7 @@ fn setup_writes_claude_hooks_and_mcp_and_backs_up_once() {
 
     let r = setup(h, false);
     let claude = agent(&r, "claude");
-    assert!(claude.found);
+    assert_ne!(claude.state, State::NotInstalled);
     assert_eq!(
         claude.wrote,
         [h.join(".claude/settings.json"), h.join(".claude.json")]
@@ -297,7 +297,7 @@ fn remove_takes_only_our_entries() {
     let r = setup(h, true);
     for a in &r.agents {
         assert!(
-            a.found && !a.wrote.is_empty() && a.notes.is_empty(),
+            a.state == State::Removed && !a.wrote.is_empty() && a.notes.is_empty(),
             "{a:?}"
         );
     }
@@ -344,7 +344,10 @@ fn a_foreign_lightbulb_mcp_entry_is_left_alone_and_gets_no_allow_rule() {
         if !remove {
             assert!(get(h, ".codex/config.toml").starts_with(&app_toml));
             for name in ["claude", "codex", "cursor", "grok"] {
-                assert!(agent(&r, name).clash(), "{name}");
+                assert!(
+                    matches!(agent(&r, name).state, State::HooksOnly(_)),
+                    "{name}"
+                );
             }
         }
     }
@@ -360,7 +363,7 @@ fn setup_touches_only_installed_agents() {
     let found: Vec<_> = r
         .agents
         .iter()
-        .filter(|a| a.found)
+        .filter(|a| a.state != State::NotInstalled)
         .map(|a| a.name)
         .collect();
     assert_eq!(found, ["grok"]);
@@ -377,7 +380,6 @@ fn hook_command_quotes_the_executable() {
         exe: "/opt/it's/lightbulb-connect",
         server: "lightbulb",
         remove: false,
-        foreign: std::cell::Cell::new(false),
     };
     let c = ctx.hook_command("grok", "stop");
     assert_eq!(c, r"'/opt/it'\''s/lightbulb-connect' hook grok stop");
@@ -470,11 +472,9 @@ fn a_bad_server_name_writes_nothing() {
     fs::create_dir(h.join(".claude")).unwrap();
     let r = run(h, Path::new(EXE), Some("a:b"), false);
     assert!(agent(&r, "claude").wrote.is_empty());
-    assert!(agent(&r, "claude")
-        .error
-        .as_deref()
-        .unwrap()
-        .contains("server name"));
+    assert!(
+        matches!(&agent(&r, "claude").state, State::Failed { why, .. } if why.contains("server name"))
+    );
     assert!(!h.join(".claude.json").exists());
 }
 
@@ -573,15 +573,15 @@ fn auto_naming_takes_lightbulb_connect_where_lightbulb_is_taken() {
     put(h, ".claude.json", &app.to_string());
     let r = run(h, Path::new(EXE), None, false);
     let claude = agent(&r, "claude");
-    assert_eq!(
-        (claude.tools.as_deref(), claude.clashed),
-        (Some("lightbulb-connect"), true)
-    );
+    assert_eq!(claude.state, State::ClashedTo("lightbulb-connect".into()));
     assert_eq!(
         json_at(h, ".claude.json")["mcpServers"]["lightbulb"],
         app["mcpServers"]["lightbulb"]
     );
-    assert_eq!(agent(&r, "grok").tools.as_deref(), Some("lightbulb"));
+    assert_eq!(
+        agent(&r, "grok").state,
+        State::Connected("lightbulb".into())
+    );
     assert_eq!(tools(h, "claude").as_deref(), Some("lightbulb-connect"));
     assert_eq!(tools(h, "grok").as_deref(), Some("lightbulb"));
     // Removing takes ours out under both names, and leaves the app's.
@@ -618,7 +618,8 @@ fn a_file_it_cannot_read_is_a_failure_not_a_name_clash() {
     put(h, ".cursor/hooks.json", "[]");
     let r = run(h, Path::new(EXE), None, false);
     let (claude, cursor) = (agent(&r, "claude"), agent(&r, "cursor"));
-    assert!(!claude.clash() && !cursor.clash());
+    assert!(matches!(claude.state, State::Failed { hooks: true, .. }));
+    assert!(matches!(cursor.state, State::Failed { hooks: false, .. }));
     let line = claude.line();
     assert!(
         line.starts_with("Claude Code: hooks added, but not its tools — "),

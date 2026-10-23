@@ -166,6 +166,15 @@ fn directory_shows_the_hooks_repo_and_never_reads_the_folder() {
         (&json!("engine"), &json!("from-hook")),
         "{d}"
     );
+    // A later event that reports neither (a tool use) keeps them.
+    let r = e.ask(
+        json!({"id": 1, "op": "register", "session": {"provider": "codex",
+        "conversation": "g1", "pid": p.pid, "birth_micros": p.birth_micros,
+        "cwd": proj.path()}}),
+    );
+    assert!(r["key"].is_string(), "{r}");
+    let d = e.ask(json!({"id": 1, "op": "directory"}));
+    assert_eq!(d["sessions"][0]["branch"], "from-hook", "{d}");
 }
 
 #[test]
@@ -775,10 +784,15 @@ fn folder_off_hides_sessions_after_reload() {
     let proj = tempfile::tempdir().unwrap();
     let dir = proj.path().to_str().unwrap().to_string();
     let p = os::process(std::process::id()).unwrap();
+    // As a hook reports a cwd: resolved.
+    let resolved = |d: &str| {
+        let r = lightbulb_connect::presence::resolved(std::path::Path::new(d));
+        r.to_str().unwrap().to_string()
+    };
     let register = |conv: &str, cwd: &str| {
         a.ask(
             json!({"id": 1, "op": "register", "session": {"provider": "codex",
-            "conversation": conv, "pid": p.pid, "birth_micros": p.birth_micros, "cwd": cwd}}),
+            "conversation": conv, "pid": p.pid, "birth_micros": p.birth_micros, "cwd": resolved(cwd)}}),
         )
     };
     let s1 = register("f1", &dir)["key"].as_str().unwrap().to_string();

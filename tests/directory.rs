@@ -132,6 +132,15 @@ async fn each_member_sees_the_whole_directory() {
             .any(|l| l.contains("bob") && l.contains("mbp")),
         "{text}"
     );
+    // Handles are this computer's sessions' alone: a teammate's takes no number.
+    assert!(rows[0].starts_with("codex-1 "), "{text}");
+    let d = a.ask(json!({"id": 1, "op": "directory"}));
+    let theirs = d["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["session_id"] == kb2.as_str());
+    assert!(theirs.into_iter().all(|s| s["handle"].is_null()), "{d}");
 }
 
 /// `id` played over its own endpoint: dialed into `env` and past its `hello` (at `head`).
@@ -281,14 +290,18 @@ async fn off_folder_sessions_are_not_published() {
     for d in [&hidden, &open, &root.path().join("x")] {
         std::fs::create_dir_all(d).unwrap();
     }
-    // The off folder spelled through `..`, its sessions through a symlink: both resolve.
+    // The off folder spelled through `..`, its sessions through a symlink, as their hook
+    // reports them: resolved (the daemon itself makes no filesystem call on a cwd).
     std::os::unix::fs::symlink(&secret, root.path().join("alias")).unwrap();
     let off = root.path().join("x/../secret");
     a.daemon(false, "", &[]);
     let sa = a.short();
     let (open, hidden) = (
         open.to_str().unwrap().to_string(),
-        root.path().join("alias/proj").to_str().unwrap().to_string(),
+        lightbulb_connect::presence::resolved(&root.path().join("alias/proj"))
+            .to_str()
+            .unwrap()
+            .to_string(),
     );
     for (conversation, cwd) in [
         ("o1", &open),

@@ -51,9 +51,6 @@ pub fn canonical_off(config: &Config) -> Vec<PathBuf> {
 }
 
 /// What every connection handler shares.
-/// A session's `(repo, branch)`, either unknown.
-pub type Git = (Option<String>, Option<String>);
-
 pub struct Daemon {
     pub store: Mutex<Store>,
     pub identity: Identity,
@@ -70,12 +67,6 @@ pub struct Daemon {
     pub mailbox_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Keys whose last push failed (more recently than one succeeded).
     pub push_failed: Mutex<HashSet<String>>,
-    /// Each session's repo and branch as its hook last read them (the daemon never reads a
-    /// session's folder: macOS may hold that read for a privacy prompt), by key.
-    /// ponytail: never pruned, one entry per session this daemon life; prune when keys churn.
-    pub git: Mutex<HashMap<String, Git>>,
-    /// `who`'s handles (`codex-1`), by session id, in the order this daemon life first saw them.
-    pub handles: Mutex<HashMap<String, String>>,
     /// The member connections (`net`).
     pub peers: net::Peers,
     /// The person's OS dialogs, one at a time, none while `ui.claim` is live.
@@ -220,8 +211,6 @@ pub async fn run(dir: &Path) -> Result<()> {
         mail: Notify::new(),
         mailbox_locks: Mutex::default(),
         push_failed: Mutex::default(),
-        git: Mutex::default(),
-        handles: Mutex::default(),
         peers,
         dialogs,
         dialog_answers: Mutex::new(Some(answers)),
