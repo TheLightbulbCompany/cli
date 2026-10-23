@@ -8,8 +8,9 @@
 //! `meta {relay}`); either one wins and then nothing of ours is contacted. Else ours: the
 //! issuer's `relays.json` and `relays.json.minisig`, verified against one of two compiled-in
 //! minisign keys and accepted only whole, cached in the state dir with its signature and
-//! refetched at most daily; the cached copy serves while a fetch fails. None at all: direct
-//! only. Every relay URL, from any source, passes `parse` (https only) or is ignored.
+//! refetched at most daily; the cached copy serves while a fetch fails. Else the default: the
+//! iroh project's public relays (`iroh::defaults::prod`), so a person configures nothing.
+//! Every relay URL, from any source, passes `parse` (https only) or is ignored.
 //!
 //! What is known of our list (`State`) is read from disk and verified once, at start; after
 //! that only a fetch changes it (and writes the files), so `list` is a pure function.
@@ -34,6 +35,8 @@ pub const FLOOR_FILE: &str = "relays.floor";
 pub const MAX_RELAYS: usize = 8;
 /// A cached list younger than this is used without asking the issuer.
 const FRESH: Duration = Duration::from_secs(86_400);
+/// Why a fetch failed when the issuer has no `relays.json` (404): not reported.
+const UNPUBLISHED: &str = "no relay list published";
 /// A failed fetch is tried again after this.
 pub const RETRY: Duration = Duration::from_secs(3_600);
 
@@ -55,7 +58,9 @@ pub enum Source {
     Team,
     /// Our signed `relays.json`.
     Lightbulb,
-    /// No relay: direct only.
+    /// The iroh project's public relays (`default_urls`).
+    Default,
+    /// No relay: direct only (only the tests' `LIGHTBULB_CONNECT_DEBUG_NO_DEFAULT_RELAYS`).
     #[default]
     None,
 }
@@ -95,8 +100,14 @@ pub fn parse(url: &str) -> Option<RelayUrl> {
     ok.then_some(u)
 }
 
+/// The iroh project's public relays, as the iroh crate names them.
+pub fn default_urls() -> Vec<RelayUrl> {
+    iroh::defaults::prod::default_relay_map().urls()
+}
+
 /// The relays for `config_relay` (`config.toml: relay`), then the team's own `team` (the
-/// roster's `meta {relay}`), then ours (`state`). An empty or invalid setting is skipped.
+/// roster's `meta {relay}`), then ours (`state`), then `default_urls`. An empty or invalid
+/// setting is skipped.
 pub fn list(config_relay: &Option<String>, team: &Option<String>, state: &State) -> List {
     let own = |v: &Option<String>| v.as_deref().and_then(parse);
     let (urls, source) = if let Some(u) = own(config_relay) {
@@ -109,10 +120,10 @@ pub fn list(config_relay: &Option<String>, team: &Option<String>, state: &State)
             .as_ref()
             .map(|c| c.0.clone())
             .unwrap_or_default();
-        let source = if urls.is_empty() {
-            Source::None
+        let (urls, source) = if urls.is_empty() {
+            (default_urls(), Source::Default)
         } else {
-            Source::Lightbulb
+            (urls, Source::Lightbulb)
         };
         let error = state.last_fetch_error.clone();
         return List {
@@ -175,6 +186,13 @@ impl State {
         self.last_fetch_at = Some(Instant::now());
         match self.refresh(dir, issuer, keys) {
             Ok(()) => self.last_fetch_error = None,
+            // No list published (yet): the default serves, and nobody needs to hear about it.
+            Err(e) if e.to_string() == UNPUBLISHED => {
+                if cfg!(debug_assertions) {
+                    eprintln!("relay: fetching {issuer}: {e}");
+                }
+                self.last_fetch_error = None;
+            }
             Err(e) => {
                 eprintln!("relay: fetching {issuer}: {e}");
                 self.last_fetch_error = Some(e.to_string());
@@ -200,7 +218,11 @@ impl State {
         let text = |url: String| -> Result<String> {
             Ok(String::from_utf8(crate::http::get(&url)?).map_err(|_| "not text")?)
         };
-        let body = text(format!("{base}/{FILE}"))?;
+        // Only `relays.json` itself missing is quiet: a list without its signature is ours to fix.
+        let body = text(format!("{base}/{FILE}")).map_err(|e| match e.to_string() {
+            s if s.ends_with(" answered 404") => UNPUBLISHED.into(),
+            _ => e,
+        })?;
         let sig = text(format!("{base}/{SIG_FILE}"))?;
         let (urls, at) = verify(body.as_bytes(), &sig, keys)?;
         if at < self.floor {
@@ -248,7 +270,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn config_then_team_win_and_no_list_is_direct_only() {
+    fn config_then_team_win_and_no_list_is_the_default() {
         let u = |s: &str| Some(s.to_string());
         let mut s = State::default();
         let l = list(&u("https://mine.example"), &u("https://team.example"), &s);
@@ -265,7 +287,8 @@ mod tests {
             list(&u("ftp://mine.example"), &u("https://t.example"), &s).source,
             Source::Team
         );
-        assert_eq!(list(&None, &u("garbage"), &s), List::default());
+        let d = list(&None, &u("garbage"), &s);
+        assert_eq!((d.source, d.urls), (Source::Default, default_urls()));
         // Ours: the issuer is down and nothing is cached; the error stays until a fetch ends it.
         let dir = tempfile::tempdir().unwrap();
         assert!(s.fetch_if_due(
@@ -275,7 +298,7 @@ mod tests {
             &[]
         ));
         let l = list(&None, &None, &s);
-        assert_eq!((l.source, l.urls.len()), (Source::None, 0));
+        assert_eq!((l.source, l.urls), (Source::Default, default_urls()));
         assert!(l.error.is_some());
         // Retried only after an hour; with a relay of our own, never.
         assert!(!s.fetch_if_due(

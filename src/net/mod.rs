@@ -77,6 +77,9 @@ pub struct Knobs {
     pub relay_keys: Vec<String>,
     /// `LIGHTBULB_CONNECT_DEBUG_RELAY_ONLY=1`: no direct (IP) transport, only the relays.
     relay_only: bool,
+    /// `LIGHTBULB_CONNECT_DEBUG_NO_DEFAULT_RELAYS=1`: no public relays when nothing else is
+    /// set (direct only), so a test never reaches the internet.
+    no_default_relays: bool,
 }
 
 fn compiled_keys() -> Vec<String> {
@@ -121,6 +124,8 @@ impl Knobs {
             relay_keys: var("LIGHTBULB_CONNECT_DEBUG_RELAY_KEYS")
                 .map_or_else(compiled_keys, |v| v.split(',').map(String::from).collect()),
             relay_only: var("LIGHTBULB_CONNECT_DEBUG_RELAY_ONLY").is_some_and(|v| v == "1"),
+            no_default_relays: var("LIGHTBULB_CONNECT_DEBUG_NO_DEFAULT_RELAYS")
+                .is_some_and(|v| v == "1"),
         }
     }
 
@@ -137,6 +142,7 @@ impl Knobs {
             outbox_s: outbox::TTL_S,
             relay_keys: compiled_keys(),
             relay_only: false,
+            no_default_relays: false,
         }
     }
 }
@@ -279,11 +285,17 @@ impl Peers {
     /// (`relay.get`, tickets and dials read it), and pokes the relay loop for the endpoint.
     /// In memory only: no disk, no crypto.
     pub fn relays_changed(&self, t: &TeamState) {
-        let new = relay::list(
+        let mut new = relay::list(
             &t.config.relay,
             &t.roster.relay,
             &self.relay_state.lock().unwrap(),
         );
+        if new.source == relay::Source::Default && self.knobs().no_default_relays {
+            new = relay::List {
+                error: new.error,
+                ..relay::List::default()
+            };
+        }
         let mut l = self.relays.lock().unwrap();
         if (&new.urls, new.source) != (&l.urls, l.source) {
             log_relays(&new);
@@ -307,9 +319,13 @@ impl Peers {
         *last
     }
 
-    /// The first relay in effect, for a ticket's `relay_hint` (`""` when none).
+    /// The first relay in effect, for a ticket's `relay_hint` (`""` when none, or the
+    /// default: the joiner has the default too).
     pub fn relay_hint(&self) -> String {
         let l = self.relays.lock().unwrap();
+        if l.source == relay::Source::Default {
+            return String::new();
+        }
         l.urls.first().map(|u| u.to_string()).unwrap_or_default()
     }
 
@@ -1351,9 +1367,11 @@ pub(crate) fn pages(entries: Vec<Entry>) -> Vec<Frame> {
         .collect()
 }
 
-/// Relay `url`, without QUIC address discovery (off in Phase 1: the relay serves HTTPS only).
+/// Relay `url`: iroh's own config for one of its public relays (QUIC address discovery on);
+/// any other without it (off in Phase 1: our relays serve HTTPS only).
 fn relay_config(url: RelayUrl) -> iroh::RelayConfig {
-    iroh::RelayConfig::new(url, None)
+    let public = iroh::defaults::prod::default_relay_map().get(&url);
+    public.map_or_else(|| iroh::RelayConfig::new(url, None), |c| (*c).clone())
 }
 
 /// The relays in effect, in the log: their URLs and where they came from.

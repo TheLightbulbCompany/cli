@@ -25,6 +25,7 @@ impl Net {
         let claude = tempfile::tempdir().unwrap();
         let daemon = Command::new(EXE)
             .arg("daemon")
+            .env("LIGHTBULB_CONNECT_DEBUG_NO_DEFAULT_RELAYS", "1")
             .env(paths::HOME_ENV, dir.path())
             .env("LIGHTBULB_CONNECT_CLAUDE_HOME", claude.path())
             .stdout(Stdio::null())
@@ -425,4 +426,46 @@ fn a_discovered_claude_session_drains_its_own_inbox() {
     let r = net.call(json!({"id": 1, "op": "inbox", "key": key,
         "caller": {"pid": me.pid, "birth_micros": 1}}));
     assert_eq!(r["reason"], "not_owner", "{r}");
+}
+
+/// Runs `hook claude session-start` pinned to `caller`; returns its stderr.
+fn claude_start_as(net: &Net, caller: &os::Process) -> String {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/hooks/claude-session-start.json");
+    let out = Command::new(EXE)
+        .args(["hook", "claude", "session-start"])
+        .env(
+            "LIGHTBULB_CONNECT_HOOK_CALLER",
+            format!("{}:{}", caller.pid, caller.birth_micros),
+        )
+        .env(paths::HOME_ENV, net.dir.path())
+        .env("LIGHTBULB_CONNECT_CLAUDE_HOME", net.claude.path())
+        .stdin(std::fs::File::open(path).unwrap())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "a hook must always exit 0");
+    assert!(out.stdout.is_empty());
+    String::from_utf8(out.stderr).unwrap()
+}
+
+#[test]
+fn a_claude_hook_fired_by_cursor_registers_nothing() {
+    let net = Net::new();
+    let key = net.key("claude", C1);
+    // A process at Cursor's app path (a copy of `sleep`) ran the Claude hook: nothing.
+    let app = tempfile::tempdir().unwrap();
+    let exe = app.path().join("Cursor.app/Contents/MacOS/Cursor");
+    std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+    std::fs::copy("/bin/sleep", &exe).unwrap();
+    let mut cursor = Command::new(&exe).arg("30").spawn().unwrap();
+    let p = os::process(cursor.id()).unwrap();
+    let err = claude_start_as(&net, &p);
+    assert!(err.contains("fired by Cursor"), "{err}");
+    assert!(net.session(&key).is_none());
+    let _ = cursor.kill();
+    let _ = cursor.wait();
+    // The same hook from a plain process registers the Claude session.
+    let other = Other::new();
+    assert_eq!(claude_start_as(&net, &other.1), "");
+    assert!(net.session(&key).is_some());
 }

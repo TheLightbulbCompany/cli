@@ -74,14 +74,29 @@ impl Env {
     }
 }
 
-const LINE: &str = "Join Lightbulb Connect: https://thelightbulb.company/j/#";
+const LINE: &str = "lightbulb-connect join '";
+const HEADER: &str = "Send this line to the person (or paste it on your other computer):\n";
 
-/// What `invite` printed after its first line (which says what to do with the link).
-fn printed_link(o: &std::process::Output) -> String {
+/// What `invite` printed before its header (a notice, or nothing), and the join command
+/// after it; the app link follows on its own line, for the same ticket.
+fn invite_parts(o: &std::process::Output) -> (String, String) {
     let text = out(o);
-    let (first, rest) = text.split_once('\n').unwrap_or_else(|| panic!("{text}"));
-    assert!(first.starts_with("Send this link to the person"), "{text}");
-    rest.to_string()
+    let (notice, rest) = text.split_once(HEADER).unwrap_or_else(|| panic!("{text}"));
+    let lines: Vec<&str> = rest.lines().collect();
+    let [line, "Replace NAME with the name they go by.", app] = lines[..] else {
+        panic!("{text}")
+    };
+    let ticket = line
+        .strip_prefix(LINE)
+        .and_then(|t| t.strip_suffix("' --name NAME"))
+        .unwrap_or_else(|| panic!("{text}"));
+    assert_eq!(app, format!("lightbulb://join/{ticket}"), "{text}");
+    (notice.to_string(), line.to_string())
+}
+
+/// The join command `invite` printed.
+fn printed_link(o: &std::process::Output) -> String {
+    invite_parts(o).1
 }
 
 #[test]
@@ -90,15 +105,13 @@ fn invite_reprints_the_same_link_until_new() {
     let first = printed_link(&e.run(&["invite"]));
     assert!(first.starts_with(LINE), "{first}");
     assert_eq!(printed_link(&e.run(&["invite"])), first);
-    let new = printed_link(&e.run(&["invite", "--new"]));
-    let line = new
-        .strip_prefix("Old link stopped working. New link: ")
-        .unwrap_or_else(|| panic!("{new}"));
-    assert!(line.starts_with(LINE) && line != first, "{new}");
+    let (notice, line) = invite_parts(&e.run(&["invite", "--new"]));
+    assert_eq!(notice, "The old invite stopped working.\n");
+    assert!(line != first, "{line}");
     assert_eq!(printed_link(&e.run(&["invite"])), line);
-    let once = printed_link(&e.run(&["invite", "--once"]));
+    let (once, _) = invite_parts(&e.run(&["invite", "--once"]));
     assert!(once.starts_with("One-time invite, expires "), "{once}");
-    assert!(once.contains(&format!(" UTC: {LINE}")), "{once}");
+    assert!(once.ends_with(" UTC.\n"), "{once}");
     // The once link leaves the reusable one alone.
     assert_eq!(printed_link(&e.run(&["invite"])), line);
 }
@@ -215,9 +228,10 @@ fn founder_admin_remove_and_leave_texts() {
     let o = out(&e.run(&["remove", "aden"]));
     let line = o
         .strip_prefix(
-            "Removed aden. New connections and new mail from it are blocked. The invite link was replaced: ",
+            "Removed aden. New connections and new mail from it are blocked. The old invite stopped working; send this line instead: ",
         )
-        .unwrap_or_else(|| panic!("{o}"));
+        .unwrap_or_else(|| panic!("{o}"))
+        .trim_end();
     assert!(line.starts_with(LINE) && line != old, "{o}");
     assert_eq!(printed_link(&e.run(&["invite"])), line);
     assert!(!out(&e.run(&["team"])).contains("aden"));

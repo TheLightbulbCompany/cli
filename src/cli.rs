@@ -598,28 +598,27 @@ pub fn invite(mode: Invite) -> Result<i32> {
         return refuse(&r, &[("not_admin", text)]);
     }
     let line = r["line"].as_str().unwrap_or_default();
-    println!(
-        "Send this link to the person (or paste it on your other computer): {} join '<link>'",
-        command()
-    );
     match mode {
         Invite::Once => {
             let at = crate::date::utc(r["expires_at"].as_i64().unwrap_or_default());
-            println!("One-time invite, expires {at}: {line}");
+            println!("One-time invite, expires {at}.");
         }
         Invite::Open => {
             println!(
-                "Anyone with this link joins without asking. Use it only with people you trust."
+                "Anyone with this line joins without asking. Use it only with people you trust."
             );
-            println!("{line}");
         }
-        _ if r["replaced"] == true => println!("Old link stopped working. New link: {line}"),
-        _ => println!("{line}"),
+        _ if r["replaced"] == true => println!("The old invite stopped working."),
+        _ => {}
     }
+    println!("Send this line to the person (or paste it on your other computer):");
+    println!("{line}");
+    println!("Replace NAME with the name they go by.");
+    println!("{}", r["app_link"].as_str().unwrap_or_default());
     Ok(0)
 }
 
-/// `join '<link>' [--name <n>]`: joins the network `link` invites to, waiting up to 600 s
+/// `join '<ticket>' [--name <n>]`: joins the network the join line `link` is for, waiting up to 600 s
 /// for its person to allow it. Hidden: `--kind cloud --proof <jws>`, a workspace member (the
 /// bridge joins in process; this is for tests and ops).
 pub fn join(link: &str, name: Option<String>, kind: &str, proof: Option<String>) -> Result<i32> {
@@ -762,7 +761,7 @@ pub fn signin() -> Result<i32> {
     let name = r["name"].as_str().unwrap_or_default();
     if r["solo"] == true {
         println!(
-            "Signed in as {name}. To join your network, paste its join line: {} join '<link>'",
+            "Signed in as {name}. To join your network, run the line your inviter sent: {} join '<ticket>' --name <your name>",
             command()
         );
     } else {
@@ -1120,7 +1119,7 @@ pub fn remove(name: &str) -> Result<i32> {
     }
     let n = r["name"].as_str().unwrap_or(name);
     let line = r["line"].as_str().unwrap_or_default();
-    println!("Removed {n}. New connections and new mail from it are blocked. The invite link was replaced: {line}");
+    println!("Removed {n}. New connections and new mail from it are blocked. The old invite stopped working; send this line instead: {line}");
     Ok(0)
 }
 
@@ -1180,7 +1179,13 @@ pub fn relay(set: Option<String>, local: bool) -> Result<i32> {
             "this computer"
         };
         match url.as_str() {
-            "" => println!("Relay cleared for {who}."),
+            "" => {
+                let l = ask(&mut conn, "relay.get", json!({}))?;
+                match l["source"].as_str() {
+                    Some("default") => println!("Relay cleared for {who}. Back to the default: the iroh project's public relays."),
+                    _ => println!("Relay cleared for {who}."),
+                }
+            }
             u => {
                 let canonical = crate::relay::parse(u).map_or(u.to_string(), |r| r.to_string());
                 println!("Relay for {who}: {canonical}")
@@ -1190,17 +1195,32 @@ pub fn relay(set: Option<String>, local: bool) -> Result<i32> {
     }
     let l = ask(&mut conn, "relay.get", json!({}))?;
     let source = l["source"].as_str().unwrap_or("none");
-    let urls = l["urls"].as_array().cloned().unwrap_or_default();
-    if urls.is_empty() {
+    let urls: Vec<String> = (l["urls"].as_array().into_iter().flatten())
+        .map(|u| cell(u.as_str().unwrap_or_default()))
+        .collect();
+    if source == "default" {
+        let hosts: Vec<String> = (urls.iter()).map(|u| relay_host(u)).collect();
+        println!(
+            "default  the iroh project's public relays ({})",
+            hosts.join(", ")
+        );
+        println!("Set your own: {} relay <url>", command());
+    } else if urls.is_empty() {
         println!("none (direct connections only)");
     }
-    for u in urls {
-        println!("{source}  {}", cell(u.as_str().unwrap_or_default()));
+    for u in urls.iter().filter(|_| source != "default") {
+        println!("{source}  {u}");
     }
     if let Some(e) = l["error"].as_str() {
         println!("Our relay list was refused: {}", cell(e));
     }
     Ok(0)
+}
+
+/// `https://use1-1.relay.n0.iroh.link./` -> `use1-1.relay.n0.iroh.link`.
+fn relay_host(url: &str) -> String {
+    let host = url.split_once("://").map_or(url, |(_, h)| h);
+    host.trim_end_matches('/').trim_end_matches('.').to_string()
 }
 
 /// Hands one of the app's verbs to the Lightbulb app's binary as its CLI (`cli` first, as the
@@ -1456,6 +1476,16 @@ pub fn doctor() -> Result<i32> {
     let mut call = |op: &str| conn.as_mut().and_then(|c| c.call(op, json!({})).ok());
     let up = call("ping").is_some_and(|r| r["ok"] == true);
     row("Background service", up, "running", "not running", &setup);
+    if let Some(l) = up.then(|| call("relay.get")).flatten() {
+        let first = l["urls"][0].as_str().map(cell).unwrap_or_default();
+        let state = match l["source"].as_str().unwrap_or("none") {
+            "default" => "default".to_string(),
+            "config" => format!("yours {first}"),
+            "none" => "none".to_string(),
+            source => format!("{source} {first}"),
+        };
+        row("Relay", true, &state, "", "");
+    }
     if up && call("status").is_some_and(|r| r["lan"] == "blocked") {
         let fix = "Allow lightbulb-connect in System Settings > Privacy & Security > Local Network";
         row("Local network", false, "", "blocked by macOS", fix);

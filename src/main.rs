@@ -15,8 +15,8 @@ Usage: lightbulb-connect <command> [options]
 Getting started:
   setup     Connect Claude Code, Codex, Cursor and Grok CLI here and start the background service
   doctor    Check that everything is connected, and say how to fix what is not
-  invite    Print a link that adds your other computer or a teammate
-  join      Join the team an invite link is for: join '<link>'
+  invite    Print the join line that adds your other computer or a teammate
+  join      Join the team a join line is for: join '<ticket>'
   signin    Sign in to Lightbulb, so teammates see your verified name
 
 Everyday:
@@ -107,15 +107,15 @@ enum Command {
     },
     /// Check the daemon, state permissions, agent wiring, alias and launchd job.
     Doctor,
-    /// Print this computer's invite line (the reusable link, unless a flag says otherwise).
+    /// Print this computer's join line (the reusable invite, unless a flag says otherwise).
     Invite {
-        /// Replace the reusable link; the old one stops working.
+        /// Replace the reusable invite; the old one stops working.
         #[arg(long, conflicts_with_all = ["once", "open"])]
         new: bool,
-        /// A link for one join, valid 24 hours.
+        /// An invite for one join, valid 24 hours.
         #[arg(long, conflicts_with = "open")]
         once: bool,
-        /// A link whose joins need no Allow (founder and admins).
+        /// An invite whose joins need no Allow (founder and admins).
         #[arg(long)]
         open: bool,
     },
@@ -127,12 +127,14 @@ enum Command {
         #[arg(long)]
         founder: bool,
     },
-    /// Remove a member (founder and admins); the invite link is replaced.
+    /// Remove a member (founder and admins); the invite is replaced.
     Remove { name: String },
     /// Leave the team; this computer is on its own network again.
     Leave,
-    /// Join the network an invite link is for (this computer must be on its own).
+    /// Join the network a join line is for (this computer must be on its own).
     Join {
+        /// The line your inviter sent (the long code after join, or the whole link).
+        #[arg(value_name = "TICKET")]
         link: String,
         /// The name you go by in the network (default: your user name).
         #[arg(long)]

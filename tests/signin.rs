@@ -141,7 +141,7 @@ fn signin_writes_a_merge_and_renews_before_expiry() {
     assert_eq!(
         out(&o),
         "Confirm the code ABCD-EFGH in your browser: https://example.invalid/d?c=ABCD\n\
-         Signed in as Prasiddha. To join your network, paste its join line: lightbulb-connect join '<link>'\n"
+         Signed in as Prasiddha. To join your network, run the line your inviter sent: lightbulb-connect join '<ticket>' --name <your name>\n"
     );
     let id = identity_of(&e);
     assert_eq!(

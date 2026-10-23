@@ -23,12 +23,12 @@ Both of you run the install line above. Then, on your Mac:
 lightbulb-connect invite
 ```
 
-It prints a line that starts `lightbulb-connect join '…'`. Send that whole line to your teammate.
-It contains a web address, but there is no page there yet: they paste the whole line into Terminal,
-with their name added:
+It prints the join command: `lightbulb-connect join '<ticket>' --name NAME` (and, on its own
+line, a `lightbulb://join/…` link for the Lightbulb app). Send that command to your teammate.
+They paste it into Terminal with their name in place of `NAME`:
 
 ```sh
-lightbulb-connect join '<the link you got>' --name sam
+lightbulb-connect join '<ticket>' --name sam
 ```
 
 A dialog opens on your Mac: `sam (computer "…") wants to join your team using your invite link.`
@@ -60,14 +60,8 @@ Three things that catch people out:
   Settings > Privacy & Security > Local Network), `lightbulb-connect doctor` shows
   `Local network        blocked by macOS`. Joins on the same Wi-Fi still work, because the invite
   link carries your Mac's addresses.
-- **Macs on different networks need a relay.** Run this once on the inviter's Mac; it sets the relay
-  for the whole team:
-
-  ```sh
-  lightbulb-connect relay https://use1-1.relay.n0.iroh.link
-  ```
-
-  That is the iroh project's public relay. It carries encrypted bytes only. A team can run its own.
+- **Macs on different networks** connect through the iroh project's public relays by default; a
+  team can set its own with `lightbulb-connect relay <url>`; relays carry encrypted bytes only.
 - **Restart open agent sessions.** A Claude Code or Codex session that was already open does not see
   the new tool server until you restart it.
 
