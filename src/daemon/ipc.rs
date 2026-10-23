@@ -182,10 +182,7 @@ async fn handle(
         },
         // Hops restart at a person: an agent may not speak as one.
         "send"
-            if req.body["from"]
-                .as_str()
-                .and_then(sessions::split_addr)
-                .is_some_and(|(_, rest)| rest == "terminal")
+            if req.body["from"].as_str().is_some_and(mail::is_person)
                 && !peer_pid.is_some_and(super::net_ops::person_only) =>
         {
             refused(id, "not_a_person")
@@ -492,17 +489,17 @@ fn send(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
         Err(_) => return Response::err(id, INTERNAL),
     };
     let p = match prepared {
-        Ok(p) => p,
-        Err(mut r) => {
+        mail::Prep::Go(p) => p,
+        mail::Prep::Done(mut r) => {
             if let Ok(Some(to)) = mail::recipient(&store, &from, rid) {
                 locate(daemon, &team.roster, &to, &mut r);
             }
             return Response::ok(id, json!({ "receipt": r }));
         }
     };
-    let prefix = sessions::split_addr(&p.to.0).map_or("", |(m, _)| m);
+    let prefix = sessions::member_of(&p.to.0).unwrap_or("");
     if prefix != daemon.identity.short {
-        let Some(member) = team.roster.members.values().find(|m| m.short == prefix) else {
+        let Some(member) = team.roster.by_short(prefix) else {
             return Response::err(id, super::net_ops::NOT_MEMBER);
         };
         return match outbox::enqueue(&store, p, member) {
@@ -542,9 +539,9 @@ pub(crate) fn stored(daemon: &Arc<Daemon>, to: &Key) {
 
 /// A receipt for mail to `to` under another member's prefix is `where` that member's computer.
 fn locate(daemon: &Daemon, roster: &crate::roster::Roster, to: &str, r: &mut mail::Receipt) {
-    let prefix = sessions::split_addr(to).map_or("", |(m, _)| m);
+    let prefix = sessions::member_of(to).unwrap_or("");
     if prefix != daemon.identity.short {
-        if let Some(m) = roster.members.values().find(|m| m.short == prefix) {
+        if let Some(m) = roster.by_short(prefix) {
             r.where_ = Some(m.computer.clone());
         }
     }
@@ -582,7 +579,7 @@ async fn inbox(
     // it is kept a day after; one the person's other computer keeps is refused.
     let short = &daemon.identity.short;
     if let frame::Sender::Name(_) = frame::Sender::of(short, &key.0) {
-        if sessions::split_addr(&key.0).is_some_and(|(m, _)| m == short) {
+        if sessions::member_of(&key.0) == Some(short.as_str()) {
             if !presence::claim(daemon, &key.0) {
                 return Response::err(id, admission::NAME_TAKEN);
             }

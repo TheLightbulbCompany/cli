@@ -47,13 +47,6 @@ impl Env {
             "birth_micros": birth, "cwd": "/tmp/proj", "title": "fix the thing"}}));
         r["key"].as_str().unwrap().to_string()
     }
-
-    fn short(&self) -> String {
-        self.ask(json!({"id": 1, "op": "status"}))["member_key_short"]
-            .as_str()
-            .unwrap()
-            .to_string()
-    }
 }
 
 #[test]

@@ -12,7 +12,8 @@ use serde_json::{json, Value};
 
 mod common;
 
-use common::{endpoint, out, peers, presence_with, remote, seed_pair, sees, until, Env, Peer, EXE};
+use common::{endpoint, out, presence_with, remote, seed_pair, sees, start_pair, until};
+use common::{Env, Peer, EXE};
 
 /// This test process as a `provider` session `conversation` in `cwd`.
 fn register(e: &Env, provider: &str, conversation: &str, cwd: &str) -> Value {
@@ -39,26 +40,12 @@ fn ids(records: &[Value]) -> Vec<String> {
     v
 }
 
-fn short(e: &Env) -> String {
-    e.identity().short
-}
-
-/// Two running daemons of `seed`ed stores, A dialing B; returns once both are online.
-fn pair(a: &Env, b: &Env, a_config: &str) {
-    b.daemon(false, "", &[]);
-    a.daemon(false, a_config, &[peers(&[b])]);
-    let connected = json!({"online": 1, "total": 1});
-    until(10, "both online", || {
-        a.status()["peers"] == connected && b.status()["peers"] == connected
-    });
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn each_member_sees_the_whole_directory() {
     let (a, b) = (Env::new(), Env::new());
     seed_pair(&a, &b);
-    let (sa, sb) = (short(&a), short(&b));
-    pair(&a, &b, "");
+    let (sa, sb) = (a.short(), b.short());
+    start_pair(&a, &b, "", &[]);
     assert_eq!(register(&a, "codex", "a1", "/tmp/work/api")["ok"], true);
     assert_eq!(register(&b, "claude", "b1", "/tmp/work/web")["ok"], true);
     let (ka, kb) = (format!("{sa}/codex:a1"), format!("{sb}/claude:b1"));
@@ -233,7 +220,7 @@ async fn kept_name_is_refused_on_the_persons_other_computer() {
         roster::accept(&store, &g, 10).unwrap();
         roster::accept(&store, &admit, 10).unwrap();
     }
-    pair(&a, &b, "");
+    start_pair(&a, &b, "", &[]);
 
     // A ends a session and listens on a name: both are kept for a day.
     assert_eq!(register(&a, "codex", "c1", "/tmp/k")["ok"], true);
@@ -272,7 +259,7 @@ async fn off_folder_sessions_are_not_published() {
     let off = root.path().join("x/../secret");
     let config = format!("folders_off = [{:?}]\n", off.to_str().unwrap());
     a.daemon(false, &config, &[]);
-    let sa = short(&a);
+    let sa = a.short();
     let (open, hidden) = (
         open.to_str().unwrap().to_string(),
         root.path().join("alias/proj").to_str().unwrap().to_string(),

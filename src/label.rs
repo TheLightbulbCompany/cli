@@ -2,7 +2,7 @@
 
 use crate::frame::{agent_name, Sender};
 use crate::roster::Roster;
-use crate::sessions::split_addr;
+use crate::sessions::{member_of, split_addr};
 use crate::store::Message;
 
 /// Whether `c` is safe to show a person or an agent: no control character (C0, C1, U+0085),
@@ -18,8 +18,8 @@ pub fn printable(c: char) -> bool {
 /// ` (not verified)` after a member with no proof other than the reader's own computer;
 /// `an unknown member (not verified)` for a prefix the roster does not hold.
 pub fn render(roster: &Roster, viewer: &str, from: &str) -> String {
-    let prefix = split_addr(from).map_or(from, |(m, _)| m);
-    let Some(m) = roster.members.values().find(|m| m.short == prefix) else {
+    let prefix = member_of(from).unwrap_or(from);
+    let Some(m) = roster.by_short(prefix) else {
         return "an unknown member (not verified)".into();
     };
     let (who, possessive) = if m.person_id == roster.person_of(viewer) {

@@ -427,6 +427,210 @@ impl Store {
     }
 }
 
+/// Joins each `messages m` row to its receipt `r` (the sender's `receipts` row).
+pub const MSG_RECEIPT: &str =
+    "JOIN receipts r ON r.from_key = m.from_key AND r.request_id = m.request_id";
+
+/// A peer's message whose receipt moved past what its sender was told (`told`).
+pub struct Untold {
+    pub sender: String,
+    pub id: String,
+    pub state: String,
+    pub reason: Option<String>,
+    pub told: String,
+}
+
+/// Mail between members: the mailbox, what peers sent (`seen_ids`) and the outbox.
+impl Store {
+    /// `from`'s message `request_id` as stored: `(to, body)`.
+    pub fn sent_as(
+        &self,
+        from: &str,
+        request_id: &str,
+    ) -> rusqlite::Result<Option<(String, String)>> {
+        self.conn
+            .query_row(
+                "SELECT to_key, body FROM messages WHERE from_key = ?1 AND request_id = ?2",
+                [from, request_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+    }
+
+    pub fn put_mailbox(&self, to: &str, id: &str, at: i64, expires: i64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO mailbox (to_key, message_id, queued_at, expires_at) VALUES (?1, ?2, ?3, ?4)",
+            params![to, id, at, expires],
+        )?;
+        Ok(())
+    }
+
+    /// `member`'s stored presence, as JSON.
+    pub fn presence_of(&self, member: &str) -> rusqlite::Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT presence FROM peers_sessions WHERE member = ?1",
+                [member],
+                |r| r.get(0),
+            )
+            .optional()
+    }
+
+    /// The receipt state now of envelope `id`, if `sender` sent it here.
+    pub fn seen_state(&self, sender: &str, id: &str) -> rusqlite::Result<Option<String>> {
+        self.conn
+            .query_row(
+                &format!(
+                    "SELECT r.state FROM seen_ids s JOIN messages m ON m.id = s.envelope_id \
+                     {MSG_RECEIPT} WHERE s.sender = ?1 AND s.envelope_id = ?2"
+                ),
+                [sender, id],
+                |r| r.get(0),
+            )
+            .optional()
+    }
+
+    pub fn put_seen(&self, sender: &str, id: &str, at: i64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO seen_ids VALUES (?1, ?2, 'stored', ?3)",
+            params![sender, id, at],
+        )?;
+        Ok(())
+    }
+
+    /// One past the deepest of the messages `ids` this computer sent (`origin` local).
+    pub fn hop_floor(&self, ids: [Option<&str>; 2]) -> rusqlite::Result<Option<i64>> {
+        self.conn.query_row(
+            "SELECT MAX(hops) + 1 FROM messages WHERE id IN (?1, ?2) AND origin = 'local'",
+            params![ids[0], ids[1]],
+            |r| r.get(0),
+        )
+    }
+
+    /// The peers' mail to `to` sent after `since`: `(from, origin)`.
+    pub fn net_mail_to(&self, to: &str, since: i64) -> rusqlite::Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT from_key, origin FROM messages WHERE to_key = ?1 AND sent_at > ?2 \
+             AND origin LIKE 'net:%'",
+        )?;
+        let rows = stmt.query_map(params![to, since], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect()
+    }
+
+    /// Peers' messages whose receipt moved since the sender was told.
+    pub fn untold(&self) -> rusqlite::Result<Vec<Untold>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT s.sender, s.envelope_id, r.state, r.reason, s.state FROM seen_ids s \
+             JOIN messages m ON m.id = s.envelope_id {MSG_RECEIPT} WHERE r.state != s.state"
+        ))?;
+        let rows = stmt.query_map([], |r| {
+            Ok(Untold {
+                sender: r.get(0)?,
+                id: r.get(1)?,
+                state: r.get(2)?,
+                reason: r.get(3)?,
+                told: r.get(4)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn set_told(&self, sender: &str, id: &str, state: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE seen_ids SET state = ?3 WHERE sender = ?1 AND envelope_id = ?2",
+            [sender, id, state],
+        )?;
+        Ok(())
+    }
+
+    pub fn put_outbox(&self, id: &str, member: &str, frame: &str, at: i64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO outbox VALUES (?1, ?2, ?3, 0, ?4, ?4)",
+            params![id, member, frame, at],
+        )?;
+        Ok(())
+    }
+
+    /// The frames still `queued` for `members`, due at `now`: `(member, frame)`.
+    pub fn outbox_due(
+        &self,
+        members: &[String],
+        now: i64,
+    ) -> rusqlite::Result<Vec<(String, String)>> {
+        if members.is_empty() {
+            return Ok(vec![]);
+        }
+        let marks = vec!["?"; members.len()].join(", ");
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT o.to_member, o.frame FROM outbox o JOIN messages m ON m.id = o.message_id \
+             {MSG_RECEIPT} WHERE r.state = 'queued' AND o.next_at <= ? AND o.to_member IN ({marks})"
+        ))?;
+        let args = std::iter::once(&now as &dyn rusqlite::ToSql)
+            .chain(members.iter().map(|m| m as &dyn rusqlite::ToSql));
+        let rows = stmt.query_map(rusqlite::params_from_iter(args), |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?;
+        rows.collect()
+    }
+
+    /// Outbox row `id` went out at `now`: the next try is 1, 2, 4 … at most 60 s later.
+    pub fn outbox_sent(&self, id: &str, now: i64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE outbox SET attempts = attempts + 1, next_at = ?2 + MIN(60, 1 << MIN(attempts, 6)) \
+             WHERE message_id = ?1",
+            params![id, now],
+        )?;
+        Ok(())
+    }
+
+    /// The sender's message behind outbox row `id`, if it went to `member`: `(from, request_id)`.
+    pub fn outbox_sender(
+        &self,
+        id: &str,
+        member: &str,
+    ) -> rusqlite::Result<Option<(String, String)>> {
+        self.conn
+            .query_row(
+                "SELECT m.from_key, m.request_id FROM outbox o JOIN messages m ON m.id = o.message_id \
+                 WHERE o.message_id = ?1 AND o.to_member = ?2",
+                [id, member],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+    }
+
+    /// The messages still `queued` in the outbox since `before` or earlier: `(from, request_id)`.
+    pub fn outbox_stale(&self, before: i64) -> rusqlite::Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT m.from_key, m.request_id FROM outbox o JOIN messages m ON m.id = o.message_id \
+             {MSG_RECEIPT} WHERE r.state = 'queued' AND o.created_at <= ?1"
+        ))?;
+        let rows = stmt.query_map([before], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect()
+    }
+
+    /// Drops outbox rows final before `final_before` or created before `created_before`, and
+    /// `seen_ids` from before `seen_before`.
+    pub fn prune_mail(
+        &self,
+        final_before: i64,
+        created_before: i64,
+        seen_before: i64,
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            &format!(
+                "DELETE FROM outbox WHERE created_at < ?2 OR message_id IN (SELECT o.message_id \
+                 FROM outbox o JOIN messages m ON m.id = o.message_id {MSG_RECEIPT} \
+                 WHERE r.state IN ('read', 'refused', 'expired') AND r.updated_at < ?1)"
+            ),
+            [final_before, created_before],
+        )?;
+        self.conn
+            .execute("DELETE FROM seen_ids WHERE seen_at < ?1", [seen_before])?;
+        Ok(())
+    }
+}
+
 /// A join request waiting for its person.
 const OPEN: &str = "open";
 /// How long answered join requests are kept.

@@ -36,6 +36,11 @@ pub fn split_addr(a: &str) -> Option<(&str, &str)> {
     a.split_once('/')
 }
 
+/// An address's member prefix; `None` without a `/`.
+pub fn member_of(a: &str) -> Option<&str> {
+    split_addr(a).map(|(m, _)| m)
+}
+
 /// The one address grammar: `to` as `<member>/<provider>:<conversation>` or `<member>/<name>`,
 /// a bare name taken as `member`'s. `None` for anything else (groups included).
 pub fn qualify(member: &str, to: &str) -> Option<String> {

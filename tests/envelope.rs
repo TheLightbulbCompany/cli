@@ -5,84 +5,25 @@
 use lightbulb_network::identity::Identity;
 use lightbulb_network::net::frames::Frame;
 use lightbulb_network::roster::{self, Entry, Kind};
-use serde_json::{json, Value};
+use serde_json::json;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod common;
 
-use common::{endpoint, err, identity, out, peers, person, remote, seed_pair, sees, until};
+use common::{
+    endpoint, err, identity, out, pair, peers, person, remote, seed_pair, sees, ulid, until,
+};
 use common::{Env, Peer, EXE};
-
-fn short(e: &Env) -> String {
-    e.identity().short
-}
 
 /// `<short>/codex:<conv>` on `e`.
 fn session(e: &Env, conv: &str) -> String {
-    format!("{}/codex:{conv}", short(e))
-}
-
-fn send(e: &Env, from: &str, to: &str, text: &str, rid: &str, reply_to: Option<&str>) -> Value {
-    let r = e.ask(
-        json!({"id": 1, "op": "send", "from": from, "to": to, "text": text,
-        "request_id": rid, "reply_to": reply_to}),
-    );
-    assert_eq!(r["ok"], true, "{r}");
-    r["receipt"].clone()
-}
-
-fn receipt(e: &Env, from: &str, rid: &str) -> Value {
-    e.ask(json!({"id": 1, "op": "receipt", "from": from, "request_id": rid}))["receipt"].clone()
-}
-
-fn state(e: &Env, from: &str, rid: &str) -> String {
-    receipt(e, from, rid)["state"]
-        .as_str()
-        .unwrap_or_default()
-        .into()
-}
-
-fn inbox(e: &Env, key: &str) -> Vec<Value> {
-    let r = e.ask(json!({"id": 1, "op": "inbox", "key": key}));
-    r["messages"].as_array().cloned().unwrap_or_default()
-}
-
-/// Waits for one message to `key` on `e` and takes it.
-fn take_one(e: &Env, key: &str) -> Value {
-    let mut got = vec![];
-    until(10, "a message arrives", || {
-        got = inbox(e, key);
-        !got.is_empty()
-    });
-    assert_eq!(got.len(), 1, "{got:?}");
-    got.remove(0)
-}
-
-fn unread(e: &Env, key: &str) -> u64 {
-    e.ask(json!({"id": 1, "op": "unread", "key": key}))["unread"]
-        .as_u64()
-        .unwrap()
+    format!("{}/codex:{conv}", e.short())
 }
 
 fn wait_state(e: &Env, from: &str, rid: &str, want: &str) {
     until(10, &format!("{rid} reads {want}"), || {
-        state(e, from, rid) == want
+        e.state(from, rid) == want
     });
-}
-
-/// A and B in one team, both running, A dialing B (`more` set on A).
-fn pair(more: &[(&str, String)]) -> (Env, Env) {
-    let (a, b) = (Env::new(), Env::new());
-    seed_pair(&a, &b);
-    b.daemon(false, "", &[]);
-    let mut env = vec![peers(&[&b])];
-    env.extend_from_slice(more);
-    a.daemon(false, "", &env);
-    let one = json!({"online": 1, "total": 1});
-    until(10, "both online", || {
-        a.status()["peers"] == one && b.status()["peers"] == one
-    });
-    (a, b)
 }
 
 /// `who` admitted into `e`'s stored team as "carol" (computer "cmac"), a computer or (with
@@ -97,10 +38,6 @@ fn admit(e: &Env, founder: &Identity, parent: &Entry, who: &Identity, cloud: boo
     let entry = Entry::signed(founder, vec![parent.hash()], Kind::Admit, body, 3);
     assert!(roster::accept(&e.store(), &entry, 10).unwrap());
     entry
-}
-
-fn ulid() -> String {
-    ulid::Ulid::generate().to_string()
 }
 
 fn now_ms() -> u64 {
@@ -194,14 +131,14 @@ fn stop(e: &Env) {
 async fn send_to_teammate_walks_queued_stored_delivered_read() {
     let (a, b) = pair(&[]);
     let (sa, sb) = (session(&a, "a1"), session(&b, "b1"));
-    let r = send(&a, &sa, &sb, "hello bob", "r1", None);
+    let r = a.send(&sa, &sb, "hello bob", "r1", None);
     assert_eq!(
         (r["state"].as_str(), r["where"].as_str()),
         (Some("queued"), Some("mbp")),
         "{r}"
     );
     wait_state(&a, &sa, "r1", "stored");
-    let m = take_one(&b, &sb);
+    let m = b.take_one(&sb);
     assert_eq!(
         (m["from"].as_str(), m["text"].as_str()),
         (Some(sa.as_str()), Some("hello bob"))
@@ -216,15 +153,15 @@ async fn send_to_teammate_walks_queued_stored_delivered_read() {
     wait_state(&a, &sa, "r1", "delivered");
     until(10, "read", || {
         b.ask(json!({"id": 1, "op": "mark_read", "key": sb}));
-        state(&a, &sa, "r1") == "read"
+        a.state(&sa, "r1") == "read"
     });
     // A retry of the same request is the same receipt, still on the teammate's computer.
-    let again = send(&a, &sa, &sb, "hello bob", "r1", None);
+    let again = a.send(&sa, &sb, "hello bob", "r1", None);
     assert_eq!(
         (again["state"].as_str(), again["where"].as_str()),
         (Some("read"), Some("mbp"))
     );
-    let r = send(&a, &sa, &sb, "other text", "r1", None);
+    let r = a.send(&sa, &sb, "other text", "r1", None);
     assert_eq!(r["reason"], "request_id_reused");
     // A prefix that is no member's.
     let r = a.ask(
@@ -240,13 +177,13 @@ async fn offline_recipient_stays_queued_then_stores_on_reconnect() {
     seed_pair(&a, &b);
     a.daemon(false, "", &[]);
     let (sa, sb) = (session(&a, "a1"), session(&b, "b1"));
-    assert_eq!(send(&a, &sa, &sb, "later", "r1", None)["state"], "queued");
+    assert_eq!(a.send(&sa, &sb, "later", "r1", None)["state"], "queued");
     std::thread::sleep(Duration::from_millis(1500));
-    assert_eq!(state(&a, &sa, "r1"), "queued");
+    assert_eq!(a.state(&sa, "r1"), "queued");
     // B comes up and dials A: the outbox flushes on its hello.
     b.daemon(false, "", &[peers(&[&a])]);
     wait_state(&a, &sa, "r1", "stored");
-    assert_eq!(take_one(&b, &sb)["text"], "later");
+    assert_eq!(b.take_one(&sb)["text"], "later");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -254,20 +191,20 @@ async fn outbox_survives_restart_and_dedupes() {
     let drop_acks = ("LIGHTBULB_NETWORK_DEBUG_DROP_ACKS", "1".to_string());
     let (a, b) = pair(&[drop_acks]);
     let (sa, sb) = (session(&a, "a1"), session(&b, "b1"));
-    send(&a, &sa, &sb, "once only", "r1", None);
-    until(10, "B stores it", || unread(&b, &sb) == 1);
+    a.send(&sa, &sb, "once only", "r1", None);
+    until(10, "B stores it", || b.unread(&sb) == 1);
     // A never hears the ack, so it sends again; B answers from what it has seen.
-    let line = format!("from {}: stored", short(&a));
+    let line = format!("from {}: stored", a.short());
     until(15, "B acks a duplicate", || {
         let log = std::fs::read_to_string(b.state.path().join("daemon.log")).unwrap();
         log.matches(&line).count() >= 2
     });
-    assert_eq!(state(&a, &sa, "r1"), "queued");
+    assert_eq!(a.state(&sa, "r1"), "queued");
     stop(&a);
     a.daemon(false, "", &[peers(&[&b])]);
     wait_state(&a, &sa, "r1", "stored");
-    assert_eq!(unread(&b, &sb), 1);
-    assert_eq!(take_one(&b, &sb)["text"], "once only");
+    assert_eq!(b.unread(&sb), 1);
+    assert_eq!(b.take_one(&sb)["text"], "once only");
     wait_state(&a, &sa, "r1", "delivered");
 }
 
@@ -281,9 +218,9 @@ async fn outbox_expires_after_24h_unreachable() {
         &[("LIGHTBULB_NETWORK_DEBUG_OUTBOX_S", "2".into())],
     );
     let (sa, sb) = (session(&a, "a1"), session(&b, "b1"));
-    assert_eq!(send(&a, &sa, &sb, "x", "r1", None)["state"], "queued");
+    assert_eq!(a.send(&sa, &sb, "x", "r1", None)["state"], "queued");
     wait_state(&a, &sa, "r1", "expired");
-    let r = receipt(&a, &sa, "r1");
+    let r = a.receipt(&sa, "r1");
     assert_eq!(r["reason"], "unreachable", "{r}");
 }
 
@@ -301,10 +238,10 @@ async fn late_duplicate_ack_never_regresses_a_receipt() {
     let f = envelope(&id, "r1", &sa, &sb, "hi");
     p.send(&f).await;
     assert_eq!(p.ack(&id).await.0, "stored"); // and the test, as A, "drops" it
-    take_one(&b, &sb);
+    b.take_one(&sb);
     until(10, "B reads it", || {
         b.ask(json!({"id": 1, "op": "mark_read", "key": sb}));
-        state(&b, &sa, "r1") == "read"
+        b.state(&sa, "r1") == "read"
     });
     p.recv_where(
         |f| matches!(f, Frame::Receipt { id: i, state, .. } if *i == id && state == "read"),
@@ -312,13 +249,13 @@ async fn late_duplicate_ack_never_regresses_a_receipt() {
     .await;
     p.send(&f).await;
     assert_eq!(p.ack(&id).await, ("read".into(), None));
-    assert_eq!(unread(&b, &sb), 0, "delivered once");
+    assert_eq!(b.unread(&sb), 0, "delivered once");
 
     // The sender's side: a late `stored` cannot pull a `read` back.
     drop(p);
     let (a, b2, _ep, mut p) = a_and_peer_b().await;
     let (sa, sb) = (session(&a, "a1"), session(&b2, "b1"));
-    send(&a, &sa, &sb, "hi", "r1", None);
+    a.send(&sa, &sb, "hi", "r1", None);
     let (id, ..) = p.envelope().await;
     p.answer(false, &id, "read").await;
     wait_state(&a, &sa, "r1", "read");
@@ -332,14 +269,14 @@ async fn late_duplicate_ack_never_regresses_a_receipt() {
     ))
     .await;
     until(5, "the presence after the late ack", || sees(&a, &s));
-    assert_eq!(state(&a, &sa, "r1"), "read");
+    assert_eq!(a.state(&sa, "r1"), "read");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn held_receipt_advances_to_stored_on_allow() {
     let (a, b, _ep, mut p) = a_and_peer_b().await;
     let (sa, sb) = (session(&a, "a1"), session(&b, "b1"));
-    send(&a, &sa, &sb, "may I", "r1", None);
+    a.send(&sa, &sb, "may I", "r1", None);
     let (id, ..) = p.envelope().await;
     p.answer(true, &id, "held").await;
     wait_state(&a, &sa, "r1", "held");
@@ -356,7 +293,7 @@ async fn held_receipt_advances_to_stored_on_allow() {
     ))
     .await;
     until(5, "the presence after the late ack", || sees(&a, &s));
-    assert_eq!(state(&a, &sa, "r1"), "delivered");
+    assert_eq!(a.state(&sa, "r1"), "delivered");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -371,7 +308,7 @@ async fn envelope_from_another_members_prefix_is_dropped() {
     p.send(&envelope(&good, "r2", &session(&b, "b1"), &to, "real"))
         .await;
     assert_eq!(p.any_ack().await, good);
-    assert_eq!(unread(&a, &to), 1);
+    assert_eq!(a.unread(&to), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -401,7 +338,7 @@ async fn cloud_envelope_from_an_unadvertised_session_is_refused() {
     let id = ulid();
     p.send(&envelope(&id, "r2", &friday, &to, "hi")).await;
     assert_eq!(p.ack(&id).await.0, "stored");
-    assert_eq!(take_one(&a, &to)["from"], friday.as_str());
+    assert_eq!(a.take_one(&to)["from"], friday.as_str());
     // A cloud member's principal is the sending session: friday's 13th in ten minutes is a
     // loop, atlas still gets through.
     for i in 1..13 {
@@ -430,7 +367,7 @@ async fn ack_from_a_third_member_is_ignored() {
     pc.hello(vec![]).await;
     until(5, "both online", || a.status()["peers"]["online"] == 2);
     let (sa, sb) = (session(&a, "a1"), session(&b, "b1"));
-    send(&a, &sa, &sb, "for bob", "r1", None);
+    a.send(&sa, &sb, "for bob", "r1", None);
     let (id, ..) = pb.envelope().await;
     pc.answer(true, &id, "read").await;
     pc.answer(false, &id, "read").await;
@@ -438,7 +375,7 @@ async fn ack_from_a_third_member_is_ignored() {
     pc.send(&common::presence_with(&c.key, now_ms(), vec![remote(&s)]))
         .await;
     until(5, "the presence after the forged acks", || sees(&a, &s));
-    assert_eq!(state(&a, &sa, "r1"), "queued");
+    assert_eq!(a.state(&sa, "r1"), "queued");
     pb.answer(true, &id, "stored").await;
     wait_state(&a, &sa, "r1", "stored");
 }
@@ -450,25 +387,22 @@ async fn fourth_hop_and_thirteenth_send_are_refused_loop() {
     let c = identity();
     admit(&a, &a.identity(), &admitted, &c, false);
     admit(&b, &a.identity(), &admitted, &c, false);
-    b.daemon(false, "", &[]);
-    a.daemon(false, "", &[peers(&[&b])]);
-    until(10, "A and B online", || a.status()["peers"]["online"] == 1);
+    common::start_pair(&a, &b, "", &[]);
 
     // With reply_to: hops 0, 1, 2, 3 go; the fourth agent reply is refused.
     let (sa, sb) = (session(&a, "a1"), session(&b, "b1"));
-    send(&a, &sa, &sb, "h0", "h0", None);
+    a.send(&sa, &sb, "h0", "h0", None);
     let ends = [(&b, &sb, &sa), (&a, &sa, &sb)];
     let mut first = String::new(); // A's first message, by id
     for hop in 1..=4 {
         let (me, at, there) = ends[(hop - 1) % 2];
-        let m = take_one(me, at);
+        let m = me.take_one(at);
         assert_eq!(m["hops"], hop - 1);
         if hop == 1 {
             first = m["id"].as_str().unwrap().into();
         }
         let rid = format!("h{hop}");
-        let r = send(
-            me,
+        let r = me.send(
             at,
             there,
             "re",
@@ -492,12 +426,12 @@ async fn fourth_hop_and_thirteenth_send_are_refused_loop() {
             (e, session(e, &format!("f{i}")))
         })
         .collect();
-    send(chain[0].0, &chain[0].1, &chain[1].1, "go", "f0", None);
+    chain[0].0.send(&chain[0].1, &chain[1].1, "go", "f0", None);
     for i in 1..=4 {
         let (me, at) = (chain[i].0, &chain[i].1);
-        assert_eq!(take_one(me, at)["hops"], i - 1);
+        assert_eq!(me.take_one(at)["hops"], i - 1);
         let rid = format!("f{i}");
-        let r = send(me, at, &chain[i + 1].1, "pass it on", &rid, None);
+        let r = me.send(at, &chain[i + 1].1, "pass it on", &rid, None);
         if i < 4 {
             wait_state(me, at, &rid, "stored");
         } else {
@@ -509,11 +443,11 @@ async fn fourth_hop_and_thirteenth_send_are_refused_loop() {
     let (s1, s2) = (session(&a, "t1"), session(&b, "t2"));
     for i in 0..12 {
         assert_eq!(
-            send(&a, &s1, &s2, "x", &format!("t{i}"), None)["state"],
+            a.send(&s1, &s2, "x", &format!("t{i}"), None)["state"],
             "queued"
         );
     }
-    assert_eq!(send(&a, &s1, &s2, "x", "t12", None)["reason"], "loop");
+    assert_eq!(a.send(&s1, &s2, "x", "t12", None)["reason"], "loop");
 
     // The recipient's own checks, against a member the test plays: hops 4, and the
     // thirteenth from one person, whatever session it comes from.
@@ -564,20 +498,13 @@ async fn a_person_at_the_terminal_resets_hops_to_zero() {
     let pin = format!("{}:{birth}", std::process::id());
     let (a, b) = pair(&[("LIGHTBULB_NETWORK_HOOK_CALLER", pin)]);
     let (sa, sb) = (session(&a, "a1"), session(&b, "b1"));
-    send(&a, &sa, &sb, "q", "r0", None);
-    let m = take_one(&b, &sb);
-    send(
-        &b,
-        &sb,
-        &sa,
-        "a",
-        "r1",
-        Some(m["request_id"].as_str().unwrap()),
-    );
-    let m = take_one(&a, &sa);
+    a.send(&sa, &sb, "q", "r0", None);
+    let m = b.take_one(&sb);
+    b.send(&sb, &sa, "a", "r1", Some(m["request_id"].as_str().unwrap()));
+    let m = a.take_one(&sa);
     assert_eq!(m["hops"], 1);
     // The person answers in that thread: hop 0 again.
-    let terminal = format!("{}/terminal", short(&a));
+    let terminal = format!("{}/terminal", a.short());
     let req = json!({"id": 1, "op": "send", "from": terminal, "to": sb, "text": "go on",
         "request_id": "r2", "reply_to": m["id"]});
     let r = a.ask(req.clone());
@@ -588,7 +515,7 @@ async fn a_person_at_the_terminal_resets_hops_to_zero() {
     );
     let r = person(&a, req);
     assert_eq!(r["receipt"]["state"], "queued", "{r}");
-    let m2 = take_one(&b, &sb);
+    let m2 = b.take_one(&sb);
     assert_eq!(
         (m2["hops"].as_i64(), &m2["thread"]),
         (Some(0), &m["thread"])
@@ -606,7 +533,7 @@ async fn wire_refusals_name_their_reason() {
     for (to, text, thread, reason) in [
         (sa.as_str(), "two", None, "request_id_reused"),
         ("*", "one", None, "policy"),
-        (&format!("{}/*", short(&a)), "one", None, "policy"),
+        (&format!("{}/*", a.short()), "one", None, "policy"),
         (sb.as_str(), "one", None, "not_member"),
         (sa.as_str(), "one", Some("not-a-ulid"), "unsupported"),
     ] {
@@ -618,7 +545,7 @@ async fn wire_refusals_name_their_reason() {
         p.send(&f).await;
         assert_eq!(p.ack(&id).await, refused(reason), "{to} {text}");
     }
-    assert_eq!(unread(&a, &sa), 1);
+    assert_eq!(a.unread(&sa), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -640,7 +567,7 @@ async fn input_kind_is_refused_unsupported() {
         p.ack(&id).await,
         ("refused".into(), Some("unsupported".into()))
     );
-    assert_eq!(unread(&a, &sa), 0);
+    assert_eq!(a.unread(&sa), 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -668,22 +595,22 @@ async fn files_or_oversize_body_are_refused_unsupported() {
     p.send(&envelope(&id, "r3", &sb, &sa, &"x".repeat(65_536)))
         .await;
     assert_eq!(p.ack(&id).await.0, "stored");
-    assert_eq!(unread(&a, &sa), 1);
+    assert_eq!(a.unread(&sa), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn implicit_reply_keeps_the_trigger_thread() {
     let (a, b) = pair(&[]);
     let (sa, sb, sc) = (session(&a, "a1"), session(&b, "b1"), session(&a, "c1"));
-    send(&a, &sa, &sb, "q", "r0", None);
-    let m = take_one(&b, &sb);
+    a.send(&sa, &sb, "q", "r0", None);
+    let m = b.take_one(&sb);
     let thread = m["thread"].clone();
     assert_eq!((m["hops"].as_i64(), &m["id"]), (Some(0), &thread));
-    send(&b, &sb, &sa, "answer, no reply_to", "r1", None);
-    let back = take_one(&a, &sa);
+    b.send(&sb, &sa, "answer, no reply_to", "r1", None);
+    let back = a.take_one(&sa);
     assert_eq!((back["hops"].as_i64(), &back["thread"]), (Some(1), &thread));
-    send(&b, &sb, &sc, "you take it", "r2", None);
-    let fwd = take_one(&a, &sc);
+    b.send(&sb, &sc, "you take it", "r2", None);
+    let fwd = a.take_one(&sc);
     assert_eq!(fwd["hops"], 1);
     assert_eq!(fwd["thread"], fwd["id"], "a new thread");
     assert_ne!(fwd["thread"], thread);

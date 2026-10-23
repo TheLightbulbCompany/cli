@@ -5,7 +5,6 @@ use crate::daemon::{ipc, Daemon};
 use crate::doing::TEXT_MAX;
 use crate::frame::Sender;
 use crate::mail::State;
-use crate::outbox;
 use crate::roster::{Entry, Member};
 use crate::sessions::Tier;
 use crate::{presence, sessions, Result};
@@ -220,19 +219,18 @@ pub async fn read(recv: &mut (impl AsyncRead + Unpin)) -> Result<Frame> {
 /// `roster::accept` itself. A `presence` is the peer's own: at most `presence::MAX` of each
 /// list, every session `Remote::valid` for it and every address under its prefix, a `seq` at
 /// most a day ahead of now. An `envelope` is checked by `mail::receive`. An `ack` or `receipt`
-/// names a state past `queued`, with a known reason exactly when it is `refused`, for an envelope that went to this
-/// member (`outbox::bound`). Task 14 adds the rules for the frames it serves, and until then
-/// every other kind is dropped.
-pub fn from_peer_ok(f: &Frame, peer: &Member, daemon: &Daemon) -> bool {
+/// names a state past `queued`, with a known reason exactly when it is `refused` (that it
+/// is bound to this member is `outbox::acked`'s check). Task 14 adds the rules for the frames
+/// it serves, and until then every other kind is dropped.
+pub fn from_peer_ok(f: &Frame, peer: &Member, _daemon: &Daemon) -> bool {
     match f {
         Frame::Hello { .. } | Frame::Roster { .. } | Frame::Envelope { .. } => true,
-        Frame::Ack { id, state, reason } | Frame::Receipt { id, state, reason } => {
+        Frame::Ack { state, reason, .. } | Frame::Receipt { state, reason, .. } => {
             let refused = state == "refused";
             State::parse(state).is_ok_and(|s| s != State::Queued)
                 && reason
                     .as_deref()
                     .map_or(!refused, |r| refused && REASONS.contains(&r))
-                && outbox::bound(&daemon.store.lock().unwrap(), id, &peer.key).unwrap_or(false)
         }
         Frame::Presence {
             member,

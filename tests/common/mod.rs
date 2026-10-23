@@ -1,7 +1,8 @@
 //! What the CLI and network test files share: a temp state dir and HOME, a daemon shut down
 //! on drop, a person's shell (`detached`) and socket client (`person`), the daemon env knobs,
 //! a two-member team seeded before start, and a member played by the test (`Peer`).
-//! ponytail: only `cli.rs`, `team_cli.rs`, `net_two.rs`, `join.rs`, `ui_claim.rs` and `dialog.rs` use it;
+//! ponytail: only `cli.rs`, `team_cli.rs`, `net_two.rs`, `join.rs`, `ui_claim.rs`, `dialog.rs`,
+//! `directory.rs` and `envelope.rs` use it;
 //! the other test files keep their own copies.
 #![allow(dead_code)]
 
@@ -95,6 +96,64 @@ impl Env {
         std::thread::spawn(move || child.wait());
     }
 
+    /// This computer's member prefix.
+    pub fn short(&self) -> String {
+        self.identity().short
+    }
+
+    /// `send`'s receipt (the op must succeed).
+    pub fn send(
+        &self,
+        from: &str,
+        to: &str,
+        text: &str,
+        rid: &str,
+        reply_to: Option<&str>,
+    ) -> Value {
+        let r = self.ask(
+            json!({"id": 1, "op": "send", "from": from, "to": to, "text": text,
+            "request_id": rid, "reply_to": reply_to}),
+        );
+        assert_eq!(r["ok"], true, "{r}");
+        r["receipt"].clone()
+    }
+
+    pub fn receipt(&self, from: &str, rid: &str) -> Value {
+        self.ask(json!({"id": 1, "op": "receipt", "from": from, "request_id": rid}))["receipt"]
+            .clone()
+    }
+
+    /// The receipt's state, `""` when there is none.
+    pub fn state(&self, from: &str, rid: &str) -> String {
+        self.receipt(from, rid)["state"]
+            .as_str()
+            .unwrap_or_default()
+            .into()
+    }
+
+    /// Takes what waits for `key`.
+    pub fn inbox(&self, key: &str) -> Vec<Value> {
+        let r = self.ask(json!({"id": 1, "op": "inbox", "key": key}));
+        r["messages"].as_array().cloned().unwrap_or_default()
+    }
+
+    /// Waits up to 10 s for one message to `key` and takes it.
+    pub fn take_one(&self, key: &str) -> Value {
+        let mut got = vec![];
+        until(10, "a message arrives", || {
+            got = self.inbox(key);
+            !got.is_empty()
+        });
+        assert_eq!(got.len(), 1, "{got:?}");
+        got.remove(0)
+    }
+
+    pub fn unread(&self, key: &str) -> u64 {
+        self.ask(json!({"id": 1, "op": "unread", "key": key}))["unread"]
+            .as_u64()
+            .unwrap()
+    }
+
     pub fn status(&self) -> Value {
         self.ask(json!({"id": 1, "op": "status"}))
     }
@@ -172,6 +231,31 @@ pub fn seed_pair(a: &Env, b: &Env) -> [Entry; 2] {
         roster::accept(&store, &admit, 10).unwrap();
     }
     [g, admit]
+}
+
+/// Starts `a` and `b`, already one team (`seed_pair`), A dialing B with `a_config` and `a_env`;
+/// returns once both are online.
+pub fn start_pair(a: &Env, b: &Env, a_config: &str, a_env: &[(&str, String)]) {
+    b.daemon(false, "", &[]);
+    let mut env = vec![peers(&[b])];
+    env.extend_from_slice(a_env);
+    a.daemon(false, a_config, &env);
+    until(10, "both online", || {
+        a.status()["peers"]["online"] == 1 && b.status()["peers"]["online"] == 1
+    });
+}
+
+/// Two new computers in one team (`seed_pair`), running (`start_pair`, `a_env` on A).
+pub fn pair(a_env: &[(&str, String)]) -> (Env, Env) {
+    let (a, b) = (Env::new(), Env::new());
+    seed_pair(&a, &b);
+    start_pair(&a, &b, "", a_env);
+    (a, b)
+}
+
+/// A fresh ULID, as ids and threads are.
+pub fn ulid() -> String {
+    ulid::Ulid::generate().to_string()
 }
 
 /// Polls `f` every 20 ms until it holds; panics after `secs`.

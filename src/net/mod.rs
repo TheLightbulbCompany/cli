@@ -124,6 +124,8 @@ pub struct Peers {
     pub connected: Notify,
     /// Poked when mail joins the outbox.
     pub outbox: Notify,
+    /// Woken (`notify_waiters`) whenever a member's connection ends.
+    pub disconnected: Notify,
     /// The endpoint's UDP port.
     pub port: OnceLock<u16>,
     /// The endpoint, for the candidate side of a join.
@@ -244,6 +246,7 @@ impl Peers {
         let mut live = self.live.lock().unwrap();
         if current(&mut live, key, conn).is_some() {
             live.remove(key);
+            self.disconnected.notify_waiters();
         }
     }
 }
@@ -361,11 +364,14 @@ impl Net {
 
     /// Sends what members are owed: on each `hello` every queued envelope of an online member,
     /// and every second the envelopes due (`outbox::due`'s per-row backoff) and the receipts
-    /// waiting; expires what waited too long, here and in the outbox.
+    /// waiting; every 60 s (or the outbox knob, if shorter) expires what waited too long, here
+    /// and in the outbox.
     // ponytail: a 1 s poll (two small queries) picks up receipts that mail state changes queue;
     // wake it from `mail` if that ever shows.
     async fn flush_loop(self) {
         let d = &self.0.daemon;
+        let every = Duration::from_secs(d.peers.knobs().outbox_s.clamp(1, 60));
+        let mut expired_at: Option<std::time::Instant> = None;
         loop {
             // Armed before the flush, so a `hello` during it is not missed.
             let connected = d.peers.connected.notified();
@@ -377,7 +383,11 @@ impl Net {
                 _ = tokio::time::sleep(Duration::from_secs(1)) => false,
                 _ = self.0.endpoint.closed() => return,
             };
-            if let Err(e) = flush(d, all) {
+            let expire = expired_at.is_none_or(|t| t.elapsed() >= every);
+            if expire {
+                expired_at = Some(std::time::Instant::now());
+            }
+            if let Err(e) = flush(d, all, expire) {
                 eprintln!("net: outbox: {e}");
             }
         }
@@ -582,7 +592,10 @@ impl Net {
             let store = d.store.lock().unwrap();
             let state = State::parse(&state).expect("checked by from_peer_ok");
             match outbox::acked(&store, key, &id, state, reason.as_deref(), ipc::now()) {
-                Ok(_) => eprintln!("net: {id} at {short}: {}", state.name()),
+                Ok(true) => eprintln!("net: {id} at {short}: {}", state.name()),
+                Ok(false) => {
+                    eprintln!("net: dropped an answer from {short} for {id} (not sent there)")
+                }
                 Err(e) => eprintln!("net: {id} at {short}: {e}"),
             }
         }
@@ -627,15 +640,17 @@ fn receive(d: &Arc<Daemon>, key: &str, env: &Frame, tx: &mpsc::UnboundedSender<F
 }
 
 /// One flush (`Net::flush_loop`): with `all`, every queued envelope of an online member,
-/// whatever its backoff.
-fn flush(d: &Daemon, all: bool) -> Result<()> {
+/// whatever its backoff; with `expire`, first what waited too long.
+fn flush(d: &Daemon, all: bool, expire: bool) -> Result<()> {
     let now = ipc::now();
-    let online: HashSet<String> = d.peers.online().into_iter().collect();
+    let online = d.peers.online();
     let store = d.store.lock().unwrap();
-    mail::expire(&store, now)?;
-    outbox::expire(&store, now, d.peers.knobs().outbox_s)?;
-    let due = outbox::due(&store, if all { u64::MAX } else { now })?;
-    for (member, f) in due.into_iter().filter(|(m, _)| online.contains(m)) {
+    if expire {
+        mail::expire(&store, now)?;
+        outbox::expire(&store, now, d.peers.knobs().outbox_s)?;
+    }
+    let due = outbox::due(&store, &online, if all { u64::MAX } else { now })?;
+    for (member, f) in due {
         let Frame::Envelope { id, .. } = &f else {
             continue;
         };

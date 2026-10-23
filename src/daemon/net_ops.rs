@@ -215,22 +215,26 @@ async fn tell(daemon: &Daemon, leave: Entry) -> bool {
     let deadline = tokio::time::Instant::now() + TELL_WAIT;
     let mut sent: HashSet<String> = HashSet::new();
     loop {
+        // Armed before looking, so a change between the look and the wait is not missed.
+        let gone = daemon.peers.disconnected.notified();
+        let came = daemon.peers.connected.notified();
+        tokio::pin!(gone, came);
+        gone.as_mut().enable();
+        came.as_mut().enable();
         let online: HashSet<String> = daemon.peers.online().into_iter().collect();
         if sent.iter().any(|k| !online.contains(k)) {
             return true;
         }
         for k in &online {
-            if sent.contains(k) {
-                continue;
-            }
-            if daemon.peers.send(k, frame.clone()).is_ok() {
+            if !sent.contains(k) && daemon.peers.send(k, frame.clone()).is_ok() {
                 sent.insert(k.clone());
             }
         }
-        if tokio::time::Instant::now() >= deadline {
-            return false;
+        tokio::select! {
+            _ = &mut gone => {}
+            _ = &mut came => {}
+            _ = tokio::time::sleep_until(deadline) => return false,
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
