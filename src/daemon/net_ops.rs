@@ -445,6 +445,12 @@ pub fn install(
     new: Roster,
 ) -> crate::Result<()> {
     sync_team_row(store, &team.roster, &new)?;
+    let me = daemon.identity.key.as_str();
+    // A removal of this computer, signed by an admin, that this install brings.
+    let removed = removal_notice(&team.roster, &new, me);
+    if !new.is_solo(me) {
+        let _ = std::fs::remove_file(daemon.dir.join(REMOVED));
+    }
     let mut new = new;
     new.lapse(super::ipc::now() as i64);
     let relay_changed = team.roster.relay != new.relay;
@@ -481,6 +487,69 @@ pub fn install(
         daemon.peers.relays_changed(team);
     }
     daemon.roster_changed.notify_waiters();
+    if let Some((notice, root_at)) = removed {
+        return removed_here(daemon, team, store, notice, root_at);
+    }
+    Ok(())
+}
+
+/// The file that keeps `team` saying this computer was removed, until it is in a team again.
+pub const REMOVED: &str = "removed.json";
+
+#[derive(Serialize, Deserialize)]
+pub struct Removed {
+    pub team: String,
+    pub by: String,
+    pub at: i64,
+}
+
+/// The kept `Removed` notice, while this computer is on its own network after a removal.
+pub fn removed_notice(daemon: &Daemon) -> Option<Removed> {
+    serde_json::from_slice(&std::fs::read(daemon.dir.join(REMOVED)).ok()?).ok()
+}
+
+/// The notice for a removal of `me` that going from `old` to `new` brings (a `remove` of it
+/// signed in this team, not known before), with `old`'s root time.
+fn removal_notice(old: &Roster, new: &Roster, me: &str) -> Option<(Removed, i64)> {
+    if old.team_id != new.team_id || !old.members.contains_key(me) || new.members.contains_key(me) {
+        return None;
+    }
+    let (_, e) = new
+        .log()
+        .iter()
+        .find(|(h, e)| e.kind == Kind::Remove && !old.knows(h) && e.body["member"] == me)?;
+    let by = old.members.get(&e.signer).map(|m| m.name.clone());
+    let notice = Removed {
+        team: old.team_name.clone(),
+        by: by.unwrap_or_else(|| crate::net::short(&e.signer).to_string()),
+        at: e.at,
+    };
+    Some((notice, old.created_at))
+}
+
+/// This computer was removed (`install` saw the entry): mail still queued for the team is
+/// refused (`not_member`) at once, the notice is kept for `team`, and the computer is on its
+/// own network again, as after `leave`.
+fn removed_here(
+    daemon: &Daemon,
+    team: &mut TeamState,
+    store: &Store,
+    notice: Removed,
+    root_at: i64,
+) -> crate::Result<()> {
+    let now = super::ipc::now();
+    crate::outbox::refuse_all(store, now, "not_member")?;
+    eprintln!(
+        "net: removed from \"{}\" by {}; on our own network again",
+        notice.team, notice.by
+    );
+    store.clear_roster()?;
+    let cloud = daemon.cloud.as_ref().map(|c| c.name.as_str());
+    let at = (now as i64).max(root_at + 1);
+    let g = solo_genesis(&daemon.identity, cloud, &team.config.computer, at);
+    roster::accept(store, &g, now as i64)?;
+    install(daemon, team, store, roster::replay(&[g]))?;
+    std::fs::write(daemon.dir.join(REMOVED), serde_json::to_vec(&notice)?)?;
     Ok(())
 }
 
@@ -571,7 +640,7 @@ impl TeamOps<'_> {
                 Response::ok(
                     id,
                     json!({"team_id": r.team_id, "name": r.team_name, "members": members,
-                        "heads": r.heads}),
+                        "heads": r.heads, "removed": removed_notice(self.daemon)}),
                 )
             }
             // `team.invite {mode}` -> `{ticket, line, app_link, expires_at, replaced}`. `reusable`
@@ -592,7 +661,7 @@ impl TeamOps<'_> {
                 let replaced = invite == Invite::New && live.is_some();
                 let t = match live {
                     Some(l) if invite != Invite::New => {
-                        let hint = self.daemon.peers.relay_hint();
+                        let hint = self.daemon.peers.hints();
                         ticket::sign(identity, r, l.ticket_id, l.secret, mode, l.expires_at, hint)
                     }
                     _ => self.new_link(mode, invite.once())?,
@@ -652,7 +721,7 @@ impl TeamOps<'_> {
             mode,
             once,
             self.now,
-            self.daemon.peers.relay_hint(),
+            self.daemon.peers.hints(),
         );
         self.write(Kind::Link, ticket::link_body(&t, hashed.as_deref()))?;
         self.store.put_link(

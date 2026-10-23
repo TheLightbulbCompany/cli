@@ -216,6 +216,12 @@ pub async fn deliver(daemon: Arc<Daemon>, to: Key) {
     }
 }
 
+/// `dir`'s lock file (`lock_dir`). Whether an engine runs is whether this file is locked,
+/// never the pid in it: the pid stays after an exit and may name any process by now.
+pub(crate) fn lock_path(dir: &Path) -> PathBuf {
+    dir.join("daemon.lock")
+}
+
 /// `dir`'s `daemon.lock`, held (and our pid written in it) until the file drops: one engine,
 /// daemon or embedded instance, per state dir. With `wait` it blocks until the holder is gone;
 /// without, it fails at once.
@@ -225,7 +231,7 @@ pub(crate) fn lock_dir(dir: &Path, wait: bool) -> Result<File> {
         .write(true)
         .create(true)
         .truncate(false)
-        .open(dir.join("daemon.lock"))?;
+        .open(lock_path(dir))?;
     if wait {
         lock.lock()?;
     } else if lock.try_lock().is_err() {
@@ -255,6 +261,23 @@ pub async fn run(dir: &Path) -> Result<()> {
     // Briefly wider than 0600 after bind; the 0700 state dir closes that window.
     fs::set_permissions(&sock, Permissions::from_mode(0o600))?;
     tokio::spawn(crate::admission::route(daemon.clone()));
+    // SIGTERM (launchd's stop) and SIGINT end it like a `shutdown` op: the socket and the
+    // loopback address file (`net::local`) are removed on the way out.
+    let d = daemon.clone();
+    tokio::spawn(async move {
+        use tokio::signal::unix::{signal, SignalKind};
+        let (Ok(mut term), Ok(mut int)) = (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::interrupt()),
+        ) else {
+            return;
+        };
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = int.recv() => {}
+        }
+        d.shutdown.notify_one();
+    });
     ipc::serve(listener, daemon).await;
     net.close().await;
     let _ = fs::remove_file(&sock);
@@ -293,7 +316,22 @@ pub fn ensure_running() -> Result<()> {
         }
         return Err("launchd's daemon did not answer within 5 s".into());
     }
-    ensure_running_at(&std::env::current_exe()?, &dir)
+    ensure_running_at(&daemon_exe()?, &dir)
+}
+
+/// The binary a daemon is started from: for the real install (the default state dir) the
+/// canonical one when it exists, never the caller's own: a hook of an old build still running
+/// during an upgrade would otherwise start an old daemon, which then holds the lock against
+/// the new one. A side-by-side state dir (`LIGHTBULB_CONNECT_HOME`) runs the caller's.
+fn daemon_exe() -> Result<PathBuf> {
+    let canonical = dirs::home_dir()
+        .filter(|_| std::env::var_os(paths::HOME_ENV).is_none())
+        .map(|h| cli::canonical(&h))
+        .filter(|p| p.exists());
+    Ok(match canonical {
+        Some(p) => p,
+        None => std::env::current_exe()?,
+    })
 }
 
 /// `ensure_running` for an explicit binary and state dir (tests).
@@ -316,7 +354,7 @@ pub fn ensure_running_at(exe: &Path, dir: &Path) -> Result<()> {
     }
     // A child that lost the lock to another daemon would wait for it forever: stop it, so
     // bursts of callers do not pile up waiting daemons.
-    let holder = fs::read_to_string(dir.join("daemon.lock")).ok();
+    let holder = fs::read_to_string(lock_path(dir)).ok();
     if up && holder.is_some_and(|h| h.trim() != child.id().to_string()) {
         let _ = child.kill();
     }

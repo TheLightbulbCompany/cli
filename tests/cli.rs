@@ -851,7 +851,7 @@ fn folder_off_hides_sessions_after_reload() {
     assert!(config.to_lowercase().contains(&want), "{config}");
     let o = a.run(&["folder", "/nonexistent/zz", "off"]);
     assert_eq!(o.status.code(), Some(1), "{}{}", out(&o), err(&o));
-    assert_eq!(err(&o).trim(), "no such folder: /nonexistent/zz");
+    assert_eq!(err(&o).trim(), "There is no folder at /nonexistent/zz.");
     // `on` takes it out again however it is spelled.
     let o = a
         .cmd(&["folder", "./sub/", "on"])
@@ -882,4 +882,216 @@ fn folder_off_hides_sessions_after_reload() {
     assert!(o.status.success(), "{}{}", out(&o), err(&o));
     let config = std::fs::read_to_string(a.state.path().join("config.toml")).unwrap();
     assert!(!config.to_lowercase().contains("/gone"), "{config}");
+}
+
+/// With the real install's layout (the default state dir under HOME), a command that starts
+/// the daemon starts it from the canonical binary, not from the binary it runs as: during an
+/// upgrade an old build's hook must not start an old daemon.
+#[test]
+fn the_daemon_starts_from_the_canonical_binary() {
+    let home = tempfile::tempdir().unwrap();
+    let bin = home.path().join(".lightbulb/connect/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let canonical = bin.join("lightbulb-connect");
+    let marker = home.path().join("started");
+    std::fs::write(
+        &canonical,
+        format!(
+            "#!/bin/sh\necho canonical >> '{}'\nexec '{EXE}' \"$@\"\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&canonical, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let o = Command::new(EXE)
+        .arg("who")
+        .env_remove("LIGHTBULB_CONNECT_HOME")
+        .env("HOME", home.path())
+        .env("LIGHTBULB_CONNECT_CLAUDE_HOME", home.path())
+        .env("LIGHTBULB_CONNECT_NO_LAUNCHCTL", "1")
+        .env("LIGHTBULB_CONNECT_DIALOG", "")
+        .env_remove("LIGHTBULB_CONNECT_HOOK_CALLER")
+        .output()
+        .unwrap();
+    let sock = home.path().join(".lightbulb/connect/sock");
+    if let Ok(mut s) = std::os::unix::net::UnixStream::connect(&sock) {
+        use std::io::{Read, Write};
+        let _ = writeln!(s, r#"{{"id":1,"op":"shutdown"}}"#);
+        let _ = s.read(&mut [0; 64]);
+    }
+    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "canonical\n");
+}
+
+/// `daemon --install` (and so `setup`) stops the daemon that runs now, and waits for it to
+/// let go of the lock, before it loads the job: a daemon launchd did not start would hold it.
+#[test]
+fn install_stops_the_running_daemon_first() {
+    let e = Env::new();
+    assert!(e.run(&["who"]).status.success());
+    let path = e.state.path().join("daemon.lock");
+    let pid: i32 = std::fs::read_to_string(&path)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let o = e.run(&["daemon", "--install"]);
+    assert!(o.status.success(), "{}", err(&o));
+    let free = std::fs::File::open(&path).unwrap().try_lock().is_ok();
+    assert!(free, "the old daemon still holds the lock");
+    // It drops the lock as its last step; its process ends just after.
+    common::until(
+        5,
+        "the old daemon exits",
+        || unsafe { libc::kill(pid, 0) } != 0,
+    );
+    assert_ne!(
+        unsafe { libc::kill(pid, 0) },
+        0,
+        "the old daemon still runs"
+    );
+}
+
+/// A daemon that holds the lock and does not let go (here this test, holding it) is
+/// reported by the pid in the file, and no job is installed behind it.
+#[test]
+fn install_refuses_while_the_old_daemon_will_not_stop() {
+    let e = Env::new();
+    let path = e.state.path().join("daemon.lock");
+    std::fs::write(&path, "4242\n").unwrap();
+    let holder = std::fs::File::open(&path).unwrap();
+    holder.try_lock().unwrap();
+    let o = e.run(&["daemon", "--install"]);
+    drop(holder);
+    assert_eq!(o.status.code(), Some(1));
+    let text = err(&o);
+    assert!(
+        text.starts_with(
+            "The old background service did not stop (pid 4242). Run: kill 4242, then "
+        ) && text.trim_end().ends_with(" setup again."),
+        "{text}"
+    );
+    assert!(!out(&o).contains("Background service"), "{}", out(&o));
+}
+
+/// A pid left in the file by a daemon long gone, now some live process that holds no lock,
+/// is no daemon: the install goes ahead at once.
+#[test]
+fn install_ignores_a_stale_pid_of_a_live_process() {
+    let e = Env::new();
+    let mut other = Command::new("/bin/sleep").arg("60").spawn().unwrap();
+    std::fs::write(e.state.path().join("daemon.lock"), other.id().to_string()).unwrap();
+    let t = std::time::Instant::now();
+    let o = e.run(&["daemon", "--install"]);
+    let alive = unsafe { libc::kill(other.id() as i32, 0) } == 0;
+    let _ = other.kill();
+    let _ = other.wait();
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(
+        t.elapsed() < std::time::Duration::from_secs(5),
+        "{:?}",
+        t.elapsed()
+    );
+    assert!(alive, "the unrelated process was left alone");
+}
+
+#[test]
+fn policy_refuses_your_own_person_and_forgets_an_old_row() {
+    let e = Env::new();
+    assert!(e.run(&["who"]).status.success());
+    let me = e.ask(json!({"id": 1, "op": "status"}))["member_key_short"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let o = e.person(&["policy", &me, "hold"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(
+        err(&o).trim(),
+        "That is you; your own computers always get through."
+    );
+    // A row an older build stored for my own person is shown as ignored.
+    let store = lightbulb_connect::store::Store::open(&e.state.path().join("state.db")).unwrap();
+    let mine = e.ask(json!({"id": 1, "op": "team.get"}))["members"][0]["person_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    lightbulb_connect::policy::set_person(
+        &store,
+        &mine,
+        lightbulb_connect::policy::Verdict::Hold,
+        "local",
+        1,
+    )
+    .unwrap();
+    let o = e.person(&["policy"]);
+    assert!(
+        out(&o).contains(
+            ": held for your Allow. (ignored: your own computers always get through — run: "
+        ) && out(&o).contains(&format!(" policy {mine} forget)")),
+        "{}",
+        out(&o)
+    );
+    // A row an older build stored under a literal name is marked, and forgotten on request.
+    lightbulb_connect::policy::set_person(
+        &store,
+        "aden",
+        lightbulb_connect::policy::Verdict::Hold,
+        "local",
+        1,
+    )
+    .unwrap();
+    let o = e.person(&["policy"]);
+    assert!(
+        out(&o).contains("Messages from aden: held for your Allow. (old entry — run: ")
+            && out(&o).contains(" policy aden forget)"),
+        "{}",
+        out(&o)
+    );
+    let o = e.person(&["policy", "aden", "forget"]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(!out(&o).contains("aden"), "{}", out(&o));
+}
+
+/// `daemon --install` over a loaded job boots it out BEFORE it stops the daemon: with the job
+/// loaded, KeepAlive would restart the stopped daemon, which would retake the lock. A
+/// `launchctl` shim on PATH records each call and whether the daemon's socket still answered
+/// then; the first call must be the bootout, made while the old daemon still runs.
+#[test]
+fn install_boots_the_job_out_before_it_stops_the_daemon() {
+    use std::os::unix::fs::PermissionsExt;
+    let e = Env::new();
+    assert!(e.run(&["who"]).status.success());
+    let shim = tempfile::tempdir().unwrap();
+    let log = shim.path().join("calls");
+    let sock = e.state.path().join("sock");
+    std::fs::write(
+        shim.path().join("launchctl"),
+        format!(
+            "#!/bin/sh\nif [ -S '{}' ]; then up=live; else up=gone; fi\necho \"$1 $up\" >> '{}'\n",
+            sock.display(),
+            log.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        shim.path().join("launchctl"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let path = format!("{}:/usr/bin:/bin", shim.path().display());
+    let o = e
+        .cmd(&["daemon", "--install"])
+        .env_remove("LIGHTBULB_CONNECT_NO_LAUNCHCTL")
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", err(&o));
+    let calls = std::fs::read_to_string(&log).unwrap();
+    let first = calls.lines().next().unwrap_or_default();
+    assert_eq!(first, "bootout live", "{calls}");
+    assert!(
+        calls.lines().any(|l| l.starts_with("bootstrap ")),
+        "{calls}"
+    );
 }

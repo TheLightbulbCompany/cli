@@ -105,6 +105,7 @@ async fn sync_sends_only_the_delta_in_pages() {
     let Frame::Hello {
         protocol,
         heads: a_heads,
+        ..
     } = p.recv().await
     else {
         panic!("hello first");
@@ -266,9 +267,14 @@ async fn removed_member_connection_is_closed_on_removal() {
 
     let o = a.detached(&[EXE, "remove", "bob"], "");
     assert!(o.status.success(), "{}", common::err(&o));
-    tokio::time::timeout(Duration::from_secs(2), p.conn.closed())
+    // Told first (the `remove`, nothing after it), then closed even though it never closes.
+    let mut p = p;
+    let told = entries_of(&p.pages().await);
+    assert_eq!(told.len(), 1, "{told:?}");
+    assert_eq!(told[0].kind, Kind::Remove);
+    tokio::time::timeout(Duration::from_secs(6), p.conn.closed())
         .await
-        .expect("closed within 2 s of the removal");
+        .expect("closed within 6 s of the removal");
     // A redial is refused.
     if let Ok(conn) = ep.connect(addr(&a), ALPN).await {
         tokio::time::timeout(Duration::from_secs(2), conn.closed())
@@ -313,6 +319,7 @@ async fn older_protocol_is_reported_not_served() {
     p.send(&Frame::Hello {
         protocol: 0,
         heads: vec![],
+        addrs: vec![],
     })
     .await;
     assert!(matches!(p.recv().await, Frame::Hello { .. }));
@@ -323,4 +330,160 @@ async fn older_protocol_is_reported_not_served() {
     assert_eq!(a.ask(json!({"id": 1, "op": "team.invite"}))["ok"], true);
     let next = tokio::time::timeout(Duration::from_secs(2), frames::read(&mut p.recv)).await;
     assert!(next.is_err(), "a frame after hello: {next:?}");
+}
+
+/// No `LIGHTBULB_CONNECT_PEERS` and no relay, `lan = true` (the default): two daemons on
+/// one computer find each other as two release builds do. This test cannot use mDNS: macOS
+/// refuses the multicast of an unsigned test binary (`EHOSTUNREACH`, Local Network), so it
+/// proves the loopback path (`net::local`, the same `Peers::addr` every dial and join uses),
+/// and that the daemon reports a refused mDNS instead of hiding it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_members_on_one_computer_find_each_other() {
+    let (a, b) = (Env::new(), Env::new());
+    seed_pair(&a, &b);
+    b.daemon(true, "", &[]);
+    a.daemon(true, "", &[]);
+    let connected = json!({"online": 1, "direct": 1, "total": 1});
+    until(15, "both online with no PEERS", || {
+        a.status()["peers"] == connected && b.status()["peers"] == connected
+    });
+    let lan = a.status()["lan"].as_str().unwrap().to_string();
+    assert!(
+        ["on", "blocked", "no network"].contains(&lan.as_str()),
+        "{lan}"
+    );
+    let log = std::fs::read_to_string(a.state.path().join("daemon.log")).unwrap();
+    assert_eq!(lan == "blocked", log.contains("Local Network"), "{log}");
+}
+
+/// A removed member is told: its `team` says so, it is on its own network again, and mail it
+/// still had queued for the team is refused (`not_member`) at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn removed_member_is_told() {
+    let (a, b) = (Env::new(), Env::new());
+    seed_pair(&a, &b);
+    // B never hears an ack, so its mail to A stays queued.
+    let drop_acks = ("LIGHTBULB_CONNECT_DEBUG_DROP_ACKS", "1".to_string());
+    b.daemon(true, "", &[drop_acks]);
+    a.daemon(true, "", &[]);
+    until(15, "both online", || {
+        a.status()["peers"]["online"] == 1 && b.status()["peers"]["online"] == 1
+    });
+    let (sa, sb) = (common::session(&a, "a1"), common::session(&b, "b1"));
+    b.send(&sb, &sa, "queued at removal", "r1", None);
+    assert_eq!(b.state(&sb, "r1"), "queued");
+
+    let o = a.detached(&[EXE, "remove", "bob"], "");
+    assert!(o.status.success(), "{}", common::err(&o));
+    until(10, "B is on its own network", || {
+        b.ask(json!({"id": 1, "op": "team.get"}))["members"]
+            .as_array()
+            .is_some_and(|m| m.len() == 1)
+    });
+    let r = b.receipt(&sb, "r1");
+    assert_eq!(
+        (&r["state"], &r["reason"]),
+        (&json!("refused"), &json!("not_member")),
+        "{r}"
+    );
+    let o = b.detached(&[EXE, "team"], "");
+    let text = common::out(&o);
+    let today = &lightbulb_connect::date::utc(common::now_s())[..10];
+    let line = format!(
+        "You were removed from \"acme\" by {} on {today}. This computer is on its own network again.",
+        a.ask(json!({"id": 1, "op": "team.get"}))["members"][0]["name"].as_str().unwrap()
+    );
+    assert!(text.starts_with(&line), "{text}");
+    let log = std::fs::read_to_string(b.state.path().join("daemon.log")).unwrap();
+    assert_eq!(
+        log.matches("net: removed from \"acme\"").count(),
+        1,
+        "{log}"
+    );
+}
+
+/// The loopback file is private, names its daemon's pid, and goes when SIGTERM stops it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn loopback_file_is_withdrawn_on_sigterm() {
+    use std::os::unix::fs::MetadataExt;
+    let a = Env::new();
+    a.daemon(true, "", &[]);
+    let uid = unsafe { libc::getuid() };
+    let file =
+        std::path::PathBuf::from(format!("/tmp/lightbulb-connect-{uid}")).join(a.identity().key);
+    let pid: i32 = std::fs::read_to_string(a.state.path().join("daemon.lock"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let text = std::fs::read_to_string(&file).unwrap();
+    assert_eq!(text, format!("127.0.0.1:{} {pid}", a.status()["port"]));
+    assert_eq!(std::fs::metadata(&file).unwrap().mode() & 0o777, 0o600);
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    until(10, "the file is withdrawn", || !file.exists());
+    until(
+        10,
+        "the daemon exits",
+        || unsafe { libc::kill(pid, 0) } != 0,
+    );
+}
+
+/// A removed member that dials in again is told only its removal: never a link minted (with
+/// its secret) or a member admitted after it, whatever heads it claims.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn removed_member_hears_its_removal_and_nothing_after() {
+    let (a, b) = (Env::new(), Env::new());
+    let [genesis, _] = seed_pair(&a, &b);
+    a.daemon(false, "", &[]);
+    let o = a.detached(&[EXE, "remove", "bob"], "");
+    assert!(o.status.success(), "{}", common::err(&o));
+    let later = common::invite(&a, "reusable");
+    let later = lightbulb_connect::ticket::decode(&later).unwrap().ticket_id;
+    // And a member admitted after the removal: carol, through an open link (no dialog).
+    let open = common::person(&a, json!({"id": 1, "op": "team.invite", "mode": "open"}));
+    let c = Env::new();
+    c.daemon(false, "", &[common::peers(&[&a])]);
+    let r = common::person(
+        &c,
+        json!({"id": 1, "op": "team.join", "ticket": open["line"], "name": "carol", "kind": "computer"}),
+    );
+    assert_eq!(r["state"], "admitted", "{r}");
+    let carol = c.identity().key;
+    let ep = endpoint(&b.identity()).await;
+    // Claiming to know only the genesis: everything after it would be the whole log.
+    for heads in [vec![genesis.hash()], vec![]] {
+        let mut p = Peer::dial(&ep, &a).await;
+        p.hello(heads).await;
+        let told = entries_of(&p.pages().await);
+        assert!(told.iter().any(|e| e.kind == Kind::Remove), "{told:?}");
+        assert!(
+            !told
+                .iter()
+                .any(|e| e.kind == Kind::Link && e.body["ticket_id"] == later.as_str()),
+            "a later link leaked: {told:?}"
+        );
+        assert!(
+            !told.iter().any(|e| e.body.to_string().contains(&carol)),
+            "a later member leaked: {told:?}"
+        );
+        p.conn.close(0u32.into(), b"");
+    }
+}
+
+/// The loopback file is written again each round of the dial loop (here forced by a roster
+/// change), so macOS's cleanup of untouched /tmp files does not lose a long-running daemon:
+/// deleted, it comes back with its text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn loopback_file_is_kept_fresh() {
+    let a = Env::new();
+    a.daemon(true, "", &[]);
+    let uid = unsafe { libc::getuid() };
+    let file =
+        std::path::PathBuf::from(format!("/tmp/lightbulb-connect-{uid}")).join(a.identity().key);
+    let text = std::fs::read_to_string(&file).unwrap();
+    std::fs::remove_file(&file).unwrap();
+    common::invite(&a, "reusable");
+    until(5, "the file is back", || {
+        std::fs::read_to_string(&file).is_ok_and(|t| t == text)
+    });
 }

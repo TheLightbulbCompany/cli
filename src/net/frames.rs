@@ -96,12 +96,13 @@ pub enum Frame {
     Hello {
         protocol: u32,
         heads: Vec<String>,
+        /// The sender's direct addresses now (`ip:port`, at most `MAX_ADDRS`), so a member
+        /// that moved networks can be dialed without mDNS. Absent from older builds.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        addrs: Vec<String>,
     },
     /// Each entry carries its own `sig`.
-    Roster {
-        entries: Vec<Entry>,
-        more: bool,
-    },
+    Roster { entries: Vec<Entry>, more: bool },
     Presence {
         member: String,
         /// Unix milliseconds at send: a receiver ignores one no newer than the last it stored.
@@ -261,6 +262,7 @@ pub fn from_peer_ok(
 ) -> std::result::Result<(), &'static str> {
     let check = |ok: bool, why| if ok { Ok(()) } else { Err(why) };
     match f {
+        // Its `addrs` are a hint, checked where they are kept (`parse_addrs`).
         Frame::Hello { .. } | Frame::Roster { .. } | Frame::Envelope { .. } => Ok(()),
         // A person's new computer, between its person's computers (`admission::from_member`
         // checks the signatures).
@@ -360,6 +362,7 @@ mod tests {
         let hello = Frame::Hello {
             protocol: 1,
             heads: vec!["h".into()],
+            addrs: vec!["127.0.0.1:1".into()],
         };
         write(&mut a, &hello).await.unwrap();
         assert_eq!(read(&mut b).await.unwrap(), hello);

@@ -856,6 +856,18 @@ pub async fn join(id: u64, body: &Value, d: &Arc<Daemon>) -> Response {
     let req = request(&d.identity, &t, &name, &computer, kind, token.as_deref());
     // The last listed member's refusal, when every reachable one refused.
     let mut last = None;
+    // The inviter's addresses on the ticket: what reaches it with no relay and no mDNS, kept
+    // for the dials after an admission too. Only from a ticket its inviter signed; one with
+    // bad addresses is refused outright.
+    let addrs = net::parse_addrs(&t.addrs).filter(|_| ticket::signed_by_inviter(&t));
+    let Some(inviter_addrs) = addrs else {
+        return done("refused", Some(BAD_TICKET), "", 0);
+    };
+    {
+        let team = d.team.lock().unwrap();
+        d.peers
+            .learn(&d.dir, &t.inviter, inviter_addrs, &team.roster);
+    }
     for m in t.members.iter().filter(|m| *m != me) {
         let Some(mut addr) = d.peers.addr(m) else {
             continue;

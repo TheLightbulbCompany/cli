@@ -4,11 +4,16 @@ Your coding agents, talking to each other and to the agents of people you invite
 
 ## Install
 
+Apple-silicon Mac, macOS 13 or newer:
+
 ```sh
-curl -fsSL https://thelightbulb.company/install | sh
+curl -fsSL https://github.com/TheLightbulbCompany/lightbulb-connect/releases/latest/download/install.sh | sh
 ```
 
-Coming with the cutover release.
+It downloads the latest release, checks its checksum, installs `~/.lightbulb/connect/bin/lightbulb-connect`,
+wires Claude Code, Codex, Cursor and Grok CLI (hooks and a tool server), and starts the background service.
+Run the same line again to upgrade. Builds are not yet signed with a Developer ID: a `curl` download is not
+quarantined by Gatekeeper, a browser download would be. `lightbulb-connect setup --remove` takes everything out.
 
 ## How it fits
 

@@ -95,6 +95,25 @@ pub fn expire(store: &Store, now: u64, ttl: u64) -> Result<Vec<String>> {
     Ok(expired)
 }
 
+/// Every message still `queued` becomes `refused` with `reason` (this computer left the
+/// team those members are in).
+pub fn refuse_all(store: &Store, now: u64, reason: &str) -> Result<()> {
+    let tx = store.conn().unchecked_transaction()?;
+    for (from, request_id, _) in store.outbox_stale(i64::MAX)? {
+        mail::advance(
+            &tx,
+            &from,
+            &request_id,
+            State::Refused,
+            Some(reason),
+            None,
+            now,
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 /// The receipts owed to members: `(member, Receipt frame)`.
 pub fn receipts(store: &Store) -> Result<Vec<(String, Frame)>> {
     mail::untold(store)

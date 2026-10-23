@@ -539,7 +539,7 @@ pub fn folder(path: &str, on: bool) -> Result<i32> {
     let dir = paths::state_dir();
     let full = std::env::current_dir()?.join(crate::config::expand_home(path));
     if !on && !full.is_dir() {
-        eprintln!("no such folder: {path}");
+        eprintln!("There is no folder at {path}.");
         return Ok(1);
     }
     let p = crate::presence::canonical(&full);
@@ -858,40 +858,63 @@ pub fn held() -> Result<i32> {
 pub fn policy(person: Option<String>, value: Option<String>) -> Result<i32> {
     if value
         .as_deref()
-        .is_some_and(|v| !["accept", "hold", "refuse"].contains(&v))
+        .is_some_and(|v| !["accept", "hold", "refuse", "forget"].contains(&v))
     {
         return Err("policy takes accept, hold or refuse.".into());
     }
     let mut conn = connect()?;
+    let mut team = None;
     let p = match (person, value) {
-        (Some(pid), Some(v)) => ask(
+        // An old row, stored under whatever it says: dropped as written.
+        (Some(who), Some(v)) if v == "forget" => ask(
             &mut conn,
             "policy.set",
-            json!({"person_id": pid, "value": v}),
+            json!({"person_id": who, "value": v}),
         )?,
+        (Some(who), Some(v)) => {
+            let (members, mine) = team_members(&mut conn)?;
+            let pid = policy_person(&members, &who)?;
+            if mine.as_deref() == Some(pid.as_str()) {
+                return Err("That is you; your own computers always get through.".into());
+            }
+            team = Some((members, mine));
+            ask(
+                &mut conn,
+                "policy.set",
+                json!({"person_id": pid, "value": v}),
+            )?
+        }
         (None, None) => ask(&mut conn, "policy.get", json!({}))?,
         _ => {
             let cmd = command();
-            eprintln!("Usage: {cmd} policy [<person> accept|hold|refuse]\n  <person> is a person id as {cmd} policy lists it (ws:<id> for a workspace's agents).\n  Example: {cmd} policy ws:acme accept");
+            eprintln!("Usage: {cmd} policy [<person> accept|hold|refuse]\n  <person> is a teammate's name or short (as {cmd} team lists it), or ws:<id> for a workspace's agents.\n  Example: {cmd} policy aden hold");
             return Ok(2);
         }
     };
-    // A row the bridge set is a relayed Allow: `Allowed <name> from your phone`.
-    // The members' names only when some row is the bridge's.
-    let bridge = (p["set_by"].as_object().into_iter().flatten()).any(|(_, v)| v == "bridge");
-    let team = if bridge {
-        ask(&mut conn, "team.get", json!({}))?
-    } else {
-        Value::Null
+    const SCOPES: [&str; 2] = ["people", "cloud_of"];
+    // The members' names only when some row needs them.
+    let rows = SCOPES
+        .iter()
+        .any(|s| p[*s].as_object().is_some_and(|o| !o.is_empty()));
+    let (members, mine) = match team {
+        Some(t) => t,
+        None if rows => team_members(&mut conn)?,
+        None => (vec![], None),
     };
-    let name_of = |pid: &str| {
-        let mut ms = team["members"].as_array().into_iter().flatten();
-        let named = ms.find_map(|m| (m["person_id"] == pid).then(|| m["name"].as_str())?);
-        cell(named.unwrap_or(pid))
+    let member = |pid: &str| members.iter().find(|m| m["person_id"] == pid);
+    let name =
+        |pid: &str| member(pid).and_then(|m| Some((m["name"].as_str()?, m["short"].as_str()?)));
+    // `aden (qxcrztez36jw)`; a person no member is (a workspace) as stored.
+    let name_of = |pid: &str| match name(pid) {
+        Some((name, short)) => format!("{} ({short})", cell(name)),
+        None => cell(pid),
     };
     let by = |key: String, who: Option<&str>| match p["set_by"][&key].as_str() {
         Some("bridge") => match who {
-            Some(pid) => format!(" (Allowed {} from your phone)", name_of(pid)),
+            Some(pid) => {
+                let n = name(pid).map_or(pid, |(n, _)| n);
+                format!(" (Allowed {} from your phone)", cell(n))
+            }
             None => " (allowed from your phone)".into(),
         },
         _ => String::new(),
@@ -905,7 +928,7 @@ pub fn policy(person: Option<String>, value: Option<String>) -> Result<i32> {
         "Your workspace's agents may message your sessions without asking: {on}.{}",
         by(crate::policy::SWITCH.into(), None)
     );
-    for scope in ["people", "cloud_of"] {
+    for scope in SCOPES {
         for (pid, v) in p[scope].as_object().into_iter().flatten() {
             let v = match v.as_str() {
                 Some("accept") => "accepted",
@@ -913,14 +936,87 @@ pub fn policy(person: Option<String>, value: Option<String>) -> Result<i32> {
                 Some("refuse") => "refused",
                 _ => "unknown",
             };
+            let forget = format!("run: {} policy {} forget", command(), cell(pid));
+            // A row for my own person (`decide` never reads it), or a `people` row no member
+            // has (an old one, stored under a literal name).
+            let note = if mine.as_deref() == Some(pid.as_str()) {
+                format!(" (ignored: your own computers always get through — {forget})")
+            } else if scope == "people" && member(pid).is_none() {
+                format!(" (old entry — {forget})")
+            } else {
+                String::new()
+            };
             println!(
-                "Messages from {}: {v}.{}",
-                cell(pid),
+                "Messages from {}: {v}.{note}{}",
+                name_of(pid),
                 by(format!("{scope}:{pid}"), Some(pid))
             );
         }
     }
     Ok(0)
+}
+
+/// The team's members (`team.get`) and this computer's person id among them.
+fn team_members(conn: &mut Conn) -> Result<(Vec<Value>, Option<String>)> {
+    let me = conn.member()?;
+    let team = ask(conn, "team.get", json!({}))?;
+    let members = team["members"].as_array().cloned().unwrap_or_default();
+    let mine = members
+        .iter()
+        .find(|m| m["short"] == me.as_str())
+        .and_then(|m| m["person_id"].as_str().map(String::from));
+    Ok((members, mine))
+}
+
+/// The person id `policy <who>` sets: the one member whose name (any case), short, key or
+/// person id is `who`; a `ws:` id as given. Several people, or none: a sentence.
+fn policy_person(members: &[Value], who: &str) -> Result<String> {
+    let field = |v: &Value, k: &str| v[k].as_str().unwrap_or_default().to_string();
+    let hits: Vec<&Value> = members
+        .iter()
+        .filter(|m| {
+            field(m, "name").eq_ignore_ascii_case(who)
+                || ["short", "key", "person_id"]
+                    .iter()
+                    .any(|k| field(m, k) == who)
+        })
+        .collect();
+    let mut people: Vec<String> = hits.iter().map(|m| field(m, "person_id")).collect();
+    people.sort();
+    people.dedup();
+    match people.len() {
+        1 => Ok(people.remove(0)),
+        0 if who.starts_with("ws:") => Ok(who.into()),
+        0 => {
+            let names: Vec<String> = members.iter().map(|v| cell(&field(v, "name"))).collect();
+            Err(format!(
+                "No teammate called \"{}\". Teammates: {} (see {} team).",
+                cell(who),
+                names.join(", "),
+                command()
+            )
+            .into())
+        }
+        _ => {
+            let each: Vec<String> = hits
+                .iter()
+                .map(|m| {
+                    format!(
+                        "{} on {}: {}",
+                        cell(&field(m, "name")),
+                        cell(&field(m, "computer")),
+                        field(m, "short")
+                    )
+                })
+                .collect();
+            Err(format!(
+                "More than one teammate is called \"{}\". Use the short of the one you mean: {}.",
+                cell(who),
+                each.join("; ")
+            )
+            .into())
+        }
+    }
 }
 
 /// `team`: the team's name and members, this computer first as `You`; a member's address only
@@ -930,6 +1026,17 @@ pub fn team() -> Result<i32> {
     let me = conn.member()?;
     let t = ask(&mut conn, "team.get", json!({}))?;
     let mut members = t["members"].as_array().cloned().unwrap_or_default();
+    let r = &t["removed"];
+    if let (Some(team), Some(by), Some(at)) =
+        (r["team"].as_str(), r["by"].as_str(), r["at"].as_i64())
+    {
+        println!(
+            "You were removed from \"{}\" by {} on {}. This computer is on its own network again.",
+            cell(team),
+            cell(by),
+            &crate::date::utc(at)[..10]
+        );
+    }
     members.sort_by_key(|m| m["short"] != me.as_str());
     let n = members.len();
     let s = if n == 1 { "" } else { "s" };
@@ -1203,22 +1310,60 @@ pub fn daemon_install() -> Result<i32> {
     install_job(&home, &canonical(&home))
 }
 
-/// Writes and loads the launchd job that runs `exe daemon`.
+/// Stops the daemon that holds this state dir's lock: asks it over the socket when it
+/// answers, and waits up to 10 s for the lock to be free either way (one still booting does
+/// not answer yet). Whether a daemon runs is the lock (`daemon::lock_dir`), never the pid in
+/// the file: that pid stays after an exit and may be any process by now. One launchd did not
+/// start (a hook's, during an upgrade) survives a bootout and would hold the lock against the
+/// new job, so one that does not let go is an error: nothing is installed behind it.
+pub fn stop_daemon() -> Result<()> {
+    let path = daemon::lock_path(&paths::state_path());
+    let Ok(lock) = fs::File::open(&path) else {
+        return Ok(());
+    };
+    // Our probe lock, when it gets one, drops with `lock` on return.
+    if lock.try_lock().is_ok() {
+        return Ok(());
+    }
+    if let Ok(mut conn) = Conn::open() {
+        let _ = conn.call("shutdown", json!({}));
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+        if lock.try_lock().is_ok() {
+            return Ok(());
+        }
+    }
+    let pid = fs::read_to_string(&path).unwrap_or_default();
+    let (pid, cmd) = (pid.trim(), command());
+    Err(format!(
+        "The old background service did not stop (pid {pid}). Run: kill {pid}, then {cmd} setup again."
+    )
+    .into())
+}
+
+/// Writes and loads the launchd job that runs `exe daemon`, after stopping the daemon that
+/// runs now (`stop_daemon`), so the one that answers after is `exe`'s.
 pub fn install_job(home: &Path, exe: &Path) -> Result<i32> {
-    let path = plist_path(home);
-    fs::create_dir_all(path.parent().unwrap())?;
-    fs::write(&path, plist(exe, &paths::state_dir().join("daemon.log")))?;
-    // Replace any loaded job so an update restarts it: bootout (result ignored), bootstrap,
-    // and `kickstart -k` if bootstrap fails.
     let uid = unsafe { libc::getuid() };
+    let path = plist_path(home);
     let (domain, service, file) = (
         format!("gui/{uid}"),
         format!("gui/{uid}/{LABEL}"),
         path.to_string_lossy().into_owned(),
     );
-    let sequence = format!("bootout {service}; bootstrap {domain} {file}; kickstart -k {service}");
+    // The loaded job goes first (result ignored): with it loaded, KeepAlive would restart the
+    // daemon `stop_daemon` stops, and the new one would hold the lock it waits on.
     if use_launchctl() {
         launchctl(&["bootout", &service]);
+    }
+    stop_daemon()?;
+    fs::create_dir_all(path.parent().unwrap())?;
+    fs::write(&path, plist(exe, &paths::state_dir().join("daemon.log")))?;
+    // Load the job so an update restarts it: bootstrap, and `kickstart -k` if that fails.
+    let sequence = format!("bootout {service}; bootstrap {domain} {file}; kickstart -k {service}");
+    if use_launchctl() {
         let up = launchctl(&["bootstrap", &domain, &file])
             || launchctl(&["load", "-w", &file])
             || launchctl(&["kickstart", "-k", &service]);
@@ -1251,9 +1396,7 @@ pub fn daemon_uninstall() -> Result<i32> {
         _ => {}
     }
     // Stop a running daemon (the job is gone, so it will not come back); state stays.
-    if let Ok(mut conn) = Conn::open() {
-        let _ = conn.call("shutdown", json!({}));
-    }
+    stop_daemon()?;
     let state = paths::state_path();
     let shown = home()
         .ok()
@@ -1284,10 +1427,14 @@ pub fn doctor() -> Result<i32> {
         };
         rows.push((name.into(), state.into(), fix));
     };
-    let up = Conn::open()
-        .and_then(|mut c| c.call("ping", json!({})))
-        .is_ok_and(|r| r["ok"] == true);
+    let mut conn = Conn::open().ok();
+    let mut call = |op: &str| conn.as_mut().and_then(|c| c.call(op, json!({})).ok());
+    let up = call("ping").is_some_and(|r| r["ok"] == true);
     row("Background service", up, "running", "not running", &setup);
+    if up && call("status").is_some_and(|r| r["lan"] == "blocked") {
+        let fix = "Allow lightbulb-connect in System Settings > Privacy & Security > Local Network";
+        row("Local network", false, "", "blocked by macOS", fix);
+    }
     if cfg!(target_os = "macos") {
         let loaded = if use_launchctl() {
             launchctl(&[

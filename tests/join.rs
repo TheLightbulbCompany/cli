@@ -247,7 +247,7 @@ fn forged_ticket_from_another_members_link_is_refused() {
         xt.secret,
         "open",
         xt.expires_at,
-        String::new(),
+        (String::new(), vec![]),
     );
     c.daemon(false, "", &[peers(&[&f])]);
     refused(
@@ -401,7 +401,11 @@ fn bad_link_and_unreachable_texts() {
     let (a, b) = (Env::new(), Env::new());
     a.daemon(false, "", &[dialog("")]);
     let t = invite(&a, "reusable");
-    // B knows no address for A: nobody is reachable.
+    // A is gone (the ticket's addresses answer nothing): nobody is reachable.
+    a.ask(json!({"id": 1, "op": "shutdown"}));
+    until(10, "A stops", || {
+        std::os::unix::net::UnixStream::connect(a.state.path().join("sock")).is_err()
+    });
     b.daemon(false, "", &[]);
     let r = join(&b, &t, "bob", "computer");
     refused(&r, "unreachable");
@@ -557,4 +561,68 @@ async fn an_unprintable_name_is_refused_as_bad_name() {
         err(&o),
         "That name has characters Lightbulb Connect cannot show. Use letters, numbers, spaces and punctuation.\n"
     );
+}
+
+/// No PEERS knob, no mDNS, no loopback file (`lan = false`), no relay: the joiner reaches the
+/// inviter through the addresses on the ticket alone, and the two stay connected after.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_ticket_addresses_alone_reach_the_inviter() {
+    let (a, b) = (Env::new(), Env::new());
+    a.daemon(false, &computer("mac"), &[dialog("Allow")]);
+    let t = invite(&a, "reusable");
+    let addrs = ticket::decode(&t).unwrap().addrs;
+    let port = a.status()["port"].to_string();
+    assert!(
+        !addrs.is_empty() && addrs.iter().all(|s| s.ends_with(&format!(":{port}"))),
+        "{addrs:?}"
+    );
+    b.daemon(false, &computer("mbp"), &[]);
+    let r = join(&b, &t, "bob", "computer");
+    assert_eq!(r["state"], "admitted", "{r}");
+    converged(&a, &b, 2);
+    until(10, "both online", || {
+        a.status()["peers"]["online"] == 1 && b.status()["peers"]["online"] == 1
+    });
+}
+
+#[test]
+fn bad_ticket_addresses_are_refused() {
+    use lightbulb_connect::net::parse_addrs;
+    let ok = |v: &[&str]| parse_addrs(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+    assert!(ok(&["192.168.0.2:4000", "[fe80::1]:4000"]).is_some());
+    assert!(ok(&["169.254.1.1:9"]).is_some(), "link-local stays");
+    for bad in [
+        &["example.com:4000"][..],
+        &["224.0.0.251:5353"],
+        &["[ff02::1]:9"],
+        &["255.255.255.255:9"],
+        &["127.0.0.1:22"],
+        &["[::1]:22"],
+        &["[::ffff:127.0.0.1]:22"],
+        &["[::ffff:224.0.0.251]:5353"],
+        &["[::ffff:255.255.255.255]:9"],
+        &["0.0.0.0:4000"],
+        &["10.0.0.1:0"],
+        &["10.0.0.1"],
+        &["10.0.0.1:1"; 9],
+    ] {
+        assert!(ok(bad).is_none(), "{bad:?}");
+    }
+}
+
+/// A forged ticket (its signature is not its inviter's) is refused before its addresses are
+/// kept or dialed.
+#[test]
+fn a_forged_ticket_leaves_no_address_behind() {
+    let (a, b) = (Env::new(), Env::new());
+    a.daemon(false, &computer("mac"), &[dialog("")]);
+    let mut t = ticket::decode(&invite(&a, "reusable")).unwrap();
+    t.addrs = vec!["192.0.2.7:4000".into()];
+    b.daemon(false, &computer("mbp"), &[]);
+    refused(
+        &join(&b, &ticket::encode(&t), "bob", "computer"),
+        "bad_ticket",
+    );
+    let kept = std::fs::read_to_string(b.state.path().join("addrs.json")).unwrap_or_default();
+    assert!(!kept.contains("192.0.2.7"), "{kept}");
 }

@@ -546,6 +546,7 @@ async fn owner_caps_input_at_4k_and_counts_other_frames() {
     let hello = Frame::Hello {
         protocol: 1,
         heads: vec![],
+        addrs: vec![],
     };
     frames::write(&mut s, &hello).await.unwrap();
     frames::write(&mut s, &input(&a, 3, 4096)).await.unwrap();
