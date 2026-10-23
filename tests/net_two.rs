@@ -469,3 +469,28 @@ async fn removed_member_hears_its_removal_and_nothing_after() {
         p.conn.close(0u32.into(), b"");
     }
 }
+
+/// The loopback file is written again each round of the dial loop (here forced by a roster
+/// change), so macOS's cleanup of untouched /tmp files does not lose a long-running daemon.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn loopback_file_is_kept_fresh() {
+    use std::os::unix::fs::MetadataExt;
+    let a = Env::new();
+    a.daemon(true, "", &[]);
+    let uid = unsafe { libc::getuid() };
+    let file =
+        std::path::PathBuf::from(format!("/tmp/lightbulb-connect-{uid}")).join(a.identity().key);
+    // An hour old, as a file nobody touched would be.
+    let c = std::ffi::CString::new(file.to_str().unwrap()).unwrap();
+    let old = common::now_s() - 3_600;
+    let tv = libc::timeval {
+        tv_sec: old,
+        tv_usec: 0,
+    };
+    assert_eq!(unsafe { libc::utimes(c.as_ptr(), [tv, tv].as_ptr()) }, 0);
+    assert_eq!(std::fs::metadata(&file).unwrap().mtime(), old);
+    common::invite(&a, "reusable");
+    until(5, "the file is written again", || {
+        std::fs::metadata(&file).is_ok_and(|m| m.mtime() > old)
+    });
+}

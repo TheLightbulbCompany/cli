@@ -633,10 +633,11 @@ impl Net {
     }
 
     pub async fn close(&self) {
+        self.0.endpoint.close().await;
+        // After the close, so the dial loop (which re-writes it) has stopped.
         if self.0.daemon.peers.lan.get() == Some(&true) {
             local::withdraw(&self.0.daemon.identity.key);
         }
-        self.0.endpoint.close().await;
     }
 
     /// Whether every task this endpoint started has ended (this handle is the last one).
@@ -666,6 +667,8 @@ impl Net {
 
     /// Dials every active member on start, after every roster change and every 30 s; after
     /// a change, closes the connections of members no longer active and pushes the change.
+    /// Each round also re-writes the loopback address file (`local`): macOS deletes /tmp
+    /// files nobody touched for 3 days. (The port is the endpoint's for its whole life.)
     async fn keep_up(self) {
         let d = &self.0.daemon;
         let mut tick = tokio::time::interval(REDIAL);
@@ -675,6 +678,9 @@ impl Net {
                 _ = d.peers.changed.notified() => true,
                 _ = self.0.endpoint.closed() => return,
             };
+            if d.peers.lan.get() == Some(&true) {
+                local::publish(&d.identity.key, d.peers.port.get().copied().unwrap_or(0));
+            }
             let to_dial = self.refresh(changed);
             for key in to_dial {
                 tokio::spawn(self.clone().dial(key));
@@ -1429,6 +1435,8 @@ mod local {
         let s = std::fs::read_to_string(dir()?.join(key)).ok()?;
         let (addr, pid) = s.split_once(' ')?;
         let pid: u32 = pid.trim().parse().ok()?;
+        // Loopback discovery is macOS-only for now: elsewhere `os::process` errors, so the
+        // file is skipped (Linux follows when there is a Linux build).
         crate::os::process(pid).ok()?;
         addr.parse().ok()
     }
