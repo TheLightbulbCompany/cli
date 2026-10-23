@@ -553,8 +553,8 @@ pub fn receive(
     if sessions::member_of(to) != Some(me) {
         return refused("not_member");
     }
-    if let Some(state) = store.seen_state(&peer.key, id)? {
-        return Ok((State::parse(&state)?, None));
+    if let Some((state, reason)) = store.seen_state(&peer.key, id)? {
+        return Ok((State::parse(&state)?, reason));
     }
     if let Some((old_to, old_body)) = store.sent_as(from, request_id)? {
         if old_to != *to || old_body != *body {
@@ -1028,6 +1028,9 @@ mod tests {
         );
         expire(&s, 1000 + HOLD_S).unwrap();
         assert_eq!(state(&s, "r1"), State::Stored);
+        // Past its hold, it is not handed out even before `expire` runs.
+        assert!(take(&s, &k("b"), 1000 + HOLD_S + 1).unwrap().is_empty());
+        assert_eq!(state(&s, "r1"), State::Stored);
         expire(&s, 1000 + HOLD_S + 1).unwrap();
         assert_eq!(state(&s, "r1"), State::Expired);
         assert!(take(&s, &k("b"), 1000 + HOLD_S + 2).unwrap().is_empty());
@@ -1236,9 +1239,8 @@ mod tests {
         assert_eq!(thread_hops(&s, "r2").2, 1);
     }
 
-    #[test]
-    fn a_peers_mail_to_a_name_address_never_expires() {
-        let (_d, s) = setup();
+    /// Member `p` (key `pkey`) in a roster, and its envelope `rid` to `to` from `p/codex:a`.
+    fn peer_mail(to: &str, rid: &str) -> (Member, Roster, Frame) {
         let peer = Member {
             key: "pkey".into(),
             short: "p".into(),
@@ -1252,20 +1254,27 @@ mod tests {
         };
         let mut roster = Roster::default();
         roster.members.insert(peer.key.clone(), peer.clone());
+        let env = Frame::Envelope {
+            id: ulid::Ulid::generate().to_string(),
+            request_id: rid.into(),
+            kind: "message".into(),
+            from: "p/codex:a".into(),
+            to: to.into(),
+            reply_to: None,
+            thread: None,
+            hops: 0,
+            body: "x".into(),
+            files: vec![],
+            sent_at: 0,
+        };
+        (peer, roster, env)
+    }
+
+    #[test]
+    fn a_peers_mail_to_a_name_address_never_expires() {
+        let (_d, s) = setup();
         for (i, to) in ["m/terminal", "m/codex:c"].iter().enumerate() {
-            let env = Frame::Envelope {
-                id: ulid::Ulid::generate().to_string(),
-                request_id: format!("r{i}"),
-                kind: "message".into(),
-                from: "p/codex:a".into(),
-                to: to.to_string(),
-                reply_to: None,
-                thread: None,
-                hops: 0,
-                body: "x".into(),
-                files: vec![],
-                sent_at: 0,
-            };
+            let (peer, roster, env) = peer_mail(to, &format!("r{i}"));
             let got = receive(&s, &env, &peer, &roster, "m", 1000).unwrap();
             assert_eq!(got, (State::Stored, None));
         }
@@ -1273,6 +1282,34 @@ mod tests {
         expire(&s, later).unwrap();
         assert_eq!(waiting(&s, &k("m/terminal"), later).unwrap().len(), 1);
         assert!(waiting(&s, &k("m/codex:c"), later).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_duplicate_envelope_is_reacked_with_its_reason_and_never_stored_twice() {
+        let (_d, s) = setup();
+        let (peer, roster, env) = peer_mail("m/codex:c", "r1");
+        let again = || receive(&s, &env, &peer, &roster, "m", 1001).unwrap();
+        receive(&s, &env, &peer, &roster, "m", 1000).unwrap();
+        advance(
+            s.conn(),
+            "p/codex:a",
+            "r1",
+            State::Refused,
+            Some("declined"),
+            1000,
+        )
+        .unwrap();
+        assert_eq!(again(), (State::Refused, Some("declined".into())));
+        // With its message and receipt rows gone, what the sender was told stands.
+        s.conn()
+            .execute_batch("DELETE FROM messages; DELETE FROM receipts; DELETE FROM mailbox;")
+            .unwrap();
+        assert_eq!(again(), (State::Stored, None));
+        assert_eq!(
+            unread(&s, &k("m/codex:c"), 1001).unwrap(),
+            0,
+            "not stored again"
+        );
     }
 
     #[test]

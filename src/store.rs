@@ -476,16 +476,22 @@ impl Store {
             .optional()
     }
 
-    /// The receipt state now of envelope `id`, if `sender` sent it here.
-    pub fn seen_state(&self, sender: &str, id: &str) -> rusqlite::Result<Option<String>> {
+    /// Envelope `id`'s receipt now, `(state, reason)`, if `sender` sent it here; what the sender
+    /// was last told when its message is gone.
+    pub fn seen_state(
+        &self,
+        sender: &str,
+        id: &str,
+    ) -> rusqlite::Result<Option<(String, Option<String>)>> {
         self.conn
             .query_row(
                 &format!(
-                    "SELECT r.state FROM seen_ids s JOIN messages m ON m.id = s.envelope_id \
-                     {MSG_RECEIPT} WHERE s.sender = ?1 AND s.envelope_id = ?2"
+                    "SELECT COALESCE(r.state, s.state), r.reason FROM seen_ids s \
+                     LEFT JOIN messages m ON m.id = s.envelope_id LEFT {MSG_RECEIPT} \
+                     WHERE s.sender = ?1 AND s.envelope_id = ?2"
                 ),
                 [sender, id],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()
     }
