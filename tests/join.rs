@@ -137,6 +137,8 @@ fn ask_ticket_admits_only_after_allow() {
         "The name \"prasiddha\" is already used in this network. Try: lightbulb-connect join '{t}' --name prasiddha-2\n"
     );
     assert_eq!(err(&o), taken);
+    // Refused at once: it never said it was asking anyone.
+    assert_eq!(out(&o), "");
     std::thread::scope(|s| {
         let joining = s.spawn(|| b.detached(&[EXE, "join", &t, "--name", "bob"], ""));
         until(10, "J1 is listed", || requests(&a).len() == 1);
@@ -153,6 +155,8 @@ fn ask_ticket_admits_only_after_allow() {
         assert_eq!(r["candidate"], b.identity().key);
         assert_eq!((&r["name"], &r["computer"]), (&json!("bob"), &json!("mbp")));
         assert_eq!((members(&a).len(), members(&b).len()), (1, 1));
+        // Past the second after which the joiner says it is asking.
+        std::thread::sleep(Duration::from_millis(1_500));
         let o = a.detached(&[EXE, "approve", "J1"], "");
         assert!(o.status.success(), "{}", err(&o));
         let o = joining.join().unwrap();
@@ -171,7 +175,9 @@ fn ask_ticket_admits_only_after_allow() {
     // A second answer finds nothing open.
     let o = a.detached(&[EXE, "decline", "J1"], "");
     assert!(!o.status.success());
-    assert_eq!(err(&o), "J1 was already answered or withdrawn.\n");
+    assert_eq!(err(&o), "J1 was already answered at the command line.\n");
+    let log = std::fs::read_to_string(a.state.path().join("daemon.log")).unwrap();
+    assert!(log.contains("join: J1 answered from the cli"), "{log}");
     let o = a.detached(&[EXE, "approve", "J9"], "");
     assert!(!o.status.success());
     assert_eq!(err(&o), "No join request J9.\n");
@@ -625,4 +631,45 @@ fn a_forged_ticket_leaves_no_address_behind() {
     );
     let kept = std::fs::read_to_string(b.state.path().join("addrs.json")).unwrap_or_default();
     assert!(!kept.contains("192.0.2.7"), "{kept}");
+}
+
+/// A roster change while an `ask` join waits prunes the ticket's addresses (the inviter is no
+/// member yet); the admission keeps them again, so with no relay and no mDNS the two still
+/// connect.
+#[test]
+fn the_inviters_addresses_survive_a_waiting_join() {
+    let (a, b) = (Env::new(), Env::new());
+    a.daemon(false, &computer("mac"), &[dialog("")]);
+    let t = invite(&a, "reusable");
+    let inviter = a.identity().key;
+    b.daemon(false, &computer("mbp"), &[]);
+    let file = b.state.path().join("addrs.json");
+    std::thread::scope(|s| {
+        let joining = s.spawn(|| join(&b, &t, "bob", "computer"));
+        until(10, "J1 is listed", || requests(&a).len() == 1);
+        // A roster change on B while it waits: a link of its own.
+        invite(&b, "reusable");
+        let kept = std::fs::read_to_string(&file).unwrap_or_default();
+        assert!(!kept.contains(&inviter), "not pruned: {kept}");
+        let o = a.detached(&[EXE, "approve", "J1"], "");
+        assert!(o.status.success(), "{}", err(&o));
+        assert_eq!(joining.join().unwrap()["state"], "admitted");
+    });
+    let kept = std::fs::read_to_string(&file).unwrap();
+    assert!(kept.contains(&inviter), "{kept}");
+    until(15, "both online", || {
+        a.status()["peers"]["online"] == 1 && b.status()["peers"]["online"] == 1
+    });
+}
+
+/// An open link asks no one: `join` never says it is asking.
+#[test]
+fn an_open_link_join_never_says_asking() {
+    let (a, b) = (Env::new(), Env::new());
+    a.daemon(false, &computer("mac"), &[]);
+    let line = invite_open(&a);
+    b.daemon(false, &computer("mbp"), &[peers(&[&a])]);
+    let o = b.detached(&[EXE, "join", &line, "--name", "bob"], "");
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(!out(&o).contains("Asking"), "{}", out(&o));
 }

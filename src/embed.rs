@@ -140,6 +140,7 @@ pub(crate) async fn boot(
         dialogs,
         dialog_answers: Mutex::new(Some(answers)),
         admissions: Mutex::default(),
+        answered_by: Mutex::default(),
         roster_changed: Default::default(),
         joining: tokio::sync::Mutex::new(()),
         presence: Default::default(),

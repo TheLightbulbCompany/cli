@@ -476,21 +476,30 @@ pub fn shown(d: &Daemon, roster: &Roster, store: &Store, h: &Hold) {
 }
 
 /// The daemon's side of a closed hold (`verdict` `allow`, `decline` or `expired`; `by` null for
-/// an expiry): its dialog withdrawn, subscribers told `hold_closed`.
-fn closed(d: &Daemon, h: &Hold, verdict: &str, by: Option<&str>) {
+/// an expiry; `surface` the one that answered, if this computer's): its dialog withdrawn,
+/// subscribers told `hold_closed`.
+fn closed(d: &Daemon, h: &Hold, verdict: &str, by: Option<&str>, surface: Option<&'static str>) {
     d.dialogs.withdraw(&h.name());
     let event = json!({"event": "hold_closed", "id": h.name(), "by": by, "verdict": verdict});
     let _ = d.events.send(event);
-    eprintln!("hold {}: {verdict}", h.name());
+    match surface {
+        Some(s) => {
+            d.answered_by.lock().unwrap().insert(h.name(), s);
+            eprintln!("hold {}: {verdict} (from the {s})", h.name());
+        }
+        None => eprintln!("hold {}: {verdict}", h.name()),
+    }
 }
 
-/// `answer` under the daemon's locks, then `closed`, and an allowed message pushed.
+/// `answer` under the daemon's locks (from `surface`), then `closed`, and an allowed message
+/// pushed.
 fn answer_here(
     d: &Arc<Daemon>,
     id: i64,
     allow: bool,
     scope: Option<&str>,
     by: &str,
+    surface: &'static str,
 ) -> Result<std::result::Result<Closed, &'static str>> {
     let r = {
         let team = d.team.lock().unwrap();
@@ -499,15 +508,15 @@ fn answer_here(
         answer(&store, &team.roster, &d.identity, id, allow, scope, by, now)?
     };
     if let Ok(c) = &r {
-        after(d, c, by);
+        after(d, c, by, Some(surface));
     }
     Ok(r)
 }
 
 /// The daemon's side of an answer `by` someone (outside the locks): `closed`, and an allowed
 /// message pushed.
-pub(crate) fn after(d: &Arc<Daemon>, c: &Closed, by: &str) {
-    closed(d, &c.hold, c.verdict(), Some(by));
+pub(crate) fn after(d: &Arc<Daemon>, c: &Closed, by: &str, surface: Option<&'static str>) {
+    closed(d, &c.hold, c.verdict(), Some(by), surface);
     if c.allow && c.hold.kind() == Kind::Message {
         ipc::stored(
             d,
@@ -520,7 +529,7 @@ pub(crate) fn after(d: &Arc<Daemon>, c: &Closed, by: &str) {
 /// Expires what is due (`expire`) and closes their dialogs; from the 60 s mail timer.
 pub fn expire_here(d: &Daemon, store: &Store, now: i64) -> Result<()> {
     for h in expire(store, now)? {
-        closed(d, &h, "expired", None);
+        closed(d, &h, "expired", None, None);
     }
     Ok(())
 }
@@ -528,7 +537,7 @@ pub fn expire_here(d: &Daemon, store: &Store, now: i64) -> Result<()> {
 /// Dialog `H<n>` answered `button`: `Decline`, `Allow` or `Always allow`.
 pub fn on_dialog(d: &Arc<Daemon>, n: i64, button: &str) {
     let always = (button == "Always allow").then_some("always");
-    if let Err(e) = answer_here(d, n, button != "Decline", always, "local") {
+    if let Err(e) = answer_here(d, n, button != "Decline", always, "local", "dialog") {
         eprintln!("hold H{n}: {e}");
     }
 }
@@ -608,12 +617,15 @@ fn run(id: u64, op: &str, body: &Value, d: &Arc<Daemon>) -> Result<Response> {
             let Some(n) = hold_id else {
                 return Ok(Response::err(id, NOT_FOUND));
             };
-            match answer_here(d, n, allow, scope, "local")? {
+            match answer_here(d, n, allow, scope, "local", "cli")? {
                 Ok(c) => Response::ok(
                     id,
                     json!({"id": c.hold.name(), "verdict": c.verdict(), "scope": c.scope}),
                 ),
-                Err(code) => Response::err(id, code),
+                Err(code) => {
+                    let by = d.answered_by.lock().unwrap().get(&format!("H{n}")).copied();
+                    Response::err_with(id, code, json!({ "answered_in": by }))
+                }
             }
         }
         // `hold.file {kind: "permission", session, prompt}` -> `{hold}`: the app asks the

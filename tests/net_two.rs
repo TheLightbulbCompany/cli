@@ -400,6 +400,40 @@ async fn removed_member_is_told() {
         1,
         "{log}"
     );
+    // Alone now, there is nothing to leave.
+    let o = b.detached(&[EXE, "leave"], "y\n");
+    assert!(o.status.success(), "{}", common::err(&o));
+    assert_eq!(
+        common::out(&o),
+        "This computer is not in a team with anyone; it is on its own network already.\n"
+    );
+}
+
+/// A removed member's addresses leave addrs.json at the removal, and stay gone after a
+/// restart; the file is private.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_removed_members_addresses_are_forgotten() {
+    use std::os::unix::fs::MetadataExt;
+    let (a, b) = (Env::new(), Env::new());
+    seed_pair(&a, &b);
+    common::start_pair(&a, &b, "", &[]);
+    let file = a.state.path().join("addrs.json");
+    let bob = b.identity().key;
+    until(10, "A keeps B's addresses", || {
+        std::fs::read_to_string(&file).is_ok_and(|t| t.contains(&bob))
+    });
+    assert_eq!(std::fs::metadata(&file).unwrap().mode() & 0o777, 0o600);
+    let o = a.detached(&[EXE, "remove", "bob"], "");
+    assert!(o.status.success(), "{}", common::err(&o));
+    let kept = std::fs::read_to_string(&file).unwrap();
+    assert!(!kept.contains(&bob), "{kept}");
+    a.ask(json!({"id": 1, "op": "shutdown"}));
+    until(10, "A stops", || {
+        std::os::unix::net::UnixStream::connect(a.state.path().join("sock")).is_err()
+    });
+    a.daemon(false, "", &[]);
+    let kept = std::fs::read_to_string(&file).unwrap();
+    assert!(!kept.contains(&bob), "{kept}");
 }
 
 /// The loopback file is private, names its daemon's pid, and goes when SIGTERM stops it.

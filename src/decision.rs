@@ -466,7 +466,7 @@ fn on_decision(
     );
     let _ = tx.send((ack(format!("{DECISION}{nonce}"), state, why), None));
     if let Some(c) = &reply.closed {
-        holds::after(d, c, "bridge");
+        holds::after(d, c, "bridge", Some("phone"));
     }
 }
 

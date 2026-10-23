@@ -378,3 +378,352 @@ A's side records each row with the dialog text, labels and `receipt --json`, the
   - A policy row for your own person that an older build stored is listed as ignored, with the `forget` hint.
   - The removal test now also proves that a member admitted after the removal is never sent to the removed member.
   - 385 tests pass.
+
+## Step 1 re-run (0.2.0, 89f34c6)
+
+- Date: 2026-10-23, 14:33–14:45 local (EDT).
+- Build: `89f34c6` (`plan-b`), `cargo build --release` only (no debug build), sha256 `49a5acd04e67728ab7f4ce78c5f9b597ed82888b34eb0e9fcce43634bb40fbd1`, `lightbulb-connect 0.2.0`, 22,938,096 bytes.
+- A = the real install (`~/.lightbulb/connect`, was 0.1.0 from e08b3fa, state.db V6). B = `LIGHTBULB_CONNECT_HOME=/tmp/lbc-b2` (fresh), `computer = "mac-b"`, the same binary, `daemon` in a tmux window. C (row 7 only) = `/tmp/lbc-c2`, `mac-c`. No `LIGHTBULB_CONNECT_PEERS` (release has none): B and C found A only through `/tmp/lightbulb-connect-501/<key>` and the ticket's addresses.
+- Every person-side command ran in tmux. Each macOS dialog was answered from the CLI, which withdrew it (no `osascript` was left running), except J4 (see F7). Dialog texts are copied from the `osascript` arguments. Body markers: `ACC8R-<n>`.
+
+### Results
+
+| # | Row | Result |
+|---|-----|--------|
+| P1 | Release binary: no `DEBUG_` knob names, no test issuer | PASS (the hidden-help knob name of note 1 is gone too) |
+| P2 | Upgrade by rename + one `setup`: one daemon, the new inode | PASS (no F1 regression) |
+| P3 | V6 → V6 no-op: `user_version=6`, row counts equal the backup's | PASS |
+| P4 | Configs byte-identical after `setup`; 20 hooks with `{}` exit 0 | PASS |
+| 1 | invite → join `--name aden` → dialog → Allow → Connected | PASS (the Allow did not come from my `approve J4`; F7) |
+| 2 | B send → `held` + dialog → `approve H5` → delivered | PASS |
+| 3 | A second B send goes straight in | PASS |
+| 4 | A fresh one declined → `refused`, reason `declined` | PASS |
+| 5 | B stopped, A sends → `queued`; B restarted → held on B, allowed → delivered | PASS |
+| 6 | `who --all` on both shows both computers' sessions | PASS |
+| 7 | `held` lists a pending join and a held message, with their commands | PASS |
+| 8 | `policy`; `policy aden hold` / `accept` BY NAME take effect | PASS (F3 fixed) |
+| 9 | `remove aden` → B is out and is TOLD; link replaced | PASS (F4 fixed) |
+| 10 | `receipt` sentences for each state | PASS (queued, held, stored, delivered, refused) |
+| 11 | `folder <path> off` hides a session from B, `on` shows it again | PASS |
+| 12 | `relay` prints the list and its source | PASS |
+| 13 | Error texts | PASS |
+| 14 | `join` with a ticket whose addrs are edited → refused | PASS |
+| 15 | After `remove`, B's key is gone from A's `addrs.json` after A's next save/restart | **FAIL (F6)** |
+| — | Message bodies absent from every daemon log | PASS |
+
+### P1
+
+```
+$ lightbulb-connect version
+lightbulb-connect 0.2.0
+strings: LIGHTBULB_CONNECT_DEBUG 0, DEBUG_ 0, LIGHTBULB_CONNECT_PEERS 0, lightbulb-debug-test-issuer 0,
+         LIGHTBULB_CONNECT_CLAUDE_HOME 0, LIGHTBULB_CONNECT_HOOK_CALLER 0, test-issuer key bytes present: False
+```
+
+### P2. Backups, rename, one `setup`, `doctor`
+
+Backups: `~/.lightbulb/acc2-backup-2026-10-23/` holds the agents' config files (`.claude/settings.json`, `.claude.json`, `.codex/{config.toml,hooks.json}`, `.cursor/{cli-config,hooks,mcp}.json`, `.grok/config.toml`, `.grok/hooks/`), `connect/state.db` (sqlite `.backup`, V6), `connect/identity.key`, `connect/config.toml`, the launchd plist, and the old binary `lightbulb-connect.e08b3fa`.
+
+```
+before: pid 7237 …/bin/lightbulb-connect daemon   (inode 1319811885, the e08b3fa binary)
+(new binary copied to bin/lightbulb-connect.new, then mv over bin/lightbulb-connect → inode 1321273298)
+$ lightbulb-connect setup                         (no `daemon --uninstall` first)
+Command: lightbulb-connect ("lightbulb" belongs to the Lightbulb app)
+Claude Code: connected (hooks + tools as "lightbulb-connect" — another "lightbulb" tool server is already installed)
+Codex: connected (hooks + tools as "lightbulb-connect" — another "lightbulb" tool server is already installed)
+Cursor: connected (hooks + tools as "lightbulb-connect" — another "lightbulb" tool server is already installed)
+Grok CLI: connected (hooks + tools as "lightbulb-connect" — another "lightbulb" tool server is already installed)
+Background service: running (starts at login).
+
+Lightbulb Connect is on.
+  Connected: Claude Code, Codex, Cursor, Grok CLI
+
+Try it: open Claude Code in any folder and ask "list my other sessions".
+Add your other computer or a teammate: lightbulb-connect invite
+Check everything: lightbulb-connect doctor
+exit=0
+$ pgrep -fl "lightbulb-connect daemon"
+53795 /Users/prasiddhaparthsarthy/.lightbulb/connect/bin/lightbulb-connect daemon    (lsof txt: inode 1321273298, the new one)
+$ lightbulb-connect doctor                        (right after setup)
+Background service   running
+Local network        blocked by macOS
+Starts at login      yes
+State folder         private
+Claude Code          connected
+Codex                connected
+Cursor               connected
+Grok CLI             connected
+Command name         "lightbulb" belongs to the Lightbulb app; type "lightbulb-connect"
+Allow lightbulb-connect in System Settings > Privacy & Security > Local Network
+exit=1
+$ status (socket)  {"lan":"blocked","port":56755,"relay":"none","version":"0.2.0",…}
+/tmp/lightbulb-connect-501/gjivepwn…me54a  =  "127.0.0.1:56755 53795"  (mode 0600, dir 0700)
+daemon.log: net: macOS refuses this program the local network, so computers on it cannot find this one. Allow lightbulb-connect in System Settings > Privacy & Security > Local Network.
+```
+
+Exactly one daemon, on the new inode, after one `setup`: the F1 fix works. `doctor` did not say `All good.` at this point only because of the Local Network row: the rebuilt binary is a new program to macOS. Local Network was allowed on the owner's side during the run (I did not click anything). After A's restart for row 15, `status.lan` read `on` and the final `doctor` said `All good.` (below).
+
+### P3
+
+```
+user_version=6
+backup: approvals=4 grants=0 hidden_sessions=0 holds=4 join_requests=3 mailbox=4 messages=11 outbox=2 peers_sessions=2
+        policy=1 receipt_out=0 receipts=11 roster=8 seen_ids=8 sessions=4 team=1 team_link=3
+after setup: the same counts; messages, mailbox, receipts, roster, holds, outbox, team, policy, approvals,
+        join_requests identical row-for-row; schema identical
+```
+
+### P4
+
+Every config file is byte-identical to the backup: `.claude/settings.json`, `.codex/config.toml`, `.codex/hooks.json`, `.cursor/{cli-config,hooks,mcp}.json`, `.grok/config.toml`, `.grok/hooks/lightbulb-connect.json` and `lightbulb.json`. `~/.claude.json` differs as a whole file because Claude Code rewrites it all the time, but its `mcpServers` is identical. The 20 `hook <claude|codex|cursor|grok> <session-start|user-prompt-submit|post-tool-use|stop|session-end>` calls with `{}` on stdin all exited 0.
+
+### 1. Join
+
+```
+A$ lightbulb-connect invite
+Send this link to the person (or paste it on your other computer): lightbulb-connect join '<link>'
+Join Lightbulb Connect: https://thelightbulb.company/j/#eyJhZGRycyI6…   (764 characters)
+   ticket: addrs ['100.100.24.52:56755', '192.168.0.110:56755', '192.168.139.3:56755'], relay_hint '', mode ask
+B$ lightbulb-connect join '<link>' --name aden
+Asking whoever sent the link to allow this computer… (they get a prompt; this waits up to 10 minutes)
+A dialog: [Lightbulb Connect] aden (computer "mac-b") wants to join your team using your invite link. Allow only if you sent them the link.
+          Or run: lightbulb-connect approve J4            [Decline] [Allow]
+A$ lightbulb-connect held
+J4  aden (mac-b) wants to join — lightbulb-connect approve J4
+A$ lightbulb-connect approve J4
+J4 was already answered or withdrawn.                     ← see F7
+A log: join: J4 open for vf73ot6v7bdg / join: J4 admitted / net: connected vf73ot6v7bdg
+B: Connected as aden (mac-b). Team "prasiddhaparthsarthy": 2 computers online.
+   Your agents here can now see and message the team's agents. Try: lightbulb-connect who --all
+   Until both computers sign in, your other computer counts as another person and its first message needs your Allow.
+A$ lightbulb-connect team
+Team "prasiddhaparthsarthy" — 2 computers
+  You (prasiddhaparthsarthy) · PPs-MacBook-Pro · founder
+  aden · mac-b · member
+Invite someone: lightbulb-connect invite
+```
+
+The release daemons found each other with no PEERS knob and with mDNS blocked: B dialed the ticket's addresses / A's loopback file.
+
+### 2. First message held, then allowed (A: `listen --as inbox`)
+
+```
+B$ lightbulb-connect send prasiddhaparthsarthy/inbox 'ACC8R-1 first message from aden'
+Sent. prasiddhaparthsarthy has to allow it first (they see a prompt). Check: lightbulb-connect receipt 01M5N0W6C2H1HV29HXY6BJTNE6
+A$ lightbulb-connect held
+H5  aden, at the terminal (not verified — they have not signed in) -> gjivepwnkmgn/inbox  "ACC8R-1 first message from aden" — lightbulb-connect approve H5
+A$ lightbulb-connect approve H5   →  Allowed H5.        (dialog withdrawn)
+A listen: From aden, at the terminal (not verified): ACC8R-1 first message from aden
+          Reply: lightbulb-connect send vf73ot6v7bdg/terminal "…" --reply-to 01M5N0W6C2H1HV29HXY6BJTNE6
+B$ lightbulb-connect receipt 01M5N0W6… --json
+{"online":true,"person":"prasiddhaparthsarthy","reason":null,"request_id":"01M5N0W6C2H1HV29HXY6BJTNE6","state":"delivered","thread":"01M5N0W6C2DA7B1021NNJXS5PH","where":"PPs-MacBook-Pro"}
+```
+
+The held-message dialog text is under row 4. The `held` receipt JSON is also under row 4.
+
+### 3. Second message goes straight in
+
+```
+B$ lightbulb-connect send prasiddhaparthsarthy/inbox 'ACC8R-2 second message'
+Sent. Stored on PPs-MacBook-Pro for the session's next step. Check: lightbulb-connect receipt 01M5N0XNCJAF811J7D1R9NYYPT
+A listen: From aden, at the terminal (not verified): ACC8R-2 second message
+{"online":true,"person":"prasiddhaparthsarthy","reason":null,"request_id":"01M5N0XNCJAF811J7D1R9NYYPT","state":"delivered",…}
+```
+
+### 4 and 8. Policy by name; held; declined; accept
+
+```
+A$ lightbulb-connect policy
+Your workspace's agents may message your sessions without asking: no.
+Messages from awljc6ald6ktba5yob5zwn46qql2jltsm7ivb7yxiwq7sg5w5fba: accepted. (old entry — run: lightbulb-connect policy awljc6ald6ktba5yob5zwn46qql2jltsm7ivb7yxiwq7sg5w5fba forget)
+Messages from aden (vf73ot6v7bdg): accepted.
+A$ lightbulb-connect policy aden hold
+… Messages from aden (vf73ot6v7bdg): held for your Allow.
+   (db: people|vf73ot6v7bdg…wpf72q|hold|local — stored under aden's person id, not the literal name)
+B$ lightbulb-connect send prasiddhaparthsarthy/desk 'ACC8R-3 please decline this'
+Sent. prasiddhaparthsarthy has to allow it first (they see a prompt). Check: lightbulb-connect receipt 01M5N0YBDVJ5JCY1YSPW28X0Q6
+A dialog: [Lightbulb Connect] aden, at the terminal (not verified) wants to send a message to "desk" on this computer.
+          "ACC8R-3 please decline this"                   [Decline] [Allow]
+B$ receipt --json  {"online":true,"person":"prasiddhaparthsarthy","reason":null,"request_id":"01M5N0YBDVJ5JCY1YSPW28X0Q6","state":"held","thread":"01M5N0YBDVXPEQ9K6G50VSMTYR","where":"PPs-MacBook-Pro"}
+A$ lightbulb-connect held
+H6  aden, at the terminal (not verified — they have not signed in) -> gjivepwnkmgn/desk  "ACC8R-3 please decline this" — lightbulb-connect approve H6
+A$ lightbulb-connect decline H6   →  Declined H6.      (dialog withdrawn)
+B$ receipt   Not sent: they declined it.
+B$ receipt --json  {"online":true,"person":"prasiddhaparthsarthy","reason":"declined","request_id":"01M5N0YBDVJ5JCY1YSPW28X0Q6","state":"refused",…}
+A$ lightbulb-connect policy aden accept   → … Messages from aden (vf73ot6v7bdg): accepted.
+A$ lightbulb-connect policy aden maybe    → policy takes accept, hold or refuse.  (exit 1)
+A$ lightbulb-connect policy nobody hold   → No teammate called "nobody". Teammates: prasiddhaparthsarthy, aden (see lightbulb-connect team).
+A$ lightbulb-connect policy prasiddhaparthsarthy hold → That is you; your own computers always get through.
+B$ lightbulb-connect send prasiddhaparthsarthy/desk 'ACC8R-4 after accept by name'
+Sent. Stored on PPs-MacBook-Pro for the session's next step. Check: lightbulb-connect receipt 01M5N0YV0HF027DSZRZWCEPTAV
+```
+
+The `awljc…` row was in A's state before this run (a key no member has now), so it shows as `old entry`. I left it.
+
+### 5. Offline, queued, delivered
+
+```
+(B's daemon stopped with Ctrl-C; its file in /tmp/lightbulb-connect-501/ was removed)
+A$ lightbulb-connect send aden/desk 'ACC8R-5 sent while you were away'
+Not delivered yet: mac-b is offline. Lightbulb Connect keeps trying until 2026-10-24 14:39. Check: lightbulb-connect receipt 01M5N0ZAD586SJJYR2YTV94H6T
+{"online":false,"person":"aden","reason":null,"request_id":"01M5N0ZAD586SJJYR2YTV94H6T","state":"queued","thread":"01M5N0ZAD5G55R1HE5H0G5H1E9","until":1792867173,"where":"mac-b"}
+(B restarted; B$ lightbulb-connect listen --as desk --once)
+B dialog: [Lightbulb Connect] prasiddhaparthsarthy, at the terminal (not verified) wants to send a message to "desk" on this computer.
+          "ACC8R-5 sent while you were away"              [Decline] [Allow]
+B$ lightbulb-connect held
+H1  prasiddhaparthsarthy, at the terminal (not verified — they have not signed in) -> vf73ot6v7bdg/desk  "ACC8R-5 sent while you were away" — lightbulb-connect approve H1
+B$ lightbulb-connect approve H1   →  Allowed H1.
+B listen: From prasiddhaparthsarthy, at the terminal (not verified): ACC8R-5 sent while you were away
+A$ lightbulb-connect receipt 01M5N0ZA…   →  Delivered to aden on mac-b.
+```
+
+### 6. who --all
+
+```
+A$ lightbulb-connect who --all
+Name                                                      Person                Computer         Agent        Folder                                                 Status                         Doing
+claude-1                                                  prasiddhaparthsarthy  PPs-MacBook-Pro  Claude Code  /Users/prasiddhaparthsarthy/Desktop/lightbulb.nosync/  idle, gets messages instantly  ship-agent-network-phase-1
+vf73ot6v7bdg/claude:dc77321a-…                            aden                  mac-b            Claude Code                                                         idle, gets messages instantly  ship-agent-network-phase-1
+B$ lightbulb-connect who --all
+vf73ot6v7bdg/claude:dc77321a-…  aden                  mac-b            Claude Code  /Users/…/lightbulb.nosync  idle, gets messages instantly  …
+gjivepwnkmgn/claude:dc77321a-…  prasiddhaparthsarthy  PPs-MacBook-Pro  Claude Code  lightbulb                  idle, gets messages instantly  …
+```
+
+The same one-Mac artifact as before: B lists A's Claude session as its own, because both daemons read `~/.claude`.
+
+### 7. held with a join and a message
+
+```
+(C: lightbulb-connect join '<link>' --name visitor; A$ lightbulb-connect policy aden hold; B sends ACC8R-6)
+A$ lightbulb-connect held
+J5  visitor (mac-c) wants to join — lightbulb-connect approve J5
+H7  aden, at the terminal (not verified — they have not signed in) -> gjivepwnkmgn/inbox  "ACC8R-6 held for row 7" — lightbulb-connect approve H7
+A dialog (one at a time): aden, at the terminal (not verified) wants to send a message to "inbox" on this computer. "ACC8R-6 held for row 7"
+A$ lightbulb-connect decline J5   →  Declined visitor.        C: Your request to join was declined.
+A$ lightbulb-connect approve H7   →  Allowed H7.               A listen: From aden, at the terminal (not verified): ACC8R-6 held for row 7
+A$ lightbulb-connect policy aden accept
+(no osascript left running)
+```
+
+### 9. remove; B is told
+
+```
+A$ lightbulb-connect remove aden
+Removed aden. New connections and new mail from it are blocked. The invite link was replaced: Join Lightbulb Connect: https://thelightbulb.company/j/#eyJhZGRycyI6…
+A$ lightbulb-connect team
+Team "prasiddhaparthsarthy" — 1 computer
+  You (prasiddhaparthsarthy) · PPs-MacBook-Pro · founder
+B$ lightbulb-connect team
+You were removed from "prasiddhaparthsarthy" by prasiddhaparthsarthy on 2026-10-23. This computer is on its own network again.
+Team "prasiddhaparthsarthy" — 1 computer
+  You (prasiddhaparthsarthy) · mac-b · founder
+B log: net: removed from "prasiddhaparthsarthy" by prasiddhaparthsarthy; on our own network again
+A log: net: closed vf73ot6v7bdg (no longer a member)
+B$ lightbulb-connect leave       (answered n)
+Leave "prasiddhaparthsarthy"? Your computer stops connecting. Mail already stored here stays. [y/N]   ← see F8
+B$ lightbulb-connect join '<the old link>' --name aden
+Asking whoever sent the link to allow this computer… (they get a prompt; this waits up to 10 minutes)
+This invite link does not work. Ask for a new one.        (A log: join: refused vf73ot6v7bdg (bad_ticket))
+```
+
+The solo team on B is named after the macOS user (`prasiddhaparthsarthy`), which is A's name too, because both run as the same user. That is a one-Mac artifact.
+
+### 10. Receipt sentences
+
+| state | sentence |
+|---|---|
+| queued | `Not delivered yet: mac-b is offline. Lightbulb Connect keeps trying until 2026-10-24 14:39. Check: lightbulb-connect receipt <id>` |
+| held | `Sent. prasiddhaparthsarthy has to allow it first (they see a prompt). Check: lightbulb-connect receipt <id>` |
+| stored | `Sent. Stored on PPs-MacBook-Pro for the session's next step. Check: lightbulb-connect receipt <id>` |
+| delivered | `Delivered to prasiddhaparthsarthy on PPs-MacBook-Pro.` / `Delivered to aden on mac-b.` |
+| refused | `Not sent: they declined it.` |
+
+`read` and `expired` were not reached, for the same reasons as before.
+
+### 11. folder off/on
+
+```
+A$ lightbulb-connect folder /Users/prasiddhaparthsarthy/Desktop/lightbulb.nosync off
+Sessions in /Users/prasiddhaparthsarthy/Desktop/lightbulb.nosync are hidden from your teammates.
+A$ lightbulb-connect who   → claude-1 … busy, gets messages instantly, hidden from teammates …
+B$ lightbulb-connect who --all   → only B's own row, already on the first call
+A$ lightbulb-connect folder … on
+Sessions in /Users/prasiddhaparthsarthy/Desktop/lightbulb.nosync are shown to your teammates.
+B$ lightbulb-connect who --all   → A's row back about 6 s later
+```
+
+### 12. relay
+
+```
+$ lightbulb-connect relay
+none (direct connections only)
+Our relay list was refused: https://thelightbulb.company/connect/relays.json answered 404
+```
+
+### 13. Error texts
+
+```
+$ lightbulb-connect frobnicate               →  Unknown command: frobnicate. Run lightbulb-connect --help.   (exit 2)
+$ lightbulb-connect send codex-9 "x"         →  No session "codex-9" is open right now. Run lightbulb-connect who to see the current ones.
+$ lightbulb-connect folder /no/such/place/xyz off  →  There is no folder at /no/such/place/xyz.
+$ lightbulb-connect send nobody/inbox "x"    →  No teammate called "nobody". Teammates: prasiddhaparthsarthy, aden (see lightbulb-connect team).
+$ lightbulb-connect receipt NOPE             →  No message NOPE was sent from this terminal.
+$ lightbulb-connect approve H99              →  No held message H99.
+$ lightbulb-connect approve J99              →  No join request J99.
+$ (in a team) join 'garbage'                 →  You are in "prasiddhaparthsarthy". Leave it first: lightbulb-connect leave
+$ lightbulb-connect policy aden maybe        →  policy takes accept, hold or refuse.
+$ held (from an agent's shell)               →  Run this from your own terminal, not from an agent.
+```
+
+### 14. A ticket with edited addresses
+
+I took A's current link (after `remove`), changed `addrs` from `['100.100.24.52:56755', '192.168.0.110:56755', '192.168.139.3:56755']` to `["224.0.0.251:5353","127.0.0.1:22"]`, kept `sig`, and joined from B (solo):
+
+```
+B$ lightbulb-connect join '<edited link>' --name aden
+Asking whoever sent the link to allow this computer… (they get a prompt; this waits up to 10 minutes)
+This invite link does not work. Ask for a new one.
+exit=1
+```
+
+The refusal is local. A logged nothing for it, and nothing was dialed. In `team.join`, `parse_addrs` (which refuses multicast and loopback) and `signed_by_inviter` both reject this ticket (`src/admission.rs:862-864`). The waiting line before the refusal is F9.
+
+### 15. A's `addrs.json` after `remove`
+
+```
+before remove: {"vf73ot6v7bdg…wpf72q": ["100.100.24.52:61720","192.168.0.110:61720","192.168.139.3:61720"]}
+after remove:  unchanged (mtime 14:39)
+after launchctl kickstart -k of A (new pid 62095, same new inode): unchanged — B's key is still there
+```
+
+### Logs
+
+`grep -c ACC8R` gives 0 in `~/.lightbulb/connect/daemon.log`, 0 in B's daemon output and 0 in C's daemon output.
+
+### End state of A
+
+```
+$ pgrep -fl "lightbulb-connect daemon"
+62095 /Users/prasiddhaparthsarthy/.lightbulb/connect/bin/lightbulb-connect daemon     (inode 1321273298)
+$ lightbulb-connect doctor
+Background service   running
+Starts at login      yes
+State folder         private
+Claude Code          connected
+Codex                connected
+Cursor               connected
+Grok CLI             connected
+Command name         "lightbulb" belongs to the Lightbulb app; type "lightbulb-connect"
+All good.
+status: {"lan":"on","version":"0.2.0","relay":"none",…}; user_version=6
+```
+
+The policy table equals the backup's: aden's row was removed with `policy <key> forget`. B, C, the tmux session and the temp homes were removed. No dialog is open.
+
+### Findings (re-run)
+
+- **F6 (row 15 FAIL): a removed member's addresses stay in `addrs.json` across `remove` and a restart.** `Peers::learn` (`src/net/mod.rs:311-321`) is the only code that prunes the file to roster members. It runs only when a peer's `hello` brings changed addresses. `remove` does not prune the file, and `load_known` (`src/net/mod.rs:324-333`) reloads every entry with no roster filter. A team that has no other members never saves the file again. The file is also mode 0644 (its folder is 0700). Fix idea: filter by the roster in `load_known`, and save the file after `remove`.
+- **F7 (row 1): J4 was answered before my `approve J4`.** The CLI said `J4 was already answered or withdrawn.` and the log said only `join: J4 admitted`. I did not click the dialog, and its default button is Decline, so a key press did not do it either: someone clicked Allow on the screen. Nothing in the log, the row (`join_requests.state = admitted`) or the CLI tells you which surface answered. Fix idea: log `J4 admitted (dialog)` / `(cli)`.
+- **F8 (minor): `leave` on a computer that is on its own network asks `Leave "<its own solo team>"?`.** After the removal, B's solo team is still named, and `leave` offers to leave it. It should say that there is nothing to leave.
+- **F9 (minor): `join` with a bad ticket prints `Asking whoever sent the link to allow this computer… (they get a prompt; this waits up to 10 minutes)` before `This invite link does not work.`** The daemon refuses before any dial, so the waiting line is wrong. The CLI prints it for any ticket that decodes in `ask` mode, before the daemon checks it (`src/cli.rs:627-629`).
+- **Minor, from the first run and still present:** `policy takes accept, hold or refuse.` is not a capitalised sentence. `stored` says "for the session's next step" for a name address (`inbox`, `desk`). `receipt` repeats `Check: lightbulb-connect receipt <id>`.

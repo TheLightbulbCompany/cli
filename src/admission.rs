@@ -61,6 +61,8 @@ const REASONS: &[&str] = &[
 
 /// A dial, a first frame, a `roster` page, the goodbye: each gets this long.
 const STEP: Duration = Duration::from_secs(10);
+/// How long a member's silence on a join request means it is asking its person.
+const ASKING: Duration = Duration::from_secs(1);
 /// Open requests at once: per team, per inviter, per candidate.
 const LIMITS: (usize, usize, usize) = (20, 5, 1);
 /// The roster a candidate takes in, at most.
@@ -520,9 +522,10 @@ async fn answered(
     (!gone).then_some(Err(NOT_ANSWERED))
 }
 
-/// The person's answer to request `n`, from the dialog or `team.admit`: its name and verdict,
-/// or `None` when it is not waiting here (answered, its candidate gone, or forwarded).
-fn answer(d: &Daemon, n: i64, allow: bool) -> Option<(String, Verdict)> {
+/// The person's answer to request `n`, from `surface` (`dialog`, or `cli` for `team.admit`):
+/// its name and verdict, or `None` when it is not waiting here (answered, its candidate gone,
+/// or forwarded).
+fn answer(d: &Daemon, n: i64, allow: bool, surface: &'static str) -> Option<(String, Verdict)> {
     let (req, tx) = {
         let mut waiting = d.admissions.lock().unwrap();
         match waiting.remove(&n)? {
@@ -534,6 +537,11 @@ fn answer(d: &Daemon, n: i64, allow: bool) -> Option<(String, Verdict)> {
         }
     };
     d.dialogs.withdraw(&format!("J{n}"));
+    d.answered_by
+        .lock()
+        .unwrap()
+        .insert(format!("J{n}"), surface);
+    eprintln!("join: J{n} answered from the {surface}");
     let v = if allow {
         admit(d, n, &req)
     } else {
@@ -735,7 +743,7 @@ pub async fn route(d: Arc<Daemon>) {
     while let Some((id, button)) = answers.recv().await {
         let Some(b) = button else { continue };
         if let Some(n) = dialog::number(&id, 'J') {
-            answer(&d, n, b == "Allow");
+            answer(&d, n, b == "Allow", "dialog");
         } else if let Some(n) = dialog::number(&id, 'H') {
             crate::holds::on_dialog(&d, n, &b);
         } else {
@@ -776,13 +784,16 @@ pub fn admit_op(id: u64, body: &Value, d: &Daemon) -> Response {
     else {
         return Response::err(id, BAD_REQUEST);
     };
-    match answer(d, n, allow) {
+    match answer(d, n, allow, "cli") {
         Some((name, v)) => Response::ok(
             id,
             json!({"name": name, "state": words(v).1, "reason": v.err()}),
         ),
         None => match d.store.lock().unwrap().join_exists(n) {
-            Ok(true) => Response::err(id, NOT_OPEN),
+            Ok(true) => {
+                let by = d.answered_by.lock().unwrap().get(&format!("J{n}")).copied();
+                Response::err_with(id, NOT_OPEN, json!({ "answered_in": by }))
+            }
             Ok(false) => Response::err(id, NOT_FOUND),
             Err(_) => Response::err(id, INTERNAL),
         },
@@ -866,7 +877,7 @@ pub async fn join(id: u64, body: &Value, d: &Arc<Daemon>) -> Response {
     {
         let team = d.team.lock().unwrap();
         d.peers
-            .learn(&d.dir, &t.inviter, inviter_addrs, &team.roster);
+            .learn(&d.dir, &t.inviter, inviter_addrs.clone(), &team.roster);
     }
     for m in t.members.iter().filter(|m| *m != me) {
         let Some(mut addr) = d.peers.addr(m) else {
@@ -888,6 +899,15 @@ pub async fn join(id: u64, body: &Value, d: &Arc<Daemon>) -> Response {
             Outcome::Refused(r) => return done("refused", Some(r), "", 0),
             Outcome::Admitted => {
                 eprintln!("join: admitted by {}", net::short(m));
+                // Kept again now the inviter is a member: a roster change while the request
+                // waited pruned what the ticket gave (the inviter was no member then), and
+                // with no relay and no mDNS it is the one way to reach the team.
+                {
+                    let team = d.team.lock().unwrap();
+                    d.peers
+                        .learn(&d.dir, &t.inviter, inviter_addrs.clone(), &team.roster);
+                }
+                d.peers.changed.notify_one();
                 // The dial loop connects to the team; give it a moment for the count.
                 let _ = tokio::time::timeout(Duration::from_secs(5), async {
                     loop {
@@ -915,9 +935,21 @@ async fn attempt(d: &Daemon, conn: &Connection, req: &Frame, m: &str, t: &Ticket
     if frames::write(&mut send, req).await.is_err() {
         return Outcome::Next(None);
     }
-    // The member gives up at its wait; we a step later.
+    // The member gives up at its wait; we a step later. No answer within a second: it took
+    // the ticket and asks its person, which `join` then says (`join_asking`).
     let wait = d.peers.knobs().join_wait + STEP;
-    let f = match tokio::time::timeout(wait, frames::read(&mut recv)).await {
+    let f = {
+        let read = frames::read(&mut recv);
+        tokio::pin!(read);
+        match tokio::time::timeout(ASKING, &mut read).await {
+            Ok(f) => Ok(f),
+            Err(_) => {
+                let _ = d.events.send(json!({"event": "join_asking"}));
+                tokio::time::timeout(wait.saturating_sub(ASKING), &mut read).await
+            }
+        }
+    };
+    let f = match f {
         Err(_) => return Outcome::Refused(NOT_ANSWERED),
         Ok(Err(_)) => return Outcome::Next(None),
         Ok(Ok(f)) => f,

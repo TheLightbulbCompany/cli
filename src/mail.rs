@@ -139,6 +139,8 @@ pub struct ForPerson<'a> {
     pub to: Option<&'a str>,
     pub rid: &'a str,
     pub cmd: &'a str,
+    /// Whether to end with `Check: <cmd> receipt <rid>` (not when `receipt` itself prints it).
+    pub check: bool,
 }
 
 /// What receipt `r` means in words. With `person`, the sentence for the person who sent it at
@@ -175,8 +177,14 @@ pub fn receipt_note(r: &Value, person: Option<&ForPerson>) -> Option<String> {
             _ => return None,
         });
     };
-    let check = format!(" Check: {} receipt {}", p.cmd, p.rid);
+    let check = if p.check {
+        format!(" Check: {} receipt {}", p.cmd, p.rid)
+    } else {
+        String::new()
+    };
     let name = p.to.map(|t| t.split_once('/').map_or(t, |(_, n)| n));
+    // A name address (`inbox`), not a session's.
+    let mailbox = name.filter(|n| !n.contains(':'));
     Some(match at("state") {
         "refused" if at("reason") == "loop" => format!("Not sent: {}.", limit()),
         "refused" => format!(
@@ -203,12 +211,20 @@ pub fn receipt_note(r: &Value, person: Option<&ForPerson>) -> Option<String> {
             )
         }
         "queued" => format!("Not delivered yet.{check}"),
-        "stored" if remote => {
-            format!("Sent. Stored on {computer} for the session's next step.{check}")
-        }
+        "stored" if remote => match mailbox {
+            Some(n) => format!(
+                "Sent. Stored on {computer} in the \"{}\" mailbox.{check}",
+                crate::label::plain(n, usize::MAX)
+            ),
+            // A session's address; unknown (`receipt` has only the id): no guess.
+            None if name.is_some() => {
+                format!("Sent. Stored on {computer} for the session's next step.{check}")
+            }
+            None => format!("Sent. Stored on {computer}.{check}"),
+        },
         "stored" if computer == "recipient" => "Sent. The session sees it at its next step.".into(),
         "stored" => match name {
-            Some(n) if !n.contains(':') => format!(
+            Some(n) if mailbox.is_some() => format!(
                 "Sent. Waiting in the \"{}\" mailbox until someone reads it.",
                 crate::label::plain(n, usize::MAX)
             ),
