@@ -111,6 +111,21 @@ pub(crate) fn ancestors_pinned(
     })
 }
 
+/// Whether `path` is Cursor: its CLI (`classify`) or the editor app and its helpers.
+pub fn is_cursor(path: &Path) -> bool {
+    classify(path) == Some("cursor") || path.to_string_lossy().contains("/Cursor.app/")
+}
+
+/// Whether the program that ran this hook is Cursor, which also runs `~/.claude/settings.json`
+/// hooks: the first program above it, or (debug builds) the process `CALLER_ENV` pins.
+pub fn fired_by_cursor() -> bool {
+    let first = match crate::hook::pinned_caller() {
+        Some(pinned) => pinned.ok().and_then(|p| os::process(p.pid).ok()),
+        None => ancestors().ok().and_then(|a| first_program(&a).cloned()),
+    };
+    first.is_some_and(|p| is_cursor(&p.executable))
+}
+
 fn first_program(ancestors: &[Process]) -> Option<&Process> {
     ancestors.iter().find(|p| !skipped(&p.executable))
 }
@@ -133,6 +148,24 @@ mod tests {
             pid,
             birth_micros: pid.into(),
             executable: PathBuf::from(exe),
+        }
+    }
+
+    #[test]
+    fn cursor_is_its_cli_or_its_app() {
+        for path in [
+            "/Users/u/.local/bin/cursor-agent",
+            "/Users/u/.local/share/cursor-agent/versions/x/node",
+            "/Applications/Cursor.app/Contents/MacOS/Cursor",
+            "/Applications/Cursor.app/Contents/Frameworks/Cursor Helper (Plugin).app/Contents/MacOS/Cursor Helper (Plugin)",
+        ] {
+            assert!(is_cursor(Path::new(path)), "{path}");
+        }
+        for path in [
+            "/Users/u/.local/bin/claude",
+            "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal",
+        ] {
+            assert!(!is_cursor(Path::new(path)), "{path}");
         }
     }
 

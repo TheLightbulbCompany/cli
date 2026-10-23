@@ -128,6 +128,14 @@ pub fn run(agent: &str, event: &str, stdin: &str) -> Result<Option<String>> {
     let Some(h) = normalize(agent, event, &serde_json::from_str(stdin)?) else {
         return Ok(None);
     };
+    // Cursor runs Claude's hooks too, and ours are installed for both: its own hooks own the
+    // session, so a Claude hook it fired registers and delivers nothing (no second session).
+    if agent == "claude" && caller::fired_by_cursor() {
+        if cfg!(debug_assertions) {
+            eprintln!("hook: claude {event} fired by Cursor; Cursor's hooks own this session");
+        }
+        return Ok(None);
+    }
     let caller = calling_agent(Some(agent));
     if h.event == Event::SessionEnd {
         // The agent may have exited before its SessionEnd hook ran, so the caller check
