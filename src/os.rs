@@ -26,7 +26,8 @@ pub fn process(pid: u32) -> Result<Process> {
     })
 }
 
-/// This computer's host name; empty when the OS will not say.
+/// This computer's short host name (its first label, at most 64 characters, so a member
+/// admits it as a computer name); empty when the OS will not say.
 pub fn hostname() -> String {
     let mut buf = [0u8; 256];
     // SAFETY: the buffer length is passed alongside the pointer.
@@ -34,7 +35,18 @@ pub fn hostname() -> String {
         return String::new();
     }
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-    String::from_utf8_lossy(&buf[..end]).into_owned()
+    short_name(&String::from_utf8_lossy(&buf[..end]))
+}
+
+/// `host`'s first label, trimmed, at most 64 characters.
+fn short_name(host: &str) -> String {
+    host.split('.')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .take(64)
+        .collect()
 }
 
 /// Whether `peer_pid` works here (Claude pushes need it).
@@ -151,6 +163,18 @@ mod imp {
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_name_fits_a_computer_name() {
+        // GitHub's macOS runner: 68 bytes in full.
+        let runner = "dsm41-ai250-f4f311fd-890c-4d34-aa50-5177d395bc82-F655ED2D4EB5.local";
+        assert_eq!(
+            short_name(runner),
+            "dsm41-ai250-f4f311fd-890c-4d34-aa50-5177d395bc82-F655ED2D4EB5"
+        );
+        assert_eq!(short_name("mac"), "mac");
+        assert_eq!(short_name(&"a".repeat(80)).len(), 64);
+    }
 
     #[test]
     fn own_process_and_parent_are_found() {
