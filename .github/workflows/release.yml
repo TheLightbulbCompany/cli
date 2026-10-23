@@ -1,0 +1,25 @@
+name: release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  macos-arm64:
+    runs-on: macos-latest # Apple silicon (arm64)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      # Not signed or notarized yet: that is a later step (Developer ID
+      # signing + notarytool), so Gatekeeper will quarantine a browser download.
+      - name: Package
+        run: |
+          tar -czf lightbulb-connect-macos-arm64.tar.gz -C target/release lightbulb-connect
+          shasum -a 256 lightbulb-connect-macos-arm64.tar.gz > lightbulb-connect-macos-arm64.tar.gz.sha256
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes \
+            lightbulb-connect-macos-arm64.tar.gz lightbulb-connect-macos-arm64.tar.gz.sha256

@@ -1,0 +1,8 @@
+# Default rules; add per-file allowlist entries for known false positives only.
+[extend]
+useDefault = true
+
+# The 12-character member-key prefixes in the acceptance record are public keys, not secrets.
+[[allowlists]]
+description = "public member-key prefixes in the Plan A acceptance record"
+paths = ['''docs/acceptance-plan-a\.md''']

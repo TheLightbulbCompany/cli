@@ -1,0 +1,27 @@
+pub mod admission;
+pub mod agents;
+pub mod cli;
+pub mod config;
+pub mod daemon;
+pub mod dialog;
+pub mod doing;
+pub mod frame;
+pub mod holds;
+pub mod hook;
+pub mod identity;
+pub mod label;
+pub mod mail;
+pub mod mcp;
+pub mod net;
+pub mod os;
+pub mod outbox;
+pub mod paths;
+pub mod policy;
+pub mod presence;
+pub mod roster;
+pub mod sessions;
+pub mod setup;
+pub mod store;
+pub mod ticket;
+
+pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
