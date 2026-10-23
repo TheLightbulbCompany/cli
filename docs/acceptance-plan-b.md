@@ -339,16 +339,16 @@ The one note: `no such folder: …` is the only error that is not a capitalised 
 
 The teammate follows this on Mac B (a different macOS account and person, release build, the same Wi-Fi as A).
 
-1. Run the install line: `curl -fsSL https://github.com/TheLightbulbCompany/lightbulb-connect/releases/latest/download/install.sh | sh`. It installs `~/.lightbulb/connect/bin/lightbulb-connect`, runs `setup` (one line per agent and `Lightbulb Connect is on.`) and starts the background service.
-2. Run `lightbulb-connect doctor`, which must show `Relay                default` and end with `All good.` (If `~/.local/bin` is not on PATH, use the full path.)
-3. Quit and restart Claude Code and Codex. An open session does not load the new tool server. The tool server is named **`lightbulb-connect`**.
-4. In a plain Terminal (not inside an agent), paste the command A's `invite` printed (`lightbulb-connect join '<ticket>' --name NAME`), with your name in place of `NAME`. Wait for `Connected as <you> (<your computer>) …`. A clicks Allow, or runs `lightbulb-connect approve J<n>`.
-5. Run `lightbulb-connect who --all`. A's sessions are listed with A's name and computer.
-6. In Claude Code, say: "Use the lightbulb-connect tools: find the sessions of `<A's name>` and send their Claude `ping from B` with send_message." Then: "read its receipt with message_receipt". Text the receipt to A. It reads `held` until A allows it.
+1. Run the install line: `curl -fsSL https://github.com/TheLightbulbCompany/lightbulb-connect/releases/latest/download/install.sh | sh`. It installs `~/.lightbulb/connect/bin/lightbulb`, runs `setup` (one line per agent and `Lightbulb Connect is on.`) and starts the background service.
+2. Run `lightbulb doctor`, which must show `Relay                default` and end with `All good.` (If `~/.local/bin` is not on PATH, use the full path.)
+3. Quit and restart Claude Code and Codex. An open session does not load the new tool server. The tool server is named **`lightbulb`**.
+4. In a plain Terminal (not inside an agent), paste the command A's `invite` printed (`lightbulb join '<ticket>' --name NAME`), with your name in place of `NAME`. Wait for `Connected as <you> (<your computer>) …`. A clicks Allow, or runs `lightbulb approve J<n>`.
+5. Run `lightbulb who --all`. A's sessions are listed with A's name and computer.
+6. In Claude Code, say: "Use the lightbulb tools: find the sessions of `<A's name>` and send their Claude `ping from B` with send_message." Then: "read its receipt with message_receipt". Text the receipt to A. It reads `held` until A allows it.
 7. After A says "allowed", send a second message from Codex the same way. Confirm the receipt reads `stored` or later, without A doing anything.
 8. Send a third. A declines it. Confirm the receipt is `refused`, reason `declined`.
 9. Close the lid for 2 minutes while A sends to your Claude. Open it. Confirm the message arrives, and that A's receipt reads `delivered`.
-10. Run `lightbulb-connect leave` and answer `y`. Confirm that `lightbulb-connect team` lists only you.
+10. Run `lightbulb leave` and answer `y`. Confirm that `lightbulb team` lists only you.
 
 A's side records each row with the dialog text, labels and `receipt --json`, then greps both `~/.lightbulb/connect/daemon.log` for the body markers (they must be absent).
 
@@ -363,7 +363,7 @@ A's side records each row with the dialog text, labels and `receipt --json`, the
   - The daemon probes mDNS at start. When macOS refuses it, the log says how to allow it, `status.lan` is `blocked` (or `no network` when no multicast interface is up), and `doctor` shows the fix.
   - Tests: `net_two::two_members_on_one_computer_find_each_other` and `join::the_ticket_addresses_alone_reach_the_inviter`. mDNS itself cannot run in the test sandbox, which gets the same `EHOSTUNREACH`.
   - Release check: two 0.2.0 release daemons in temp homes, with no PEERS knob (release has none). `join … --name aden`, then `approve J1` from a detached shell, gave `Connected as aden (mac-b). Team "a": 2 computers online.` Both daemons logged the Local Network refusal, and `status.lan` read `blocked`. Then `remove aden` gave on B: `You were removed from "a" by a on 2026-10-23. This computer is on its own network again.`
-  - For step 2: on each Mac, allow `lightbulb-connect` in System Settings > Privacy & Security > Local Network if `doctor` asks, so that mDNS works too.
+  - For step 2: on each Mac, allow `lightbulb` in System Settings > Privacy & Security > Local Network if `doctor` asks, so that mDNS works too.
 - **F1 (e6a712a, c946668).** `ensure_running` starts the canonical binary for the real install. `setup` and `daemon --install/--uninstall` send `shutdown` and wait for the lock holder's pid to exit. A daemon that does not exit is reported (`The old background service did not stop (pid N). Run: kill N, then lightbulb-connect setup again.`), and no job is installed behind it. The daemon does not check versions at start.
 - **F3.** `policy <name|short|key> <value>` stores the member's person id. More than one match, or no match, gives a sentence. The listing shows `aden (qxcrztez36jw)`. `policy.set` refuses an id that no member has, unless it is a `ws:` id. Your own person is refused. A row stored under a literal name by an older build is marked `old entry`, and `policy <id> forget` deletes it.
 - **F4.** A removed member is told its removal (the `remove` entry and the ancestors it lacks, never a later entry) on its live link or on its next dial. Its queued mail becomes `refused not_member`, it logs one line, and it goes solo. `team` says `You were removed from "<team>" by <name> on <date>. This computer is on its own network again.`

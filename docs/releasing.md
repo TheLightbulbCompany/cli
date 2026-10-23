@@ -4,13 +4,15 @@
 2. Tag and push: `git tag v<x.y.z> && git push origin v<x.y.z>`.
 3. `.github/workflows/release.yml` runs on the tag:
    - `macos-arm64` builds on Apple silicon and creates the GitHub release with
-     `lightbulb-connect-macos-arm64.tar.gz`, its `.sha256` and `install.sh`. The curl installer
+     `lightbulb-connect-macos-arm64.tar.gz` (it holds one binary, `lightbulb`), its `.sha256` and
+     `install.sh`. The curl installer
      always takes the latest release, so it is live as soon as this job ends.
    - `publish-npm` sets `npm/package.json` to the tag's version and runs
      `npm publish --provenance --access public`. Needs the `NPM_TOKEN` secret.
    - `bump-brew` rewrites `url`, `sha256` and the test's version in
-     `Formula/lightbulb-connect.rb` in `TheLightbulbCompany/homebrew-tap`, commits
-     `lightbulb-connect <x.y.z>` and pushes. Needs the `HOMEBREW_TAP_TOKEN` secret.
+     `Formula/lightbulb-connect.rb` in `TheLightbulbCompany/homebrew-tap` (the test line reads
+     `lightbulb <x.y.z>`, what `lightbulb version` prints), commits `lightbulb-connect <x.y.z>`
+     and pushes. Needs the `HOMEBREW_TAP_TOKEN` secret.
 4. A job whose secret is missing passes with `NPM_TOKEN not set; skipping npm publish` or
    `HOMEBREW_TAP_TOKEN not set; skipping brew bump` in its log. Then do it by hand:
    - npm: `cd npm && npm version <x.y.z> --no-git-tag-version --allow-same-version && npm publish --access public`
