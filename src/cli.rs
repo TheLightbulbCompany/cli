@@ -1328,21 +1328,24 @@ pub fn stop_daemon() -> Result<()> {
 /// Writes and loads the launchd job that runs `exe daemon`, after stopping the daemon that
 /// runs now (`stop_daemon`), so the one that answers after is `exe`'s.
 pub fn install_job(home: &Path, exe: &Path) -> Result<i32> {
-    stop_daemon()?;
-    let path = plist_path(home);
-    fs::create_dir_all(path.parent().unwrap())?;
-    fs::write(&path, plist(exe, &paths::state_dir().join("daemon.log")))?;
-    // Replace any loaded job so an update restarts it: bootout (result ignored), bootstrap,
-    // and `kickstart -k` if bootstrap fails.
     let uid = unsafe { libc::getuid() };
+    let path = plist_path(home);
     let (domain, service, file) = (
         format!("gui/{uid}"),
         format!("gui/{uid}/{LABEL}"),
         path.to_string_lossy().into_owned(),
     );
-    let sequence = format!("bootout {service}; bootstrap {domain} {file}; kickstart -k {service}");
+    // The loaded job goes first (result ignored): with it loaded, KeepAlive would restart the
+    // daemon `stop_daemon` stops, and the new one would hold the lock it waits on.
     if use_launchctl() {
         launchctl(&["bootout", &service]);
+    }
+    stop_daemon()?;
+    fs::create_dir_all(path.parent().unwrap())?;
+    fs::write(&path, plist(exe, &paths::state_dir().join("daemon.log")))?;
+    // Load the job so an update restarts it: bootstrap, and `kickstart -k` if that fails.
+    let sequence = format!("bootout {service}; bootstrap {domain} {file}; kickstart -k {service}");
+    if use_launchctl() {
         let up = launchctl(&["bootstrap", &domain, &file])
             || launchctl(&["load", "-w", &file])
             || launchctl(&["kickstart", "-k", &service]);

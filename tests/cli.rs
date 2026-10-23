@@ -1052,3 +1052,46 @@ fn policy_refuses_your_own_person_and_forgets_an_old_row() {
     assert!(o.status.success(), "{}", err(&o));
     assert!(!out(&o).contains("aden"), "{}", out(&o));
 }
+
+/// `daemon --install` over a loaded job boots it out BEFORE it stops the daemon: with the job
+/// loaded, KeepAlive would restart the stopped daemon, which would retake the lock. A
+/// `launchctl` shim on PATH records each call and whether the daemon's socket still answered
+/// then; the first call must be the bootout, made while the old daemon still runs.
+#[test]
+fn install_boots_the_job_out_before_it_stops_the_daemon() {
+    use std::os::unix::fs::PermissionsExt;
+    let e = Env::new();
+    assert!(e.run(&["who"]).status.success());
+    let shim = tempfile::tempdir().unwrap();
+    let log = shim.path().join("calls");
+    let sock = e.state.path().join("sock");
+    std::fs::write(
+        shim.path().join("launchctl"),
+        format!(
+            "#!/bin/sh\nif [ -S '{}' ]; then up=live; else up=gone; fi\necho \"$1 $up\" >> '{}'\n",
+            sock.display(),
+            log.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        shim.path().join("launchctl"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let path = format!("{}:/usr/bin:/bin", shim.path().display());
+    let o = e
+        .cmd(&["daemon", "--install"])
+        .env_remove("LIGHTBULB_CONNECT_NO_LAUNCHCTL")
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", err(&o));
+    let calls = std::fs::read_to_string(&log).unwrap();
+    let first = calls.lines().next().unwrap_or_default();
+    assert_eq!(first, "bootout live", "{calls}");
+    assert!(
+        calls.lines().any(|l| l.starts_with("bootstrap ")),
+        "{calls}"
+    );
+}
