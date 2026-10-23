@@ -3,7 +3,7 @@ use std::path::Path;
 
 /// Migration `i` takes the db to `user_version` `i + 1`. Forward only; each one only adds
 /// tables or columns, and runs once (in the transaction that moves `user_version`).
-const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5];
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6];
 
 const V1: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
@@ -74,6 +74,13 @@ const V3: &str = "ALTER TABLE sessions ADD COLUMN ended_at INTEGER;";
 const V4: &str = "ALTER TABLE holds ADD COLUMN shown TEXT;";
 /// Which loop limit a `loop` refusal hit (`mail::HOPS`, `mail::RATE`), when known.
 const V5: &str = "ALTER TABLE receipts ADD COLUMN \"limit\" TEXT;";
+/// A session's repo and branch as its hook read them (the daemon never reads a session's
+/// folder), and the index a mailbox's reply-window query reads by.
+const V6: &str = "
+ALTER TABLE sessions ADD COLUMN repo TEXT;
+ALTER TABLE sessions ADD COLUMN branch TEXT;
+CREATE INDEX IF NOT EXISTS messages_to_sent ON messages (to_key, sent_at);
+";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Session {
@@ -88,6 +95,11 @@ pub struct Session {
     pub seen_at: i64,
     /// The agent process's executable, as the registering hook found it.
     pub executable: Option<String>,
+    pub repo: Option<String>,
+    pub branch: Option<String>,
+    /// `who`'s `<provider>-<n>`: the row's place among this provider's rows, ended ones too
+    /// (only `sessions` reads it; never written).
+    pub handle: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -116,6 +128,9 @@ fn row_session(r: &rusqlite::Row) -> rusqlite::Result<Session> {
         status: r.get("status")?,
         seen_at: r.get("seen_at")?,
         executable: r.get("executable")?,
+        repo: r.get("repo")?,
+        branch: r.get("branch")?,
+        handle: r.get("handle").ok().flatten(),
     })
 }
 
@@ -166,11 +181,16 @@ impl Store {
         &self.conn
     }
 
-    /// Writes `s` as a live row (an ended one is live again).
+    /// Writes `s` as a live row (an ended one is live again), in place: a row keeps its place
+    /// (`handle`).
     pub fn put_session(&self, s: &Session) -> rusqlite::Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO sessions (key, provider, conversation, pid, birth_micros, cwd, \
-             title, status, seen_at, executable) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO sessions (key, provider, conversation, pid, birth_micros, cwd, title, \
+             status, seen_at, executable, repo, branch) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
+             ON CONFLICT(key) DO UPDATE SET provider = ?2, conversation = ?3, pid = ?4, \
+             birth_micros = ?5, cwd = ?6, title = ?7, status = ?8, seen_at = ?9, \
+             executable = ?10, repo = ?11, branch = ?12, ended_at = NULL",
             params![
                 s.key,
                 s.provider,
@@ -181,7 +201,9 @@ impl Store {
                 s.title,
                 s.status,
                 s.seen_at,
-                s.executable
+                s.executable,
+                s.repo,
+                s.branch
             ],
         )?;
         Ok(())
@@ -200,9 +222,11 @@ impl Store {
 
     /// The rows that have not ended.
     pub fn sessions(&self) -> rusqlite::Result<Vec<Session>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT * FROM sessions WHERE ended_at IS NULL")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT * FROM (SELECT rowid AS place, *, provider || '-' || \
+             row_number() OVER (PARTITION BY provider ORDER BY rowid) AS handle FROM sessions) \
+             WHERE ended_at IS NULL ORDER BY place",
+        )?;
         let rows = stmt.query_map([], row_session)?;
         rows.collect()
     }
@@ -683,6 +707,9 @@ mod tests {
             status: "idle".into(),
             seen_at: 7,
             executable: Some("/bin/claude".into()),
+            repo: None,
+            branch: None,
+            handle: None,
         };
         store.put_session(&session).unwrap();
         assert_eq!(store.session("claude:abc").unwrap(), Some(session));
@@ -779,6 +806,48 @@ mod tests {
         );
         assert!(store.ended_since(10).unwrap().is_empty());
         assert!(!store.holds("k").unwrap());
+    }
+
+    #[test]
+    fn a_rewritten_row_keeps_its_handle_and_an_ended_one_its_number() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("state.db")).unwrap();
+        let row = |key: &str, provider: &str| Session {
+            key: key.into(),
+            provider: provider.into(),
+            conversation: None,
+            pid: None,
+            birth_micros: None,
+            cwd: "/".into(),
+            title: None,
+            status: "idle".into(),
+            seen_at: 1,
+            executable: None,
+            repo: Some("r".into()),
+            branch: None,
+            handle: None,
+        };
+        for (k, p) in [
+            ("a", "codex"),
+            ("b", "claude"),
+            ("c", "codex"),
+            ("d", "codex"),
+        ] {
+            store.put_session(&row(k, p)).unwrap();
+        }
+        store.put_session(&row("a", "codex")).unwrap();
+        store.end_session("c", 5).unwrap();
+        let got: Vec<_> = store
+            .sessions()
+            .unwrap()
+            .into_iter()
+            .map(|s| (s.key, s.handle, s.repo))
+            .collect();
+        let h = |k: &str, n: &str| (k.to_string(), Some(n.to_string()), Some("r".to_string()));
+        assert_eq!(
+            got,
+            [h("a", "codex-1"), h("b", "claude-1"), h("d", "codex-3")]
+        );
     }
 
     #[test]

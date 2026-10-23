@@ -419,6 +419,9 @@ fn register(id: u64, body: &Value, daemon: &Daemon) -> Response {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs() as i64),
         executable: r.executable,
+        repo: None,
+        branch: None,
+        handle: None,
     };
     // Every hook event registers: mail delivered before it has been seen.
     match put_row(daemon, &store, &row).and_then(|()| mail::mark_read_for(&store, &key, now())) {
@@ -730,6 +733,9 @@ async fn inbox(
                 status: "idle".into(),
                 seen_at: now() as i64,
                 executable: None,
+                repo: None,
+                branch: None,
+                handle: None,
             };
             if put_row(daemon, &daemon.store.lock().unwrap(), &row).is_err() {
                 return Response::err(id, INTERNAL);

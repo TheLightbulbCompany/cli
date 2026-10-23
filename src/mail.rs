@@ -938,6 +938,9 @@ mod tests {
                 status: "idle".into(),
                 seen_at: 0,
                 executable: None,
+                repo: None,
+                branch: None,
+                handle: None,
             })
             .unwrap();
     }
