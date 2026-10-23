@@ -8,9 +8,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-const WEB: &str = "https://thelightbulb.company/j/#";
 const APP: &str = "lightbulb://join/";
-const LINE: &str = "Join Lightbulb Connect: ";
+/// The join line is the command itself; `--name <their name>` is for the person to replace.
+const COMMAND: &str = "lightbulb-connect join '";
+const NAME: &str = "' --name <their name>";
 /// A reusable (or open) link lasts 7 days; a once link 24 hours.
 const REUSABLE_S: i64 = 7 * 86_400;
 const ONCE_S: i64 = 86_400;
@@ -117,12 +118,16 @@ pub fn encode(t: &Ticket) -> String {
     BASE64URL_NOPAD.encode(&canonical(&value(t)))
 }
 
-/// A ticket from the bare ticket, its web link, the full join line, or its app link.
+/// A ticket from the bare ticket, the join line (the command), its app link, or the old web
+/// link (`https://thelightbulb.company/j/#<ticket>`, alone or in its `Join …:` line).
 pub fn decode(s: &str) -> Result<Ticket> {
     let s = s.trim();
-    let bare = match s.split_once("/j/#") {
-        Some((_, t)) => t,
-        None => s.strip_prefix(APP).unwrap_or(s),
+    let bare = if let Some((_, t)) = s.split_once("/j/#") {
+        t
+    } else if let Some((_, t)) = s.split_once(" join '") {
+        t.split('\'').next().unwrap_or_default()
+    } else {
+        s.strip_prefix(APP).unwrap_or(s)
     };
     let t: Ticket = BASE64URL_NOPAD
         .decode(bare.trim().as_bytes())
@@ -167,9 +172,9 @@ pub fn line(t: &Ticket) -> String {
     join_line(&encode(t))
 }
 
-/// The join line for an `encode`d ticket.
+/// The join line for an `encode`d ticket: the command the person runs.
 pub fn join_line(encoded: &str) -> String {
-    format!("{LINE}{WEB}{encoded}")
+    format!("{COMMAND}{encoded}{NAME}")
 }
 
 /// The link the Lightbulb app opens, for an `encode`d ticket.
@@ -222,8 +227,13 @@ mod tests {
     fn ticket_round_trips_through_every_link_form() {
         let (_, x, r, t) = team("ask", false);
         let bare = encode(&t);
-        let web = format!("{WEB}{bare}");
-        for s in [bare.clone(), line(&t), web, app_link(&bare)] {
+        let web = format!("https://thelightbulb.company/j/#{bare}");
+        let old_line = format!("Join Lightbulb Connect: {web}");
+        assert_eq!(
+            line(&t),
+            format!("lightbulb-connect join '{bare}' --name <their name>")
+        );
+        for s in [bare.clone(), line(&t), web, old_line, app_link(&bare)] {
             assert_eq!(decode(&s).unwrap(), t);
         }
         verify(&t, &r).unwrap();

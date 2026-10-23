@@ -47,6 +47,7 @@ impl Env {
         c.env("LIGHTBULB_CONNECT_HOME", self.state.path())
             .env("LIGHTBULB_CONNECT_CLAUDE_HOME", self.home.path())
             .env("LIGHTBULB_CONNECT_NO_LAUNCHCTL", "1")
+            .env("LIGHTBULB_CONNECT_DEBUG_NO_DEFAULT_RELAYS", "1")
             .env("HOME", self.home.path())
             .env("USER", "prasiddha");
         c

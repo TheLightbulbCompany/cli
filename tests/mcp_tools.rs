@@ -24,6 +24,7 @@ impl Net {
         let claude = tempfile::tempdir().unwrap();
         let daemon = Command::new(EXE)
             .arg("daemon")
+            .env("LIGHTBULB_CONNECT_DEBUG_NO_DEFAULT_RELAYS", "1")
             .env(paths::HOME_ENV, dir.path())
             .env("LIGHTBULB_CONNECT_CLAUDE_HOME", claude.path())
             .stdout(Stdio::null())

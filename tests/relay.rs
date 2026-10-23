@@ -348,11 +348,11 @@ fn an_older_list_or_a_tampered_cache_is_refused() {
         "{l:?}"
     );
     // A tampered cache does not verify, and does not lower the floor: the older list is
-    // still refused, and nothing is in effect.
+    // still refused, and nothing of ours is in effect (the default serves).
     std::fs::write(d.join("relays.json"), &older).unwrap();
     age(d);
     let l = ours_after_fetch(d, &iss, &keys);
-    assert_eq!((l.source, l.urls.len()), (relay::Source::None, 0), "{l:?}");
+    assert_eq!(l.source, relay::Source::Default, "{l:?}");
     assert!(l.error.is_some());
 }
 
@@ -380,4 +380,93 @@ async fn a_joiner_reaches_the_inviter_through_the_relay_hint_alone() {
         json!({"id": 1, "op": "team.join", "ticket": t, "name": "carol", "kind": "computer"}),
     );
     assert_eq!(r["state"], "admitted", "{r}");
+}
+
+/// An issuer that answers 404 to everything: no list of ours published.
+fn issuer_404() -> String {
+    let l = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let url = format!("http://{}/connect", l.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for s in l.incoming().flatten() {
+            let mut r = BufReader::new(&s);
+            while r.read_line(&mut String::new()).is_ok_and(|n| n > 2) {}
+            let mut s = &s;
+            let _ = write!(
+                s,
+                "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            );
+        }
+    });
+    url
+}
+
+/// The hint a ticket carries with `list` in effect.
+fn hint(list: relay::List) -> String {
+    let p = lightbulb_connect::net::Peers::default();
+    *p.relays.lock().unwrap() = list;
+    p.relay_hint()
+}
+
+#[test]
+fn default_relays_are_used_when_nothing_is_configured() {
+    // Nothing set and nothing of ours: the iroh project's public relays, from the iroh crate.
+    let l = relay::list(&None, &None, &relay::State::default());
+    assert_eq!(l.source, relay::Source::Default);
+    assert_eq!(l.urls, relay::default_urls());
+    assert!(!l.urls.is_empty());
+    assert!(l.urls.iter().all(|u| u
+        .host_str()
+        .is_some_and(|h| h.ends_with("relay.n0.iroh.link."))));
+    // A ticket carries no hint for them: the joiner has the default too.
+    assert_eq!(hint(l), "");
+    // No list of ours published (404): the default, and nothing to report.
+    let dir = tempfile::tempdir().unwrap();
+    let l = ours_after_fetch(dir.path(), &issuer_404(), &[]);
+    assert_eq!((l.source, l.error), (relay::Source::Default, None));
+}
+
+#[test]
+fn team_relay_overrides_the_default() {
+    let team = Some("https://team.example".to_string());
+    let l = relay::list(&None, &team, &relay::State::default());
+    assert_eq!(l.source, relay::Source::Team);
+    assert_eq!(l.urls, [relay::parse("https://team.example").unwrap()]);
+    // The founder's relay travels in the ticket's hint.
+    assert_eq!(hint(l), canon("https://team.example"));
+    let mine = Some("https://mine.example".to_string());
+    assert_eq!(
+        relay::list(&mine, &team, &relay::State::default()).source,
+        relay::Source::Config
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relay_clear_returns_to_the_default() {
+    let (_server, url) = relay_server(0).await;
+    let e = Env::new();
+    // The default on: the knob that keeps the other tests off the internet is cleared.
+    let on = ("LIGHTBULB_CONNECT_DEBUG_NO_DEFAULT_RELAYS", "0".to_string());
+    let config = format!("relay = \"{url}\"\nissuer = \"{}\"\n", issuer_404());
+    e.daemon(false, &config, &[on]);
+    let o = e.detached(&[EXE, "relay"], "");
+    assert_eq!(out(&o), format!("config  {}\n", canon(&url)));
+    let o = e.detached(&[EXE, "relay", "--clear", "--local"], "");
+    assert_eq!(
+        out(&o),
+        "Relay cleared for this computer. Back to the default: the iroh project's public relays.\n"
+    );
+    let o = e.detached(&[EXE, "relay"], "");
+    assert_eq!(
+        out(&o),
+        "default  the iroh project's public relays (aps1-1.relay.n0.iroh.link, \
+         euc1-1.relay.n0.iroh.link, use1-1.relay.n0.iroh.link, usw1-1.relay.n0.iroh.link)\n\
+         Set your own: lightbulb-connect relay <url>\n"
+    );
+    let o = e.detached(&[EXE, "doctor"], "");
+    assert!(
+        out(&o).contains("\nRelay                default\n"),
+        "{}",
+        out(&o)
+    );
+    e.ask(json!({"id": 1, "op": "shutdown"}));
 }

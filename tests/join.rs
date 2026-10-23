@@ -334,7 +334,7 @@ fn link_replaced_on_removal_no_longer_joins() {
     let o = a.detached(&[EXE, "remove", "bob"], "");
     assert!(o.status.success(), "{}", err(&o));
     let line = out(&o)
-        .split("replaced: ")
+        .split("send this line instead: ")
         .nth(1)
         .unwrap()
         .trim()
@@ -672,4 +672,32 @@ fn an_open_link_join_never_says_asking() {
     let o = b.detached(&[EXE, "join", &line, "--name", "bob"], "");
     assert!(o.status.success(), "{}", err(&o));
     assert!(!out(&o).contains("Asking"), "{}", out(&o));
+}
+
+/// `join` (the CLI) with the open link's ticket written as `form` makes: admitted.
+fn joins_with(form: fn(&str) -> String) {
+    let (a, b, line) = pair("Decline", "open");
+    let bare = ticket::encode(&ticket::decode(&line).unwrap());
+    assert_eq!(
+        line,
+        format!("lightbulb-connect join '{bare}' --name <their name>")
+    );
+    let o = b.detached(&[EXE, "join", &form(&bare), "--name", "bob"], "");
+    assert!(o.status.success(), "{}{}", out(&o), err(&o));
+    converged(&a, &b, 2);
+}
+
+#[test]
+fn join_takes_the_bare_ticket() {
+    joins_with(|t| t.to_string());
+}
+
+#[test]
+fn join_takes_the_app_link() {
+    joins_with(|t| format!("lightbulb://join/{t}"));
+}
+
+#[test]
+fn join_takes_the_old_web_link() {
+    joins_with(|t| format!("https://thelightbulb.company/j/#{t}"));
 }

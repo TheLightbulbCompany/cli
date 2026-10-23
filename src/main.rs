@@ -131,8 +131,10 @@ enum Command {
     Remove { name: String },
     /// Leave the team; this computer is on its own network again.
     Leave,
-    /// Join the network an invite link is for (this computer must be on its own).
+    /// Join the network an invite is for (this computer must be on its own).
     Join {
+        /// The line your inviter sent (the long code after join, or the whole link).
+        #[arg(value_name = "TICKET")]
         link: String,
         /// The name you go by in the network (default: your user name).
         #[arg(long)]
