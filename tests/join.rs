@@ -485,3 +485,54 @@ fn bad_ticket_at_the_first_member_tries_the_next() {
     assert!(rows(&f).is_empty(), "F refused before storing a request");
     assert_eq!(rows(&x), ["admitted"]);
 }
+
+/// A computer proof valid `secs` more seconds, for `id`'s key.
+fn short_proof(id: &Identity, secs: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    common::issuer::mint(&json!({"iss": "test", "iat": now, "exp": now + secs,
+        "sub": "person-c", "name": "Carol", "computer": id.key, "kind": "computer",
+        "workspace": null, "agents": []}))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_proof_that_expires_while_its_dialog_waits_is_refused_at_allow() {
+    let a = Env::new();
+    a.daemon(false, "", &[dialog("")]);
+    let t = ticket::decode(&invite(&a, "reusable")).unwrap();
+    let me = identity();
+    let token = short_proof(&me, 2);
+    let req = admission::request(&me, &t, "carol", "mbp", "computer", Some(&token));
+    let _p = Played::send(&a, &me, &req).await;
+    until(10, "J1 is listed", || requests(&a).len() == 1);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let r = person(
+        &a,
+        json!({"id": 1, "op": "team.admit", "request": "J1", "verdict": "allow"}),
+    );
+    assert_eq!(r["state"], "refused", "{r}");
+    assert_eq!(members(&a).len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unprintable_name_is_refused_as_bad_name() {
+    let (a, b) = (Env::new(), Env::new());
+    a.daemon(false, "", &[dialog("Allow")]);
+    let line = invite(&a, "reusable");
+    let t = ticket::decode(&line).unwrap();
+    let mut p = Played::ask(&a, &t, "car\u{202e}ol").await;
+    match p.recv().await.unwrap() {
+        Frame::JoinDecision { reason, .. } => assert_eq!(reason.as_deref(), Some("bad_name")),
+        f => panic!("{f:?}"),
+    }
+    // The candidate's own CLI says it in a sentence, before any dial.
+    b.daemon(false, "", &[peers(&[&a])]);
+    let o = b.detached(&[EXE, "join", &line, "--name", "car\u{202e}ol"], "");
+    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(
+        err(&o),
+        "That name has characters Lightbulb Connect cannot show. Use letters, numbers, spaces and punctuation.\n"
+    );
+}

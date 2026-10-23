@@ -427,6 +427,7 @@ pub fn join(link: &str, name: Option<String>, kind: &str, proof: Option<String>)
         ),
         (_, Some(admission::UNREACHABLE)) => "No one from this network is online right now. Ask them to open their laptop, then run the same command again. Your key is ready; nothing was lost.".to_string(),
         (_, Some(admission::DECLINED)) => "Your request to join was declined.".to_string(),
+        (_, Some(admission::BAD_NAME)) => "That name has characters Lightbulb Connect cannot show. Use letters, numbers, spaces and punctuation.".to_string(),
         (_, Some(admission::YOUR_COMPUTER_OFFLINE)) => "Open your other computer, then run the same command again.".to_string(),
         (_, Some(admission::BAD_TICKET)) => "This invite link does not work. Ask for a new one.".to_string(),
         (_, Some(admission::EXPIRED_TICKET)) => "This invite link has expired. Ask for a new one.".to_string(),
