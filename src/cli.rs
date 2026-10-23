@@ -867,9 +867,25 @@ pub fn policy(person: Option<String>, value: Option<String>) -> Result<i32> {
             return Ok(2);
         }
     };
-    let by = |key: String| match p["set_by"][&key].as_str() {
-        Some("bridge") => " (set by the Lightbulb app)",
-        _ => "",
+    // A row the bridge set is a relayed Allow: `Allowed <name> from your phone`.
+    // The members' names only when some row is the bridge's.
+    let bridge = (p["set_by"].as_object().into_iter().flatten()).any(|(_, v)| v == "bridge");
+    let team = if bridge {
+        ask(&mut conn, "team.get", json!({}))?
+    } else {
+        Value::Null
+    };
+    let name_of = |pid: &str| {
+        let mut ms = team["members"].as_array().into_iter().flatten();
+        let named = ms.find_map(|m| (m["person_id"] == pid).then(|| m["name"].as_str())?);
+        cell(named.unwrap_or(pid))
+    };
+    let by = |key: String, who: Option<&str>| match p["set_by"][&key].as_str() {
+        Some("bridge") => match who {
+            Some(pid) => format!(" (Allowed {} from your phone)", name_of(pid)),
+            None => " (allowed from your phone)".into(),
+        },
+        _ => String::new(),
     };
     let on = if p["agents_send_without_asking"] == true {
         "yes"
@@ -878,7 +894,7 @@ pub fn policy(person: Option<String>, value: Option<String>) -> Result<i32> {
     };
     println!(
         "Agents may message teammates without asking you: {on}.{}",
-        by(crate::policy::SWITCH.into())
+        by(crate::policy::SWITCH.into(), None)
     );
     for scope in ["people", "cloud_of"] {
         for (pid, v) in p[scope].as_object().into_iter().flatten() {
@@ -891,7 +907,7 @@ pub fn policy(person: Option<String>, value: Option<String>) -> Result<i32> {
             println!(
                 "Messages from {}: {v}.{}",
                 cell(pid),
-                by(format!("{scope}:{pid}"))
+                by(format!("{scope}:{pid}"), Some(pid))
             );
         }
     }

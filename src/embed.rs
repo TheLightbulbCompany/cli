@@ -160,7 +160,8 @@ impl Instance {
     /// cloud member (with its proof) and `team.leave`: the caller is the bridge, acting for a
     /// workspace admin who confirmed in the app. `inbox {session}` takes a declared session's
     /// mail as Task 10's records, read. `app.send`, `app.inbox` and `app.receipt` carry a
-    /// hosted app's call to its person's own computer (`app_send`).
+    /// hosted app's call to its person's own computer (`app_send`); `decision.send` carries a
+    /// person's tap on a hold notice back to the holding computer (`decision`).
     pub async fn call(&self, req: Value) -> Value {
         let id = req["id"].as_u64().unwrap_or(0);
         json!(match serde_json::from_value::<Request>(req) {
@@ -170,7 +171,8 @@ impl Instance {
     }
 
     /// Every event a socket subscriber gets (`message`, `held`, `hold_closed`,
-    /// `receipt_changed`, `member_removed`, `stream_*`, …), from now on.
+    /// `receipt_changed`, `member_removed`, `stream_*`, …), and an instance's own
+    /// (`hold_notice`, `decision_result`: `decision`), from now on.
     pub fn events(&self) -> broadcast::Receiver<Value> {
         self.daemon.events.subscribe()
     }

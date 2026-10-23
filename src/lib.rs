@@ -5,6 +5,7 @@ pub mod cli;
 pub mod config;
 pub mod daemon;
 pub mod date;
+pub mod decision;
 pub mod dialog;
 pub mod doing;
 pub mod embed;
