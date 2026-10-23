@@ -612,6 +612,43 @@ pub fn leave() -> Result<i32> {
     Ok(0)
 }
 
+/// `relay [<url> | --clear]`: sets (or clears) this computer's relay, and from the founder or
+/// an admin the team's; alone, prints the relays in effect and where they come from.
+pub fn relay(url: Option<String>, clear: bool) -> Result<i32> {
+    let mut conn = connect()?;
+    if url.is_some() || clear {
+        let url = url.unwrap_or_default();
+        let r = conn.call("relay.set", json!({ "url": url }))?;
+        if r["ok"] != true {
+            let texts = [("bad_request", format!("Not a relay URL: {url}"))];
+            return refuse(&r, &texts, "relay");
+        }
+        let who = if r["team"] == true {
+            "this computer and the team"
+        } else {
+            "this computer"
+        };
+        match url.as_str() {
+            "" => println!("Relay cleared for {who}."),
+            u => println!("Relay for {who}: {u}"),
+        }
+        return Ok(0);
+    }
+    let l = ask(&mut conn, "relay.get", json!({}))?;
+    let source = l["source"].as_str().unwrap_or("none");
+    let urls = l["urls"].as_array().cloned().unwrap_or_default();
+    if urls.is_empty() {
+        println!("none (direct connections only)");
+    }
+    for u in urls {
+        println!("{source}  {}", cell(u.as_str().unwrap_or_default()));
+    }
+    if let Some(e) = l["error"].as_str() {
+        println!("Our relay list was refused: {}", cell(e));
+    }
+    Ok(0)
+}
+
 /// `secs` as `YYYY-MM-DD HH:MM UTC`.
 fn utc(secs: i64) -> String {
     // Days to a civil date (Howard Hinnant's `civil_from_days`).

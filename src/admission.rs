@@ -514,9 +514,13 @@ pub async fn join(id: u64, body: &Value, d: &Arc<Daemon>) -> Response {
     // The last listed member's refusal, when every reachable one refused.
     let mut last = None;
     for m in t.members.iter().filter(|m| *m != me) {
-        let Some(addr) = d.peers.addr(m) else {
+        let Some(mut addr) = d.peers.addr(m) else {
             continue;
         };
+        // The inviter's relay, before this computer knows its own list.
+        if let Ok(u) = t.relay_hint.parse() {
+            addr = addr.with_relay_url(u);
+        }
         let Ok(Ok(conn)) = tokio::time::timeout(STEP, ep.connect(addr, JOIN_ALPN)).await else {
             eprintln!("join: dial {} failed", net::short(m));
             continue;

@@ -246,6 +246,7 @@ fn forged_ticket_from_another_members_link_is_refused() {
         xt.secret,
         "open",
         xt.expires_at,
+        String::new(),
     );
     c.daemon(false, "", &[peers(&[&f])]);
     refused(

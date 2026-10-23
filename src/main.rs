@@ -119,6 +119,14 @@ enum Command {
         #[arg(value_parser = ["on", "off"])]
         state: String,
     },
+    /// The relays this computer uses (with a URL, sets yours; from the founder or an admin,
+    /// the team's too). Relays carry encrypted traffic only, when no direct path exists.
+    Relay {
+        url: Option<String>,
+        /// Clear the relay you set.
+        #[arg(long, conflicts_with = "url")]
+        clear: bool,
+    },
     #[command(external_subcommand)]
     External(Vec<OsString>),
     /// Run by an agent's hook config: `hook <claude|codex|cursor|grok> <session-start|user-prompt-submit|post-tool-use|stop|session-end>`.
@@ -209,6 +217,7 @@ fn main() -> lightbulb_connect::Result<()> {
         Command::Held => exit(cli::held()?),
         Command::Policy { person, value } => exit(cli::policy(person, value)?),
         Command::Folder { path, state } => exit(cli::folder(&path, state == "on")?),
+        Command::Relay { url, clear } => exit(cli::relay(url, clear)?),
         Command::External(args) => exit(cli::forward(args)?),
         Command::Mcp { server_name } => mcp::run(server_name)?,
         Command::Setup {

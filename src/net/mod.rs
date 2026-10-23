@@ -1,6 +1,8 @@
 //! The member transport: a QUIC endpoint (iroh) whose key is this computer's member key, one
 //! connection per member pair carrying one stream of `Frame`s, the membership gate, and delta
-//! roster sync. Relays are off; peers are found on the local network (mDNS, `config.lan`).
+//! roster sync. Peers are found on the local network (mDNS, `config.lan`) and through the
+//! relays in effect (`relay`), which also carry a connection when no direct path exists
+//! (ciphertext only: QUIC is end to end between the two member keys).
 //!
 //! Sync: each side's first frame is `hello {heads}`. A `hello` is answered with the entries
 //! that are not ancestors of its heads (the whole log when none is known), parents first,
@@ -19,10 +21,10 @@ use crate::mail::{self, State};
 use crate::roster::{self, Entry, Roster};
 use crate::sessions::Key;
 use crate::Result;
-use crate::{holds, identity, outbox};
+use crate::{holds, identity, outbox, relay};
 use frames::Frame;
 use iroh::endpoint::{presets, Connection, VarInt};
-use iroh::{Endpoint, EndpointAddr, PublicKey, SecretKey};
+use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMode, RelayUrl, SecretKey, Watcher};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -37,7 +39,12 @@ pub const PROTOCOL: u32 = 1;
 /// A `roster` page closes before the next entry would take it past this (half the frame cap).
 const PAGE_BYTES: usize = 512 * 1024;
 const PAGE_ENTRIES: usize = 500;
+/// Every member is redialed this often (through each relay too), within the 60 s cap.
 const REDIAL: Duration = Duration::from_secs(30);
+/// How often the relay list is looked at again; a fetch is tried at most this often (a list
+/// that came is kept a day: `relay::list`).
+const RELAY_LOOK: Duration = Duration::from_secs(30);
+const RELAY_FETCH: Duration = Duration::from_secs(3_600);
 /// Entries one connection may hold waiting for their parents.
 const MAX_PENDING: usize = 10_000;
 const JOIN_WAIT: Duration = Duration::from_secs(600);
@@ -66,6 +73,15 @@ pub struct Knobs {
     drop_acks: bool,
     /// How long the outbox keeps trying (`outbox::TTL_S`), or `LIGHTBULB_CONNECT_DEBUG_OUTBOX_S`.
     outbox_s: u64,
+    /// The keys `relays.json` may be signed by: `relay::KEYS`, or
+    /// `LIGHTBULB_CONNECT_DEBUG_RELAY_KEYS=<minisign public key>,…`.
+    pub relay_keys: Vec<String>,
+    /// `LIGHTBULB_CONNECT_DEBUG_RELAY_ONLY=1`: no direct (IP) transport, only the relays.
+    relay_only: bool,
+}
+
+fn compiled_keys() -> Vec<String> {
+    relay::KEYS.iter().map(|k| k.to_string()).collect()
 }
 
 const OSASCRIPT: &str = "/usr/bin/osascript";
@@ -103,6 +119,9 @@ impl Knobs {
             outbox_s: var("LIGHTBULB_CONNECT_DEBUG_OUTBOX_S")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(outbox::TTL_S),
+            relay_keys: var("LIGHTBULB_CONNECT_DEBUG_RELAY_KEYS")
+                .map_or_else(compiled_keys, |v| v.split(',').map(String::from).collect()),
+            relay_only: var("LIGHTBULB_CONNECT_DEBUG_RELAY_ONLY").is_some_and(|v| v == "1"),
         }
     }
 
@@ -117,6 +136,8 @@ impl Knobs {
             osascript: OSASCRIPT.into(),
             drop_acks: false,
             outbox_s: outbox::TTL_S,
+            relay_keys: compiled_keys(),
+            relay_only: false,
         }
     }
 }
@@ -140,6 +161,10 @@ pub struct Peers {
     pub endpoint: OnceLock<Endpoint>,
     /// Frames dropped by `frames::from_peer_ok`, by kind.
     pub dropped: Mutex<std::collections::BTreeMap<&'static str, u64>>,
+    /// The relays in effect (`relay::list`), as the endpoint has them.
+    pub relays: Mutex<relay::List>,
+    /// Poked when the relay setting may have changed (`relay.set`, a roster install).
+    pub relay_changed: Notify,
 }
 
 struct Link {
@@ -166,11 +191,42 @@ impl Peers {
         self.knobs.get_or_init(Knobs::read)
     }
 
-    /// Where to dial member `key`: its key, and the knob's addresses for it.
+    /// Where to dial member `key`: its key, the knob's addresses for it, and every relay in
+    /// effect (iroh tries them all, and upgrades to a direct path where it can).
     pub fn addr(&self, key: &str) -> Option<EndpointAddr> {
         let id = PublicKey::from_bytes(&identity::key_bytes(key)?).ok()?;
         let addrs = self.knobs().peers.get(key).into_iter().flatten();
-        Some(addrs.fold(EndpointAddr::new(id), |a, s| a.with_ip_addr(*s)))
+        let a = addrs.fold(EndpointAddr::new(id), |a, s| a.with_ip_addr(*s));
+        let relays = self.relays.lock().unwrap().urls.clone();
+        Some(
+            relays
+                .iter()
+                .filter_map(|u| u.parse().ok())
+                .fold(a, |a, u| a.with_relay_url(u)),
+        )
+    }
+
+    /// The first relay in effect, for a ticket's `relay_hint` (`""` when none).
+    pub fn relay_hint(&self) -> String {
+        let l = self.relays.lock().unwrap();
+        l.urls.first().cloned().unwrap_or_default()
+    }
+
+    /// `status.relay`: `none` without relays, `ok` while a home relay is connected, else
+    /// `unreachable`.
+    pub fn relay_state(&self) -> &'static str {
+        if self.relays.lock().unwrap().urls.is_empty() {
+            return "none";
+        }
+        let up = self
+            .endpoint
+            .get()
+            .is_some_and(|e| e.home_relay_status().get().iter().any(|r| r.is_connected()));
+        if up {
+            "ok"
+        } else {
+            "unreachable"
+        }
     }
 
     /// Members with a live connection that said `hello` in our protocol.
@@ -182,21 +238,27 @@ impl Peers {
             .collect()
     }
 
-    /// For `status`, in one pass: how many members are online, and `(key, their protocol)`
-    /// for each that needs an update, by key.
-    pub fn status(&self) -> (usize, Vec<(String, u32)>) {
+    /// For `status`, in one pass: how many members are online, how many of those are reached
+    /// directly (their selected path is not a relay), and `(key, their protocol)` for each
+    /// that needs an update, by key.
+    pub fn status(&self) -> (usize, usize, Vec<(String, u32)>) {
         let live = self.live.lock().unwrap();
-        let mut online = 0;
+        let (mut online, mut direct) = (0, 0);
         let mut outdated = Vec::new();
         for (k, l) in live.iter() {
             match l.protocol {
-                Protocol::Ok(_) => online += 1,
+                Protocol::Ok(_) => {
+                    online += 1;
+                    if l.conn.paths().iter().any(|p| p.is_selected() && p.is_ip()) {
+                        direct += 1;
+                    }
+                }
                 Protocol::Outdated(p) => outdated.push((k.clone(), p)),
                 Protocol::Unknown => {}
             }
         }
         outdated.sort();
-        (online, outdated)
+        (online, direct, outdated)
     }
 
     /// `f` on `member`'s link, once it said `hello` in our protocol.
@@ -319,17 +381,32 @@ struct Inner {
 }
 
 impl Net {
-    /// Binds the endpoint (secret = the member key, relays off, mDNS when `config.lan`) and
-    /// starts accepting and dialing every active member.
+    /// Binds the endpoint (secret = the member key, the relays known without the network,
+    /// mDNS when `config.lan`) and starts accepting, dialing every active member, and keeping
+    /// the relay list.
     pub async fn start(daemon: Arc<Daemon>) -> Result<Net> {
-        let lan = daemon.team.lock().unwrap().config.lan;
+        let (lan, relays) = {
+            let t = daemon.team.lock().unwrap();
+            let keys = &daemon.peers.knobs().relay_keys;
+            let l = relay::list(&daemon.dir, &t.config, &t.roster.relay, keys, false);
+            (t.config.lan, l)
+        };
         let secret = SecretKey::from_bytes(&daemon.identity.signing.to_bytes());
+        // Always a relay transport (an empty map is direct only), so a list that comes later
+        // can be added at runtime.
+        let map = relays.urls.iter().filter_map(|u| relay_config(u));
         let mut b = Endpoint::builder(presets::Minimal)
             .secret_key(secret)
-            .alpns(vec![ALPN.to_vec(), JOIN_ALPN.to_vec()]);
+            .alpns(vec![ALPN.to_vec(), JOIN_ALPN.to_vec()])
+            .relay_mode(RelayMode::Custom(map.collect()));
+        if daemon.peers.knobs().relay_only {
+            b = b.clear_ip_transports();
+        }
         if lan {
             b = b.address_lookup(iroh_mdns_address_lookup::MdnsAddressLookup::builder());
         }
+        log_relays(&relays);
+        *daemon.peers.relays.lock().unwrap() = relays;
         let endpoint = b.bind().await?;
         let port = endpoint.bound_sockets().first().map_or(0, |a| a.port());
         let _ = daemon.peers.port.set(port);
@@ -343,7 +420,59 @@ impl Net {
         tokio::spawn(net.clone().accept_loop());
         tokio::spawn(net.clone().keep_up());
         tokio::spawn(net.clone().flush_loop());
+        tokio::spawn(net.clone().relay_loop());
         Ok(net)
+    }
+
+    /// Keeps the endpoint's relays those `relay::list` gives: at start, every 30 s, and when
+    /// the setting may have changed; a fetch of ours is tried at most hourly. iroh keeps the
+    /// connection to its home relay up itself (and the dial loop redials members through
+    /// every relay), so this only changes which relays there are.
+    async fn relay_loop(self) {
+        let d = &self.0.daemon;
+        let mut tick = tokio::time::interval(RELAY_LOOK);
+        let mut tried: Option<std::time::Instant> = None;
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {}
+                _ = d.peers.relay_changed.notified() => {}
+                _ = self.0.endpoint.closed() => return,
+            }
+            let fetch = tried.is_none_or(|t| t.elapsed() >= RELAY_FETCH);
+            let d2 = d.clone();
+            let Ok(new) = tokio::task::spawn_blocking(move || {
+                let (config, team) = {
+                    let t = d2.team.lock().unwrap();
+                    (t.config.clone(), t.roster.relay.clone())
+                };
+                relay::list(&d2.dir, &config, &team, &d2.peers.knobs().relay_keys, fetch)
+            })
+            .await
+            else {
+                continue;
+            };
+            // Only a list of ours is fetched: only then did this try the network.
+            if fetch && new.source != relay::Source::Config && new.source != relay::Source::Team {
+                tried = Some(std::time::Instant::now());
+            }
+            let old = d.peers.relays.lock().unwrap().clone();
+            if old == new {
+                continue;
+            }
+            let ep = &self.0.endpoint;
+            for u in old.urls.iter().filter(|u| !new.urls.contains(u)) {
+                if let Ok(u) = u.parse::<RelayUrl>() {
+                    ep.remove_relay(&u).await;
+                }
+            }
+            for u in new.urls.iter().filter(|u| !old.urls.contains(u)) {
+                if let Some(c) = relay_config(u) {
+                    ep.insert_relay(c.url.clone(), Arc::new(c)).await;
+                }
+            }
+            log_relays(&new);
+            *d.peers.relays.lock().unwrap() = new;
+        }
     }
 
     pub async fn close(&self) {
@@ -843,6 +972,20 @@ pub(crate) fn pages(entries: Vec<Entry>) -> Vec<Frame> {
             more: i < last,
         })
         .collect()
+}
+
+/// Relay `url`, without QUIC address discovery (off in Phase 1: the relay serves HTTPS only).
+fn relay_config(url: &str) -> Option<iroh::RelayConfig> {
+    Some(iroh::RelayConfig::new(url.parse().ok()?, None))
+}
+
+/// The relays in effect, in the log: their URLs and where they came from.
+fn log_relays(l: &relay::List) {
+    let source = serde_json::to_value(l.source).unwrap_or_default();
+    match &l.error {
+        Some(e) => eprintln!("relay: {source} {:?} ({e})", l.urls),
+        None => eprintln!("relay: {source} {:?}", l.urls),
+    }
 }
 
 pub(crate) fn short(key: &str) -> &str {

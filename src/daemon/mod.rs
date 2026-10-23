@@ -29,6 +29,8 @@ pub struct TeamState {
 
 /// What every connection handler shares.
 pub struct Daemon {
+    /// The state dir.
+    pub dir: PathBuf,
     pub store: Mutex<Store>,
     pub identity: Identity,
     pub team: Mutex<TeamState>,
@@ -171,6 +173,7 @@ pub async fn run(dir: &Path) -> Result<()> {
     let (dialogs, answers) = dialog::Queue::new(peers.knobs().osascript.clone());
     dialogs.set_knob(peers.knobs().dialog.clone());
     let daemon = Arc::new(Daemon {
+        dir: dir.to_path_buf(),
         store: Mutex::new(store),
         identity,
         team: Mutex::new(team),

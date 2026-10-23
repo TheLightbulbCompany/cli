@@ -69,8 +69,14 @@ impl Env {
 
     /// Starts `lightbulb-connect daemon` on this state dir with `lan` (mDNS) and `config` as
     /// `config.toml`, and `env` set, and waits until it answers.
+    /// Unless `config` names an issuer, a closed port's: no test fetches our relay list.
     pub fn daemon(&self, lan: bool, config: &str, env: &[(&str, String)]) {
-        let config = format!("lan = {lan}\n{config}");
+        let issuer = if config.contains("issuer") {
+            ""
+        } else {
+            "issuer = \"http://127.0.0.1:9/connect\"\n"
+        };
+        let config = format!("lan = {lan}\n{issuer}{config}");
         std::fs::write(self.state.path().join("config.toml"), config).unwrap();
         let log = std::fs::File::create(self.state.path().join("daemon.log")).unwrap();
         let mut c = self.base_cmd(Command::new(EXE));
@@ -80,6 +86,8 @@ impl Env {
             .env("LIGHTBULB_CONNECT_DIALOG", "")
             .env_remove("LIGHTBULB_CONNECT_PEERS")
             .env_remove("LIGHTBULB_CONNECT_DEBUG_PROTOCOL")
+            .env_remove("LIGHTBULB_CONNECT_DEBUG_RELAY_KEYS")
+            .env_remove("LIGHTBULB_CONNECT_DEBUG_RELAY_ONLY")
             .envs(env.iter().map(|(k, v)| (k, v)))
             .stdin(Stdio::null());
         if env

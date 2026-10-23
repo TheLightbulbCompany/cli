@@ -119,6 +119,10 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, peer_pid: Option
                 "verified": false,
             }),
         ),
+        // `relay.get {}` -> `{urls, source, error}`: the relays in effect and where they came
+        // from (`config`, `team`, `lightbulb` or `none`).
+        "relay.get" => Response::ok(id, json!(*daemon.peers.relays.lock().unwrap())),
+        "relay.set" => relay_set(id, body, daemon, peer_pid),
         // `ui.claim {}` -> `{lease_s}`: the Lightbulb app shows the person's questions itself;
         // no OS dialog opens until it stops heartbeating.
         "ui.claim" => {
@@ -144,6 +148,54 @@ pub fn reload(daemon: &Daemon) -> crate::Result<()> {
     daemon.team.lock().unwrap().config = config;
     daemon.presence.notify_one();
     Ok(())
+}
+
+/// `relay.set {url}` -> `{team}`: writes `config.toml: relay` (an empty or missing `url`
+/// clears it); from the founder or an admin also the roster's `meta {relay}`, so the whole
+/// team adopts it (`team: true`). A person only: it moves where this computer's traffic goes.
+fn relay_set(id: u64, body: &Value, daemon: &Daemon, peer_pid: Option<u32>) -> Response {
+    if !peer_pid.is_some_and(person_only) {
+        return refused(id, "not_a_person");
+    }
+    let url = body["url"].as_str().unwrap_or_default().trim();
+    if !url.is_empty() && url.parse::<iroh::RelayUrl>().is_err() {
+        return Response::err(id, BAD_REQUEST);
+    }
+    let mut team = daemon.team.lock().unwrap();
+    let store = daemon.store.lock().unwrap();
+    let me = &daemon.identity.key;
+    let elevated = team
+        .roster
+        .members
+        .get(me)
+        .is_some_and(|m| m.role >= Role::Admin);
+    let now = super::ipc::now() as i64;
+    let mut set = || -> crate::Result<()> {
+        crate::config::Config::set(&daemon.dir, "relay", url)?;
+        team.config.relay = Some(url.to_string());
+        if elevated {
+            write(
+                daemon,
+                &mut team,
+                &store,
+                Kind::Meta,
+                json!({"relay": url}),
+                now,
+            )?;
+        }
+        Ok(())
+    };
+    match set() {
+        Ok(()) => {
+            daemon.peers.relay_changed.notify_one();
+            eprintln!("relay.set: {url:?} (team: {elevated})");
+            Response::ok(id, json!({"team": elevated}))
+        }
+        Err(e) => {
+            eprintln!("relay.set: {e}");
+            Response::err(id, INTERNAL)
+        }
+    }
 }
 
 /// How long `team.leave` waits for a peer to take the `leave` entry.
@@ -288,6 +340,8 @@ pub fn install(
     sync_team_row(store, &team.roster, &new)?;
     team.roster = new;
     daemon.peers.changed.notify_one();
+    // The team's relay may have changed.
+    daemon.peers.relay_changed.notify_one();
     Ok(())
 }
 
@@ -399,7 +453,8 @@ impl TeamOps<'_> {
                 let replaced = invite == Invite::New && live.is_some();
                 let t = match live {
                     Some(l) if invite != Invite::New => {
-                        ticket::sign(identity, r, l.ticket_id, l.secret, mode, l.expires_at)
+                        let hint = self.daemon.peers.relay_hint();
+                        ticket::sign(identity, r, l.ticket_id, l.secret, mode, l.expires_at, hint)
                     }
                     _ => self.new_link(mode, invite.once())?,
                 };
@@ -458,6 +513,7 @@ impl TeamOps<'_> {
             mode,
             once,
             self.now,
+            self.daemon.peers.relay_hint(),
         );
         self.write(Kind::Link, ticket::link_body(&t, hashed.as_deref()))?;
         self.store.put_link(
