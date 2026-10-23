@@ -3,7 +3,7 @@
 use super::Daemon;
 use crate::sessions::{self, Key};
 use crate::store;
-use crate::{frame, mail};
+use crate::{admission, frame, label, mail, presence};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::os::fd::AsRawFd;
@@ -192,6 +192,7 @@ async fn handle(
             _ => Response::err(id, BAD_REQUEST),
         },
         "inbox" => inbox(id, &req.body, daemon, peer).await,
+        "directory" => Response::ok(id, presence::directory(daemon, req.body["query"].as_str())),
         // An agent fed a hostile link must not move this computer into another network.
         "team.join" if !peer_pid.is_some_and(super::net_ops::person_only) => {
             refused(id, "not_a_person")
@@ -288,8 +289,13 @@ fn end(id: u64, key: &str, body: &Value, daemon: &Daemon) -> Response {
             return Response::ok(id, json!({ "ended": false }));
         }
     }
+    let cwd = store.session(key).ok().flatten().map(|s| s.cwd);
     match store.delete_session(key) {
-        Ok(true) => Response::ok(id, json!({ "ended": true })),
+        Ok(true) => {
+            drop(store);
+            presence::keep(daemon, key, &cwd.unwrap_or_default());
+            Response::ok(id, json!({ "ended": true }))
+        }
         Ok(false) => Response::err(id, NOT_FOUND),
         Err(_) => Response::err(id, INTERNAL),
     }
@@ -329,11 +335,14 @@ fn register(id: u64, body: &Value, daemon: &Daemon) -> Response {
     };
     let me = caller.unwrap_or((r.pid, r.birth_micros));
     let key = Key::new(&daemon.identity.short, &r.provider, &r.conversation);
+    // A new session may not take what the person's other computer keeps.
+    let taken = presence::kept_elsewhere(daemon, &format!("{}:{}", r.provider, r.conversation));
     let store = daemon.store.lock().unwrap();
     match row_process(&store, &key.0) {
         Ok(Some(owner)) if owner != me && sessions::alive(owner.0, owner.1) => {
             return refused(id, "owned_by_live_process")
         }
+        Ok(None) if taken => return Response::err(id, admission::NAME_TAKEN),
         Ok(_) => {}
         Err(_) => return Response::err(id, INTERNAL),
     }
@@ -357,14 +366,17 @@ fn register(id: u64, body: &Value, daemon: &Daemon) -> Response {
         .map_err(Into::into)
         .and_then(|()| mail::mark_read_for(&store, &key, now()))
     {
-        Ok(()) => Response::ok(id, json!({ "key": key })),
+        Ok(()) => {
+            daemon.presence.notify_one();
+            Response::ok(id, json!({ "key": key }))
+        }
         Err(_) => Response::err(id, INTERNAL),
     }
 }
 
 /// Registered and discovered sessions, `gone` ones left out (their rows stay until `end`).
 /// A session whose last push failed reads `next_step`: its mail waits for the next step.
-fn live_sessions(daemon: &Daemon) -> Vec<sessions::Session> {
+pub(crate) fn live_sessions(daemon: &Daemon) -> Vec<sessions::Session> {
     let rows = daemon.store.lock().unwrap().sessions().unwrap_or_default();
     let mut all = sessions::all(&rows, &daemon.claude_home, &daemon.identity.short);
     let failed = daemon.push_failed.lock().unwrap();
@@ -378,6 +390,27 @@ fn live_sessions(daemon: &Daemon) -> Vec<sessions::Session> {
 
 fn live_count(daemon: &Daemon) -> usize {
     live_sessions(daemon).len()
+}
+
+/// `m`'s sender as this computer's agents are told it (`label::render`, this computer's
+/// person reading). Mail that came in over the IPC (`origin` other than `net:`) is this
+/// computer's by construction, whatever member prefix its `from` carries.
+pub(crate) fn sender_label(daemon: &Daemon, m: &store::Message) -> String {
+    let from = if m.origin.as_deref().is_some_and(|o| o.starts_with("net:")) {
+        m.from_key.clone()
+    } else {
+        let rest = m
+            .from_key
+            .split_once('/')
+            .map_or(m.from_key.as_str(), |(_, r)| r);
+        format!("{}/{rest}", daemon.identity.short)
+    };
+    let team = daemon.team.lock().unwrap();
+    label::render(
+        &team.roster,
+        &presence::my_person(daemon, &team.roster),
+        &from,
+    )
 }
 
 pub fn now() -> u64 {
@@ -455,6 +488,18 @@ async fn inbox(
             Err(_) => return Response::err(id, INTERNAL),
         }
     }
+    // A name (`listen --as`) is this computer's while it is in use here, and kept a day after;
+    // one the person's other computer keeps is refused.
+    let short = &daemon.identity.short;
+    if let frame::Sender::Name(name) = frame::Sender::of(short, &key.0) {
+        if key.0.starts_with(&format!("{short}/")) {
+            let ours = daemon.kept.lock().unwrap().contains_key(&key.0);
+            if !ours && presence::kept_elsewhere(daemon, name) {
+                return Response::err(id, admission::NAME_TAKEN);
+            }
+            presence::keep(daemon, &key.0, "");
+        }
+    }
     let wait = match body.get("wait_secs") {
         None | Some(Value::Null) => 0,
         Some(v) => match v.as_u64() {
@@ -500,7 +545,7 @@ async fn inbox(
                         json!({ "id": m.id, "request_id": m.request_id, "from": m.from_key,
                             "to": m.to_key, "kind": m.kind, "thread": m.thread, "hops": m.hops,
                             "text": m.body, "sent_at": m.sent_at,
-                            "framed": frame::framed(frame::Sender::of(&daemon.identity.short, &m.from_key), None, &m.request_id, &m.body) })
+                            "framed": frame::framed(&sender_label(daemon, m), &m.request_id, &m.body) })
                     })
                     .collect();
                 return Response::ok(id, json!({ "messages": messages }));

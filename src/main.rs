@@ -24,11 +24,14 @@ enum Command {
         #[arg(long)]
         uninstall: bool,
     },
-    /// List the coding sessions on this computer.
+    /// List the coding sessions on this computer (with `--all`, then every teammate's).
     Who {
         /// Print the raw session list as JSON.
         #[arg(long)]
         json: bool,
+        /// Also list the sessions on teammates' computers.
+        #[arg(long)]
+        all: bool,
     },
     /// Send text to a session (`session_id`), a name address (`<member>/<name>`), or, from a
     /// person's terminal, a group (`*`, `<member>/*`).
@@ -154,7 +157,7 @@ fn main() -> lightbulb_network::Result<()> {
         Command::Daemon { .. } => {
             tokio::runtime::Runtime::new()?.block_on(daemon::run(&paths::state_dir()))?
         }
-        Command::Who { json } => exit(cli::who(json)?),
+        Command::Who { json, all } => exit(cli::who(json, all)?),
         Command::Send {
             target,
             text,

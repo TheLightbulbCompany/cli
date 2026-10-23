@@ -54,6 +54,11 @@ pub struct Daemon {
     pub admissions: crate::admission::Waiting,
     /// Held while a `team.join` runs: one at a time.
     pub joining: tokio::sync::Mutex<()>,
+    /// Poked on a local session change: the presence sender (`presence::run`) looks again.
+    pub presence: Notify,
+    /// Ended sessions' and names' addresses, kept a day: `(when, cwd)` (`presence::keep`).
+    /// ponytail: in memory, so a restart forgets them; persist if that bites.
+    pub kept: Mutex<HashMap<String, (u64, String)>>,
 }
 
 impl Daemon {
@@ -94,8 +99,7 @@ pub async fn deliver(daemon: Arc<Daemon>, to: Key) {
         let Some(m) = next.ok().and_then(|w| w.into_iter().next()) else {
             return;
         };
-        let sender = frame::Sender::of(&daemon.identity.short, &m.from_key);
-        let framed = frame::framed(sender, None, &m.request_id, &m.body);
+        let framed = frame::framed(&ipc::sender_label(&daemon, &m), &m.request_id, &m.body);
         let pushed = match session.provider.as_str() {
             "claude" => claude::push(&session, &framed).await,
             _ => codex::push(&session, &framed).await,
@@ -180,10 +184,13 @@ pub async fn run(dir: &Path) -> Result<()> {
         dialog_answers: Mutex::new(Some(answers)),
         admissions: Mutex::default(),
         joining: tokio::sync::Mutex::new(()),
+        presence: Notify::new(),
+        kept: Mutex::default(),
     });
     // No join connection outlives a restart: its open requests are over.
     daemon.store.lock().unwrap().expire_joins(i64::MAX, now)?;
     tokio::spawn(crate::admission::route(daemon.clone()));
+    tokio::spawn(crate::presence::run(daemon.clone()));
     let net = net::Net::start(daemon.clone()).await?;
     ipc::serve(listener, daemon).await;
     net.close().await;

@@ -313,7 +313,7 @@ fn the_frame_names_the_terminal_and_name_senders() {
         framed.starts_with("[Lightbulb teammate contribution from You, at the terminal {"),
         "{framed}"
     );
-    // A name address is named by its name.
+    // A name address is named as the person's mailbox (`label::render`).
     let short = e.short();
     let r = e.ask(
         json!({"id": 2, "op": "send", "from": format!("{short}/desk"), "to": key,
@@ -323,7 +323,7 @@ fn the_frame_names_the_terminal_and_name_senders() {
     let m = e.ask(json!({"id": 3, "op": "inbox", "key": key}));
     let framed = m["messages"][0]["framed"].as_str().unwrap();
     assert!(
-        framed.starts_with("[Lightbulb teammate contribution from desk {"),
+        framed.starts_with("[Lightbulb teammate contribution from Your desk mailbox {"),
         "{framed}"
     );
 }

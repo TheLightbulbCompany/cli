@@ -233,12 +233,25 @@ impl TeamOps<'_> {
             })
         };
         Ok(match op {
-            // `team.get {}` -> `{team_id, name, members, heads}`.
-            "team.get" => Response::ok(
-                id,
-                json!({"team_id": r.team_id, "name": r.team_name,
-                    "members": r.members.values().collect::<Vec<_>>(), "heads": r.heads}),
-            ),
+            // `team.get {}` -> `{team_id, name, members, heads}`, each member with `online`
+            // (this computer always).
+            "team.get" => {
+                let online = self.daemon.peers.online();
+                let members: Vec<Value> = r
+                    .members
+                    .values()
+                    .map(|m| {
+                        let mut v = json!(m);
+                        v["online"] = (m.key == me_key || online.contains(&m.key)).into();
+                        v
+                    })
+                    .collect();
+                Response::ok(
+                    id,
+                    json!({"team_id": r.team_id, "name": r.team_name, "members": members,
+                        "heads": r.heads}),
+                )
+            }
             // `team.invite {mode}` -> `{ticket, line, app_link, expires_at, replaced}`. `reusable`
             // (and `open`) reprint this member's live link of that mode, minting one if none.
             "team.invite" => {

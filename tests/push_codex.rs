@@ -148,7 +148,7 @@ async fn codex_push_runs_codex_queue_with_the_thread_id() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert_eq!(s, "delivered");
-    let framed = frame::framed(frame::Sender::Agent("claude"), None, "r1", "hello codex");
+    let framed = frame::framed("Your Claude Code", "r1", "hello codex");
     assert_eq!(argv(bin, 1), expected_argv("t1", &framed));
     assert_eq!(std::fs::read(bin.join("stdin.1")).unwrap(), b"");
     assert_eq!(
@@ -190,8 +190,8 @@ async fn a_partial_batch_delivers_only_what_was_pushed() {
         call(&mut c, json!({"id": 5, "op": "unread", "key": to})).await["unread"],
         1
     );
-    let first = frame::framed(frame::Sender::Agent("claude"), None, "r1", "first");
-    let second = frame::framed(frame::Sender::Agent("claude"), None, "r2", "second");
+    let first = frame::framed("Your Claude Code", "r1", "first");
+    let second = frame::framed("Your Claude Code", "r2", "second");
     assert_eq!(argv(bin, 1), expected_argv("t3", &first));
     assert_eq!(argv(bin, 2), expected_argv("t3", &second));
     assert_eq!(

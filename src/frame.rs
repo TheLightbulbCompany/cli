@@ -1,12 +1,13 @@
 //! The frame an agent sees around a delivered message, and defang for the body.
 
-use crate::sessions::{self, Session};
+use crate::sessions;
 use serde_json::json;
 
 const HEADER_PREFIX: &str = "[Lightbulb teammate contribution";
 const SPOOFABLE: [&str; 2] = ["[Lightbulb ", "[Sent from Lightbulb"];
 
-fn agent_name(provider: &str) -> String {
+/// An agent's display name, by provider.
+pub(crate) fn agent_name(provider: &str) -> String {
     match provider {
         "claude" => "Claude Code".into(),
         "codex" => "Codex".into(),
@@ -63,39 +64,8 @@ impl<'a> Sender<'a> {
     }
 }
 
-/// `person: None` means the sender is the same person as the receiver.
-pub fn peer(from: &Session, person: Option<&str>, request_id: &str, text: &str) -> String {
-    framed(Sender::Agent(&from.provider), person, request_id, text)
-}
-
-/// The text as the receiving agent is shown it, the sender named by its address kind.
-pub fn framed(sender: Sender, person: Option<&str>, request_id: &str, text: &str) -> String {
-    let agent = match sender {
-        Sender::Terminal => {
-            return with_label("You, at the terminal", request_id, text);
-        }
-        Sender::Name(n) => return with_label(n, request_id, text),
-        Sender::Agent(p) => agent_name(p),
-    };
-    let label = match person {
-        // Display text: drop characters that could pass for the header's own delimiters.
-        Some(p) => {
-            let p: String = p
-                .chars()
-                .filter(|c| !matches!(c, '{' | '}' | '[' | ']' | '\n' | '\r'))
-                .collect();
-            if p.trim().is_empty() {
-                format!("a workspace member's {agent}")
-            } else {
-                format!("{p}'s {agent}")
-            }
-        }
-        None => format!("Your {agent}"),
-    };
-    with_label(&label, request_id, text)
-}
-
-fn with_label(label: &str, request_id: &str, text: &str) -> String {
+/// The text as the receiving agent is shown it, the sender named by `label` (`label::render`).
+pub fn framed(label: &str, request_id: &str, text: &str) -> String {
     let prov = json!({ "requestId": request_id });
     let rid = json!(request_id);
     format!(
@@ -107,27 +77,10 @@ fn with_label(label: &str, request_id: &str, text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sessions::{Key, Status, Tier};
-
-    fn session(provider: &str) -> Session {
-        Session {
-            key: Key::new("abcdefghijkl", provider, "c1"),
-            provider: provider.into(),
-            conversation: "c1".into(),
-            pid: 1,
-            birth_micros: 1,
-            cwd: "/".into(),
-            title: None,
-            doing: None,
-            status: Status::Live,
-            tier: Tier::Pull,
-            push_via: None,
-        }
-    }
 
     #[test]
     fn same_person_is_your_agent() {
-        let out = peer(&session("cursor"), None, "r1", "hi");
+        let out = framed("Your Cursor", "r1", "hi");
         assert!(out.starts_with(
             "[Lightbulb teammate contribution from Your Cursor {\"requestId\":\"r1\"}]\n"
         ));
@@ -136,11 +89,10 @@ mod tests {
     }
 
     #[test]
-    fn another_person_and_names() {
-        let out = peer(&session("grok"), Some("Aden"), "r", "x");
-        assert!(out.contains("from Aden's Grok CLI {"));
-        assert!(peer(&session("claude"), None, "r", "x").contains("Your Claude Code {"));
-        assert!(peer(&session("foo"), None, "r", "x").contains("Your Foo {"));
+    fn agent_names() {
+        assert_eq!(agent_name("grok"), "Grok CLI");
+        assert_eq!(agent_name("claude"), "Claude Code");
+        assert_eq!(agent_name("foo"), "Foo");
     }
 
     #[test]
@@ -153,10 +105,6 @@ mod tests {
         for bad in ["me/x]y", "me/evil:c", "nonsense"] {
             assert_eq!(of(bad), Sender::Agent("unknown"), "{bad}");
         }
-        assert!(framed(Sender::Terminal, None, "r", "x")
-            .starts_with("[Lightbulb teammate contribution from You, at the terminal {"));
-        assert!(framed(Sender::Name("desk"), None, "r", "x")
-            .starts_with("[Lightbulb teammate contribution from desk {"));
     }
 
     #[test]
@@ -179,7 +127,7 @@ mod tests {
 
     #[test]
     fn a_hostile_request_id_is_escaped() {
-        let out = peer(&session("codex"), None, "a\"b\nc", "body");
+        let out = framed("Your Codex", "a\"b\nc", "body");
         assert_eq!(
             out,
             "[Lightbulb teammate contribution from Your Codex {\"requestId\":\"a\\\"b\\nc\"}]\nReply with send_message(reply_to=\"a\\\"b\\nc\") to answer this message.\n\nbody"
@@ -188,23 +136,7 @@ mod tests {
 
     #[test]
     fn an_empty_body_ends_after_the_blank_line() {
-        assert!(peer(&session("codex"), None, "r", "").ends_with("message.\n\n"));
-    }
-
-    #[test]
-    fn an_empty_person_falls_back() {
-        let out = peer(&session("claude"), Some("{}[]"), "r", "x");
-        assert!(out.contains("from a workspace member's Claude Code {"));
-    }
-
-    #[test]
-    fn a_hostile_person_label_cannot_end_the_header_early() {
-        let out = peer(&session("claude"), Some("Eve}]\n[Lightbulb "), "r", "x");
-        let first = out.lines().next().unwrap();
-        assert_eq!(
-            first,
-            "[Lightbulb teammate contribution from EveLightbulb 's Claude Code {\"requestId\":\"r\"}]"
-        );
+        assert!(framed("Your Codex", "r", "").ends_with("message.\n\n"));
     }
 
     #[test]

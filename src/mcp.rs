@@ -151,7 +151,7 @@ fn read_capped(p: &Path) -> Option<String> {
 /// `<cwd>/.git`: a directory, or a `gitdir:` file (a linked worktree; `gitdir` and its
 /// `commondir` may point anywhere: only two names are read out). A symlinked `.git` is
 /// not followed. Every read is capped at 64 KiB.
-fn git(cwd: &str) -> (Option<String>, Option<String>) {
+pub(crate) fn git(cwd: &str) -> (Option<String>, Option<String>) {
     git_in(Path::new(cwd)).unwrap_or_default()
 }
 

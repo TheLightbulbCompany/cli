@@ -50,11 +50,17 @@ impl Peer {
         self.send(&Frame::Hello { protocol, heads }).await;
     }
 
+    /// The next frame other than a `presence` (each `hello` is also answered with one).
     async fn recv(&mut self) -> Frame {
-        tokio::time::timeout(Duration::from_secs(5), frames::read(&mut self.recv))
-            .await
-            .expect("a frame within 5 s")
-            .unwrap()
+        loop {
+            let f = tokio::time::timeout(Duration::from_secs(5), frames::read(&mut self.recv))
+                .await
+                .expect("a frame within 5 s")
+                .unwrap();
+            if !matches!(f, Frame::Presence { .. }) {
+                return f;
+            }
+        }
     }
 
     /// The `roster` frames up to and including the one with `more: false`.

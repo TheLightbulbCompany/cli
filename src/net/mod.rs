@@ -453,6 +453,7 @@ impl Net {
             }
         }
         d.peers.forget(&key, &conn);
+        crate::presence::seen(d, &key);
         conn.close(VarInt::from_u32(0), b"");
         eprintln!("net: disconnected {}", short(&key));
     }
@@ -473,6 +474,8 @@ impl Net {
         };
         let short = peer.short.clone();
         let mut synced = false;
+        let mut hello_ok = false;
+        let mut presence = None;
         if !frames::from_peer_ok(&f, peer, d) {
             eprintln!("net: dropped a {} frame from {short}", f.kind());
         } else if let Frame::Hello { protocol: p, heads } = f {
@@ -488,6 +491,7 @@ impl Net {
             d.peers
                 .with_link(key, conn, |l| l.protocol = Protocol::Ok(heads));
             d.peers.connected.notify_waiters();
+            hello_ok = true;
         } else if let Frame::Roster { entries, more } = f {
             sync.page.extend(entries);
             // A sync is applied once, at its last page (or when it alone would overflow).
@@ -495,11 +499,23 @@ impl Net {
                 synced = !sync.page.is_empty();
                 sync.pending.append(&mut sync.page);
             }
+        } else if matches!(f, Frame::Presence { .. }) {
+            presence = Some(f);
         }
         // Waiting entries are retried after each sync, and when the roster changed: another
         // connection may have brought their parents.
         let due = !sync.pending.is_empty() && (synced || team.roster.heads != sync.tried);
         drop(team);
+        // Outside `team`: building ours reads the sessions, storing theirs takes `store`.
+        if hello_ok {
+            let _ = tx.send(crate::presence::current(d));
+        }
+        if let Some(p) = presence {
+            let stored = crate::presence::put(&d.store.lock().unwrap(), key, &p, ipc::now());
+            if let Err(e) = stored {
+                eprintln!("net: storing presence from {short}: {e}");
+            }
+        }
         if due {
             match apply(d, &mut sync.pending, &short) {
                 Ok(heads) => sync.tried = heads,

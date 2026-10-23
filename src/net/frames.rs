@@ -3,7 +3,7 @@
 
 use crate::daemon::Daemon;
 use crate::roster::{Entry, Member};
-use crate::Result;
+use crate::{presence, sessions, Result};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -39,7 +39,8 @@ pub enum Frame {
     },
     Presence {
         member: String,
-        seq: u32,
+        /// Unix milliseconds at send: a receiver ignores one no newer than the last it stored.
+        seq: u64,
         sessions: Vec<Remote>,
         known: Vec<String>,
         kept: Vec<String>,
@@ -161,10 +162,32 @@ pub async fn read(recv: &mut (impl AsyncRead + Unpin)) -> Result<Frame> {
 }
 
 /// The one per-frame check on what a member sends. `roster` entries are checked by
-/// `roster::accept` itself; Tasks 7, 8 and 14 add the rules for the frames they serve, and
-/// until then every other kind is dropped.
-pub fn from_peer_ok(f: &Frame, _peer: &Member, _daemon: &Daemon) -> bool {
-    matches!(f, Frame::Hello { .. } | Frame::Roster { .. })
+/// `roster::accept` itself; a `presence` is the peer's own, at most `presence::MAX` of each
+/// list, every address under the peer's prefix. Tasks 8 and 14 add the rules for the frames
+/// they serve, and until then every other kind is dropped.
+pub fn from_peer_ok(f: &Frame, peer: &Member, _daemon: &Daemon) -> bool {
+    match f {
+        Frame::Hello { .. } | Frame::Roster { .. } => true,
+        Frame::Presence {
+            member,
+            sessions,
+            known,
+            kept,
+            ..
+        } => {
+            let own = |a: &str| {
+                sessions::qualify(&peer.short, a).as_deref() == Some(a)
+                    && a.split_once('/').is_some_and(|(m, _)| m == peer.short)
+            };
+            *member == peer.key
+                && [sessions.len(), known.len(), kept.len()]
+                    .iter()
+                    .all(|n| *n <= presence::MAX)
+                && sessions.iter().all(|s| own(&s.session_id))
+                && known.iter().chain(kept).all(|a| own(a))
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]
