@@ -449,9 +449,11 @@ fn live_count(daemon: &Daemon) -> usize {
 
 /// `m`'s sender as this computer's agents are told it (`label::sender`).
 pub(crate) fn sender_label(daemon: &Daemon, m: &store::Message) -> String {
+    let from = label::from(&daemon.identity.short, m);
+    let declared = presence::declared_agent(daemon, &from);
     let team = daemon.team.lock().unwrap();
     let me = (daemon.identity.key.as_str(), daemon.identity.short.as_str());
-    label::sender(&team.roster, me, m)
+    label::sender(&team.roster, me, m, declared.as_deref())
 }
 
 pub fn now_ms() -> u64 {
@@ -612,15 +614,23 @@ async fn settle(daemon: &Daemon, from: &Key, mut r: mail::Receipt, member: &str)
 /// `person_verified` (`label::verified`, as the label says it) and `computer`; this computer's
 /// own name and user, verified, before it is in a team. One team lock, one label per sender.
 fn records(daemon: &Daemon, messages: &[store::Message]) -> Vec<Value> {
-    let team = daemon.team.lock().unwrap();
     let (key, short) = (&daemon.identity.key, &daemon.identity.short);
+    // Before `team`: the presences' own lock.
+    let declared: HashMap<String, String> = (messages.iter())
+        .filter_map(|m| {
+            let from = label::from(short, m);
+            Some((from.clone(), presence::declared_agent(daemon, &from)?))
+        })
+        .collect();
+    let team = daemon.team.lock().unwrap();
     let mut senders: HashMap<String, Value> = HashMap::new();
     messages
         .iter()
         .map(|m| {
             let from = label::from(short, m);
             let who = senders.entry(from.clone()).or_insert_with(|| {
-                let label = label::render(&team.roster, key, &from);
+                let agent = declared.get(&from).map(String::as_str);
+                let label = label::render_as(&team.roster, key, &from, agent);
                 match team
                     .roster
                     .by_short(sessions::member_of(&from).unwrap_or(""))

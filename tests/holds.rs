@@ -577,8 +577,9 @@ async fn always_allow_on_a_workspace_can_be_taken_back_with_policy() {
     let [_, admitted] = seed_team(&a, &b);
     // Carol: another workspace's cloud member.
     let c = common::identity();
+    let proof = common::issuer::workspace_proof(&c.key, "w2", "carol", &[], common::now_s());
     let body = json!({"member": c.key, "name": "carol", "computer": "cloud", "person_id": "ws:w2",
-        "kind": "cloud", "role": "member", "proof": "p"});
+        "kind": "cloud", "role": "member", "proof": proof});
     let entry = Entry::signed(&a.identity(), vec![admitted.hash()], Kind::Admit, body, 3);
     assert!(roster::accept(&a.store(), &entry, 10).unwrap());
     a.daemon(false, "", &[]);
@@ -667,7 +668,7 @@ async fn a_cloud_sender_gets_always_allow() {
     let ws = common::identity();
     let (_d, s, roster, me, _) = lib_with(Some(json!({"member": ws.key, "name": "carol",
         "computer": "cloud", "person_id": "ws:w2", "kind": "cloud", "role": "member",
-        "proof": "p"})));
+        "proof": common::issuer::workspace_proof(&ws.key, "w2", "carol", &[], common::now_s())})));
     let p = mail::Prepared {
         message_id: ulid(),
         from: Key(format!("{}/friday", ws.short)),

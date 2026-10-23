@@ -95,7 +95,15 @@ enum Command {
         /// The name you go by in the network (default: your user name).
         #[arg(long)]
         name: Option<String>,
+        /// `cloud`: join as a workspace member (tests and ops; needs `--proof`).
+        #[arg(long, hide = true, default_value = "computer", value_parser = ["computer", "cloud"])]
+        kind: String,
+        /// The workspace member's `kind=workspace` proof.
+        #[arg(long, hide = true)]
+        proof: Option<String>,
     },
+    /// Sign in to Lightbulb in your browser, so teammates see your verified name.
+    Signin,
     /// Allow a join request (`J<n>`) or a held message (`H<n>`).
     Approve {
         request: String,
@@ -203,7 +211,13 @@ fn main() -> lightbulb_connect::Result<()> {
         Command::Admin { name, founder } => exit(cli::admin(&name, founder)?),
         Command::Remove { name } => exit(cli::remove(&name)?),
         Command::Leave => exit(cli::leave()?),
-        Command::Join { link, name } => exit(cli::join(&link, name)?),
+        Command::Join {
+            link,
+            name,
+            kind,
+            proof,
+        } => exit(cli::join(&link, name, &kind, proof)?),
+        Command::Signin => exit(cli::signin()?),
         Command::Approve { request, always } => exit(cli::answer(&request, true, always)?),
         Command::Decline { request } => exit(cli::answer(&request, false, false)?),
         Command::Held => exit(cli::held()?),

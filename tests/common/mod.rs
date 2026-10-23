@@ -1,10 +1,12 @@
 //! What the CLI and network test files share: a temp state dir and HOME, a daemon shut down
 //! on drop, a person's shell (`detached`) and socket client (`person`), the daemon env knobs,
 //! a two-member team seeded before start, and a member played by the test (`Peer`).
-//! ponytail: only `cli.rs`, `team_cli.rs`, `net_two.rs`, `join.rs`, `ui_claim.rs`, `dialog.rs`,
+//! ponytail: only `cli.rs`, `team_cli.rs`, `net_two.rs`, `join.rs`, `ui_claim.rs`, `dialog.rs`, `signin.rs`,
 //! `directory.rs` and `envelope.rs` use it;
 //! the other test files keep their own copies.
 #![allow(dead_code)]
+
+pub mod issuer;
 
 use iroh::endpoint::{presets, Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, PublicKey, SecretKey};
@@ -69,8 +71,14 @@ impl Env {
 
     /// Starts `lightbulb-connect daemon` on this state dir with `lan` (mDNS) and `config` as
     /// `config.toml`, and `env` set, and waits until it answers.
+    /// Unless `config` names an issuer, a closed port's: no test reaches ours.
     pub fn daemon(&self, lan: bool, config: &str, env: &[(&str, String)]) {
-        let config = format!("lan = {lan}\n{config}");
+        let issuer = if config.contains("issuer") {
+            ""
+        } else {
+            "issuer = \"http://127.0.0.1:9/connect\"\n"
+        };
+        let config = format!("lan = {lan}\n{issuer}{config}");
         std::fs::write(self.state.path().join("config.toml"), config).unwrap();
         let log = std::fs::File::create(self.state.path().join("daemon.log")).unwrap();
         let mut c = self.base_cmd(Command::new(EXE));
@@ -231,6 +239,14 @@ pub fn seed_pair(a: &Env, b: &Env) -> [Entry; 2] {
         policy::set_person(&env.store(), &key, accept, "local", 1).unwrap();
     }
     seeded
+}
+
+/// Unix seconds.
+pub fn now_s() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
 }
 
 /// The same team in both stores before either daemon starts: `a` founds "acme" (computer

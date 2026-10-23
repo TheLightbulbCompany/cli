@@ -219,8 +219,9 @@ fn founder_whose_only_other_member_is_cloud_can_leave() {
         &me,
         vec![g.hash()],
         Kind::Admit,
-        json!({"member": bridge.key, "name": "bridge", "computer": "cloud", "person_id": me.key,
-               "kind": "cloud", "role": "member", "proof": "p"}),
+        json!({"member": bridge.key, "name": "bridge", "computer": "cloud", "person_id": "ws:W1",
+               "kind": "cloud", "role": "member",
+               "proof": common::issuer::workspace_proof(&bridge.key, "W1", "bridge", &[], common::now_s())}),
         2,
     );
     roster::accept(

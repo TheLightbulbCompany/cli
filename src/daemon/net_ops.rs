@@ -1,6 +1,6 @@
 //! The network ops, reached from `ipc::handle`'s fallback arm.
 
-use super::ipc::{refused, Response, BAD_REQUEST, INTERNAL, NOT_FOUND, UNKNOWN_OP};
+use super::ipc::{refused, Response, BAD_REQUEST, INTERNAL, NOT_FOUND, UNKNOWN_OP, UNSUPPORTED};
 use super::{Daemon, TeamState};
 use crate::agents::caller;
 use crate::identity::Identity;
@@ -70,6 +70,10 @@ fn gate(op: &str, invite: Invite) -> Gate {
 }
 
 pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, peer_pid: Option<u32>) -> Response {
+    // Retired: a cloud member is removed by an admin like any member.
+    if op == "team.unlink" {
+        return Response::err(id, UNSUPPORTED);
+    }
     if op.starts_with("team.") {
         let invite = if op == "team.invite" {
             match serde_json::from_value::<Option<Invite>>(body["mode"].clone()) {
@@ -107,18 +111,50 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, peer_pid: Option
         };
     }
     match op {
-        // `identity.get {}` -> who this computer is. Until sign-in, `person_id` is its own key.
-        "identity.get" => Response::ok(
-            id,
-            json!({
-                "member_key": daemon.identity.key,
-                "member_key_short": daemon.identity.short,
-                "name": super::user_name(),
-                "computer": daemon.team.lock().unwrap().config.computer,
-                "person_id": daemon.identity.key,
-                "verified": false,
-            }),
-        ),
+        // `identity.get {}` -> who this computer is: until sign-in, `person_id` is its own key
+        // and `name` the user's; `verified` while its proof is in force (`expires_at`).
+        "identity.get" => {
+            let t = daemon.team.lock().unwrap();
+            let me = &daemon.identity.key;
+            let proof = t.roster.members.get(me).and_then(|m| m.proof.as_ref());
+            Response::ok(
+                id,
+                json!({
+                    "member_key": me,
+                    "member_key_short": daemon.identity.short,
+                    "name": proof.map_or_else(super::user_name, |p| p.name.clone()),
+                    "computer": t.config.computer,
+                    "person_id": t.roster.person_of(me),
+                    "verified": proof.is_some(),
+                    "expires_at": proof.map(|p| p.exp),
+                    "solo": t.roster.is_solo(me),
+                }),
+            )
+        }
+        // `identity.proof {proof}` -> `{name, person_id, solo}`: this computer's sign-in proof,
+        // written to the roster (`proof::record`); `bad_request` when it does not verify.
+        "identity.proof" => match body["proof"]
+            .as_str()
+            .map(|t| crate::proof::record(daemon, t))
+        {
+            Some(Ok(p)) => {
+                let solo = daemon
+                    .team
+                    .lock()
+                    .unwrap()
+                    .roster
+                    .is_solo(&daemon.identity.key);
+                Response::ok(
+                    id,
+                    json!({"name": p.name, "person_id": p.sub, "solo": solo}),
+                )
+            }
+            Some(Err(e)) => {
+                eprintln!("identity.proof: refused: {e}");
+                Response::err(id, BAD_REQUEST)
+            }
+            None => Response::err(id, BAD_REQUEST),
+        },
         // `ui.claim {}` -> `{lease_s}`: the Lightbulb app shows the person's questions itself;
         // no OS dialog opens until it stops heartbeating.
         "ui.claim" => {
@@ -279,7 +315,7 @@ pub(super) fn sync_team_row(store: &Store, old: &Roster, new: &Roster) -> crate:
 }
 
 /// The one post-write hook, for local writes and entries from peers alike: makes `new` the
-/// cached roster, rewrites Plan A's `team` row if it changed, and tells `net` (which closes
+/// cached roster (its expired proofs lapsed), rewrites Plan A's `team` row if it changed, and tells `net` (which closes
 /// the connections of members gone, dials new ones and pushes the change).
 pub fn install(
     daemon: &Daemon,
@@ -288,6 +324,8 @@ pub fn install(
     new: Roster,
 ) -> crate::Result<()> {
     sync_team_row(store, &team.roster, &new)?;
+    let mut new = new;
+    new.lapse(super::ipc::now() as i64);
     team.roster = new;
     daemon.peers.changed.notify_one();
     Ok(())

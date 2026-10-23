@@ -226,11 +226,17 @@ pub async fn read(recv: &mut (impl AsyncRead + Unpin)) -> Result<Frame> {
 /// most a day ahead of now. An `envelope` is checked by `mail::receive`. An `ack` or `receipt`
 /// names a state past `queued`, with a known reason exactly when it is `refused`, and a `limit`
 /// only on a `loop` refusal (that it
-/// is bound to this member is `outbox::acked`'s check). Task 14 adds the rules for the frames
+/// is bound to this member is `outbox::acked`'s check). A `join_request` or `join_decision`
+/// comes from a computer member. Task 14 adds the rules for the frames
 /// it serves, and until then every other kind is dropped.
 pub fn from_peer_ok(f: &Frame, peer: &Member, _daemon: &Daemon) -> bool {
     match f {
         Frame::Hello { .. } | Frame::Roster { .. } | Frame::Envelope { .. } => true,
+        // A person's new computer, between its person's computers (`admission::from_member`
+        // checks the signatures).
+        Frame::JoinRequest { .. } | Frame::JoinDecision { .. } => {
+            peer.kind == crate::roster::MemberKind::Computer
+        }
         Frame::Ack {
             state,
             reason,

@@ -75,6 +75,8 @@ pub struct Daemon {
     pub dialog_answers: Mutex<Option<dialog::Answers>>,
     /// The join requests waiting for their person's answer (`admission`).
     pub admissions: crate::admission::Waiting,
+    /// The join requests forwarded to another computer of their person (`admission`).
+    pub forwards: crate::admission::Forwards,
     /// Held while a `team.join` runs: one at a time.
     pub joining: tokio::sync::Mutex<()>,
     /// Poked on a local session change: the presence sender (`presence::run`) looks again.
@@ -171,8 +173,10 @@ pub async fn run(dir: &Path) -> Result<()> {
         roster::accept(&store, &g, now)?;
         entries.push(g);
     }
+    let mut roster = roster::replay(&entries);
+    roster.lapse(now);
     let mut team = TeamState {
-        roster: roster::replay(&entries),
+        roster,
         config: Config::default(),
         off: vec![],
     };
@@ -211,6 +215,7 @@ pub async fn run(dir: &Path) -> Result<()> {
         dialogs,
         dialog_answers: Mutex::new(Some(answers)),
         admissions: Mutex::default(),
+        forwards: Mutex::default(),
         joining: tokio::sync::Mutex::new(()),
         presence: Notify::new(),
         built: Mutex::default(),

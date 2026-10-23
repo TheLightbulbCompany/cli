@@ -19,6 +19,7 @@ pub mod outbox;
 pub mod paths;
 pub mod policy;
 pub mod presence;
+pub mod proof;
 pub mod roster;
 pub mod sessions;
 pub mod setup;

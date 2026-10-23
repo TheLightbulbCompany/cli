@@ -1,7 +1,8 @@
 //! Who a message is from, as its reader is told: rendered from the roster alone.
 
 use crate::frame::{agent_name, Sender};
-use crate::roster::{Member, Roster};
+use crate::proof::ProofKind;
+use crate::roster::{Member, MemberKind, Roster};
 use crate::sessions::{member_of, split_addr};
 use crate::store::Message;
 
@@ -14,18 +15,41 @@ pub fn printable(c: char) -> bool {
 
 /// `from`'s label for the reader at member `viewer` (its person is `Roster::person_of`):
 /// `Your Codex`, `You, at the terminal`, `Your desk mailbox` for the reader's own person;
-/// `aden's Codex`, `aden, at the terminal`, `aden's desk mailbox` for another's;
+/// `aden's Codex`, `aden, at the terminal`, `aden's desk mailbox` for another's, `✓ Aden
+/// Smith's Codex` when that member's proof is in force (its name);
 /// ` (not verified)` after a member with no proof other than the reader's own computer;
+/// `<Agent> · <workspace name>` for a session of a workspace member in force (`render_as`);
 /// `an unknown member (not verified)` for a prefix the roster does not hold.
 pub fn render(roster: &Roster, viewer: &str, from: &str) -> String {
+    render_as(roster, viewer, from, None)
+}
+
+/// `render`, `declared` the agent the sender's presence declares for `from` (a workspace
+/// member's session: `Friday`); else the proof's agent of that name, else the session's name.
+pub fn render_as(roster: &Roster, viewer: &str, from: &str, declared: Option<&str>) -> String {
     let prefix = member_of(from).unwrap_or(from);
     let Some(m) = roster.by_short(prefix) else {
         return "an unknown member (not verified)".into();
     };
+    let ws = m.proof.as_ref().filter(|p| p.kind == ProofKind::Workspace);
+    if let Some(p) = ws.filter(|_| m.kind == MemberKind::Cloud) {
+        let rest = split_addr(from).map_or(from, |(_, r)| r);
+        let named = p.agents.iter().find(|a| a.eq_ignore_ascii_case(rest));
+        let agent = declared.or(named.map(String::as_str)).unwrap_or(rest);
+        let space = p.workspace.as_ref().map_or("", |w| w.name.as_str());
+        return format!(
+            "{} · {}",
+            shown(agent, 32, "an agent"),
+            shown(space, 64, "a workspace")
+        );
+    }
     let (who, possessive) = if m.person_id == roster.person_of(viewer) {
         ("You".to_string(), "Your".to_string())
     } else {
-        let name = name(m);
+        let name = match &m.proof {
+            Some(p) => format!("✓ {}", shown(&p.name, 64, "a member")),
+            None => name(m),
+        };
         (name.clone(), format!("{name}'s"))
     };
     let label = match Sender::of(prefix, from) {
@@ -46,26 +70,31 @@ pub fn verified(m: &Member, own: &str) -> bool {
     m.proof.is_some() || m.key == own
 }
 
-/// `m`'s name as display text: without the characters that could pass for the frame header's
-/// delimiters, `a member` when nothing is left.
+/// `m`'s name as display text (`shown`).
 pub fn name(m: &Member) -> String {
-    let name: String = m
-        .name
+    shown(&m.name, usize::MAX, "a member")
+}
+
+/// `s` as display text: at most `max` characters, without the characters that could pass for
+/// the frame header's delimiters; `none` when nothing is left.
+fn shown(s: &str, max: usize, none: &str) -> String {
+    let s: String = s
         .chars()
         .filter(|c| printable(*c) && !matches!(c, '{' | '}' | '[' | ']'))
+        .take(max)
         .collect();
-    if name.trim().is_empty() {
-        "a member".to_string()
+    if s.trim().is_empty() {
+        none.to_string()
     } else {
-        name
+        s
     }
 }
 
 /// `m`'s sender as the agents of the computer `me` (key, short) are told it. Mail that came in
 /// over the IPC (`origin` other than `net:`) is that computer's by construction, whatever
 /// member prefix its `from` carries.
-pub fn sender(roster: &Roster, me: (&str, &str), m: &Message) -> String {
-    render(roster, me.0, &from(me.1, m))
+pub fn sender(roster: &Roster, me: (&str, &str), m: &Message, declared: Option<&str>) -> String {
+    render_as(roster, me.0, &from(me.1, m), declared)
 }
 
 /// The address `m` is from as its reader at member `short` labels it (`sender`).
@@ -81,7 +110,28 @@ pub fn from(short: &str, m: &Message) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::roster::{MemberKind, Role};
+    use crate::proof::{Proof, ProofWorkspace};
+    use crate::roster::Role;
+
+    fn proof(name: &str, kind: ProofKind) -> Proof {
+        let workspace = Some(ProofWorkspace {
+            id: "W1".into(),
+            name: "The Lightbulb Company".into(),
+        });
+        Proof {
+            iss: "test".into(),
+            kid: "k".into(),
+            iat: 0,
+            exp: 1,
+            sub: "s".into(),
+            name: name.into(),
+            computer: "c".into(),
+            kind,
+            workspace,
+            agents: vec!["Friday".into(), "Engineering".into()],
+            token: String::new(),
+        }
+    }
 
     fn member(key: &str, short: &str, name: &str, person: &str, proof: Option<&str>) -> Member {
         Member {
@@ -93,7 +143,7 @@ mod tests {
             role: Role::Member,
             kind: MemberKind::Computer,
             admitted_at: 0,
-            proof: proof.map(String::from),
+            proof: proof.map(|n| self::proof(n, ProofKind::Computer)),
             workspace: None,
         }
     }
@@ -105,8 +155,8 @@ mod tests {
         for m in [
             member("akey", "ashort", "prasiddha", "akey", None),
             member("bkey", "bshort", "aden", "bkey", None),
-            member("ckey", "cshort", "prasiddha", "akey", Some("p")),
-            member("dkey", "dshort", "Eve}]\n[Lightbulb ", "dkey", Some("p")),
+            member("ckey", "cshort", "prasiddha", "akey", Some("Prasiddha")),
+            member("dkey", "dshort", "eve", "dkey", Some("Eve}]\n[Lightbulb ")),
         ] {
             r.members.insert(m.key.clone(), m);
         }
@@ -137,11 +187,43 @@ mod tests {
         // A hostile roster name cannot end the frame header early.
         assert_eq!(
             render(&r, &a_pid, "dshort/codex:1"),
-            "EveLightbulb 's Codex"
+            "✓ EveLightbulb 's Codex"
         );
         let mut r2 = r.clone();
-        r2.members.get_mut("dkey").unwrap().name = "Ev\u{202e}e\u{2028}\u{85}\u{1b}x".into();
-        assert_eq!(render(&r2, &a_pid, "dshort/codex:1"), "Evex's Codex");
+        r2.members.get_mut("bkey").unwrap().name = "Ev\u{202e}e\u{2028}\u{85}\u{1b}x".into();
+        assert_eq!(
+            render(&r2, &a_pid, "bshort/codex:1"),
+            "Evex's Codex (not verified)"
+        );
+    }
+
+    #[test]
+    fn workspace_session_renders_agent_dot_workspace_name() {
+        let a_pid = "akey".to_string();
+        let mut r = Roster::default();
+        let mut w = member("wkey", "wshort", "The Lightbulb Company", "ws:W1", None);
+        w.kind = MemberKind::Cloud;
+        w.proof = Some(proof("The Lightbulb Company", ProofKind::Workspace));
+        r.members.insert(w.key.clone(), w);
+        r.members
+            .insert("akey".into(), member("akey", "ashort", "me", "akey", None));
+        assert_eq!(
+            render(&r, &a_pid, "wshort/friday"),
+            "Friday · The Lightbulb Company"
+        );
+        // The presence's declared agent, sanitised and cut to 32 characters.
+        let long = format!("Fri[day]\n{}", "x".repeat(40));
+        let shown = render_as(&r, &a_pid, "wshort/friday", Some(&long));
+        assert_eq!(
+            shown,
+            format!("Friday{} · The Lightbulb Company", "x".repeat(26))
+        );
+        // Lapsed: an unverified member's mailbox.
+        r.members.get_mut("wkey").unwrap().proof = None;
+        assert_eq!(
+            render(&r, &a_pid, "wshort/friday"),
+            "The Lightbulb Company's friday mailbox (not verified)"
+        );
     }
 
     #[test]

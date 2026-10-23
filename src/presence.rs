@@ -39,6 +39,14 @@ pub struct Latest {
     pub kept: Vec<String>,
 }
 
+/// The `agent` a member's latest presence declares for its session `from` (a workspace
+/// member's: `Friday`).
+pub fn declared_agent(d: &Daemon, from: &str) -> Option<String> {
+    let latest = d.latest.lock().unwrap();
+    let mut all = latest.values().flat_map(|l| &l.sessions);
+    all.find(|s| s.session_id == from).map(|s| s.agent.clone())
+}
+
 /// The stored presences, by member (read at daemon start).
 pub fn load(store: &Store) -> HashMap<String, Latest> {
     let rows = store.peers_presence().unwrap_or_default();

@@ -28,14 +28,16 @@ fn wait_state(e: &Env, from: &str, rid: &str, want: &str) {
 }
 
 /// `who` admitted into `e`'s stored team as "carol" (computer "cmac"), a computer or (with
-/// `cloud`) a cloud member of workspace `ws:<key>` with an opaque proof, signed by the founder
+/// `cloud`) a cloud member of workspace `ws:<key>` with its workspace proof, signed by the founder
 /// `founder`; `e` already allows carol's mail (`people` or `cloud_of` accept).
 fn admit(e: &Env, founder: &Identity, parent: &Entry, who: &Identity, cloud: bool) -> Entry {
     let mut body = json!({"member": who.key, "name": "carol", "computer": "cmac",
         "person_id": who.key, "kind": "computer", "role": "member"});
     if cloud {
         body["kind"] = json!("cloud");
-        body["proof"] = json!("p");
+        let proof =
+            common::issuer::workspace_proof(&who.key, &who.key, "carol", &[], common::now_s());
+        body["proof"] = json!(proof);
         body["person_id"] = json!(format!("ws:{}", who.key));
     }
     let entry = Entry::signed(founder, vec![parent.hash()], Kind::Admit, body, 3);

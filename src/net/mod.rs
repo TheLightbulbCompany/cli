@@ -382,13 +382,14 @@ impl Net {
     /// Sends what members are owed: on each `hello` every queued envelope of an online member,
     /// and every second the envelopes due (`outbox::due`'s per-row backoff) and the receipts
     /// waiting; every 60 s (or the outbox knob, if shorter) expires what waited too long, here
-    /// and in the outbox.
+    /// and in the outbox, and lapses and renews sign-in proofs (`proof::tick`).
     // ponytail: a 1 s poll (two small queries) picks up receipts that mail state changes queue;
     // wake it from `mail` if that ever shows.
     async fn flush_loop(self) {
         let d = &self.0.daemon;
         let every = Duration::from_secs(d.peers.knobs().outbox_s.clamp(1, 60));
         let mut expired_at: Option<std::time::Instant> = None;
+        let renew_at = Arc::new(std::sync::atomic::AtomicI64::new(0));
         loop {
             // Armed before the flush, so a `hello` during it is not missed.
             let connected = d.peers.connected.notified();
@@ -403,6 +404,7 @@ impl Net {
             let expire = expired_at.is_none_or(|t| t.elapsed() >= every);
             if expire {
                 expired_at = Some(std::time::Instant::now());
+                crate::proof::tick(d, &renew_at);
             }
             if let Err(e) = flush(d, all, expire) {
                 eprintln!("net: outbox: {e}");
@@ -553,7 +555,7 @@ impl Net {
         let short = peer.short.clone();
         let mut synced = false;
         let mut hello_ok = false;
-        let (mut presence, mut envelope, mut answer) = (None, None, None);
+        let (mut presence, mut envelope, mut answer, mut join) = (None, None, None, None);
         if !frames::from_peer_ok(&f, peer, d) {
             eprintln!("net: dropped a {} frame from {short}", f.kind());
         } else if let Frame::Hello { protocol: p, heads } = f {
@@ -581,6 +583,8 @@ impl Net {
             presence = Some(f);
         } else if matches!(f, Frame::Envelope { .. }) {
             envelope = Some(f);
+        } else if matches!(f, Frame::JoinRequest { .. } | Frame::JoinDecision { .. }) {
+            join = Some(f);
         } else if matches!(f, Frame::Ack { .. }) && d.peers.knobs().drop_acks {
             eprintln!("net: dropped an ack from {short} (debug)");
         } else if let Frame::Ack {
@@ -613,6 +617,9 @@ impl Net {
         if let Some(p) = presence.filter(|_| d.peers.speaks_ours(key, conn)) {
             let first = !std::mem::replace(&mut sync.presence_stored, true);
             crate::presence::put(d, key, &p, ipc::now(), first);
+        }
+        if let Some(f) = join {
+            tokio::spawn(crate::admission::from_member(d.clone(), key.to_string(), f));
         }
         if let Some(env) = envelope.filter(|_| d.peers.speaks_ours(key, conn)) {
             receive(d, key, &env, tx);

@@ -395,8 +395,9 @@ pub fn invite(mode: Invite) -> Result<i32> {
 }
 
 /// `join '<link>' [--name <n>]`: joins the network `link` invites to, waiting up to 600 s
-/// for its person to allow it.
-pub fn join(link: &str, name: Option<String>) -> Result<i32> {
+/// for its person to allow it. Hidden: `--kind cloud --proof <jws>`, a workspace member (the
+/// bridge joins in process; this is for tests and ops).
+pub fn join(link: &str, name: Option<String>, kind: &str, proof: Option<String>) -> Result<i32> {
     let name = name.unwrap_or_else(daemon::user_name);
     let mut conn = connect()?;
     if crate::ticket::decode(link).is_ok_and(|t| t.mode == "ask") {
@@ -406,7 +407,7 @@ pub fn join(link: &str, name: Option<String>) -> Result<i32> {
     let r = ask(
         &mut conn,
         "team.join",
-        json!({"ticket": link, "name": name, "kind": "computer"}),
+        json!({"ticket": link, "name": name, "kind": kind, "proof": proof}),
     )?;
     let team = r["team"].as_str().unwrap_or_default();
     let text = match (r["state"].as_str(), r["reason"].as_str()) {
@@ -426,12 +427,75 @@ pub fn join(link: &str, name: Option<String>) -> Result<i32> {
         ),
         (_, Some(admission::UNREACHABLE)) => "No one from this network is online right now. Ask them to open their laptop, then run the same command again. Your key is ready; nothing was lost.".to_string(),
         (_, Some(admission::DECLINED)) => "Your request to join was declined.".to_string(),
+        (_, Some(admission::YOUR_COMPUTER_OFFLINE)) => "Open your other computer, then run the same command again.".to_string(),
         (_, Some(admission::BAD_TICKET)) => "This invite link does not work. Ask for a new one.".to_string(),
         (_, Some(admission::EXPIRED_TICKET)) => "This invite link has expired. Ask for a new one.".to_string(),
         (_, reason) => format!("join: {}", reason.unwrap_or("refused")),
     };
     eprintln!("{text}");
     Ok(1)
+}
+
+/// How long `signin` waits for the person to confirm in the browser.
+const SIGNIN_WAIT: Duration = Duration::from_secs(900);
+
+/// `signin`: the issuer's device flow for this computer's key (`device/start`, the browser,
+/// then `device/token` until it answers), the proof written to the roster (`identity.proof`).
+pub fn signin() -> Result<i32> {
+    let issuer = crate::config::Config::load(&paths::state_dir())?.issuer;
+    let mut conn = connect()?;
+    let me = ask(&mut conn, "identity.get", json!({}))?;
+    let start = json!({"member_key": me["member_key"], "computer": me["computer"]});
+    let (status, s) = crate::proof::post(&crate::proof::route(&issuer, "device/start"), &start)?;
+    let (Some(code), Some(uri)) = (
+        s["device_code"].as_str(),
+        s["verification_uri_complete"].as_str(),
+    ) else {
+        eprintln!(
+            "Sign-in is not available right now (the issuer answered {status}). Try again later."
+        );
+        return Ok(1);
+    };
+    let user_code = s["user_code"].as_str().unwrap_or_default();
+    println!("Confirm the code {user_code} in your browser: {uri}");
+    // A person at a terminal gets the browser; a script reads the line above.
+    if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+        let _ = Command::new("open").arg(uri).status();
+    }
+    let every = Duration::from_secs(s["interval"].as_u64().unwrap_or(5).clamp(1, 60));
+    let deadline = std::time::Instant::now() + SIGNIN_WAIT;
+    let token = loop {
+        let (status, t) = crate::proof::post(
+            &crate::proof::route(&issuer, "device/token"),
+            &json!({"device_code": code}),
+        )?;
+        match (status, t["proof"].as_str()) {
+            (200, Some(p)) => break p.to_string(),
+            (200, None) if t["pending"] == true && std::time::Instant::now() < deadline => {}
+            (410, _) | (200, None) => {
+                eprintln!("This sign-in code expired. Run the same command again.");
+                return Ok(1);
+            }
+            _ => {
+                eprintln!("Sign-in failed (the issuer answered {status}). Try again later.");
+                return Ok(1);
+            }
+        }
+        std::thread::sleep(every);
+    };
+    // A fresh connection: the first may have sat idle through the wait.
+    let r = connect()?.call("identity.proof", json!({ "proof": token }))?;
+    if r["ok"] != true {
+        eprintln!("The issuer's answer did not verify for this computer. Try again later.");
+        return Ok(1);
+    }
+    let name = r["name"].as_str().unwrap_or_default();
+    if r["solo"] == true {
+        println!("Signed in as {name}. To join your network, paste its join line: lightbulb-connect join '<link>'");
+    } else {
+        println!("Signed in as {name}.");
+    }
+    Ok(0)
 }
 
 /// `approve <id> [--always]` / `decline <id>`: answers join request `J<n>` or held message
