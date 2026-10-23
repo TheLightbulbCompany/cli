@@ -418,6 +418,88 @@ pub fn answer_join(request: &str, allow: bool) -> Result<i32> {
     Ok(0)
 }
 
+/// `approve H<n> [--always]` / `decline H<n>`: answers a held message. `--always` covers the
+/// sender's workspace (`own_cloud` or `cloud_of`, as `hold.get` says), cloud members only.
+pub fn answer_hold(hold: &str, allow: bool, always: bool) -> Result<i32> {
+    let mut conn = connect()?;
+    let mut scope = Value::Null;
+    if always {
+        let h = conn.call("hold.get", json!({ "hold": hold }))?;
+        scope = h["always"].clone();
+        if h["ok"] == true && scope.is_null() {
+            eprintln!("--always is only for messages from a cloud member's agents.");
+            return Ok(1);
+        }
+    }
+    let verdict = if allow { "allow" } else { "decline" };
+    let r = conn.call(
+        "hold.answer",
+        json!({"hold": hold, "verdict": verdict, "scope": scope}),
+    )?;
+    if r["ok"] != true {
+        let texts = [
+            (
+                admission::NOT_OPEN,
+                format!("{hold} was already answered or has expired."),
+            ),
+            (ipc::NOT_FOUND, format!("No held message {hold}.")),
+        ];
+        return refuse(&r, &texts, if allow { "approve" } else { "decline" });
+    }
+    println!("{} {hold}.", if allow { "Allowed" } else { "Declined" });
+    Ok(0)
+}
+
+/// `held`: the held messages, one per line.
+pub fn held() -> Result<i32> {
+    let r = ask(&mut connect()?, "holds", json!({}))?;
+    for h in r["holds"].as_array().into_iter().flatten() {
+        let f = |k: &str| h[k].as_str().map(cell).unwrap_or_default();
+        println!(
+            "{}  {} -> {}  \"{}\"",
+            f("id"),
+            f("label"),
+            f("target_session"),
+            f("preview")
+        );
+    }
+    Ok(0)
+}
+
+/// `policy [<person> accept|hold|refuse]`: lists the policy (rows the bridge set marked so),
+/// or sets `people[<person>]`.
+pub fn policy(person: Option<String>, value: Option<String>) -> Result<i32> {
+    let mut conn = connect()?;
+    let p = match (person, value) {
+        (Some(pid), Some(v)) => ask(
+            &mut conn,
+            "policy.set",
+            json!({"person_id": pid, "scope": "people", "value": v}),
+        )?,
+        (None, None) => ask(&mut conn, "policy.get", json!({}))?,
+        _ => {
+            eprintln!("Usage: lightbulb-connect policy [<person> accept|hold|refuse]");
+            return Ok(2);
+        }
+    };
+    let by = |key: String| match p["set_by"][&key].as_str() {
+        Some("bridge") => "  (set_by: bridge)",
+        _ => "",
+    };
+    let on = p["agents_send_without_asking"] == true;
+    println!(
+        "agents_send_without_asking: {on}{}",
+        by(crate::policy::SWITCH.into())
+    );
+    for scope in ["people", "cloud_of"] {
+        for (pid, v) in p[scope].as_object().into_iter().flatten() {
+            let v = v.as_str().unwrap_or_default();
+            println!("{scope} {}: {v}{}", cell(pid), by(format!("{scope}:{pid}")));
+        }
+    }
+    Ok(0)
+}
+
 /// `team`: the team's name and members.
 pub fn team() -> Result<i32> {
     let t = ask(&mut connect()?, "team.get", json!({}))?;

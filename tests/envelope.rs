@@ -4,6 +4,7 @@
 
 use lightbulb_connect::identity::Identity;
 use lightbulb_connect::net::frames::Frame;
+use lightbulb_connect::policy;
 use lightbulb_connect::roster::{self, Entry, Kind};
 use serde_json::json;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -27,7 +28,8 @@ fn wait_state(e: &Env, from: &str, rid: &str, want: &str) {
 }
 
 /// `who` admitted into `e`'s stored team as "carol" (computer "cmac"), a computer or (with
-/// `cloud`) a cloud member with an opaque proof, signed by the founder `founder`.
+/// `cloud`) a cloud member with an opaque proof, signed by the founder `founder`; `e` already
+/// allows carol's mail (`people` accept).
 fn admit(e: &Env, founder: &Identity, parent: &Entry, who: &Identity, cloud: bool) -> Entry {
     let mut body = json!({"member": who.key, "name": "carol", "computer": "cmac",
         "person_id": who.key, "kind": "computer", "role": "member"});
@@ -37,6 +39,8 @@ fn admit(e: &Env, founder: &Identity, parent: &Entry, who: &Identity, cloud: boo
     }
     let entry = Entry::signed(founder, vec![parent.hash()], Kind::Admit, body, 3);
     assert!(roster::accept(&e.store(), &entry, 10).unwrap());
+    let accept = policy::Verdict::Accept;
+    policy::set(&e.store(), "people", &who.key, accept, "local", 1).unwrap();
     entry
 }
 

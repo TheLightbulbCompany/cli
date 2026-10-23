@@ -19,7 +19,7 @@ use crate::mail::{self, State};
 use crate::roster::{self, Entry, Roster};
 use crate::sessions::Key;
 use crate::Result;
-use crate::{identity, outbox};
+use crate::{holds, identity, outbox};
 use frames::Frame;
 use iroh::endpoint::{presets, Connection, VarInt};
 use iroh::{Endpoint, EndpointAddr, PublicKey, SecretKey};
@@ -622,8 +622,14 @@ fn receive(d: &Arc<Daemon>, key: &str, env: &Frame, tx: &mpsc::UnboundedSender<F
     let short = &peer.short;
     let store = d.store.lock().unwrap();
     let me = &d.identity.short;
+    let fresh = matches!(store.seen_state(&peer.key, id), Ok(None));
     match mail::receive(&store, env, peer, &team.roster, me, ipc::now()) {
         Ok((state, reason)) => {
+            if fresh && state == State::Held {
+                if let Ok(Some(h)) = holds::by_message(&store, id) {
+                    holds::shown(d, &team.roster, &store, &h);
+                }
+            }
             eprintln!("net: envelope {id} from {short}: {}", state.name());
             let _ = tx.send(Frame::Ack {
                 id: id.clone(),
@@ -648,6 +654,7 @@ fn flush(d: &Daemon, all: bool, expire: bool) -> Result<()> {
     if expire {
         mail::expire(&store, now)?;
         outbox::expire(&store, now, d.peers.knobs().outbox_s)?;
+        holds::expire_here(d, &store, now as i64)?;
     }
     let due = outbox::due(&store, &online, if all { u64::MAX } else { now })?;
     for (member, f) in due {

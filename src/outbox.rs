@@ -111,6 +111,7 @@ mod tests {
             kind: MemberKind::Computer,
             admitted_at: 0,
             proof: None,
+            workspace: None,
         }
     }
 

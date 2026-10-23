@@ -403,7 +403,7 @@ async fn tell(
     conn.close(VarInt::from_u32(0), b"");
 }
 
-/// Routes the person's dialog answers by id: `J<n>` to admission. `None` (gave up, no GUI)
+/// Routes the person's dialog answers by id: `J<n>` to admission, `H<n>` to holds. `None` (gave up, no GUI)
 /// leaves the request waiting for `approve`/`decline` until its candidate gives up.
 pub async fn route(d: Arc<Daemon>) {
     let Some(mut answers) = d.dialog_answers.lock().unwrap().take() else {
@@ -414,8 +414,11 @@ pub async fn route(d: Arc<Daemon>) {
             if let Some(b) = button {
                 answer(&d, n, b == "Allow");
             }
+        } else if let Some(n) = crate::holds::parse_id(&id) {
+            if let Some(b) = button {
+                crate::holds::on_dialog(&d, n, &b);
+            }
         } else {
-            // Task 9 adds `H<n>`, a hold's answer.
             eprintln!("dialog {id}: nothing waits for it");
         }
     }

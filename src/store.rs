@@ -496,10 +496,11 @@ impl Store {
             .optional()
     }
 
-    pub fn put_seen(&self, sender: &str, id: &str, at: i64) -> rusqlite::Result<()> {
+    /// `sender`'s envelope `id` was seen at `at`, and `told` its state.
+    pub fn put_seen(&self, sender: &str, id: &str, told: &str, at: i64) -> rusqlite::Result<()> {
         self.conn.execute(
-            "INSERT INTO seen_ids VALUES (?1, ?2, 'stored', ?3)",
-            params![sender, id, at],
+            "INSERT INTO seen_ids VALUES (?1, ?2, ?3, ?4)",
+            params![sender, id, told, at],
         )?;
         Ok(())
     }

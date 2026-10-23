@@ -241,6 +241,9 @@ async fn handle(
             None => Response::err(id, BAD_REQUEST),
         },
         "team.leave" => super::net_ops::leave(id, daemon, peer_pid).await,
+        "holds" | "hold.get" | "hold.answer" | "hold.file" | "policy.get" | "policy.set" => {
+            crate::holds::op(id, &req.op, &req.body, daemon, peer_pid)
+        }
         op => super::net_ops::handle(id, op, &req.body, daemon, peer_pid),
     }
 }
@@ -287,7 +290,7 @@ fn owner_process(daemon: &Daemon, key: &str) -> rusqlite::Result<Option<Proc>> {
     )
 }
 
-pub(super) fn refused(id: u64, reason: &str) -> Response {
+pub(crate) fn refused(id: u64, reason: &str) -> Response {
     Response::err_with(id, BAD_REQUEST, json!({ "reason": reason }))
 }
 

@@ -99,6 +99,8 @@ pub struct Member {
     pub kind: MemberKind,
     pub admitted_at: i64,
     pub proof: Option<String>,
+    /// The admit body's `workspace` (opaque; Task 13 takes it from the verified proof).
+    pub workspace: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -160,6 +162,14 @@ impl Roster {
         } else {
             None
         }
+    }
+
+    /// My workspace's member: the cloud member whose `person_id` is `ws:<me.workspace>`.
+    pub fn my_workspace_member(&self, me: &Member) -> Option<&Member> {
+        let ws = format!("ws:{}", me.workspace.as_ref()?);
+        self.members
+            .values()
+            .find(|m| m.kind == MemberKind::Cloud && m.person_id == ws)
     }
 
     pub fn by_short(&self, short: &str) -> Option<&Member> {
@@ -534,6 +544,7 @@ fn new_member(e: &Entry, role: Role) -> Member {
         },
         admitted_at: e.at,
         proof: e.body["proof"].as_str().map(str::to_string),
+        workspace: e.body["workspace"].as_str().map(str::to_string),
         key,
     }
 }

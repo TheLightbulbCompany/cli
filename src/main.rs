@@ -96,10 +96,23 @@ enum Command {
         #[arg(long)]
         name: Option<String>,
     },
-    /// Allow a join request (`J<n>`).
-    Approve { request: String },
-    /// Decline a join request (`J<n>`).
+    /// Allow a join request (`J<n>`) or a held message (`H<n>`).
+    Approve {
+        request: String,
+        /// For a held message from a cloud member: always allow that workspace's agents.
+        #[arg(long)]
+        always: bool,
+    },
+    /// Decline a join request (`J<n>`) or a held message (`H<n>`).
     Decline { request: String },
+    /// The held messages waiting for your Allow.
+    Held,
+    /// Who may message your sessions; with a person and a value, sets it.
+    Policy {
+        person: Option<String>,
+        /// accept, hold or refuse.
+        value: Option<String>,
+    },
     #[command(external_subcommand)]
     External(Vec<OsString>),
     /// Run by an agent's hook config: `hook <claude|codex|cursor|grok> <session-start|user-prompt-submit|post-tool-use|stop|session-end>`.
@@ -185,8 +198,16 @@ fn main() -> lightbulb_connect::Result<()> {
         Command::Remove { name } => exit(cli::remove(&name)?),
         Command::Leave => exit(cli::leave()?),
         Command::Join { link, name } => exit(cli::join(&link, name)?),
-        Command::Approve { request } => exit(cli::answer_join(&request, true)?),
+        Command::Approve { request, always } if request.starts_with('H') => {
+            exit(cli::answer_hold(&request, true, always)?)
+        }
+        Command::Approve { request, .. } => exit(cli::answer_join(&request, true)?),
+        Command::Decline { request } if request.starts_with('H') => {
+            exit(cli::answer_hold(&request, false, false)?)
+        }
         Command::Decline { request } => exit(cli::answer_join(&request, false)?),
+        Command::Held => exit(cli::held()?),
+        Command::Policy { person, value } => exit(cli::policy(person, value)?),
         Command::External(args) => exit(cli::forward(args)?),
         Command::Mcp { server_name } => mcp::run(server_name)?,
         Command::Setup {

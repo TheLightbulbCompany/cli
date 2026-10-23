@@ -12,6 +12,7 @@ use lightbulb_connect::daemon::net_ops;
 use lightbulb_connect::identity::{self, Identity};
 use lightbulb_connect::net::frames::{self, Frame, Remote};
 use lightbulb_connect::net::{ALPN, PROTOCOL};
+use lightbulb_connect::policy;
 use lightbulb_connect::roster::{self, Entry, Kind};
 use lightbulb_connect::store::Store;
 use serde_json::{json, Value};
@@ -212,9 +213,28 @@ impl Drop for Env {
     }
 }
 
+/// `seed_team`, and each person already allows the other (`people` accept), so their mail is
+/// not held.
+pub fn seed_pair(a: &Env, b: &Env) -> [Entry; 2] {
+    let seeded = seed_team(a, b);
+    for (env, other) in [(a, b), (b, a)] {
+        let key = other.identity().key;
+        policy::set(
+            &env.store(),
+            "people",
+            &key,
+            policy::Verdict::Accept,
+            "local",
+            1,
+        )
+        .unwrap();
+    }
+    seeded
+}
+
 /// The same team in both stores before either daemon starts: `a` founds "acme" (computer
 /// "mac") and admits `b` as "bob" (computer "mbp"). Returns `[genesis, admit]`.
-pub fn seed_pair(a: &Env, b: &Env) -> [Entry; 2] {
+pub fn seed_team(a: &Env, b: &Env) -> [Entry; 2] {
     let (ia, ib) = (a.identity(), b.identity());
     let g = net_ops::genesis(&ia, "prasiddha", "mac", "acme", 1);
     let admit = Entry::signed(
