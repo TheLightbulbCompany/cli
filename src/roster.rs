@@ -140,15 +140,6 @@ impl Roster {
         self.members.get(key).map_or(key, |m| &m.person_id)
     }
 
-    /// This person's own workspace member: the cloud member whose `person_id` is
-    /// `ws:<the workspace me's member names>`.
-    pub fn my_workspace_member(&self, me: &str) -> Option<&Member> {
-        let pid = format!("ws:{}", self.members.get(me)?.workspace.as_ref()?);
-        self.members
-            .values()
-            .find(|m| m.kind == MemberKind::Cloud && m.person_id == pid)
-    }
-
     /// Whether `b` is a computer member of `a`'s person.
     pub fn same_person_computer(&self, a: &str, b: &str) -> bool {
         match (self.members.get(a), self.members.get(b)) {
