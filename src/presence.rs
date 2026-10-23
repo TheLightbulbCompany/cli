@@ -209,8 +209,15 @@ fn stamp(f: &mut Frame) {
     if let Frame::Presence { seq, .. } = f {
         let now = ipc::now_ms();
         let next = |last: u64| now.max(last + 1);
-        let last = LAST_SEQ.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |l| Some(next(l)));
-        *seq = next(last.unwrap_or_else(|l| l));
+        // A compare-exchange loop: `fetch_update` is deprecated on current stable (1.99) and its
+        // replacement `try_update` is not on the oldest toolchain this builds with (1.96).
+        let mut last = LAST_SEQ.load(Ordering::SeqCst);
+        while let Err(l) =
+            LAST_SEQ.compare_exchange_weak(last, next(last), Ordering::SeqCst, Ordering::SeqCst)
+        {
+            last = l;
+        }
+        *seq = next(last);
     }
 }
 
@@ -391,6 +398,7 @@ pub fn directory(d: &Daemon, query: Option<&str>) -> Value {
             kind: MemberKind::Computer,
             admitted_at: 0,
             proof: None,
+            workspace: None,
         });
         (my_person(d, &t.roster), own)
     };
