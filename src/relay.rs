@@ -9,7 +9,10 @@
 //! issuer's `relays.json` and `relays.json.minisig`, verified against one of two compiled-in
 //! minisign keys and accepted only whole, cached in the state dir with its signature and
 //! refetched at most daily; the cached copy serves while a fetch fails. None at all: direct
-//! only.
+//! only. Every relay URL, from any source, passes `valid` (https only) or is ignored.
+//!
+//! The fetch uses `ureq`: blocking, small and rustls-only; it runs on a blocking thread,
+//! where `reqwest::blocking` would start a second runtime per fetch.
 
 use crate::config::Config;
 use crate::Result;
@@ -21,6 +24,11 @@ use std::time::Duration;
 
 pub const FILE: &str = "relays.json";
 pub const SIG_FILE: &str = "relays.json.minisig";
+/// The `expires_at` of the newest list ever verified here, apart from the cached body: a
+/// cache that no longer verifies cannot lower it (no rollback to an older signed list).
+pub const FLOOR_FILE: &str = "relays.floor";
+/// A signed list with more relays than this is refused whole.
+pub const MAX_RELAYS: usize = 8;
 /// A cached list younger than this is used without asking the issuer.
 const FRESH: Duration = Duration::from_secs(86_400);
 /// The most a relay list (or its signature) may be.
@@ -56,6 +64,35 @@ pub struct List {
     pub urls: Vec<String>,
     pub source: Source,
     pub error: Option<String>,
+    /// This list came with a fetch attempt (its `error` is then that fetch's outcome).
+    #[serde(skip)]
+    pub fetched: bool,
+}
+
+/// Whether `url` may be a relay: `https` with a host and no userinfo, query or fragment.
+/// `http` only in debug builds (the tests' loopback relay): a plain-TCP relay would show
+/// member keys and who talks to whom on the path.
+pub fn valid(url: &str) -> bool {
+    let Ok(u) = url.parse::<iroh::RelayUrl>() else {
+        return false;
+    };
+    let scheme = u.scheme() == "https" || (cfg!(debug_assertions) && u.scheme() == "http");
+    scheme
+        && u.host_str().is_some_and(|h| !h.is_empty())
+        && u.username().is_empty()
+        && u.password().is_none()
+        && u.query().is_none()
+        && u.fragment().is_none()
+}
+
+/// `new` as it replaces `old` in effect: our list's error stays until a fetch ends it (a tick
+/// without a fetch knows nothing new about the issuer).
+pub fn merge(old: &List, mut new: List) -> List {
+    let ours = matches!(new.source, Source::Lightbulb | Source::None);
+    if ours && !new.fetched && new.error.is_none() {
+        new.error = old.error.clone();
+    }
+    new
 }
 
 #[derive(Deserialize)]
@@ -76,32 +113,31 @@ pub fn list(
     keys: &[String],
     fetch: bool,
 ) -> List {
-    let own = |v: &Option<String>| {
-        let u = v.as_deref().map(str::trim).filter(|u| !u.is_empty());
-        u.map(|u| vec![u.to_string()])
+    let own = |v: &Option<String>, source| {
+        let u = v.as_deref().map(str::trim).filter(|u| !u.is_empty())?;
+        if !valid(u) {
+            warn_once(u);
+            return None;
+        }
+        Some(List {
+            urls: vec![u.to_string()],
+            source,
+            ..List::default()
+        })
     };
-    if let Some(urls) = own(&config.relay) {
-        return List {
-            urls,
-            source: Source::Config,
-            error: None,
-        };
-    }
-    if let Some(urls) = own(team) {
-        return List {
-            urls,
-            source: Source::Team,
-            error: None,
-        };
+    if let Some(l) = own(&config.relay, Source::Config).or_else(|| own(team, Source::Team)) {
+        return l;
     }
     let cached = cached(dir, keys);
+    if let Ok((_, at)) = &cached {
+        raise_floor(dir, *at);
+    }
     let fresh = fs::metadata(dir.join(FILE))
         .and_then(|m| m.modified())
         .is_ok_and(|t| t.elapsed().is_ok_and(|e| e < FRESH));
     let mut fetched = None;
     if fetch && !fresh {
-        let floor = cached.as_ref().map_or(i64::MIN, |c| c.1);
-        match refresh(dir, &config.issuer, keys, floor) {
+        match refresh(dir, &config.issuer, keys) {
             Ok(got) => fetched = Some(Ok(got)),
             Err(e) => {
                 eprintln!("relay: fetching {}: {e}", config.issuer);
@@ -111,22 +147,50 @@ pub fn list(
     }
     let (got, error) = match (fetched, cached) {
         (Some(Ok(got)), _) => (Some(got), None),
-        // A failed fetch: the cached copy serves.
-        (Some(Err(_)), Ok(c)) => (Some(c), None),
+        // A failed fetch: the cached copy serves, and the failure is said.
+        (Some(Err(e)), Ok(c)) => (Some(c), Some(e.to_string())),
         (Some(Err(e)), Err(_)) => (None, Some(e.to_string())),
         (None, Ok(c)) => (Some(c), None),
         (None, Err(e)) => (None, e),
     };
+    let fetched = fetch && !fresh;
     match got {
         Some((urls, _)) if !urls.is_empty() => List {
             urls,
             source: Source::Lightbulb,
             error,
+            fetched,
         },
         _ => List {
             error,
+            fetched,
             ..List::default()
         },
+    }
+}
+
+/// Logs an invalid relay setting once per value (it is ignored: the next source serves).
+fn warn_once(url: &str) {
+    static WARNED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let mut w = WARNED.lock().unwrap();
+    if !w.iter().any(|u| u == url) {
+        eprintln!("relay: ignored {url:?} (not an https relay URL)");
+        w.push(url.to_string());
+    }
+}
+
+fn floor(dir: &Path) -> i64 {
+    let text = fs::read_to_string(dir.join(FLOOR_FILE)).unwrap_or_default();
+    text.trim().parse().unwrap_or(i64::MIN)
+}
+
+fn raise_floor(dir: &Path, at: i64) {
+    if at > floor(dir) {
+        let mut r = crate::setup::AgentReport::default();
+        let path = dir.join(FLOOR_FILE);
+        if let Err(e) = crate::setup::write(&path, &at.to_string(), false, &mut r) {
+            eprintln!("relay: {FLOOR_FILE}: {e}");
+        }
     }
 }
 
@@ -143,8 +207,8 @@ fn cached(dir: &Path, keys: &[String]) -> std::result::Result<(Vec<String>, i64)
 }
 
 /// Fetches `{issuer}/relays.json` and its signature; on a list that verifies and expires no
-/// earlier than the cached one's (`floor`: no rollback to an older list), caches both.
-fn refresh(dir: &Path, issuer: &str, keys: &[String], floor: i64) -> Result<(Vec<String>, i64)> {
+/// earlier than the newest one verified here (`FLOOR_FILE`: no rollback), caches both.
+fn refresh(dir: &Path, issuer: &str, keys: &[String]) -> Result<(Vec<String>, i64)> {
     let base = issuer.trim_end_matches('/');
     let text = |url: String| -> Result<String> {
         Ok(String::from_utf8(get(&url)?).map_err(|_| "not text")?)
@@ -152,13 +216,14 @@ fn refresh(dir: &Path, issuer: &str, keys: &[String], floor: i64) -> Result<(Vec
     let body = text(format!("{base}/{FILE}"))?;
     let sig = text(format!("{base}/{SIG_FILE}"))?;
     let got = parse(body.as_bytes(), &sig, keys)?;
-    if got.1 < floor {
+    if got.1 < floor(dir) {
         return Err("older than the cached list".into());
     }
     // A crash between the two leaves a pair that does not verify: refetched next time.
     let mut r = crate::setup::AgentReport::default();
     crate::setup::write(&dir.join(FILE), &body, false, &mut r)?;
     crate::setup::write(&dir.join(SIG_FILE), &sig, false, &mut r)?;
+    raise_floor(dir, got.1);
     eprintln!("relay: fetched {} relays from {issuer}", got.0.len());
     Ok(got)
 }
@@ -166,6 +231,9 @@ fn refresh(dir: &Path, issuer: &str, keys: &[String], floor: i64) -> Result<(Vec
 fn get(url: &str) -> Result<Vec<u8>> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(FETCH_TIMEOUT))
+        // No redirect (to http, or anywhere); https only, but for the tests' loopback issuer.
+        .max_redirects(0)
+        .https_only(!cfg!(debug_assertions))
         .build()
         .into();
     let mut body = agent
@@ -195,8 +263,7 @@ fn parse(body: &[u8], sig: &str, keys: &[String]) -> Result<(Vec<String>, i64)> 
         return Err("bad signature".into());
     }
     let l: Signed = serde_json::from_slice(body).map_err(|_| "not a relay list")?;
-    let valid = |u: &String| u.parse::<iroh::RelayUrl>().is_ok();
-    if l.v != 1 || !l.relays.iter().all(valid) {
+    if l.v != 1 || l.relays.len() > MAX_RELAYS || !l.relays.iter().all(|u| valid(u)) {
         return Err("not a relay list".into());
     }
     Ok((l.relays, l.expires_at))
@@ -229,10 +296,50 @@ mod tests {
         let l = list(dir.path(), &config, &team, &[], true);
         assert_eq!((l.source, l.urls.len()), (Source::None, 0));
         assert!(l.error.is_some());
-        // Without `fetch`, nothing is tried and nothing is wrong.
-        assert_eq!(
-            list(dir.path(), &config, &team, &[], false),
-            List::default()
+        // A tick without a fetch keeps that error; only a fetch's outcome replaces it.
+        let tick = list(dir.path(), &config, &team, &[], false);
+        assert_eq!(tick, List::default());
+        assert_eq!(merge(&l, tick).error, l.error);
+        let mut team_list = list(
+            dir.path(),
+            &config,
+            &Some("https://t.example".into()),
+            &[],
+            false,
         );
+        team_list = merge(&l, team_list);
+        assert_eq!((team_list.source, team_list.error), (Source::Team, None));
+        // An invalid setting is ignored: the next source serves.
+        config.relay = Some("ftp://mine.example".into());
+        let l = list(
+            dir.path(),
+            &config,
+            &Some("https://t.example".into()),
+            &[],
+            false,
+        );
+        assert_eq!(l.source, Source::Team);
+        let l = list(dir.path(), &config, &Some("garbage".into()), &[], false);
+        assert_eq!((l.source, l.urls.len()), (Source::None, 0));
+    }
+
+    #[test]
+    fn only_https_relay_urls_are_valid() {
+        assert!(valid("https://relay.example"));
+        assert!(valid("https://relay.example:443/"));
+        assert_eq!(valid("http://127.0.0.1:3340"), cfg!(debug_assertions));
+        for bad in [
+            "ftp://relay.example",
+            "file:///etc/passwd",
+            "ws://relay.example",
+            "https://evil@relay.example",
+            "https://u:p@relay.example",
+            "https://relay.example/?x=1",
+            "https://relay.example/#f",
+            "relay.example",
+            "",
+        ] {
+            assert!(!valid(bad), "{bad}");
+        }
     }
 }

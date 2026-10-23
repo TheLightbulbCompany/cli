@@ -126,6 +126,9 @@ enum Command {
         /// Clear the relay you set.
         #[arg(long, conflicts_with = "url")]
         clear: bool,
+        /// Only this computer, not the team (founder and admins set the team's by default).
+        #[arg(long)]
+        local: bool,
     },
     #[command(external_subcommand)]
     External(Vec<OsString>),
@@ -217,7 +220,7 @@ fn main() -> lightbulb_connect::Result<()> {
         Command::Held => exit(cli::held()?),
         Command::Policy { person, value } => exit(cli::policy(person, value)?),
         Command::Folder { path, state } => exit(cli::folder(&path, state == "on")?),
-        Command::Relay { url, clear } => exit(cli::relay(url, clear)?),
+        Command::Relay { url, clear, local } => exit(cli::relay(url, clear, local)?),
         Command::External(args) => exit(cli::forward(args)?),
         Command::Mcp { server_name } => mcp::run(server_name)?,
         Command::Setup {

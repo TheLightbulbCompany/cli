@@ -150,15 +150,16 @@ pub fn reload(daemon: &Daemon) -> crate::Result<()> {
     Ok(())
 }
 
-/// `relay.set {url}` -> `{team}`: writes `config.toml: relay` (an empty or missing `url`
-/// clears it); from the founder or an admin also the roster's `meta {relay}`, so the whole
-/// team adopts it (`team: true`). A person only: it moves where this computer's traffic goes.
+/// `relay.set {url, local}` -> `{team}`: writes `config.toml: relay` (an empty or missing
+/// `url` clears it); from the founder or an admin, unless `local`, also the roster's
+/// `meta {relay}`, so the whole team adopts it (`team: true`). In effect before the answer.
+/// A person only: it moves where this computer's traffic goes.
 fn relay_set(id: u64, body: &Value, daemon: &Daemon, peer_pid: Option<u32>) -> Response {
     if !peer_pid.is_some_and(person_only) {
         return refused(id, "not_a_person");
     }
     let url = body["url"].as_str().unwrap_or_default().trim();
-    if !url.is_empty() && url.parse::<iroh::RelayUrl>().is_err() {
+    if !url.is_empty() && !crate::relay::valid(url) {
         return Response::err(id, BAD_REQUEST);
     }
     let mut team = daemon.team.lock().unwrap();
@@ -168,7 +169,8 @@ fn relay_set(id: u64, body: &Value, daemon: &Daemon, peer_pid: Option<u32>) -> R
         .roster
         .members
         .get(me)
-        .is_some_and(|m| m.role >= Role::Admin);
+        .is_some_and(|m| m.role >= Role::Admin)
+        && body["local"] != true;
     let now = super::ipc::now() as i64;
     let mut set = || -> crate::Result<()> {
         crate::config::Config::set(&daemon.dir, "relay", url)?;
@@ -187,7 +189,10 @@ fn relay_set(id: u64, body: &Value, daemon: &Daemon, peer_pid: Option<u32>) -> R
     };
     match set() {
         Ok(()) => {
-            daemon.peers.relay_changed.notify_one();
+            let t = &team;
+            daemon
+                .peers
+                .set_relays(&daemon.dir, &t.config, &t.roster.relay);
             eprintln!("relay.set: {url:?} (team: {elevated})");
             Response::ok(id, json!({"team": elevated}))
         }
@@ -338,10 +343,14 @@ pub fn install(
     new: Roster,
 ) -> crate::Result<()> {
     sync_team_row(store, &team.roster, &new)?;
+    let relay_changed = team.roster.relay != new.relay;
     team.roster = new;
     daemon.peers.changed.notify_one();
-    // The team's relay may have changed.
-    daemon.peers.relay_changed.notify_one();
+    if relay_changed {
+        daemon
+            .peers
+            .set_relays(&daemon.dir, &team.config, &team.roster.relay);
+    }
     Ok(())
 }
 

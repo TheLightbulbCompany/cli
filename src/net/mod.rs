@@ -206,6 +206,31 @@ impl Peers {
         )
     }
 
+    /// Makes `new` the list in effect at once (`relay.get`, tickets and dials read it; the
+    /// relay loop, poked, brings the endpoint after): `relay.set` and a roster install whose
+    /// team relay changed. Reads the cache only, never the network.
+    pub fn set_relays(
+        &self,
+        dir: &std::path::Path,
+        config: &crate::config::Config,
+        team: &Option<String>,
+    ) {
+        let new = relay::list(dir, config, team, &self.knobs().relay_keys, false);
+        self.store_relays(new);
+        self.relay_changed.notify_one();
+    }
+
+    /// Stores `new` (`relay::merge`d over the list in effect), logging a change; its URLs.
+    fn store_relays(&self, new: relay::List) -> Vec<String> {
+        let mut l = self.relays.lock().unwrap();
+        let new = relay::merge(&l, new);
+        if new != *l {
+            log_relays(&new);
+        }
+        *l = new;
+        l.urls.clone()
+    }
+
     /// The first relay in effect, for a ticket's `relay_hint` (`""` when none).
     pub fn relay_hint(&self) -> String {
         let l = self.relays.lock().unwrap();
@@ -432,6 +457,8 @@ impl Net {
         let d = &self.0.daemon;
         let mut tick = tokio::time::interval(RELAY_LOOK);
         let mut tried: Option<std::time::Instant> = None;
+        // What the endpoint has (`peers.relays` may be ahead of it: `set_relays`).
+        let mut applied = d.peers.relays.lock().unwrap().urls.clone();
         loop {
             tokio::select! {
                 _ = tick.tick() => {}
@@ -455,23 +482,22 @@ impl Net {
             if fetch && new.source != relay::Source::Config && new.source != relay::Source::Team {
                 tried = Some(std::time::Instant::now());
             }
-            let old = d.peers.relays.lock().unwrap().clone();
-            if old == new {
+            let urls = d.peers.store_relays(new);
+            if urls == applied {
                 continue;
             }
             let ep = &self.0.endpoint;
-            for u in old.urls.iter().filter(|u| !new.urls.contains(u)) {
+            for u in applied.iter().filter(|u| !urls.contains(u)) {
                 if let Ok(u) = u.parse::<RelayUrl>() {
                     ep.remove_relay(&u).await;
                 }
             }
-            for u in new.urls.iter().filter(|u| !old.urls.contains(u)) {
+            for u in urls.iter().filter(|u| !applied.contains(u)) {
                 if let Some(c) = relay_config(u) {
                     ep.insert_relay(c.url.clone(), Arc::new(c)).await;
                 }
             }
-            log_relays(&new);
-            *d.peers.relays.lock().unwrap() = new;
+            applied = urls;
         }
     }
 

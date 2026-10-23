@@ -612,15 +612,16 @@ pub fn leave() -> Result<i32> {
     Ok(0)
 }
 
-/// `relay [<url> | --clear]`: sets (or clears) this computer's relay, and from the founder or
-/// an admin the team's; alone, prints the relays in effect and where they come from.
-pub fn relay(url: Option<String>, clear: bool) -> Result<i32> {
+/// `relay [<url> | --clear] [--local]`: sets (or clears) this computer's relay, and from the
+/// founder or an admin the team's unless `local`; alone, prints the relays in effect and
+/// where they come from.
+pub fn relay(url: Option<String>, clear: bool, local: bool) -> Result<i32> {
     let mut conn = connect()?;
     if url.is_some() || clear {
         let url = url.unwrap_or_default();
-        let r = conn.call("relay.set", json!({ "url": url }))?;
+        let r = conn.call("relay.set", json!({ "url": url, "local": local }))?;
         if r["ok"] != true {
-            let texts = [("bad_request", format!("Not a relay URL: {url}"))];
+            let texts = [("bad_request", format!("Not an https relay URL: {url}"))];
             return refuse(&r, &texts, "relay");
         }
         let who = if r["team"] == true {
