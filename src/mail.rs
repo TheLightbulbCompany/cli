@@ -540,15 +540,17 @@ pub fn send(
 /// workspace member, `policy::cloud_inbound`): refused
 /// `policy`, or kept under a hold (`holds::hold`, `held`, in no mailbox), or stored for `to`
 /// with origin `net:<peer short>`, timed by its arrival (`now`). Held or stored, it is
-/// remembered in `seen_ids`.
+/// remembered in `seen_ids`. On a workspace member, `declared` are its sessions: new mail for
+/// any other is `policy` (after the resend checks, so a resend gets the state it has).
 pub fn receive(
     store: &Store,
     env: &Frame,
     peer: &Member,
     roster: &Roster,
     me: &str,
+    declared: Option<&[String]>,
     now: u64,
-) -> Result<(State, Option<String>, Option<crate::holds::Hold>)> {
+) -> Result<Received> {
     let Frame::Envelope {
         id,
         request_id,
@@ -565,7 +567,7 @@ pub fn receive(
     else {
         return Err("not an envelope".into());
     };
-    let refused = |r: &str| Ok((State::Refused, Some(r.to_string()), None));
+    let refused = |r: &str| Ok(Received::old(State::Refused, Some(r.to_string())));
     let address = |a: &str| sessions::qualify("", a).as_deref() == Some(a);
     let ulid = |a: &str| ulid::Ulid::from_string(a).is_ok();
     if !address(from) || sessions::member_of(from) != Some(peer.short.as_str()) {
@@ -590,7 +592,7 @@ pub fn receive(
         return refused("not_member");
     }
     if let Some((state, reason)) = store.seen_state(&peer.key, id)? {
-        return Ok((State::parse(&state)?, reason, None));
+        return Ok(Received::old(State::parse(&state)?, reason));
     }
     if let Some((old_to, old_body)) = store.sent_as(from, request_id)? {
         if old_to != *to || old_body != *body {
@@ -599,7 +601,10 @@ pub fn receive(
         // The same message under another envelope id: where it is now.
         let sender = Key(from.clone());
         let r = receipt(store, &sender, request_id)?.ok_or("message without a receipt")?;
-        return Ok((r.state, r.reason, None));
+        return Ok(Received::old(r.state, r.reason));
+    }
+    if declared.is_some_and(|d| !d.iter().any(|s| s == to)) {
+        return refused("policy");
     }
     // An answer to (or in the thread of) a message this computer sent is at least one hop
     // past it, whatever `hops` the peer claims; only a person (`/terminal`, fenced by the
@@ -655,7 +660,33 @@ pub fn receive(
     };
     store.put_seen(&peer.key, id, state.name(), now as i64)?;
     tx.commit()?;
-    Ok((state, None, held))
+    Ok(Received {
+        state,
+        reason: None,
+        held,
+        fresh: true,
+    })
+}
+
+/// What an envelope became (`receive`): its state, the refusal's reason, the hold it opened,
+/// and whether it is new mail (stored or held now), not a resend or a refusal.
+#[derive(Debug, PartialEq)]
+pub struct Received {
+    pub state: State,
+    pub reason: Option<String>,
+    pub held: Option<crate::holds::Hold>,
+    pub fresh: bool,
+}
+
+impl Received {
+    fn old(state: State, reason: Option<String>) -> Received {
+        Received {
+            state,
+            reason,
+            held: None,
+            fresh: false,
+        }
+    }
 }
 
 /// Whether `member`'s latest presence names `address` among its sessions, `known` or `kept`
@@ -1352,8 +1383,11 @@ mod tests {
         allow_p(&s);
         for (i, to) in ["m/terminal", "m/codex:c"].iter().enumerate() {
             let (peer, roster, env) = peer_mail(to, &format!("r{i}"));
-            let got = receive(&s, &env, &peer, &roster, "m", 1000).unwrap();
-            assert_eq!(got, (State::Stored, None, None));
+            let got = receive(&s, &env, &peer, &roster, "m", None, 1000).unwrap();
+            assert_eq!(
+                (got.state, got.reason, got.fresh),
+                (State::Stored, None, true)
+            );
         }
         let later = 1000 + 100 * HOLD_S;
         expire(&s, later).unwrap();
@@ -1366,8 +1400,11 @@ mod tests {
         let (_d, s) = setup();
         allow_p(&s);
         let (peer, roster, env) = peer_mail("m/codex:c", "r1");
-        let again = || receive(&s, &env, &peer, &roster, "m", 1001).unwrap();
-        receive(&s, &env, &peer, &roster, "m", 1000).unwrap();
+        let again = || {
+            let r = receive(&s, &env, &peer, &roster, "m", None, 1001).unwrap();
+            (r.state, r.reason, r.fresh)
+        };
+        receive(&s, &env, &peer, &roster, "m", None, 1000).unwrap();
         advance(
             s.conn(),
             "p/codex:a",
@@ -1377,12 +1414,12 @@ mod tests {
             1000,
         )
         .unwrap();
-        assert_eq!(again(), (State::Refused, Some("declined".into()), None));
+        assert_eq!(again(), (State::Refused, Some("declined".into()), false));
         // With its message and receipt rows gone, what the sender was told stands.
         s.conn()
             .execute_batch("DELETE FROM messages; DELETE FROM receipts; DELETE FROM mailbox;")
             .unwrap();
-        assert_eq!(again(), (State::Stored, None, None));
+        assert_eq!(again(), (State::Stored, None, false));
         assert_eq!(
             unread(&s, &k("m/codex:c"), 1001).unwrap(),
             0,

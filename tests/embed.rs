@@ -593,3 +593,48 @@ async fn one_message_event_per_message_and_none_for_an_undeclared_name() {
     );
     i.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dropped_instance_shuts_down_before_its_home_is_free() {
+    let home = tempfile::tempdir().unwrap();
+    let i = start(home.path(), &[], None).await;
+    let key = ok(&i, "identity.get", json!({})).await["member_key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let port = ok(&i, "status", json!({})).await["port"].as_u64().unwrap();
+    drop(i); // no shutdown: a panic or a cancelled future
+    let mut next = None;
+    for _ in 0..500 {
+        if let Ok(n) = try_start(home.path(), &[], None).await {
+            next = Some(n);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let next = next.expect("the home is free once the dropped instance is down");
+    // By then the old endpoint is gone: nothing answers at its address.
+    let pk = iroh::PublicKey::from_bytes(&key_bytes(&key).unwrap()).unwrap();
+    let old =
+        iroh::EndpointAddr::new(pk).with_ip_addr(format!("127.0.0.1:{port}").parse().unwrap());
+    let ep = endpoint(&identity()).await;
+    let dial = tokio::time::timeout(Duration::from_secs(2), ep.connect(old, ALPN)).await;
+    assert!(!matches!(dial, Ok(Ok(_))), "the old endpoint still answers");
+    // A snapshot path inside the home is refused at start, too.
+    next.shutdown().await;
+    let mut opts_err = None;
+    {
+        let _one = STARTING.lock().await;
+        let opts = EmbedOpts {
+            kind: MemberKind::Cloud,
+            relay: None,
+            issuer: "http://127.0.0.1:9/connect".into(),
+            snapshot: Some(home.path().join("final.db")),
+            name: NAME.into(),
+        };
+        if let Err(e) = embed::start(home.path(), opts).await {
+            opts_err = Some(e.to_string());
+        }
+    }
+    assert!(opts_err.is_some_and(|e| e.contains("snapshot")));
+}

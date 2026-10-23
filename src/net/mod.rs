@@ -507,6 +507,11 @@ impl Net {
         self.0.endpoint.close().await;
     }
 
+    /// Whether every task this endpoint started has ended (this handle is the last one).
+    pub fn idle(&self) -> bool {
+        Arc::strong_count(&self.0) == 1
+    }
+
     async fn accept_loop(self) {
         while let Some(incoming) = self.0.endpoint.accept().await {
             let net = self.clone();
@@ -825,14 +830,7 @@ impl Net {
 /// Member `key`'s envelope: checked and stored (`mail::receive`), answered with an `ack`.
 /// One whose `from` is not the member's own is dropped unanswered.
 fn receive(d: &Arc<Daemon>, key: &str, env: &Frame, tx: &mpsc::UnboundedSender<Frame>) {
-    let Frame::Envelope {
-        id,
-        to,
-        from,
-        request_id,
-        ..
-    } = env
-    else {
+    let Frame::Envelope { id, to, .. } = env else {
         return;
     };
     let team = d.team.lock().unwrap();
@@ -847,27 +845,29 @@ fn receive(d: &Arc<Daemon>, key: &str, env: &Frame, tx: &mpsc::UnboundedSender<F
             reason,
         });
     };
-    // An instance's sessions are the ones it declared: mail for any other is refused as for a
-    // session no presence advertises.
-    if let Some(c) = &d.cloud {
-        if !c
-            .sessions
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|s| s.session_id == *to)
-        {
-            eprintln!("net: envelope {id} from {short}: refused (undeclared)");
-            return ack(State::Refused, Some("policy".into()));
-        }
-    }
+    // An instance's sessions are the ones it declared: new mail for any other is refused.
+    let declared: Option<Vec<String>> = d.cloud.as_ref().map(|c| {
+        let s = c.sessions.lock().unwrap();
+        s.iter().map(|s| s.session_id.clone()).collect()
+    });
     let store = d.store.lock().unwrap();
     let me = &d.identity.short;
-    // The checks `mail::receive` makes first for a resend: a resend is not new mail.
-    let fresh = matches!(store.seen_state(&peer.key, id), Ok(None))
-        && matches!(store.sent_as(from, request_id), Ok(None));
-    match mail::receive(&store, env, peer, &team.roster, me, ipc::now()) {
-        Ok((state, reason, held)) => {
+    let now = ipc::now();
+    match mail::receive(
+        &store,
+        env,
+        peer,
+        &team.roster,
+        me,
+        declared.as_deref(),
+        now,
+    ) {
+        Ok(mail::Received {
+            state,
+            reason,
+            held,
+            fresh,
+        }) => {
             if let Some(h) = held {
                 holds::shown(d, &team.roster, &store, &h);
             }

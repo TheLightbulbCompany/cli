@@ -31,13 +31,14 @@ pub struct EmbedOpts {
     pub name: String,
 }
 
-/// A running instance. Dropping it without `shutdown` leaves its endpoint up.
+/// A running instance. Dropping it without `shutdown` closes its endpoint all the same (no
+/// final snapshot); its home is free once the last of its tasks ends.
 pub struct Instance {
     daemon: Arc<Daemon>,
     net: net::Net,
     snapshot: Option<PathBuf>,
-    /// `home`'s `daemon.lock`: a second start on one home fails.
-    _lock: std::fs::File,
+    /// Set by `shutdown`: nothing is left for `drop` to close.
+    closed: bool,
 }
 
 /// Starts the instance whose state is `home` (made 0700 if missing): the daemon's roster,
@@ -49,6 +50,13 @@ pub async fn start(home: &Path, opts: EmbedOpts) -> Result<Instance> {
     }
     std::fs::create_dir_all(home)?;
     std::fs::set_permissions(home, std::fs::Permissions::from_mode(0o700))?;
+    if let Some(p) = &opts.snapshot {
+        if !p.to_str().is_some_and(|s| net_ops::outside(home, s)) {
+            return Err(
+                "the snapshot path must be absolute and outside the instance's home".into(),
+            );
+        }
+    }
     let lock = crate::daemon::lock_dir(home, false)?;
     let config = Config {
         issuer: opts.issuer,
@@ -56,24 +64,25 @@ pub async fn start(home: &Path, opts: EmbedOpts) -> Result<Instance> {
         lan: false,
         ..Config::load(home)?
     };
-    let (daemon, net) = boot(home, config, Some(opts.name)).await?;
+    let (daemon, net) = boot(home, config, Some((opts.name, lock))).await?;
     Ok(Instance {
         daemon,
         net,
         snapshot: opts.snapshot,
-        _lock: lock,
+        closed: false,
     })
 }
 
 /// The start path the daemon and an instance share, under `dir`'s lock (the caller's):
 /// identity, store, the solo genesis on first start, the team, the transport and the presence
-/// sender. A `cloud` instance (its workspace's name) has no dialogs and declares its sessions;
-/// a computer's are its agents' (`claude_home`).
+/// sender. A `cloud` instance (its workspace's name, and the home lock it keeps) has no
+/// dialogs and declares its sessions; a computer's are its agents' (`claude_home`).
 pub(crate) async fn boot(
     dir: &Path,
     config: Config,
-    cloud: Option<String>,
+    cloud: Option<(String, std::fs::File)>,
 ) -> Result<(Arc<Daemon>, net::Net)> {
+    let (cloud, home_lock) = cloud.unzip();
     let identity = Identity::load_or_create(dir)?;
     let store = Store::open(&dir.join("state.db"))?;
     let now = ipc::now() as i64;
@@ -130,6 +139,7 @@ pub(crate) async fn boot(
             name,
             sessions: Mutex::default(),
         }),
+        home_lock,
     });
     // No join connection outlives a restart: its open requests are over.
     daemon.store.lock().unwrap().expire_joins(i64::MAX, now)?;
@@ -172,14 +182,37 @@ impl Instance {
         self.daemon.events.subscribe()
     }
 
-    /// Closes the endpoint (the instance's tasks end with it), then leaves the final snapshot.
-    pub async fn shutdown(self) {
+    /// Closes the endpoint and waits (up to 5 s) for the instance's tasks to end with it, then
+    /// leaves the final snapshot. The home is free when this returns, unless a task outlived
+    /// the wait.
+    pub async fn shutdown(mut self) {
+        self.closed = true;
         let _ = self.daemon.events.send(json!({ "event": "shutdown" }));
         self.net.close().await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        // Ours and the endpoint's hold the daemon; any other is a task still running.
+        let running = |i: &Instance| !i.net.idle() || Arc::strong_count(&i.daemon) > 2;
+        while running(&self) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         if let Some(p) = &self.snapshot {
             if let Err(e) = self.daemon.store.lock().unwrap().snapshot(p) {
                 eprintln!("snapshot: {e}");
             }
+        }
+    }
+}
+
+/// A dropped instance (a panic, a cancelled future) shuts down too: its endpoint is closed in
+/// the background, and its tasks, which hold the daemon and so the home lock, end with it.
+impl Drop for Instance {
+    fn drop(&mut self) {
+        if self.closed {
+            return;
+        }
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            let net = self.net.clone();
+            rt.spawn(async move { net.close().await });
         }
     }
 }

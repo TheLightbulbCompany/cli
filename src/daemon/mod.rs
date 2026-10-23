@@ -67,6 +67,10 @@ pub struct Daemon {
     pub streams: crate::streams::Streams,
     /// What an embedded (cloud) instance is; `None` on a computer.
     pub cloud: Option<Cloud>,
+    /// An instance's `daemon.lock` (`lock_dir`): released only when the last task holding the
+    /// daemon ends, so no second engine starts on this home while one still runs. The socket
+    /// daemon holds its own across `run`.
+    pub home_lock: Option<File>,
 }
 
 /// An embedded instance: a Lightbulb workspace's member.

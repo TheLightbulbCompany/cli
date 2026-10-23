@@ -367,7 +367,7 @@ pub(crate) fn solo_genesis(me: &Identity, cloud: Option<&str>, computer: &str, a
 
 /// Whether `path` is absolute and names nothing in (or of) state dir `dir`: a snapshot never
 /// lands on the live database.
-fn outside(dir: &std::path::Path, path: &str) -> bool {
+pub(crate) fn outside(dir: &std::path::Path, path: &str) -> bool {
     let p = std::path::Path::new(path);
     let canon = |q: &std::path::Path| std::fs::canonicalize(q).ok();
     let (Some(dir), Some(parent)) = (canon(dir), p.parent().and_then(canon)) else {
