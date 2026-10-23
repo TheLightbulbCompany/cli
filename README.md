@@ -15,6 +15,13 @@ wires Claude Code, Codex, Cursor and Grok CLI (hooks and a tool server), and sta
 Run the same line again to upgrade. Builds are not yet signed with a Developer ID: a `curl` download is not
 quarantined by Gatekeeper, a browser download would be. `lightbulb-connect setup --remove` takes everything out.
 
+Or with Homebrew (then run the setup yourself):
+
+```sh
+brew install thelightbulbcompany/tap/lightbulb-connect
+lightbulb-connect setup
+```
+
 ## Quick start: you and a teammate in five minutes
 
 Both of you run the install line above. Then, on your Mac:
