@@ -8,7 +8,7 @@
 
 mod common;
 
-use common::{admit, call, endpoint, now_s, person, person_proof, until, Env, Peer};
+use common::{admit, call, count, endpoint, now_s, person, person_proof, played, until, Env, Peer};
 use lightbulb_connect::admission;
 use lightbulb_connect::embed::Instance;
 use lightbulb_connect::identity::Identity;
@@ -30,15 +30,6 @@ struct World {
     c: Identity,
     w1: tempfile::TempDir,
     w2: tempfile::TempDir,
-}
-
-/// `who` played by the test, connected to `env`'s daemon.
-async fn played(who: &Identity, env: &Env) -> (Peer, iroh::Endpoint) {
-    let ep = endpoint(who).await;
-    let mut p = Peer::dial(&ep, env).await;
-    p.hello(vec![]).await;
-    p.presence().await;
-    (p, ep)
 }
 
 /// The world, holder B signed into `holder_ws` (`None`: a free user).
@@ -307,11 +298,6 @@ async fn event(rx: &mut Receiver<Value>, name: &str) -> Value {
     })
     .await
     .unwrap_or_else(|_| panic!("a {name} event"))
-}
-
-fn count(db: &std::path::Path, sql: &str) -> i64 {
-    let c = rusqlite::Connection::open(db).unwrap();
-    c.query_row(sql, [], |r| r.get(0)).unwrap()
 }
 
 fn people(e: &Env) -> Value {

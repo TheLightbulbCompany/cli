@@ -8,7 +8,7 @@
 
 mod common;
 
-use common::{admit, call, endpoint, identity, now_s, online, person_proof, until, Env, Peer};
+use common::{admit, call, count, identity, now_s, online, person_proof, played, until, Env, Peer};
 use lightbulb_connect::embed::Instance;
 use lightbulb_connect::identity::Identity;
 use lightbulb_connect::net::frames::{self, Frame};
@@ -19,7 +19,6 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::path::Path;
 use std::time::{Duration, Instant};
 
 const NAME: &str = "The Lightbulb Company";
@@ -148,11 +147,6 @@ fn send_body(app: &str, to: &str, rid: &str) -> Value {
         "request_id": rid})
 }
 
-fn count(db: &Path, sql: &str) -> i64 {
-    let c = rusqlite::Connection::open(db).unwrap();
-    c.query_row(sql, [], |r| r.get(0)).unwrap()
-}
-
 fn db(e: &Env) -> std::path::PathBuf {
     e.state.path().join("state.db")
 }
@@ -215,15 +209,6 @@ async fn app_answer(p: &mut Peer) -> Option<(String, Option<String>, Value)> {
         } => Some((kind, reply_to, serde_json::from_str(&body).unwrap())),
         _ => unreachable!(),
     }
-}
-
-/// `who` played by the test, connected to `env`'s daemon.
-async fn played(who: &Identity, env: &Env) -> (Peer, iroh::Endpoint) {
-    let ep = endpoint(who).await;
-    let mut p = Peer::dial(&ep, env).await;
-    p.hello(vec![]).await;
-    p.presence().await;
-    (p, ep)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

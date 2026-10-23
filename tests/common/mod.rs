@@ -577,3 +577,18 @@ pub fn sees(env: &Env, session_id: &str) -> bool {
         .flatten()
         .any(|s| s["session_id"] == session_id)
 }
+
+/// A member `who` played by the test, dialed in: `hello`, then `presence`.
+pub async fn played(who: &Identity, env: &Env) -> (Peer, Endpoint) {
+    let ep = endpoint(who).await;
+    let mut p = Peer::dial(&ep, env).await;
+    p.hello(vec![]).await;
+    p.presence().await;
+    (p, ep)
+}
+
+/// The one number `sql` selects from the database at `db`.
+pub fn count(db: &std::path::Path, sql: &str) -> i64 {
+    let c = rusqlite::Connection::open(db).unwrap();
+    c.query_row(sql, [], |r| r.get(0)).unwrap()
+}

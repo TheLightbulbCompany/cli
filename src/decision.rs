@@ -229,7 +229,7 @@ fn on_notice(d: &Daemon, cloud: &Cloud, key: &str, f: &Frame, tx: &crate::net::T
     let ours = {
         let team = d.team.lock().unwrap();
         let r = &team.roster;
-        r.workspace_computer(&d.identity.key, key, &person)
+        crate::policy::workspace_computer(r, &d.identity.key, key, &person)
             .is_some_and(|m| m.computer == computer)
     };
     if !ours {
@@ -495,9 +495,8 @@ pub(crate) fn op(id: u64, body: &Value, d: &Daemon) -> Response {
     };
     let words = hold_no(hold_id).is_some() && verdict(v).is_some() && RELAYED.contains(&scope);
     let team = d.team.lock().unwrap();
-    let theirs = (team.roster)
-        .workspace_computer(&d.identity.key, holding, by)
-        .is_some();
+    let theirs =
+        crate::policy::workspace_computer(&team.roster, &d.identity.key, holding, by).is_some();
     if !(words && theirs) {
         return Response::err(id, BAD_REQUEST);
     }

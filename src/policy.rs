@@ -94,6 +94,18 @@ pub fn my_workspace(roster: &Roster, me: &str, from: &str, for_person: Option<&s
     })
 }
 
+/// The inverse, as an instance asks it of a holder: member `key`, if it is a computer of person
+/// `person` whose own workspace's member is me (`my_workspace` from its side).
+pub fn workspace_computer<'a>(
+    roster: &'a Roster,
+    me: &str,
+    key: &str,
+    person: &str,
+) -> Option<&'a Member> {
+    (roster.members.get(key))
+        .filter(|m| m.kind == MemberKind::Computer && my_workspace(roster, key, me, Some(person)))
+}
+
 /// `from`'s row, by its kind: my workspace's member is the switch, another cloud member
 /// `cloud_of[pid]`, a computer `people[pid]`.
 fn row<'a>(roster: &Roster, me: &str, from: &'a Member) -> (&'static str, &'a str) {
