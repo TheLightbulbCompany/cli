@@ -399,9 +399,10 @@ fn a_discovered_claude_session_keeps_its_hooks_folder() {
     until(15, "B no longer sees it", || !sees(&b, &key));
 }
 
-/// A Claude session first registered under an off folder has no row; Claude's own file names
-/// the folder through a symlink. Its discovery stays hidden (title too) until a register finds
-/// the folder shown again.
+/// A Claude session teammates already see by discovery (Claude's own file names its folder
+/// through a symlink) is refused by its first register once that folder is off: it has no row,
+/// and its mark takes it (title too) from teammates at once, while this computer still lists
+/// it. A register after the folder is shown again brings it back.
 #[test]
 fn a_session_refused_under_an_off_folder_is_not_discovered_either() {
     let (a, b) = common::pair(&[]);
@@ -420,7 +421,6 @@ fn a_session_refused_under_an_off_folder_is_not_discovered_either() {
         std::fs::write(a.state.path().join("config.toml"), format!("{base}{extra}")).unwrap();
         assert_eq!(a.ask(json!({"id": 1, "op": "reload"}))["ok"], true);
     };
-    set(true);
     let me = std::process::id();
     let birth = os::process(me).unwrap().birth_micros;
     let claude = a.home.path().join(".claude/sessions");
@@ -433,25 +433,27 @@ fn a_session_refused_under_an_off_folder_is_not_discovered_either() {
         .to_string(),
     )
     .unwrap();
+    let key = format!("{}/claude:s2", a.short());
+    until(15, "B sees the discovery", || sees(&b, &key));
+    set(true);
+    // The reload's own presence goes out first; the folder alone does not hide the discovery
+    // (its cwd names the folder through the link).
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    assert!(sees(&b, &key));
     let resolved = lightbulb_connect::presence::resolved(&raw);
     let r = register(&a, "claude", "s2", resolved.to_str().unwrap());
     assert_eq!(r["ignored"], true, "{r}");
-    let key = r["key"].as_str().unwrap().to_string();
-    // A presence goes out at least every 5 s: two rounds, and nothing of it.
-    let start = std::time::Instant::now();
-    while start.elapsed() < std::time::Duration::from_secs(11) {
+    // At once (the register wakes the sender: under 2 s), not at a later 5 s tick or a restart.
+    until(2, "B no longer sees it", || {
         let d = b.ask(json!({"id": 1, "op": "directory"})).to_string();
-        assert!(!d.contains(&key) && !d.contains("secret plan"), "{d}");
-        std::thread::sleep(std::time::Duration::from_millis(200));
-    }
-    assert!(!a
-        .ask(json!({"id": 1, "op": "sessions"}))
-        .to_string()
-        .contains(&key));
+        !d.contains(&key) && !d.contains("secret plan")
+    });
+    let mine = a.ask(json!({"id": 1, "op": "sessions"})).to_string();
+    assert!(mine.contains(&key), "this computer still lists it: {mine}");
     set(false);
     assert_eq!(
         register(&a, "claude", "s2", resolved.to_str().unwrap())["ok"],
         true
     );
-    until(15, "B sees it again", || sees(&b, &key));
+    until(2, "B sees it again", || sees(&b, &key));
 }

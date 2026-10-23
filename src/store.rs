@@ -82,7 +82,7 @@ const V6: &str = "
 ALTER TABLE sessions ADD COLUMN repo TEXT;
 ALTER TABLE sessions ADD COLUMN branch TEXT;
 ALTER TABLE sessions ADD COLUMN handle TEXT;
-CREATE TABLE IF NOT EXISTS hidden_sessions (key TEXT PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS hidden_sessions (key TEXT PRIMARY KEY, updated_at INTEGER);
 CREATE INDEX IF NOT EXISTS messages_to_sent ON messages (to_key, sent_at);
 ";
 
@@ -219,15 +219,28 @@ impl Store {
         Ok(())
     }
 
-    /// Marks `key` as registered under a hidden folder (`hidden`), or no longer.
-    pub fn set_hidden(&self, key: &str, hidden: bool) -> rusqlite::Result<()> {
-        let sql = if hidden {
-            "INSERT OR IGNORE INTO hidden_sessions VALUES (?1)"
+    /// Marks `key` as registered under a hidden folder at `now` (`hidden`), or no longer;
+    /// whether the mark changed. A mark not renewed for a day goes with `ended_since`'s purge.
+    pub fn set_hidden(&self, key: &str, hidden: bool, now: i64) -> rusqlite::Result<bool> {
+        let was = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM hidden_sessions WHERE key = ?1",
+                [key],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if hidden {
+            self.conn.execute(
+                "INSERT OR REPLACE INTO hidden_sessions VALUES (?1, ?2)",
+                params![key, now],
+            )?;
         } else {
-            "DELETE FROM hidden_sessions WHERE key = ?1"
-        };
-        self.conn.execute(sql, [key])?;
-        Ok(())
+            self.conn
+                .execute("DELETE FROM hidden_sessions WHERE key = ?1", [key])?;
+        }
+        Ok(was != hidden)
     }
 
     /// The keys `set_hidden` marked.
@@ -273,10 +286,13 @@ impl Store {
         )? > 0)
     }
 
-    /// The rows that ended at `since` or later, `(key, ended_at, cwd)`; deletes older ends.
+    /// The rows that ended at `since` or later, `(key, ended_at, cwd)`; deletes older ends and
+    /// hidden marks last renewed before `since`.
     pub fn ended_since(&self, since: i64) -> rusqlite::Result<Vec<(String, i64, String)>> {
         self.conn
             .execute("DELETE FROM sessions WHERE ended_at < ?1", [since])?;
+        self.conn
+            .execute("DELETE FROM hidden_sessions WHERE updated_at < ?1", [since])?;
         let mut stmt = self
             .conn
             .prepare("SELECT key, ended_at, cwd FROM sessions WHERE ended_at IS NOT NULL")?;
@@ -882,6 +898,19 @@ mod tests {
         store.put_session(&row("e", "codex")).unwrap();
         let e = store.session("e").unwrap().unwrap();
         assert_eq!(e.handle.as_deref(), Some("codex-4"));
+    }
+
+    #[test]
+    fn a_hidden_mark_says_when_it_changed_and_goes_a_day_after_its_last_renewal() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("state.db")).unwrap();
+        assert!(store.set_hidden("k", true, 10).unwrap());
+        assert!(!store.set_hidden("k", true, 20).unwrap());
+        store.ended_since(20).unwrap();
+        assert!(store.hidden_keys().unwrap().contains("k"));
+        store.ended_since(21).unwrap();
+        assert!(store.hidden_keys().unwrap().is_empty());
+        assert!(!store.set_hidden("k", false, 30).unwrap());
     }
 
     #[test]

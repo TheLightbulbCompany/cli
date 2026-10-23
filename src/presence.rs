@@ -165,7 +165,13 @@ fn build(d: &Daemon, seq: u64) -> Frame {
         .filter(|(k, _, cwd)| k.starts_with(&mine) && publishable(cwd))
         .collect();
     candidates.sort_by_key(|(_, at, _)| std::cmp::Reverse(*at));
-    live.retain(|s| publishable(&s.cwd));
+    // A session whose register a hidden folder refused has no row, but Claude's own file may
+    // still name it (its folder spelled another way): its mark keeps that discovery from
+    // teammates too. The mark is cleared only by its next register, so after `folder on` it
+    // stays hidden until its next hook event; and a discovery that never registered is
+    // matched by Claude's cwd as given.
+    let marked = d.store.lock().unwrap().hidden_keys().unwrap_or_default();
+    live.retain(|s| publishable(&s.cwd) && !marked.contains(&s.key.0));
     live.sort_by_key(|s| std::cmp::Reverse(s.birth_micros));
     live.truncate(MAX);
     let live_keys: HashSet<&str> = live.iter().map(|s| s.key.0.as_str()).collect();

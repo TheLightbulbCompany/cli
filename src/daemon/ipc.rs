@@ -385,8 +385,11 @@ fn register(id: u64, body: &Value, daemon: &Daemon) -> Response {
     // folder another way) is left out too, until a register finds it shown again.
     let hidden = presence::hidden(&daemon.team.lock().unwrap().off, &r.cwd);
     let mut store = daemon.store.lock().unwrap();
-    if store.set_hidden(&key.0, hidden).is_err() {
-        return Response::err(id, INTERNAL);
+    match store.set_hidden(&key.0, hidden, now() as i64) {
+        // Its teammates learn at once (a discovery of it may be on their screens).
+        Ok(true) => daemon.presence.notify_one(),
+        Ok(false) => {}
+        Err(_) => return Response::err(id, INTERNAL),
     }
     if hidden {
         return Response::ok(id, json!({ "key": key, "ignored": true }));
@@ -471,14 +474,8 @@ fn put_row(daemon: &Daemon, store: &store::Store, row: &store::Session) -> crate
 /// Registered and discovered sessions, `gone` ones left out (their rows stay until `end`).
 /// A session whose last push failed reads `next_step`: its mail waits for the next step.
 pub(crate) fn live_sessions(daemon: &Daemon) -> Vec<sessions::Session> {
-    let (rows, hidden) = {
-        let store = daemon.store.lock().unwrap();
-        let hidden = store.hidden_keys().unwrap_or_default();
-        (store.sessions().unwrap_or_default(), hidden)
-    };
+    let rows = daemon.store.lock().unwrap().sessions().unwrap_or_default();
     let mut all = sessions::all(&rows, &daemon.claude_home, &daemon.identity.short);
-    // Registered under a hidden folder: not even its discovery is shown.
-    all.retain(|s| !hidden.contains(&s.key.0));
     let failed = daemon.push_failed.lock().unwrap();
     for s in &mut all {
         if s.tier == sessions::Tier::Push && failed.contains(&s.key.0) {
