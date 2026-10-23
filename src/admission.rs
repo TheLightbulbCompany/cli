@@ -865,8 +865,8 @@ pub async fn join(id: u64, body: &Value, d: &Arc<Daemon>) -> Response {
     };
     {
         let team = d.team.lock().unwrap();
-        let keep = |k: &str| k == t.inviter || team.roster.members.contains_key(k);
-        d.peers.learn(&d.dir, &t.inviter, inviter_addrs, keep);
+        d.peers
+            .learn(&d.dir, &t.inviter, inviter_addrs, &team.roster);
     }
     for m in t.members.iter().filter(|m| *m != me) {
         let Some(mut addr) = d.peers.addr(m) else {

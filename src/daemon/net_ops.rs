@@ -447,27 +447,7 @@ pub fn install(
     sync_team_row(store, &team.roster, &new)?;
     let me = daemon.identity.key.as_str();
     // A removal of this computer, signed by an admin, that this install brings.
-    let removed = (team.roster.team_id == new.team_id
-        && team.roster.members.contains_key(me)
-        && !new.members.contains_key(me))
-    .then(|| {
-        new.log()
-            .iter()
-            .find(|(h, e)| {
-                e.kind == Kind::Remove && !team.roster.knows(h) && e.body["member"] == me
-            })
-            .map(|(_, e)| (e.signer.clone(), e.at))
-    })
-    .flatten()
-    .map(|(signer, at)| {
-        let by = team.roster.members.get(&signer).map(|m| m.name.clone());
-        let notice = Removed {
-            team: team.roster.team_name.clone(),
-            by: by.unwrap_or_else(|| signer[..12.min(signer.len())].to_string()),
-            at,
-        };
-        (notice, team.roster.created_at)
-    });
+    let removed = removal_notice(&team.roster, &new, me);
     if !new.is_solo(me) {
         let _ = std::fs::remove_file(daemon.dir.join(REMOVED));
     }
@@ -521,6 +501,30 @@ pub struct Removed {
     pub team: String,
     pub by: String,
     pub at: i64,
+}
+
+/// The kept `Removed` notice, while this computer is on its own network after a removal.
+pub fn removed_notice(daemon: &Daemon) -> Option<Removed> {
+    serde_json::from_slice(&std::fs::read(daemon.dir.join(REMOVED)).ok()?).ok()
+}
+
+/// The notice for a removal of `me` that going from `old` to `new` brings (a `remove` of it
+/// signed in this team, not known before), with `old`'s root time.
+fn removal_notice(old: &Roster, new: &Roster, me: &str) -> Option<(Removed, i64)> {
+    if old.team_id != new.team_id || !old.members.contains_key(me) || new.members.contains_key(me) {
+        return None;
+    }
+    let (_, e) = new
+        .log()
+        .iter()
+        .find(|(h, e)| e.kind == Kind::Remove && !old.knows(h) && e.body["member"] == me)?;
+    let by = old.members.get(&e.signer).map(|m| m.name.clone());
+    let notice = Removed {
+        team: old.team_name.clone(),
+        by: by.unwrap_or_else(|| crate::net::short(&e.signer).to_string()),
+        at: e.at,
+    };
+    Some((notice, old.created_at))
 }
 
 /// This computer was removed (`install` saw the entry): mail still queued for the team is
@@ -876,9 +880,4 @@ mod tests {
         println!("{}", sleep.id());
         sleep.wait().unwrap();
     }
-}
-
-/// The kept `Removed` notice, while this computer is on its own network after a removal.
-pub fn removed_notice(daemon: &Daemon) -> Option<Removed> {
-    serde_json::from_slice(&std::fs::read(daemon.dir.join(REMOVED)).ok()?).ok()
 }

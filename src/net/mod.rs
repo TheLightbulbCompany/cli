@@ -236,8 +236,8 @@ impl Peers {
     /// effect (iroh tries them all, and upgrades to a direct path where it can).
     pub fn addr(&self, key: &str) -> Option<EndpointAddr> {
         let id = PublicKey::from_bytes(&identity::key_bytes(key)?).ok()?;
-        let here = self.lan.get() == Some(&true);
-        let here = here.then(|| local::addr(key)).flatten();
+        let lan_on = self.lan.get() == Some(&true);
+        let here = lan_on.then(|| local::addr(key)).flatten();
         let known = self.known.lock().unwrap().get(key).cloned();
         let addrs = self.knobs().peers.get(key).into_iter().flatten().copied();
         let a = addrs
@@ -304,36 +304,30 @@ impl Peers {
         (self.relay_hint(), self.own_addrs())
     }
 
-    /// Member `key` told its direct addresses `addrs` (already checked, `parse_addrs`):
-    /// kept for its dials, and in `dir`'s `ADDRS` when they changed. Only the keys `keep`
-    /// names stay (the roster's members, and a join's inviter), so the file has no stale ones.
-    pub fn learn(
-        &self,
-        dir: &std::path::Path,
-        key: &str,
-        addrs: Vec<SocketAddr>,
-        keep: impl Fn(&str) -> bool,
-    ) {
+    /// `key` told its direct addresses `addrs` (already checked, `parse_addrs`): kept for its
+    /// dials, and in `dir`'s `ADDRS` when they changed. The one rule for what is kept: the
+    /// members of `roster` and `key` itself (a join's inviter is not a member yet), so the
+    /// file holds no stale keys after its next save.
+    pub fn learn(&self, dir: &std::path::Path, key: &str, addrs: Vec<SocketAddr>, roster: &Roster) {
         let mut known = self.known.lock().unwrap();
         if addrs.is_empty() || known.get(key) == Some(&addrs) {
             return;
         }
-        known.retain(|k, _| keep(k));
+        known.retain(|k, _| roster.members.contains_key(k));
         known.insert(key.to_string(), addrs);
         if let Ok(b) = serde_json::to_vec(&*known) {
             let _ = std::fs::write(dir.join(ADDRS), b);
         }
     }
 
-    /// Loads `ADDRS` from `dir`, keeping the entries of `members` that still check.
-    fn load_known(&self, dir: &std::path::Path, members: &Roster) {
+    /// Loads `ADDRS` from `dir` (as `learn` last saved it), keeping the entries that check.
+    fn load_known(&self, dir: &std::path::Path) {
         let read: HashMap<String, Vec<String>> = std::fs::read(dir.join(ADDRS))
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
         let ok = read
             .into_iter()
-            .filter(|(k, _)| members.members.contains_key(k))
             .filter_map(|(k, v)| Some((k, parse_addrs(&v)?)));
         *self.known.lock().unwrap() = ok.collect();
     }
@@ -520,9 +514,7 @@ impl Net {
     /// mDNS when `config.lan`) and starts accepting, dialing every active member, and keeping
     /// the relay list.
     pub async fn start(daemon: Arc<Daemon>) -> Result<Net> {
-        daemon
-            .peers
-            .load_known(&daemon.dir, &daemon.team.lock().unwrap().roster);
+        daemon.peers.load_known(&daemon.dir);
         let state = relay::State::load(&daemon.dir, &daemon.peers.knobs().relay_keys);
         *daemon.peers.relay_state.lock().unwrap() = state;
         let lan = {
@@ -750,13 +742,13 @@ impl Net {
         if changed {
             // Peers with equal heads share one delta.
             let mut memo = HashMap::new();
-            let protocol = d.peers.knobs().protocol;
+            let (protocol, addrs) = (d.peers.knobs().protocol, d.peers.own_addrs());
             for l in live.values_mut() {
                 let Protocol::Ok(heads) = &l.protocol else {
                     continue;
                 };
                 push_delta(&l.tx, r, heads, &mut memo, true);
-                let _ = l.tx.send((hello(r, protocol, d.peers.own_addrs()), None));
+                let _ = l.tx.send((hello(r, protocol, addrs.clone()), None));
                 // After the push the peer holds all of ours: the next change sends only itself.
                 l.protocol = Protocol::Ok(r.heads.clone());
             }
@@ -915,9 +907,7 @@ impl Net {
         {
             // A hint: bad ones are dropped, the hello is served.
             let addrs = parse_addrs(&addrs).unwrap_or_default();
-            let r = &team.roster;
-            d.peers
-                .learn(&d.dir, key, addrs, |k| r.members.contains_key(k));
+            d.peers.learn(&d.dir, key, addrs, &team.roster);
             // ponytail: a hello costs O(log) under `team`, and a member may send them back to
             // back; rate-limit per connection if one does.
             if p != d.peers.knobs().protocol {
@@ -1196,11 +1186,17 @@ async fn tell_removed(conn: Connection, r: Roster, key: String) {
         for f in removal_pages(&r, &key, &heads) {
             frames::write(&mut send, &f).await.ok()?;
         }
-        tokio::time::timeout(Duration::from_secs(3), conn.closed())
-            .await
-            .ok()
+        Some(())
     };
-    told.await;
+    if told.await.is_some() {
+        close_after_grace(&conn).await;
+    }
+    conn.close(VarInt::from_u32(NOT_MEMBER), b"not a member");
+}
+
+/// Waits up to 3 s for a told ex-member to close, then closes it as not a member.
+async fn close_after_grace(conn: &Connection) {
+    let _ = tokio::time::timeout(Duration::from_secs(3), conn.closed()).await;
     conn.close(VarInt::from_u32(NOT_MEMBER), b"not a member");
 }
 
@@ -1236,10 +1232,9 @@ async fn tell_then_close(conn: Connection, tx: Tx, told: Vec<Frame>) {
     }
     if let Some(w) = last {
         let _ = tokio::time::timeout(Duration::from_secs(1), w).await;
-        let _ = tokio::time::timeout(Duration::from_secs(3), conn.closed()).await;
     }
+    close_after_grace(&conn).await;
     drop(tx);
-    conn.close(VarInt::from_u32(NOT_MEMBER), b"not a member");
 }
 
 /// Queues on `tx` the `roster` pages of what `heads` lacks (`memo` keeps them by heads); with
@@ -1381,10 +1376,14 @@ mod local {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     use std::path::PathBuf;
 
-    /// `/tmp/lightbulb-connect-<uid>`, if it is ours (a directory, not a link, mode 0700);
-    /// one log line the first time it is not.
+    /// `/tmp/lightbulb-connect-<uid>`, if it is ours (a directory, not a link, mode 0700),
+    /// kept once it was; one log line the first time it is not.
     fn dir() -> Option<PathBuf> {
+        static OURS: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
         static WARNED: std::sync::Once = std::sync::Once::new();
+        if let Some(d) = OURS.get() {
+            return Some(d.clone());
+        }
         let uid = unsafe { libc::getuid() };
         let d = PathBuf::from(format!("/tmp/lightbulb-connect-{uid}"));
         let _ = std::fs::DirBuilder::new().mode(0o700).create(&d);
@@ -1398,7 +1397,7 @@ mod local {
                 )
             });
         }
-        ok.then_some(d)
+        ok.then(|| OURS.get_or_init(|| d).clone())
     }
 
     /// `127.0.0.1:<port> <pid>`, mode 0600.
@@ -1429,10 +1428,8 @@ mod local {
     pub fn addr(key: &str) -> Option<SocketAddr> {
         let s = std::fs::read_to_string(dir()?.join(key)).ok()?;
         let (addr, pid) = s.split_once(' ')?;
-        let pid: libc::pid_t = pid.trim().parse().ok()?;
-        // SAFETY: signal 0 only checks that the process exists.
-        let alive = unsafe { libc::kill(pid, 0) } == 0
-            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
-        alive.then(|| addr.parse().ok()).flatten()
+        let pid: u32 = pid.trim().parse().ok()?;
+        crate::os::process(pid).ok()?;
+        addr.parse().ok()
     }
 }

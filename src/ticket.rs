@@ -145,7 +145,7 @@ pub fn signed_by_inviter(t: &Ticket) -> bool {
 /// roster that its inviter signed, in its mode and with its secret (hashed for a once link).
 pub fn verify(t: &Ticket, roster: &Roster) -> Result<()> {
     let link = roster.links.get(&t.ticket_id);
-    let ok = identity::verify(&t.inviter, &value(t), &t.sig)
+    let ok = signed_by_inviter(t)
         && t.team_id == roster.team_id
         && link.is_some_and(|l| {
             let secret = if l.once {

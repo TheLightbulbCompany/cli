@@ -216,6 +216,12 @@ pub async fn deliver(daemon: Arc<Daemon>, to: Key) {
     }
 }
 
+/// `dir`'s lock file (`lock_dir`). Whether an engine runs is whether this file is locked,
+/// never the pid in it: the pid stays after an exit and may name any process by now.
+pub(crate) fn lock_path(dir: &Path) -> PathBuf {
+    dir.join("daemon.lock")
+}
+
 /// `dir`'s `daemon.lock`, held (and our pid written in it) until the file drops: one engine,
 /// daemon or embedded instance, per state dir. With `wait` it blocks until the holder is gone;
 /// without, it fails at once.
@@ -225,7 +231,7 @@ pub(crate) fn lock_dir(dir: &Path, wait: bool) -> Result<File> {
         .write(true)
         .create(true)
         .truncate(false)
-        .open(dir.join("daemon.lock"))?;
+        .open(lock_path(dir))?;
     if wait {
         lock.lock()?;
     } else if lock.try_lock().is_err() {
@@ -348,7 +354,7 @@ pub fn ensure_running_at(exe: &Path, dir: &Path) -> Result<()> {
     }
     // A child that lost the lock to another daemon would wait for it forever: stop it, so
     // bursts of callers do not pile up waiting daemons.
-    let holder = fs::read_to_string(dir.join("daemon.lock")).ok();
+    let holder = fs::read_to_string(lock_path(dir)).ok();
     if up && holder.is_some_and(|h| h.trim() != child.id().to_string()) {
         let _ = child.kill();
     }
