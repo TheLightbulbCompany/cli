@@ -209,6 +209,12 @@ impl Peers {
         true
     }
 
+    /// Whether `key`'s link is still `conn` and said `hello` in our protocol.
+    fn speaks_ours(&self, key: &str, conn: &Connection) -> bool {
+        current(&mut self.live.lock().unwrap(), key, conn)
+            .is_some_and(|l| matches!(l.protocol, Protocol::Ok(_)))
+    }
+
     /// Runs `f` on `key`'s link if it is still `conn`.
     fn with_link(&self, key: &str, conn: &Connection, f: impl FnOnce(&mut Link)) {
         if let Some(l) = current(&mut self.live.lock().unwrap(), key, conn) {
@@ -251,6 +257,8 @@ struct Incoming {
     pending: Vec<Entry>,
     /// The roster heads at the last `apply`.
     tried: Vec<String>,
+    /// A presence was stored from this connection: later ones must carry a newer `seq`.
+    presence_stored: bool,
 }
 
 /// The running endpoint. Cheap to clone; the daemon's `Peers` hold the connection state.
@@ -506,12 +514,17 @@ impl Net {
         // connection may have brought their parents.
         let due = !sync.pending.is_empty() && (synced || team.roster.heads != sync.tried);
         drop(team);
-        // Outside `team`: building ours reads the sessions, storing theirs takes `store`.
+        // Outside `team`: building ours reads transcripts and git files (so off the async
+        // threads), storing theirs takes `store`.
         if hello_ok {
-            let _ = tx.send(crate::presence::current(d));
+            let (d, tx) = (d.clone(), tx.clone());
+            tokio::task::spawn_blocking(move || {
+                let _ = tx.send(crate::presence::current(&d));
+            });
         }
-        if let Some(p) = presence {
-            let stored = crate::presence::put(&d.store.lock().unwrap(), key, &p, ipc::now());
+        if let Some(p) = presence.filter(|_| d.peers.speaks_ours(key, conn)) {
+            let first = !std::mem::replace(&mut sync.presence_stored, true);
+            let stored = crate::presence::put(&d.store.lock().unwrap(), key, &p, ipc::now(), first);
             if let Err(e) = stored {
                 eprintln!("net: storing presence from {short}: {e}");
             }

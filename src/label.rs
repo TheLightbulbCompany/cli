@@ -3,11 +3,20 @@
 use crate::frame::{agent_name, Sender};
 use crate::roster::Roster;
 
-/// `from`'s label for a reader whose person is `viewer_person`: `Your Codex`, `You, at the
-/// terminal`, `Your desk mailbox` for the reader's own person; `aden's Codex`, `aden, at the
-/// terminal`, `aden's desk mailbox` for another's; ` (not verified)` after a member with no
-/// proof; `an unknown member (not verified)` for a prefix the roster does not hold.
-pub fn render(roster: &Roster, viewer_person: &str, from: &str) -> String {
+/// Whether `c` is safe to show a person or an agent: no control character (C0, C1, U+0085),
+/// line or paragraph separator, or bidi control that could reorder or hide what is around it.
+pub fn printable(c: char) -> bool {
+    !c.is_control()
+        && !matches!(c, '\u{2028}' | '\u{2029}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
+/// `from`'s label for the reader at member `viewer` (its person is its roster `person_id`, else
+/// its key): `Your Codex`, `You, at the terminal`, `Your desk mailbox` for the reader's own
+/// person; `aden's Codex`, `aden, at the terminal`, `aden's desk mailbox` for another's;
+/// ` (not verified)` after a member with no proof other than the reader's own computer;
+/// `an unknown member (not verified)` for a prefix the roster does not hold.
+pub fn render(roster: &Roster, viewer: &str, from: &str) -> String {
+    let viewer_person = roster.members.get(viewer).map_or(viewer, |m| &m.person_id);
     let prefix = from.split_once('/').map_or(from, |(m, _)| m);
     let Some(m) = roster.members.values().find(|m| m.short == prefix) else {
         return "an unknown member (not verified)".into();
@@ -23,7 +32,7 @@ pub fn render(roster: &Roster, viewer_person: &str, from: &str) -> String {
         let name: String = m
             .name
             .chars()
-            .filter(|c| !matches!(c, '{' | '}' | '[' | ']' | '\n' | '\r'))
+            .filter(|c| printable(*c) && !matches!(c, '{' | '}' | '[' | ']'))
             .collect();
         let name = if name.trim().is_empty() {
             "a member"
@@ -36,8 +45,8 @@ pub fn render(roster: &Roster, viewer_person: &str, from: &str) -> String {
             Sender::Agent(p) => format!("{name}'s {}", agent_name(p)),
         }
     };
-    // The reader's own computer before sign-in (its key is its `person_id`) proves nothing to itself.
-    if m.proof.is_some() || m.key == viewer_person {
+    // The reader's own computer has nothing to prove to itself.
+    if m.proof.is_some() || m.key == viewer {
         label
     } else {
         format!("{label} (not verified)")
@@ -103,6 +112,26 @@ mod tests {
         assert_eq!(
             render(&r, &a_pid, "dshort/codex:1"),
             "EveLightbulb 's Codex"
+        );
+        let mut r2 = r.clone();
+        r2.members.get_mut("dkey").unwrap().name = "Ev\u{202e}e\u{2028}\u{85}\u{1b}x".into();
+        assert_eq!(render(&r2, &a_pid, "dshort/codex:1"), "Evex's Codex");
+    }
+
+    #[test]
+    fn a_merged_unproven_viewer_is_verified_to_itself_only() {
+        // The viewer `v` was merged into person `pkey`, the key of another (unproven) computer.
+        let mut r = Roster::default();
+        for m in [
+            member("vkey", "vshort", "me", "pkey", None),
+            member("pkey", "pshort", "me-too", "pkey", None),
+        ] {
+            r.members.insert(m.key.clone(), m);
+        }
+        assert_eq!(render(&r, "vkey", "vshort/codex:1"), "Your Codex");
+        assert_eq!(
+            render(&r, "vkey", "pshort/codex:1"),
+            "Your Codex (not verified)"
         );
     }
 }

@@ -99,6 +99,16 @@ fn read(dir: &Path) -> Result<DocumentMut> {
     Ok(text.parse().map_err(|e| format!("{FILE}: {e}"))?)
 }
 
+/// `p` with a leading `~` (alone or before `/`) as the home directory.
+fn expand_home(p: &str) -> PathBuf {
+    match (p.strip_prefix('~'), dirs::home_dir()) {
+        (Some(rest), Some(home)) if rest.is_empty() || rest.starts_with('/') => {
+            home.join(rest.trim_start_matches('/'))
+        }
+        _ => PathBuf::from(p),
+    }
+}
+
 fn from_doc(doc: &DocumentMut) -> Result<Config> {
     let mut c = Config::default();
     for (k, item) in doc.iter() {
@@ -116,7 +126,7 @@ fn from_doc(doc: &DocumentMut) -> Result<Config> {
                     .as_array()
                     .ok_or_else(bad)?
                     .iter()
-                    .map(|v| v.as_str().map(PathBuf::from).ok_or_else(bad))
+                    .map(|v| v.as_str().map(expand_home).ok_or_else(bad))
                     .collect::<std::result::Result<_, _>>()?
             }
         }
@@ -128,6 +138,15 @@ fn from_doc(doc: &DocumentMut) -> Result<Config> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn a_leading_tilde_is_the_home_dir() {
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(expand_home("~/secret"), home.join("secret"));
+        assert_eq!(expand_home("~"), home);
+        assert_eq!(expand_home("~bob/x"), PathBuf::from("~bob/x"));
+        assert_eq!(expand_home("/a/~"), PathBuf::from("/a/~"));
+    }
 
     #[test]
     fn config_defaults_and_set_round_trip() {

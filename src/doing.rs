@@ -7,6 +7,8 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 const TAIL_BYTES: u64 = 256 * 1024;
+/// The most characters of a `doing` or `title` (or a published folder) a teammate is sent.
+pub const TEXT_MAX: usize = 256;
 
 /// `(title, current todo)` from `<home>/.claude/projects/<escaped-cwd>/<conversation>.jsonl`.
 /// Only the last 256 KB is read; `(None, None)` for other providers or no transcript.

@@ -3,6 +3,7 @@
 //! that merges both.
 
 use crate::daemon::{ipc, Daemon};
+use crate::doing::TEXT_MAX;
 use crate::net::frames::{Frame, Remote};
 use crate::roster::{Member, MemberKind, Role, Roster};
 use crate::sessions::{Session, Status};
@@ -10,9 +11,9 @@ use crate::store::Store;
 use rusqlite::params;
 use serde_json::{json, Value};
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// At most this many sessions, `known` and `kept` addresses each per presence.
 pub const MAX: usize = 100;
@@ -24,6 +25,8 @@ const COALESCE: Duration = Duration::from_millis(250);
 /// What is read from transcripts (`doing`, `title`) and process tables has no event: the
 /// presence is rebuilt this often and sent when it changed.
 const TICK: Duration = Duration::from_secs(5);
+/// An unchanged presence is sent again this often.
+const RESEND: Duration = Duration::from_secs(60);
 
 /// This computer's person: its roster member's `person_id`, else its own key.
 pub fn my_person(d: &Daemon, r: &Roster) -> String {
@@ -40,7 +43,13 @@ pub fn keep(d: &Daemon, key: &str, cwd: &str) {
     d.presence.notify_one();
 }
 
-/// `s` as published: `folder` is `cwd`'s last part, or all of it with `share_paths`.
+/// At most `TEXT_MAX` characters of `s`.
+fn capped(s: &str) -> String {
+    s.chars().take(TEXT_MAX).collect()
+}
+
+/// `s` as published: `folder` is `cwd`'s last part, or all of it with `share_paths`; text
+/// longer than a peer accepts is cut.
 fn remote(s: &Session, share_paths: bool) -> Remote {
     let (repo, branch) = crate::mcp::git(&s.cwd);
     let folder = if share_paths {
@@ -54,21 +63,21 @@ fn remote(s: &Session, share_paths: bool) -> Remote {
     Remote {
         session_id: s.key.0.clone(),
         agent: s.provider.clone(),
-        repo,
-        branch,
-        folder,
+        repo: repo.as_deref().map(capped),
+        branch: branch.as_deref().map(capped),
+        folder: capped(&folder),
         status: if s.status == Status::Live {
             "busy"
         } else {
             "idle"
         }
         .into(),
-        doing: s.doing.clone(),
+        doing: s.doing.as_deref().map(capped),
         tier: serde_json::to_value(s.tier)
             .ok()
             .and_then(|t| t.as_str().map(String::from))
             .unwrap_or_default(),
-        title: s.title.clone(),
+        title: s.title.as_deref().map(capped),
     }
 }
 
@@ -81,7 +90,11 @@ fn build(d: &Daemon) -> Frame {
         let t = d.team.lock().unwrap();
         (t.config.share_paths, t.config.folders_off.clone())
     };
-    let is_off = |cwd: &str| off.iter().any(|o| Path::new(cwd).starts_with(o));
+    let off: Vec<PathBuf> = off.iter().map(|o| canonical(o)).collect();
+    let is_off = |cwd: &str| {
+        let cwd = canonical(Path::new(cwd));
+        off.iter().any(|o| cwd.starts_with(o))
+    };
     let mut live = ipc::live_sessions(d);
     live.retain(|s| !is_off(&s.cwd));
     live.sort_by_key(|s| std::cmp::Reverse(s.birth_micros));
@@ -90,21 +103,28 @@ fn build(d: &Daemon) -> Frame {
     let mine = format!("{}/", d.identity.short);
     let store = d.store.lock().unwrap();
     let rows = store.sessions().unwrap_or_default();
-    let off_key = |k: &str| rows.iter().any(|r| r.key == k && is_off(&r.cwd));
+    let held: Vec<(String, (u64, String))> = {
+        let mut map = d.kept.lock().unwrap();
+        map.retain(|_, (at, _)| *at + DAY >= now);
+        map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    };
+    // Only an address this computer knows the folder of: a row, or a kept entry.
+    let shown = |k: &str| {
+        let cwd = rows.iter().find(|r| r.key == k).map(|r| &r.cwd);
+        let cwd = cwd.or_else(|| held.iter().find(|(h, _)| h == k).map(|(_, (_, c))| c));
+        cwd.is_some_and(|c| !is_off(c))
+    };
     let known: Vec<String> = waiting_keys(&store, now)
         .into_iter()
-        .filter(|k| k.starts_with(&mine) && !live_keys.contains(k.as_str()) && !off_key(k))
+        .filter(|k| k.starts_with(&mine) && !live_keys.contains(k.as_str()) && shown(k))
         .take(MAX)
         .collect();
     // Ended (`keep`) and gone (a row whose process died) addresses seen within the day.
-    let mut kept: Vec<(u64, String)> = {
-        let mut map = d.kept.lock().unwrap();
-        map.retain(|_, (at, _)| *at + DAY >= now);
-        map.iter()
-            .filter(|(_, (_, cwd))| !is_off(cwd))
-            .map(|(k, (at, _))| (*at, k.clone()))
-            .collect()
-    };
+    let mut kept: Vec<(u64, String)> = held
+        .iter()
+        .filter(|(_, (_, cwd))| !is_off(cwd))
+        .map(|(k, (at, _))| (*at, k.clone()))
+        .collect();
     for r in rows.iter().filter(|r| !is_off(&r.cwd)) {
         kept.push((u64::try_from(r.seen_at).unwrap_or(0), r.key.clone()));
     }
@@ -127,6 +147,16 @@ fn build(d: &Daemon) -> Frame {
         sessions: live.iter().map(|s| remote(s, share)).collect(),
         known,
         kept,
+    }
+}
+
+/// `p` resolved (symlinks, `..`), else as given; lowercased on macOS, whose volumes ignore case.
+fn canonical(p: &Path) -> PathBuf {
+    let p = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    if cfg!(target_os = "macos") {
+        PathBuf::from(p.to_string_lossy().to_lowercase())
+    } else {
+        p
     }
 }
 
@@ -158,28 +188,36 @@ pub fn current(d: &Daemon) -> Frame {
 }
 
 /// The sender: on a local change (`Daemon::presence`, coalesced over 250 ms) or every 5 s,
-/// sends this computer's presence to every online member when it differs from the last sent.
+/// sends this computer's presence to every online member when it changed, and every 60 s
+/// regardless.
 pub async fn run(d: Arc<Daemon>) {
-    let mut last = None;
+    let mut last: Option<(Frame, Instant)> = None;
     loop {
         tokio::select! {
             _ = d.presence.notified() => tokio::time::sleep(COALESCE).await,
             _ = tokio::time::sleep(TICK) => {}
         }
-        let f = build(&d);
-        if last.as_ref() == Some(&f) {
+        let d2 = d.clone();
+        let Ok(f) = tokio::task::spawn_blocking(move || build(&d2)).await else {
+            continue;
+        };
+        if last
+            .as_ref()
+            .is_some_and(|(l, at)| *l == f && at.elapsed() < RESEND)
+        {
             continue;
         }
         let out = stamped(f.clone());
         for m in d.peers.online() {
             let _ = d.peers.send(&m, out.clone());
         }
-        last = Some(f);
+        last = Some((f, Instant::now()));
     }
 }
 
-/// Stores `member`'s presence `f` unless the one stored is as new (`seq`).
-pub fn put(store: &Store, member: &str, f: &Frame, now: u64) -> rusqlite::Result<()> {
+/// Stores `member`'s presence `f`: unless the one stored is as new (`seq`), or always with
+/// `first` (the first on a connection, so a peer whose clock stepped back is not frozen).
+pub fn put(store: &Store, member: &str, f: &Frame, now: u64, first: bool) -> rusqlite::Result<()> {
     let Frame::Presence { seq, .. } = f else {
         return Ok(());
     };
@@ -187,8 +225,14 @@ pub fn put(store: &Store, member: &str, f: &Frame, now: u64) -> rusqlite::Result
     store.conn().execute(
         "INSERT INTO peers_sessions VALUES (?1, ?2, ?3, ?4) ON CONFLICT(member) DO UPDATE SET \
          seq = excluded.seq, presence = excluded.presence, seen_at = excluded.seen_at \
-         WHERE excluded.seq > peers_sessions.seq",
-        params![member, *seq as i64, text, now as i64],
+         WHERE ?5 OR excluded.seq > peers_sessions.seq",
+        params![
+            member,
+            i64::try_from(*seq).unwrap_or(i64::MAX),
+            text,
+            now as i64,
+            first
+        ],
     )?;
     Ok(())
 }
@@ -331,12 +375,19 @@ mod tests {
             kept: vec![],
         };
         for seq in [5, 3, 5, 7] {
-            put(&store, "m", &p(seq, "m"), 1).unwrap();
+            put(&store, "m", &p(seq, "m"), 1, false).unwrap();
         }
         let text: String = store
             .conn()
             .query_row("SELECT presence FROM peers_sessions", [], |r| r.get(0))
             .unwrap();
         assert_eq!(serde_json::from_str::<Frame>(&text).unwrap(), p(7, "m"));
+        // A connection's first presence is taken whatever its seq.
+        put(&store, "m", &p(2, "m"), 1, true).unwrap();
+        let text: String = store
+            .conn()
+            .query_row("SELECT presence FROM peers_sessions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(serde_json::from_str::<Frame>(&text).unwrap(), p(2, "m"));
     }
 }

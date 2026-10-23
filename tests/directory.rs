@@ -228,6 +228,28 @@ async fn presence_naming_another_prefix_is_dropped() {
     p.send(&presence(&ib.key, 3, &[&good, &forged], &[])).await;
     p.send(&presence(&ib.key, 4, &[&good], &[format!("{sa}/desk")]))
         .await;
+    // Malformed sessions: text past the cap, an agent other than the id's provider, an unknown
+    // status; and a seq more than a day ahead.
+    let bad = |f: fn(&mut Remote)| {
+        let mut r = remote(&good);
+        f(&mut r);
+        Frame::Presence {
+            member: ib.key.clone(),
+            seq: 4,
+            sessions: vec![r],
+            known: vec![],
+            kept: vec![],
+        }
+    };
+    p.send(&bad(|r| r.doing = Some("x".repeat(257)))).await;
+    p.send(&bad(|r| r.agent = "claude".into())).await;
+    p.send(&bad(|r| r.status = "gone".into())).await;
+    let ahead = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 2 * 86_400_000;
+    p.send(&presence(&ib.key, ahead, &[&good], &[])).await;
     let fence = format!("{sb}/codex:fence");
     p.send(&presence(&ib.key, 5, &[&fence], &[])).await;
     until(5, "A applies the fence", || {
@@ -245,7 +267,26 @@ async fn presence_naming_another_prefix_is_dropped() {
 
     let log = std::fs::read_to_string(a.state.path().join("daemon.log")).unwrap();
     let line = format!("net: dropped a presence frame from {sb}");
-    assert_eq!(log.matches(&line).count(), 3, "{log}");
+    assert_eq!(log.matches(&line).count(), 7, "{log}");
+
+    // A teammate's text reaches the person's terminal without what a terminal acts on.
+    let mut r = remote(&late);
+    r.doing = Some("\u{1b}]0;pwned\u{7}red\u{1b}[31m\u{202e}txt".into());
+    p.send(&Frame::Presence {
+        member: ib.key.clone(),
+        seq: 7,
+        sessions: vec![r],
+        known: vec![],
+        kept: vec![],
+    })
+    .await;
+    until(5, "A applies it", || {
+        ids(&directory(&a, None)) == [late.clone()]
+    });
+    let o = a.detached(&[EXE, "who", "--all"], "");
+    let text = out(&o);
+    assert!(text.contains("]0;pwnedred[31mtxt"), "{text}");
+    assert!(!text.contains(['\u{1b}', '\u{7}', '\u{202e}']), "{text:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -298,27 +339,40 @@ async fn off_folder_sessions_are_not_published() {
     let (a, b) = (Env::new(), Env::new());
     let [_, admit] = seed_pair(&a, &b);
     let root = tempfile::tempdir().unwrap();
-    let secret = root.path().join("secret");
-    let config = format!("folders_off = [{:?}]\n", secret.to_str().unwrap());
+    let (secret, open) = (root.path().join("secret"), root.path().join("open"));
+    let hidden = secret.join("proj");
+    for d in [&hidden, &open, &root.path().join("x")] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    // The off folder spelled through `..`, its sessions through a symlink: both resolve.
+    std::os::unix::fs::symlink(&secret, root.path().join("alias")).unwrap();
+    let off = root.path().join("x/../secret");
+    let config = format!("folders_off = [{:?}]\n", off.to_str().unwrap());
     a.daemon(false, &config, &[]);
     let sa = short(&a);
-    let open = root.path().join("open");
-    let hidden = secret.join("proj");
-    assert_eq!(
-        register(&a, "codex", "o1", open.to_str().unwrap())["ok"],
-        true
+    let (open, hidden) = (
+        open.to_str().unwrap().to_string(),
+        root.path().join("alias/proj").to_str().unwrap().to_string(),
     );
-    assert_eq!(
-        register(&a, "codex", "h1", hidden.to_str().unwrap())["ok"],
-        true
-    );
-    // Ended under the off folder: not even its name is published.
-    let r = a.ask(json!({"id": 1, "op": "end", "key": format!("{sa}/codex:h1")}));
-    assert_eq!(r["ended"], true, "{r}");
-    assert_eq!(
-        register(&a, "codex", "h2", hidden.to_str().unwrap())["ok"],
-        true
-    );
+    for (conversation, cwd) in [
+        ("o1", &open),
+        ("o2", &open),
+        ("h1", &hidden),
+        ("h2", &hidden),
+    ] {
+        assert_eq!(register(&a, "codex", conversation, cwd)["ok"], true);
+    }
+    // Ended with mail waiting: the open one is `known`, the off-folder one nowhere.
+    for c in ["o2", "h1"] {
+        let to = format!("{sa}/codex:{c}");
+        let r = a.ask(
+            json!({"id": 1, "op": "send", "from": format!("{sa}/terminal"),
+            "to": to, "text": "x", "request_id": format!("r-{c}")}),
+        );
+        assert_eq!(r["receipt"]["state"], "stored", "{r}");
+        let r = a.ask(json!({"id": 1, "op": "end", "key": to}));
+        assert_eq!(r["ended"], true, "{r}");
+    }
 
     let mut p = Peer::dial(&b.identity(), &a, &admit).await;
     let Frame::Presence {
@@ -336,7 +390,8 @@ async fn off_folder_sessions_are_not_published() {
     assert_eq!(ids, [format!("{sa}/codex:o1")]);
     // The last path part, not the path.
     assert_eq!(sessions[0].folder, "open");
-    assert!(known.is_empty() && kept.is_empty(), "{known:?} {kept:?}");
+    let o2 = format!("{sa}/codex:o2");
+    assert_eq!((known, kept), (vec![o2.clone()], vec![o2]));
     // Locally the off-folder session is still listed.
     assert_eq!(directory(&a, None).len(), 2);
 }

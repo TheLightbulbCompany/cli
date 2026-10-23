@@ -2,6 +2,7 @@
 //! tagged by `t`, at most 1 MiB. The one definition of every frame later tasks send.
 
 use crate::daemon::Daemon;
+use crate::doing::TEXT_MAX;
 use crate::roster::{Entry, Member};
 use crate::{presence, sessions, Result};
 use serde::{Deserialize, Serialize};
@@ -162,28 +163,50 @@ pub async fn read(recv: &mut (impl AsyncRead + Unpin)) -> Result<Frame> {
 }
 
 /// The one per-frame check on what a member sends. `roster` entries are checked by
-/// `roster::accept` itself; a `presence` is the peer's own, at most `presence::MAX` of each
-/// list, every address under the peer's prefix. Tasks 8 and 14 add the rules for the frames
-/// they serve, and until then every other kind is dropped.
+/// `roster::accept` itself. A `presence` is the peer's own: at most `presence::MAX` of each
+/// list; every address under the peer's prefix (`sessions::qualify` bounds its parts); each
+/// session's `agent` its id's provider, `status` `busy` or `idle`, a known `tier`, and text at
+/// most `doing::TEXT_MAX` characters; a `seq` at most a day ahead of now. Tasks 8 and 14 add
+/// the rules for the frames they serve, and until then every other kind is dropped.
 pub fn from_peer_ok(f: &Frame, peer: &Member, _daemon: &Daemon) -> bool {
     match f {
         Frame::Hello { .. } | Frame::Roster { .. } => true,
         Frame::Presence {
             member,
+            seq,
             sessions,
             known,
             kept,
-            ..
         } => {
             let own = |a: &str| {
                 sessions::qualify(&peer.short, a).as_deref() == Some(a)
                     && a.split_once('/').is_some_and(|(m, _)| m == peer.short)
             };
+            let short =
+                |t: &Option<String>| t.as_ref().is_none_or(|t| t.chars().count() <= TEXT_MAX);
+            let session_ok = |s: &Remote| {
+                let provider = s
+                    .session_id
+                    .split_once('/')
+                    .and_then(|(_, r)| r.split_once(':'));
+                own(&s.session_id)
+                    && provider.is_some_and(|(p, _)| p == s.agent)
+                    && matches!(s.status.as_str(), "busy" | "idle")
+                    && matches!(s.tier.as_str(), "push" | "next_step" | "pull")
+                    && s.folder.chars().count() <= TEXT_MAX
+                    && [&s.doing, &s.title, &s.repo, &s.branch]
+                        .into_iter()
+                        .all(short)
+            };
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as u64);
             *member == peer.key
+                && *seq <= now_ms + 86_400_000
                 && [sessions.len(), known.len(), kept.len()]
                     .iter()
                     .all(|n| *n <= presence::MAX)
-                && sessions.iter().all(|s| own(&s.session_id))
+                && sessions.iter().all(session_ok)
                 && known.iter().chain(kept).all(|a| own(a))
         }
         _ => false,

@@ -61,8 +61,13 @@ fn ask(conn: &mut Conn, op: &str, body: Value) -> Result<Value> {
     }
 }
 
+/// `s` as one table cell: line breaks and tabs as spaces, and nothing a terminal would act on
+/// (escape sequences, bidi controls), since a teammate's text is printed here.
 fn cell(s: &str) -> String {
-    s.replace(['\n', '\t'], " ")
+    s.chars()
+        .map(|c| if matches!(c, '\n' | '\t') { ' ' } else { c })
+        .filter(|c| crate::label::printable(*c))
+        .collect()
 }
 
 /// `who [--all]`: this computer's sessions; with `all`, then every teammate's (`directory`).
@@ -736,5 +741,11 @@ mod tests {
         assert_eq!(super::utc(0), "1970-01-01 00:00 UTC");
         assert_eq!(super::utc(1_792_728_600), "2026-10-23 04:10 UTC");
         assert_eq!(super::utc(951_782_400), "2000-02-29 00:00 UTC");
+    }
+
+    #[test]
+    fn a_title_with_control_characters_prints_as_plain_text() {
+        let title = "fix\u{1b}[2J\u{1b}]8;;http://x\u{7}\tit\u{85}\u{2066}now\r\nok";
+        assert_eq!(super::cell(title), "fix[2J]8;;http://x itnow ok");
     }
 }

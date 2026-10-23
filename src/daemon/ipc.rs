@@ -192,7 +192,14 @@ async fn handle(
             _ => Response::err(id, BAD_REQUEST),
         },
         "inbox" => inbox(id, &req.body, daemon, peer).await,
-        "directory" => Response::ok(id, presence::directory(daemon, req.body["query"].as_str())),
+        // Reads every session's transcript and git files: off the async threads.
+        "directory" => {
+            let (d, q) = (daemon.clone(), req.body["query"].as_str().map(String::from));
+            match tokio::task::spawn_blocking(move || presence::directory(&d, q.as_deref())).await {
+                Ok(v) => Response::ok(id, v),
+                Err(_) => Response::err(id, INTERNAL),
+            }
+        }
         // An agent fed a hostile link must not move this computer into another network.
         "team.join" if !peer_pid.is_some_and(super::net_ops::person_only) => {
             refused(id, "not_a_person")
@@ -335,14 +342,21 @@ fn register(id: u64, body: &Value, daemon: &Daemon) -> Response {
     };
     let me = caller.unwrap_or((r.pid, r.birth_micros));
     let key = Key::new(&daemon.identity.short, &r.provider, &r.conversation);
-    // A new session may not take what the person's other computer keeps.
-    let taken = presence::kept_elsewhere(daemon, &format!("{}:{}", r.provider, r.conversation));
-    let store = daemon.store.lock().unwrap();
+    let mut store = daemon.store.lock().unwrap();
     match row_process(&store, &key.0) {
         Ok(Some(owner)) if owner != me && sessions::alive(owner.0, owner.1) => {
             return refused(id, "owned_by_live_process")
         }
-        Ok(None) if taken => return Response::err(id, admission::NAME_TAKEN),
+        // A new session may not take what the person's other computer keeps (read with
+        // `store` let go: `kept_elsewhere` takes `team`, then `store`).
+        Ok(None) => {
+            drop(store);
+            let rest = format!("{}:{}", r.provider, r.conversation);
+            if presence::kept_elsewhere(daemon, &rest) {
+                return Response::err(id, admission::NAME_TAKEN);
+            }
+            store = daemon.store.lock().unwrap();
+        }
         Ok(_) => {}
         Err(_) => return Response::err(id, INTERNAL),
     }
@@ -392,8 +406,8 @@ fn live_count(daemon: &Daemon) -> usize {
     live_sessions(daemon).len()
 }
 
-/// `m`'s sender as this computer's agents are told it (`label::render`, this computer's
-/// person reading). Mail that came in over the IPC (`origin` other than `net:`) is this
+/// `m`'s sender as this computer's agents are told it (`label::render`, this computer
+/// reading). Mail that came in over the IPC (`origin` other than `net:`) is this
 /// computer's by construction, whatever member prefix its `from` carries.
 pub(crate) fn sender_label(daemon: &Daemon, m: &store::Message) -> String {
     let from = if m.origin.as_deref().is_some_and(|o| o.starts_with("net:")) {
@@ -406,11 +420,7 @@ pub(crate) fn sender_label(daemon: &Daemon, m: &store::Message) -> String {
         format!("{}/{rest}", daemon.identity.short)
     };
     let team = daemon.team.lock().unwrap();
-    label::render(
-        &team.roster,
-        &presence::my_person(daemon, &team.roster),
-        &from,
-    )
+    label::render(&team.roster, &daemon.identity.key, &from)
 }
 
 pub fn now() -> u64 {
@@ -488,6 +498,13 @@ async fn inbox(
             Err(_) => return Response::err(id, INTERNAL),
         }
     }
+    let wait = match body.get("wait_secs") {
+        None | Some(Value::Null) => 0,
+        Some(v) => match v.as_u64() {
+            Some(w) if w <= 600 => w,
+            _ => return Response::err(id, BAD_REQUEST),
+        },
+    };
     // A name (`listen --as`) is this computer's while it is in use here, and kept a day after;
     // one the person's other computer keeps is refused.
     let short = &daemon.identity.short;
@@ -500,13 +517,6 @@ async fn inbox(
             presence::keep(daemon, &key.0, "");
         }
     }
-    let wait = match body.get("wait_secs") {
-        None | Some(Value::Null) => 0,
-        Some(v) => match v.as_u64() {
-            Some(w) if w <= 600 => w,
-            _ => return Response::err(id, BAD_REQUEST),
-        },
-    };
     let deadline = tokio::time::Instant::now() + Duration::from_secs(wait);
     let mut events = daemon.events.subscribe();
     // Watch the peer for EOF while waiting, so mail that arrives after it hung up stays in
