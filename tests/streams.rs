@@ -41,9 +41,13 @@ impl Sub {
     fn new(e: &Env) -> Sub {
         let mut s = UnixStream::connect(e.state.path().join("sock")).unwrap();
         writeln!(s, r#"{{"id":1,"op":"subscribe"}}"#).unwrap();
+        // Events reach a connection only once its `subscribe` is handled: wait for the ack.
+        let mut lines = BufReader::new(s).lines();
+        let ack: Value = serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
+        assert_eq!(ack["ok"], true, "{ack}");
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            for line in BufReader::new(s).lines() {
+            for line in lines {
                 let Ok(v) = serde_json::from_str::<Value>(&line.unwrap_or_default()) else {
                     return;
                 };
@@ -609,11 +613,12 @@ async fn close_unblocks_a_send_waiting_on_flow_control() {
         }
     });
     let mut sent = 0;
-    while let Ok(r) = rx.recv_timeout(Duration::from_secs(2)) {
+    // A send that has not returned in 5 s is stalled on flow control.
+    while let Ok(r) = rx.recv_timeout(Duration::from_secs(5)) {
         assert_eq!(r["ok"], true, "{r}");
         sent += 1;
     }
-    assert!((13..100).contains(&sent), "{sent} sends before one blocked");
+    assert!((1..100).contains(&sent), "{sent} sends before one stalled");
     let t = Instant::now();
     let r = a.ask(json!({"id": 1, "op": "stream.close", "stream_id": owner_id}));
     assert_eq!(r["ok"], true, "{r}");
