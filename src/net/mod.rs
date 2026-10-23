@@ -874,11 +874,11 @@ impl Net {
                 eprintln!("net: a share_grant from {short}: {e}");
             }
         }
-        if let Some((id, state, ..)) = answer
+        if let Some((id, state, reason, _)) = answer
             .as_ref()
             .filter(|a| crate::decision::is_control(&a.0))
         {
-            crate::decision::acked(d, key, id, state);
+            crate::decision::acked(d, key, id, state, reason.as_deref());
         } else if let Some((id, state, reason, limit)) = answer {
             let store = d.store.lock().unwrap();
             let state = State::parse(&state).expect("checked by from_peer_ok");

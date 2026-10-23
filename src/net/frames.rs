@@ -251,7 +251,7 @@ pub async fn read(recv: &mut (impl AsyncRead + Unpin)) -> Result<Frame> {
 /// `join_request` or `join_decision` comes from a computer member. A `share_grant` passes
 /// `streams::grant_ok`. A `hold_notice` comes from a computer member, with no preview; a
 /// `decision` from a cloud member (`decision` checks the rest). An `ack` of a notice or a
-/// decision (`decision::is_control` ids) carries `decision::ack_ok`'s states only, and a
+/// decision (`decision::is_control` ids) carries `decision::ack_ok`'s states and reasons only, and a
 /// `receipt` never names one. A `stream` never rides the control stream. `Err` names the
 /// check.
 pub fn from_peer_ok(
@@ -273,7 +273,7 @@ pub fn from_peer_ok(
             reason,
             limit,
         } if crate::decision::is_control(id) => check(
-            crate::decision::ack_ok(id, state) && reason.is_none() && limit.is_none(),
+            crate::decision::ack_ok(id, state, reason.as_deref()) && limit.is_none(),
             "state",
         ),
         Frame::Receipt { id, .. } if crate::decision::is_control(id) => Err("state"),

@@ -6,24 +6,28 @@
 //!
 //! Both ride the outbox table: one row each, `hn:<hold id>` on the holder and `dc:<nonce>` on
 //! the member, sent with the mail's backoff to the one member named, again on every `hello`,
-//! until that member acks it (`ack {id: <row id>}`, state `delivered` for a notice, `applied`
-//! or `not_open` for a decision) or, for a notice, its hold closes; at most `mail::HELD_S`.
-//! A decision refused by the holder is not acked: what refused it (a lapsed proof, a roster
-//! not yet synced) may heal, and the member's retries end with the hold's 7 days.
+//! until that member acks it (`ack {id: <row id>}`: state `delivered` for a notice; `applied`,
+//! `not_open`, or `refused` with a `REFUSALS` reason for a decision) or, for a notice, its
+//! hold closes; at most `mail::HELD_S`, then the row goes. The holder keeps each decision's
+//! answer by its nonce and gives a resent copy the same one. Only a decision from a member
+//! not (yet) my workspace's is left unanswered: a roster sync or a renewed proof may heal it.
 //!
-//! On the instance, `hold_notice` and `decision_result` are events, `decision.send` the op.
-//! Logs carry ids and shorts, never text.
+//! On the instance, `hold_notice` and `decision_result` are events, `decision.send` and
+//! `holds.pending` the ops. A notice is acked only once the event went to a subscriber, and it
+//! stays pending (`holds.pending`) until its decision's answer, or `mail::HELD_S`. Logs carry
+//! ids and shorts, never text.
 
 use crate::admission::{self, NOT_OPEN};
 use crate::daemon::ipc::{self, Response, BAD_REQUEST, UNSUPPORTED};
 use crate::daemon::Daemon;
+use crate::doing::TEXT_MAX;
 use crate::holds::{self, Closed, Hold, ALLOW, DECLINE};
 use crate::identity::Identity;
-use crate::net::frames::Frame;
+use crate::net::frames::{self, Frame};
 use crate::net::short;
 use crate::roster::{Member, MemberKind, Roster};
 use crate::store::Store;
-use crate::{dialog, mail, policy, Result};
+use crate::{dialog, label, mail, policy, sessions, Result};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
@@ -33,6 +37,11 @@ const DECISION: &str = "dc:";
 /// The ack states of a notice, and of a decision.
 const NOTICE_ACK: &str = "delivered";
 const APPLIED: &str = "applied";
+const REFUSED: &str = "refused";
+/// Why a decision was refused: a scope that does not fit, a hold no longer open, a malformed
+/// one or a nonce reused on another hold, a signature not the signer's, a hold not mine (or a
+/// person not mine).
+pub const REFUSALS: [&str; 5] = ["scope", NOT_OPEN, "bad_request", "bad_sig", "not_mine"];
 /// The scopes a relayed decision may carry.
 const RELAYED: [&str; 3] = ["once", "person", "own_cloud"];
 
@@ -41,12 +50,12 @@ pub fn is_control(id: &str) -> bool {
     id.starts_with(NOTICE) || id.starts_with(DECISION)
 }
 
-/// Whether `state` may ack row `id`.
-pub fn ack_ok(id: &str, state: &str) -> bool {
-    if id.starts_with(NOTICE) {
-        state == NOTICE_ACK
-    } else {
-        id.starts_with(DECISION) && [APPLIED, NOT_OPEN].contains(&state)
+/// Whether `state` (with `reason`) may ack row `id`.
+pub fn ack_ok(id: &str, state: &str, reason: Option<&str>) -> bool {
+    match reason {
+        _ if id.starts_with(NOTICE) => state == NOTICE_ACK && reason.is_none(),
+        None => id.starts_with(DECISION) && [APPLIED, NOT_OPEN].contains(&state),
+        Some(r) => id.starts_with(DECISION) && state == REFUSED && REFUSALS.contains(&r),
     }
 }
 
@@ -117,12 +126,18 @@ pub(crate) fn flush(
 ) -> Result<()> {
     let due_at = if all { i64::MAX } else { now as i64 };
     let since = now.saturating_sub(mail::HELD_S) as i64;
+    // Past the hold's 7 days nothing can come of a row.
+    store.conn().execute(
+        "DELETE FROM outbox WHERE substr(message_id, 1, 3) IN ('hn:', 'dc:') \
+         AND created_at <= ?1",
+        [since],
+    )?;
     let rows: Vec<(String, String, String)> = {
         let mut stmt = store.conn().prepare(
             "SELECT message_id, to_member, frame FROM outbox WHERE substr(message_id, 1, 3) \
-             IN ('hn:', 'dc:') AND next_at <= ?1 AND created_at > ?2",
+             IN ('hn:', 'dc:') AND next_at <= ?1",
         )?;
-        let rows = stmt.query_map([due_at, since], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        let rows = stmt.query_map([due_at], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
         rows.collect::<rusqlite::Result<_>>()?
     };
     for (id, member, frame) in rows {
@@ -136,9 +151,10 @@ pub(crate) fn flush(
     Ok(())
 }
 
-/// Member `key`'s ack of row `id` at `state` (checked by `ack_ok`): the row is done. A
-/// decision's ack is the instance's `decision_result` event.
-pub(crate) fn acked(d: &Daemon, key: &str, id: &str, state: &str) {
+/// Member `key`'s ack of row `id` at `state` (and `reason`, checked by `ack_ok`): the row is
+/// done. A decision's ack is the instance's `decision_result` event, and its notice is no
+/// longer pending.
+pub(crate) fn acked(d: &Daemon, key: &str, id: &str, state: &str, reason: Option<&str>) {
     let store = d.store.lock().unwrap();
     let got: rusqlite::Result<String> = store.conn().query_row(
         "SELECT frame FROM outbox WHERE message_id = ?1 AND to_member = ?2",
@@ -159,10 +175,14 @@ pub(crate) fn acked(d: &Daemon, key: &str, id: &str, state: &str) {
     }
     eprintln!("net: {id} at {}: {state}", short(key));
     if let Ok(Frame::Decision { hold_id, .. }) = serde_json::from_str(&frame) {
+        if let Some(c) = &d.cloud {
+            let at = (key.to_string(), hold_id.clone());
+            c.notices.lock().unwrap().remove(&at);
+        }
         let _ = d
             .events
             .send(json!({"event": "decision_result", "hold_id": hold_id,
-            "holding_member": key, "result": state}));
+            "holding_member": key, "result": state, "reason": reason}));
     }
 }
 
@@ -181,8 +201,10 @@ pub(crate) fn on_frame(d: &Arc<Daemon>, key: &str, f: &Frame, tx: &UnboundedSend
 }
 
 /// On an instance: a notice from a computer of this workspace, for its own person, signed by
-/// it, becomes the `hold_notice` event and is acked. A resent one is an event again (the
-/// bridge keys on `holding_member` and `hold_id`).
+/// it, with its own computer name, its own session as the target, and printable short text,
+/// is kept pending and becomes the `hold_notice` event; it is acked only when a subscriber got
+/// the event (else the holder sends it again). A resent one is an event again (the bridge
+/// keys on `holding_member` and `hold_id`).
 fn on_notice(d: &Daemon, key: &str, f: &Frame, tx: &UnboundedSender<Frame>) -> bool {
     let Frame::HoldNotice {
         hold_id,
@@ -210,42 +232,92 @@ fn on_notice(d: &Daemon, key: &str, f: &Frame, tx: &UnboundedSender<Frame>) -> b
                 && mine.is_some()
                 && p.workspace.as_ref() == mine
                 && p.person_id == *for_person
+                && p.computer == *holding_computer
+                && frames::own(&p.short, target_session)
         })
     };
+    let text =
+        |t: &str| !t.is_empty() && t.chars().count() <= TEXT_MAX && t.chars().all(label::printable);
     let well_formed = dialog::number(hold_id, 'H').is_some()
-        && ["message", "permission"].contains(&kind.as_str());
-    if !(ours && well_formed && admission::signed_by(key, f)) {
+        && ["message", "permission"].contains(&kind.as_str())
+        && text(label)
+        && text(from)
+        && sessions::split_addr(from).is_some();
+    let (Some(cloud), true) = (
+        &d.cloud,
+        ours && well_formed && admission::signed_by(key, f),
+    ) else {
         return false;
-    }
-    let _ = d
-        .events
-        .send(json!({"event": "hold_notice", "hold_id": hold_id,
+    };
+    let event = json!({"event": "hold_notice", "hold_id": hold_id,
         "holding_member": key, "holding_computer": holding_computer, "for_person": for_person,
         "target_session": target_session, "from": from, "label": label, "kind": kind,
-        "created_at": created_at}));
+        "created_at": created_at});
+    // ponytail: in memory, a restart forgets it (the bridge re-reads on attach); one per hold
+    // still open, at most a week.
+    let at = (key.to_string(), hold_id.clone());
+    cloud.notices.lock().unwrap().insert(at, event.clone());
+    if d.events.send(event).is_err() {
+        eprintln!("hold {hold_id} at {}: notice, no subscriber", short(key));
+        return true;
+    }
     eprintln!("hold {hold_id} at {}: notice", short(key));
-    let _ = tx.send(ack(notice_row(hold_id), NOTICE_ACK));
+    let _ = tx.send(ack(notice_row(hold_id), NOTICE_ACK, None));
     true
 }
 
-fn ack(id: String, state: &str) -> Frame {
+/// `holds.pending {}` -> `{notices}`: the `hold_notice` events received and not yet answered
+/// by their decision, oldest first, for a bridge that attached late. An instance's op only.
+pub(crate) fn pending(id: u64, d: &Daemon) -> Response {
+    let Some(cloud) = &d.cloud else {
+        return Response::err(id, UNSUPPORTED);
+    };
+    let since = ipc::now().saturating_sub(mail::HELD_S) as i64;
+    let mut map = cloud.notices.lock().unwrap();
+    map.retain(|_, v| v["created_at"].as_i64().is_some_and(|t| t > since));
+    let mut list: Vec<Value> = map.values().cloned().collect();
+    list.sort_by_key(|v| v["created_at"].as_i64());
+    Response::ok(id, json!({ "notices": list }))
+}
+
+fn ack(id: String, state: &str, reason: Option<&str>) -> Frame {
     Frame::Ack {
         id,
         state: state.into(),
-        reason: None,
+        reason: reason.map(Into::into),
         limit: None,
     }
 }
 
-/// Decision `f` from `signer`, on this computer (`me`), at `now`: applied as the person's
-/// answer (`holds::answer`, by `bridge`) only if its `sig` is the signer's, the signer is my
-/// own workspace's member (proof in force), it was `decided_by` my person, its
-/// `holding_member` is me and its hold is mine, its nonce is new, and its scope fits: `once`
-/// for any hold; `person` for a message from a computer member (on a cloud sender it would be
-/// `cloud_of`); `own_cloud` only for a message from the signer's own session. `cloud_of` and
-/// `always` never. `Some` the answer applied, `None` when its hold was already answered or
-/// expired, or its nonce was seen (`not_open`). `Err` names the refusal (nothing changes, the
-/// nonce stays unused).
+/// What a decision is answered: `state` (`applied`, `not_open`, `refused`), the refusal's
+/// `reason`, and the answer when this copy applied it.
+#[derive(Debug)]
+pub struct Reply {
+    pub state: String,
+    pub reason: Option<String>,
+    pub closed: Option<Closed>,
+}
+
+impl Reply {
+    fn of(state: &str, reason: Option<&str>) -> Reply {
+        Reply {
+            state: state.into(),
+            reason: reason.map(Into::into),
+            closed: None,
+        }
+    }
+}
+
+/// Decision `f` from `signer`, on this computer (`me`), at `now`. `None` (left unanswered,
+/// it may heal) unless the signer is my own workspace's member (proof in force). Else `Some`:
+/// `refused bad_sig` unless its `sig` is the signer's; a nonce seen before gets the answer its
+/// first copy got (`refused bad_request` when it named another hold); else it is applied as the
+/// person's answer (`holds::answer`, by `bridge`) only if it was `decided_by` my person, its
+/// `holding_member` is me and its hold is mine (`not_mine`), its verdict and hold id are well
+/// formed (`bad_request`), and its scope fits (`scope`): `once` for any hold; `person` for a
+/// message from a computer member (on a cloud sender it would be `cloud_of`); `own_cloud`
+/// only for a message from the signer's own session; `cloud_of` and `always` never. A hold no
+/// longer open is `not_open`. That answer is kept by its nonce.
 pub fn accept(
     store: &Store,
     roster: &Roster,
@@ -253,41 +325,68 @@ pub fn accept(
     signer: &Member,
     f: &Frame,
     now: i64,
-) -> Result<std::result::Result<Option<Closed>, &'static str>> {
+) -> Result<Option<Reply>> {
+    let Frame::Decision { hold_id, nonce, .. } = f else {
+        return Ok(None);
+    };
+    if !policy::my_workspace(roster, &me.key, signer) {
+        return Ok(None);
+    }
+    let refused = |why| Ok(Some(Reply::of(REFUSED, Some(why))));
+    if !admission::signed_by(&signer.key, f) {
+        return refused("bad_sig");
+    }
+    let seen = format!("{DECISION}{nonce}");
+    if let Some((kept, _)) = store.seen_state(&signer.key, &seen)? {
+        let kept: Value = serde_json::from_str(&kept).unwrap_or_default();
+        if kept["hold"] != hold_id.as_str() {
+            return refused("bad_request");
+        }
+        let state = kept["state"].as_str().unwrap_or(NOT_OPEN);
+        return Ok(Some(Reply::of(state, kept["reason"].as_str())));
+    }
+    let reply = judge(store, roster, me, signer, f, now)?;
+    let kept = json!({"hold": hold_id, "state": reply.state, "reason": reply.reason});
+    store.put_seen(&signer.key, &seen, &kept.to_string(), now)?;
+    Ok(Some(reply))
+}
+
+/// `accept`'s rules past the signer and the nonce.
+fn judge(
+    store: &Store,
+    roster: &Roster,
+    me: &Identity,
+    signer: &Member,
+    f: &Frame,
+    now: i64,
+) -> Result<Reply> {
     let Frame::Decision {
         hold_id,
         holding_member,
         verdict,
         scope,
         decided_by,
-        nonce,
         ..
     } = f
     else {
-        return Ok(Err("not a decision"));
+        return Ok(Reply::of(REFUSED, Some("bad_request")));
     };
-    if !admission::signed_by(&signer.key, f) {
-        return Ok(Err("signature"));
-    }
-    if !policy::my_workspace(roster, &me.key, signer) {
-        return Ok(Err("not my workspace's member"));
-    }
+    let refused = |why| Ok(Reply::of(REFUSED, Some(why)));
     if *holding_member != me.key
         || Some(decided_by) != roster.members.get(&me.key).map(|m| &m.person_id)
     {
-        return Ok(Err("not for me"));
+        return refused("not_mine");
     }
-    let allow = match verdict.as_str() {
+    let (allow, Some(n)) = (verdict.as_str(), dialog::number(hold_id, 'H')) else {
+        return refused("bad_request");
+    };
+    let allow = match allow {
         ALLOW => true,
         DECLINE => false,
-        _ => return Ok(Err("verdict")),
+        _ => return refused("bad_request"),
     };
-    let Some(h) = dialog::number(hold_id, 'H')
-        .map(|n| holds::get(store, n))
-        .transpose()?
-        .flatten()
-    else {
-        return Ok(Err("no such hold"));
+    let Some(h) = holds::get(store, n)? else {
+        return refused("not_mine");
     };
     let sender = roster.members.get(&h.from_member);
     let fits = match scope.as_str() {
@@ -297,26 +396,30 @@ pub fn accept(
         _ => false,
     };
     if !fits {
-        return Ok(Err("scope"));
+        return refused("scope");
     }
-    let seen = format!("{DECISION}{nonce}");
-    if store.seen_state(&signer.key, &seen)?.is_some() {
-        return Ok(Ok(None));
-    }
-    let r = holds::answer(store, roster, me, h.id, allow, Some(scope), "bridge", now)?;
-    let out = match r {
-        Ok(c) => Some(c),
-        Err(NOT_OPEN) => None,
-        Err(_) => return Ok(Err("scope")),
-    };
-    store.put_seen(&signer.key, &seen, "decision", now)?;
-    Ok(Ok(out))
+    Ok(
+        match holds::answer(store, roster, me, h.id, allow, Some(scope), "bridge", now)? {
+            Ok(c) => Reply {
+                closed: Some(c),
+                ..Reply::of(APPLIED, None)
+            },
+            Err(NOT_OPEN) => Reply::of(NOT_OPEN, None),
+            Err(_) => return refused("scope"),
+        },
+    )
 }
 
-/// On a computer: `accept` under the daemon's locks; an applied or spent decision is acked.
+/// On a computer: `accept` under the daemon's locks, and its answer acked.
 fn on_decision(d: &Arc<Daemon>, key: &str, f: &Frame, tx: &UnboundedSender<Frame>) -> bool {
     let Frame::Decision { hold_id, nonce, .. } = f else {
         return false;
+    };
+    // The peer chose it: logged only in its shape.
+    let hold = if dialog::number(hold_id, 'H').is_some() {
+        hold_id.as_str()
+    } else {
+        "<bad id>"
     };
     let r = {
         let team = d.team.lock().unwrap();
@@ -324,34 +427,33 @@ fn on_decision(d: &Arc<Daemon>, key: &str, f: &Frame, tx: &UnboundedSender<Frame
             return false;
         };
         let store = d.store.lock().unwrap();
-        accept(
-            &store,
-            &team.roster,
-            &d.identity,
-            signer,
-            f,
-            ipc::now() as i64,
-        )
+        let now = ipc::now() as i64;
+        accept(&store, &team.roster, &d.identity, signer, f, now)
     };
-    let (state, closed) = match r {
-        Ok(Ok(Some(c))) => (APPLIED, Some(c)),
-        Ok(Ok(None)) => (NOT_OPEN, None),
-        Ok(Err(why)) => {
+    let reply = match r {
+        Ok(Some(reply)) => reply,
+        Ok(None) => {
             eprintln!(
-                "hold {hold_id}: refused a decision from {} ({why})",
+                "hold {hold}: a decision from {}, not my workspace's member (yet)",
                 short(key)
             );
             return true;
         }
         Err(e) => {
-            eprintln!("hold {hold_id}: a decision from {}: {e}", short(key));
+            eprintln!("hold {hold}: a decision from {}: {e}", short(key));
             return true;
         }
     };
-    eprintln!("hold {hold_id}: decision from {}: {state}", short(key));
-    let _ = tx.send(ack(format!("{DECISION}{nonce}"), state));
-    if let Some(c) = closed {
-        holds::after(d, &c, "bridge");
+    let why = reply.reason.as_deref();
+    eprintln!(
+        "hold {hold}: decision from {}: {} {}",
+        short(key),
+        reply.state,
+        why.unwrap_or("")
+    );
+    let _ = tx.send(ack(format!("{DECISION}{nonce}"), &reply.state, why));
+    if let Some(c) = &reply.closed {
+        holds::after(d, c, "bridge");
     }
     true
 }

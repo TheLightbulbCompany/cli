@@ -26,6 +26,8 @@ const Q: &str = "p-quinn";
 struct World {
     b: Env,
     a: Identity,
+    /// R's computer ("mbc") in W2, played.
+    c: Identity,
     w1: tempfile::TempDir,
     w2: tempfile::TempDir,
 }
@@ -41,10 +43,16 @@ async fn played(who: &Identity, env: &Env) -> (Peer, iroh::Endpoint) {
 
 /// The world, holder B signed into `holder_ws` (`None`: a free user).
 fn world(holder_ws: Option<&str>) -> World {
+    world_at(holder_ws, now_s())
+}
+
+/// `world`, W1's member's proof issued at `iat` (two days back: lapsed).
+fn world_at(holder_ws: Option<&str>, iat: i64) -> World {
     let b = Env::new();
     let (w1, w2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let id = |d: &tempfile::TempDir| Identity::load_or_create(d.path()).unwrap();
     let (ib, ia, iw1, iw2) = (b.identity(), common::identity(), id(&w1), id(&w2));
+    let ic = common::identity();
     let g = Entry::signed(
         &ib,
         vec![],
@@ -62,12 +70,26 @@ fn world(holder_ws: Option<&str>) -> World {
         json!({"person_id": P, "computer": "mac",
             "proof": person_proof(&ia, P, "Prasiddha", Some("W1"))}),
     );
-    let ws = |who: &Identity, id: &str, name: &str| {
+    let ws = |who: &Identity, id: &str, name: &str, iat| {
         json!({"kind": "cloud", "person_id": format!("ws:{id}"),
-            "proof": common::ws_proof(who, id, name)})
+            "proof": common::issuer::workspace_proof(&who.key, id, name, &[], iat)})
     };
-    let e2 = admit(&ib, &e1, &iw1, NAME, ws(&iw1, "W1", NAME));
-    let e3 = admit(&ib, &e2, &iw2, "Other Co", ws(&iw2, "W2", "Other Co"));
+    let e2 = admit(&ib, &e1, &iw1, NAME, ws(&iw1, "W1", NAME, iat));
+    let e3 = admit(
+        &ib,
+        &e2,
+        &iw2,
+        "Other Co",
+        ws(&iw2, "W2", "Other Co", now_s()),
+    );
+    let e4 = admit(
+        &ib,
+        &e3,
+        &ic,
+        "rae",
+        json!({"person_id": "p-rae", "computer": "mbc",
+            "proof": person_proof(&ic, "p-rae", "Rae", Some("W2"))}),
+    );
     for d in [&w1, &w2] {
         std::fs::set_permissions(
             d.path(),
@@ -81,11 +103,17 @@ fn world(holder_ws: Option<&str>) -> World {
         Store::open(&w2.path().join("state.db")).unwrap(),
     ];
     for s in &stores {
-        for e in [&g, &e1, &e2, &e3] {
+        for e in [&g, &e1, &e2, &e3, &e4] {
             roster::accept(s, e, 10).unwrap();
         }
     }
-    World { b, a: ia, w1, w2 }
+    World {
+        b,
+        a: ia,
+        c: ic,
+        w1,
+        w2,
+    }
 }
 
 impl World {
@@ -219,14 +247,29 @@ fn nonce_of(f: &Frame) -> String {
 
 /// The ack of decision `f`: its state.
 async fn decision_ack(p: &mut Peer, f: &Frame) -> String {
+    let (state, reason) = ack_of(p, f).await;
+    assert_eq!(reason, None);
+    state
+}
+
+/// The ack of decision `f`: its state and reason.
+async fn ack_of(p: &mut Peer, f: &Frame) -> (String, Option<String>) {
     let want = format!("dc:{}", nonce_of(f));
     match p
         .recv_where(|x| matches!(x, Frame::Ack { id, .. } if *id == want))
         .await
     {
-        Frame::Ack { state, .. } => state,
+        Frame::Ack { state, reason, .. } => (state, reason),
         _ => unreachable!(),
     }
+}
+
+/// Decision `f` sent by `p` is refused for `why`, acked, its hold `hold` still open.
+async fn refused(w: &World, p: &mut Peer, f: &Frame, hold: &str, why: &str) {
+    p.send(f).await;
+    let got = ack_of(p, f).await;
+    assert_eq!(got, ("refused".into(), Some(why.into())));
+    assert_eq!(hold_state(&w.b, hold), "open");
 }
 
 /// The next hold notice `p` gets, if one comes within `secs`.
@@ -239,8 +282,8 @@ async fn notice(p: &mut Peer, secs: u64) -> Option<Frame> {
     .ok()
 }
 
-/// A decision `f` sent by `p` is refused: no ack in a second, the hold still open.
-async fn refused(w: &World, p: &mut Peer, f: &Frame, hold: &str) {
+/// A decision `f` sent by `p` is left unanswered: no ack in a second, the hold still open.
+async fn unanswered(w: &World, p: &mut Peer, f: &Frame, hold: &str) {
     p.send(f).await;
     let want = format!("dc:{}", nonce_of(f));
     let acked = tokio::time::timeout(
@@ -254,7 +297,7 @@ async fn refused(w: &World, p: &mut Peer, f: &Frame, hold: &str) {
 
 /// The next instance event called `name`.
 async fn event(rx: &mut Receiver<Value>, name: &str) -> Value {
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let v = rx.recv().await.unwrap();
             if v["event"] == name {
@@ -332,7 +375,10 @@ async fn decision_from_another_workspaces_member_is_refused() {
     w.held_from(&mut pa, &format!("{}/codex:a1", w.a.short), 1)
         .await;
     let d = decision(&w.w2_id(), &w.b, "H1", "once", Q);
-    refused(&w, &mut other, &d, "H1").await;
+    unanswered(&w, &mut other, &d, "H1").await;
+    // A computer signer: never served.
+    let d = decision(&w.a, &w.b, "H1", "once", Q);
+    unanswered(&w, &mut pa, &d, "H1").await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -345,13 +391,16 @@ async fn decision_decided_by_another_person_is_refused() {
         .await;
     // P is a W1 teammate, not the holding computer's person.
     let d = decision(&w.w1_id(), &w.b, "H1", "once", P);
-    refused(&w, &mut m, &d, "H1").await;
+    refused(&w, &mut m, &d, "H1", "not_mine").await;
     // Unsigned (signed by someone else) is refused too.
     let mut forged = decision(&w.w2_id(), &w.b, "H1", "once", Q);
     if let Frame::Decision { holding_member, .. } = &mut forged {
         assert_eq!(*holding_member, w.b.identity().key);
     }
-    refused(&w, &mut m, &forged, "H1").await;
+    refused(&w, &mut m, &forged, "H1", "bad_sig").await;
+    // A hold id that exists only on another computer.
+    let d = decision(&w.w1_id(), &w.b, "H9", "once", Q);
+    refused(&w, &mut m, &d, "H1", "not_mine").await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -392,11 +441,11 @@ async fn relayed_cloud_of_is_refused() {
         .await;
     for scope in ["cloud_of", "always"] {
         let d = decision(&w.w1_id(), &w.b, "H1", scope, Q);
-        refused(&w, &mut m, &d, "H1").await;
+        refused(&w, &mut m, &d, "H1", "scope").await;
     }
     // Nor `person` on another workspace's member: it would be `cloud_of`.
     let d = decision(&w.w1_id(), &w.b, "H1", "person", Q);
-    refused(&w, &mut m, &d, "H1").await;
+    refused(&w, &mut m, &d, "H1", "scope").await;
     assert_eq!(people(&w.b)["cloud_of"], json!({}));
 }
 
@@ -411,15 +460,18 @@ async fn replayed_nonce_is_refused() {
     let d = decision(&w.w1_id(), &w.b, "H1", "once", Q);
     m.send(&d).await;
     assert_eq!(decision_ack(&mut m, &d).await, "applied");
-    // The same frame again: acked, not applied.
+    // The same frame again (its ack was lost): the same answer, applied once.
     m.send(&d).await;
-    assert_eq!(decision_ack(&mut m, &d).await, "not_open");
-    // Its nonce on another hold: not applied either.
+    assert_eq!(decision_ack(&mut m, &d).await, "applied");
+    assert_eq!(w.b.unread(&w.target()), 1);
+    // Its nonce on another hold: refused, not applied.
     w.held_from(&mut pa, &from, 1).await;
     let again = decision_with(&w.w1_id(), &w.b, "H2", "once", Q, &nonce_of(&d));
-    m.send(&again).await;
-    assert_eq!(decision_ack(&mut m, &again).await, "not_open");
-    assert_eq!(hold_state(&w.b, "H2"), "open");
+    refused(&w, &mut m, &again, "H2", "bad_request").await;
+    // A refusal is kept too: its copy is refused the same.
+    let bad = decision(&w.w1_id(), &w.b, "H2", "cloud_of", Q);
+    refused(&w, &mut m, &bad, "H2", "scope").await;
+    refused(&w, &mut m, &bad, "H2", "scope").await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -432,7 +484,7 @@ async fn own_cloud_scope_only_for_the_members_own_session() {
     w.held_from(&mut pa, &format!("{}/codex:a1", w.a.short), 1)
         .await;
     let d = decision(&w.w1_id(), &w.b, "H1", "own_cloud", Q);
-    refused(&w, &mut m, &d, "H1").await;
+    refused(&w, &mut m, &d, "H1", "scope").await;
     let d = decision(&w.w1_id(), &w.b, "H1", "person", Q);
     m.send(&d).await;
     assert_eq!(decision_ack(&mut m, &d).await, "applied");
@@ -575,10 +627,11 @@ async fn decision_reaches_a_holder_that_was_offline() {
     assert_eq!(hold_state(&w.b, "H1"), "allowed");
     assert_eq!(w.b.unread(&w.target()), 1);
     i.shutdown().await;
-    // A second copy of the same decision: acked `not_open`, nothing more delivered.
+    // A second copy of the same decision (its ack lost): acked `applied` again, nothing more
+    // delivered.
     let (mut m, _e1) = played(&w.w1_id(), &w.b).await;
     m.send(&copy).await;
-    assert_eq!(decision_ack(&mut m, &copy).await, "not_open");
+    assert_eq!(decision_ack(&mut m, &copy).await, "applied");
     assert_eq!(w.b.unread(&w.target()), 1);
 }
 
@@ -683,4 +736,155 @@ fn next_event(r: &mut std::io::BufReader<std::os::unix::net::UnixStream>, name: 
             return v;
         }
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lapsed_member_is_left_unanswered() {
+    let w = world_at(Some("W1"), now_s() - 2 * 86_400);
+    w.b.daemon(false, "", &[]);
+    let (mut m, _e1) = played(&w.w1_id(), &w.b).await;
+    let (mut pa, _e2) = played(&w.a, &w.b).await;
+    w.held_from(&mut pa, &format!("{}/codex:a1", w.a.short), 1)
+        .await;
+    // No workspace member in force: no notice, and its decisions may heal, so no answer.
+    assert!(notice(&mut m, 1).await.is_none());
+    let d = decision(&w.w1_id(), &w.b, "H1", "once", Q);
+    unanswered(&w, &mut m, &d, "H1").await;
+}
+
+/// A signed notice from `who` (member `short`'s computer `computer`) for `for_person`.
+fn notice_from(who: &Identity, computer: &str, for_person: &str) -> Frame {
+    admission::signed(
+        who,
+        Frame::HoldNotice {
+            hold_id: "H1".into(),
+            kind: "message".into(),
+            holding_computer: computer.into(),
+            for_person: for_person.into(),
+            target_session: format!("{}/codex:x", who.short),
+            from: format!("{}/codex:y", who.short),
+            label: "Someone's Codex".into(),
+            preview: String::new(),
+            created_at: now_s(),
+            sig: String::new(),
+        },
+    )
+}
+
+/// `who` played by the test, connected to the instance at `addr`.
+async fn dial(addr: &iroh::EndpointAddr, who: &Identity) -> (Peer, iroh::Endpoint) {
+    let ep = endpoint(who).await;
+    let conn = ep
+        .connect(addr.clone(), lightbulb_connect::net::ALPN)
+        .await
+        .unwrap();
+    let (send, recv) = conn.open_bi().await.unwrap();
+    let mut p = Peer { conn, send, recv };
+    p.hello(vec![]).await;
+    (p, ep)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_instance_drops_notices_not_from_its_own_persons_computers() {
+    let w = world(Some("W1"));
+    w.b.daemon(false, "", &[]);
+    let (i, mut rx) = w.instance(&[]).await;
+    let port = call(&i, "status", json!({})).await["port"]
+        .as_u64()
+        .unwrap();
+    let key = lightbulb_connect::identity::key_bytes(&w.w1_id().key).unwrap();
+    let addr = iroh::EndpointAddr::new(iroh::PublicKey::from_bytes(&key).unwrap())
+        .with_ip_addr(format!("127.0.0.1:{port}").parse().unwrap());
+
+    // R's computer in W2; P's computer naming Q; P's computer under another computer's name.
+    let (mut pc, _e1) = dial(&addr, &w.c).await;
+    pc.send(&notice_from(&w.c, "mbc", "p-rae")).await;
+    let (mut pa, _e2) = dial(&addr, &w.a).await;
+    pa.send(&notice_from(&w.a, "mac", Q)).await;
+    pa.send(&notice_from(&w.a, "mbp", P)).await;
+    // The one that is P's own, for P: the only event.
+    pa.send(&notice_from(&w.a, "mac", P)).await;
+    let e = event(&mut rx, "hold_notice").await;
+    assert_eq!(
+        (e["holding_member"].as_str(), e["for_person"].as_str()),
+        (Some(w.a.key.as_str()), Some(P))
+    );
+    let dropped = call(&i, "status", json!({})).await["dropped"]["hold_notice"].clone();
+    assert_eq!(dropped, 3, "{dropped}");
+    i.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusal_reaches_decision_result() {
+    let w = world(Some("W1"));
+    w.b.daemon(false, "", &[]);
+    let (i, mut rx) = w.instance(&[]).await;
+    let (mut pa, _e) = played(&w.a, &w.b).await;
+    w.held_from(&mut pa, &format!("{}/codex:a1", w.a.short), 1)
+        .await;
+    event(&mut rx, "hold_notice").await;
+    // `own_cloud` on a teammate's message.
+    let r = call(
+        &i,
+        "decision.send",
+        json!({"hold_id": "H1", "holding_member": w.b.identity().key, "verdict": "allow",
+            "scope": "own_cloud", "decided_by": Q}),
+    )
+    .await;
+    assert_eq!(r["ok"], true, "{r}");
+    let e = event(&mut rx, "decision_result").await;
+    assert_eq!(
+        (
+            e["hold_id"].as_str(),
+            e["result"].as_str(),
+            e["reason"].as_str()
+        ),
+        (Some("H1"), Some("refused"), Some("scope"))
+    );
+    assert_eq!(hold_state(&w.b, "H1"), "open");
+    // Answered: no longer pending.
+    assert_eq!(
+        call(&i, "holds.pending", json!({})).await["notices"],
+        json!([])
+    );
+    i.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_notice_no_one_heard_is_not_acked_and_stays_pending() {
+    let w = world(Some("W1"));
+    w.b.daemon(false, "", &[]);
+    // No subscriber yet.
+    let i = common::instance(
+        w.w1.path(),
+        &[&w.b],
+        NAME,
+        "http://127.0.0.1:9/connect",
+        None,
+        &[],
+    )
+    .await
+    .unwrap();
+    online(&i).await;
+    let (mut pa, _e) = played(&w.a, &w.b).await;
+    w.held_from(&mut pa, &format!("{}/codex:a1", w.a.short), 1)
+        .await;
+    let mut pending = json!([]);
+    for _ in 0..250 {
+        pending = call(&i, "holds.pending", json!({})).await["notices"].clone();
+        if pending != json!([]) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(pending[0]["hold_id"], "H1", "{pending}");
+    let db = w.b.state.path().join("state.db");
+    let unacked = "SELECT COUNT(*) FROM outbox WHERE message_id = 'hn:H1'";
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(count(&db, unacked), 1, "not acked without a subscriber");
+    // The bridge attaches: the holder's next try is heard and acked.
+    let mut rx = i.events();
+    assert_eq!(event(&mut rx, "hold_notice").await["hold_id"], "H1");
+    until(5, "acked", || count(&db, unacked) == 0);
+    i.shutdown().await;
 }
