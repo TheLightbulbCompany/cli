@@ -75,11 +75,14 @@ const V4: &str = "ALTER TABLE holds ADD COLUMN shown TEXT;";
 /// Which loop limit a `loop` refusal hit (`mail::HOPS`, `mail::RATE`), when known.
 const V5: &str = "ALTER TABLE receipts ADD COLUMN \"limit\" TEXT;";
 /// A session's repo and branch as its hook read them (the daemon never reads a session's
-/// folder), its `who` handle, and the index a mailbox's reply-window query reads by.
+/// folder), its `who` handle, the sessions registered under a hidden folder (kept out of
+/// discovery too), and the index a mailbox's reply-window query reads by.
+/// (Edited in place while unreleased: no installed build has written V6.)
 const V6: &str = "
 ALTER TABLE sessions ADD COLUMN repo TEXT;
 ALTER TABLE sessions ADD COLUMN branch TEXT;
 ALTER TABLE sessions ADD COLUMN handle TEXT;
+CREATE TABLE IF NOT EXISTS hidden_sessions (key TEXT PRIMARY KEY);
 CREATE INDEX IF NOT EXISTS messages_to_sent ON messages (to_key, sent_at);
 ";
 
@@ -214,6 +217,24 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    /// Marks `key` as registered under a hidden folder (`hidden`), or no longer.
+    pub fn set_hidden(&self, key: &str, hidden: bool) -> rusqlite::Result<()> {
+        let sql = if hidden {
+            "INSERT OR IGNORE INTO hidden_sessions VALUES (?1)"
+        } else {
+            "DELETE FROM hidden_sessions WHERE key = ?1"
+        };
+        self.conn.execute(sql, [key])?;
+        Ok(())
+    }
+
+    /// The keys `set_hidden` marked.
+    pub fn hidden_keys(&self) -> rusqlite::Result<std::collections::HashSet<String>> {
+        let mut stmt = self.conn.prepare("SELECT key FROM hidden_sessions")?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        rows.collect()
     }
 
     /// `key`'s row, unless it ended.
