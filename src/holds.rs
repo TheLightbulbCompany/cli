@@ -342,6 +342,7 @@ pub fn answer(
         "UPDATE holds SET state = ?2 WHERE id = ?1",
         params![id, state],
     )?;
+    crate::decision::withdraw(store, &c.hold.name())?;
     if c.hold.kind() == Kind::Message {
         let (f, rid, at) = (&m.from_key, &m.request_id, now as u64);
         if allow {
@@ -407,6 +408,7 @@ pub fn expire(store: &Store, now: i64) -> Result<Vec<Hold>> {
         store
             .conn()
             .execute("UPDATE holds SET state = 'expired' WHERE id = ?1", [h.id])?;
+        crate::decision::withdraw(store, &h.name())?;
         if h.kind() == Kind::Message {
             let m = &h.message;
             let (f, rid) = (&m.from_key, &m.request_id);
@@ -446,6 +448,7 @@ pub fn shown(d: &Daemon, roster: &Roster, store: &Store, h: &Hold) {
         .events
         .send(json!({"event": "held", "id": h.name(), "kind": h.kind(),
         "target_session": h.target_session, "from": h.from_session, "label": who}));
+    crate::decision::notify(d, roster, store, h, &who);
     let args = dialog::args("Lightbulb Connect", &text, &buttons);
     d.dialogs.show(&h.name(), args);
     eprintln!("hold {}: open", h.name());
@@ -475,16 +478,22 @@ fn answer_here(
         answer(&store, &team.roster, &d.identity, id, allow, scope, by, now)?
     };
     if let Ok(c) = &r {
-        closed(d, &c.hold, c.verdict(), Some(by));
-        if allow && c.hold.kind() == Kind::Message {
-            ipc::stored(
-                d,
-                &Key(c.hold.message.to_key.clone()),
-                Some(&c.hold.message.id),
-            );
-        }
+        after(d, c, by);
     }
     Ok(r)
+}
+
+/// The daemon's side of an answer `by` someone (outside the locks): `closed`, and an allowed
+/// message pushed.
+pub(crate) fn after(d: &Arc<Daemon>, c: &Closed, by: &str) {
+    closed(d, &c.hold, c.verdict(), Some(by));
+    if c.allow && c.hold.kind() == Kind::Message {
+        ipc::stored(
+            d,
+            &Key(c.hold.message.to_key.clone()),
+            Some(&c.hold.message.id),
+        );
+    }
 }
 
 /// Expires what is due (`expire`) and closes their dialogs; from the 60 s mail timer.

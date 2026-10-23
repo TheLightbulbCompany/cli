@@ -605,19 +605,32 @@ pub fn policy(person: Option<String>, value: Option<String>) -> Result<i32> {
             return Ok(2);
         }
     };
-    let by = |key: String| match p["set_by"][&key].as_str() {
-        Some("bridge") => "  (set_by: bridge)",
-        _ => "",
+    // A row the bridge set is a relayed Allow: `Allowed <name> from your phone`.
+    let team = ask(&mut conn, "team.get", json!({}))?;
+    let name_of = |pid: &str| {
+        let ms = team["members"].as_array().into_iter().flatten();
+        let named = ms
+            .filter(|m| m["person_id"] == pid)
+            .find_map(|m| m["name"].as_str());
+        cell(named.unwrap_or(pid))
+    };
+    let by = |key: String, who: Option<&str>| match p["set_by"][&key].as_str() {
+        Some("bridge") => match who {
+            Some(pid) => format!("  (Allowed {} from your phone)", name_of(pid)),
+            None => "  (allowed from your phone)".into(),
+        },
+        _ => String::new(),
     };
     let on = p["agents_send_without_asking"] == true;
     println!(
         "agents_send_without_asking: {on}{}",
-        by(crate::policy::SWITCH.into())
+        by(crate::policy::SWITCH.into(), None)
     );
     for scope in ["people", "cloud_of"] {
         for (pid, v) in p[scope].as_object().into_iter().flatten() {
             let v = v.as_str().unwrap_or_default();
-            println!("{scope} {}: {v}{}", cell(pid), by(format!("{scope}:{pid}")));
+            let set = by(format!("{scope}:{pid}"), Some(pid));
+            println!("{scope} {}: {v}{set}", cell(pid));
         }
     }
     Ok(0)

@@ -139,19 +139,30 @@ pub enum Frame {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         limit: Option<String>,
     },
+    /// A computer's new hold, to its own workspace's member only (`decision`): ids and the
+    /// sender's label, never text (`preview` always empty). Signed by the holder.
     HoldNotice {
         hold_id: String,
+        /// `message` or `permission`.
+        kind: String,
+        holding_computer: String,
+        /// The holding computer's `person_id`.
+        for_person: String,
         target_session: String,
         from: String,
-        from_label_parts: Vec<String>,
+        label: String,
         preview: String,
         created_at: i64,
+        sig: String,
     },
+    /// The person's tap on a hold notice, from the workspace member (`decision`); `decided_by`
+    /// the person who tapped, covered by `sig`.
     Decision {
         hold_id: String,
         holding_member: String,
         verdict: String,
         scope: String,
+        decided_by: String,
         nonce: String,
         decided_at: i64,
         sig: String,
@@ -238,8 +249,11 @@ pub async fn read(recv: &mut (impl AsyncRead + Unpin)) -> Result<Frame> {
 /// names a state past `queued`, with a known reason exactly when it is `refused`, and a `limit`
 /// only on a `loop` refusal (that it is bound to this member is `outbox::acked`'s check). A
 /// `join_request` or `join_decision` comes from a computer member. A `share_grant` passes
-/// `streams::grant_ok`. A `stream` never rides the control stream. Task 14 adds the rules for
-/// the frames it serves, and until then every other kind is dropped. `Err` names the check.
+/// `streams::grant_ok`. A `hold_notice` comes from a computer member, with no preview; a
+/// `decision` from a cloud member (`decision` checks the rest). An `ack` of a notice or a
+/// decision (`decision::is_control` ids) carries `decision::ack_ok`'s states only, and a
+/// `receipt` never names one. A `stream` never rides the control stream. `Err` names the
+/// check.
 pub fn from_peer_ok(
     f: &Frame,
     peer: &Member,
@@ -253,6 +267,21 @@ pub fn from_peer_ok(
         Frame::JoinRequest { .. } | Frame::JoinDecision { .. } => {
             check(peer.kind == MemberKind::Computer, "join")
         }
+        Frame::Ack {
+            id,
+            state,
+            reason,
+            limit,
+        } if crate::decision::is_control(id) => check(
+            crate::decision::ack_ok(id, state) && reason.is_none() && limit.is_none(),
+            "state",
+        ),
+        Frame::Receipt { id, .. } if crate::decision::is_control(id) => Err("state"),
+        Frame::HoldNotice { preview, .. } => check(
+            peer.kind == MemberKind::Computer && preview.is_empty(),
+            "hold_notice",
+        ),
+        Frame::Decision { .. } => check(peer.kind == MemberKind::Cloud, "decision"),
         Frame::Ack {
             state,
             reason,

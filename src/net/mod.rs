@@ -792,7 +792,7 @@ impl Net {
         let mut synced = false;
         let mut hello_ok = false;
         let (mut presence, mut envelope, mut answer) = (None, None, None);
-        let (mut grant, mut join) = (None, None);
+        let (mut grant, mut join, mut relayed) = (None, None, None);
         if let Err(why) = frames::from_peer_ok(&f, peer, d) {
             d.peers.dropped(f.kind());
             eprintln!("net: dropped a {} frame from {short} ({why})", f.kind());
@@ -825,6 +825,8 @@ impl Net {
             grant = Some(f);
         } else if matches!(f, Frame::JoinRequest { .. } | Frame::JoinDecision { .. }) {
             join = Some(f);
+        } else if matches!(f, Frame::HoldNotice { .. } | Frame::Decision { .. }) {
+            relayed = Some(f);
         } else if matches!(f, Frame::Ack { .. }) && d.peers.knobs().drop_acks {
             eprintln!("net: dropped an ack from {short} (debug)");
         } else if let Frame::Ack {
@@ -864,12 +866,20 @@ impl Net {
         if let Some(env) = envelope.filter(|_| d.peers.speaks_ours(key, conn)) {
             receive(d, key, &env, tx);
         }
+        if let Some(f) = relayed.filter(|_| d.peers.speaks_ours(key, conn)) {
+            crate::decision::on_frame(d, key, &f, tx);
+        }
         if let Some(g) = grant.filter(|_| d.peers.speaks_ours(key, conn)) {
             if let Err(e) = crate::streams::store(&d.store.lock().unwrap(), &g, ipc::now() as i64) {
                 eprintln!("net: a share_grant from {short}: {e}");
             }
         }
-        if let Some((id, state, reason, limit)) = answer {
+        if let Some((id, state, ..)) = answer
+            .as_ref()
+            .filter(|a| crate::decision::is_control(&a.0))
+        {
+            crate::decision::acked(d, key, id, state);
+        } else if let Some((id, state, reason, limit)) = answer {
             let store = d.store.lock().unwrap();
             let state = State::parse(&state).expect("checked by from_peer_ok");
             let (reason, limit) = (reason.as_deref(), limit.as_deref());
@@ -985,6 +995,7 @@ fn flush(d: &Daemon, all: bool, expire: bool) -> Result<()> {
             outbox::sent(&store, &id, now)?;
         }
     }
+    crate::decision::flush(d, &store, &online, all, now)?;
     for (member, f) in outbox::receipts(&store)? {
         let Frame::Receipt { id, state, .. } = &f else {
             continue;

@@ -197,6 +197,7 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
         "inbox" if instance => crate::embed::inbox(id, body, daemon),
         "cloud.sessions.set" => super::net_ops::cloud_sessions_set(id, body, daemon).await,
         "app.send" | "app.inbox" | "app.receipt" => crate::app_send::op(id, op, body, daemon).await,
+        "decision.send" => crate::decision::op(id, body, daemon),
         "status" => {
             let t = daemon.team.lock().unwrap();
             let me = &daemon.identity.key;
