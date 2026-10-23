@@ -650,12 +650,21 @@ fn run(id: u64, op: &str, body: &Value, d: &Arc<Daemon>) -> Result<Response> {
             let now = ipc::now() as i64;
             if let Some(on) = body["agents_send_without_asking"].as_bool() {
                 policy::set_switch(&store, on, "local", now)?;
+            } else if body["value"] == "forget" {
+                let Some(pid) = body["person_id"].as_str() else {
+                    return Ok(Response::err(id, BAD_REQUEST));
+                };
+                policy::forget(&store, pid)?;
             } else {
                 let value = body["value"].as_str().and_then(Verdict::parse);
                 let (Some(pid), Some(v)) = (body["person_id"].as_str(), value) else {
                     return Ok(Response::err(id, BAD_REQUEST));
                 };
                 let r = &team.roster;
+                // My own person is always accepted (`decide`): a row would only mislead.
+                if r.members.get(me).is_some_and(|m| m.person_id == pid) {
+                    return Ok(Response::err(id, "own_person"));
+                }
                 match r.members.values().find(|m| m.person_id == pid) {
                     Some(m) => policy::set(&store, r, me, m, v, "local", now)?,
                     None if pid.starts_with("ws:") => {

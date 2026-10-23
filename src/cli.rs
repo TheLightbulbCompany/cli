@@ -858,16 +858,27 @@ pub fn held() -> Result<i32> {
 pub fn policy(person: Option<String>, value: Option<String>) -> Result<i32> {
     if value
         .as_deref()
-        .is_some_and(|v| !["accept", "hold", "refuse"].contains(&v))
+        .is_some_and(|v| !["accept", "hold", "refuse", "forget"].contains(&v))
     {
         return Err("policy takes accept, hold or refuse.".into());
     }
     let mut conn = connect()?;
+    let me = conn.member()?;
     let team = ask(&mut conn, "team.get", json!({}))?;
     let members = team["members"].as_array().cloned().unwrap_or_default();
     let p = match (person, value) {
+        // An old row, stored under whatever it says: dropped as written.
+        (Some(who), Some(v)) if v == "forget" => ask(
+            &mut conn,
+            "policy.set",
+            json!({"person_id": who, "value": v}),
+        )?,
         (Some(who), Some(v)) => {
             let pid = policy_person(&members, &who)?;
+            let mine = members.iter().find(|m| m["short"] == me.as_str());
+            if mine.is_some_and(|m| m["person_id"] == pid.as_str()) {
+                return Err("That is you; your own computers always get through.".into());
+            }
             ask(
                 &mut conn,
                 "policy.set",
@@ -917,8 +928,19 @@ pub fn policy(person: Option<String>, value: Option<String>) -> Result<i32> {
                 Some("refuse") => "refused",
                 _ => "unknown",
             };
+            // A `people` row no member has: an old one, stored under a literal name.
+            let old = scope == "people" && !members.iter().any(|m| m["person_id"] == pid.as_str());
+            let old = if old {
+                format!(
+                    " (old entry — run: {} policy {} forget)",
+                    command(),
+                    cell(pid)
+                )
+            } else {
+                String::new()
+            };
             println!(
-                "Messages from {}: {v}.{}",
+                "Messages from {}: {v}.{old}{}",
                 name_of(pid),
                 by(format!("{scope}:{pid}"), Some(pid))
             );
@@ -1269,31 +1291,41 @@ pub fn daemon_install() -> Result<i32> {
     install_job(&home, &canonical(&home))
 }
 
-/// Stops whatever daemon answers this state dir's socket and waits (up to 10 s) for its
-/// process to exit: one launchd did not start (a hook's, during an upgrade) survives a
-/// bootout and would hold the lock against the new job.
-pub fn stop_daemon() {
+/// Stops the daemon that holds this state dir's lock (its pid is in `daemon.lock`): asks it
+/// over the socket when it answers, and waits up to 10 s for its process to exit either way
+/// (one still booting does not answer yet). One launchd did not start (a hook's, during an
+/// upgrade) survives a bootout and would hold the lock against the new job, so one that does
+/// not exit is an error: nothing is installed behind it.
+pub fn stop_daemon() -> Result<()> {
+    let alive = |pid: libc::pid_t| unsafe { libc::kill(pid, 0) } == 0;
     let pid = fs::read_to_string(paths::state_path().join("daemon.lock"))
         .ok()
         .and_then(|p| p.trim().parse::<libc::pid_t>().ok())
-        .filter(|p| *p > 0);
-    let Ok(mut conn) = Conn::open() else {
-        return;
-    };
-    let _ = conn.call("shutdown", json!({}));
+        .filter(|p| *p > 0 && alive(*p));
+    if let Ok(mut conn) = Conn::open() {
+        let _ = conn.call("shutdown", json!({}));
+    }
     let Some(pid) = pid else {
-        return;
+        return Ok(());
     };
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while unsafe { libc::kill(pid, 0) } == 0 && std::time::Instant::now() < deadline {
+    while alive(pid) && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(50));
     }
+    if alive(pid) {
+        let cmd = command();
+        return Err(format!(
+            "The old background service did not stop (pid {pid}). Run: kill {pid}, then {cmd} setup again."
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// Writes and loads the launchd job that runs `exe daemon`, after stopping the daemon that
 /// runs now (`stop_daemon`), so the one that answers after is `exe`'s.
 pub fn install_job(home: &Path, exe: &Path) -> Result<i32> {
-    stop_daemon();
+    stop_daemon()?;
     let path = plist_path(home);
     fs::create_dir_all(path.parent().unwrap())?;
     fs::write(&path, plist(exe, &paths::state_dir().join("daemon.log")))?;
@@ -1340,7 +1372,7 @@ pub fn daemon_uninstall() -> Result<i32> {
         _ => {}
     }
     // Stop a running daemon (the job is gone, so it will not come back); state stays.
-    stop_daemon();
+    stop_daemon()?;
     let state = paths::state_path();
     let shown = home()
         .ok()

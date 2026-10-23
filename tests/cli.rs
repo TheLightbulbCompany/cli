@@ -943,3 +943,61 @@ fn install_stops_the_running_daemon_first() {
         "the old daemon still runs"
     );
 }
+
+/// A daemon that holds the lock and does not exit (here one that never answers the socket)
+/// is reported, and no job is installed behind it.
+#[test]
+fn install_refuses_while_the_old_daemon_will_not_stop() {
+    let e = Env::new();
+    let mut stuck = Command::new("/bin/sleep").arg("60").spawn().unwrap();
+    std::fs::write(e.state.path().join("daemon.lock"), stuck.id().to_string()).unwrap();
+    let o = e.run(&["daemon", "--install"]);
+    let _ = stuck.kill();
+    let _ = stuck.wait();
+    assert_eq!(o.status.code(), Some(1));
+    let pid = stuck.id();
+    let text = err(&o);
+    assert!(
+        text.starts_with(&format!(
+            "The old background service did not stop (pid {pid}). Run: kill {pid}, then "
+        )) && text.trim_end().ends_with(" setup again."),
+        "{text}"
+    );
+    assert!(!out(&o).contains("Background service"), "{}", out(&o));
+}
+
+#[test]
+fn policy_refuses_your_own_person_and_forgets_an_old_row() {
+    let e = Env::new();
+    assert!(e.run(&["who"]).status.success());
+    let me = e.ask(json!({"id": 1, "op": "status"}))["member_key_short"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let o = e.person(&["policy", &me, "hold"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(
+        err(&o).trim(),
+        "That is you; your own computers always get through."
+    );
+    // A row an older build stored under a literal name is marked, and forgotten on request.
+    let store = lightbulb_connect::store::Store::open(&e.state.path().join("state.db")).unwrap();
+    lightbulb_connect::policy::set_person(
+        &store,
+        "aden",
+        lightbulb_connect::policy::Verdict::Hold,
+        "local",
+        1,
+    )
+    .unwrap();
+    let o = e.person(&["policy"]);
+    assert!(
+        out(&o).contains("Messages from aden: held for your Allow. (old entry — run: ")
+            && out(&o).contains(" policy aden forget)"),
+        "{}",
+        out(&o)
+    );
+    let o = e.person(&["policy", "aden", "forget"]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(!out(&o).contains("aden"), "{}", out(&o));
+}

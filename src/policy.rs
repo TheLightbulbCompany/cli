@@ -221,6 +221,15 @@ pub fn set_person(store: &Store, pid: &str, v: Verdict, by: &str, now: i64) -> R
     put(store, scope, pid, v.as_str(), by, now)
 }
 
+/// Drops the rows of `pid` (`policy <id> forget`): an old row stored under a literal name.
+pub fn forget(store: &Store, pid: &str) -> Result<()> {
+    store.conn().execute(
+        "DELETE FROM policy WHERE scope IN (?1, ?2) AND person_id = ?3",
+        params![PEOPLE, CLOUD_OF, pid],
+    )?;
+    Ok(())
+}
+
 fn put(store: &Store, scope: &str, pid: &str, value: &str, by: &str, now: i64) -> Result<()> {
     store.conn().execute(
         "INSERT OR REPLACE INTO policy VALUES (?1, ?2, ?3, ?4, ?5)",

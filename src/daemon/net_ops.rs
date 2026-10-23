@@ -657,7 +657,7 @@ impl TeamOps<'_> {
                 let replaced = invite == Invite::New && live.is_some();
                 let t = match live {
                     Some(l) if invite != Invite::New => {
-                        let hint = self.daemon.peers.relay_hint();
+                        let hint = self.daemon.peers.hints();
                         ticket::sign(identity, r, l.ticket_id, l.secret, mode, l.expires_at, hint)
                     }
                     _ => self.new_link(mode, invite.once())?,
@@ -717,7 +717,7 @@ impl TeamOps<'_> {
             mode,
             once,
             self.now,
-            self.daemon.peers.relay_hint(),
+            self.daemon.peers.hints(),
         );
         self.write(Kind::Link, ticket::link_body(&t, hashed.as_deref()))?;
         self.store.put_link(

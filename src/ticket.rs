@@ -26,6 +26,10 @@ pub struct Ticket {
     pub mode: String,
     pub inviter: String,
     pub relay_hint: String,
+    /// The inviter's direct addresses when it signed (`ip:port`, at most `net::MAX_ADDRS`):
+    /// what a joiner dials with no relay and no mDNS. Absent from older tickets.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub addrs: Vec<String>,
     pub members: Vec<String>,
     pub expires_at: i64,
     pub sig: String,
@@ -38,14 +42,15 @@ pub fn hash(secret: &str) -> String {
 
 /// A new ticket from `id` for a new link, and, for a `once` one, its secret's hash (what the
 /// link entry carries in place of the secret). `relay_hint` is the first relay in effect
-/// (`""` for none): a joiner dials through it before it knows its own list.
+/// (`""` for none): a joiner dials through it before it knows its own list; `addrs` this
+/// computer's direct addresses (`Peers::hints`).
 pub fn mint(
     id: &Identity,
     roster: &Roster,
     mode: &str,
     once: bool,
     now: i64,
-    relay_hint: String,
+    hints: (String, Vec<String>),
 ) -> (Ticket, Option<String>) {
     let secret = BASE64URL_NOPAD.encode(&rand::random::<[u8; 32]>());
     let ttl = if once { ONCE_S } else { REUSABLE_S };
@@ -57,7 +62,7 @@ pub fn mint(
         secret,
         mode,
         now + ttl,
-        relay_hint,
+        hints,
     );
     (t, hashed)
 }
@@ -71,7 +76,7 @@ pub fn sign(
     secret: String,
     mode: &str,
     expires_at: i64,
-    relay_hint: String,
+    (relay_hint, addrs): (String, Vec<String>),
 ) -> Ticket {
     // The inviter first, then the founder and admins, by key.
     let mut members = vec![id.key.clone()];
@@ -89,6 +94,7 @@ pub fn sign(
         mode: mode.into(),
         inviter: id.key.clone(),
         relay_hint,
+        addrs,
         members,
         expires_at,
         sig: String::new(),
@@ -194,7 +200,7 @@ mod tests {
             2,
         );
         let before = replay(&[g.clone(), ax.clone()]);
-        let (t, hashed) = mint(&x, &before, mode, once, 100, String::new());
+        let (t, hashed) = mint(&x, &before, mode, once, 100, (String::new(), vec![]));
         let l = Entry::signed(
             &x,
             vec![ax.hash()],
@@ -251,7 +257,7 @@ mod tests {
                 t.secret.clone(),
                 mode,
                 t.expires_at,
-                String::new(),
+                (String::new(), vec![]),
             )
         };
         assert!(verify(&forge(&f, "open"), &r).is_err());

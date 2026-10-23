@@ -513,7 +513,13 @@ impl Peer {
 
     pub async fn hello(&mut self, heads: Vec<String>) {
         let protocol = PROTOCOL;
-        self.send(&Frame::Hello { protocol, heads }).await;
+        let addrs = vec![];
+        self.send(&Frame::Hello {
+            protocol,
+            heads,
+            addrs,
+        })
+        .await;
     }
 
     /// The next frame `pred` holds for (the others are skipped), within 5 s.

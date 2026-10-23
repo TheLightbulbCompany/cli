@@ -105,6 +105,7 @@ async fn sync_sends_only_the_delta_in_pages() {
     let Frame::Hello {
         protocol,
         heads: a_heads,
+        ..
     } = p.recv().await
     else {
         panic!("hello first");
@@ -266,9 +267,14 @@ async fn removed_member_connection_is_closed_on_removal() {
 
     let o = a.detached(&[EXE, "remove", "bob"], "");
     assert!(o.status.success(), "{}", common::err(&o));
-    tokio::time::timeout(Duration::from_secs(2), p.conn.closed())
+    // Told first (the `remove`, nothing after it), then closed even though it never closes.
+    let mut p = p;
+    let told = entries_of(&p.pages().await);
+    assert_eq!(told.len(), 1, "{told:?}");
+    assert_eq!(told[0].kind, Kind::Remove);
+    tokio::time::timeout(Duration::from_secs(6), p.conn.closed())
         .await
-        .expect("closed within 2 s of the removal");
+        .expect("closed within 6 s of the removal");
     // A redial is refused.
     if let Ok(conn) = ep.connect(addr(&a), ALPN).await {
         tokio::time::timeout(Duration::from_secs(2), conn.closed())
@@ -313,6 +319,7 @@ async fn older_protocol_is_reported_not_served() {
     p.send(&Frame::Hello {
         protocol: 0,
         heads: vec![],
+        addrs: vec![],
     })
     .await;
     assert!(matches!(p.recv().await, Frame::Hello { .. }));
@@ -341,7 +348,10 @@ async fn two_members_on_one_computer_find_each_other() {
         a.status()["peers"] == connected && b.status()["peers"] == connected
     });
     let lan = a.status()["lan"].as_str().unwrap().to_string();
-    assert!(lan == "on" || lan == "blocked", "{lan}");
+    assert!(
+        ["on", "blocked", "no network"].contains(&lan.as_str()),
+        "{lan}"
+    );
     let log = std::fs::read_to_string(a.state.path().join("daemon.log")).unwrap();
     assert_eq!(lan == "blocked", log.contains("Local Network"), "{log}");
 }
@@ -390,4 +400,58 @@ async fn removed_member_is_told() {
         1,
         "{log}"
     );
+}
+
+/// The loopback file is private, names its daemon's pid, and goes when SIGTERM stops it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn loopback_file_is_withdrawn_on_sigterm() {
+    use std::os::unix::fs::MetadataExt;
+    let a = Env::new();
+    a.daemon(true, "", &[]);
+    let uid = unsafe { libc::getuid() };
+    let file =
+        std::path::PathBuf::from(format!("/tmp/lightbulb-connect-{uid}")).join(a.identity().key);
+    let pid: i32 = std::fs::read_to_string(a.state.path().join("daemon.lock"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let text = std::fs::read_to_string(&file).unwrap();
+    assert_eq!(text, format!("127.0.0.1:{} {pid}", a.status()["port"]));
+    assert_eq!(std::fs::metadata(&file).unwrap().mode() & 0o777, 0o600);
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    until(10, "the file is withdrawn", || !file.exists());
+    until(
+        10,
+        "the daemon exits",
+        || unsafe { libc::kill(pid, 0) } != 0,
+    );
+}
+
+/// A removed member that dials in again is told only its removal: never a link minted (with
+/// its secret) or a member admitted after it, whatever heads it claims.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn removed_member_hears_its_removal_and_nothing_after() {
+    let (a, b) = (Env::new(), Env::new());
+    let [genesis, _] = seed_pair(&a, &b);
+    a.daemon(false, "", &[]);
+    let o = a.detached(&[EXE, "remove", "bob"], "");
+    assert!(o.status.success(), "{}", common::err(&o));
+    let later = common::invite(&a, "reusable");
+    let later = lightbulb_connect::ticket::decode(&later).unwrap().ticket_id;
+    let ep = endpoint(&b.identity()).await;
+    // Claiming to know only the genesis: everything after it would be the whole log.
+    for heads in [vec![genesis.hash()], vec![]] {
+        let mut p = Peer::dial(&ep, &a).await;
+        p.hello(heads).await;
+        let told = entries_of(&p.pages().await);
+        assert!(told.iter().any(|e| e.kind == Kind::Remove), "{told:?}");
+        assert!(
+            !told
+                .iter()
+                .any(|e| e.kind == Kind::Link && e.body["ticket_id"] == later.as_str()),
+            "a later link leaked: {told:?}"
+        );
+        p.conn.close(0u32.into(), b"");
+    }
 }

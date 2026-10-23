@@ -29,7 +29,6 @@ use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMode, RelayUrl, SecretKey, Wa
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, Notify};
@@ -171,8 +170,28 @@ pub struct Peers {
     pub relay_changed: Notify,
     /// `config.lan` at start.
     pub lan: OnceLock<bool>,
-    /// The last mDNS probe was refused (`lan_refused`).
-    lan_blocked: AtomicBool,
+    /// The last mDNS probe's answer (`lan_probe`); `""` before the first.
+    lan_probe: Mutex<&'static str>,
+    /// Each member's direct addresses as it last told them (its `hello`, or the ticket for
+    /// the inviter), kept in `ADDRS` across restarts.
+    known: Mutex<HashMap<String, Vec<SocketAddr>>>,
+}
+
+/// Where `Peers::known` is kept, in the state dir.
+const ADDRS: &str = "addrs.json";
+/// The most direct addresses taken from a peer or a ticket.
+pub const MAX_ADDRS: usize = 8;
+
+/// `v` as direct addresses: IP literals with a port (never a host name), at most
+/// `MAX_ADDRS`, none unspecified nor port 0; `None` when any is not.
+pub fn parse_addrs(v: &[String]) -> Option<Vec<SocketAddr>> {
+    if v.len() > MAX_ADDRS {
+        return None;
+    }
+    v.iter()
+        .map(|s| s.parse::<SocketAddr>().ok())
+        .map(|a| a.filter(|a| a.port() != 0 && !a.ip().is_unspecified()))
+        .collect()
 }
 
 /// A connection's outgoing frames, each with whoever waits to hear it was written.
@@ -209,9 +228,11 @@ impl Peers {
         let id = PublicKey::from_bytes(&identity::key_bytes(key)?).ok()?;
         let here = self.lan.get() == Some(&true);
         let here = here.then(|| local::addr(key)).flatten();
+        let known = self.known.lock().unwrap().get(key).cloned();
         let addrs = self.knobs().peers.get(key).into_iter().flatten().copied();
         let a = addrs
             .chain(here)
+            .chain(known.into_iter().flatten())
             .fold(EndpointAddr::new(id), |a, s| a.with_ip_addr(s));
         let relays = self.relays.lock().unwrap().urls.clone();
         Some(relays.into_iter().fold(a, |a, u| a.with_relay_url(u)))
@@ -236,26 +257,66 @@ impl Peers {
         self.relay_changed.notify_one();
     }
 
-    /// The first relay in effect, for a ticket's `relay_hint` (`""` when none).
-    /// `"off"` (`config.lan = false`), `"blocked"` (macOS refuses our mDNS: no Local Network
-    /// permission) or `"on"`. While blocked each call probes again, so an Allow shows at once.
+    /// `"off"` (`config.lan = false`), else `lan_probe`'s answer: `"on"`, `"blocked"` (macOS
+    /// refuses our mDNS: no Local Network permission) or `"no network"`. Until it is `"on"`
+    /// each call probes again, so an Allow (or Wi-Fi coming back) shows at once.
     pub fn lan_status(&self) -> &'static str {
-        if !self.lan.get().copied().unwrap_or(false) {
+        if self.lan.get() != Some(&true) {
             return "off";
         }
-        if self.lan_blocked.load(Ordering::Relaxed) {
-            self.lan_blocked.store(lan_refused(), Ordering::Relaxed);
+        let mut last = self.lan_probe.lock().unwrap();
+        if *last != "on" {
+            *last = lan_probe();
         }
-        if self.lan_blocked.load(Ordering::Relaxed) {
-            "blocked"
-        } else {
-            "on"
-        }
+        *last
     }
 
+    /// The first relay in effect, for a ticket's `relay_hint` (`""` when none).
     pub fn relay_hint(&self) -> String {
         let l = self.relays.lock().unwrap();
         l.urls.first().map(|u| u.to_string()).unwrap_or_default()
+    }
+
+    /// This computer's direct addresses now, as a ticket or `hello` carries them.
+    pub fn own_addrs(&self) -> Vec<String> {
+        let Some(ep) = self.endpoint.get() else {
+            return vec![];
+        };
+        let a = ep.addr();
+        a.ip_addrs()
+            .take(MAX_ADDRS)
+            .map(|a| a.to_string())
+            .collect()
+    }
+
+    /// What a ticket carries to be dialed: `relay_hint` and `own_addrs`.
+    pub fn hints(&self) -> (String, Vec<String>) {
+        (self.relay_hint(), self.own_addrs())
+    }
+
+    /// Member `key` told its direct addresses `addrs` (already checked, `parse_addrs`):
+    /// kept for its dials, and in `dir`'s `ADDRS` when they changed.
+    pub fn learn(&self, dir: &std::path::Path, key: &str, addrs: Vec<SocketAddr>) {
+        let mut known = self.known.lock().unwrap();
+        if addrs.is_empty() || known.get(key) == Some(&addrs) {
+            return;
+        }
+        known.insert(key.to_string(), addrs);
+        if let Ok(b) = serde_json::to_vec(&*known) {
+            let _ = std::fs::write(dir.join(ADDRS), b);
+        }
+    }
+
+    /// Loads `ADDRS` from `dir`, keeping the entries that still check.
+    fn load_known(&self, dir: &std::path::Path) {
+        let read: HashMap<String, Vec<String>> = std::fs::read(dir.join(ADDRS))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+        let ok = read
+            .into_iter()
+            .filter_map(|(k, v)| Some((k, parse_addrs(&v)?)));
+        *self.known.lock().unwrap() = ok.collect();
     }
 
     /// `status.relay` and `status.relay_error`: `none` without relays, `ok` while a home relay
@@ -440,6 +501,7 @@ impl Net {
     /// mDNS when `config.lan`) and starts accepting, dialing every active member, and keeping
     /// the relay list.
     pub async fn start(daemon: Arc<Daemon>) -> Result<Net> {
+        daemon.peers.load_known(&daemon.dir);
         let state = relay::State::load(&daemon.dir, &daemon.peers.knobs().relay_keys);
         *daemon.peers.relay_state.lock().unwrap() = state;
         let lan = {
@@ -473,8 +535,7 @@ impl Net {
         let _ = daemon.peers.lan.set(lan);
         if lan {
             local::publish(&daemon.identity.key, port);
-            if lan_refused() {
-                daemon.peers.lan_blocked.store(true, Ordering::Relaxed);
+            if daemon.peers.lan_status() == "blocked" {
                 eprintln!(
                     "net: macOS refuses this program the local network, so computers on it cannot find this one. \
                      Allow lightbulb-connect in System Settings > Privacy & Security > Local Network."
@@ -651,8 +712,17 @@ impl Net {
         live.retain(|key, l| {
             let active = r.members.contains_key(key);
             if !active {
-                l.conn.close(VarInt::from_u32(NOT_MEMBER), b"not a member");
                 eprintln!("net: closed {} (no longer a member)", short(key));
+                // A removed member on a live link hears of it first (`removal_pages`).
+                let told = match &l.protocol {
+                    Protocol::Ok(heads) => removal_pages(r, key, heads),
+                    _ => vec![],
+                };
+                if told.is_empty() {
+                    l.conn.close(VarInt::from_u32(NOT_MEMBER), b"not a member");
+                } else {
+                    tokio::spawn(tell_then_close(l.conn.clone(), l.tx.clone(), told));
+                }
             }
             active
         });
@@ -665,7 +735,7 @@ impl Net {
                     continue;
                 };
                 push_delta(&l.tx, r, heads, &mut memo, true);
-                let _ = l.tx.send((hello(r, protocol), None));
+                let _ = l.tx.send((hello(r, protocol, d.peers.own_addrs()), None));
                 // After the push the peer holds all of ours: the next change sends only itself.
                 l.protocol = Protocol::Ok(r.heads.clone());
             }
@@ -718,7 +788,9 @@ impl Net {
                 }
                 if d.peers.adopt(&key, me, &conn, dialer, &tx) {
                     // The first frame, written once the stream is open.
-                    let _ = tx.send((hello(&team.roster, d.peers.knobs().protocol), None));
+                    let protocol = d.peers.knobs().protocol;
+                    let addrs = d.peers.own_addrs();
+                    let _ = tx.send((hello(&team.roster, protocol, addrs), None));
                     None
                 } else {
                     Some((SUPERSEDED, b"superseded"))
@@ -730,11 +802,8 @@ impl Net {
                 eprintln!("net: refused {} (not a member)", short(&key));
                 // A removed member that dials in hears of it first (`tell_removed`).
                 let r = d.team.lock().unwrap().roster.clone();
-                let gone = r.log().iter().any(|(_, e)| {
-                    e.kind == roster::Kind::Remove && e.body["member"] == key.as_str()
-                });
-                if gone && !outgoing {
-                    return tell_removed(conn, r).await;
+                if removal(&r, &key).is_some() && !outgoing {
+                    return tell_removed(conn, r, key).await;
                 }
             }
             conn.close(VarInt::from_u32(code), reason);
@@ -789,19 +858,10 @@ impl Net {
                 _ = viewers => {}
             }
         }
-        // A member that refuses us on a live link has likely removed us: dial it again at
-        // once, so its answer (`tell_removed`) comes now, not at the next redial. Only after a
-        // live link, so a member that keeps refusing is not redialed in a loop.
-        let refused = d.peers.speaks_ours(&key, &conn)
-            && matches!(conn.close_reason(), Some(iroh::endpoint::ConnectionError::ApplicationClosed(c))
-                if c.error_code == VarInt::from_u32(NOT_MEMBER));
         d.peers.forget(&key, &conn);
         crate::presence::seen(d, &key);
         conn.close(VarInt::from_u32(0), b"");
         eprintln!("net: disconnected {}", short(&key));
-        if refused && d.team.lock().unwrap().roster.members.contains_key(&key) {
-            Box::pin(self.clone().dial(key)).await;
-        }
     }
 
     /// Handles one frame from `key`; `false` once the peer speaks another protocol.
@@ -826,7 +886,15 @@ impl Net {
         if let Err(why) = frames::from_peer_ok(&f, peer, d) {
             d.peers.dropped(f.kind());
             eprintln!("net: dropped a {} frame from {short} ({why})", f.kind());
-        } else if let Frame::Hello { protocol: p, heads } = f {
+        } else if let Frame::Hello {
+            protocol: p,
+            heads,
+            addrs,
+        } = f
+        {
+            // Checked by `from_peer_ok`.
+            d.peers
+                .learn(&d.dir, key, parse_addrs(&addrs).unwrap_or_default());
             // ponytail: a hello costs O(log) under `team`, and a member may send them back to
             // back; rate-limit per connection if one does.
             if p != d.peers.knobs().protocol {
@@ -1079,17 +1147,18 @@ fn apply(d: &Daemon, pending: &mut Vec<Entry>, from: &str) -> Result<Vec<String>
     Ok(team.roster.heads.clone())
 }
 
-fn hello(r: &Roster, protocol: u32) -> Frame {
+fn hello(r: &Roster, protocol: u32, addrs: Vec<String>) -> Frame {
     Frame::Hello {
         protocol,
         heads: r.heads.clone(),
+        addrs,
     }
 }
 
 /// Answers a removed member's `hello` with the roster pages it lacks, the removal among them,
 /// then refuses it: its install of them tells it it was removed (`net_ops::install`), and it
 /// closes. Its `hello` is awaited 1 s, its close 3 s; the refusal follows whatever happened.
-async fn tell_removed(conn: Connection, r: Roster) {
+async fn tell_removed(conn: Connection, r: Roster, key: String) {
     let hello = async {
         let (send, mut recv) = conn.accept_bi().await.ok()?;
         match frames::read(&mut recv).await.ok()? {
@@ -1101,7 +1170,7 @@ async fn tell_removed(conn: Connection, r: Roster) {
         let (mut send, heads) = tokio::time::timeout(Duration::from_secs(1), hello)
             .await
             .ok()??;
-        for f in pages(delta(&r, &heads)) {
+        for f in removal_pages(&r, &key, &heads) {
             frames::write(&mut send, &f).await.ok()?;
         }
         tokio::time::timeout(Duration::from_secs(3), conn.closed())
@@ -1109,6 +1178,44 @@ async fn tell_removed(conn: Connection, r: Roster) {
             .ok()
     };
     told.await;
+    conn.close(VarInt::from_u32(NOT_MEMBER), b"not a member");
+}
+
+/// The hash of the last `remove` of `key` in `r`.
+fn removal(r: &Roster, key: &str) -> Option<String> {
+    let mut removes = r
+        .log()
+        .iter()
+        .filter(|(_, e)| e.kind == roster::Kind::Remove && e.body["member"] == key);
+    removes.next_back().map(|(h, _)| h.clone())
+}
+
+/// What a removed `key` at `heads` is told: the `remove` of it and those of its ancestors it
+/// lacks, never anything after (later links and their secrets, later members).
+fn removal_pages(r: &Roster, key: &str, heads: &[String]) -> Vec<Frame> {
+    let Some(h) = removal(r, key) else {
+        return vec![];
+    };
+    let mut upto = r.ancestors_of(&[&h]);
+    upto.insert(h);
+    let d = delta(r, heads);
+    pages(d.into_iter().filter(|e| upto.contains(&e.hash())).collect())
+}
+
+/// Writes `told` on a live link (its writer, through `tx`), then waits up to 3 s for the
+/// peer to close before closing it as not a member.
+async fn tell_then_close(conn: Connection, tx: Tx, told: Vec<Frame>) {
+    let mut last = None;
+    for f in told {
+        let (done, written) = tokio::sync::oneshot::channel();
+        let _ = tx.send((f, Some(done)));
+        last = Some(written);
+    }
+    if let Some(w) = last {
+        let _ = tokio::time::timeout(Duration::from_secs(1), w).await;
+        let _ = tokio::time::timeout(Duration::from_secs(3), conn.closed()).await;
+    }
+    drop(tx);
     conn.close(VarInt::from_u32(NOT_MEMBER), b"not a member");
 }
 
@@ -1199,16 +1306,46 @@ pub(crate) fn short(key: &str) -> &str {
     key.get(..12).unwrap_or(key)
 }
 
-/// Whether an mDNS send is refused with `EHOSTUNREACH`: what macOS answers every multicast
-/// of a program without the Local Network permission. iroh's mDNS lookup only logs that (at
-/// `tracing` level, which this daemon does not print), so without this the daemon is deaf to
-/// the LAN and says nothing. A 12-byte mDNS header with no questions: nobody answers it.
-fn lan_refused() -> bool {
+/// Whether an mDNS send goes out: `"on"`; `"blocked"` when it is refused with
+/// `EHOSTUNREACH` while an interface that can multicast is up, which is what macOS answers
+/// every multicast of a program without the Local Network permission; `"no network"` when no
+/// such interface is up (Wi-Fi off gives the same error). iroh's mDNS lookup only logs a
+/// refusal (at `tracing` level, which this daemon does not print), so without this the daemon
+/// is deaf to the LAN and says nothing. The probe is a 12-byte mDNS header with no questions:
+/// nobody answers it.
+fn lan_probe() -> &'static str {
     let Ok(s) = std::net::UdpSocket::bind("0.0.0.0:0") else {
-        return false;
+        return "on";
     };
     let r = s.send_to(&[0; 12], "224.0.0.251:5353");
-    r.is_err_and(|e| e.raw_os_error() == Some(libc::EHOSTUNREACH))
+    if !r.is_err_and(|e| e.raw_os_error() == Some(libc::EHOSTUNREACH)) {
+        "on"
+    } else if multicast_up() {
+        "blocked"
+    } else {
+        "no network"
+    }
+}
+
+/// Whether an interface other than loopback is up, running, multicast-capable and has an
+/// IPv4 address.
+fn multicast_up() -> bool {
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: `getifaddrs` fills `head` with a list we only read, then `freeifaddrs` it.
+    if unsafe { libc::getifaddrs(&mut head) } != 0 {
+        return false;
+    }
+    let want = (libc::IFF_UP | libc::IFF_RUNNING | libc::IFF_MULTICAST) as u32;
+    let mut found = false;
+    let mut p = head;
+    while let Some(i) = unsafe { p.as_ref() } {
+        let v4 =
+            unsafe { i.ifa_addr.as_ref() }.is_some_and(|a| a.sa_family as i32 == libc::AF_INET);
+        found |= v4 && i.ifa_flags & want == want && i.ifa_flags & libc::IFF_LOOPBACK as u32 == 0;
+        p = i.ifa_next;
+    }
+    unsafe { libc::freeifaddrs(head) };
+    found
 }
 
 /// This user's daemons on this computer, found over loopback: each writes
@@ -1221,18 +1358,41 @@ mod local {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     use std::path::PathBuf;
 
-    /// `/tmp/lightbulb-connect-<uid>`, if it is ours (mode 0700).
+    /// `/tmp/lightbulb-connect-<uid>`, if it is ours (a directory, not a link, mode 0700);
+    /// one log line the first time it is not.
     fn dir() -> Option<PathBuf> {
+        static WARNED: std::sync::Once = std::sync::Once::new();
         let uid = unsafe { libc::getuid() };
         let d = PathBuf::from(format!("/tmp/lightbulb-connect-{uid}"));
         let _ = std::fs::DirBuilder::new().mode(0o700).create(&d);
-        let m = std::fs::symlink_metadata(&d).ok()?;
-        (m.is_dir() && m.uid() == uid && m.mode() & 0o077 == 0).then_some(d)
+        let m = std::fs::symlink_metadata(&d).ok();
+        let ok = m.is_some_and(|m| m.is_dir() && m.uid() == uid && m.mode() & 0o077 == 0);
+        if !ok {
+            WARNED.call_once(|| {
+                eprintln!(
+                    "net: {} is not a private folder of this user; daemons on this computer are not found through it",
+                    d.display()
+                )
+            });
+        }
+        ok.then_some(d)
     }
 
+    /// `127.0.0.1:<port> <pid>`, mode 0600.
     pub fn publish(key: &str, port: u16) {
-        if let Some(d) = dir() {
-            let _ = std::fs::write(d.join(key), format!("127.0.0.1:{port}"));
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let Some(d) = dir() else {
+            return;
+        };
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(d.join(key));
+        if let Ok(mut f) = f {
+            let _ = write!(f, "127.0.0.1:{port} {}", std::process::id());
         }
     }
 
@@ -1242,7 +1402,14 @@ mod local {
         }
     }
 
+    /// `key`'s address, unless the daemon that wrote it is gone (a crash leaves the file).
     pub fn addr(key: &str) -> Option<SocketAddr> {
-        std::fs::read_to_string(dir()?.join(key)).ok()?.parse().ok()
+        let s = std::fs::read_to_string(dir()?.join(key)).ok()?;
+        let (addr, pid) = s.split_once(' ')?;
+        let pid: libc::pid_t = pid.trim().parse().ok()?;
+        // SAFETY: signal 0 only checks that the process exists.
+        let alive = unsafe { libc::kill(pid, 0) } == 0
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+        alive.then(|| addr.parse().ok()).flatten()
     }
 }

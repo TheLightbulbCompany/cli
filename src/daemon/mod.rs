@@ -255,6 +255,23 @@ pub async fn run(dir: &Path) -> Result<()> {
     // Briefly wider than 0600 after bind; the 0700 state dir closes that window.
     fs::set_permissions(&sock, Permissions::from_mode(0o600))?;
     tokio::spawn(crate::admission::route(daemon.clone()));
+    // SIGTERM (launchd's stop) and SIGINT end it like a `shutdown` op: the socket and the
+    // loopback address file (`net::local`) are removed on the way out.
+    let d = daemon.clone();
+    tokio::spawn(async move {
+        use tokio::signal::unix::{signal, SignalKind};
+        let (Ok(mut term), Ok(mut int)) = (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::interrupt()),
+        ) else {
+            return;
+        };
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = int.recv() => {}
+        }
+        d.shutdown.notify_one();
+    });
     ipc::serve(listener, daemon).await;
     net.close().await;
     let _ = fs::remove_file(&sock);
