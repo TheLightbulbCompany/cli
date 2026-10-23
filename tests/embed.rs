@@ -240,8 +240,12 @@ async fn person_only_ops_are_refused_in_process() {
     // Its solo network is the workspace's.
     let me = ok(&i, "identity.get", json!({})).await;
     assert_eq!(
-        (me["kind"].as_str(), me["name"].as_str()),
-        (Some("cloud"), Some(NAME))
+        (
+            me["kind"].as_str(),
+            me["name"].as_str(),
+            me["computer"].as_str()
+        ),
+        (Some("cloud"), Some(NAME), Some(NAME))
     );
     // One engine per home; a snapshot never lands in it.
     assert!(try_start(home.path(), &[], None).await.is_err());

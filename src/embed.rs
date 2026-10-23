@@ -58,7 +58,10 @@ pub async fn start(home: &Path, opts: EmbedOpts) -> Result<Instance> {
         }
     }
     let lock = crate::daemon::lock_dir(home, false)?;
+    // An instance's computer is its workspace, never the host it runs on: the name lands in
+    // every peer's roster.
     let config = Config {
+        computer: opts.name.clone(),
         issuer: opts.issuer,
         relay: opts.relay.map(|u| u.to_string()),
         lan: false,

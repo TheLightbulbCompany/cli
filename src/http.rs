@@ -1,6 +1,6 @@
 //! The engine's HTTP calls (the issuer's sign-in and our signed relay list): one policy.
-//! https only in release builds (debug: the tests' loopback servers), no redirects, 10 s to
-//! connect and to read, answers at most 64 KiB. Blocking: callers run off the async threads.
+//! https only in release builds (debug: the tests' loopback servers), no redirects, one 10 s
+//! deadline for the whole call (connect, send, answer), answers at most 64 KiB. Blocking: callers run off the async threads.
 
 use crate::Result;
 use serde_json::Value;
@@ -12,9 +12,7 @@ const MAX_BODY: u64 = 64 * 1024;
 /// An agent with the policy; a non-2xx status is an answer, not an error.
 pub fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
-        .timeout_connect(Some(TIMEOUT))
-        .timeout_recv_response(Some(TIMEOUT))
-        .timeout_recv_body(Some(TIMEOUT))
+        .timeout_global(Some(TIMEOUT))
         .https_only(!cfg!(debug_assertions))
         .max_redirects(0)
         .http_status_as_error(false)

@@ -354,6 +354,7 @@ fn check(
     };
     // Decided from the proof, never from what the request says of itself.
     let c = match &req.claims {
+        // A cloud candidate with no proof at all is not a workspace this engine knows.
         None if cloud => return Err(UNSUPPORTED),
         None => None,
         Some(Ok(c)) if (c.kind == ProofKind::Workspace) == cloud => Some(c),
