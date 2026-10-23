@@ -679,6 +679,7 @@ pub async fn from_member(d: Arc<Daemon>, from: String, f: Frame) {
     }
 }
 
+/// Paired by ticket id: the wire's decision carries no request id of ours.
 /// The oldest request forwarded to `to` for `candidate` with `ticket_id`: what its decision
 /// answers (the decision names no request of ours, so the oldest goes first).
 fn forwarded_to(

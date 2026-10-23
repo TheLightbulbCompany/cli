@@ -390,7 +390,12 @@ fn register(id: u64, body: &Value, daemon: &Daemon) -> Response {
         Ok(_) => {}
         Err(_) => return Response::err(id, INTERNAL),
     }
-    let git = (r.repo, r.branch);
+    // Shown to teammates: plain text, cut to 256 characters, whatever the caller sent.
+    let clamp = |s: Option<String>| {
+        s.map(|s| crate::label::plain(&s, 256))
+            .filter(|s| !s.is_empty())
+    };
+    let git = (clamp(r.repo), clamp(r.branch));
     if daemon
         .git
         .lock()

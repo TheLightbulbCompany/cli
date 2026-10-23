@@ -136,6 +136,15 @@ fn address(conn: &mut Conn, addr: &str) -> Result<String> {
             if let Some(id) = hit.and_then(|s| s["session_id"].as_str()) {
                 return Ok(id.into());
             }
+            // An agent's handle shape is never a name: its session closed.
+            let agent = addr.rsplit_once('-').map_or("", |(a, _)| a);
+            if crate::sessions::PROVIDERS.contains(&agent) {
+                return Err(format!(
+                    "No session \"{addr}\" is open right now. Run {} who to see the current ones.",
+                    command()
+                )
+                .into());
+            }
         }
         return Ok(addr.into());
     };
@@ -450,7 +459,8 @@ fn listen_on(key: &str, once: bool) -> Result<()> {
                 .chars()
                 .filter(|c| *c == '\n' || crate::label::printable(*c))
                 .collect();
-            println!("From {}: {text}", cell(at("label")));
+            // Continuation lines indented: no line of the body can pass for the Reply line.
+            println!("From {}: {}", cell(at("label")), text.replace('\n', "\n  "));
             println!(
                 "Reply: {} send {} \"…\" --reply-to {}",
                 command(),
@@ -1021,14 +1031,24 @@ pub fn install_alias(home: &Path, exe: &Path) -> Result<String> {
     let full = link(&home.join(".local/bin/lightbulb-connect"), &canon)?;
     Ok(match (link(&home.join(".local/bin/lightbulb"), &canon)?, full) {
         (true, _) => "Command: lightbulb (or lightbulb-connect)".into(),
-        (false, true) => {
-            "Command: lightbulb-connect (\"lightbulb\" belongs to another program)".into()
-        }
+        (false, true) => format!(
+            "Command: lightbulb-connect (\"lightbulb\" belongs to {})",
+            link_owner(&home.join(".local/bin/lightbulb"))
+        ),
         (false, false) => format!(
             "Command: {} (lightbulb and lightbulb-connect in ~/.local/bin belong to other programs)",
             canon.display()
         ),
     })
+}
+
+/// Who has the command name at `path` that is not ours: the Lightbulb app when it links to the
+/// app's binary, else another program.
+fn link_owner(path: &Path) -> &'static str {
+    match fs::read_link(path) {
+        Ok(t) if t.to_string_lossy().contains("Lightbulb.app") => "the Lightbulb app",
+        _ => "another program",
+    }
 }
 
 /// Makes `path` a symlink to `canon` unless something else is there; whether it is ours.
@@ -1246,10 +1266,7 @@ pub fn doctor() -> Result<i32> {
         home.join(".local/bin/lightbulb"),
         home.join(".local/bin/lightbulb-connect"),
     );
-    let owner = match fs::read_link(&short) {
-        Ok(t) if t.to_string_lossy().contains("Lightbulb.app") => "the Lightbulb app",
-        _ => "another program",
-    };
+    let owner = link_owner(&short);
     let (state, fix) = if ours(&short) {
         ("\"lightbulb\"".to_string(), None)
     } else if ours(&full) && short.symlink_metadata().is_ok() {
@@ -1345,19 +1362,39 @@ pub fn setup(
             return Ok(code);
         }
     }
-    let short: Vec<String> = report
-        .agents
-        .iter()
-        .filter(|a| a.hooks_only())
-        .map(|a| a.product())
-        .collect();
-    if !short.is_empty() {
-        let has = if short.len() == 1 { "has" } else { "have" };
+    let names = |f: fn(&setup::AgentReport) -> bool| -> Vec<String> {
+        report
+            .agents
+            .iter()
+            .filter(|a| f(a))
+            .map(|a| a.product())
+            .collect()
+    };
+    let (clash, failed) = (names(|a| a.clash()), names(|a| a.error.is_some()));
+    let verb = |n: &[String], one: &'static str, many: &'static str| {
+        if n.len() == 1 {
+            one
+        } else {
+            many
+        }
+    };
+    if !clash.is_empty() {
         eprintln!(
-            "{} {has} hooks but no tools: another program has the tool server name. Run: {} setup --server-name <a free name>",
-            short.join(", "),
+            "{} {} hooks but no tools: another program has the tool server name. Run: {} setup --server-name <a free name>",
+            clash.join(", "),
+            verb(&clash, "has", "have"),
             command()
         );
+    }
+    if !failed.is_empty() {
+        eprintln!(
+            "{} {} not connected: fix the file named above, then run {} setup again.",
+            failed.join(", "),
+            verb(&failed, "is", "are"),
+            command()
+        );
+    }
+    if !clash.is_empty() || !failed.is_empty() {
         return Ok(1);
     }
     let connected: Vec<String> = report

@@ -344,7 +344,7 @@ fn a_foreign_lightbulb_mcp_entry_is_left_alone_and_gets_no_allow_rule() {
         if !remove {
             assert!(get(h, ".codex/config.toml").starts_with(&app_toml));
             for name in ["claude", "codex", "cursor", "grok"] {
-                assert!(agent(&r, name).hooks_only(), "{name}");
+                assert!(agent(&r, name).clash(), "{name}");
             }
         }
     }
@@ -470,7 +470,11 @@ fn a_bad_server_name_writes_nothing() {
     fs::create_dir(h.join(".claude")).unwrap();
     let r = run(h, Path::new(EXE), Some("a:b"), false);
     assert!(agent(&r, "claude").wrote.is_empty());
-    assert!(agent(&r, "claude").notes[0].contains("server name"));
+    assert!(agent(&r, "claude")
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("server name"));
     assert!(!h.join(".claude.json").exists());
 }
 
@@ -595,12 +599,33 @@ fn the_closing_words_name_what_is_connected_and_the_command_to_type() {
         ),
         "Lightbulb Connect is on.
   Connected: Claude Code, Codex, Cursor, Grok CLI
-  macOS may ask to let lightbulb-connect read your Desktop folder: click Allow
-  (it reads only each project's .git name and branch).
 
 Try it: open Claude Code in any folder and ask \"list my other sessions\".
 Add your other computer or a teammate: lightbulb-connect invite
 Check everything: lightbulb-connect doctor"
     );
     assert!(summary(&["Codex"], "lightbulb").contains("open Codex in any folder"));
+}
+
+#[test]
+fn a_file_it_cannot_read_is_a_failure_not_a_name_clash() {
+    let home = tempfile::tempdir().unwrap();
+    let h = home.path();
+    // The tools file is broken: the hooks still go in.
+    fs::create_dir(h.join(".claude")).unwrap();
+    put(h, ".claude.json", "{not json");
+    // The hooks file is broken: nothing goes in.
+    put(h, ".cursor/hooks.json", "[]");
+    let r = run(h, Path::new(EXE), None, false);
+    let (claude, cursor) = (agent(&r, "claude"), agent(&r, "cursor"));
+    assert!(!claude.clash() && !cursor.clash());
+    let line = claude.line();
+    assert!(
+        line.starts_with("Claude Code: hooks added, but not its tools — "),
+        "{line}"
+    );
+    assert!(line.contains(".claude.json"), "{line}");
+    let line = cursor.line();
+    assert!(line.starts_with("Cursor: not connected — "), "{line}");
+    assert!(!line.contains("tool server name"), "{line}");
 }

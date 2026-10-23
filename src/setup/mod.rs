@@ -45,6 +45,10 @@ pub struct AgentReport {
     pub clashed: bool,
     /// Codex: its hook trust was written for the person this run.
     pub trusted: bool,
+    /// Why wiring it failed (a file it could not read or write), when it did.
+    pub error: Option<String>,
+    /// Whether its hooks are in place after the run.
+    pub hooks: bool,
 }
 
 type Configure = fn(&Ctx, &mut AgentReport) -> Result<()>;
@@ -131,7 +135,7 @@ pub fn summary(connected: &[&str], cmd: &str) -> String {
     };
     let first = connected.first().copied().unwrap_or("Claude Code");
     format!(
-        "Lightbulb Connect is on.\n  Connected: {list}\n  macOS may ask to let lightbulb-connect read your Desktop folder: click Allow\n  (it reads only each project's .git name and branch).\n\nTry it: open {first} in any folder and ask \"list my other sessions\".\nAdd your other computer or a teammate: {cmd} invite\nCheck everything: {cmd} doctor"
+        "Lightbulb Connect is on.\n  Connected: {list}\n\nTry it: open {first} in any folder and ask \"list my other sessions\".\nAdd your other computer or a teammate: {cmd} invite\nCheck everything: {cmd} doctor"
     )
 }
 
@@ -157,8 +161,7 @@ pub fn run(home: &Path, executable: &Path, server: Option<&str>, remove: bool) -
             ..Default::default()
         };
         if r.found && !names.iter().all(|n| valid_server_name(n)) {
-            r.notes
-                .push("skipped: the server name takes letters, digits, - and _".into());
+            r.error = Some("the server name takes letters, digits, - and _".into());
         } else if r.found {
             for server in &names {
                 let ctx = Ctx {
@@ -169,7 +172,7 @@ pub fn run(home: &Path, executable: &Path, server: Option<&str>, remove: bool) -
                     foreign: Cell::new(false),
                 };
                 if let Err(e) = configure(&ctx, &mut r) {
-                    r.notes.push(format!("stopped: {e}"));
+                    r.error = Some(e.to_string());
                     break;
                 }
                 if !remove && !ctx.foreign.get() {
@@ -184,6 +187,7 @@ pub fn run(home: &Path, executable: &Path, server: Option<&str>, remove: bool) -
             let mut seen = std::collections::HashSet::new();
             r.wrote.retain(|p| seen.insert(p.clone()));
         }
+        r.hooks = r.found && wired(home, name);
         report.agents.push(r);
     }
     report
@@ -195,9 +199,9 @@ impl AgentReport {
         crate::frame::agent_name(self.name)
     }
 
-    /// Whether installing left it with hooks but no tools.
-    pub fn hooks_only(&self) -> bool {
-        self.found && self.tools.is_none()
+    /// Whether installing left it without tools because another program has the name.
+    pub fn clash(&self) -> bool {
+        self.found && self.tools.is_none() && self.error.is_none()
     }
 
     /// One line for the person, installing: connected or not, and why.
@@ -210,9 +214,16 @@ impl AgentReport {
                 "{who}: connected (hooks + tools as \"{t}\" — another \"{DEFAULT_SERVER}\" tool server is already installed)"
             ),
             Some(t) => format!("{who}: connected (hooks + tools as \"{t}\")"),
-            None => format!(
-                "{who}: hooks added, but not its tools — another program has the tool server name"
-            ),
+            None => {
+                let why = self.error.clone().unwrap_or_else(|| {
+                    "another program has the tool server name".into()
+                });
+                if self.hooks {
+                    format!("{who}: hooks added, but not its tools — {why}")
+                } else {
+                    format!("{who}: not connected — {why}")
+                }
+            }
         };
         if self.trusted {
             line.push_str(". Its hook prompt was answered for you.");

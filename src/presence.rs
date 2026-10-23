@@ -114,9 +114,47 @@ fn remote(d: &Daemon, s: &Session, share_paths: bool) -> Remote {
 /// Whether `cwd` is under one of `off` (`folders_off`, each `canonical`).
 pub(crate) fn hidden(off: &[PathBuf], cwd: &str) -> bool {
     !off.is_empty() && {
-        let cwd = canonical(Path::new(cwd));
+        let cwd = canonical_cwd(cwd);
         off.iter().any(|o| cwd.starts_with(o))
     }
+}
+
+/// `canonical(cwd)`, cached, resolved on its own thread and waited for at most 1 s (macOS may
+/// hold a stat under a session's folder for a privacy prompt). Until it is resolved, the path
+/// as given (lowercased on macOS), so a hidden folder named as `folders_off` names it still
+/// matches. ponytail: the cache is never pruned or refreshed (one entry per cwd seen).
+fn canonical_cwd(cwd: &str) -> PathBuf {
+    static CACHE: std::sync::Mutex<Option<HashMap<String, PathBuf>>> = std::sync::Mutex::new(None);
+    let cached = |c: &str| {
+        CACHE
+            .lock()
+            .unwrap()
+            .get_or_insert_default()
+            .get(c)
+            .cloned()
+    };
+    if let Some(p) = cached(cwd) {
+        return p;
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let owned = cwd.to_string();
+    std::thread::spawn(move || {
+        let p = canonical(Path::new(&owned));
+        CACHE
+            .lock()
+            .unwrap()
+            .get_or_insert_default()
+            .insert(owned, p.clone());
+        let _ = tx.send(p);
+    });
+    rx.recv_timeout(Duration::from_secs(1)).unwrap_or_else(|_| {
+        let p = PathBuf::from(cwd);
+        if cfg!(target_os = "macos") {
+            PathBuf::from(cwd.to_lowercase())
+        } else {
+            p
+        }
+    })
 }
 
 /// `p` resolved (symlinks, `..`); a path that does not exist (a deleted folder) is its nearest
