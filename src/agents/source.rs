@@ -66,6 +66,9 @@ mod tests {
             status: Status::Idle,
             tier: Tier::Pull,
             push_via: None,
+            handle: None,
+            repo: None,
+            branch: None,
         }
     }
 

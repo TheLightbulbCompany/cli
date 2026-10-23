@@ -79,9 +79,9 @@ pub fn my_person(d: &Daemon, r: &Roster) -> String {
     r.person_of(&d.identity.key).to_string()
 }
 
-/// `s` as published: `folder` is `cwd`'s last part, or all of it with `share_paths`.
+/// `s` as published: `folder` is `cwd`'s last part, or all of it with `share_paths`; repo and
+/// branch as its hook reported them.
 fn remote(s: &Session, share_paths: bool) -> Remote {
-    let (repo, branch) = crate::mcp::git(&s.cwd);
     let folder = if share_paths {
         s.cwd.clone()
     } else {
@@ -93,8 +93,8 @@ fn remote(s: &Session, share_paths: bool) -> Remote {
     Remote {
         session_id: s.key.0.clone(),
         agent: s.provider.clone(),
-        repo,
-        branch,
+        repo: s.repo.clone(),
+        branch: s.branch.clone(),
         folder,
         status: STATUSES[usize::from(s.status != Status::Live)].into(),
         doing: s.doing.clone(),
@@ -104,29 +104,37 @@ fn remote(s: &Session, share_paths: bool) -> Remote {
     .clamp()
 }
 
-/// Whether `cwd` is under one of `off` (`folders_off`, each `canonical`).
+/// Whether `cwd` is under one of `off` (`folders_off`, each `canonical`). A string compare, no
+/// filesystem call: a hook reports its cwd resolved (`resolved`), in the agent's process,
+/// which has the folder access the person gave it.
 pub(crate) fn hidden(off: &[PathBuf], cwd: &str) -> bool {
-    !off.is_empty() && {
-        let cwd = canonical(Path::new(cwd));
-        off.iter().any(|o| cwd.starts_with(o))
-    }
+    let cwd = lower(PathBuf::from(cwd));
+    off.iter().any(|o| cwd.starts_with(o))
 }
 
-/// `p` resolved (symlinks, `..`); a path that does not exist (a deleted folder) is its nearest
-/// existing parent resolved, then the rest as given. Lowercased on macOS, whose volumes ignore case.
-pub(crate) fn canonical(p: &Path) -> PathBuf {
-    let p = p
-        .ancestors()
-        .find_map(|a| {
-            let rest = p.strip_prefix(a).ok()?;
-            Some(std::fs::canonicalize(a).ok()?.join(rest))
-        })
-        .unwrap_or_else(|| p.to_path_buf());
+/// `p` lowercased on macOS, whose volumes ignore case.
+pub(crate) fn lower(p: PathBuf) -> PathBuf {
     if cfg!(target_os = "macos") {
         PathBuf::from(p.to_string_lossy().to_lowercase())
     } else {
         p
     }
+}
+
+/// `p` resolved (symlinks, `..`); a path that does not exist (a deleted folder) is its nearest
+/// existing parent resolved, then the rest as given.
+pub fn resolved(p: &Path) -> PathBuf {
+    p.ancestors()
+        .find_map(|a| {
+            let rest = p.strip_prefix(a).ok()?;
+            Some(std::fs::canonicalize(a).ok()?.join(rest))
+        })
+        .unwrap_or_else(|| p.to_path_buf())
+}
+
+/// `resolved`, lowercased on macOS: how `folders_off` holds a folder.
+pub(crate) fn canonical(p: &Path) -> PathBuf {
+    lower(resolved(p))
 }
 
 /// This computer's presence: its live sessions (newest first), the non-live addresses still
@@ -161,7 +169,13 @@ fn build(d: &Daemon, seq: u64) -> Frame {
         .filter(|(k, _, cwd)| k.starts_with(&mine) && publishable(cwd))
         .collect();
     candidates.sort_by_key(|(_, at, _)| std::cmp::Reverse(*at));
-    live.retain(|s| publishable(&s.cwd));
+    // A session whose register a hidden folder refused has no row, but Claude's own file may
+    // still name it (its folder spelled another way): its mark keeps that discovery from
+    // teammates too. The mark is cleared only by its next register, so after `folder on` it
+    // stays hidden until its next hook event; and a discovery that never registered is
+    // matched by Claude's cwd as given.
+    let marked = d.store.lock().unwrap().hidden_keys().unwrap_or_default();
+    live.retain(|s| publishable(&s.cwd) && !marked.contains(&s.key.0));
     live.sort_by_key(|s| std::cmp::Reverse(s.birth_micros));
     live.truncate(MAX);
     let live_keys: HashSet<&str> = live.iter().map(|s| s.key.0.as_str()).collect();
@@ -450,16 +464,16 @@ fn record(m: &Member, me: &str, s: &Remote, cwd: &str, verified: bool, online: b
 /// full path), repo, branch, what it is doing or its title, any case.
 pub fn directory(d: &Daemon, query: Option<&str>) -> Value {
     // This computer's, with their folders; an instance's are the sessions it declared.
-    let local: Vec<(Remote, String)> = match &d.cloud {
+    let local: Vec<(Remote, String, Option<String>)> = match &d.cloud {
         Some(c) => c
             .declared()
             .sessions
             .iter()
-            .map(|r| (r.clone(), String::new()))
+            .map(|r| (r.clone(), String::new(), None))
             .collect(),
         None => ipc::live_sessions(d)
             .iter()
-            .map(|s| (remote(s, false), s.cwd.clone()))
+            .map(|s| (remote(s, false), s.cwd.clone(), s.handle.clone()))
             .collect(),
     };
     let remote_ones = stored(d);
@@ -498,9 +512,12 @@ pub fn directory(d: &Daemon, query: Option<&str>) -> Value {
     };
     let key = &d.identity.key;
     let mut out = vec![];
-    for (r, cwd) in &local {
+    for (r, cwd, handle) in &local {
         if hit(&own, r, cwd) {
-            out.push(record(&own, &me, r, cwd, true, true));
+            let mut v = record(&own, &me, r, cwd, true, true);
+            // `who --all`'s name for it (the MCP server leaves it out).
+            v["handle"] = handle.clone().into();
+            out.push(v);
         }
     }
     for (m, l) in &remote_ones {

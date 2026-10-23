@@ -33,6 +33,8 @@ pub const NAME_TAKEN: &str = "name_taken";
 pub const KEY_COLLISION: &str = "key_collision";
 pub const UNREACHABLE: &str = "unreachable";
 pub const DECLINED: &str = "declined";
+/// A name or computer name with characters a dialog cannot show as they are (`fits`).
+pub const BAD_NAME: &str = "bad_name";
 pub const TOO_MANY: &str = "too_many_requests";
 /// The person did not answer within the wait: the candidate is told so and stops asking.
 pub const NOT_ANSWERED: &str = "not_answered";
@@ -47,6 +49,7 @@ const REASONS: &[&str] = &[
     NAME_TAKEN,
     KEY_COLLISION,
     DECLINED,
+    BAD_NAME,
     TOO_MANY,
     NOT_ANSWERED,
     YOUR_COMPUTER_OFFLINE,
@@ -86,6 +89,7 @@ pub enum Pending {
     Forwarded {
         to: String,
         candidate: String,
+        ticket_id: String,
         tx: oneshot::Sender<Verdict>,
     },
 }
@@ -167,15 +171,22 @@ pub fn workspace_prompt(c: &Proof) -> String {
     )
 }
 
-/// What the person is asked about `req`: plain text (`check` let only that in).
-fn prompt(r: &Roster, req: &Request) -> String {
-    match req.verified() {
+/// What the person is asked about request `n` (`req`): plain text (`check` let only that in),
+/// and the command that answers it too.
+fn prompt(r: &Roster, req: &Request, n: i64) -> String {
+    let ask = match req.verified() {
         Some(c) if c.kind == ProofKind::Workspace => workspace_prompt(c),
         _ if same_person(r, req).is_some() => {
             format!("Your new Mac {} wants to join. Allow?", req.computer)
         }
-        _ => format!("{} wants to join your network", req.name),
-    }
+        _ => join_text(&req.name, &req.computer),
+    };
+    format!("{ask}\nOr run: {} approve J{n}", crate::cli::command())
+}
+
+/// The join dialog's words for a candidate called `name` on computer `computer`.
+fn join_text(name: &str, computer: &str) -> String {
+    format!("{name} (computer \"{computer}\") wants to join your team using your invite link. Allow only if you sent them the link.")
 }
 
 /// What a `join_request` proves it holds: hex sha256(secret ‖ candidate).
@@ -352,11 +363,13 @@ fn check(
         "cloud" => true,
         _ => return Err(UNSUPPORTED),
     };
-    // Decided from the proof, never from what the request says of itself.
+    // Decided from the proof, never from what the request says of itself; one that expired
+    // while its dialog waited is not in force at the Allow.
     let c = match &req.claims {
         // A cloud candidate with no proof at all is not a workspace this engine knows.
         None if cloud => return Err(UNSUPPORTED),
         None => None,
+        Some(Ok(c)) if now > c.exp => return Err(if cloud { UNSUPPORTED } else { BAD_REQUEST }),
         Some(Ok(c)) if (c.kind == ProofKind::Workspace) == cloud => Some(c),
         // Another kind's proof: a computer's person cannot take a workspace's place.
         Some(Ok(_)) if cloud => return Err(UNSUPPORTED),
@@ -367,7 +380,7 @@ fn check(
         _ => req.name.as_str(),
     };
     if !fits(name) || !fits(&req.computer) {
-        return Err(BAD_REQUEST);
+        return Err(BAD_NAME);
     }
     // One member per workspace (on a fork, the roster's replay keeps the first).
     let taken = |sub: &str| {
@@ -402,7 +415,7 @@ fn check(
 
 /// A name or computer name: trimmed, 1-64 characters, all `label::printable` (so the dialog
 /// shows it as is).
-fn fits(s: &str) -> bool {
+pub fn fits(s: &str) -> bool {
     !s.is_empty()
         && s.trim() == s
         && s.chars().count() <= 64
@@ -466,7 +479,7 @@ fn admit(d: &Daemon, n: i64, req: &Request) -> Verdict {
 /// candidate is gone.
 async fn wait(d: &Daemon, gone: impl Future, n: i64, req: Request) -> Option<Verdict> {
     let (tx, rx) = oneshot::channel();
-    let text = prompt(&d.team.lock().unwrap().roster, &req);
+    let text = prompt(&d.team.lock().unwrap().roster, &req, n);
     // Before the dialog: a headless one answers at once.
     d.admissions.lock().unwrap().insert(
         n,
@@ -588,10 +601,10 @@ async fn forward(d: &Daemon, conn: &Connection, raw: Frame, req: &Request) -> Op
         n
     };
     let (tx, rx) = oneshot::channel();
-    let candidate = req.candidate.clone();
     let pending = Pending::Forwarded {
         to: to.clone(),
-        candidate,
+        candidate: req.candidate.clone(),
+        ticket_id: req.ticket.ticket_id.clone(),
         tx,
     };
     d.admissions.lock().unwrap().insert(n, pending);
@@ -653,14 +666,14 @@ pub async fn from_member(d: Arc<Daemon>, from: String, f: Frame) {
             let _ = d.peers.send(&from, signed(&d.identity, decision));
         }
         Frame::JoinDecision {
+            ref ticket_id,
             ref candidate,
             ref verdict,
             ref reason,
             ..
         } if signed_by(&from, &f) => {
             let mut waiting = d.admissions.lock().unwrap();
-            let ours = |p: &Pending| matches!(p, Pending::Forwarded { to, candidate: c, .. } if *to == from && c == candidate);
-            let Some(n) = waiting.iter().find(|(_, p)| ours(p)).map(|(n, _)| *n) else {
+            let Some(n) = forwarded_to(&waiting, &from, candidate, ticket_id) else {
                 return;
             };
             let Some(Pending::Forwarded { tx, .. }) = waiting.remove(&n) else {
@@ -675,6 +688,26 @@ pub async fn from_member(d: Arc<Daemon>, from: String, f: Frame) {
         }
         _ => {}
     }
+}
+
+/// Paired by ticket id: the wire's decision carries no request id of ours.
+/// The oldest request forwarded to `to` for `candidate` with `ticket_id`: what its decision
+/// answers (the decision names no request of ours, so the oldest goes first).
+fn forwarded_to(
+    waiting: &HashMap<i64, Pending>,
+    to: &str,
+    candidate: &str,
+    ticket_id: &str,
+) -> Option<i64> {
+    let ours = |p: &Pending| {
+        matches!(p, Pending::Forwarded { to: t, candidate: c, ticket_id: i, .. }
+            if t == to && c == candidate && i == ticket_id)
+    };
+    waiting
+        .iter()
+        .filter(|(_, p)| ours(p))
+        .map(|(n, _)| *n)
+        .min()
 }
 
 /// The request in a forwarded `join_request`, when its candidate signed it, and its ticket id.
@@ -803,6 +836,10 @@ pub async fn join(id: u64, body: &Value, d: &Arc<Daemon>) -> Response {
     };
     if !solo {
         return done("refused", Some(ALREADY_IN_TEAM), &team, 0);
+    }
+    // What every member would refuse, refused before any dial.
+    if !fits(&name) || !fits(&computer) {
+        return done("refused", Some(BAD_NAME), "", 0);
     }
     let Ok(t) = ticket::decode(link) else {
         return done("refused", Some(BAD_TICKET), "", 0);
@@ -946,4 +983,37 @@ fn take_roster(d: &Daemon, entries: &[Entry], team_id: &str) -> crate::Result<bo
     tx.commit()?;
     net_ops::install(d, &mut team, &store, new)?;
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_join_dialog_says_who_from_where_and_how_they_got_in() {
+        assert_eq!(
+            join_text("demo2", "demo-laptop"),
+            "demo2 (computer \"demo-laptop\") wants to join your team using your invite link. Allow only if you sent them the link."
+        );
+    }
+
+    #[test]
+    fn a_forwarded_decision_answers_its_own_request_the_oldest_first() {
+        let forwarded = |to: &str, ticket: &str| Pending::Forwarded {
+            to: to.into(),
+            candidate: "cand".into(),
+            ticket_id: ticket.into(),
+            tx: oneshot::channel().0,
+        };
+        let waiting: HashMap<i64, Pending> = [
+            (7, forwarded("x", "t2")),
+            (9, forwarded("x", "t1")),
+            (4, forwarded("y", "t1")),
+            (8, forwarded("x", "t1")),
+        ]
+        .into();
+        assert_eq!(forwarded_to(&waiting, "x", "cand", "t1"), Some(8));
+        assert_eq!(forwarded_to(&waiting, "x", "cand", "t2"), Some(7));
+        assert_eq!(forwarded_to(&waiting, "x", "other", "t1"), None);
+    }
 }

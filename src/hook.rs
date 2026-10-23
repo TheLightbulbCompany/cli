@@ -11,7 +11,7 @@ use crate::agents::cursor_grok;
 use crate::os::Process;
 use crate::{daemon, paths, Result};
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
@@ -155,12 +155,20 @@ pub fn run(agent: &str, event: &str, stdin: &str) -> Result<Option<String>> {
         Event::UserPromptSubmit | Event::PostToolUse => "busy",
         _ => "idle",
     };
+    // Read here, in the agent's process, which has the folder access the person gave it: the
+    // folder resolved (what `folders_off` is matched against) and, at a session's start and
+    // each prompt, its repo and branch (absent otherwise: the daemon keeps the last).
+    let cwd = crate::presence::resolved(std::path::Path::new(&h.cwd));
+    let mut session = json!({ "provider": h.provider, "conversation": h.conversation,
+        "pid": me.pid, "birth_micros": me.birth_micros, "cwd": cwd, "status": status,
+        "executable": me.executable });
+    if matches!(h.event, Event::SessionStart | Event::UserPromptSubmit) {
+        let (repo, branch) = crate::mcp::git(&h.cwd);
+        (session["repo"], session["branch"]) = (repo.into(), branch.into());
+    }
     let r = conn.call(
         "register",
-        json!({ "session": { "provider": h.provider, "conversation": h.conversation,
-            "pid": me.pid, "birth_micros": me.birth_micros, "cwd": h.cwd, "status": status,
-            "executable": me.executable },
-            "caller": proc_json(&me) }),
+        json!({ "session": session, "caller": proc_json(&me) }),
     )?;
     let key = r["key"].clone();
     if !key.is_string() {
@@ -254,14 +262,40 @@ impl Conn {
             .get_mut()
             .write_all(format!("{body}\n").as_bytes())?;
         let mut line = String::new();
-        self.stream.read_line(&mut line)?;
-        Ok(serde_json::from_str(&line)?)
+        match self.stream.read_line(&mut line) {
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                let waited = self.stream.get_ref().read_timeout().ok().flatten();
+                Err(no_answer(waited.unwrap_or_default()).into())
+            }
+            Err(e) => Err(e.into()),
+            Ok(_) => Ok(serde_json::from_str(&line)?),
+        }
     }
+}
+
+/// What a person is told when the daemon does not answer within `waited`.
+fn no_answer(waited: Duration) -> String {
+    format!(
+        "The background service did not answer in {} s. If macOS is asking whether lightbulb-connect may read a folder, click Allow, then try again.",
+        waited.as_secs()
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_daemon_that_does_not_answer_is_a_sentence() {
+        let (a, _b) = UnixStream::pair().unwrap();
+        let mut conn = Conn {
+            stream: BufReader::new(a),
+            next: 1,
+        };
+        conn.wait_up_to(Duration::from_secs(1)).unwrap();
+        let e = conn.call("ping", json!({})).unwrap_err().to_string();
+        assert_eq!(e, "The background service did not answer in 1 s. If macOS is asking whether lightbulb-connect may read a folder, click Allow, then try again.");
+    }
 
     fn hook(provider: &'static str, event: Event) -> Hook {
         Hook {

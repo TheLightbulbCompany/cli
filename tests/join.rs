@@ -142,6 +142,14 @@ fn ask_ticket_admits_only_after_allow() {
         until(10, "J1 is listed", || requests(&a).len() == 1);
         let r = &requests(&a)[0];
         assert_eq!(r["id"], "J1");
+        // `held` lists it with the command that answers it.
+        let o = a.detached(&[EXE, "held"], "");
+        assert_eq!(
+            out(&o),
+            "J1  bob (mbp) wants to join — lightbulb-connect approve J1\n",
+            "{}",
+            err(&o)
+        );
         assert_eq!(r["candidate"], b.identity().key);
         assert_eq!((&r["name"], &r["computer"]), (&json!("bob"), &json!("mbp")));
         assert_eq!((members(&a).len(), members(&b).len()), (1, 1));
@@ -151,10 +159,15 @@ fn ask_ticket_admits_only_after_allow() {
         assert!(o.status.success(), "{}", err(&o));
         assert_eq!(
             out(&o),
-            "Waiting for an admin to allow this...\nConnected as bob (mbp). Team \"prasiddha\": 2 computers online.\n"
+            "Asking whoever sent the link to allow this computer… (they get a prompt; this waits up to 10 minutes)\n\
+             Connected as bob (mbp). Team \"prasiddha\": 2 computers online.\n\
+             Your agents here can now see and message the team's agents. Try: lightbulb-connect who --all\n\
+             Until both computers sign in, your other computer counts as another person and its first message needs your Allow.\n"
         );
     });
     converged(&a, &b, 2);
+    let o = a.detached(&[EXE, "held"], "");
+    assert_eq!(out(&o), "No messages are waiting for your Allow.\n");
     // A second answer finds nothing open.
     let o = a.detached(&[EXE, "decline", "J1"], "");
     assert!(!o.status.success());
@@ -493,4 +506,55 @@ fn bad_ticket_at_the_first_member_tries_the_next() {
     assert_eq!(r["team"], "acme");
     assert!(rows(&f).is_empty(), "F refused before storing a request");
     assert_eq!(rows(&x), ["admitted"]);
+}
+
+/// A computer proof valid `secs` more seconds, for `id`'s key.
+fn short_proof(id: &Identity, secs: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    common::issuer::mint(&json!({"iss": "test", "iat": now, "exp": now + secs,
+        "sub": "person-c", "name": "Carol", "computer": id.key, "kind": "computer",
+        "workspace": null, "agents": []}))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_proof_that_expires_while_its_dialog_waits_is_refused_at_allow() {
+    let a = Env::new();
+    a.daemon(false, "", &[dialog("")]);
+    let t = ticket::decode(&invite(&a, "reusable")).unwrap();
+    let me = identity();
+    let token = short_proof(&me, 2);
+    let req = admission::request(&me, &t, "carol", "mbp", "computer", Some(&token));
+    let _p = Played::send(&a, &me, &req).await;
+    until(10, "J1 is listed", || requests(&a).len() == 1);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let r = person(
+        &a,
+        json!({"id": 1, "op": "team.admit", "request": "J1", "verdict": "allow"}),
+    );
+    assert_eq!(r["state"], "refused", "{r}");
+    assert_eq!(members(&a).len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unprintable_name_is_refused_as_bad_name() {
+    let (a, b) = (Env::new(), Env::new());
+    a.daemon(false, "", &[dialog("Allow")]);
+    let line = invite(&a, "reusable");
+    let t = ticket::decode(&line).unwrap();
+    let mut p = Played::ask(&a, &t, "car\u{202e}ol").await;
+    match p.recv().await.unwrap() {
+        Frame::JoinDecision { reason, .. } => assert_eq!(reason.as_deref(), Some("bad_name")),
+        f => panic!("{f:?}"),
+    }
+    // The candidate's own CLI says it in a sentence, before any dial.
+    b.daemon(false, "", &[peers(&[&a])]);
+    let o = b.detached(&[EXE, "join", &line, "--name", "car\u{202e}ol"], "");
+    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(
+        err(&o),
+        "That name has characters Lightbulb Connect cannot show. Use letters, numbers, spaces and punctuation.\n"
+    );
 }

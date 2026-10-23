@@ -233,13 +233,25 @@ pub fn dialog(
             })
             .filter(|f| !f.is_empty())
             .map_or(String::new(), |f| format!(" in {f}"));
-        format!("{who} wants to message your {agent}{folder}.\n\"{quote}\"")
+        message_text(&who, &h.target_session, &agent, &folder, &quote)
     };
     let mut buttons = vec!["Decline", "Allow"];
     if always_scope(roster, me, h).is_some() {
         buttons.push("Always allow");
     }
     Ok((text, buttons, who))
+}
+
+/// A held message's dialog words: `who` wants to message the session (`agent`, in `folder`)
+/// or the name at `target`, then the `quote`.
+fn message_text(who: &str, target: &str, agent: &str, folder: &str, quote: &str) -> String {
+    let member = sessions::member_of(target).unwrap_or_default();
+    match Sender::of(member, target) {
+        Sender::Name(n) => {
+            format!("{who} wants to send a message to \"{n}\" on this computer.\n\"{quote}\"")
+        }
+        _ => format!("{who} wants to message your {agent}{folder}.\n\"{quote}\""),
+    }
 }
 
 /// What "Always allow" means for `h`'s sender: `OwnCloud` for my workspace's member, `CloudOf`
@@ -522,16 +534,20 @@ fn run(id: u64, op: &str, body: &Value, d: &Arc<Daemon>) -> Result<Response> {
     let me = &d.identity.key;
     let hold_id = body["hold"].as_str().and_then(|s| dialog::number(s, 'H'));
     Ok(match op {
-        // `holds {}` -> `{holds: [{id, kind, target_session, from, label, preview, created_at}]}`
+        // `holds {}` -> `{holds: [{id, kind, target_session, from, label, verified, preview,
+        // created_at}]}` (`verified` as the label says it)
         "holds" => {
             let team = d.team.lock().unwrap();
             let store = d.store.lock().unwrap();
             let list: Vec<Value> = open(&store)?
                 .iter()
                 .map(|h| {
+                    let from = sessions::member_of(&h.from_session).unwrap_or_default();
+                    let m = team.roster.by_short(from);
                     json!({"id": h.name(), "kind": h.kind(), "target_session": h.target_session,
                         "from": h.from_session,
                         "label": label::render(&team.roster, me, &h.from_session),
+                        "verified": m.is_some_and(|m| label::verified(m, me)),
                         "preview": preview(&h.message.body), "created_at": h.created_at})
                 })
                 .collect();
@@ -631,4 +647,25 @@ fn run(id: u64, op: &str, body: &Value, d: &Arc<Daemon>) -> Result<Response> {
         }
         _ => Response::err(id, ipc::UNKNOWN_OP),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_hold_for_a_name_says_so_without_mailbox_jargon() {
+        assert_eq!(
+            super::message_text(
+                "demo2, at the terminal",
+                "abc/inbox",
+                "inbox mailbox",
+                "",
+                "hi"
+            ),
+            "demo2, at the terminal wants to send a message to \"inbox\" on this computer.\n\"hi\""
+        );
+        assert_eq!(
+            super::message_text("bob's Codex", "abc/codex:t", "Codex", " in app", "hi"),
+            "bob's Codex wants to message your Codex in app.\n\"hi\""
+        );
+    }
 }

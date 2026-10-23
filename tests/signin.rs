@@ -265,7 +265,10 @@ fn second_computer_of_same_person_is_admitted_by_the_first() {
     assert!(o.status.success(), "{}{}", out(&o), err(&o));
     assert_eq!(
         texts(dir.path()),
-        ["Your new Mac mbp wants to join. Allow?"]
+        [
+            "Your new Mac mbp wants to join. Allow?",
+            "Or run: lightbulb-connect approve J1"
+        ]
     );
     let ms = members(&f);
     let mb = member(&ms, &b.identity().key);
@@ -340,7 +343,10 @@ async fn workspace_member_joins_with_a_workspace_proof() {
     assert_eq!(r["state"], "admitted", "{r}");
     assert_eq!(
         texts(dir.path()),
-        ["Lightbulb workspace \"The Lightbulb Company\" wants to join as a member. Its agents (Friday, Engineering) will appear in your directory, and it will see this network's directory."]
+        [
+            "Lightbulb workspace \"The Lightbulb Company\" wants to join as a member. Its agents (Friday, Engineering) will appear in your directory, and it will see this network's directory.",
+            "Or run: lightbulb-connect approve J1"
+        ]
     );
     let ms = members(&f);
     let m = member(&ms, &wk);

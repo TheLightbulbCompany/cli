@@ -133,41 +133,94 @@ pub struct Receipt {
     pub at: Option<i64>,
 }
 
-/// What receipt `r` (as `send` and `receipt` answer it) means in words, when it needs them: mail
-/// on a teammate's computer, or a `loop` refusal. With `rid` it is the terminal's line: the id
-/// first where the receipt may still change, and a stored line naming the session's tier and
-/// the `receipt` command.
-pub fn receipt_note(r: &Value, rid: Option<&str>) -> Option<String> {
+/// What a terminal's sender is told about a receipt: the address it went `to` (when known), its
+/// request id and the command name to type (`receipt_note`).
+pub struct ForPerson<'a> {
+    pub to: Option<&'a str>,
+    pub rid: &'a str,
+    pub cmd: &'a str,
+}
+
+/// What receipt `r` means in words. With `person`, the sentence for the person who sent it at
+/// a terminal (always one). Without, the note an agent's `send_message` and `message_receipt`
+/// carry, only for mail on a teammate's computer or a `loop` refusal.
+pub fn receipt_note(r: &Value, person: Option<&ForPerson>) -> Option<String> {
     let at = |f: &str| r[f].as_str().unwrap_or_default();
-    let (computer, person) = (at("where"), at("person"));
+    // A teammate's words, printed to a terminal: one line, nothing it would act on.
+    let shown = |f: &str| crate::label::plain(&at(f).replace(['\n', '\t'], " "), usize::MAX);
+    let (computer, who) = (shown("where"), shown("person"));
     let remote = r["person"].is_string();
-    let id = rid.map(|i| format!("{i} ")).unwrap_or_default();
+    let until = || crate::date::local_time(r["until"].as_i64().unwrap_or_default());
+    let limit = || match at("limit") {
+        RATE => format!("loop limit: {LOOP_LIMIT} messages in 10 minutes to this session"),
+        HOPS => format!("paused after {MAX_HOPS} agent replies; a person must speak"),
+        _ => "paused by a loop limit".into(),
+    };
+    let Some(p) = person else {
+        let (computer, person) = (at("where"), at("person"));
+        return Some(match at("state") {
+            "refused" if at("reason") == "loop" => limit(),
+            "queued" if remote => {
+                let why = if r["online"] == true {
+                    "has not confirmed yet"
+                } else {
+                    "is offline"
+                };
+                format!("queued: {computer} {why}. Will retry until {}.", until())
+            }
+            "stored" if remote => format!(
+                "stored on {computer}. It may be held for {person} to approve; you will see the receipt change."
+            ),
+            "held" if remote => format!("held: waiting for {person} to approve"),
+            _ => return None,
+        });
+    };
+    let check = format!(" Check: {} receipt {}", p.cmd, p.rid);
+    let name = p.to.map(|t| t.split_once('/').map_or(t, |(_, n)| n));
     Some(match at("state") {
-        "refused" if at("reason") == "loop" => match at("limit") {
-            RATE => format!("loop limit: {LOOP_LIMIT} messages in 10 minutes to this session"),
-            HOPS => format!("paused after {MAX_HOPS} agent replies; a person must speak"),
-            _ => "paused by a loop limit".into(),
-        },
+        "refused" if at("reason") == "loop" => format!("Not sent: {}.", limit()),
+        "refused" => format!(
+            "Not sent: {}.",
+            match at("reason") {
+                "policy" => "they do not take messages from you".to_string(),
+                "declined" => "they declined it".into(),
+                "not_member" => "that computer is not in your team".into(),
+                "request_id_reused" => "that request id was used for another message".into(),
+                "unsupported" => "their computer cannot take it".into(),
+                _ => shown("reason").replace('_', " "),
+            }
+        ),
+        "held" => format!("Sent. {who} has to allow it first (they see a prompt).{check}"),
         "queued" if remote => {
-            let until = crate::date::local_time(r["until"].as_i64().unwrap_or_default());
             let why = if r["online"] == true {
-                "has not confirmed yet"
+                "has not confirmed it yet"
             } else {
                 "is offline"
             };
-            format!("{id}queued: {computer} {why}. Will retry until {until}.")
+            format!(
+                "Not delivered yet: {computer} {why}. Lightbulb Connect keeps trying until {}.{check}",
+                until()
+            )
         }
-        "stored" if remote => match rid {
-            Some(i) => format!(
-                "{i} stored on {computer} (tier {}). Receipt: lightbulb-connect receipt {i}",
-                r["tier"].as_str().unwrap_or("unknown")
+        "queued" => format!("Not delivered yet.{check}"),
+        "stored" if remote => {
+            format!("Sent. Stored on {computer} for the session's next step.{check}")
+        }
+        "stored" if computer == "recipient" => "Sent. The session sees it at its next step.".into(),
+        "stored" => match name {
+            Some(n) if !n.contains(':') => format!(
+                "Sent. Waiting in the \"{}\" mailbox until someone reads it.",
+                crate::label::plain(n, usize::MAX)
             ),
-            None => format!(
-                "stored on {computer}. It may be held for {person} to approve; you will see the receipt change."
-            ),
+            Some(_) => "Sent. It waits until that session is back.".into(),
+            None => "Sent. It waits until it is read.".into(),
         },
-        "held" if remote => format!("{id}held: waiting for {person} to approve"),
-        _ => return None,
+        "delivered" if remote => format!("Delivered to {who} on {computer}."),
+        "delivered" => "Delivered.".into(),
+        "read" if remote => format!("Read by {who} on {computer}."),
+        "read" => "Read.".into(),
+        "expired" => "Not delivered: the other computer could not be reached for 24 hours.".into(),
+        other => format!("Sent ({}).", crate::label::plain(other, usize::MAX)),
     })
 }
 
@@ -973,6 +1026,9 @@ mod tests {
                 status: "idle".into(),
                 seen_at: 0,
                 executable: None,
+                repo: None,
+                branch: None,
+                handle: None,
             })
             .unwrap();
     }
