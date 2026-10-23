@@ -10,6 +10,10 @@ other people can see. For a first run, see the quick start in the [README](../RE
   `~/.lightbulb/connect/bin/lightbulb-connect`. The same folder holds this computer's key
   (`identity.key`), its settings (`config.toml`), its messages (`state.db`) and the log
   (`daemon.log`). The folder is private to your user.
+  With npm (`npx lightbulb-connect setup` or `npm install -g lightbulb-connect`), the install
+  step downloads the same release binary into the npm package's `vendor/` folder and checks its
+  checksum; `setup` then copies it to `~/.lightbulb/connect/bin`, so the background service does
+  not depend on the npm cache.
 - **The command:** a `lightbulb-connect` link in `~/.local/bin` (and `lightbulb`, when no other
   program has that name).
 - **The background service:** the launchd job `company.thelightbulb.connect`, in
