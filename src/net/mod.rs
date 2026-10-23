@@ -153,6 +153,8 @@ pub struct Peers {
     pub outbox: Notify,
     /// Woken (`notify_waiters`) whenever a member's connection ends.
     pub disconnected: Notify,
+    /// Woken (`notify_waiters`) whenever a member answers for mail sent it (`outbox::acked`).
+    pub acked: Notify,
     /// The endpoint's UDP port.
     pub port: OnceLock<u16>,
     /// The endpoint, for the candidate side of a join.
@@ -247,6 +249,13 @@ impl Peers {
             .filter(|(_, l)| matches!(l.protocol, Protocol::Ok(_)))
             .map(|(k, _)| k.clone())
             .collect()
+    }
+
+    /// Whether member `key` is `online`.
+    pub fn is_online(&self, key: &str) -> bool {
+        let live = self.live.lock().unwrap();
+        live.get(key)
+            .is_some_and(|l| matches!(l.protocol, Protocol::Ok(_)))
     }
 
     /// For `status`, in one pass: how many members are online, how many of those are reached
@@ -553,13 +562,14 @@ impl Net {
     /// Sends what members are owed: on each `hello` every queued envelope of an online member,
     /// and every second the envelopes due (`outbox::due`'s per-row backoff) and the receipts
     /// waiting; every 60 s (or the outbox knob, if shorter) expires what waited too long, here
-    /// and in the outbox.
+    /// and in the outbox, and lapses and renews sign-in proofs (`proof::tick`).
     // ponytail: a 1 s poll (two small queries) picks up receipts that mail state changes queue;
     // wake it from `mail` if that ever shows.
     async fn flush_loop(self) {
         let d = &self.0.daemon;
         let every = Duration::from_secs(d.peers.knobs().outbox_s.clamp(1, 60));
         let mut expired_at: Option<std::time::Instant> = None;
+        let mut renew_at = 0;
         loop {
             // Armed before the flush, so a `hello` during it is not missed.
             let connected = d.peers.connected.notified();
@@ -574,6 +584,7 @@ impl Net {
             let expire = expired_at.is_none_or(|t| t.elapsed() >= every);
             if expire {
                 expired_at = Some(std::time::Instant::now());
+                crate::proof::tick(d, &mut renew_at);
             }
             if let Err(e) = flush(d, all, expire) {
                 eprintln!("net: outbox: {e}");
@@ -741,7 +752,8 @@ impl Net {
         let short = peer.short.clone();
         let mut synced = false;
         let mut hello_ok = false;
-        let (mut presence, mut envelope, mut answer, mut grant) = (None, None, None, None);
+        let (mut presence, mut envelope, mut answer) = (None, None, None);
+        let (mut grant, mut join) = (None, None);
         if let Err(why) = frames::from_peer_ok(&f, peer, d) {
             d.peers.dropped(f.kind());
             eprintln!("net: dropped a {} frame from {short} ({why})", f.kind());
@@ -772,10 +784,24 @@ impl Net {
             envelope = Some(f);
         } else if matches!(f, Frame::ShareGrant { .. }) {
             grant = Some(f);
+        } else if matches!(f, Frame::JoinRequest { .. } | Frame::JoinDecision { .. }) {
+            join = Some(f);
         } else if matches!(f, Frame::Ack { .. }) && d.peers.knobs().drop_acks {
             eprintln!("net: dropped an ack from {short} (debug)");
-        } else if let Frame::Ack { id, state, reason } | Frame::Receipt { id, state, reason } = f {
-            answer = Some((id, state, reason));
+        } else if let Frame::Ack {
+            id,
+            state,
+            reason,
+            limit,
+        }
+        | Frame::Receipt {
+            id,
+            state,
+            reason,
+            limit,
+        } = f
+        {
+            answer = Some((id, state, reason, limit));
         }
         // Waiting entries are retried after each sync, and when the roster changed: another
         // connection may have brought their parents.
@@ -793,6 +819,9 @@ impl Net {
             let first = !std::mem::replace(&mut sync.presence_stored, true);
             crate::presence::put(d, key, &p, ipc::now(), first);
         }
+        if let Some(f) = join {
+            tokio::spawn(crate::admission::from_member(d.clone(), key.to_string(), f));
+        }
         if let Some(env) = envelope.filter(|_| d.peers.speaks_ours(key, conn)) {
             receive(d, key, &env, tx);
         }
@@ -801,14 +830,16 @@ impl Net {
                 eprintln!("net: a share_grant from {short}: {e}");
             }
         }
-        if let Some((id, state, reason)) = answer {
+        if let Some((id, state, reason, limit)) = answer {
             let store = d.store.lock().unwrap();
             let state = State::parse(&state).expect("checked by from_peer_ok");
-            match outbox::acked(&store, key, &id, state, reason.as_deref(), ipc::now()) {
+            let (reason, limit) = (reason.as_deref(), limit.as_deref());
+            match outbox::acked(&store, key, &id, state, reason, limit, ipc::now()) {
                 Ok(Some(moved)) => {
                     eprintln!("net: {id} at {short}: {}", state.name());
+                    d.peers.acked.notify_waiters();
                     if moved {
-                        receipt_changed(d, &id, state.name(), reason.as_deref());
+                        receipt_changed(d, &id, state.name(), reason);
                     }
                 }
                 Ok(None) => {
@@ -838,11 +869,12 @@ fn receive(d: &Arc<Daemon>, key: &str, env: &Frame, tx: &mpsc::UnboundedSender<F
         return;
     };
     let short = &peer.short;
-    let ack = |state: State, reason: Option<String>| {
+    let ack = |state: State, reason: Option<String>, limit: Option<String>| {
         let _ = tx.send(Frame::Ack {
             id: id.clone(),
             state: state.name().into(),
             reason,
+            limit,
         });
     };
     // An instance's sessions are the ones it declared: new mail for any other is refused.
@@ -859,9 +891,10 @@ fn receive(d: &Arc<Daemon>, key: &str, env: &Frame, tx: &mpsc::UnboundedSender<F
         declared.as_deref(),
         now,
     ) {
-        Ok(mail::Received {
+        Ok(mail::Answer {
             state,
             reason,
+            limit,
             held,
             fresh,
         }) => {
@@ -869,7 +902,7 @@ fn receive(d: &Arc<Daemon>, key: &str, env: &Frame, tx: &mpsc::UnboundedSender<F
                 holds::shown(d, &team.roster, &store, &h);
             }
             eprintln!("net: envelope {id} from {short}: {}", state.name());
-            ack(state, reason);
+            ack(state, reason, limit);
             if state == State::Stored {
                 drop((store, team));
                 ipc::stored(d, &Key(to.clone()), fresh.then_some(id.as_str()));

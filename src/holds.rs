@@ -346,12 +346,20 @@ pub fn answer(
         let (f, rid, at) = (&m.from_key, &m.request_id, now as u64);
         if allow {
             store.put_mailbox(&m.to_key, &m.id, now, mail::expires_for(&m.to_key, now))?;
-            mail::advance(store.conn(), f, rid, State::Stored, None, at)?;
+            mail::advance(store.conn(), f, rid, State::Stored, None, None, at)?;
             if let (Some(f), false) = (from, scope == Scope::Once) {
                 policy::set(store, roster, &me.key, f, Verdict::Accept, by, now)?;
             }
         } else {
-            mail::advance(store.conn(), f, rid, State::Refused, Some("declined"), at)?;
+            mail::advance(
+                store.conn(),
+                f,
+                rid,
+                State::Refused,
+                Some("declined"),
+                None,
+                at,
+            )?;
         }
     }
     let nonce = ulid::Ulid::generate().to_string();
@@ -402,7 +410,15 @@ pub fn expire(store: &Store, now: i64) -> Result<Vec<Hold>> {
         if h.kind() == Kind::Message {
             let m = &h.message;
             let (f, rid) = (&m.from_key, &m.request_id);
-            mail::advance(store.conn(), f, rid, State::Expired, reason, now as u64)?;
+            mail::advance(
+                store.conn(),
+                f,
+                rid,
+                State::Expired,
+                reason,
+                None,
+                now as u64,
+            )?;
         }
         out.push(h);
     }

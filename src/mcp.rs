@@ -195,55 +195,9 @@ fn git_in(cwd: &Path) -> Option<(Option<String>, Option<String>)> {
     Some((repo, branch))
 }
 
-/// What receipt `r` (as `send` and `receipt` answer, `ipc::annotate`) means, in words, when it
-/// needs them: mail on a teammate's computer, or a `loop` refusal.
-pub(crate) fn note(r: &Value) -> Option<String> {
-    let at = |f: &str| r[f].as_str().unwrap_or_default();
-    let (computer, person) = (at("where"), at("person"));
-    let remote = r["person"].is_string();
-    Some(match at("state") {
-        "refused" if at("reason") == "loop" && at("loop") == "rate" => {
-            format!("loop limit: {} messages in 10 minutes to this session", mail::LOOP_LIMIT)
-        }
-        "refused" if at("reason") == "loop" => {
-            format!("paused after {} agent replies; a person must speak", mail::MAX_HOPS)
-        }
-        "queued" if remote => {
-            let until = local_time(r["until"].as_i64().unwrap_or_default());
-            format!("queued: {computer} is offline. Will retry until {until}.")
-        }
-        "stored" if remote => format!(
-            "stored on {computer}. It may be held for {person} to approve; you will see the receipt change."
-        ),
-        "held" if remote => format!("held: waiting for {person} to approve"),
-        _ => return None,
-    })
-}
-
-/// `secs` in local time: `HH:MM`, after the date (`YYYY-MM-DD HH:MM`) when it is not today.
-pub(crate) fn local_time(secs: i64) -> String {
-    let tm = |t: i64| {
-        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-        unsafe { libc::localtime_r(&(t as libc::time_t), &mut tm) };
-        tm
-    };
-    let (t, today) = (tm(secs), tm(crate::daemon::ipc::now() as i64));
-    let hm = format!("{:02}:{:02}", t.tm_hour, t.tm_min);
-    if (t.tm_year, t.tm_yday) == (today.tm_year, today.tm_yday) {
-        hm
-    } else {
-        format!(
-            "{:04}-{:02}-{:02} {hm}",
-            t.tm_year + 1900,
-            t.tm_mon + 1,
-            t.tm_mday
-        )
-    }
-}
-
 /// Receipt `r` with its `note`, when it has one.
 fn with_note(mut r: Value) -> Value {
-    if let Some(n) = note(&r) {
+    if let Some(n) = mail::receipt_note(&r, None) {
         r["note"] = n.into();
     }
     r
@@ -310,36 +264,16 @@ impl Server {
             Ok(c) => c,
             Err(e) => return e,
         };
-        let Ok(r) = ask("directory", json!({})).await else {
+        let Ok(r) = ask("directory", json!({ "query": a.query })).await else {
             return code("internal");
         };
-        let query = a.query.to_lowercase();
-        let fields = [
-            "session_id",
-            "person",
-            "computer",
-            "agent",
-            "cwd",
-            "repo",
-            "branch",
-            "doing",
-        ];
-        let found: Vec<Value> = r["sessions"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|r| {
-                fields
-                    .iter()
-                    .filter_map(|f| r[f].as_str())
-                    .any(|v| v.to_lowercase().contains(&query))
-            })
-            .map(|r| {
-                let mut r = r.clone();
-                r["is_this_session"] = (r["session_id"] == call.from.0.as_str()).into();
-                r
-            })
-            .collect();
+        let mut found: Vec<Value> = match r["sessions"].clone() {
+            Value::Array(v) => v,
+            _ => vec![],
+        };
+        for r in &mut found {
+            r["is_this_session"] = (r["session_id"] == call.from.0.as_str()).into();
+        }
         let total = found.len();
         let sessions: Vec<Value> = found.into_iter().take(a.limit as usize).collect();
         Self::done(&call, json!({ "sessions": sessions, "total": total })).await

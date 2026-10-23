@@ -29,7 +29,6 @@ sha2 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros", "io-std", "process"] }
 toml_edit = "0.25"
 ulid = "3.0.0"
-# Blocking HTTPS for the signed relay list (Task 12) and, later, the device flow (Task 13).
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 
 [dev-dependencies]

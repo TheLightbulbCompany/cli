@@ -459,6 +459,7 @@ async fn only_own_workspace_computers_start_a_conversation() {
         id,
         state: "stored".into(),
         reason: None,
+        limit: None,
     };
     pc.send(&stored).await;
     let mut accepted = false;
@@ -509,12 +510,14 @@ async fn snapshot_and_events() {
                 id: id2,
                 state: state2,
                 reason,
+                limit: None,
             }
         } else {
             Frame::Receipt {
                 id: id2,
                 state: state2,
                 reason,
+                limit: None,
             }
         };
         pa.send(&f).await;

@@ -93,10 +93,15 @@ pub(crate) async fn boot(
         roster::accept(&store, &g, now)?;
         entries.push(g);
     }
-    let team = TeamState {
-        roster: roster::replay(&entries),
-        config,
+    let mut roster = roster::replay(&entries);
+    roster.lapse(now);
+    let mut team = TeamState {
+        roster,
+        config: Config::default(),
+        off: vec![],
     };
+    let off = crate::daemon::canonical_off(&config);
+    team.set_config(config, off);
     net_ops::sync_team_row(&store, &roster::Roster::default(), &team.roster)?;
     let latest = presence::load(&store);
     let peers = net::Peers::default();
@@ -130,6 +135,7 @@ pub(crate) async fn boot(
         dialogs,
         dialog_answers: Mutex::new(Some(answers)),
         admissions: Mutex::default(),
+        roster_changed: Default::default(),
         joining: tokio::sync::Mutex::new(()),
         presence: Default::default(),
         built: Mutex::default(),
@@ -217,10 +223,9 @@ pub(crate) fn inbox(id: u64, body: &Value, d: &Daemon) -> Response {
     let Ok(taken) = taken else {
         return Response::err(id, INTERNAL);
     };
-    let messages: Vec<Value> = taken
-        .iter()
-        .map(|m| {
-            let v = ipc::record(d, m);
+    let messages: Vec<Value> = ipc::records(d, &taken)
+        .into_iter()
+        .map(|v| {
             let keys = ipc::INBOX_RECORD.iter();
             keys.map(|k| (k.to_string(), v[k].clone())).collect()
         })

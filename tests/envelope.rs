@@ -24,13 +24,20 @@ fn wait_state(e: &Env, from: &str, rid: &str, want: &str) {
 }
 
 /// `who` admitted into `e`'s stored team as "carol" (computer "cmac"), a computer or (with
-/// `cloud`) a cloud member of workspace `ws:<key>` with an opaque proof, signed by the founder
+/// `cloud`) a cloud member of workspace `ws:<key>` with its workspace proof, signed by the founder
 /// `founder`; `e` already allows carol's mail (`people` or `cloud_of` accept).
 fn admit(e: &Env, founder: &Identity, parent: &Entry, who: &Identity, cloud: bool) -> Entry {
     let mut extra = json!({"computer": "cmac"});
     if cloud {
         extra["kind"] = json!("cloud");
-        extra["proof"] = json!("p");
+        let proof = common::issuer::workspace_proof(
+            &who.key,
+            &who.key,
+            "carol",
+            &[],
+            lightbulb_connect::daemon::ipc::now() as i64,
+        );
+        extra["proof"] = json!(proof);
         extra["person_id"] = json!(format!("ws:{}", who.key));
     }
     let entry = common::admit(founder, parent, who, "carol", extra);
@@ -110,9 +117,19 @@ impl Peer {
     async fn answer(&mut self, ack: bool, id: &str, state: &str) {
         let (id, state, reason) = (id.to_string(), state.to_string(), None);
         let f = if ack {
-            Frame::Ack { id, state, reason }
+            Frame::Ack {
+                id,
+                state,
+                reason,
+                limit: None,
+            }
         } else {
-            Frame::Receipt { id, state, reason }
+            Frame::Receipt {
+                id,
+                state,
+                reason,
+                limit: None,
+            }
         };
         self.send(&f).await;
     }

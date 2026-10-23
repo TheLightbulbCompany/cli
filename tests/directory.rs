@@ -203,22 +203,40 @@ async fn presence_naming_another_prefix_is_dropped() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kept_name_is_refused_on_the_persons_other_computer() {
-    // The same person on two computers: B's admit names A's person_id, with a proof.
+    // The same person on two computers: A signed in as `user_p`, and B's admit names that
+    // person with B's own proof.
     let (a, b) = (Env::new(), Env::new());
     let (ia, ib) = (a.identity(), b.identity());
     let g = net_ops::genesis(&ia, "prasiddha", "mac", "acme", 1);
-    let admit = Entry::signed(
+    let proof = |k: &str| {
+        common::issuer::computer_proof(
+            k,
+            "user_p",
+            "Prasiddha",
+            None,
+            lightbulb_connect::daemon::ipc::now() as i64,
+        )
+    };
+    let merge = Entry::signed(
         &ia,
         vec![g.hash()],
-        Kind::Admit,
-        json!({"member": ib.key, "name": "prasiddha-mbp", "computer": "mbp", "person_id": ia.key,
-               "kind": "computer", "role": "member", "proof": "test"}),
+        Kind::Merge,
+        json!({"member": ia.key, "person_id": "user_p", "proof": proof(&ia.key)}),
         2,
+    );
+    let admit = Entry::signed(
+        &ia,
+        vec![merge.hash()],
+        Kind::Admit,
+        json!({"member": ib.key, "name": "prasiddha-mbp", "computer": "mbp", "person_id": "user_p",
+               "kind": "computer", "role": "member", "proof": proof(&ib.key)}),
+        3,
     );
     for env in [&a, &b] {
         let store = env.store();
-        roster::accept(&store, &g, 10).unwrap();
-        roster::accept(&store, &admit, 10).unwrap();
+        for e in [&g, &merge, &admit] {
+            roster::accept(&store, e, 10).unwrap();
+        }
     }
     start_pair(&a, &b, "", &[]);
 

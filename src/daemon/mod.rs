@@ -25,6 +25,29 @@ pub struct TeamState {
     /// The replayed roster, replaced by every write (`net_ops`), never replayed per op.
     pub roster: roster::Roster,
     pub config: Config,
+    /// `config.folders_off`, each `presence::canonical`: what `register` and the presence
+    /// compare a session's folder with. Set with `config` (`set_config`).
+    pub off: Vec<PathBuf>,
+}
+
+impl TeamState {
+    /// Takes `config` and its canonical `off` (computed before the lock: `canonical` is a
+    /// syscall); whether either changed (a folder may resolve anew with the file unchanged).
+    pub fn set_config(&mut self, config: Config, off: Vec<PathBuf>) -> bool {
+        let changed = self.config != config || self.off != off;
+        self.off = off;
+        self.config = config;
+        changed
+    }
+}
+
+/// `config.folders_off`, each `presence::canonical`: `TeamState::set_config`'s `off`.
+pub fn canonical_off(config: &Config) -> Vec<PathBuf> {
+    config
+        .folders_off
+        .iter()
+        .map(|o| crate::presence::canonical(o))
+        .collect()
 }
 
 /// What every connection handler shares.
@@ -55,6 +78,8 @@ pub struct Daemon {
     pub dialog_answers: Mutex<Option<dialog::Answers>>,
     /// The join requests waiting for their person's answer (`admission`).
     pub admissions: crate::admission::Waiting,
+    /// Poked on every roster install (`net_ops::install`): waiters look again.
+    pub roster_changed: Notify,
     /// Held while a `team.join` runs: one at a time.
     pub joining: tokio::sync::Mutex<()>,
     /// Poked on a local session change: the presence sender (`presence::run`) looks again.

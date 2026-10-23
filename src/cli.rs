@@ -5,7 +5,7 @@
 use crate::daemon::ipc;
 use crate::daemon::net_ops::Invite;
 use crate::hook::{self, Conn};
-use crate::{admission, daemon, paths, setup, Result};
+use crate::{admission, daemon, http, label, paths, proof, setup, Result};
 use serde_json::{json, Value};
 use std::ffi::OsString;
 use std::fs;
@@ -236,25 +236,17 @@ pub fn send(
         if state == "refused" {
             code = 1;
         }
-        let line = match crate::mcp::note(receipt) {
-            Some(_) if state == "stored" => format!(
-                "{rid} stored on {} (tier {}). Receipt: lightbulb-connect receipt {rid}",
-                receipt["where"].as_str().unwrap_or_default(),
-                receipt["tier"].as_str().unwrap_or("unknown"),
-            ),
-            Some(note) => note,
-            None => {
-                let mut line = match receipt["reason"].as_str() {
-                    Some(reason) if state == "refused" => format!("refused: {reason}"),
-                    _ => state.to_string(),
-                };
-                line.push_str(&format!(" {rid}"));
-                if group {
-                    line.push_str(&format!(" {to}"));
-                }
-                line
+        let line = crate::mail::receipt_note(receipt, Some(&rid)).unwrap_or_else(|| {
+            let mut line = match receipt["reason"].as_str() {
+                Some(reason) if state == "refused" => format!("refused: {reason}"),
+                _ => state.to_string(),
+            };
+            line.push_str(&format!(" {rid}"));
+            if group {
+                line.push_str(&format!(" {to}"));
             }
-        };
+            line
+        });
         println!("{line}");
     }
     Ok(code)
@@ -317,11 +309,24 @@ pub fn receipt(request_id: &str, from: Option<String>) -> Result<i32> {
 
 /// `folder <path> on|off`: whether the sessions under `path` are shown to teammates
 /// (`folders_off` in `config.toml`, canonical as presence compares them), then `reload`.
+/// A folder that does not exist cannot be turned off; one turned off before it went away can
+/// still be turned on (`presence::canonical` resolves it through its existing parent). `on` for
+/// a folder that was not off says so and exits 1.
 pub fn folder(path: &str, on: bool) -> Result<i32> {
     let dir = paths::state_dir();
-    let p = crate::presence::canonical(Path::new(path));
+    let full = std::env::current_dir()?.join(crate::config::expand_home(path));
+    if !on && !full.is_dir() {
+        eprintln!("no such folder: {path}");
+        return Ok(1);
+    }
+    let p = crate::presence::canonical(&full);
     let mut off = crate::config::Config::load(&dir)?.folders_off;
+    let before = off.len();
     off.retain(|o| crate::presence::canonical(o) != p);
+    if on && off.len() == before {
+        eprintln!("{path} was not hidden");
+        return Ok(1);
+    }
     if !on {
         off.push(p);
     }
@@ -329,8 +334,14 @@ pub fn folder(path: &str, on: bool) -> Result<i32> {
         .iter()
         .map(|o| o.to_string_lossy().into_owned())
         .collect();
+    // Not locked: the write is atomic, and one person's concurrent `folder` calls are not a case.
     crate::config::Config::set(&dir, "folders_off", &list.to_string())?;
-    ask(&mut connect()?, "reload", json!({}))?;
+    let r = connect()?.call("reload", json!({}))?;
+    if r["ok"] != true {
+        let code = r["error"].as_str().unwrap_or("failed");
+        eprintln!("Saved to config.toml, but the background service did not reload: {code}");
+        return Ok(1);
+    }
     if on {
         println!("Sessions in {path} are shown to your teammates.");
     } else {
@@ -368,7 +379,7 @@ pub fn invite(mode: Invite) -> Result<i32> {
     let line = r["line"].as_str().unwrap_or_default();
     match mode {
         Invite::Once => {
-            let at = utc(r["expires_at"].as_i64().unwrap_or_default());
+            let at = crate::date::utc(r["expires_at"].as_i64().unwrap_or_default());
             println!("One-time invite, expires {at}: {line}");
         }
         Invite::Open => {
@@ -384,8 +395,9 @@ pub fn invite(mode: Invite) -> Result<i32> {
 }
 
 /// `join '<link>' [--name <n>]`: joins the network `link` invites to, waiting up to 600 s
-/// for its person to allow it.
-pub fn join(link: &str, name: Option<String>) -> Result<i32> {
+/// for its person to allow it. Hidden: `--kind cloud --proof <jws>`, a workspace member (the
+/// bridge joins in process; this is for tests and ops).
+pub fn join(link: &str, name: Option<String>, kind: &str, proof: Option<String>) -> Result<i32> {
     let name = name.unwrap_or_else(daemon::user_name);
     let mut conn = connect()?;
     if crate::ticket::decode(link).is_ok_and(|t| t.mode == "ask") {
@@ -395,7 +407,7 @@ pub fn join(link: &str, name: Option<String>) -> Result<i32> {
     let r = ask(
         &mut conn,
         "team.join",
-        json!({"ticket": link, "name": name, "kind": "computer"}),
+        json!({"ticket": link, "name": name, "kind": kind, "proof": proof}),
     )?;
     let team = r["team"].as_str().unwrap_or_default();
     let text = match (r["state"].as_str(), r["reason"].as_str()) {
@@ -415,12 +427,99 @@ pub fn join(link: &str, name: Option<String>) -> Result<i32> {
         ),
         (_, Some(admission::UNREACHABLE)) => "No one from this network is online right now. Ask them to open their laptop, then run the same command again. Your key is ready; nothing was lost.".to_string(),
         (_, Some(admission::DECLINED)) => "Your request to join was declined.".to_string(),
+        (_, Some(admission::YOUR_COMPUTER_OFFLINE)) => "Open your other computer, then run the same command again.".to_string(),
         (_, Some(admission::BAD_TICKET)) => "This invite link does not work. Ask for a new one.".to_string(),
         (_, Some(admission::EXPIRED_TICKET)) => "This invite link has expired. Ask for a new one.".to_string(),
         (_, reason) => format!("join: {}", reason.unwrap_or("refused")),
     };
     eprintln!("{text}");
     Ok(1)
+}
+
+/// How long `signin` waits for the person to confirm in the browser.
+const SIGNIN_WAIT: Duration = Duration::from_secs(900);
+
+/// `signin`: the issuer's device flow for this computer's key (`device/start`, the browser,
+/// then `device/token` until it answers), the proof written to the roster (`identity.proof`).
+pub fn signin() -> Result<i32> {
+    let issuer = crate::config::Config::load(&paths::state_dir())?.issuer;
+    let start = connect()?.call("identity.device_start", json!({}))?;
+    if start["ok"] != true {
+        match start["reason"].as_str().or(start["error"].as_str()) {
+            Some("not_a_person") => eprintln!("Sign in from your own terminal, not from an agent."),
+            reason => eprintln!("signin: {}", reason.unwrap_or("failed")),
+        }
+        return Ok(1);
+    }
+    let body = json!({"member_key": start["member_key"], "computer": start["computer"],
+        "at": start["at"], "sig": start["sig"]});
+    let post = |path: &str, body: &Value| http::post_json(&proof::route(&issuer, path), body);
+    let (status, s) = post("device/start", &body)?;
+    let (Some(code), Some(uri)) = (
+        s["device_code"].as_str(),
+        s["verification_uri_complete"].as_str(),
+    ) else {
+        eprintln!(
+            "Sign-in is not available right now (the issuer answered {status}). Try again later."
+        );
+        return Ok(1);
+    };
+    // The issuer's words, as plain text: `config.toml` (its URL) is the agent's to write.
+    let user_code = label::plain(s["user_code"].as_str().unwrap_or_default(), 32);
+    println!(
+        "Confirm the code {user_code} in your browser: {}",
+        label::plain(uri, 512)
+    );
+    // A person at a terminal gets the browser (an https page only; debug: the tests' http);
+    // a script reads the line above.
+    let web = uri.starts_with("https://") || (cfg!(debug_assertions) && uri.starts_with("http://"));
+    if web
+        && uri.chars().all(label::printable)
+        && std::io::IsTerminal::is_terminal(&std::io::stdout())
+    {
+        let _ = Command::new("open").arg(uri).status();
+    }
+    let every = Duration::from_secs(s["interval"].as_u64().unwrap_or(5).clamp(1, 60));
+    let deadline = std::time::Instant::now() + SIGNIN_WAIT;
+    let mut token = None;
+    while token.is_none() && std::time::Instant::now() < deadline {
+        let (status, t) = post("device/token", &json!({"device_code": code}))?;
+        match status {
+            200 if t["pending"] == true => std::thread::sleep(every),
+            // A proof, or (neither) nothing more to wait for.
+            200 => match t["proof"].as_str() {
+                Some(p) => token = Some(p.to_string()),
+                None => break,
+            },
+            410 => break,
+            _ => {
+                eprintln!("Sign-in failed (the issuer answered {status}). Try again later.");
+                return Ok(1);
+            }
+        }
+    }
+    let Some(token) = token else {
+        eprintln!("This sign-in code expired. Run the same command again.");
+        return Ok(1);
+    };
+    // A fresh connection: the first may have sat idle through the wait.
+    let r = connect()?.call("identity.proof", json!({ "proof": token }))?;
+    if r["reason"] == "other_person" {
+        eprintln!("This sign-in is for a different person than this computer already belongs to.");
+        return Ok(1);
+    }
+    if r["ok"] != true {
+        eprintln!("The issuer's answer did not verify for this computer. Try again later.");
+        return Ok(1);
+    }
+    // `proof::parse` let only plain text in.
+    let name = r["name"].as_str().unwrap_or_default();
+    if r["solo"] == true {
+        println!("Signed in as {name}. To join your network, paste its join line: lightbulb-connect join '<link>'");
+    } else {
+        println!("Signed in as {name}.");
+    }
+    Ok(0)
 }
 
 /// `approve <id> [--always]` / `decline <id>`: answers join request `J<n>` or held message
@@ -652,26 +751,6 @@ pub fn relay(set: Option<String>, local: bool) -> Result<i32> {
     Ok(0)
 }
 
-/// `secs` as `YYYY-MM-DD HH:MM UTC`.
-fn utc(secs: i64) -> String {
-    // Days to a civil date (Howard Hinnant's `civil_from_days`).
-    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + i64::from(m <= 2);
-    format!(
-        "{y:04}-{m:02}-{d:02} {:02}:{:02} UTC",
-        rem / 3600,
-        rem % 3600 / 60
-    )
-}
-
 /// Hands an unowned subcommand to the Lightbulb app's binary (replacing this process), or says
 /// what is needed.
 pub fn forward(args: Vec<OsString>) -> Result<i32> {
@@ -890,13 +969,6 @@ pub fn doctor() -> Result<i32> {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn utc_formats_a_unix_time() {
-        assert_eq!(super::utc(0), "1970-01-01 00:00 UTC");
-        assert_eq!(super::utc(1_792_728_600), "2026-10-23 04:10 UTC");
-        assert_eq!(super::utc(951_782_400), "2000-02-29 00:00 UTC");
-    }
-
     #[test]
     fn a_title_with_control_characters_prints_as_plain_text() {
         let title = "fix\u{1b}[2J\u{1b}]8;;http://x\u{7}\tit\u{85}\u{2066}now\r\nok";

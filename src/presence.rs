@@ -39,6 +39,15 @@ pub struct Latest {
     pub kept: Vec<String>,
 }
 
+/// The `agent` every member's latest presence declares, by session id (a workspace member's:
+/// `Friday`). One look per batch of labels.
+pub fn declared_agents(d: &Daemon) -> HashMap<String, String> {
+    let latest = d.latest.lock().unwrap();
+    let all = latest.values().flat_map(|l| &l.sessions);
+    all.map(|s| (s.session_id.clone(), s.agent.clone()))
+        .collect()
+}
+
 /// The stored presences, by member (read at daemon start).
 pub fn load(store: &Store) -> HashMap<String, Latest> {
     let rows = store.peers_presence().unwrap_or_default();
@@ -103,9 +112,16 @@ pub(crate) fn hidden(off: &[PathBuf], cwd: &str) -> bool {
     }
 }
 
-/// `p` resolved (symlinks, `..`), else as given; lowercased on macOS, whose volumes ignore case.
+/// `p` resolved (symlinks, `..`); a path that does not exist (a deleted folder) is its nearest
+/// existing parent resolved, then the rest as given. Lowercased on macOS, whose volumes ignore case.
 pub(crate) fn canonical(p: &Path) -> PathBuf {
-    let p = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let p = p
+        .ancestors()
+        .find_map(|a| {
+            let rest = p.strip_prefix(a).ok()?;
+            Some(std::fs::canonicalize(a).ok()?.join(rest))
+        })
+        .unwrap_or_else(|| p.to_path_buf());
     if cfg!(target_os = "macos") {
         PathBuf::from(p.to_string_lossy().to_lowercase())
     } else {
@@ -124,9 +140,8 @@ fn build(d: &Daemon, seq: u64) -> Frame {
     let now = ipc::now();
     let (share, off) = {
         let t = d.team.lock().unwrap();
-        (t.config.share_paths, t.config.folders_off.clone())
+        (t.config.share_paths, t.off.clone())
     };
-    let off: Vec<PathBuf> = off.iter().map(|o| canonical(o)).collect();
     let publishable = |cwd: &str| !hidden(&off, cwd);
     let mut live = ipc::live_sessions(d);
     let (rows, ended, waiting) = {
@@ -407,12 +422,14 @@ pub fn claim(d: &Daemon, key: &str) -> bool {
 }
 
 /// A directory record (architecture §9); `cwd` is empty for another computer's session.
-fn record(m: &Member, me: &str, s: &Remote, cwd: &str) -> Value {
+/// `verified` as its label says it (`label::verified`); `online`, whether its computer is
+/// connected now (this one always is).
+fn record(m: &Member, me: &str, s: &Remote, cwd: &str, verified: bool, online: bool) -> Value {
     json!({
         "session_id": s.session_id,
         "person": m.name,
         "person_id": m.person_id,
-        "person_verified": m.proof.is_some(),
+        "person_verified": verified,
         "computer": m.computer,
         "agent": s.agent,
         "cwd": cwd,
@@ -420,14 +437,17 @@ fn record(m: &Member, me: &str, s: &Remote, cwd: &str) -> Value {
         "branch": s.branch,
         "status": s.status,
         "doing": s.doing.clone().unwrap_or_default(),
+        "title": s.title,
         "tier": s.tier,
+        "online": online,
         "can_send": true,
         "needs_owner_ok": m.person_id != me,
     })
 }
 
 /// `directory {query?}` -> `{sessions}`: this computer's sessions, then every member's latest
-/// presence; `query` matches session id, person, computer, agent, repo or folder, any case.
+/// presence; `query` matches session id, person, computer, agent, folder (and this computer's
+/// full path), repo, branch, what it is doing or its title, any case.
 pub fn directory(d: &Daemon, query: Option<&str>) -> Value {
     // This computer's, with their folders; an instance's are the sessions it declared.
     let local: Vec<(Remote, String)> = match &d.cloud {
@@ -461,23 +481,32 @@ pub fn directory(d: &Daemon, query: Option<&str>) -> Value {
         (my_person(d, &t.roster), own)
     };
     let q = query.map(str::to_lowercase).filter(|q| !q.is_empty());
-    let hit = |m: &Member, s: &Remote| {
+    let hit = |m: &Member, s: &Remote, cwd: &str| {
         q.as_ref().is_none_or(|q| {
             [&s.session_id, &m.name, &m.computer, &s.agent, &s.folder]
                 .into_iter()
-                .chain(s.repo.as_ref())
+                .map(String::as_str)
+                .chain(
+                    [&s.repo, &s.branch, &s.doing, &s.title]
+                        .into_iter()
+                        .flatten()
+                        .map(String::as_str),
+                )
+                .chain([cwd])
                 .any(|f| f.to_lowercase().contains(q))
         })
     };
+    let key = &d.identity.key;
     let mut out = vec![];
     for (r, cwd) in &local {
-        if hit(&own, r) {
-            out.push(record(&own, &me, r, cwd));
+        if hit(&own, r, cwd) {
+            out.push(record(&own, &me, r, cwd, true, true));
         }
     }
     for (m, l) in &remote_ones {
-        for r in l.sessions.iter().filter(|r| hit(m, r)) {
-            out.push(record(m, &me, r, ""));
+        let (verified, up) = (crate::label::verified(m, key), d.peers.is_online(&m.key));
+        for r in l.sessions.iter().filter(|r| hit(m, r, "")) {
+            out.push(record(m, &me, r, "", verified, up));
         }
     }
     json!({ "sessions": out })

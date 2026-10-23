@@ -114,25 +114,32 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, caller: Caller) 
     }
     match op {
         // `identity.get {}` -> who this computer (or instance: `kind` `cloud`, named for its
-        // workspace) is. Until sign-in, a computer's `person_id` is its own key; an instance's is
-        // its roster member's (`ws:<id>` once admitted).
+        // workspace) is: until sign-in, a computer's `person_id` is its own key and `name` the
+        // user's; an instance's is its roster member's (`ws:<id>` once admitted). `verified`
+        // while its proof is in force (`expires_at`).
         "identity.get" => {
             let t = daemon.team.lock().unwrap();
-            let key = &daemon.identity.key;
-            let (name, kind, person_id) = match &daemon.cloud {
-                Some(c) => (c.name.clone(), "cloud", t.roster.person_of(key)),
-                None => (super::user_name(), "computer", key.as_str()),
+            let me = &daemon.identity.key;
+            let proof = t.roster.members.get(me).and_then(|m| m.proof.as_ref());
+            let (name, kind) = match &daemon.cloud {
+                Some(c) => (c.name.clone(), "cloud"),
+                None => (
+                    proof.map_or_else(super::user_name, |p| p.name.clone()),
+                    "computer",
+                ),
             };
             Response::ok(
                 id,
                 json!({
-                    "member_key": key,
+                    "member_key": me,
                     "member_key_short": daemon.identity.short,
                     "name": name,
                     "kind": kind,
                     "computer": t.config.computer,
-                    "person_id": person_id,
-                    "verified": false,
+                    "person_id": t.roster.person_of(me),
+                    "verified": proof.is_some(),
+                    "expires_at": proof.map(|p| p.exp),
+                    "solo": t.roster.is_solo(me),
                 }),
             )
         }
@@ -140,6 +147,47 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, caller: Caller) 
         // from (`config`, `team`, `lightbulb` or `none`); the snapshot `status` reads too.
         "relay.get" => Response::ok(id, json!(*daemon.peers.relays.lock().unwrap())),
         "relay.set" => relay_set(id, body, daemon, caller),
+        // An agent fed a hostile sign-in must not move this computer into another person.
+        "identity.proof" | "identity.device_start" if !caller.is_person() => {
+            refused(id, "not_a_person")
+        }
+        // `identity.device_start {}` -> `{member_key, computer, at, sig}`: `device/start`'s
+        // body, `sig` by this computer's key over the rest (person-only).
+        "identity.device_start" => {
+            let computer = daemon.team.lock().unwrap().config.computer.clone();
+            let at = super::ipc::now() as i64;
+            let body = json!({"member_key": daemon.identity.key, "computer": computer, "at": at});
+            Response::ok(id, daemon.identity.signed(body))
+        }
+        // `identity.proof {proof}` -> `{name, person_id, solo}`: this computer's sign-in proof,
+        // written to the roster (`proof::record`), person-only; `bad_request` when it does not
+        // verify (reason `other_person` when it names another person than this computer's).
+        "identity.proof" => match body["proof"]
+            .as_str()
+            .map(|t| crate::proof::record(daemon, t))
+        {
+            Some(Ok(p)) => {
+                let solo = daemon
+                    .team
+                    .lock()
+                    .unwrap()
+                    .roster
+                    .is_solo(&daemon.identity.key);
+                Response::ok(
+                    id,
+                    json!({"name": p.name, "person_id": p.sub, "solo": solo}),
+                )
+            }
+            Some(Err(e)) => {
+                eprintln!("identity.proof: refused: {e}");
+                if e.to_string() == crate::proof::OTHER_PERSON {
+                    refused(id, "other_person")
+                } else {
+                    Response::err(id, BAD_REQUEST)
+                }
+            }
+            None => Response::err(id, BAD_REQUEST),
+        },
         // `ui.claim {}` -> `{lease_s}`: the Lightbulb app shows the person's questions itself;
         // no OS dialog opens until it stops heartbeating.
         "ui.claim" => {
@@ -179,11 +227,13 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, caller: Caller) 
 
 /// `reload {}` -> `{}`: re-reads `config.toml` into `TeamState`, and rebuilds the presence (a
 /// session under a folder turned off leaves it). Every file the daemon reads at start and may
-/// read again is re-read here.
+/// read again is re-read here. Not person-only: `config.toml` is the agent's to write anyway.
 pub fn reload(daemon: &Daemon) -> crate::Result<()> {
     let config = crate::config::Config::load(&daemon.dir)?;
-    daemon.team.lock().unwrap().config = config;
-    daemon.presence.notify_one();
+    let off = super::canonical_off(&config);
+    if daemon.team.lock().unwrap().set_config(config, off) {
+        daemon.presence.notify_one();
+    }
     Ok(())
 }
 
@@ -388,7 +438,7 @@ pub(crate) fn sync_team_row(store: &Store, old: &Roster, new: &Roster) -> crate:
 }
 
 /// The one post-write hook, for local writes and entries from peers alike: makes `new` the
-/// cached roster, rewrites Plan A's `team` row if it changed, and tells `net` (which closes
+/// cached roster (its expired proofs lapsed), rewrites Plan A's `team` row if it changed, and tells `net` (which closes
 /// the connections of members gone, dials new ones and pushes the change).
 pub fn install(
     daemon: &Daemon,
@@ -397,6 +447,8 @@ pub fn install(
     new: Roster,
 ) -> crate::Result<()> {
     sync_team_row(store, &team.roster, &new)?;
+    let mut new = new;
+    new.lapse(super::ipc::now() as i64);
     let relay_changed = team.roster.relay != new.relay;
     // A removal or leave applied in this team (not a team left or joined, nor a member a fork's
     // resolution dropped): every subscriber hears of each member it took.
@@ -430,6 +482,7 @@ pub fn install(
         }
         daemon.peers.relays_changed(team);
     }
+    daemon.roster_changed.notify_waiters();
     Ok(())
 }
 

@@ -1,10 +1,12 @@
 //! What the CLI and network test files share: a temp state dir and HOME, a daemon shut down
 //! on drop, a person's shell (`detached`) and socket client (`person`), the daemon env knobs,
 //! a two-member team seeded before start, and a member played by the test (`Peer`).
-//! ponytail: only `cli.rs`, `team_cli.rs`, `net_two.rs`, `join.rs`, `ui_claim.rs`, `dialog.rs`,
+//! ponytail: only `cli.rs`, `team_cli.rs`, `net_two.rs`, `join.rs`, `ui_claim.rs`, `dialog.rs`, `signin.rs`,
 //! `directory.rs` and `envelope.rs` use it;
 //! the other test files keep their own copies.
 #![allow(dead_code)]
+
+pub mod issuer;
 
 use iroh::endpoint::{presets, Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, PublicKey, SecretKey};
@@ -69,7 +71,8 @@ impl Env {
 
     /// Starts `lightbulb-connect daemon` on this state dir with `lan` (mDNS) and `config` as
     /// `config.toml`, and `env` set, and waits until it answers.
-    /// Unless `config` names an issuer, a closed port's: no test fetches our relay list.
+    /// Unless `config` names an issuer, a closed port's: no test reaches ours (nor fetches our
+    /// relay list).
     pub fn daemon(&self, lan: bool, config: &str, env: &[(&str, String)]) {
         let issuer = if config.contains("issuer") {
             ""
@@ -263,6 +266,19 @@ pub fn now_s() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64
+}
+
+/// `e`'s invite link of `mode` (`team.invite`): its ticket.
+pub fn invite(e: &Env, mode: &str) -> String {
+    let r = e.ask(json!({"id": 1, "op": "team.invite", "mode": mode}));
+    assert_eq!(r["ok"], true, "{r}");
+    r["ticket"].as_str().unwrap().into()
+}
+
+/// `e`'s members (`team.get`).
+pub fn members(e: &Env) -> Vec<Value> {
+    let r = e.ask(json!({"id": 1, "op": "team.get"}));
+    r["members"].as_array().unwrap().clone()
 }
 
 /// The same team in both stores before either daemon starts: `a` founds "acme" (computer
