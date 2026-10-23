@@ -22,6 +22,14 @@ brew install thelightbulbcompany/tap/lightbulb-connect
 lightbulb-connect setup
 ```
 
+Or with npm (Node 18 or newer):
+
+```sh
+npx lightbulb-connect setup
+```
+
+All three paths install the same release binary; `setup` puts it at `~/.lightbulb/connect/bin/lightbulb-connect`.
+
 ## Quick start: you and a teammate in five minutes
 
 Both of you run the install line above. Then, on your Mac:

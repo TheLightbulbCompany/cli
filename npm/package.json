@@ -1,0 +1,28 @@
+{
+  "name": "lightbulb-connect",
+  "version": "0.2.1",
+  "description": "Lightbulb Connect: your coding agents and your teammates' agents, talking to each other.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TheLightbulbCompany/lightbulb-connect.git",
+    "directory": "npm"
+  },
+  "homepage": "https://github.com/TheLightbulbCompany/lightbulb-connect#readme",
+  "bin": {
+    "lightbulb-connect": "bin/lightbulb-connect.js"
+  },
+  "files": [
+    "bin/",
+    "scripts/"
+  ],
+  "scripts": {
+    "postinstall": "node scripts/postinstall.js",
+    "test": "node test/postinstall.test.js"
+  },
+  "os": ["darwin"],
+  "cpu": ["arm64"],
+  "engines": {
+    "node": ">=18"
+  }
+}
