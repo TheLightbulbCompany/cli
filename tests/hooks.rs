@@ -1,9 +1,9 @@
 //! `hook <agent> <event>` run as the agents run it: the built binary, a fixture on stdin.
-//! The caller is pinned with LIGHTBULB_NETWORK_HOOK_CALLER, since the test runner is not
+//! The caller is pinned with LIGHTBULB_CONNECT_HOOK_CALLER, since the test runner is not
 //! an agent. That override is compiled out of release builds, so `cargo test --release`
 //! fails the pinned tests here; run them in a debug build.
 
-use lightbulb_network::{os, paths};
+use lightbulb_connect::{os, paths};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-const EXE: &str = env!("CARGO_BIN_EXE_lightbulb-network");
+const EXE: &str = env!("CARGO_BIN_EXE_lightbulb-connect");
 
 struct Net {
     dir: tempfile::TempDir,
@@ -26,7 +26,7 @@ impl Net {
         let daemon = Command::new(EXE)
             .arg("daemon")
             .env(paths::HOME_ENV, dir.path())
-            .env("LIGHTBULB_NETWORK_CLAUDE_HOME", claude.path())
+            .env("LIGHTBULB_CONNECT_CLAUDE_HOME", claude.path())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -103,14 +103,14 @@ impl Net {
         let mut cmd = Command::new(EXE);
         if let Some(p) = pin {
             cmd.env(
-                "LIGHTBULB_NETWORK_HOOK_CALLER",
+                "LIGHTBULB_CONNECT_HOOK_CALLER",
                 format!("{}:{}", p.pid, p.birth_micros),
             );
         }
         let mut child = cmd
             .args(["hook", agent, event])
             .env(paths::HOME_ENV, self.dir.path())
-            .env("LIGHTBULB_NETWORK_CLAUDE_HOME", self.claude.path())
+            .env("LIGHTBULB_CONNECT_CLAUDE_HOME", self.claude.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

@@ -14,7 +14,7 @@ this repository.
 
 Include what you can of:
 
-- the version (`lightbulb-network version`) and your operating system;
+- the version (`lightbulb-connect version`) and your operating system;
 - what an attacker needs (a malicious peer, a network position, a local process);
 - steps to reproduce, and what you saw happen.
 

@@ -3,10 +3,10 @@
 //! member itself, with that member's key, over its own iroh endpoint.
 
 use iroh::Endpoint;
-use lightbulb_network::identity::Identity;
-use lightbulb_network::net::frames::{self, Frame};
-use lightbulb_network::net::{ALPN, PROTOCOL};
-use lightbulb_network::roster::{self, Entry, Kind};
+use lightbulb_connect::identity::Identity;
+use lightbulb_connect::net::frames::{self, Frame};
+use lightbulb_connect::net::{ALPN, PROTOCOL};
+use lightbulb_connect::roster::{self, Entry, Kind};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::time::Duration;
@@ -72,7 +72,7 @@ async fn two_members_connect_and_converge_rosters() {
     let (a, b) = (Env::new(), Env::new());
     seed_pair(&a, &b);
     b.daemon(false, "", &[]);
-    a.daemon(false, "", &[("LIGHTBULB_NETWORK_PEERS", b.peer_arg())]);
+    a.daemon(false, "", &[("LIGHTBULB_CONNECT_PEERS", b.peer_arg())]);
     let connected = json!({"online": 1, "total": 1});
     until(5, "both online", || {
         a.status()["peers"] == connected && b.status()["peers"] == connected
@@ -279,7 +279,7 @@ async fn removed_member_connection_is_closed_on_removal() {
 async fn removal_inside_the_gate_closes_the_connection() {
     let (a, b) = (Env::new(), Env::new());
     seed_pair(&a, &b);
-    let pause = ("LIGHTBULB_NETWORK_DEBUG_GATE_PAUSE_MS", "1500".to_string());
+    let pause = ("LIGHTBULB_CONNECT_DEBUG_GATE_PAUSE_MS", "1500".to_string());
     a.daemon(false, "", &[pause]);
     let ep = endpoint(&b.identity()).await;
     let conn = ep.connect(addr(&a), ALPN).await.unwrap();

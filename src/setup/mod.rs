@@ -68,7 +68,7 @@ pub fn wired(home: &Path, agent: &str) -> bool {
         "claude" => ".claude/settings.json",
         "codex" => ".codex/hooks.json",
         "cursor" => ".cursor/hooks.json",
-        "grok" => ".grok/hooks/lightbulb-network.json",
+        "grok" => ".grok/hooks/lightbulb-connect.json",
         _ => return false,
     };
     fs::read_to_string(home.join(file)).is_ok_and(|t| t.contains(&format!(" hook {agent} ")))

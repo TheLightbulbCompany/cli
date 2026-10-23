@@ -8,12 +8,12 @@
 
 use iroh::endpoint::{presets, Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, PublicKey, SecretKey};
-use lightbulb_network::daemon::net_ops;
-use lightbulb_network::identity::{self, Identity};
-use lightbulb_network::net::frames::{self, Frame, Remote};
-use lightbulb_network::net::{ALPN, PROTOCOL};
-use lightbulb_network::roster::{self, Entry, Kind};
-use lightbulb_network::store::Store;
+use lightbulb_connect::daemon::net_ops;
+use lightbulb_connect::identity::{self, Identity};
+use lightbulb_connect::net::frames::{self, Frame, Remote};
+use lightbulb_connect::net::{ALPN, PROTOCOL};
+use lightbulb_connect::roster::{self, Entry, Kind};
+use lightbulb_connect::store::Store;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -21,12 +21,12 @@ use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
 
-pub const EXE: &str = env!("CARGO_BIN_EXE_lightbulb-network");
+pub const EXE: &str = env!("CARGO_BIN_EXE_lightbulb-connect");
 
 pub struct Env {
     pub state: tempfile::TempDir,
     pub home: tempfile::TempDir,
-    /// `LIGHTBULB_NETWORK_HOOK_CALLER` for the daemon: the process it treats as an agent.
+    /// `LIGHTBULB_CONNECT_HOOK_CALLER` for the daemon: the process it treats as an agent.
     pub pin: Option<String>,
 }
 
@@ -41,9 +41,9 @@ impl Env {
 
     /// `c` with this env's state dir, Claude home, HOME and user, launchctl off.
     fn base_cmd(&self, mut c: Command) -> Command {
-        c.env("LIGHTBULB_NETWORK_HOME", self.state.path())
-            .env("LIGHTBULB_NETWORK_CLAUDE_HOME", self.home.path())
-            .env("LIGHTBULB_NETWORK_NO_LAUNCHCTL", "1")
+        c.env("LIGHTBULB_CONNECT_HOME", self.state.path())
+            .env("LIGHTBULB_CONNECT_CLAUDE_HOME", self.home.path())
+            .env("LIGHTBULB_CONNECT_NO_LAUNCHCTL", "1")
             .env("HOME", self.home.path())
             .env("USER", "prasiddha");
         c
@@ -66,7 +66,7 @@ impl Env {
         Store::open(&self.state.path().join("state.db")).unwrap()
     }
 
-    /// Starts `lightbulb-network daemon` on this state dir with `lan` (mDNS) and `config` as
+    /// Starts `lightbulb-connect daemon` on this state dir with `lan` (mDNS) and `config` as
     /// `config.toml`, and `env` set, and waits until it answers.
     pub fn daemon(&self, lan: bool, config: &str, env: &[(&str, String)]) {
         let config = format!("lan = {lan}\n{config}");
@@ -74,8 +74,8 @@ impl Env {
         let log = std::fs::File::create(self.state.path().join("daemon.log")).unwrap();
         let mut c = self.base_cmd(Command::new(EXE));
         c.arg("daemon")
-            .env_remove("LIGHTBULB_NETWORK_PEERS")
-            .env_remove("LIGHTBULB_NETWORK_DEBUG_PROTOCOL")
+            .env_remove("LIGHTBULB_CONNECT_PEERS")
+            .env_remove("LIGHTBULB_CONNECT_DEBUG_PROTOCOL")
             .envs(env.iter().map(|(k, v)| (k, v)))
             .stdin(Stdio::null())
             .stdout(log.try_clone().unwrap())
@@ -162,7 +162,7 @@ impl Env {
         self.ask(json!({"id": 1, "op": "team.get"}))["heads"].clone()
     }
 
-    /// `<member key>@127.0.0.1:<port>`: this running daemon, for `LIGHTBULB_NETWORK_PEERS`.
+    /// `<member key>@127.0.0.1:<port>`: this running daemon, for `LIGHTBULB_CONNECT_PEERS`.
     pub fn peer_arg(&self) -> String {
         format!(
             "{}@127.0.0.1:{}",
@@ -182,9 +182,9 @@ impl Env {
         c.args(["-c", script, "sh"])
             .args(argv)
             .env("D", d.path())
-            .env_remove("LIGHTBULB_NETWORK_HOOK_CALLER");
+            .env_remove("LIGHTBULB_CONNECT_HOOK_CALLER");
         if let Some(pin) = &self.pin {
-            c.env("LIGHTBULB_NETWORK_HOOK_CALLER", pin);
+            c.env("LIGHTBULB_CONNECT_HOOK_CALLER", pin);
         }
         assert!(c.status().unwrap().success());
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -303,20 +303,20 @@ pub fn person(e: &Env, req: Value) -> Value {
     serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{}{}", out(&o), err(&o)))
 }
 
-/// `LIGHTBULB_NETWORK_DIALOG`: every dialog answers `button` (empty: no answer).
+/// `LIGHTBULB_CONNECT_DIALOG`: every dialog answers `button` (empty: no answer).
 pub fn dialog(button: &str) -> (&'static str, String) {
-    ("LIGHTBULB_NETWORK_DIALOG", button.into())
+    ("LIGHTBULB_CONNECT_DIALOG", button.into())
 }
 
-/// `LIGHTBULB_NETWORK_PEERS`: the running daemons of `envs`.
+/// `LIGHTBULB_CONNECT_PEERS`: the running daemons of `envs`.
 pub fn peers(envs: &[&Env]) -> (&'static str, String) {
     let list: Vec<String> = envs.iter().map(|e| e.peer_arg()).collect();
-    ("LIGHTBULB_NETWORK_PEERS", list.join(","))
+    ("LIGHTBULB_CONNECT_PEERS", list.join(","))
 }
 
 /// The join wait (600 s), shortened to `s`.
 pub fn wait_s(s: u64) -> (&'static str, String) {
-    ("LIGHTBULB_NETWORK_DEBUG_JOIN_WAIT_S", s.to_string())
+    ("LIGHTBULB_CONNECT_DEBUG_JOIN_WAIT_S", s.to_string())
 }
 
 /// A `config.toml` line naming the computer.

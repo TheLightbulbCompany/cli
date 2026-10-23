@@ -18,7 +18,7 @@ use std::time::Duration;
 /// Debug builds only: `<pid>:<birth_micros>` stands in for the calling agent (tests).
 /// Compiled out of release builds.
 #[cfg(debug_assertions)]
-pub const CALLER_ENV: &str = "LIGHTBULB_NETWORK_HOOK_CALLER";
+pub const CALLER_ENV: &str = "LIGHTBULB_CONNECT_HOOK_CALLER";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {

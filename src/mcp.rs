@@ -423,10 +423,10 @@ mod tests {
         fs::write(main.join(".git/HEAD"), "ref: refs/heads/init\n").unwrap();
         fs::write(
             main.join(".git/config"),
-            "[remote \"upstream\"]\n\turl = x/other.git\n[remote \"origin\"]\n\turl = git@github.com:Org/lightbulb-network.git\n",
+            "[remote \"upstream\"]\n\turl = x/other.git\n[remote \"origin\"]\n\turl = git@github.com:Org/lightbulb-connect.git\n",
         )
         .unwrap();
-        let name = Some("lightbulb-network".to_string());
+        let name = Some("lightbulb-connect".to_string());
         assert_eq!(
             git(main.to_str().unwrap()),
             (name.clone(), Some("init".into()))

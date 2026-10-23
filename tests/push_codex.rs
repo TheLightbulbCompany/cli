@@ -1,6 +1,6 @@
 //! Push into Codex: a thread served by Codex's app-server daemon gets
 //! `<daemon codex> queue --thread <id> --message <framed>`; any other Codex thread is never pushed.
-use lightbulb_network::{daemon, frame, os, paths};
+use lightbulb_connect::{daemon, frame, os, paths};
 use serde_json::{json, Value};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -22,7 +22,7 @@ fn home() -> &'static Path {
     static HOME: OnceLock<tempfile::TempDir> = OnceLock::new();
     HOME.get_or_init(|| {
         let home = tempfile::tempdir().unwrap();
-        std::env::set_var("LIGHTBULB_NETWORK_CLAUDE_HOME", home.path());
+        std::env::set_var("LIGHTBULB_CONNECT_CLAUDE_HOME", home.path());
         home
     })
     .path()

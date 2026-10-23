@@ -9,12 +9,12 @@ use common::{
 };
 use iroh::endpoint::{presets, Connection, RecvStream, SendStream};
 use iroh::{Endpoint, SecretKey};
-use lightbulb_network::admission;
-use lightbulb_network::identity::Identity;
-use lightbulb_network::net::frames::{self, Frame};
-use lightbulb_network::net::JOIN_ALPN;
-use lightbulb_network::roster;
-use lightbulb_network::ticket::{self, Ticket};
+use lightbulb_connect::admission;
+use lightbulb_connect::identity::Identity;
+use lightbulb_connect::net::frames::{self, Frame};
+use lightbulb_connect::net::JOIN_ALPN;
+use lightbulb_connect::roster;
+use lightbulb_connect::ticket::{self, Ticket};
 use serde_json::{json, Value};
 use std::time::Duration;
 
@@ -146,7 +146,7 @@ fn ask_ticket_admits_only_after_allow() {
     let o = b.detached(&[EXE, "join", &t], "");
     assert!(!o.status.success());
     let taken = format!(
-        "The name \"prasiddha\" is already used in this network. Try: lightbulb-network join '{t}' --name prasiddha-2\n"
+        "The name \"prasiddha\" is already used in this network. Try: lightbulb-connect join '{t}' --name prasiddha-2\n"
     );
     assert_eq!(err(&o), taken);
     std::thread::scope(|s| {
@@ -360,7 +360,7 @@ fn join_from_a_multi_member_network_is_refused() {
     assert!(!o.status.success());
     assert_eq!(
         err(&o),
-        "You are in \"acme\". Leave it first: lightbulb-network leave\n"
+        "You are in \"acme\". Leave it first: lightbulb-connect leave\n"
     );
     assert_eq!(b.heads(), heads);
     assert_eq!(members(&c), 1);
@@ -465,8 +465,8 @@ fn team_join_is_person_only() {
     let t = invite(&a, "reusable");
     // B's daemon takes this test process for an agent.
     let me = std::process::id();
-    let birth = lightbulb_network::os::process(me).unwrap().birth_micros;
-    let pin = ("LIGHTBULB_NETWORK_HOOK_CALLER", format!("{me}:{birth}"));
+    let birth = lightbulb_connect::os::process(me).unwrap().birth_micros;
+    let pin = ("LIGHTBULB_CONNECT_HOOK_CALLER", format!("{me}:{birth}"));
     b.daemon(false, "", &[peers(&[&a]), pin]);
     let r = b.ask(json!({"id": 1, "op": "team.join", "ticket": t, "name": "bob"}));
     assert_eq!(

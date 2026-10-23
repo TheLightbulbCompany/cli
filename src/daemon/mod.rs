@@ -32,7 +32,7 @@ pub struct Daemon {
     pub store: Mutex<Store>,
     pub identity: Identity,
     pub team: Mutex<TeamState>,
-    /// Where Claude Code's `.claude/` lives: `$LIGHTBULB_NETWORK_CLAUDE_HOME`, else the home dir.
+    /// Where Claude Code's `.claude/` lives: `$LIGHTBULB_CONNECT_CLAUDE_HOME`, else the home dir.
     pub claude_home: PathBuf,
     /// Pushed to every `subscribe`d connection as `{"event": ...}` frames.
     pub events: broadcast::Sender<Value>,
@@ -172,7 +172,7 @@ pub async fn run(dir: &Path) -> Result<()> {
         store: Mutex::new(store),
         identity,
         team: Mutex::new(team),
-        claude_home: std::env::var_os("LIGHTBULB_NETWORK_CLAUDE_HOME")
+        claude_home: std::env::var_os("LIGHTBULB_CONNECT_CLAUDE_HOME")
             .map(PathBuf::from)
             .or_else(dirs::home_dir)
             .ok_or("no home directory")?,

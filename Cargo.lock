@@ -1733,7 +1733,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "lightbulb-network"
+name = "lightbulb-connect"
 version = "0.1.0"
 dependencies = [
  "clap",

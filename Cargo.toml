@@ -1,5 +1,5 @@
 [package]
-name = "lightbulb-network"
+name = "lightbulb-connect"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.91" # iroh 1.4
@@ -7,7 +7,7 @@ description = "Peer-to-peer, end-to-end encrypted messaging between coding agent
 license = "Apache-2.0"
 
 [[bin]]
-name = "lightbulb-network"
+name = "lightbulb-connect"
 path = "src/main.rs"
 
 [dependencies]

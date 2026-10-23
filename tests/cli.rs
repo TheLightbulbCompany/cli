@@ -1,6 +1,6 @@
 //! Drives the built binary against a temp state dir and a temp HOME.
 
-use lightbulb_network::os;
+use lightbulb_connect::os;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Output, Stdio};
@@ -10,7 +10,7 @@ mod common;
 use common::{err, out, Env, EXE};
 
 impl Env {
-    /// `lightbulb-network args` as a person at a terminal: detached (so no agent the tests run
+    /// `lightbulb-connect args` as a person at a terminal: detached (so no agent the tests run
     /// under is above it, which the daemon checks for `<member>/terminal` sends) under a
     /// program that is neither a shell nor an agent (`perl`), where the CLI's own walk stops.
     fn person(&self, args: &[&str]) -> Output {
@@ -23,14 +23,14 @@ impl Env {
     }
 
     fn cmd(&self, args: &[&str]) -> Command {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_lightbulb-network"));
+        let mut c = Command::new(env!("CARGO_BIN_EXE_lightbulb-connect"));
         c.args(args)
-            .env("LIGHTBULB_NETWORK_HOME", self.state.path())
-            .env("LIGHTBULB_NETWORK_CLAUDE_HOME", self.home.path())
-            .env("LIGHTBULB_NETWORK_NO_LAUNCHCTL", "1")
+            .env("LIGHTBULB_CONNECT_HOME", self.state.path())
+            .env("LIGHTBULB_CONNECT_CLAUDE_HOME", self.home.path())
+            .env("LIGHTBULB_CONNECT_NO_LAUNCHCTL", "1")
             .env("HOME", self.home.path())
-            .env_remove("LIGHTBULB_NETWORK_SESSION")
-            .env_remove("LIGHTBULB_NETWORK_HOOK_CALLER");
+            .env_remove("LIGHTBULB_CONNECT_SESSION")
+            .env_remove("LIGHTBULB_CONNECT_HOOK_CALLER");
         c
     }
 
@@ -99,7 +99,7 @@ fn send_with_group_target_from_a_session_is_refused() {
     };
     sent_nothing(
         &e.cmd(&["send", "*", "hi"])
-            .env("LIGHTBULB_NETWORK_SESSION", &key)
+            .env("LIGHTBULB_CONNECT_SESSION", &key)
             .output()
             .unwrap(),
     );
@@ -111,7 +111,7 @@ fn send_with_group_target_from_a_session_is_refused() {
     sent_nothing(
         &e.cmd(&["send", "*", "hi"])
             .env(
-                "LIGHTBULB_NETWORK_HOOK_CALLER",
+                "LIGHTBULB_CONNECT_HOOK_CALLER",
                 format!("{}:{birth}", std::process::id()),
             )
             .output()
@@ -200,7 +200,7 @@ fn an_unknown_subcommand_forwards_or_explains() {
     let e = Env::new();
     let missing = e
         .cmd(&["claude", "--resume"])
-        .env("LIGHTBULB_NETWORK_DESKTOP", "/nonexistent/app")
+        .env("LIGHTBULB_CONNECT_DESKTOP", "/nonexistent/app")
         .output()
         .unwrap();
     assert_eq!(missing.status.code(), Some(2));
@@ -212,7 +212,7 @@ fn an_unknown_subcommand_forwards_or_explains() {
     for sub in ["claude", "share", "frobnicate"] {
         let o = e
             .cmd(&[sub, "a", "--b"])
-            .env("LIGHTBULB_NETWORK_DESKTOP", &app)
+            .env("LIGHTBULB_CONNECT_DESKTOP", &app)
             .output()
             .unwrap();
         assert_eq!(
@@ -245,14 +245,14 @@ fn daemon_install_writes_the_plist_and_alias_without_touching_a_foreign_file() {
     let plist = std::fs::read_to_string(
         e.home
             .path()
-            .join("Library/LaunchAgents/company.thelightbulb.network.plist"),
+            .join("Library/LaunchAgents/company.thelightbulb.connect.plist"),
     )
     .unwrap();
     let canon = e
         .home
         .path()
-        .join(".lightbulb/network/bin/lightbulb-network");
-    assert!(plist.contains("<string>company.thelightbulb.network</string>"));
+        .join(".lightbulb/connect/bin/lightbulb-connect");
+    assert!(plist.contains("<string>company.thelightbulb.connect</string>"));
     assert!(plist.contains(&format!(
         "<string>{}</string><string>daemon</string>",
         canon.display()
@@ -282,7 +282,7 @@ fn daemon_install_writes_the_plist_and_alias_without_touching_a_foreign_file() {
     assert!(!e
         .home
         .path()
-        .join("Library/LaunchAgents/company.thelightbulb.network.plist")
+        .join("Library/LaunchAgents/company.thelightbulb.connect.plist")
         .exists());
     assert!(e.state.path().exists());
 }
@@ -341,7 +341,7 @@ fn send_from_an_agent_shell_sends_as_its_session_or_refuses() {
     let o = e
         .cmd(&["send", "bob", "from my shell", "--request-id", "s1"])
         .env(
-            "LIGHTBULB_NETWORK_HOOK_CALLER",
+            "LIGHTBULB_CONNECT_HOOK_CALLER",
             format!("{}:{birth}", std::process::id()),
         )
         .output()
@@ -357,7 +357,7 @@ fn send_from_an_agent_shell_sends_as_its_session_or_refuses() {
     let pinned = |from: &str| {
         e.cmd(&["send", "bob", "x", "--from", from])
             .env(
-                "LIGHTBULB_NETWORK_HOOK_CALLER",
+                "LIGHTBULB_CONNECT_HOOK_CALLER",
                 format!("{}:{birth}", std::process::id()),
             )
             .output()
@@ -378,7 +378,7 @@ fn send_from_an_agent_shell_sends_as_its_session_or_refuses() {
     let o = e
         .cmd(&["send", "bob", "who am i"])
         .env(
-            "LIGHTBULB_NETWORK_HOOK_CALLER",
+            "LIGHTBULB_CONNECT_HOOK_CALLER",
             format!("{}:{ob}", other.id()),
         )
         .output()
@@ -400,10 +400,10 @@ fn setup_installs_the_canonical_binary_and_wires_everything_to_it() {
     let e = Env::new();
     let h = e.home.path();
     std::fs::create_dir(h.join(".claude")).unwrap();
-    let canon = h.join(".lightbulb/network/bin/lightbulb-network");
+    let canon = h.join(".lightbulb/connect/bin/lightbulb-connect");
 
     // A missing --executable is refused before anything is written.
-    let o = e.run(&["setup", "--executable", "/nonexistent/lightbulb-network"]);
+    let o = e.run(&["setup", "--executable", "/nonexistent/lightbulb-connect"]);
     assert!(!o.status.success());
     assert!(err(&o).contains("does not exist"), "{}", err(&o));
     assert!(!h.join(".claude.json").exists());
@@ -426,7 +426,7 @@ fn setup_installs_the_canonical_binary_and_wires_everything_to_it() {
     assert!(!hooks.contains("target/"), "{hooks}");
     if cfg!(target_os = "macos") {
         let plist = std::fs::read_to_string(
-            h.join("Library/LaunchAgents/company.thelightbulb.network.plist"),
+            h.join("Library/LaunchAgents/company.thelightbulb.connect.plist"),
         )
         .unwrap();
         assert!(plist.contains(&format!(
@@ -441,7 +441,7 @@ fn setup_remove_also_stops_the_daemon_and_removes_the_job() {
     let e = Env::new();
     let h = e.home.path();
     assert!(e.run(&["setup"]).status.success());
-    let plist = h.join("Library/LaunchAgents/company.thelightbulb.network.plist");
+    let plist = h.join("Library/LaunchAgents/company.thelightbulb.connect.plist");
     assert!(plist.exists());
     let o = e.run(&["setup", "--remove"]);
     assert!(o.status.success(), "{}", err(&o));

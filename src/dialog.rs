@@ -97,7 +97,7 @@ impl Queue {
         (Queue(inner), rx)
     }
 
-    /// Debug builds' `LIGHTBULB_NETWORK_DIALOG`: each dialog, in its turn, answers `knob`
+    /// Debug builds' `LIGHTBULB_CONNECT_DIALOG`: each dialog, in its turn, answers `knob`
     /// without a window.
     pub fn set_knob(&self, knob: Option<Option<String>>) {
         if let Some(k) = knob {

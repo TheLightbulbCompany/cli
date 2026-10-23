@@ -51,7 +51,7 @@ impl Default for Config {
     fn default() -> Config {
         Config {
             computer: os::hostname(),
-            issuer: "https://thelightbulb.company/network".into(),
+            issuer: "https://thelightbulb.company/connect".into(),
             preview_to_workspace: false,
             share_paths: false,
             lan: true,
@@ -153,7 +153,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path();
         let c = Config::load(d).unwrap();
-        assert_eq!(c.issuer, "https://thelightbulb.company/network");
+        assert_eq!(c.issuer, "https://thelightbulb.company/connect");
         assert_eq!(c.computer, crate::os::hostname());
         assert!(!c.preview_to_workspace && !c.share_paths && c.lan);
         assert_eq!((c.relay, c.folders_off.len()), (None, 0));

@@ -1,15 +1,15 @@
 //! `mcp` driven over stdio as an agent drives it: the built binary, JSON-RPC lines.
-//! The calling agent is pinned with LIGHTBULB_NETWORK_HOOK_CALLER (debug builds only),
+//! The calling agent is pinned with LIGHTBULB_CONNECT_HOOK_CALLER (debug builds only),
 //! since the test runner is not an agent.
 
-use lightbulb_network::{os, paths};
+use lightbulb_connect::{os, paths};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Lines, Write};
 use std::os::unix::net::UnixStream;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
 
-const EXE: &str = env!("CARGO_BIN_EXE_lightbulb-network");
+const EXE: &str = env!("CARGO_BIN_EXE_lightbulb-connect");
 const NOTE: &str = "unread message(s) for this session; they arrive at your next step.";
 
 struct Net {
@@ -25,7 +25,7 @@ impl Net {
         let daemon = Command::new(EXE)
             .arg("daemon")
             .env(paths::HOME_ENV, dir.path())
-            .env("LIGHTBULB_NETWORK_CLAUDE_HOME", claude.path())
+            .env("LIGHTBULB_CONNECT_CLAUDE_HOME", claude.path())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -81,9 +81,9 @@ impl Net {
             .arg("mcp")
             .args(name.map(|n| ["--server-name", n]).into_iter().flatten())
             .env(paths::HOME_ENV, self.dir.path())
-            .env("LIGHTBULB_NETWORK_CLAUDE_HOME", self.claude.path())
+            .env("LIGHTBULB_CONNECT_CLAUDE_HOME", self.claude.path())
             .env(
-                "LIGHTBULB_NETWORK_HOOK_CALLER",
+                "LIGHTBULB_CONNECT_HOOK_CALLER",
                 format!("{}:{}", as_.pid, as_.birth_micros),
             )
             .stdin(Stdio::piped())
@@ -449,7 +449,7 @@ fn a_failed_push_brings_the_unread_note_back() {
 fn the_server_advertises_its_installed_name() {
     let net = Net::new();
     // mcp_named asserts serverInfo.name on initialize.
-    net.mcp_named(&me(), Some("lightbulb-network"));
+    net.mcp_named(&me(), Some("lightbulb-connect"));
 }
 
 #[test]

@@ -29,8 +29,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, Notify};
 
-pub const ALPN: &[u8] = b"lightbulb-network/1";
-pub const JOIN_ALPN: &[u8] = b"lightbulb-network/join/1";
+pub const ALPN: &[u8] = b"lightbulb-connect/1";
+pub const JOIN_ALPN: &[u8] = b"lightbulb-connect/join/1";
 pub const PROTOCOL: u32 = 1;
 
 /// A `roster` page closes before the next entry would take it past this (half the frame cap).
@@ -46,22 +46,22 @@ const SUPERSEDED: u32 = 2;
 
 /// The debug knobs, read once (`Peers::knobs`); release builds take the defaults.
 pub struct Knobs {
-    /// `PROTOCOL`, or `LIGHTBULB_NETWORK_DEBUG_PROTOCOL`.
+    /// `PROTOCOL`, or `LIGHTBULB_CONNECT_DEBUG_PROTOCOL`.
     pub protocol: u32,
-    /// Addresses to dial members at without discovery: `LIGHTBULB_NETWORK_PEERS=<key>@<ip:port>,…`.
+    /// Addresses to dial members at without discovery: `LIGHTBULB_CONNECT_PEERS=<key>@<ip:port>,…`.
     peers: HashMap<String, Vec<SocketAddr>>,
-    /// `LIGHTBULB_NETWORK_DEBUG_GATE_PAUSE_MS`: the gate holds `team` that long before adopting,
+    /// `LIGHTBULB_CONNECT_DEBUG_GATE_PAUSE_MS`: the gate holds `team` that long before adopting,
     /// so a test can land a removal in the window.
     gate_pause: Option<Duration>,
-    /// `LIGHTBULB_NETWORK_DIALOG=<button>`: every OS dialog answers that button, in its turn,
+    /// `LIGHTBULB_CONNECT_DIALOG=<button>`: every OS dialog answers that button, in its turn,
     /// without a window (empty: answers `None`).
     pub dialog: Option<Option<String>>,
     /// How long a join request waits for its person (600 s), or
-    /// `LIGHTBULB_NETWORK_DEBUG_JOIN_WAIT_S`.
+    /// `LIGHTBULB_CONNECT_DEBUG_JOIN_WAIT_S`.
     pub join_wait: Duration,
-    /// `LIGHTBULB_NETWORK_DEBUG_DROP_ACKS=1`: every `ack` that arrives is dropped.
+    /// `LIGHTBULB_CONNECT_DEBUG_DROP_ACKS=1`: every `ack` that arrives is dropped.
     drop_acks: bool,
-    /// How long the outbox keeps trying (`outbox::TTL_S`), or `LIGHTBULB_NETWORK_DEBUG_OUTBOX_S`.
+    /// How long the outbox keeps trying (`outbox::TTL_S`), or `LIGHTBULB_CONNECT_DEBUG_OUTBOX_S`.
     outbox_s: u64,
 }
 
@@ -70,7 +70,7 @@ impl Knobs {
     fn read() -> Knobs {
         let var = |name| std::env::var(name).ok();
         let mut peers: HashMap<String, Vec<SocketAddr>> = HashMap::new();
-        for item in var("LIGHTBULB_NETWORK_PEERS")
+        for item in var("LIGHTBULB_CONNECT_PEERS")
             .unwrap_or_default()
             .split(',')
         {
@@ -81,19 +81,19 @@ impl Knobs {
             }
         }
         Knobs {
-            protocol: var("LIGHTBULB_NETWORK_DEBUG_PROTOCOL")
+            protocol: var("LIGHTBULB_CONNECT_DEBUG_PROTOCOL")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(PROTOCOL),
             peers,
-            gate_pause: var("LIGHTBULB_NETWORK_DEBUG_GATE_PAUSE_MS")
+            gate_pause: var("LIGHTBULB_CONNECT_DEBUG_GATE_PAUSE_MS")
                 .and_then(|v| v.parse().ok())
                 .map(Duration::from_millis),
-            dialog: var("LIGHTBULB_NETWORK_DIALOG").map(|b| Some(b).filter(|b| !b.is_empty())),
-            join_wait: var("LIGHTBULB_NETWORK_DEBUG_JOIN_WAIT_S")
+            dialog: var("LIGHTBULB_CONNECT_DIALOG").map(|b| Some(b).filter(|b| !b.is_empty())),
+            join_wait: var("LIGHTBULB_CONNECT_DEBUG_JOIN_WAIT_S")
                 .and_then(|v| v.parse().ok())
                 .map_or(JOIN_WAIT, Duration::from_secs),
-            drop_acks: var("LIGHTBULB_NETWORK_DEBUG_DROP_ACKS").is_some_and(|v| v == "1"),
-            outbox_s: var("LIGHTBULB_NETWORK_DEBUG_OUTBOX_S")
+            drop_acks: var("LIGHTBULB_CONNECT_DEBUG_DROP_ACKS").is_some_and(|v| v == "1"),
+            outbox_s: var("LIGHTBULB_CONNECT_DEBUG_OUTBOX_S")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(outbox::TTL_S),
         }

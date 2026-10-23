@@ -1,4 +1,4 @@
-use lightbulb_network::{daemon, os, paths};
+use lightbulb_connect::{daemon, os, paths};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -29,7 +29,7 @@ async fn call(
 async fn send_wakes_a_waiting_inbox_and_the_receipt_walks_to_delivered() {
     let dir = tempfile::tempdir().unwrap();
     let claude_home = tempfile::tempdir().unwrap();
-    std::env::set_var("LIGHTBULB_NETWORK_CLAUDE_HOME", claude_home.path());
+    std::env::set_var("LIGHTBULB_CONNECT_CLAUDE_HOME", claude_home.path());
     let home = dir.path().to_path_buf();
     tokio::spawn(async move { daemon::run(&home).await.unwrap() });
     let sock = dir.path().join(paths::SOCKET);
@@ -110,7 +110,7 @@ async fn send_wakes_a_waiting_inbox_and_the_receipt_walks_to_delivered() {
 async fn shutdown_ends_a_waiting_inbox_promptly() {
     let dir = tempfile::tempdir().unwrap();
     let claude_home = tempfile::tempdir().unwrap();
-    std::env::set_var("LIGHTBULB_NETWORK_CLAUDE_HOME", claude_home.path());
+    std::env::set_var("LIGHTBULB_CONNECT_CLAUDE_HOME", claude_home.path());
     let home = dir.path().to_path_buf();
     tokio::spawn(async move { daemon::run(&home).await.unwrap() });
     let sock = dir.path().join(paths::SOCKET);
@@ -140,7 +140,7 @@ async fn shutdown_ends_a_waiting_inbox_promptly() {
 async fn mail_arriving_after_a_waiting_inbox_hung_up_stays_in_the_mailbox() {
     let dir = tempfile::tempdir().unwrap();
     let claude_home = tempfile::tempdir().unwrap();
-    std::env::set_var("LIGHTBULB_NETWORK_CLAUDE_HOME", claude_home.path());
+    std::env::set_var("LIGHTBULB_CONNECT_CLAUDE_HOME", claude_home.path());
     let home = dir.path().to_path_buf();
     tokio::spawn(async move { daemon::run(&home).await.unwrap() });
     let sock = dir.path().join(paths::SOCKET);
@@ -185,7 +185,7 @@ async fn mail_arriving_after_a_waiting_inbox_hung_up_stays_in_the_mailbox() {
 async fn send_qualifies_a_bare_name_and_refuses_bad_addresses() {
     let dir = tempfile::tempdir().unwrap();
     let claude_home = tempfile::tempdir().unwrap();
-    std::env::set_var("LIGHTBULB_NETWORK_CLAUDE_HOME", claude_home.path());
+    std::env::set_var("LIGHTBULB_CONNECT_CLAUDE_HOME", claude_home.path());
     let home = dir.path().to_path_buf();
     tokio::spawn(async move { daemon::run(&home).await.unwrap() });
     let (mut l, mut w) = connect(&dir.path().join(paths::SOCKET)).await;
@@ -234,7 +234,7 @@ async fn send_qualifies_a_bare_name_and_refuses_bad_addresses() {
 async fn a_peer_hanging_up_as_mail_arrives_never_loses_the_message() {
     let dir = tempfile::tempdir().unwrap();
     let claude_home = tempfile::tempdir().unwrap();
-    std::env::set_var("LIGHTBULB_NETWORK_CLAUDE_HOME", claude_home.path());
+    std::env::set_var("LIGHTBULB_CONNECT_CLAUDE_HOME", claude_home.path());
     let home = dir.path().to_path_buf();
     tokio::spawn(async move { daemon::run(&home).await.unwrap() });
     let sock = dir.path().join(paths::SOCKET);

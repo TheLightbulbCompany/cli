@@ -1,11 +1,11 @@
 use clap::{Parser, Subcommand};
-use lightbulb_network::daemon::net_ops::Invite;
-use lightbulb_network::{cli, daemon, hook, mcp, paths, setup};
+use lightbulb_connect::daemon::net_ops::Invite;
+use lightbulb_connect::{cli, daemon, hook, mcp, paths, setup};
 use std::ffi::OsString;
 use std::io::{Read, Write};
 
 #[derive(Parser)]
-#[command(name = "lightbulb-network", version)]
+#[command(name = "lightbulb-connect", version)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -105,11 +105,11 @@ enum Command {
     /// Run by an agent's hook config: `hook <claude|codex|cursor|grok> <session-start|user-prompt-submit|post-tool-use|stop|session-end>`.
     ///
     /// Always exits 0; errors go to stderr.
-    /// Debug builds only: LIGHTBULB_NETWORK_HOOK_CALLER=<pid>:<birth_micros> names the calling agent (tests).
+    /// Debug builds only: LIGHTBULB_CONNECT_HOOK_CALLER=<pid>:<birth_micros> names the calling agent (tests).
     Hook { agent: String, event: String },
     /// Run the stdio MCP server an agent talks to (find_sessions, send_message, ...).
     ///
-    /// Debug builds only: LIGHTBULB_NETWORK_HOOK_CALLER=<pid>:<birth_micros> names the calling agent (tests).
+    /// Debug builds only: LIGHTBULB_CONNECT_HOOK_CALLER=<pid>:<birth_micros> names the calling agent (tests).
     Mcp {
         /// The name this server advertises: the one its MCP entry was installed under.
         #[arg(long, default_value = setup::DEFAULT_SERVER)]
@@ -122,7 +122,7 @@ enum Command {
         #[arg(long)]
         remove: bool,
         /// The engine binary the hooks, MCP entries and launchd job run (default: the canonical
-        /// copy, ~/.lightbulb/network/bin/lightbulb-network, which setup installs from this one).
+        /// copy, ~/.lightbulb/connect/bin/lightbulb-connect, which setup installs from this one).
         #[arg(long)]
         executable: Option<std::path::PathBuf>,
         /// The MCP server entry's name, also used in Cursor's and Grok's allow rules.
@@ -138,7 +138,7 @@ fn exit(code: i32) {
     }
 }
 
-fn main() -> lightbulb_network::Result<()> {
+fn main() -> lightbulb_connect::Result<()> {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         // A hook must never fail its agent, even on bad arguments.
@@ -149,7 +149,7 @@ fn main() -> lightbulb_network::Result<()> {
         Err(e) => e.exit(),
     };
     match cli.command {
-        Command::Version => println!("lightbulb-network {}", env!("CARGO_PKG_VERSION")),
+        Command::Version => println!("lightbulb-connect {}", env!("CARGO_PKG_VERSION")),
         Command::Daemon { install: true, .. } => exit(cli::daemon_install()?),
         Command::Daemon {
             uninstall: true, ..
@@ -209,6 +209,17 @@ fn main() -> lightbulb_network::Result<()> {
             for agent in setup::run(&home, &executable, &server_name, remove).agents {
                 println!("{}", agent.line());
             }
+            if remove {
+                // legacy (Plan A install): its hook and MCP entries name the old binary.
+                for agent in
+                    setup::run(&home, &cli::legacy_canonical(&home), &server_name, true).agents
+                {
+                    if !agent.wrote.is_empty() {
+                        println!("{}", agent.line());
+                    }
+                }
+                cli::legacy_uninstall(&home)?;
+            }
             if cfg!(target_os = "macos") {
                 // `--remove` is the off switch: the job and the running daemon go too.
                 exit(if remove {
@@ -233,7 +244,7 @@ fn main() -> lightbulb_network::Result<()> {
                 Err(e) => {
                     let _ = writeln!(
                         std::io::stderr(),
-                        "lightbulb-network hook {agent} {event}: {e}"
+                        "lightbulb-connect hook {agent} {event}: {e}"
                     );
                 }
             }

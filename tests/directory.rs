@@ -3,11 +3,11 @@
 //! refused on the same person's other computer, and an `off` folder is never published.
 
 use iroh::Endpoint;
-use lightbulb_network::daemon::{ipc, net_ops};
-use lightbulb_network::identity::Identity;
-use lightbulb_network::net::frames::{Frame, Remote};
-use lightbulb_network::os;
-use lightbulb_network::roster::{self, Entry, Kind};
+use lightbulb_connect::daemon::{ipc, net_ops};
+use lightbulb_connect::identity::Identity;
+use lightbulb_connect::net::frames::{Frame, Remote};
+use lightbulb_connect::os;
+use lightbulb_connect::roster::{self, Entry, Kind};
 use serde_json::{json, Value};
 
 mod common;

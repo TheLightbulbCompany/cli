@@ -1,5 +1,7 @@
 # Plan A acceptance on a real Mac
 
+> Historical record: the product was renamed Lightbulb Connect afterwards (binary `lightbulb-connect`, state dir `~/.lightbulb/connect`). The commands and paths below are kept as recorded, under the old names.
+
 - Date: 2026-10-22, 14:36–14:50 local.
 - Build: `d9185a275540d6ac1a05a3be5ede6c82058cfc95` (`cargo build --release`, cargo 1.96.0), copied to `~/.lightbulb/network/bin/lightbulb-network`.
 - Machine: one Apple-silicon Mac, macOS (Darwin 25.2.0). Real state dir `~/.lightbulb/network`, no env override.

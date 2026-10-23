@@ -4,7 +4,7 @@ use super::*;
 use serde_json::json;
 use std::path::Path;
 
-const EXE: &str = "/opt/lb/bin/lightbulb-network";
+const EXE: &str = "/opt/lb/bin/lightbulb-connect";
 const APP: &str = "/Applications/Lightbulb.app/Contents/MacOS/lightbulb-desktop";
 const EVENTS: [(&str, &str); 5] = [
     ("SessionStart", "session-start"),
@@ -227,11 +227,11 @@ fn setup_writes_grok_hooks_and_mcp_and_backs_up_once() {
     assert_eq!(
         agent(&r, "grok").wrote,
         [
-            h.join(".grok/hooks/lightbulb-network.json"),
+            h.join(".grok/hooks/lightbulb-connect.json"),
             h.join(".grok/config.toml")
         ]
     );
-    let hooks = json_at(h, ".grok/hooks/lightbulb-network.json");
+    let hooks = json_at(h, ".grok/hooks/lightbulb-connect.json");
     for (event, arg) in EVENTS {
         let timeout = if event == "SessionEnd" { 3 } else { 10 };
         let mut ours = json!({"hooks": [{"type": "command", "command": cmd("grok", arg), "timeout": timeout}]});
@@ -307,7 +307,7 @@ fn remove_takes_only_our_entries() {
     assert_eq!(get(h, ".codex/config.toml").trim_end(), codex.trim_end());
     assert_eq!(get(h, ".grok/config.toml").trim_end(), grok.trim_end());
     // Our own Grok hook file is gone.
-    assert!(!h.join(".grok/hooks/lightbulb-network.json").exists());
+    assert!(!h.join(".grok/hooks/lightbulb-connect.json").exists());
     // Nothing left to remove.
     assert!(setup(h, true).agents.iter().all(|a| a.wrote.is_empty()));
 }
@@ -377,12 +377,12 @@ fn setup_touches_only_installed_agents() {
 fn hook_command_quotes_the_executable() {
     let ctx = Ctx {
         home: Path::new("/"),
-        exe: "/opt/it's/lightbulb-network",
+        exe: "/opt/it's/lightbulb-connect",
         server: "lightbulb",
         remove: false,
     };
     let c = ctx.hook_command("grok", "stop");
-    assert_eq!(c, r"'/opt/it'\''s/lightbulb-network' hook grok stop");
+    assert_eq!(c, r"'/opt/it'\''s/lightbulb-connect' hook grok stop");
     assert!(ctx.is_ours(&c));
     assert!(!ctx.is_ours(&format!("'{APP}' local-session-hook grok stop")));
 }
@@ -446,10 +446,10 @@ fn files_setup_created_are_deleted_on_remove() {
     fs::create_dir(h.join(".grok")).unwrap();
     setup(h, false);
     assert!(h.join(".cursor/hooks.json").exists());
-    assert!(h.join(".grok/hooks/lightbulb-network.json").exists());
+    assert!(h.join(".grok/hooks/lightbulb-connect.json").exists());
     setup(h, true);
     assert!(!h.join(".cursor/hooks.json").exists());
-    assert!(!h.join(".grok/hooks/lightbulb-network.json").exists());
+    assert!(!h.join(".grok/hooks/lightbulb-connect.json").exists());
 }
 
 #[test]
@@ -483,25 +483,25 @@ fn a_non_default_server_name_is_passed_to_mcp() {
     for dir in [".claude", ".codex", ".cursor", ".grok"] {
         fs::create_dir(h.join(dir)).unwrap();
     }
-    run(h, Path::new(EXE), "lightbulb-network", false);
-    let args = json!(["mcp", "--server-name", "lightbulb-network"]);
+    run(h, Path::new(EXE), "lightbulb-connect", false);
+    let args = json!(["mcp", "--server-name", "lightbulb-connect"]);
     assert_eq!(
-        json_at(h, ".claude.json")["mcpServers"]["lightbulb-network"]["args"],
+        json_at(h, ".claude.json")["mcpServers"]["lightbulb-connect"]["args"],
         args
     );
     assert_eq!(
-        json_at(h, ".cursor/mcp.json")["mcpServers"]["lightbulb-network"]["args"],
+        json_at(h, ".cursor/mcp.json")["mcpServers"]["lightbulb-connect"]["args"],
         args
     );
     for rel in [".codex/config.toml", ".grok/config.toml"] {
         let doc = toml_at(h, rel);
-        let got: Vec<_> = doc["mcp_servers"]["lightbulb-network"]["args"]
+        let got: Vec<_> = doc["mcp_servers"]["lightbulb-connect"]["args"]
             .as_array()
             .unwrap()
             .iter()
             .map(|v| v.as_str().unwrap().to_string())
             .collect();
-        assert_eq!(got, ["mcp", "--server-name", "lightbulb-network"], "{rel}");
+        assert_eq!(got, ["mcp", "--server-name", "lightbulb-connect"], "{rel}");
     }
 }
 
@@ -539,4 +539,19 @@ fn a_codex_hook_in_a_shared_group_says_codex_will_ask() {
     let config = get(h, ".codex/config.toml");
     assert!(!config.contains(":stop:"), "{config}");
     assert!(config.contains(":session_start:0:0"), "{config}");
+}
+
+#[test]
+fn remove_takes_out_a_plan_a_era_install() {
+    let home = tempfile::tempdir().unwrap();
+    let h = home.path();
+    fs::create_dir(h.join(".grok")).unwrap();
+    // legacy (Plan A install)
+    put(h, ".grok/hooks/lightbulb-network.json", "{}");
+    let old = Path::new("/opt/lb/bin/lightbulb-network");
+    run(h, old, "lightbulb", false);
+    let r = run(h, old, "lightbulb", true);
+    assert!(!h.join(".grok/hooks/lightbulb-network.json").exists());
+    assert!(!agent(&r, "grok").wrote.is_empty());
+    assert!(toml_at(h, ".grok/config.toml").get("mcp_servers").is_none());
 }

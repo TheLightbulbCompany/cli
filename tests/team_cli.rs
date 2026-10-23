@@ -1,11 +1,11 @@
 //! The team verbs against the built binary: `invite`, `remove`, `leave`, and the roster the
 //! daemon keeps across restarts.
 
-use lightbulb_network::daemon::net_ops;
-use lightbulb_network::identity::Identity;
-use lightbulb_network::os;
-use lightbulb_network::roster::{self, Entry, Kind};
-use lightbulb_network::store::Store;
+use lightbulb_connect::daemon::net_ops;
+use lightbulb_connect::identity::Identity;
+use lightbulb_connect::os;
+use lightbulb_connect::roster::{self, Entry, Kind};
+use lightbulb_connect::store::Store;
 use serde_json::json;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -74,7 +74,7 @@ impl Env {
     }
 }
 
-const LINE: &str = "Join the Lightbulb network: https://thelightbulb.company/j/#";
+const LINE: &str = "Join Lightbulb Connect: https://thelightbulb.company/j/#";
 
 #[test]
 fn invite_reprints_the_same_link_until_new() {
@@ -189,7 +189,7 @@ fn founder_admin_remove_and_leave_texts() {
     assert_eq!(o.status.code(), Some(1));
     assert_eq!(
         err(&o).trim(),
-        "You are the founder. Name a new founder first: lightbulb-network admin <name> --founder"
+        "You are the founder. Name a new founder first: lightbulb-connect admin <name> --founder"
     );
     assert_eq!(
         out(&e.run(&["admin", "ADEN"])),

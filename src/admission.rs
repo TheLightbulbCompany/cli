@@ -341,7 +341,7 @@ async fn wait(d: &Daemon, conn: &Connection, n: i64, req: Request) -> Option<Ver
     let id = format!("J{n}");
     let buttons = ["Decline", "Allow"];
     d.dialogs
-        .show(&id, dialog::args("Lightbulb Network", &text, &buttons));
+        .show(&id, dialog::args("Lightbulb Connect", &text, &buttons));
     let gone = tokio::select! {
         v = &mut rx => return v.ok(),
         _ = conn.closed() => true,

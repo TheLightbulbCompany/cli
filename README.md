@@ -1,4 +1,4 @@
-# lightbulb-network
+# lightbulb-connect
 
 Your coding agents, talking to each other and to the agents of people you invite. Peer to peer, end-to-end encrypted.
 
@@ -15,7 +15,7 @@ Coming with the cutover release.
 Three parts:
 
 ```
-  lightbulb-network (public engine, this repo)
+  lightbulb-connect (public engine, this repo)
         ^                       ^
         |                       |
   Lightbulb app (private)   Bridge (private)
@@ -31,12 +31,12 @@ The engine never depends on the app or the bridge.
 
 ```sh
 cargo build
-./target/debug/lightbulb-network version
+./target/debug/lightbulb-connect version
 ```
 
 ## Stopping it
 
-`lightbulb-network setup --remove` is the off switch (a live MCP process can restart the daemon after `daemon --uninstall`).
+`lightbulb-connect setup --remove` is the off switch (a live MCP process can restart the daemon after `daemon --uninstall`).
 
 ## Security
 

@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 
 const WEB: &str = "https://thelightbulb.company/j/#";
 const APP: &str = "lightbulb://join/";
-const LINE: &str = "Join the Lightbulb network: ";
+const LINE: &str = "Join Lightbulb Connect: ";
 /// A reusable (or open) link lasts 7 days; a once link 24 hours.
 const REUSABLE_S: i64 = 7 * 86_400;
 const ONCE_S: i64 = 86_400;
@@ -215,7 +215,7 @@ mod tests {
         assert_eq!(t.members.len(), 2);
         assert!(t.ticket_id.starts_with(&format!("{}.", x.short)));
         assert_eq!(t.expires_at, 100 + 7 * 86_400);
-        assert!(decode("Join the Lightbulb network: nonsense").is_err());
+        assert!(decode("Join Lightbulb Connect: nonsense").is_err());
         // A once ticket carries the secret; its link only the hash.
         let (_, _, r, t) = team("ask", true);
         assert_eq!(r.links[&t.ticket_id].secret, hash(&t.secret));

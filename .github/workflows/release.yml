@@ -15,11 +15,11 @@ jobs:
       # signing + notarytool), so Gatekeeper will quarantine a browser download.
       - name: Package
         run: |
-          tar -czf lightbulb-network-macos-arm64.tar.gz -C target/release lightbulb-network
-          shasum -a 256 lightbulb-network-macos-arm64.tar.gz > lightbulb-network-macos-arm64.tar.gz.sha256
+          tar -czf lightbulb-connect-macos-arm64.tar.gz -C target/release lightbulb-connect
+          shasum -a 256 lightbulb-connect-macos-arm64.tar.gz > lightbulb-connect-macos-arm64.tar.gz.sha256
       - name: Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes \
-            lightbulb-network-macos-arm64.tar.gz lightbulb-network-macos-arm64.tar.gz.sha256
+            lightbulb-connect-macos-arm64.tar.gz lightbulb-connect-macos-arm64.tar.gz.sha256

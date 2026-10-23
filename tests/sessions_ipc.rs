@@ -1,4 +1,4 @@
-use lightbulb_network::{daemon, os, paths};
+use lightbulb_connect::{daemon, os, paths};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -18,7 +18,7 @@ async fn call(
 async fn register_sessions_end_round_trip() {
     let dir = tempfile::tempdir().unwrap();
     let claude_home = tempfile::tempdir().unwrap();
-    std::env::set_var("LIGHTBULB_NETWORK_CLAUDE_HOME", claude_home.path());
+    std::env::set_var("LIGHTBULB_CONNECT_CLAUDE_HOME", claude_home.path());
     let home = dir.path().to_path_buf();
     tokio::spawn(async move { daemon::run(&home).await.unwrap() });
 

@@ -1,4 +1,4 @@
-use lightbulb_network::{daemon, paths};
+use lightbulb_connect::{daemon, paths};
 use serde_json::{json, Value};
 use std::path::Path;
 use std::time::Duration;
@@ -30,7 +30,7 @@ async fn call(
 async fn identity_get_matches_status() {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().to_path_buf();
-    std::env::set_var("LIGHTBULB_NETWORK_CLAUDE_HOME", dir.path());
+    std::env::set_var("LIGHTBULB_CONNECT_CLAUDE_HOME", dir.path());
     std::fs::write(dir.path().join("config.toml"), "computer = \"mac-b\"\n").unwrap();
     tokio::spawn(async move { daemon::run(&home).await.unwrap() });
     let (mut lines, mut w) = connect(dir.path()).await;

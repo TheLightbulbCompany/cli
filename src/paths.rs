@@ -3,16 +3,16 @@ use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::PathBuf;
 
 /// Overrides the state dir (tests, side-by-side installs).
-pub const HOME_ENV: &str = "LIGHTBULB_NETWORK_HOME";
+pub const HOME_ENV: &str = "LIGHTBULB_CONNECT_HOME";
 pub const SOCKET: &str = "sock";
 
-/// `~/.lightbulb/network` (or `$LIGHTBULB_NETWORK_HOME`), not created.
+/// `~/.lightbulb/connect` (or `$LIGHTBULB_CONNECT_HOME`), not created.
 pub fn state_path() -> PathBuf {
     match std::env::var_os(HOME_ENV) {
         Some(d) => PathBuf::from(d),
         None => dirs::home_dir()
             .expect("no home directory")
-            .join(".lightbulb/network"),
+            .join(".lightbulb/connect"),
     }
 }
 

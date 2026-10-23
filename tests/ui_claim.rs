@@ -1,8 +1,8 @@
 mod common;
 
 use common::{script, Env};
-use lightbulb_network::daemon::ipc;
-use lightbulb_network::dialog::{self, Queue};
+use lightbulb_connect::daemon::ipc;
+use lightbulb_connect::dialog::{self, Queue};
 use serde_json::json;
 use std::time::Duration;
 

@@ -16,21 +16,49 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-pub const LABEL: &str = "company.thelightbulb.network";
+pub const LABEL: &str = "company.thelightbulb.connect";
 /// Set to skip every `launchctl` call (tests).
-const NO_LAUNCHCTL: &str = "LIGHTBULB_NETWORK_NO_LAUNCHCTL";
+const NO_LAUNCHCTL: &str = "LIGHTBULB_CONNECT_NO_LAUNCHCTL";
 /// Overrides where the Lightbulb app's binary is looked for (tests).
-const DESKTOP_ENV: &str = "LIGHTBULB_NETWORK_DESKTOP";
+const DESKTOP_ENV: &str = "LIGHTBULB_CONNECT_DESKTOP";
 const DESKTOP: &str = "/Applications/Lightbulb.app/Contents/MacOS/lightbulb-desktop";
 /// Names a session the invocation speaks as (nothing sets it yet).
-const SESSION_ENV: &str = "LIGHTBULB_NETWORK_SESSION";
+const SESSION_ENV: &str = "LIGHTBULB_CONNECT_SESSION";
 
 pub fn home() -> Result<PathBuf> {
     dirs::home_dir().ok_or_else(|| "no home directory".into())
 }
 
 pub fn canonical(home: &Path) -> PathBuf {
+    home.join(".lightbulb/connect/bin/lightbulb-connect")
+}
+
+/// legacy (Plan A install): the names `setup --remove` still cleans up.
+pub const LEGACY_LABEL: &str = "company.thelightbulb.network";
+
+/// legacy (Plan A install): the old canonical binary.
+pub fn legacy_canonical(home: &Path) -> PathBuf {
     home.join(".lightbulb/network/bin/lightbulb-network")
+}
+
+/// legacy (Plan A install): stops and removes the old launchd job and deletes the old binary.
+pub fn legacy_uninstall(home: &Path) -> Result<()> {
+    if cfg!(target_os = "macos") {
+        if use_launchctl() {
+            let target = format!("gui/{}/{LEGACY_LABEL}", unsafe { libc::getuid() });
+            launchctl(&["bootout", &target]);
+        }
+        let plist = home
+            .join("Library/LaunchAgents")
+            .join(format!("{LEGACY_LABEL}.plist"));
+        for path in [plist, legacy_canonical(home)] {
+            match fs::remove_file(&path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+                _ => {}
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn plist_path(home: &Path) -> PathBuf {
@@ -345,9 +373,9 @@ pub fn join(link: &str, name: Option<String>) -> Result<i32> {
             return Ok(0);
         }
         (Some("waiting"), _) => "No one has answered yet. Run the same command again to keep asking.".to_string(),
-        (_, Some(admission::ALREADY_IN_TEAM)) => format!("You are in \"{team}\". Leave it first: lightbulb-network leave"),
+        (_, Some(admission::ALREADY_IN_TEAM)) => format!("You are in \"{team}\". Leave it first: lightbulb-connect leave"),
         (_, Some(admission::NAME_TAKEN)) => format!(
-            "The name \"{name}\" is already used in this network. Try: lightbulb-network join '{link}' --name {name}-2"
+            "The name \"{name}\" is already used in this network. Try: lightbulb-connect join '{link}' --name {name}-2"
         ),
         (_, Some(admission::UNREACHABLE)) => "No one from this network is online right now. Ask them to open their laptop, then run the same command again. Your key is ready; nothing was lost.".to_string(),
         (_, Some(admission::DECLINED)) => "Your request to join was declined.".to_string(),
@@ -468,7 +496,7 @@ pub fn leave() -> Result<i32> {
     }
     let r = conn.call("team.leave", json!({}))?;
     if r["ok"] != true {
-        let text = "You are the founder. Name a new founder first: lightbulb-network admin <name> --founder";
+        let text = "You are the founder. Name a new founder first: lightbulb-connect admin <name> --founder";
         return refuse(&r, &[("founder_must_transfer", text.to_string())], "leave");
     }
     println!("Left \"{name}\". This computer is on its own network again.");
