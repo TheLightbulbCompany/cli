@@ -8,6 +8,7 @@ use crate::store::{Message, Store, MSG_RECEIPT};
 use crate::Result;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 pub const LOOP_LIMIT: u32 = 12;
 /// Half-open: a send counts while `sent_at > now - LOOP_WINDOW_S`, so one sent at T stops counting at T + 600.
@@ -20,14 +21,36 @@ pub const MAX_TEXT: usize = 65_536;
 pub const MAX_REQUEST_ID: usize = 128;
 /// A message `MAX_HOPS` agent replies deep is refused `loop`: a person must speak.
 pub const MAX_HOPS: i64 = 4;
-/// What `receive` decided: the state, the refusal reason, the loop limit a `loop` refusal hit,
-/// and the hold it opened.
-pub type Answer = (
-    State,
-    Option<String>,
-    Option<String>,
-    Option<crate::holds::Hold>,
-);
+/// What `receive` decided.
+#[derive(Debug, PartialEq)]
+pub struct Answer {
+    pub state: State,
+    /// Why, when `refused`.
+    pub reason: Option<String>,
+    /// The loop limit a `loop` refusal hit (`HOPS`, `RATE`).
+    pub limit: Option<String>,
+    /// The hold it opened.
+    pub held: Option<crate::holds::Hold>,
+}
+
+impl Answer {
+    fn is(state: State) -> Answer {
+        Answer {
+            state,
+            reason: None,
+            limit: None,
+            held: None,
+        }
+    }
+
+    fn refused(reason: &str, limit: Option<&str>) -> Answer {
+        Answer {
+            reason: Some(reason.into()),
+            limit: limit.map(Into::into),
+            ..Answer::is(State::Refused)
+        }
+    }
+}
 
 /// Which loop limit a `loop` refusal hit (`Receipt::limit`, the wire's `limit`): `MAX_HOPS` agent
 /// replies, or `LOOP_LIMIT` messages in the window.
@@ -100,6 +123,49 @@ pub struct Receipt {
     /// For a `loop` refusal, `HOPS` or `RATE`; `None` when the refuser did not say.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<String>,
+    /// Who the message was stored for (none for a refusal), and when the receipt last moved.
+    #[serde(skip)]
+    pub to: Option<String>,
+    #[serde(skip)]
+    pub at: Option<i64>,
+}
+
+/// What receipt `r` (as `send` and `receipt` answer it) means in words, when it needs them: mail
+/// on a teammate's computer, or a `loop` refusal. With `rid` it is the terminal's line: the id
+/// first where the receipt may still change, and a stored line naming the session's tier and
+/// the `receipt` command.
+pub fn receipt_note(r: &Value, rid: Option<&str>) -> Option<String> {
+    let at = |f: &str| r[f].as_str().unwrap_or_default();
+    let (computer, person) = (at("where"), at("person"));
+    let remote = r["person"].is_string();
+    let id = rid.map(|i| format!("{i} ")).unwrap_or_default();
+    Some(match at("state") {
+        "refused" if at("reason") == "loop" => match at("limit") {
+            RATE => format!("loop limit: {LOOP_LIMIT} messages in 10 minutes to this session"),
+            HOPS => format!("paused after {MAX_HOPS} agent replies; a person must speak"),
+            _ => "paused by a loop limit".into(),
+        },
+        "queued" if remote => {
+            let until = crate::date::local_time(r["until"].as_i64().unwrap_or_default());
+            let why = if r["online"] == true {
+                "has not confirmed yet"
+            } else {
+                "is offline"
+            };
+            format!("{id}queued: {computer} {why}. Will retry until {until}.")
+        }
+        "stored" if remote => match rid {
+            Some(i) => format!(
+                "{i} stored on {computer} (tier {}). Receipt: lightbulb-connect receipt {i}",
+                r["tier"].as_str().unwrap_or("unknown")
+            ),
+            None => format!(
+                "stored on {computer}. It may be held for {person} to approve; you will see the receipt change."
+            ),
+        },
+        "held" if remote => format!("{id}held: waiting for {person} to approve"),
+        _ => return None,
+    })
 }
 
 /// Live means a registered row whose process is the registered one.
@@ -118,13 +184,15 @@ fn live(store: &Store, key: &str) -> bool {
         .is_some_and(|(pid, birth)| sessions::alive(pid, birth))
 }
 
-/// Writes `state` only if it is later than the stored one.
+/// Writes `state` (with `reason` and, for a `loop` refusal, its `limit`) only if it is later
+/// than the stored one.
 pub(crate) fn advance(
     conn: &Connection,
     from: &str,
     request_id: &str,
     state: State,
     reason: Option<&str>,
+    limit: Option<&str>,
     now: u64,
 ) -> Result<()> {
     let old = conn
@@ -146,94 +214,56 @@ pub(crate) fn advance(
             )?;
         } else {
             conn.execute(
-                "INSERT OR REPLACE INTO receipts (from_key, request_id, state, reason, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![from, request_id, state.name(), reason, now as i64],
+                "INSERT OR REPLACE INTO receipts (from_key, request_id, state, reason, updated_at, \
+                 \"limit\") VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![from, request_id, state.name(), reason, now as i64, limit],
             )?;
         }
     }
     Ok(())
 }
 
-/// Records which loop limit refused `from`'s `request_id` (nothing for `None`).
-pub(crate) fn set_limit(
-    conn: &Connection,
-    from: &str,
-    request_id: &str,
-    limit: Option<&str>,
-) -> Result<()> {
-    if let Some(l) = limit {
-        conn.execute(
-            "UPDATE receipts SET \"limit\" = ?3 WHERE from_key = ?1 AND request_id = ?2 \
-             AND state = 'refused'",
-            [from, request_id, l],
-        )?;
-    }
-    Ok(())
-}
-
-/// Who `from`'s message `request_id` was stored for; `None` when it stored nothing.
-pub fn recipient(store: &Store, from: &Key, request_id: &str) -> Result<Option<String>> {
-    Ok(store
-        .conn()
-        .query_row(
-            "SELECT to_key FROM messages WHERE from_key = ?1 AND request_id = ?2",
-            [&from.0, request_id],
-            |r| r.get(0),
-        )
-        .optional()?)
-}
-
-/// When `from`'s receipt for `request_id` last moved (unix seconds).
-pub fn receipt_at(store: &Store, from: &Key, request_id: &str) -> Result<Option<i64>> {
-    Ok(store
-        .conn()
-        .query_row(
-            "SELECT updated_at FROM receipts WHERE from_key = ?1 AND request_id = ?2",
-            [&from.0, request_id],
-            |r| r.get(0),
-        )
-        .optional()?)
-}
-
-/// The stored receipt for `from`'s `request_id`, with `where_` worked out from the recipient's liveness now.
+/// The stored receipt for `from`'s `request_id`, with `where_` worked out from the recipient's
+/// liveness now, and the recipient and the time it last moved (`to`, `at`) read with it.
 pub fn receipt(store: &Store, from: &Key, request_id: &str) -> Result<Option<Receipt>> {
-    let conn = store.conn();
-    let row = conn
+    let row = store
+        .conn()
         .query_row(
-            "SELECT state, reason, \"limit\" FROM receipts WHERE from_key = ?1 AND request_id = ?2",
+            "SELECT r.state, r.reason, r.\"limit\", r.updated_at, m.to_key FROM receipts r \
+             LEFT JOIN messages m ON m.from_key = r.from_key AND m.request_id = r.request_id \
+             WHERE r.from_key = ?1 AND r.request_id = ?2",
             [&from.0, request_id],
             |r| {
                 Ok((
                     r.get::<_, String>(0)?,
-                    r.get::<_, Option<String>>(1)?,
-                    r.get::<_, Option<String>>(2)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get::<_, Option<String>>(4)?,
                 ))
             },
         )
         .optional()?;
-    let Some((state, reason, limit)) = row else {
+    let Some((state, reason, limit, at, to)) = row else {
         return Ok(None);
     };
     let state = State::parse(&state)?;
-    let where_ = if state == State::Stored {
-        recipient(store, from, request_id)?.map(|to| {
-            if live(store, &to) {
-                "recipient"
-            } else {
-                "mailbox"
-            }
-            .to_string()
-        })
-    } else {
-        None
-    };
+    let where_ = to.as_deref().filter(|_| state == State::Stored).map(|to| {
+        if live(store, to) {
+            "recipient"
+        } else {
+            "mailbox"
+        }
+        .to_string()
+    });
     Ok(Some(Receipt {
         request_id: request_id.into(),
         state,
         reason,
         where_,
         limit,
+        to,
+        at,
     }))
 }
 
@@ -245,14 +275,23 @@ fn refuse(
     limit: Option<&str>,
     now: u64,
 ) -> Result<Receipt> {
-    advance(conn, &from.0, request_id, State::Refused, Some(reason), now)?;
-    set_limit(conn, &from.0, request_id, limit)?;
+    advance(
+        conn,
+        &from.0,
+        request_id,
+        State::Refused,
+        Some(reason),
+        limit,
+        now,
+    )?;
     Ok(Receipt {
         request_id: request_id.into(),
         state: State::Refused,
         reason: Some(reason.into()),
         where_: None,
         limit: limit.map(Into::into),
+        to: None,
+        at: Some(now as i64),
     })
 }
 
@@ -381,6 +420,8 @@ pub fn prepare(
             reason: Some(reason.into()),
             where_: None,
             limit: None,
+            to: None,
+            at: None,
         }))
     };
     let refused = |reason: &str| {
@@ -496,6 +537,7 @@ pub(crate) fn put(store: &Store, p: &Prepared, origin: Origin, state: State) -> 
         &p.request_id,
         state,
         None,
+        None,
         p.sent_at as u64,
     )
 }
@@ -595,8 +637,8 @@ pub fn receive(
     else {
         return Err("not an envelope".into());
     };
-    let refused = |r: &str| Ok((State::Refused, Some(r.to_string()), None, None));
-    let looped = |l: &str| Ok((State::Refused, Some("loop".into()), Some(l.into()), None));
+    let refused = |r: &str| Ok(Answer::refused(r, None));
+    let looped = |l: &str| Ok(Answer::refused("loop", Some(l)));
     let address = |a: &str| sessions::qualify("", a).as_deref() == Some(a);
     let ulid = |a: &str| ulid::Ulid::from_string(a).is_ok();
     if !address(from) || sessions::member_of(from) != Some(peer.short.as_str()) {
@@ -621,7 +663,10 @@ pub fn receive(
         return refused("not_member");
     }
     if let Some((state, reason)) = store.seen_state(&peer.key, id)? {
-        return Ok((State::parse(&state)?, reason, None, None));
+        return Ok(Answer {
+            reason,
+            ..Answer::is(State::parse(&state)?)
+        });
     }
     if let Some((old_to, old_body)) = store.sent_as(from, request_id)? {
         if old_to != *to || old_body != *body {
@@ -630,7 +675,11 @@ pub fn receive(
         // The same message under another envelope id: where it is now.
         let sender = Key(from.clone());
         let r = receipt(store, &sender, request_id)?.ok_or("message without a receipt")?;
-        return Ok((r.state, r.reason, r.limit, None));
+        return Ok(Answer {
+            reason: r.reason,
+            limit: r.limit,
+            ..Answer::is(r.state)
+        });
     }
     // An answer to (or in the thread of) a message this computer sent is at least one hop
     // past it, whatever `hops` the peer claims; only a person (`/terminal`, fenced by the
@@ -682,7 +731,10 @@ pub fn receive(
     };
     store.put_seen(&peer.key, id, state.name(), now as i64)?;
     tx.commit()?;
-    Ok((state, None, None, held))
+    Ok(Answer {
+        held,
+        ..Answer::is(state)
+    })
 }
 
 /// Whether `member`'s latest presence names `address` among its sessions, `known` or `kept`
@@ -772,7 +824,15 @@ fn take_where(store: &Store, to: &Key, only: Option<&str>, now: u64) -> Result<V
     let mut out = vec![];
     for (row_id, message_id) in rows {
         if let Some(m) = store.message(&message_id)? {
-            advance(&tx, &m.from_key, &m.request_id, State::Delivered, None, now)?;
+            advance(
+                &tx,
+                &m.from_key,
+                &m.request_id,
+                State::Delivered,
+                None,
+                None,
+                now,
+            )?;
             out.push(m);
         }
         tx.execute("DELETE FROM mailbox WHERE id = ?1", [row_id])?;
@@ -828,7 +888,7 @@ pub fn expire(store: &Store, now: u64) -> Result<()> {
         rows.collect::<rusqlite::Result<_>>()?
     };
     for (from, request_id) in due {
-        advance(&tx, &from, &request_id, State::Expired, None, now)?;
+        advance(&tx, &from, &request_id, State::Expired, None, None, now)?;
     }
     tx.execute("DELETE FROM mailbox WHERE expires_at < ?1", [now as i64])?;
     tx.commit()?;
@@ -838,6 +898,41 @@ pub fn expire(store: &Store, now: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notes_name_the_loop_limit_or_say_a_limit() {
+        let r = |limit: Option<&str>| {
+            receipt_note(
+                &serde_json::json!({"state": "refused", "reason": "loop", "limit": limit}),
+                None,
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            r(Some("hops")),
+            "paused after 4 agent replies; a person must speak"
+        );
+        assert_eq!(
+            r(Some("rate")),
+            "loop limit: 12 messages in 10 minutes to this session"
+        );
+        assert_eq!(r(None), "paused by a loop limit");
+        assert_eq!(
+            receipt_note(
+                &serde_json::json!({"state": "refused", "reason": "policy"}),
+                None
+            ),
+            None
+        );
+        assert_eq!(
+            receipt_note(
+                &serde_json::json!({"state": "stored", "where": "recipient"}),
+                None
+            ),
+            None
+        );
+    }
+
     use crate::{os, store::Session};
 
     fn setup() -> (tempfile::TempDir, Store) {
@@ -918,7 +1013,7 @@ mod tests {
         mark_read_for(&s, &k("m/codex:b"), 103).unwrap();
         assert_eq!(state(&s, "r1"), State::Read);
         // never backwards
-        advance(s.conn(), "m/codex:a", "r1", State::Stored, None, 104).unwrap();
+        advance(s.conn(), "m/codex:a", "r1", State::Stored, None, None, 104).unwrap();
         assert_eq!(state(&s, "r1"), State::Read);
     }
 
@@ -1397,7 +1492,7 @@ mod tests {
         for (i, to) in ["m/terminal", "m/codex:c"].iter().enumerate() {
             let (peer, roster, env) = peer_mail(to, &format!("r{i}"));
             let got = receive(&s, &env, &peer, &roster, "m", 1000).unwrap();
-            assert_eq!(got, (State::Stored, None, None, None));
+            assert_eq!(got, Answer::is(State::Stored));
         }
         let later = 1000 + 100 * HOLD_S;
         expire(&s, later).unwrap();
@@ -1418,18 +1513,16 @@ mod tests {
             "r1",
             State::Refused,
             Some("declined"),
+            None,
             1000,
         )
         .unwrap();
-        assert_eq!(
-            again(),
-            (State::Refused, Some("declined".into()), None, None)
-        );
+        assert_eq!(again(), Answer::refused("declined", None));
         // With its message and receipt rows gone, what the sender was told stands.
         s.conn()
             .execute_batch("DELETE FROM messages; DELETE FROM receipts; DELETE FROM mailbox;")
             .unwrap();
-        assert_eq!(again(), (State::Stored, None, None, None));
+        assert_eq!(again(), Answer::is(State::Stored));
         assert_eq!(
             unread(&s, &k("m/codex:c"), 1001).unwrap(),
             0,

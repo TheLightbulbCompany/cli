@@ -25,6 +25,23 @@ pub struct TeamState {
     /// The replayed roster, replaced by every write (`net_ops`), never replayed per op.
     pub roster: roster::Roster,
     pub config: Config,
+    /// `config.folders_off`, each `presence::canonical`: what `register` and the presence
+    /// compare a session's folder with. Set with `config` (`set_config`).
+    pub off: Vec<PathBuf>,
+}
+
+impl TeamState {
+    /// Takes `config` (and its canonical `off`); whether it changed.
+    pub fn set_config(&mut self, config: Config) -> bool {
+        let changed = self.config != config;
+        self.off = config
+            .folders_off
+            .iter()
+            .map(|o| crate::presence::canonical(o))
+            .collect();
+        self.config = config;
+        changed
+    }
 }
 
 /// What every connection handler shares.
@@ -148,10 +165,12 @@ pub async fn run(dir: &Path) -> Result<()> {
         roster::accept(&store, &g, now)?;
         entries.push(g);
     }
-    let team = TeamState {
+    let mut team = TeamState {
         roster: roster::replay(&entries),
-        config,
+        config: Config::default(),
+        off: vec![],
     };
+    team.set_config(config);
     net_ops::sync_team_row(&store, &roster::Roster::default(), &team.roster)?;
 
     // We hold the lock, so any socket file left behind is stale.

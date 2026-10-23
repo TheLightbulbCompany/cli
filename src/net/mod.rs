@@ -134,6 +134,8 @@ pub struct Peers {
     pub outbox: Notify,
     /// Woken (`notify_waiters`) whenever a member's connection ends.
     pub disconnected: Notify,
+    /// Woken (`notify_waiters`) whenever a member answers for mail sent it (`outbox::acked`).
+    pub acked: Notify,
     /// The endpoint's UDP port.
     pub port: OnceLock<u16>,
     /// The endpoint, for the candidate side of a join.
@@ -178,6 +180,13 @@ impl Peers {
             .filter(|(_, l)| matches!(l.protocol, Protocol::Ok(_)))
             .map(|(k, _)| k.clone())
             .collect()
+    }
+
+    /// Whether member `key` is `online`.
+    pub fn is_online(&self, key: &str) -> bool {
+        let live = self.live.lock().unwrap();
+        live.get(key)
+            .is_some_and(|l| matches!(l.protocol, Protocol::Ok(_)))
     }
 
     /// For `status`, in one pass: how many members are online, and `(key, their protocol)`
@@ -613,7 +622,10 @@ impl Net {
             let state = State::parse(&state).expect("checked by from_peer_ok");
             let (reason, limit) = (reason.as_deref(), limit.as_deref());
             match outbox::acked(&store, key, &id, state, reason, limit, ipc::now()) {
-                Ok(true) => eprintln!("net: {id} at {short}: {}", state.name()),
+                Ok(true) => {
+                    eprintln!("net: {id} at {short}: {}", state.name());
+                    d.peers.acked.notify_waiters();
+                }
                 Ok(false) => {
                     eprintln!("net: dropped an answer from {short} for {id} (not sent there)")
                 }
@@ -644,7 +656,12 @@ fn receive(d: &Arc<Daemon>, key: &str, env: &Frame, tx: &mpsc::UnboundedSender<F
     let store = d.store.lock().unwrap();
     let me = &d.identity.short;
     match mail::receive(&store, env, peer, &team.roster, me, ipc::now()) {
-        Ok((state, reason, limit, held)) => {
+        Ok(mail::Answer {
+            state,
+            reason,
+            limit,
+            held,
+        }) => {
             if let Some(h) = held {
                 holds::shown(d, &team.roster, &store, &h);
             }

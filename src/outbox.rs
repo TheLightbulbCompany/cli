@@ -59,8 +59,7 @@ pub fn acked(
     let Some((from, request_id)) = store.outbox_sender(id, member)? else {
         return Ok(false);
     };
-    mail::advance(store.conn(), &from, &request_id, state, reason, now)?;
-    mail::set_limit(store.conn(), &from, &request_id, limit)?;
+    mail::advance(store.conn(), &from, &request_id, state, reason, limit, now)?;
     Ok(true)
 }
 
@@ -76,6 +75,7 @@ pub fn expire(store: &Store, now: u64, ttl: u64) -> Result<()> {
             &request_id,
             State::Expired,
             Some("unreachable"),
+            None,
             now,
         )?;
     }

@@ -33,12 +33,17 @@ pub fn render(roster: &Roster, viewer: &str, from: &str) -> String {
         Sender::Name(n) => format!("{possessive} {n} mailbox"),
         Sender::Agent(p) => format!("{possessive} {}", agent_name(p)),
     };
-    // The reader's own computer has nothing to prove to itself.
-    if m.proof.is_some() || m.key == viewer {
+    if verified(m, viewer) {
         label
     } else {
         format!("{label} (not verified)")
     }
+}
+
+/// Whether member `m` reads as verified to the computer `own` (its key): it has a proof, or it is
+/// `own`, which has nothing to prove to itself.
+pub fn verified(m: &Member, own: &str) -> bool {
+    m.proof.is_some() || m.key == own
 }
 
 /// `m`'s name as display text: without the characters that could pass for the frame header's

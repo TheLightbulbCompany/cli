@@ -348,9 +348,9 @@ fn held_lib(
 ) -> holds::Hold {
     let peer = &roster.members[&aden.key];
     let env = from_aden(aden, "r1", to, "secret");
-    let (state, reason, _, h) = mail::receive(s, &env, peer, roster, &me.short, now).unwrap();
-    assert_eq!((state, reason), (State::Held, None));
-    let h = h.unwrap();
+    let a = mail::receive(s, &env, peer, roster, &me.short, now).unwrap();
+    assert_eq!((a.state, a.reason), (State::Held, None));
+    let h = a.held.unwrap();
     assert_eq!(holds::open(s).unwrap(), std::slice::from_ref(&h));
     h
 }

@@ -506,7 +506,7 @@ fn folder_off_hides_sessions_after_reload() {
     let want = want.to_str().unwrap().to_lowercase();
     assert!(config.to_lowercase().contains(&want), "{config}");
     let o = a.run(&["folder", "/nonexistent/zz", "off"]);
-    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(o.status.code(), Some(1), "{}{}", out(&o), err(&o));
     assert_eq!(err(&o).trim(), "no such folder: /nonexistent/zz");
     // `on` takes it out again however it is spelled.
     let o = a

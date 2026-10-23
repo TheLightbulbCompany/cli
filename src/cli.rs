@@ -236,26 +236,17 @@ pub fn send(
         if state == "refused" {
             code = 1;
         }
-        let line = match crate::mcp::note(receipt) {
-            Some(_) if state == "stored" => format!(
-                "{rid} stored on {} (tier {}). Receipt: lightbulb-connect receipt {rid}",
-                receipt["where"].as_str().unwrap_or_default(),
-                receipt["tier"].as_str().unwrap_or("unknown"),
-            ),
-            Some(note) if matches!(state, "queued" | "held") => format!("{rid} {note}"),
-            Some(note) => note,
-            None => {
-                let mut line = match receipt["reason"].as_str() {
-                    Some(reason) if state == "refused" => format!("refused: {reason}"),
-                    _ => state.to_string(),
-                };
-                line.push_str(&format!(" {rid}"));
-                if group {
-                    line.push_str(&format!(" {to}"));
-                }
-                line
+        let line = crate::mail::receipt_note(receipt, Some(&rid)).unwrap_or_else(|| {
+            let mut line = match receipt["reason"].as_str() {
+                Some(reason) if state == "refused" => format!("refused: {reason}"),
+                _ => state.to_string(),
+            };
+            line.push_str(&format!(" {rid}"));
+            if group {
+                line.push_str(&format!(" {to}"));
             }
-        };
+            line
+        });
         println!("{line}");
     }
     Ok(code)
@@ -388,7 +379,7 @@ pub fn invite(mode: Invite) -> Result<i32> {
     let line = r["line"].as_str().unwrap_or_default();
     match mode {
         Invite::Once => {
-            let at = utc(r["expires_at"].as_i64().unwrap_or_default());
+            let at = crate::date::utc(r["expires_at"].as_i64().unwrap_or_default());
             println!("One-time invite, expires {at}: {line}");
         }
         Invite::Open => {
@@ -632,26 +623,6 @@ pub fn leave() -> Result<i32> {
     Ok(0)
 }
 
-/// `secs` as `YYYY-MM-DD HH:MM UTC`.
-fn utc(secs: i64) -> String {
-    // Days to a civil date (Howard Hinnant's `civil_from_days`).
-    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + i64::from(m <= 2);
-    format!(
-        "{y:04}-{m:02}-{d:02} {:02}:{:02} UTC",
-        rem / 3600,
-        rem % 3600 / 60
-    )
-}
-
 /// Hands an unowned subcommand to the Lightbulb app's binary (replacing this process), or says
 /// what is needed.
 pub fn forward(args: Vec<OsString>) -> Result<i32> {
@@ -870,13 +841,6 @@ pub fn doctor() -> Result<i32> {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn utc_formats_a_unix_time() {
-        assert_eq!(super::utc(0), "1970-01-01 00:00 UTC");
-        assert_eq!(super::utc(1_792_728_600), "2026-10-23 04:10 UTC");
-        assert_eq!(super::utc(951_782_400), "2000-02-29 00:00 UTC");
-    }
-
     #[test]
     fn a_title_with_control_characters_prints_as_plain_text() {
         let title = "fix\u{1b}[2J\u{1b}]8;;http://x\u{7}\tit\u{85}\u{2066}now\r\nok";
