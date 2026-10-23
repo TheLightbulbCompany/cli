@@ -557,6 +557,9 @@ async fn run(
     } else {
         d.streams.close(&sid);
     }
+    // Only now may the channel close: a `stream.send` blocked in `tx.send` reads the ended
+    // record (`no_grant`), never a stream that seems to have vanished (`not_found`).
+    drop(rx);
     eprintln!("streams: {sid} closed ({why})");
     event(&d, json!({"event": "stream_closed", "stream_id": sid}));
 }
