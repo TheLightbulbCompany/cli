@@ -255,6 +255,63 @@ pub fn admit(by: &Identity, parent: &Entry, who: &Identity, name: &str, extra: V
     Entry::signed(by, vec![parent.hash()], Kind::Admit, body, 2)
 }
 
+/// `who`'s computer proof (`issuer::computer_proof`), issued now: person `sub` called `name`,
+/// signed into workspace `ws` (named for its id) if any.
+pub fn person_proof(who: &Identity, sub: &str, name: &str, ws: Option<&str>) -> String {
+    issuer::computer_proof(&who.key, sub, name, ws.map(|w| (w, w)), now_s())
+}
+
+/// `who`'s workspace proof (`issuer::workspace_proof`) for workspace `ws` called `name`, with
+/// no agents, issued now.
+pub fn ws_proof(who: &Identity, ws: &str, name: &str) -> String {
+    issuer::workspace_proof(&who.key, ws, name, &[], now_s())
+}
+
+/// `LIGHTBULB_CONNECT_PEERS` is read from this process's environment when an instance starts:
+/// one start at a time.
+static STARTING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// An embedded instance on `home`, workspace `name`, with issuer `issuer`, that dials `envs`
+/// at their running daemons, leaving a final snapshot at `snapshot` on shutdown; `knobs` are
+/// set while it starts (its knobs are read then).
+pub async fn instance(
+    home: &std::path::Path,
+    envs: &[&Env],
+    name: &str,
+    issuer: &str,
+    snapshot: Option<&std::path::Path>,
+    knobs: &[(&str, String)],
+) -> lightbulb_connect::Result<lightbulb_connect::embed::Instance> {
+    let _one = STARTING.lock().await;
+    let knobs: Vec<(&str, String)> = [peers(envs)]
+        .into_iter()
+        .chain(knobs.iter().cloned())
+        .collect();
+    for (k, v) in &knobs {
+        std::env::set_var(k, v);
+    }
+    let opts = lightbulb_connect::embed::EmbedOpts {
+        kind: roster::MemberKind::Cloud,
+        relay: None,
+        issuer: issuer.into(),
+        snapshot: snapshot.map(std::path::Path::to_path_buf),
+        name: name.into(),
+    };
+    let i = lightbulb_connect::embed::start(home, opts).await;
+    for (k, _) in &knobs {
+        std::env::remove_var(k);
+    }
+    i
+}
+
+/// Instance `i`'s answer to `op` with `body`.
+pub async fn call(i: &lightbulb_connect::embed::Instance, op: &str, body: Value) -> Value {
+    let mut req = body;
+    req["id"] = 1.into();
+    req["op"] = op.into();
+    i.call(req).await
+}
+
 /// `<short>/codex:<conv>` on `e`.
 pub fn session(e: &Env, conv: &str) -> String {
     format!("{}/codex:{conv}", e.short())

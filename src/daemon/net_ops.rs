@@ -398,16 +398,13 @@ pub fn genesis(me: &Identity, name: &str, computer: &str, team_name: &str, at: i
 }
 
 /// This engine's solo network: a computer's (`genesis`, as its person), or a workspace
-/// member's (`cloud`: the workspace's name, member and team alike).
+/// member's (`cloud`: the workspace's name, member and team alike). An instance founds it as a
+/// plain member of its own key: a `cloud` member needs a workspace proof, which only `team.join`
+/// brings (`roster::own_person`).
 pub(crate) fn solo_genesis(me: &Identity, cloud: Option<&str>, computer: &str, at: i64) -> Entry {
-    let Some(name) = cloud else {
-        let user = super::user_name();
-        return genesis(me, &user, computer, &user, at);
-    };
-    let body = json!({"member": me.key, "name": name, "computer": computer,
-        "person_id": me.key, "kind": "cloud", "role": "founder", "ticket_id": "",
-        "team_name": name});
-    Entry::signed(me, vec![], Kind::Admit, body, at)
+    let user = super::user_name();
+    let name = cloud.unwrap_or(&user);
+    genesis(me, name, computer, name, at)
 }
 
 /// Whether `path` is absolute and names nothing in (or of) state dir `dir`: a snapshot never
@@ -671,9 +668,9 @@ impl TeamOps<'_> {
 /// `cloud.sessions.set {sessions: [{name, agent, title?}]}` -> `{}` (an embedded instance only;
 /// `unsupported` on a computer): the workspace's agents, published as `<short>/<name>` with
 /// `agent` and `title` (at most `presence::MAX`, each name a `valid_name`, once). Answers once
-/// the presence sender (`presence::run`) has handed on the presence carrying them (at most
-/// 5 s), so a `send` from a name just declared is never refused as unadvertised by a peer the
-/// envelope reaches first.
+/// the presence sender (`presence::run`) has handed on the presence carrying them, so a `send`
+/// from a name just declared is never refused as unadvertised by a peer the envelope reaches
+/// first; `internal` if that takes over 5 s (the list stands, and goes out on the next send).
 pub async fn cloud_sessions_set(id: u64, body: &Value, daemon: &Daemon) -> Response {
     let Some(cloud) = &daemon.cloud else {
         return Response::err(id, UNSUPPORTED);
@@ -714,8 +711,15 @@ pub async fn cloud_sessions_set(id: u64, body: &Value, daemon: &Daemon) -> Respo
     let version = cloud.set(out);
     daemon.presence.notify_one();
     let handed = sent.wait_for(|v| *v >= version);
-    let _ = tokio::time::timeout(Duration::from_secs(5), handed).await;
-    Response::ok(id, json!({}))
+    let handed = matches!(
+        tokio::time::timeout(Duration::from_secs(5), handed).await,
+        Ok(Ok(_))
+    );
+    if handed {
+        Response::ok(id, json!({}))
+    } else {
+        Response::err(id, INTERNAL)
+    }
 }
 
 /// Whether a person, not an agent, is at the other end of the socket: no process from

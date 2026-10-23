@@ -536,7 +536,15 @@ pub(crate) fn put(store: &Store, p: &Prepared, origin: Origin, state: State) -> 
     }
     store.put_message(&m)?;
     let at = p.sent_at as u64;
-    advance(store.conn(), &p.from.0, &p.request_id, state, None, None, at)?;
+    advance(
+        store.conn(),
+        &p.from.0,
+        &p.request_id,
+        state,
+        None,
+        None,
+        at,
+    )?;
     Ok(())
 }
 

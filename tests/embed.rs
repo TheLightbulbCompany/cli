@@ -3,32 +3,20 @@
 
 mod common;
 
-use common::{dialog, endpoint, identity, now_s, peers, ulid, until, Env, Peer};
-use lightbulb_connect::embed::{self, EmbedOpts, Instance};
+use common::{call, dialog, endpoint, identity, now_s, ulid, until, Env, Peer};
+use lightbulb_connect::embed::Instance;
 use lightbulb_connect::identity::{key_bytes, Identity};
 use lightbulb_connect::net::frames::Frame;
 use lightbulb_connect::net::ALPN;
 use lightbulb_connect::policy;
-use lightbulb_connect::roster::{self, Entry, Kind, MemberKind};
+use lightbulb_connect::roster::{self, Entry, Kind};
 use lightbulb_connect::store::Store;
 use serde_json::{json, Value};
 use std::path::Path;
 use std::time::Duration;
 use tokio::sync::broadcast::Receiver;
-use tokio::sync::Mutex;
 
 const NAME: &str = "The Lightbulb Company";
-
-/// A workspace proof for `ws` (opaque until Task 13 verifies it).
-fn proof(ws: &str) -> String {
-    json!({"kind": "workspace", "sub": format!("ws:{ws}"),
-        "workspace": {"id": ws, "name": NAME}})
-    .to_string()
-}
-
-/// `LIGHTBULB_CONNECT_PEERS` is read from this process's environment when an instance
-/// starts: one start at a time.
-static STARTING: Mutex<()> = Mutex::const_new(());
 
 /// An instance on `home` that dials `envs` at their running daemons, with a final snapshot to
 /// `snapshot` at shutdown.
@@ -41,25 +29,15 @@ async fn try_start(
     envs: &[&Env],
     snapshot: Option<&Path>,
 ) -> lightbulb_connect::Result<Instance> {
-    let _one = STARTING.lock().await;
-    std::env::set_var("LIGHTBULB_CONNECT_PEERS", peers(envs).1);
-    let opts = EmbedOpts {
-        kind: MemberKind::Cloud,
-        relay: None,
-        issuer: "http://127.0.0.1:9/connect".into(),
-        snapshot: snapshot.map(Path::to_path_buf),
-        name: NAME.into(),
-    };
-    let i = embed::start(home, opts).await;
-    std::env::remove_var("LIGHTBULB_CONNECT_PEERS");
-    i
-}
-
-async fn call(i: &Instance, op: &str, body: Value) -> Value {
-    let mut req = body;
-    req["id"] = 1.into();
-    req["op"] = op.into();
-    i.call(req).await
+    common::instance(
+        home,
+        envs,
+        NAME,
+        "http://127.0.0.1:9/connect",
+        snapshot,
+        &[],
+    )
+    .await
 }
 
 async fn ok(i: &Instance, op: &str, body: Value) -> Value {
@@ -92,9 +70,12 @@ async fn event(rx: &mut Receiver<Value>, pred: impl Fn(&Value) -> bool) -> Value
 
 /// A genesis by `id` ("prasiddha" on "mac", team "acme") signed into workspace `ws`.
 fn genesis(id: &Identity, ws: Option<&str>) -> Entry {
-    let body = json!({"member": id.key, "name": "prasiddha", "computer": "mac",
+    let mut body = json!({"member": id.key, "name": "prasiddha", "computer": "mac",
         "person_id": id.key, "kind": "computer", "role": "founder", "ticket_id": "",
-        "team_name": "acme", "workspace": ws});
+        "team_name": "acme"});
+    if let Some(ws) = ws {
+        signed_into(&mut body, id, "prasiddha", ws);
+    }
     Entry::signed(id, vec![], Kind::Admit, body, 1)
 }
 
@@ -109,13 +90,28 @@ fn computer_a() -> Env {
     a
 }
 
+/// `who`'s admit `body` as person `p-<short>` signed into workspace `ws`: a member's workspace
+/// is its proof's.
+fn signed_into(body: &mut Value, who: &Identity, name: &str, ws: &str) {
+    let person = format!("p-{}", who.short);
+    body["proof"] = common::person_proof(who, &person, name, Some(ws)).into();
+    body["person_id"] = person.into();
+}
+
+/// Instance `i`'s workspace proof for `ws` (`common::issuer`).
+async fn proof(i: &Instance, ws: &str) -> String {
+    let me = ok(i, "identity.get", json!({})).await;
+    let key = me["member_key"].as_str().unwrap();
+    common::issuer::workspace_proof(key, ws, NAME, &[], now_s())
+}
+
 async fn join(i: &Instance, a: &Env) -> Value {
     let t = a.ask(json!({"id": 1, "op": "team.invite"}));
     let ticket = t["ticket"].as_str().unwrap();
     ok(
         i,
         "team.join",
-        json!({"ticket": ticket, "name": NAME, "kind": "cloud", "proof": proof("W1")}),
+        json!({"ticket": ticket, "name": NAME, "kind": "cloud", "proof": proof(i, "W1").await}),
     )
     .await
 }
@@ -168,6 +164,18 @@ async fn embedded_instance_joins_and_talks_without_a_socket() {
     .await;
     assert_eq!(r["receipt"]["request_id"], "f1");
     assert!(r["receipt"]["thread"].is_string(), "{r}");
+    // A replayed send and the `receipt` op carry the same thread.
+    let again = json!({"from": friday, "to": sa, "text": "hello from friday", "request_id": "f1"});
+    let again = ok(&i, "send", again).await;
+    let asked = ok(&i, "receipt", json!({"from": friday, "request_id": "f1"})).await;
+    assert_eq!(
+        again["receipt"]["thread"], r["receipt"]["thread"],
+        "{again}"
+    );
+    assert_eq!(
+        asked["receipt"]["thread"], r["receipt"]["thread"],
+        "{asked}"
+    );
     let m = a.take_one(&sa);
     assert_eq!(m["from"], friday.as_str());
 
@@ -292,7 +300,10 @@ async fn workspace_instance_joins_and_leaves_in_process() {
     )
     .await;
     assert_eq!(r["error"], "bad_request", "{r}");
-    let bad = json!({"kind": "workspace", "sub": "ws:W2", "workspace": {"id": "W1"}}).to_string();
+    let key = ok(&i, "identity.get", json!({})).await["member_key"].clone();
+    let bad = common::issuer::mint(&json!({"iss": "test", "iat": now_s(), "exp": now_s() + 600,
+        "sub": "ws:W2", "name": NAME, "computer": key, "kind": "workspace",
+        "workspace": {"id": "W1", "name": NAME}, "agents": []}));
     let r = ok(
         &i,
         "team.join",
@@ -354,7 +365,9 @@ async fn seeded(snapshot: Option<&Path>) -> (tempfile::TempDir, Instance, [Playe
     let w = Identity::load_or_create(home.path()).unwrap();
     let (ia, ib, ic) = (identity(), identity(), identity());
     let g = genesis(&ia, Some("W1"));
-    let ab = common::admit(&ia, &g, &ib, "bob", json!({"workspace": "W2"}));
+    let mut b = json!({});
+    signed_into(&mut b, &ib, "bob", "W2");
+    let ab = common::admit(&ia, &g, &ib, "bob", b);
     let ac = common::admit(&ia, &ab, &ic, "carol", json!({}));
     let aw = common::admit(
         &ia,
@@ -362,7 +375,7 @@ async fn seeded(snapshot: Option<&Path>) -> (tempfile::TempDir, Instance, [Playe
         &w,
         NAME,
         json!({"kind": "cloud", "person_id": "ws:W1",
-        "workspace": "W1", "proof": proof("W1")}),
+        "proof": common::ws_proof(&w, "W1", NAME)}),
     );
     let store = Store::open(&home.path().join("state.db")).unwrap();
     for e in [&g, &ab, &ac, &aw] {
@@ -625,19 +638,7 @@ async fn a_dropped_instance_shuts_down_before_its_home_is_free() {
     assert!(!matches!(dial, Ok(Ok(_))), "the old endpoint still answers");
     // A snapshot path inside the home is refused at start, too.
     next.shutdown().await;
-    let mut opts_err = None;
-    {
-        let _one = STARTING.lock().await;
-        let opts = EmbedOpts {
-            kind: MemberKind::Cloud,
-            relay: None,
-            issuer: "http://127.0.0.1:9/connect".into(),
-            snapshot: Some(home.path().join("final.db")),
-            name: NAME.into(),
-        };
-        if let Err(e) = embed::start(home.path(), opts).await {
-            opts_err = Some(e.to_string());
-        }
-    }
-    assert!(opts_err.is_some_and(|e| e.contains("snapshot")));
+    let inside = home.path().join("final.db");
+    let r = try_start(home.path(), &[], Some(&inside)).await;
+    assert!(r.err().is_some_and(|e| e.to_string().contains("snapshot")));
 }

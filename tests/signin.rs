@@ -5,9 +5,10 @@ mod common;
 
 use common::issuer::{computer_proof, workspace_proof};
 use common::{
-    computer, dialog, err, invite, members, out, peers, person, seed_pair, until, Env, EXE,
+    call, computer, dialog, err, invite, members, out, peers, person, seed_pair, until, Env, EXE,
 };
 use lightbulb_connect::daemon::ipc;
+use lightbulb_connect::embed::Instance;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, TcpListener};
@@ -46,7 +47,10 @@ fn issuer() -> (String, Asked) {
             r.read_exact(&mut body).unwrap_or_default();
             let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
             let path = line.split(' ').nth(1).unwrap_or_default().to_string();
-            log.lock().unwrap().push((path.clone(), body.clone()));
+            // Our signed relay list is fetched from the issuer too (`relay`): not the sign-in's.
+            if !path.contains("/relays.json") {
+                log.lock().unwrap().push((path.clone(), body.clone()));
+            }
             let proof = |k: &str| computer_proof(k, "user_1", "Prasiddha", None, ipc::now() as i64);
             let (status, answer) = if path.ends_with("/device/start") {
                 key = body["member_key"].as_str().unwrap_or_default().into();
@@ -288,30 +292,52 @@ fn second_computer_of_same_person_is_admitted_by_the_first() {
     assert_eq!(members(&f).len(), 3);
 }
 
-/// F founds a solo network whose dialogs `allowing` answers; W, a solo engine, is to be the
-/// workspace member.
-fn founder_and_workspace() -> (Env, Env, tempfile::TempDir, String) {
-    let (f, w) = (Env::new(), Env::new());
+const WS: &str = "The Lightbulb Company";
+/// A closed port's: no test reaches ours.
+const NO_ISSUER: &str = "http://127.0.0.1:9/connect";
+
+/// F founds a solo network whose dialogs `allowing` answers; its link. The workspace member is
+/// an embedded instance (only one joins as `cloud`).
+fn founder() -> (Env, tempfile::TempDir, String) {
+    let f = Env::new();
     let dir = tempfile::tempdir().unwrap();
     f.daemon(false, &computer("mac"), &[allowing(dir.path())]);
     let t = invite(&f, "reusable");
-    w.daemon(false, &computer("cloud"), &[peers(&[&f])]);
-    (f, w, dir, t)
+    (f, dir, t)
 }
 
-#[test]
-fn workspace_member_joins_with_a_workspace_proof() {
-    let (f, w, dir, t) = founder_and_workspace();
-    let wk = w.identity().key;
-    let proof = workspace_proof(
-        &wk,
-        "W1",
-        "The Lightbulb Company",
-        &["Friday", "Engineering"],
-        ipc::now() as i64,
-    );
-    let o = w.detached(&[EXE, "join", &t, "--kind", "cloud", "--proof", &proof], "");
-    assert!(o.status.success(), "{}{}", out(&o), err(&o));
+/// An instance of workspace `WS` on `home`, dialing `f`, with `issuer` and `knobs`.
+async fn workspace(
+    home: &Path,
+    f: &Env,
+    issuer: &str,
+    knobs: &[(&str, String)],
+) -> (Instance, String) {
+    let i = common::instance(home, &[f], WS, issuer, None, knobs)
+        .await
+        .unwrap();
+    let me = call(&i, "identity.get", json!({})).await;
+    let key = me["member_key"].as_str().unwrap().to_string();
+    (i, key)
+}
+
+/// `i` joins link `t` as the workspace member with `proof`.
+async fn join_cloud(i: &Instance, t: &str, proof: &str) -> Value {
+    let body = json!({"ticket": t, "name": WS, "kind": "cloud", "proof": proof});
+    let r = call(i, "team.join", body).await;
+    assert_eq!(r["ok"], true, "{r}");
+    r
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn workspace_member_joins_with_a_workspace_proof() {
+    let (f, dir, t) = founder();
+    let home = tempfile::tempdir().unwrap();
+    let (w, wk) = workspace(home.path(), &f, NO_ISSUER, &[]).await;
+    let agents = ["Friday", "Engineering"];
+    let proof = workspace_proof(&wk, "W1", WS, &agents, ipc::now() as i64);
+    let r = join_cloud(&w, &t, &proof).await;
+    assert_eq!(r["state"], "admitted", "{r}");
     assert_eq!(
         texts(dir.path()),
         ["Lightbulb workspace \"The Lightbulb Company\" wants to join as a member. Its agents (Friday, Engineering) will appear in your directory, and it will see this network's directory."]
@@ -327,28 +353,19 @@ fn workspace_member_joins_with_a_workspace_proof() {
             &json!("W1")
         )
     );
+    w.shutdown().await;
 }
 
-#[test]
-fn workspace_member_renews_its_workspace_proof() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn workspace_member_renews_its_workspace_proof() {
     let (url, _asked) = issuer();
-    let (f, w) = (Env::new(), Env::new());
-    let dir = tempfile::tempdir().unwrap();
-    f.daemon(false, &computer("mac"), &[allowing(dir.path())]);
-    let t = invite(&f, "reusable");
+    let (f, _dir, t) = founder();
+    let home = tempfile::tempdir().unwrap();
     let fast = ("LIGHTBULB_CONNECT_DEBUG_OUTBOX_S", "1".to_string());
-    let config = format!("issuer = \"{url}\"\n{}", computer("cloud"));
-    w.daemon(false, &config, &[peers(&[&f]), fast]);
-    let wk = w.identity().key;
-    let old = workspace_proof(
-        &wk,
-        "W1",
-        "The Lightbulb Company",
-        &["Friday"],
-        ipc::now() as i64 - 21 * 3600,
-    );
-    let o = w.detached(&[EXE, "join", &t, "--kind", "cloud", "--proof", &old], "");
-    assert!(o.status.success(), "{}{}", out(&o), err(&o));
+    let (w, wk) = workspace(home.path(), &f, &url, &[fast]).await;
+    let old = workspace_proof(&wk, "W1", WS, &["Friday"], ipc::now() as i64 - 21 * 3600);
+    let r = join_cloud(&w, &t, &old).await;
+    assert_eq!(r["state"], "admitted", "{r}");
     until(10, "renewed on F", || {
         let ms = members(&f);
         let m = member(&ms, &wk);
@@ -356,56 +373,37 @@ fn workspace_member_renews_its_workspace_proof() {
             && m["proof"]["kind"] == "workspace"
     });
     assert_eq!(member(&members(&f), &wk)["person_id"], "ws:W1");
+    w.shutdown().await;
 }
 
-#[test]
-#[ignore = "lands with the Lane B merge"]
-fn second_member_for_one_workspace_is_refused() {
-    let (f, w, _dir, t) = founder_and_workspace();
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn second_member_for_one_workspace_is_refused() {
+    let (f, _dir, t) = founder();
     // Another name, so only the one-member-per-`sub` rule can refuse the second.
     let proof = |k: &str, name: &str| workspace_proof(k, "W1", name, &[], ipc::now() as i64);
-    let o = w.detached(
-        &[
-            EXE,
-            "join",
-            &t,
-            "--kind",
-            "cloud",
-            "--proof",
-            &proof(&w.identity().key, "The Lightbulb Company"),
-        ],
-        "",
-    );
-    assert!(o.status.success(), "{}", err(&o));
-    let w2 = Env::new();
-    w2.daemon(false, &computer("cloud2"), &[peers(&[&f])]);
-    let r = person(
-        &w2,
-        json!({"id": 1, "op": "team.join", "ticket": t, "kind": "cloud",
-               "proof": proof(&w2.identity().key, "Lightbulb, renamed")}),
-    );
+    let (h1, h2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (w, wk) = workspace(h1.path(), &f, NO_ISSUER, &[]).await;
+    let r = join_cloud(&w, &t, &proof(&wk, WS)).await;
+    assert_eq!(r["state"], "admitted", "{r}");
+    let (w2, wk2) = workspace(h2.path(), &f, NO_ISSUER, &[]).await;
+    let r = join_cloud(&w2, &t, &proof(&wk2, "Lightbulb, renamed")).await;
     assert_eq!(
         (&r["state"], &r["reason"]),
         (&json!("refused"), &json!("name_taken")),
         "{r}"
     );
+    w.shutdown().await;
+    w2.shutdown().await;
 }
 
-#[test]
-fn computer_proof_cannot_join_as_cloud() {
-    let (f, w, dir, t) = founder_and_workspace();
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn computer_proof_cannot_join_as_cloud() {
+    let (f, dir, t) = founder();
+    let home = tempfile::tempdir().unwrap();
+    let (w, wk) = workspace(home.path(), &f, NO_ISSUER, &[]).await;
     let ws = Some(("W1", "The Lightbulb Company"));
-    let proof = computer_proof(
-        &w.identity().key,
-        "user_1",
-        "Prasiddha",
-        ws,
-        ipc::now() as i64,
-    );
-    let r = person(
-        &w,
-        json!({"id": 1, "op": "team.join", "ticket": t, "kind": "cloud", "proof": proof}),
-    );
+    let proof = computer_proof(&wk, "user_1", "Prasiddha", ws, ipc::now() as i64);
+    let r = join_cloud(&w, &t, &proof).await;
     assert_eq!(
         (&r["state"], &r["reason"]),
         (&json!("refused"), &json!("unsupported")),
@@ -413,6 +411,7 @@ fn computer_proof_cannot_join_as_cloud() {
     );
     assert!(texts(dir.path()).is_empty(), "the person was asked");
     assert_eq!(members(&f).len(), 1);
+    w.shutdown().await;
 }
 
 #[test]

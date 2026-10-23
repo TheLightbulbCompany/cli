@@ -14,8 +14,8 @@
 //! What is known of our list (`State`) is read from disk and verified once, at start; after
 //! that only a fetch changes it (and writes the files), so `list` is a pure function.
 //!
-//! The fetch uses `ureq`: blocking, small and rustls-only; it runs on a blocking thread,
-//! where `reqwest::blocking` would start a second runtime per fetch.
+//! The fetch is `http::get` (the engine's one HTTP policy, at most 64 KiB, raw bytes: the
+//! signature is over them); it blocks, so it runs on a blocking thread.
 
 use crate::Result;
 use iroh::RelayUrl;
@@ -36,9 +36,6 @@ pub const MAX_RELAYS: usize = 8;
 const FRESH: Duration = Duration::from_secs(86_400);
 /// A failed fetch is tried again after this.
 pub const RETRY: Duration = Duration::from_secs(3_600);
-/// The most a relay list (or its signature) may be.
-const MAX_BYTES: u64 = 64 * 1024;
-const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The public halves of the two keys that may sign `relays.json`.
 // replaced at the key ceremony (Plan C): two throwaway PLACEHOLDER keys whose secret halves
@@ -201,7 +198,7 @@ impl State {
         }
         let base = issuer.trim_end_matches('/');
         let text = |url: String| -> Result<String> {
-            Ok(String::from_utf8(get(&url)?).map_err(|_| "not text")?)
+            Ok(String::from_utf8(crate::http::get(&url)?).map_err(|_| "not text")?)
         };
         let body = text(format!("{base}/{FILE}"))?;
         let sig = text(format!("{base}/{SIG_FILE}"))?;
@@ -218,26 +215,6 @@ impl State {
         self.cache = Some((urls, at, SystemTime::now()));
         Ok(())
     }
-}
-
-fn get(url: &str) -> Result<Vec<u8>> {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(FETCH_TIMEOUT))
-        // No redirect (to http, or anywhere); https only, but for the tests' loopback issuer.
-        .max_redirects(0)
-        .https_only(!cfg!(debug_assertions))
-        .build()
-        .into();
-    let mut body = agent
-        .get(url)
-        .call()
-        .map_err(|e| e.to_string())?
-        .into_body();
-    Ok(body
-        .with_config()
-        .limit(MAX_BYTES)
-        .read_to_vec()
-        .map_err(|e| e.to_string())?)
 }
 
 /// The relays of `body` and its `expires_at`, when `sig` is a minisign signature of it by one

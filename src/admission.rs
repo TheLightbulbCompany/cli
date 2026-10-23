@@ -357,7 +357,8 @@ fn check(
         None if cloud => return Err(UNSUPPORTED),
         None => None,
         Some(Ok(c)) if (c.kind == ProofKind::Workspace) == cloud => Some(c),
-        Some(_) if cloud => return Err(UNSUPPORTED),
+        // Another kind's proof: a computer's person cannot take a workspace's place.
+        Some(Ok(_)) if cloud => return Err(UNSUPPORTED),
         Some(_) => return Err(BAD_REQUEST),
     };
     let name = match c.and_then(|c| c.workspace.as_ref()) {

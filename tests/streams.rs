@@ -18,8 +18,8 @@ use std::time::{Duration, Instant};
 
 mod common;
 
-use common::{admit, endpoint, identity, now_s as now, pair, peers, person, session};
-use common::{start_pair, ulid, until, Env, Peer};
+use common::{admit, endpoint, identity, now_s as now, pair, peers, person, person_proof, session};
+use common::{start_pair, ulid, until, ws_proof, Env, Peer};
 
 /// The session every test streams: `c1` on `e`.
 fn c1(e: &Env) -> String {
@@ -128,7 +128,7 @@ fn same_person() -> (Env, Env) {
         &g,
         &ib,
         "mbp",
-        json!({"person_id": ia.key, "proof": "t"}),
+        json!({"person_id": ia.key, "proof": person_proof(&ib, &ia.key, "prasiddha", None)}),
     );
     seed(&[&a, &b], &[g, ab]);
     start_pair(&a, &b, "", &[]);
@@ -375,13 +375,13 @@ async fn own_bridge_input_grant_delivers_viewer_frames() {
     let (f, a, c) = (Env::new(), Env::new(), Env::new());
     let (i_f, ia, ic) = (f.identity(), a.identity(), c.identity());
     let g = net_ops::genesis(&i_f, "founder", "fmac", "acme", 1);
-    let fa = admit(&i_f, &g, &ia, "prasiddha", json!({"workspace": "test"}));
+    let fa = admit(&i_f, &g, &ia, "prasiddha", owner(&ia));
     let fc = admit(
         &i_f,
         &fa,
         &ic,
         "bridge",
-        json!({"kind": "cloud", "person_id": "ws:test", "proof": "p"}),
+        json!({"kind": "cloud", "person_id": "ws:test", "proof": ws_proof(&ic, "test", "test")}),
     );
     // Another workspace's cloud member (no daemon).
     let other = identity();
@@ -390,7 +390,8 @@ async fn own_bridge_input_grant_delivers_viewer_frames() {
         &fc,
         &other,
         "elsewhere",
-        json!({"kind": "cloud", "person_id": "ws:other", "proof": "p"}),
+        json!({"kind": "cloud", "person_id": "ws:other",
+            "proof": ws_proof(&other, "other", "other")}),
     );
     seed(&[&f, &a, &c], &[g, fa, fc, fo]);
     f.daemon(false, "", &[]);
@@ -450,17 +451,19 @@ async fn raw_open(
     }
 }
 
+/// The owner A's admit fields: person `user_a`, signed into workspace "test".
+fn owner(ia: &Identity) -> Value {
+    json!({"person_id": "user_a", "proof": person_proof(ia, "user_a", "prasiddha", Some("test"))})
+}
+
 /// A (the owner, a daemon, workspace "test") and M (played, connected to A), M admitted with
-/// `m_extra(A)` over a computer member's fields.
+/// `m_extra(M)` over a computer member's fields.
 async fn owner_and(m_extra: impl FnOnce(&Identity) -> Value) -> (Env, Identity, (Endpoint, Peer)) {
     let (a, m) = (Env::new(), identity());
     let ia = a.identity();
     team(
         &[&a],
-        &[
-            (&ia, "prasiddha", json!({"workspace": "test"})),
-            (&m, "mal", m_extra(&ia)),
-        ],
+        &[(&ia, "prasiddha", owner(&ia)), (&m, "mal", m_extra(&m))],
     );
     a.daemon(false, "", &[]);
     let j = join(&m, &a).await;
@@ -497,20 +500,26 @@ async fn owner_refuses_another_viewers_grant() {
     assert!(!sa.any("stream_opened", 300));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn owner_refuses_a_cloud_member_with_my_person_id() {
-    let (a, _m, (_ep, peer)) =
-        owner_and(|a| json!({"kind": "cloud", "person_id": a.key, "proof": "p"})).await;
-    let sa = Sub::new(&a);
-    assert_eq!(raw_open(&peer, "", &c1(&a)).await.err(), Some(true));
-    assert!(!sa.any("stream_opened", 300));
+/// A cloud member never carries a computer's person: its proof's `sub` is `ws:<id>`
+/// (`proof::parse`), so an admit claiming the owner's is dropped and never opens a stream.
+#[test]
+fn owner_refuses_a_cloud_member_with_my_person_id() {
+    let (a, m) = (Env::new(), identity());
+    let ia = a.identity();
+    let claim = json!({"kind": "cloud", "person_id": "user_a", "proof": ws_proof(&m, "test", "t")});
+    team(&[&a], &[(&ia, "prasiddha", owner(&ia)), (&m, "mal", claim)]);
+    let r = roster::replay(&roster::entries(&a.store()).unwrap());
+    assert!(r.members.contains_key(&ia.key));
+    assert!(!r.members.contains_key(&m.key));
 }
 
 /// A and its workspace member M (played), M's input grant ending in `secs`, M's stream open:
 /// A, M's connection, the stream, A's events, the grant's end.
 async fn input_stream(secs: i64) -> (Env, (Endpoint, Peer), SendStream, RecvStream, Sub, i64) {
-    let (a, m, j) =
-        owner_and(|_| json!({"kind": "cloud", "person_id": "ws:test", "proof": "p"})).await;
+    let (a, m, j) = owner_and(
+        |m| json!({"kind": "cloud", "person_id": "ws:test", "proof": ws_proof(m, "test", "t")}),
+    )
+    .await;
     let end = now() + secs;
     let r = grant(&a, &c1(&a), &m.key, true, end);
     assert_eq!(r["ok"], true, "{r}");
@@ -566,7 +575,10 @@ async fn expired_input_grant_never_raises_input() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn close_unblocks_a_send_waiting_on_flow_control() {
     // M is the owner's own computer (no grant needed) and never reads its stream.
-    let (a, _m, (_ep, peer)) = owner_and(|a| json!({"person_id": a.key, "proof": "t"})).await;
+    let (a, _m, (_ep, peer)) = owner_and(|m| {
+        json!({"person_id": "user_a", "proof": person_proof(m, "user_a", "prasiddha", Some("test"))})
+    })
+    .await;
     let sa = Sub::new(&a);
     let (_s, _r) = raw_open(&peer, "", &c1(&a)).await.unwrap();
     let owner_id: String = sa.next("stream_opened")["stream_id"]

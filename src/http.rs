@@ -1,4 +1,4 @@
-//! The engine's HTTP calls (the issuer; the relay list joins at the Lane B merge): one policy.
+//! The engine's HTTP calls (the issuer's sign-in and our signed relay list): one policy.
 //! https only in release builds (debug: the tests' loopback servers), no redirects, 10 s to
 //! connect and to read, answers at most 64 KiB. Blocking: callers run off the async threads.
 

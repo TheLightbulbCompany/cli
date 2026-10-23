@@ -72,7 +72,15 @@ pub fn expire(store: &Store, now: u64, ttl: u64) -> Result<Vec<String>> {
     let mut expired = vec![];
     for (from, request_id, id) in store.outbox_stale(now.saturating_sub(ttl) as i64)? {
         let unreachable = Some("unreachable");
-        if mail::advance(&tx, &from, &request_id, State::Expired, unreachable, None, now)? {
+        if mail::advance(
+            &tx,
+            &from,
+            &request_id,
+            State::Expired,
+            unreachable,
+            None,
+            now,
+        )? {
             expired.push(id);
         }
     }
@@ -155,7 +163,10 @@ mod tests {
         assert_eq!(due_n(&s, 101), 1);
         sent(&s, &id, 101).unwrap();
         assert_eq!(due_n(&s, 102), 0, "then 2 s");
-        assert_eq!(acked(&s, "c", &id, State::Read, None, None, 102).unwrap(), None);
+        assert_eq!(
+            acked(&s, "c", &id, State::Read, None, None, 102).unwrap(),
+            None
+        );
         assert!(!bound(&s, &id, "c") && bound(&s, &id, "b"));
         for (st, want) in [
             (State::Held, State::Held),
@@ -165,7 +176,10 @@ mod tests {
             (State::Delivered, State::Read),
         ] {
             let moved = state(&s).0 != want;
-            assert_eq!(acked(&s, "b", &id, st, None, None, 103).unwrap(), Some(moved));
+            assert_eq!(
+                acked(&s, "b", &id, st, None, None, 103).unwrap(),
+                Some(moved)
+            );
             assert_eq!(state(&s).0, want);
         }
         assert_eq!(due_n(&s, 1_000), 0, "acked: never sent again");
