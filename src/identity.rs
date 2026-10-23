@@ -59,6 +59,12 @@ impl Identity {
     pub fn sign(&self, v: &Value) -> String {
         BASE64URL_NOPAD.encode(&self.signing.sign(&unsigned(v)).to_bytes())
     }
+
+    /// `v` with its `sig` (`sign`).
+    pub fn signed(&self, mut v: Value) -> Value {
+        v["sig"] = self.sign(&v).into();
+        v
+    }
 }
 
 /// The member key of the 32 public-key bytes `pk`.

@@ -5,7 +5,8 @@
 mod common;
 
 use common::{
-    addr, computer, dialog, err, identity, out, peers, person, seed_pair, until, wait_s, Env, EXE,
+    addr, computer, dialog, err, identity, invite, members, out, peers, person, seed_pair, until,
+    wait_s, Env, EXE,
 };
 use iroh::endpoint::{presets, Connection, RecvStream, SendStream};
 use iroh::{Endpoint, SecretKey};
@@ -17,12 +18,6 @@ use lightbulb_connect::roster;
 use lightbulb_connect::ticket::{self, Ticket};
 use serde_json::{json, Value};
 use std::time::Duration;
-
-fn invite(e: &Env, mode: &str) -> String {
-    let r = e.ask(json!({"id": 1, "op": "team.invite", "mode": mode}));
-    assert_eq!(r["ok"], true, "{r}");
-    r["ticket"].as_str().unwrap().into()
-}
 
 /// An open link's join line: person-only.
 fn invite_open(e: &Env) -> String {
@@ -55,7 +50,7 @@ fn pair(button: &str, mode: &str) -> (Env, Env, String) {
 /// Both list `n` members, with the same heads.
 fn converged(a: &Env, b: &Env, n: usize) {
     until(5, "both converge", || {
-        members(a) == n && members(b) == n && a.heads() == b.heads()
+        members(a).len() == n && members(b).len() == n && a.heads() == b.heads()
     });
 }
 
@@ -65,13 +60,6 @@ fn refused(r: &Value, reason: &str) {
         (Some("refused"), Some(reason)),
         "{r}"
     );
-}
-
-fn members(e: &Env) -> usize {
-    e.ask(json!({"id": 1, "op": "team.get"}))["members"]
-        .as_array()
-        .unwrap()
-        .len()
 }
 
 fn requests(e: &Env) -> Vec<Value> {
@@ -126,7 +114,7 @@ impl Played {
         Played::send(
             env,
             &id,
-            &admission::request(&id, t, name, "mbp", "computer"),
+            &admission::request(&id, t, name, "mbp", "computer", None),
         )
         .await
     }
@@ -154,19 +142,32 @@ fn ask_ticket_admits_only_after_allow() {
         until(10, "J1 is listed", || requests(&a).len() == 1);
         let r = &requests(&a)[0];
         assert_eq!(r["id"], "J1");
+        // `held` lists it with the command that answers it.
+        let o = a.detached(&[EXE, "held"], "");
+        assert_eq!(
+            out(&o),
+            "J1  bob (mbp) wants to join — lightbulb-connect approve J1\n",
+            "{}",
+            err(&o)
+        );
         assert_eq!(r["candidate"], b.identity().key);
         assert_eq!((&r["name"], &r["computer"]), (&json!("bob"), &json!("mbp")));
-        assert_eq!((members(&a), members(&b)), (1, 1));
+        assert_eq!((members(&a).len(), members(&b).len()), (1, 1));
         let o = a.detached(&[EXE, "approve", "J1"], "");
         assert!(o.status.success(), "{}", err(&o));
         let o = joining.join().unwrap();
         assert!(o.status.success(), "{}", err(&o));
         assert_eq!(
             out(&o),
-            "Waiting for an admin to allow this...\nConnected as bob (mbp). Team \"prasiddha\": 2 computers online.\n"
+            "Asking whoever sent the link to allow this computer… (they get a prompt; this waits up to 10 minutes)\n\
+             Connected as bob (mbp). Team \"prasiddha\": 2 computers online.\n\
+             Your agents here can now see and message the team's agents. Try: lightbulb-connect who --all\n\
+             Until both computers sign in, your other computer counts as another person and its first message needs your Allow.\n"
         );
     });
     converged(&a, &b, 2);
+    let o = a.detached(&[EXE, "held"], "");
+    assert_eq!(out(&o), "No messages are waiting for your Allow.\n");
     // A second answer finds nothing open.
     let o = a.detached(&[EXE, "decline", "J1"], "");
     assert!(!o.status.success());
@@ -182,7 +183,7 @@ fn decline_refuses_and_writes_nothing() {
     let heads = a.heads();
     refused(&join(&b, &t, "bob", "computer"), "declined");
     assert_eq!(a.heads(), heads);
-    assert_eq!((members(&a), members(&b)), (1, 1));
+    assert_eq!((members(&a).len(), members(&b).len()), (1, 1));
     assert!(requests(&a).is_empty());
 }
 
@@ -205,7 +206,7 @@ fn forged_open_mode_is_refused() {
         &join(&b, &ticket::encode(&t), "bob", "computer"),
         "bad_ticket",
     );
-    assert_eq!((members(&a), members(&b)), (1, 1));
+    assert_eq!((members(&a).len(), members(&b).len()), (1, 1));
 }
 
 #[test]
@@ -221,12 +222,12 @@ fn once_ticket_admits_once() {
     );
     c1.daemon(false, "", &[peers(&[&x])]);
     assert_eq!(join(&c1, &t, "carol", "computer")["state"], "admitted");
-    until(5, "F converges", || members(&f) == 3);
+    until(5, "F converges", || members(&f).len() == 3);
     x.ask(json!({"id": 1, "op": "shutdown"}));
     // The inviter is offline: C2 reaches only F.
     c2.daemon(false, "", &[peers(&[&f])]);
     refused(&join(&c2, &t, "dave", "computer"), "bad_ticket");
-    assert_eq!(members(&f), 3);
+    assert_eq!(members(&f).len(), 3);
 }
 
 #[test]
@@ -246,13 +247,14 @@ fn forged_ticket_from_another_members_link_is_refused() {
         xt.secret,
         "open",
         xt.expires_at,
+        String::new(),
     );
     c.daemon(false, "", &[peers(&[&f])]);
     refused(
         &join(&c, &ticket::encode(&forged), "carol", "computer"),
         "bad_ticket",
     );
-    assert_eq!((members(&f), members(&x)), (2, 2));
+    assert_eq!((members(&f).len(), members(&x).len()), (2, 2));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -262,12 +264,12 @@ async fn candidate_field_must_be_the_peer_key() {
     let t = ticket::decode(&invite(&a, "reusable")).unwrap();
     // Signed by `other`, naming `other`, sent over `me`'s endpoint.
     let (me, other) = (identity(), identity());
-    let req = admission::request(&other, &t, "carol", "mbp", "computer");
+    let req = admission::request(&other, &t, "carol", "mbp", "computer", None);
     let mut p = Played::send(&a, &me, &req).await;
     let got = p.recv().await;
     assert!(got.is_err(), "answered: {got:?}");
     assert!(requests(&a).is_empty());
-    assert_eq!(members(&a), 1);
+    assert_eq!(members(&a).len(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -333,16 +335,24 @@ fn link_replaced_on_removal_no_longer_joins() {
         .to_string();
     c.daemon(false, "", &[peers(&[&a])]);
     refused(&join(&c, &t, "carol", "computer"), "bad_ticket");
-    assert_eq!(members(&a), 1);
+    assert_eq!(members(&a).len(), 1);
     // The link that replaced it does.
     assert_eq!(join(&c, &line, "carol", "computer")["state"], "admitted");
 }
 
+/// Only an embedded instance joins as a cloud member (`tests/embed.rs`): a computer's person
+/// cannot take a workspace's one place.
 #[test]
-fn cloud_candidate_without_bridge_proof_is_refused() {
+fn a_computer_cannot_join_as_cloud() {
     let (a, b, t) = pair("Allow", "reusable");
-    refused(&join(&b, &t, "bot", "cloud"), "unsupported");
-    assert_eq!(members(&a), 1);
+    let proof = json!({"kind": "workspace", "sub": "ws:W1", "workspace": {"id": "W1"}});
+    let r = person(
+        &b,
+        json!({"id": 1, "op": "team.join", "ticket": t, "name": "bot", "kind": "cloud",
+            "proof": proof.to_string()}),
+    );
+    assert_eq!(r["error"], "bad_request", "{r}");
+    assert_eq!(members(&a).len(), 1);
 }
 
 #[test]
@@ -363,7 +373,7 @@ fn join_from_a_multi_member_network_is_refused() {
         "You are in \"acme\". Leave it first: lightbulb-connect leave\n"
     );
     assert_eq!(b.heads(), heads);
-    assert_eq!(members(&c), 1);
+    assert_eq!(members(&c).len(), 1);
 }
 
 #[test]
@@ -377,11 +387,11 @@ fn non_admin_inviter_admits_its_own_invitee_with_no_admin_online() {
     let r = join(&c, &t, "carol", "computer");
     assert_eq!(r["state"], "admitted", "{r}");
     assert_eq!(r["team"], "acme");
-    assert_eq!(members(&x), 3);
+    assert_eq!(members(&x).len(), 3);
     // The founder comes back and converges.
     f.daemon(false, "", &[peers(&[&x])]);
     until(5, "F converges", || {
-        members(&f) == 3 && f.heads() == x.heads()
+        members(&f).len() == 3 && f.heads() == x.heads()
     });
 }
 
@@ -411,15 +421,17 @@ async fn candidate_with_a_bad_signature_is_dropped() {
     let t = ticket::decode(&invite(&a, "reusable")).unwrap();
     // `candidate` is the peer, but the name was changed after signing.
     let me = identity();
-    let mut v =
-        serde_json::to_value(admission::request(&me, &t, "carol", "mbp", "computer")).unwrap();
+    let mut v = serde_json::to_value(admission::request(
+        &me, &t, "carol", "mbp", "computer", None,
+    ))
+    .unwrap();
     v["name"] = json!("mallory");
     let req: Frame = serde_json::from_value(v).unwrap();
     let mut p = Played::send(&a, &me, &req).await;
     let got = p.recv().await;
     assert!(got.is_err(), "answered: {got:?}");
     assert!(rows(&a).is_empty());
-    assert_eq!(members(&a), 1);
+    assert_eq!(members(&a).len(), 1);
 }
 
 #[test]
@@ -434,7 +446,7 @@ fn unanswered_request_is_waiting_and_asks_no_one_else() {
     assert_eq!(r["state"], "waiting", "{r}");
     assert_eq!(rows(&x), ["expired"]);
     assert!(rows(&f).is_empty(), "the second member was asked");
-    assert_eq!(members(&c), 1);
+    assert_eq!(members(&c).len(), 1);
 }
 
 #[test]
@@ -447,7 +459,7 @@ fn admitted_candidate_that_lost_the_roster_rejoins() {
     until(10, "B stops", || !b.state.path().join("sock").exists());
     b.store().clear_roster().unwrap();
     b.daemon(false, &computer("mbp"), &[peers(&[&a])]);
-    assert_eq!(members(&b), 1);
+    assert_eq!(members(&b).len(), 1);
     let r = join(&b, &t, "bob", "computer");
     assert_eq!(r["state"], "admitted", "{r}");
     assert_eq!(
@@ -474,7 +486,7 @@ fn team_join_is_person_only() {
         (Some("bad_request"), Some("not_a_person")),
         "{r}"
     );
-    assert_eq!((members(&a), members(&b)), (1, 1));
+    assert_eq!((members(&a).len(), members(&b).len()), (1, 1));
 }
 
 #[test]
@@ -494,4 +506,55 @@ fn bad_ticket_at_the_first_member_tries_the_next() {
     assert_eq!(r["team"], "acme");
     assert!(rows(&f).is_empty(), "F refused before storing a request");
     assert_eq!(rows(&x), ["admitted"]);
+}
+
+/// A computer proof valid `secs` more seconds, for `id`'s key.
+fn short_proof(id: &Identity, secs: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    common::issuer::mint(&json!({"iss": "test", "iat": now, "exp": now + secs,
+        "sub": "person-c", "name": "Carol", "computer": id.key, "kind": "computer",
+        "workspace": null, "agents": []}))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_proof_that_expires_while_its_dialog_waits_is_refused_at_allow() {
+    let a = Env::new();
+    a.daemon(false, "", &[dialog("")]);
+    let t = ticket::decode(&invite(&a, "reusable")).unwrap();
+    let me = identity();
+    let token = short_proof(&me, 2);
+    let req = admission::request(&me, &t, "carol", "mbp", "computer", Some(&token));
+    let _p = Played::send(&a, &me, &req).await;
+    until(10, "J1 is listed", || requests(&a).len() == 1);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let r = person(
+        &a,
+        json!({"id": 1, "op": "team.admit", "request": "J1", "verdict": "allow"}),
+    );
+    assert_eq!(r["state"], "refused", "{r}");
+    assert_eq!(members(&a).len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unprintable_name_is_refused_as_bad_name() {
+    let (a, b) = (Env::new(), Env::new());
+    a.daemon(false, "", &[dialog("Allow")]);
+    let line = invite(&a, "reusable");
+    let t = ticket::decode(&line).unwrap();
+    let mut p = Played::ask(&a, &t, "car\u{202e}ol").await;
+    match p.recv().await.unwrap() {
+        Frame::JoinDecision { reason, .. } => assert_eq!(reason.as_deref(), Some("bad_name")),
+        f => panic!("{f:?}"),
+    }
+    // The candidate's own CLI says it in a sentence, before any dial.
+    b.daemon(false, "", &[peers(&[&a])]);
+    let o = b.detached(&[EXE, "join", &line, "--name", "car\u{202e}ol"], "");
+    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(
+        err(&o),
+        "That name has characters Lightbulb Connect cannot show. Use letters, numbers, spaces and punctuation.\n"
+    );
 }

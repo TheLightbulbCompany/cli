@@ -1,6 +1,8 @@
 //! The network ops, reached from `ipc::handle`'s fallback arm.
 
-use super::ipc::{refused, Response, BAD_REQUEST, INTERNAL, NOT_FOUND, UNKNOWN_OP};
+use super::ipc::{
+    refused, Caller, Response, BAD_REQUEST, INTERNAL, NOT_FOUND, UNKNOWN_OP, UNSUPPORTED,
+};
 use super::{Daemon, TeamState};
 use crate::agents::caller;
 use crate::identity::Identity;
@@ -69,7 +71,11 @@ fn gate(op: &str, invite: Invite) -> Gate {
     }
 }
 
-pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, peer_pid: Option<u32>) -> Response {
+pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, caller: Caller) -> Response {
+    // Retired: a cloud member is removed by an admin like any member.
+    if op == "team.unlink" {
+        return Response::err(id, UNSUPPORTED);
+    }
     if op.starts_with("team.") {
         let invite = if op == "team.invite" {
             match serde_json::from_value::<Option<Invite>>(body["mode"].clone()) {
@@ -81,7 +87,7 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, peer_pid: Option
         };
         let gate = gate(op, invite);
         // Governance and open links need a person at the socket, before any authority check.
-        if gate.person_only && !peer_pid.is_some_and(person_only) {
+        if gate.person_only && !caller.is_person() {
             return refused(id, "not_a_person");
         }
         match op {
@@ -107,26 +113,176 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, peer_pid: Option
         };
     }
     match op {
-        // `identity.get {}` -> who this computer is. Until sign-in, `person_id` is its own key.
-        "identity.get" => Response::ok(
-            id,
-            json!({
-                "member_key": daemon.identity.key,
-                "member_key_short": daemon.identity.short,
-                "name": super::user_name(),
-                "computer": daemon.team.lock().unwrap().config.computer,
-                "person_id": daemon.identity.key,
-                "verified": false,
-            }),
-        ),
+        // `identity.get {}` -> who this computer (or instance: `kind` `cloud`, named for its
+        // workspace) is: until sign-in, a computer's `person_id` is its own key and `name` the
+        // user's; an instance's is its roster member's (`ws:<id>` once admitted). `verified`
+        // while its proof is in force (`expires_at`).
+        "identity.get" => {
+            let t = daemon.team.lock().unwrap();
+            let me = &daemon.identity.key;
+            let proof = t.roster.members.get(me).and_then(|m| m.proof.as_ref());
+            let (name, kind) = match &daemon.cloud {
+                Some(c) => (c.name.clone(), "cloud"),
+                None => (
+                    proof.map_or_else(super::user_name, |p| p.name.clone()),
+                    "computer",
+                ),
+            };
+            Response::ok(
+                id,
+                json!({
+                    "member_key": me,
+                    "member_key_short": daemon.identity.short,
+                    "name": name,
+                    "kind": kind,
+                    "computer": t.config.computer,
+                    "person_id": t.roster.person_of(me),
+                    "verified": proof.is_some(),
+                    "expires_at": proof.map(|p| p.exp),
+                    "solo": t.roster.is_solo(me),
+                }),
+            )
+        }
+        // `relay.get {}` -> `{urls, source, error}`: the relays in effect and where they came
+        // from (`config`, `team`, `lightbulb` or `none`); the snapshot `status` reads too.
+        "relay.get" => Response::ok(id, json!(*daemon.peers.relays.lock().unwrap())),
+        "relay.set" => relay_set(id, body, daemon, caller),
+        // An agent fed a hostile sign-in must not move this computer into another person.
+        "identity.proof" | "identity.device_start" if !caller.is_person() => {
+            refused(id, "not_a_person")
+        }
+        // `identity.device_start {}` -> `{member_key, computer, at, sig}`: `device/start`'s
+        // body, `sig` by this computer's key over the rest (person-only).
+        "identity.device_start" => {
+            let computer = daemon.team.lock().unwrap().config.computer.clone();
+            let at = super::ipc::now() as i64;
+            let body = json!({"member_key": daemon.identity.key, "computer": computer, "at": at});
+            Response::ok(id, daemon.identity.signed(body))
+        }
+        // `identity.proof {proof}` -> `{name, person_id, solo}`: this computer's sign-in proof,
+        // written to the roster (`proof::record`), person-only; `bad_request` when it does not
+        // verify (reason `other_person` when it names another person than this computer's).
+        "identity.proof" => match body["proof"]
+            .as_str()
+            .map(|t| crate::proof::record(daemon, t))
+        {
+            Some(Ok(p)) => {
+                let solo = daemon
+                    .team
+                    .lock()
+                    .unwrap()
+                    .roster
+                    .is_solo(&daemon.identity.key);
+                Response::ok(
+                    id,
+                    json!({"name": p.name, "person_id": p.sub, "solo": solo}),
+                )
+            }
+            Some(Err(e)) => {
+                eprintln!("identity.proof: refused: {e}");
+                if e.to_string() == crate::proof::OTHER_PERSON {
+                    refused(id, "other_person")
+                } else {
+                    Response::err(id, BAD_REQUEST)
+                }
+            }
+            None => Response::err(id, BAD_REQUEST),
+        },
         // `ui.claim {}` -> `{lease_s}`: the Lightbulb app shows the person's questions itself;
         // no OS dialog opens until it stops heartbeating.
+        "ui.claim" if !caller.is_person() => refused(id, "not_a_person"),
         "ui.claim" => {
             daemon.dialogs.claim(super::ipc::now() as i64);
             Response::ok(id, json!({ "lease_s": crate::dialog::LEASE_S }))
         }
+        // `snapshot {path}` -> `{}`: a consistent copy of `state.db` at `path` (absolute, outside
+        // the state dir). On a computer a person only: it copies every message out.
+        "snapshot" if !(caller.is_person() || caller == Caller::Instance) => {
+            refused(id, "not_a_person")
+        }
+        "snapshot" => match body["path"].as_str().filter(|p| outside(&daemon.dir, p)) {
+            Some(p) => match daemon
+                .store
+                .lock()
+                .unwrap()
+                .snapshot(std::path::Path::new(p))
+            {
+                Ok(()) => Response::ok(id, json!({})),
+                Err(e) => {
+                    eprintln!("snapshot: {e}");
+                    Response::err(id, INTERNAL)
+                }
+            },
+            None => Response::err(id, BAD_REQUEST),
+        },
+        "reload" => match reload(daemon) {
+            Ok(()) => Response::ok(id, json!({})),
+            Err(e) => {
+                eprintln!("reload: {e}");
+                Response::err(id, INTERNAL)
+            }
+        },
         _ => Response::err(id, UNKNOWN_OP),
     }
+}
+
+/// `reload {}` -> `{}`: re-reads `config.toml` into `TeamState`, and rebuilds the presence (a
+/// session under a folder turned off leaves it). Every file the daemon reads at start and may
+/// read again is re-read here. Not person-only: `config.toml` is the agent's to write anyway.
+pub fn reload(daemon: &Daemon) -> crate::Result<()> {
+    let config = crate::config::Config::load(&daemon.dir)?;
+    let off = super::canonical_off(&config);
+    if daemon.team.lock().unwrap().set_config(config, off) {
+        daemon.presence.notify_one();
+    }
+    Ok(())
+}
+
+/// `relay.set {url, local}` -> `{team}`: writes `config.toml: relay` (an empty or missing
+/// `url` clears it); from the founder or an admin, unless `local`, also the roster's
+/// `meta {relay}`, so the whole team adopts it (`team: true`). In effect before the answer.
+/// A person only: it moves where this computer's traffic goes.
+fn relay_set(id: u64, body: &Value, daemon: &Daemon, caller: Caller) -> Response {
+    if !caller.is_person() {
+        return refused(id, "not_a_person");
+    }
+    let url = body["url"].as_str().unwrap_or_default().trim();
+    if !url.is_empty() && crate::relay::parse(url).is_none() {
+        return Response::err(id, BAD_REQUEST);
+    }
+    let mut team = daemon.team.lock().unwrap();
+    let store = daemon.store.lock().unwrap();
+    let me = &daemon.identity.key;
+    let role = team.roster.members.get(me).map(|m| m.role);
+    let elevated = role >= Some(Role::Admin) && body["local"] != true;
+    match set_relay(daemon, &mut team, &store, url, elevated) {
+        Ok(()) => {
+            daemon.peers.relays_changed(&team);
+            eprintln!("relay.set: {url:?} (team: {elevated})");
+            Response::ok(id, json!({"team": elevated}))
+        }
+        Err(e) => {
+            eprintln!("relay.set: {e}");
+            Response::err(id, INTERNAL)
+        }
+    }
+}
+
+/// `config.toml: relay` = `url`, here and on disk; with `team`, the roster's `meta {relay}`.
+fn set_relay(
+    daemon: &Daemon,
+    team: &mut TeamState,
+    store: &Store,
+    url: &str,
+    meta: bool,
+) -> crate::Result<()> {
+    crate::config::Config::set(&daemon.dir, "relay", url)?;
+    team.config.relay = Some(url.to_string());
+    if meta {
+        let now = super::ipc::now() as i64;
+        write(daemon, team, store, Kind::Meta, json!({"relay": url}), now)?;
+    }
+    Ok(())
 }
 
 /// How long `team.leave` waits for a peer to take the `leave` entry.
@@ -136,9 +292,10 @@ const TELL_WAIT: Duration = Duration::from_secs(5);
 /// online members, waiting up to 5 s for one to take it (it then drops the connection, as to
 /// any computer no longer a member); `told` is false when none did. Then it forgets the team
 /// and starts this computer's solo network. A founder with other computers in the team and
-/// no admin must transfer first.
-pub async fn leave(id: u64, daemon: &Daemon, peer_pid: Option<u32>) -> Response {
-    if !peer_pid.is_some_and(person_only) {
+/// no admin must transfer first. `person`: a person asked (an embedded instance's caller
+/// counts as one: the bridge acts for a workspace admin who confirmed in the app).
+pub async fn leave(id: u64, daemon: &Daemon, person: bool) -> Response {
+    if !person {
         return refused(id, "not_a_person");
     }
     let me = daemon.identity.key.clone();
@@ -183,15 +340,10 @@ pub async fn leave(id: u64, daemon: &Daemon, peer_pid: Option<u32>) -> Response 
     let mut solo = || -> crate::Result<()> {
         store.clear_roster()?;
         // Stamped after the old root, so the new network never repeats its `team_id`.
-        let user = super::user_name();
         let now = super::ipc::now() as i64;
-        let g = genesis(
-            &daemon.identity,
-            &user,
-            &team.config.computer,
-            &user,
-            now.max(root_at + 1),
-        );
+        let cloud = daemon.cloud.as_ref().map(|c| c.name.as_str());
+        let at = now.max(root_at + 1);
+        let g = solo_genesis(&daemon.identity, cloud, &team.config.computer, at);
         roster::accept(&store, &g, now)?;
         install(daemon, &mut team, &store, roster::replay(&[g]))
     };
@@ -246,8 +398,32 @@ pub fn genesis(me: &Identity, name: &str, computer: &str, team_name: &str, at: i
     Entry::signed(me, vec![], Kind::Admit, body, at)
 }
 
+/// This engine's solo network: a computer's (`genesis`, as its person), or a workspace
+/// member's (`cloud`: the workspace's name, member and team alike). An instance founds it as a
+/// plain member of its own key: a `cloud` member needs a workspace proof, which only `team.join`
+/// brings (`roster::own_person`).
+pub(crate) fn solo_genesis(me: &Identity, cloud: Option<&str>, computer: &str, at: i64) -> Entry {
+    let user = super::user_name();
+    let name = cloud.unwrap_or(&user);
+    genesis(me, name, computer, name, at)
+}
+
+/// Whether `path` is absolute and names nothing in (or of) state dir `dir`: a snapshot never
+/// lands on the live database.
+pub(crate) fn outside(dir: &std::path::Path, path: &str) -> bool {
+    let p = std::path::Path::new(path);
+    let canon = |q: &std::path::Path| std::fs::canonicalize(q).ok();
+    let (Some(dir), Some(parent)) = (canon(dir), p.parent().and_then(canon)) else {
+        return false;
+    };
+    p.is_absolute()
+        && p.file_name().is_some()
+        && !parent.starts_with(&dir)
+        && !canon(p).is_some_and(|c| c.starts_with(&dir))
+}
+
 /// Rewrites Plan A's `team` row from `new` when its id, name or founder differs from `old`'s.
-pub(super) fn sync_team_row(store: &Store, old: &Roster, new: &Roster) -> crate::Result<()> {
+pub(crate) fn sync_team_row(store: &Store, old: &Roster, new: &Roster) -> crate::Result<()> {
     fn row(r: &Roster) -> (&str, &str, &str) {
         let founder = r.founder().map_or("", |m| m.key.as_str());
         (&r.team_id, &r.team_name, founder)
@@ -260,7 +436,7 @@ pub(super) fn sync_team_row(store: &Store, old: &Roster, new: &Roster) -> crate:
 }
 
 /// The one post-write hook, for local writes and entries from peers alike: makes `new` the
-/// cached roster, rewrites Plan A's `team` row if it changed, and tells `net` (which closes
+/// cached roster (its expired proofs lapsed), rewrites Plan A's `team` row if it changed, and tells `net` (which closes
 /// the connections of members gone, dials new ones and pushes the change).
 pub fn install(
     daemon: &Daemon,
@@ -269,8 +445,42 @@ pub fn install(
     new: Roster,
 ) -> crate::Result<()> {
     sync_team_row(store, &team.roster, &new)?;
+    let mut new = new;
+    new.lapse(super::ipc::now() as i64);
+    let relay_changed = team.roster.relay != new.relay;
+    // A removal or leave applied in this team (not a team left or joined, nor a member a fork's
+    // resolution dropped): every subscriber hears of each member it took.
+    if team.roster.team_id == new.team_id {
+        let took = |k: &str| {
+            new.log().iter().any(|(h, e)| {
+                matches!(e.kind, Kind::Remove | Kind::Leave)
+                    && !team.roster.knows(h)
+                    && e.body["member"] == k
+            })
+        };
+        for k in team
+            .roster
+            .members
+            .keys()
+            .filter(|k| !new.members.contains_key(*k) && took(k))
+        {
+            let _ = daemon
+                .events
+                .send(json!({"event": "member_removed", "member": k}));
+        }
+    }
     team.roster = new;
     daemon.peers.changed.notify_one();
+    if relay_changed {
+        // Logged once per value: an install changes it once.
+        if let Some(v) = team.roster.relay.as_deref() {
+            if !v.trim().is_empty() && crate::relay::parse(v).is_none() {
+                eprintln!("relay: ignored the team's {v:?} (not an https relay URL)");
+            }
+        }
+        daemon.peers.relays_changed(team);
+    }
+    daemon.roster_changed.notify_waiters();
     Ok(())
 }
 
@@ -382,7 +592,8 @@ impl TeamOps<'_> {
                 let replaced = invite == Invite::New && live.is_some();
                 let t = match live {
                     Some(l) if invite != Invite::New => {
-                        ticket::sign(identity, r, l.ticket_id, l.secret, mode, l.expires_at)
+                        let hint = self.daemon.peers.relay_hint();
+                        ticket::sign(identity, r, l.ticket_id, l.secret, mode, l.expires_at, hint)
                     }
                     _ => self.new_link(mode, invite.once())?,
                 };
@@ -441,6 +652,7 @@ impl TeamOps<'_> {
             mode,
             once,
             self.now,
+            self.daemon.peers.relay_hint(),
         );
         self.write(Kind::Link, ticket::link_body(&t, hashed.as_deref()))?;
         self.store.put_link(
@@ -451,6 +663,63 @@ impl TeamOps<'_> {
             t.expires_at,
         )?;
         Ok(t)
+    }
+}
+
+/// `cloud.sessions.set {sessions: [{name, agent, title?}]}` -> `{}` (an embedded instance only;
+/// `unsupported` on a computer): the workspace's agents, published as `<short>/<name>` with
+/// `agent` and `title` (at most `presence::MAX`, each name a `valid_name`, once). Answers once
+/// the presence sender (`presence::run`) has handed on the presence carrying them, so a `send`
+/// from a name just declared is never refused as unadvertised by a peer the envelope reaches
+/// first; `internal` if that takes over 5 s (the list stands, and goes out on the next send).
+pub async fn cloud_sessions_set(id: u64, body: &Value, daemon: &Daemon) -> Response {
+    let Some(cloud) = &daemon.cloud else {
+        return Response::err(id, UNSUPPORTED);
+    };
+    let Some(list) = body["sessions"]
+        .as_array()
+        .filter(|l| l.len() <= crate::presence::MAX)
+    else {
+        return Response::err(id, BAD_REQUEST);
+    };
+    let mut names = HashSet::new();
+    let mut out = vec![];
+    for s in list {
+        let (Some(name), Some(agent)) = (s["name"].as_str(), s["agent"].as_str()) else {
+            return Response::err(id, BAD_REQUEST);
+        };
+        if !crate::sessions::valid_name(name) || !names.insert(name) {
+            return Response::err(id, BAD_REQUEST);
+        }
+        let r = crate::net::frames::Remote {
+            session_id: format!("{}/{name}", daemon.identity.short),
+            agent: agent.into(),
+            repo: None,
+            branch: None,
+            folder: String::new(),
+            status: "idle".into(),
+            doing: None,
+            tier: crate::sessions::Tier::Pull.as_str().into(),
+            title: s["title"].as_str().map(String::from),
+        }
+        .clamp();
+        if !r.valid(&daemon.identity.short, true) {
+            return Response::err(id, BAD_REQUEST);
+        }
+        out.push(r);
+    }
+    let mut sent = cloud.sent.subscribe();
+    let version = cloud.set(out);
+    daemon.presence.notify_one();
+    let handed = sent.wait_for(|v| *v >= version);
+    let handed = matches!(
+        tokio::time::timeout(Duration::from_secs(5), handed).await,
+        Ok(Ok(_))
+    );
+    if handed {
+        Response::ok(id, json!({}))
+    } else {
+        Response::err(id, INTERNAL)
     }
 }
 

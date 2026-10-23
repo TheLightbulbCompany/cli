@@ -3,7 +3,7 @@ use std::path::Path;
 
 /// Migration `i` takes the db to `user_version` `i + 1`. Forward only; each one only adds
 /// tables or columns, and runs once (in the transaction that moves `user_version`).
-const MIGRATIONS: &[&str] = &[V1, V2, V3];
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6];
 
 const V1: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
@@ -70,6 +70,22 @@ CREATE TABLE IF NOT EXISTS grants (grant_id TEXT PRIMARY KEY, \"grant\" TEXT, ex
 /// A session's end: its row stays a day (`presence`'s `kept`) with `ended_at` set.
 const V3: &str = "ALTER TABLE sessions ADD COLUMN ended_at INTEGER;";
 
+/// The text a hold's dialog showed, which its `approvals` record signs.
+const V4: &str = "ALTER TABLE holds ADD COLUMN shown TEXT;";
+/// Which loop limit a `loop` refusal hit (`mail::HOPS`, `mail::RATE`), when known.
+const V5: &str = "ALTER TABLE receipts ADD COLUMN \"limit\" TEXT;";
+/// A session's repo and branch as its hook read them (the daemon never reads a session's
+/// folder), its `who` handle, the sessions registered under a hidden folder (kept out of
+/// discovery too), and the index a mailbox's reply-window query reads by.
+/// (Edited in place while unreleased: no installed build has written V6.)
+const V6: &str = "
+ALTER TABLE sessions ADD COLUMN repo TEXT;
+ALTER TABLE sessions ADD COLUMN branch TEXT;
+ALTER TABLE sessions ADD COLUMN handle TEXT;
+CREATE TABLE IF NOT EXISTS hidden_sessions (key TEXT PRIMARY KEY, updated_at INTEGER);
+CREATE INDEX IF NOT EXISTS messages_to_sent ON messages (to_key, sent_at);
+";
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Session {
     pub key: String,
@@ -83,6 +99,11 @@ pub struct Session {
     pub seen_at: i64,
     /// The agent process's executable, as the registering hook found it.
     pub executable: Option<String>,
+    pub repo: Option<String>,
+    pub branch: Option<String>,
+    /// `who`'s `<provider>-<n>`, given when the row is first written and kept for its life
+    /// (`put_session` sets it; what a caller passes is ignored).
+    pub handle: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -111,6 +132,25 @@ fn row_session(r: &rusqlite::Row) -> rusqlite::Result<Session> {
         status: r.get("status")?,
         seen_at: r.get("seen_at")?,
         executable: r.get("executable")?,
+        repo: r.get("repo")?,
+        branch: r.get("branch")?,
+        handle: r.get("handle")?,
+    })
+}
+
+/// A `messages` row, read by column name (so `m.*` in a join reads too).
+pub(crate) fn row_message(r: &rusqlite::Row) -> rusqlite::Result<Message> {
+    Ok(Message {
+        id: r.get("id")?,
+        request_id: r.get("request_id")?,
+        from_key: r.get("from_key")?,
+        to_key: r.get("to_key")?,
+        kind: r.get("kind")?,
+        thread: r.get("thread")?,
+        hops: r.get("hops")?,
+        origin: r.get("origin")?,
+        body: r.get("body")?,
+        sent_at: r.get("sent_at")?,
     })
 }
 
@@ -141,15 +181,40 @@ impl Store {
         Ok(Store { conn })
     }
 
+    /// A consistent copy of the database at `path` (`VACUUM INTO` a temporary file beside it,
+    /// then renamed over it).
+    pub fn snapshot(&self, path: &Path) -> crate::Result<()> {
+        let tmp = path.with_extension("snapshot-tmp");
+        let _ = std::fs::remove_file(&tmp);
+        let to = tmp.to_str().ok_or("the snapshot path is not UTF-8")?;
+        self.conn.execute("VACUUM INTO ?1", [to])?;
+        // Mail bodies: the person's own, like the state dir.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
     pub(crate) fn conn(&self) -> &Connection {
         &self.conn
     }
 
-    /// Writes `s` as a live row (an ended one is live again).
+    /// Writes `s` as a live row (an ended one is live again). A new agent session's row gets the
+    /// handle `<provider>-<n>`, one past its provider's highest, which it then keeps.
+    /// ponytail: a number frees up again only when its row is purged (a day after it ended)
+    /// and it was the highest.
     pub fn put_session(&self, s: &Session) -> rusqlite::Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO sessions (key, provider, conversation, pid, birth_micros, cwd, \
-             title, status, seen_at, executable) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO sessions (key, provider, conversation, pid, birth_micros, cwd, title, \
+             status, seen_at, executable, repo, branch, handle) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, \
+             CASE WHEN ?2 = '' THEN NULL ELSE ?2 || '-' || (SELECT 1 + coalesce(max( \
+             CAST(substr(handle, length(?2) + 2) AS INTEGER)), 0) FROM sessions \
+             WHERE provider = ?2) END) \
+             ON CONFLICT(key) DO UPDATE SET provider = ?2, conversation = ?3, pid = ?4, \
+             birth_micros = ?5, cwd = ?6, title = ?7, status = ?8, seen_at = ?9, \
+             executable = ?10, repo = ?11, branch = ?12, ended_at = NULL, \
+             handle = coalesce(handle, excluded.handle)",
             params![
                 s.key,
                 s.provider,
@@ -160,10 +225,64 @@ impl Store {
                 s.title,
                 s.status,
                 s.seen_at,
-                s.executable
+                s.executable,
+                s.repo,
+                s.branch
             ],
         )?;
         Ok(())
+    }
+
+    /// Marks `key` as registered under a hidden folder at `now` (`hidden`), or no longer;
+    /// whether the mark changed. A mark not renewed for a day goes with `prune_hidden`, unless its session is live.
+    pub fn set_hidden(&self, key: &str, hidden: bool, now: i64) -> rusqlite::Result<bool> {
+        let was = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM hidden_sessions WHERE key = ?1",
+                [key],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if hidden {
+            self.conn.execute(
+                "INSERT OR REPLACE INTO hidden_sessions VALUES (?1, ?2)",
+                params![key, now],
+            )?;
+        } else {
+            self.conn
+                .execute("DELETE FROM hidden_sessions WHERE key = ?1", [key])?;
+        }
+        Ok(was != hidden)
+    }
+
+    /// Deletes the hidden marks last renewed before `since` but those of `live` sessions: a
+    /// live one stays hidden however long it idles without a hook event.
+    pub fn prune_hidden(
+        &self,
+        since: i64,
+        live: &std::collections::HashSet<&str>,
+    ) -> rusqlite::Result<()> {
+        let old: Vec<String> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT key FROM hidden_sessions WHERE updated_at < ?1")?;
+            let rows = stmt.query_map([since], |r| r.get(0))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        for k in old.iter().filter(|k| !live.contains(k.as_str())) {
+            self.conn
+                .execute("DELETE FROM hidden_sessions WHERE key = ?1", [k])?;
+        }
+        Ok(())
+    }
+
+    /// The keys `set_hidden` marked.
+    pub fn hidden_keys(&self) -> rusqlite::Result<std::collections::HashSet<String>> {
+        let mut stmt = self.conn.prepare("SELECT key FROM hidden_sessions")?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        rows.collect()
     }
 
     /// `key`'s row, unless it ended.
@@ -181,7 +300,7 @@ impl Store {
     pub fn sessions(&self) -> rusqlite::Result<Vec<Session>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT * FROM sessions WHERE ended_at IS NULL")?;
+            .prepare("SELECT * FROM sessions WHERE ended_at IS NULL ORDER BY rowid")?;
         let rows = stmt.query_map([], row_session)?;
         rows.collect()
     }
@@ -277,20 +396,7 @@ impl Store {
 
     pub fn message(&self, id: &str) -> rusqlite::Result<Option<Message>> {
         self.conn
-            .query_row("SELECT * FROM messages WHERE id = ?1", [id], |r| {
-                Ok(Message {
-                    id: r.get("id")?,
-                    request_id: r.get("request_id")?,
-                    from_key: r.get("from_key")?,
-                    to_key: r.get("to_key")?,
-                    kind: r.get("kind")?,
-                    thread: r.get("thread")?,
-                    hops: r.get("hops")?,
-                    origin: r.get("origin")?,
-                    body: r.get("body")?,
-                    sent_at: r.get("sent_at")?,
-                })
-            })
+            .query_row("SELECT * FROM messages WHERE id = ?1", [id], row_message)
             .optional()
     }
 
@@ -457,6 +563,18 @@ impl Store {
             .optional()
     }
 
+    /// The thread of `from`'s message `request_id`, if it has one here.
+    pub fn thread_of(&self, from: &str, request_id: &str) -> rusqlite::Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT thread FROM messages WHERE from_key = ?1 AND request_id = ?2",
+                [from, request_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map(Option::flatten)
+    }
+
     pub fn put_mailbox(&self, to: &str, id: &str, at: i64, expires: i64) -> rusqlite::Result<()> {
         self.conn.execute(
             "INSERT INTO mailbox (to_key, message_id, queued_at, expires_at) VALUES (?1, ?2, ?3, ?4)",
@@ -558,24 +676,30 @@ impl Store {
         Ok(())
     }
 
-    /// The frames still `queued` for `members`, due at `now`: `(member, frame)`.
+    /// The frames for `members` due at `now`: `(row id, member, frame)`. A message's while still
+    /// `queued`; a row that is no message (a hold notice or decision, `decision`) while
+    /// created after `since`.
     pub fn outbox_due(
         &self,
         members: &[String],
         now: i64,
-    ) -> rusqlite::Result<Vec<(String, String)>> {
+        since: i64,
+    ) -> rusqlite::Result<Vec<(String, String, String)>> {
         if members.is_empty() {
             return Ok(vec![]);
         }
         let marks = vec!["?"; members.len()].join(", ");
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT o.to_member, o.frame FROM outbox o JOIN messages m ON m.id = o.message_id \
-             {MSG_RECEIPT} WHERE r.state = 'queued' AND o.next_at <= ? AND o.to_member IN ({marks})"
+            "SELECT o.message_id, o.to_member, o.frame FROM outbox o \
+             LEFT JOIN messages m ON m.id = o.message_id LEFT {MSG_RECEIPT} \
+             WHERE (r.state = 'queued' OR (m.id IS NULL AND o.created_at > ?)) \
+             AND o.next_at <= ? AND o.to_member IN ({marks})"
         ))?;
-        let args = std::iter::once(&now as &dyn rusqlite::ToSql)
+        let args = [&since as &dyn rusqlite::ToSql, &now]
+            .into_iter()
             .chain(members.iter().map(|m| m as &dyn rusqlite::ToSql));
         let rows = stmt.query_map(rusqlite::params_from_iter(args), |r| {
-            Ok((r.get(0)?, r.get(1)?))
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
         })?;
         rows.collect()
     }
@@ -606,13 +730,15 @@ impl Store {
             .optional()
     }
 
-    /// The messages still `queued` in the outbox since `before` or earlier: `(from, request_id)`.
-    pub fn outbox_stale(&self, before: i64) -> rusqlite::Result<Vec<(String, String)>> {
+    /// The messages still `queued` in the outbox since `before` or earlier: `(from, request_id,
+    /// envelope id)`.
+    pub fn outbox_stale(&self, before: i64) -> rusqlite::Result<Vec<(String, String, String)>> {
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT m.from_key, m.request_id FROM outbox o JOIN messages m ON m.id = o.message_id \
+            "SELECT m.from_key, m.request_id, o.message_id FROM outbox o \
+             JOIN messages m ON m.id = o.message_id \
              {MSG_RECEIPT} WHERE r.state = 'queued' AND o.created_at <= ?1"
         ))?;
-        let rows = stmt.query_map([before], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let rows = stmt.query_map([before], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
         rows.collect()
     }
 
@@ -675,9 +801,16 @@ mod tests {
             status: "idle".into(),
             seen_at: 7,
             executable: Some("/bin/claude".into()),
+            repo: None,
+            branch: None,
+            handle: None,
         };
         store.put_session(&session).unwrap();
-        assert_eq!(store.session("claude:abc").unwrap(), Some(session));
+        let handle = Some("claude-1".into());
+        assert_eq!(
+            store.session("claude:abc").unwrap(),
+            Some(Session { handle, ..session })
+        );
 
         let message = Message {
             id: "m1".into(),
@@ -759,7 +892,7 @@ mod tests {
             .unwrap();
         }
         let store = Store::open(&path).unwrap();
-        assert_eq!(user_version(&path), 3);
+        assert_eq!(user_version(&path), MIGRATIONS.len() as i64);
         assert_eq!(store.sessions().unwrap().len(), 1);
         assert!(store.end_session("k", 9).unwrap());
         assert!(!store.end_session("k", 9).unwrap());
@@ -771,6 +904,69 @@ mod tests {
         );
         assert!(store.ended_since(10).unwrap().is_empty());
         assert!(!store.holds("k").unwrap());
+    }
+
+    #[test]
+    fn a_rewritten_row_keeps_its_handle_and_an_ended_one_its_number() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("state.db")).unwrap();
+        let row = |key: &str, provider: &str| Session {
+            key: key.into(),
+            provider: provider.into(),
+            conversation: None,
+            pid: None,
+            birth_micros: None,
+            cwd: "/".into(),
+            title: None,
+            status: "idle".into(),
+            seen_at: 1,
+            executable: None,
+            repo: Some("r".into()),
+            branch: None,
+            handle: None,
+        };
+        for (k, p) in [
+            ("a", "codex"),
+            ("b", "claude"),
+            ("c", "codex"),
+            ("d", "codex"),
+        ] {
+            store.put_session(&row(k, p)).unwrap();
+        }
+        store.put_session(&row("a", "codex")).unwrap();
+        store.end_session("c", 5).unwrap();
+        let got: Vec<_> = store
+            .sessions()
+            .unwrap()
+            .into_iter()
+            .map(|s| (s.key, s.handle, s.repo))
+            .collect();
+        let h = |k: &str, n: &str| (k.to_string(), Some(n.to_string()), Some("r".to_string()));
+        assert_eq!(
+            got,
+            [h("a", "codex-1"), h("b", "claude-1"), h("d", "codex-3")]
+        );
+        // An ended row still holds its number; a new one takes the next.
+        store.put_session(&row("e", "codex")).unwrap();
+        let e = store.session("e").unwrap().unwrap();
+        assert_eq!(e.handle.as_deref(), Some("codex-4"));
+    }
+
+    #[test]
+    fn a_hidden_mark_says_when_it_changed_and_goes_a_day_after_its_last_renewal() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("state.db")).unwrap();
+        let none = std::collections::HashSet::new();
+        assert!(store.set_hidden("k", true, 10).unwrap());
+        assert!(!store.set_hidden("k", true, 20).unwrap());
+        store.prune_hidden(20, &none).unwrap();
+        assert!(store.hidden_keys().unwrap().contains("k"));
+        // A live session's mark stays however old.
+        store.prune_hidden(21, &["k"].into()).unwrap();
+        assert!(store.hidden_keys().unwrap().contains("k"));
+        store.prune_hidden(21, &none).unwrap();
+        assert!(store.hidden_keys().unwrap().is_empty());
+        assert!(!store.set_hidden("k", false, 30).unwrap());
     }
 
     #[test]

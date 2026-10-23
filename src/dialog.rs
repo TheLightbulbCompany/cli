@@ -49,6 +49,11 @@ pub fn args(title: &str, text: &str, buttons: &[&str]) -> Vec<String> {
     a
 }
 
+/// Dialog id `<prefix><n>`'s `n` (`J` a join request, `H` a hold).
+pub fn number(id: &str, prefix: char) -> Option<i64> {
+    id.strip_prefix(prefix)?.parse().ok()
+}
+
 /// The button `osascript` printed, or `None` (gave up, or nothing we can read).
 fn answer_of(out: &str) -> Option<String> {
     if out.contains("gave up:true") {
@@ -126,6 +131,14 @@ impl Queue {
         }
     }
 
+    /// A queue that shows nothing: every dialog answers "not shown" (`None`) at once, so its
+    /// question stays open for another way to answer (an embedded instance's).
+    pub fn headless() -> (Queue, Answers) {
+        let (q, a) = Queue::new(PathBuf::new());
+        let _ = q.0.knob.set(None);
+        (q, a)
+    }
+
     /// `ui.claim` at `now`: no dialog opens for `LEASE_S`.
     pub fn claim(&self, now: i64) {
         self.0.claim_until.store(now + LEASE_S, Relaxed);
@@ -136,10 +149,20 @@ impl Queue {
     }
 }
 
+impl Drop for Queue {
+    fn drop(&mut self) {
+        self.0.wake.notify_one();
+    }
+}
+
 /// One dialog at a time, in order. While a claim is live the head waits for the claim to
 /// lapse (looking again at least each second), or to be withdrawn.
 async fn run(inner: Arc<Inner>) {
     loop {
+        // The queue is gone (`Drop`): so is its last dialog.
+        if Arc::strong_count(&inner) == 1 {
+            return;
+        }
         let left = inner.claim_until.load(Relaxed) - now() as i64;
         let idle = inner.state.lock().unwrap().waiting.is_empty();
         if idle {

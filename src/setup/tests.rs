@@ -33,7 +33,7 @@ fn toml_at(home: &Path, rel: &str) -> toml_edit::DocumentMut {
 }
 
 fn setup(home: &Path, remove: bool) -> Report {
-    run(home, Path::new(EXE), "lightbulb", remove)
+    run(home, Path::new(EXE), Some("lightbulb"), remove)
 }
 
 fn agent<'a>(r: &'a Report, name: &str) -> &'a AgentReport {
@@ -70,7 +70,7 @@ fn setup_writes_claude_hooks_and_mcp_and_backs_up_once() {
 
     let r = setup(h, false);
     let claude = agent(&r, "claude");
-    assert!(claude.found);
+    assert_ne!(claude.state, State::NotInstalled);
     assert_eq!(
         claude.wrote,
         [h.join(".claude/settings.json"), h.join(".claude.json")]
@@ -297,7 +297,7 @@ fn remove_takes_only_our_entries() {
     let r = setup(h, true);
     for a in &r.agents {
         assert!(
-            a.found && !a.wrote.is_empty() && a.notes.is_empty(),
+            a.state == State::Removed && !a.wrote.is_empty() && a.notes.is_empty(),
             "{a:?}"
         );
     }
@@ -345,7 +345,7 @@ fn a_foreign_lightbulb_mcp_entry_is_left_alone_and_gets_no_allow_rule() {
             assert!(get(h, ".codex/config.toml").starts_with(&app_toml));
             for name in ["claude", "codex", "cursor", "grok"] {
                 assert!(
-                    agent(&r, name).notes.iter().any(|n| n.contains("not ours")),
+                    matches!(agent(&r, name).state, State::HooksOnly(_)),
                     "{name}"
                 );
             }
@@ -363,14 +363,14 @@ fn setup_touches_only_installed_agents() {
     let found: Vec<_> = r
         .agents
         .iter()
-        .filter(|a| a.found)
+        .filter(|a| a.state != State::NotInstalled)
         .map(|a| a.name)
         .collect();
     assert_eq!(found, ["grok"]);
     for missing in [".claude", ".claude.json", ".codex", ".cursor"] {
         assert!(!h.join(missing).exists(), "{missing}");
     }
-    assert_eq!(agent(&r, "claude").line(), "claude: not installed");
+    assert_eq!(agent(&r, "claude").line(), "Claude Code: not installed");
 }
 
 #[test]
@@ -470,9 +470,11 @@ fn a_bad_server_name_writes_nothing() {
     let home = tempfile::tempdir().unwrap();
     let h = home.path();
     fs::create_dir(h.join(".claude")).unwrap();
-    let r = run(h, Path::new(EXE), "a:b", false);
+    let r = run(h, Path::new(EXE), Some("a:b"), false);
     assert!(agent(&r, "claude").wrote.is_empty());
-    assert!(agent(&r, "claude").notes[0].contains("server name"));
+    assert!(
+        matches!(&agent(&r, "claude").state, State::Failed { why, .. } if why.contains("server name"))
+    );
     assert!(!h.join(".claude.json").exists());
 }
 
@@ -483,7 +485,7 @@ fn a_non_default_server_name_is_passed_to_mcp() {
     for dir in [".claude", ".codex", ".cursor", ".grok"] {
         fs::create_dir(h.join(dir)).unwrap();
     }
-    run(h, Path::new(EXE), "lightbulb-connect", false);
+    run(h, Path::new(EXE), Some("lightbulb-connect"), false);
     let args = json!(["mcp", "--server-name", "lightbulb-connect"]);
     assert_eq!(
         json_at(h, ".claude.json")["mcpServers"]["lightbulb-connect"]["args"],
@@ -510,10 +512,15 @@ fn codex_says_it_trusted_the_hooks() {
     let home = tempfile::tempdir().unwrap();
     fs::create_dir(home.path().join(".codex")).unwrap();
     let r = setup(home.path(), false);
-    assert!(agent(&r, "codex")
-        .line()
-        .contains("Codex hooks trusted on your behalf"));
-    assert!(agent(&setup(home.path(), false), "codex").notes.is_empty());
+    assert_eq!(
+        agent(&r, "codex").line(),
+        "Codex: connected (hooks + tools). Its hook prompt was answered for you."
+    );
+    // Said once: a second run has nothing new to trust.
+    assert_eq!(
+        agent(&setup(home.path(), false), "codex").line(),
+        "Codex: connected (hooks + tools)"
+    );
 }
 
 #[test]
@@ -549,9 +556,101 @@ fn remove_takes_out_a_plan_a_era_install() {
     // legacy (Plan A install)
     put(h, ".grok/hooks/lightbulb-network.json", "{}");
     let old = Path::new("/opt/lb/bin/lightbulb-network");
-    run(h, old, "lightbulb", false);
-    let r = run(h, old, "lightbulb", true);
+    run(h, old, Some("lightbulb"), false);
+    let r = run(h, old, Some("lightbulb"), true);
     assert!(!h.join(".grok/hooks/lightbulb-network.json").exists());
     assert!(!agent(&r, "grok").wrote.is_empty());
     assert!(toml_at(h, ".grok/config.toml").get("mcp_servers").is_none());
+}
+
+#[test]
+fn auto_naming_takes_lightbulb_connect_where_lightbulb_is_taken() {
+    let home = tempfile::tempdir().unwrap();
+    let h = home.path();
+    fs::create_dir(h.join(".claude")).unwrap();
+    fs::create_dir(h.join(".grok")).unwrap();
+    let app = json!({"mcpServers": {"lightbulb": {"command": APP}}});
+    put(h, ".claude.json", &app.to_string());
+    let r = run(h, Path::new(EXE), None, false);
+    let claude = agent(&r, "claude");
+    assert_eq!(claude.state, State::ClashedTo("lightbulb-connect".into()));
+    assert_eq!(
+        json_at(h, ".claude.json")["mcpServers"]["lightbulb"],
+        app["mcpServers"]["lightbulb"]
+    );
+    assert_eq!(
+        agent(&r, "grok").state,
+        State::Connected("lightbulb".into())
+    );
+    assert_eq!(tools(h, "claude").as_deref(), Some("lightbulb-connect"));
+    assert_eq!(tools(h, "grok").as_deref(), Some("lightbulb"));
+    // Removing takes ours out under both names, and leaves the app's.
+    run(h, Path::new(EXE), None, true);
+    assert_eq!(json_at(h, ".claude.json"), app);
+    assert_eq!((tools(h, "claude"), tools(h, "grok")), (None, None));
+}
+
+#[test]
+fn the_closing_words_name_what_is_connected_and_the_command_to_type() {
+    assert_eq!(
+        summary(
+            &["Claude Code", "Codex", "Cursor", "Grok CLI"],
+            "lightbulb-connect"
+        ),
+        "Lightbulb Connect is on.
+  Connected: Claude Code, Codex, Cursor, Grok CLI
+
+Try it: open Claude Code in any folder and ask \"list my other sessions\".
+Add your other computer or a teammate: lightbulb-connect invite
+Check everything: lightbulb-connect doctor"
+    );
+    assert!(summary(&["Codex"], "lightbulb").contains("open Codex in any folder"));
+}
+
+#[test]
+fn a_file_it_cannot_read_is_a_failure_not_a_name_clash() {
+    let home = tempfile::tempdir().unwrap();
+    let h = home.path();
+    // The tools file is broken: the hooks still go in.
+    fs::create_dir(h.join(".claude")).unwrap();
+    put(h, ".claude.json", "{not json");
+    // The hooks file is broken: nothing goes in.
+    put(h, ".cursor/hooks.json", "[]");
+    let r = run(h, Path::new(EXE), None, false);
+    let (claude, cursor) = (agent(&r, "claude"), agent(&r, "cursor"));
+    assert!(matches!(claude.state, State::Failed { hooks: true, .. }));
+    assert!(matches!(cursor.state, State::Failed { hooks: false, .. }));
+    let line = claude.line();
+    assert!(
+        line.starts_with("Claude Code: hooks added, but not its tools — "),
+        "{line}"
+    );
+    assert!(line.contains(".claude.json"), "{line}");
+    let line = cursor.line();
+    assert!(line.starts_with("Cursor: not connected — "), "{line}");
+    assert!(!line.contains("tool server name"), "{line}");
+}
+
+#[test]
+fn an_http_tool_server_under_the_name_counts_as_taken() {
+    let home = tempfile::tempdir().unwrap();
+    let h = home.path();
+    fs::create_dir(h.join(".claude")).unwrap();
+    let app = json!({"mcpServers": {"lightbulb": {"type": "http", "url": "https://x/mcp"}}});
+    put(h, ".claude.json", &app.to_string());
+    let r = run(h, Path::new(EXE), None, false);
+    assert_eq!(
+        agent(&r, "claude").state,
+        State::ClashedTo("lightbulb-connect".into())
+    );
+    let doc = json_at(h, ".claude.json");
+    assert_eq!(
+        doc["mcpServers"]["lightbulb"],
+        app["mcpServers"]["lightbulb"]
+    );
+    assert_eq!(doc["mcpServers"]["lightbulb-connect"]["command"], EXE);
+    // With the name given, it is hooks only, and says so.
+    put(h, ".claude.json", &app.to_string());
+    let r = run(h, Path::new(EXE), Some("lightbulb"), false);
+    assert!(matches!(agent(&r, "claude").state, State::HooksOnly(_)));
 }

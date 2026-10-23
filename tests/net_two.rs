@@ -73,11 +73,11 @@ async fn two_members_connect_and_converge_rosters() {
     seed_pair(&a, &b);
     b.daemon(false, "", &[]);
     a.daemon(false, "", &[("LIGHTBULB_CONNECT_PEERS", b.peer_arg())]);
-    let connected = json!({"online": 1, "total": 1});
+    let connected = json!({"online": 1, "direct": 1, "total": 1});
     until(5, "both online", || {
         a.status()["peers"] == connected && b.status()["peers"] == connected
     });
-    assert_eq!(a.status()["relay"], "off");
+    assert_eq!(a.status()["relay"], "none");
     // A writes (a link entry), B follows.
     let before = a.heads();
     let r = a.ask(json!({"id": 1, "op": "team.invite"}));
@@ -249,7 +249,10 @@ async fn non_member_is_refused_on_member_alpn() {
     tokio::time::timeout(Duration::from_secs(2), conn.closed())
         .await
         .expect("closed within 2 s");
-    assert_eq!(a.status()["peers"], json!({"online": 0, "total": 1}));
+    assert_eq!(
+        a.status()["peers"],
+        json!({"online": 0, "direct": 0, "total": 1})
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -272,7 +275,10 @@ async fn removed_member_connection_is_closed_on_removal() {
             .await
             .expect("redial closed");
     }
-    assert_eq!(a.status()["peers"], json!({"online": 0, "total": 0}));
+    assert_eq!(
+        a.status()["peers"],
+        json!({"online": 0, "direct": 0, "total": 0})
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -290,7 +296,10 @@ async fn removal_inside_the_gate_closes_the_connection() {
     tokio::time::timeout(Duration::from_secs(3), conn.closed())
         .await
         .expect("closed within 3 s of the removal");
-    assert_eq!(a.status()["peers"], json!({"online": 0, "total": 0}));
+    assert_eq!(
+        a.status()["peers"],
+        json!({"online": 0, "direct": 0, "total": 0})
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

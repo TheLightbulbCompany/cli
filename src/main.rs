@@ -4,8 +4,46 @@ use lightbulb_connect::{cli, daemon, hook, mcp, paths, setup};
 use std::ffi::OsString;
 use std::io::{Read, Write};
 
+/// The top-level help: the person's commands in groups (`hook`, `mcp` and `daemon` are the
+/// agents' and launchd's, so not listed; they are still accepted).
+const HELP: &str = "\
+Lightbulb Connect lets your coding agents message each other: on this computer, on your other
+computers and on your teammates'.
+
+Usage: lightbulb-connect <command> [options]
+
+Getting started:
+  setup     Connect Claude Code, Codex, Cursor and Grok CLI here and start the background service
+  doctor    Check that everything is connected, and say how to fix what is not
+  invite    Print a link that adds your other computer or a teammate
+  join      Join the team an invite link is for: join '<link>'
+  signin    Sign in to Lightbulb, so teammates see your verified name
+
+Everyday:
+  who       List the sessions here (who --all: your teammates' too)
+  send      Send a message: send codex-1 \"hi\", or to a name: send demo2/inbox \"hi\"
+  listen    Print the messages sent to a name: listen --as inbox
+  receipt   Whether a message you sent arrived: receipt <id>
+  held      Join requests and messages waiting for your Allow
+  approve   Allow one: approve J1, approve H1
+  decline   Decline one: decline H1
+
+Team:
+  team      The team and its computers
+  admin     Make a member an admin (or with --founder, the founder)
+  remove    Remove a member
+  leave     Leave the team
+  policy    Who may message your sessions without asking
+  folder    Show or hide the sessions in a folder from your teammates: folder <path> on|off
+
+The Lightbulb app:
+  claude, codex, share   Run by the Lightbulb app, when it is installed
+
+Run lightbulb-connect <command> --help for its options; lightbulb-connect --version for the version.
+";
+
 #[derive(Parser)]
-#[command(name = "lightbulb-connect", version)]
+#[command(name = "lightbulb-connect", version, help_template = HELP)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -16,6 +54,7 @@ enum Command {
     /// Print the version.
     Version,
     /// Run the per-computer daemon in the foreground, or install/remove its launchd job.
+    #[command(hide = true)]
     Daemon {
         /// Write the launchd job (and the `lightbulb` alias) and load it.
         #[arg(long, conflicts_with = "uninstall")]
@@ -62,6 +101,9 @@ enum Command {
         request_id: String,
         #[arg(long)]
         from: Option<String>,
+        /// Print the receipt as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Check the daemon, state permissions, agent wiring, alias and launchd job.
     Doctor,
@@ -95,7 +137,15 @@ enum Command {
         /// The name you go by in the network (default: your user name).
         #[arg(long)]
         name: Option<String>,
+        /// `cloud`: join as a workspace member (tests and ops; needs `--proof`).
+        #[arg(long, hide = true, default_value = "computer", value_parser = ["computer", "cloud"])]
+        kind: String,
+        /// The workspace member's `kind=workspace` proof.
+        #[arg(long, hide = true)]
+        proof: Option<String>,
     },
+    /// Sign in to Lightbulb in your browser, so teammates see your verified name.
+    Signin,
     /// Allow a join request (`J<n>`) or a held message (`H<n>`).
     Approve {
         request: String,
@@ -113,16 +163,35 @@ enum Command {
         /// accept, hold or refuse.
         value: Option<String>,
     },
+    /// Show (`on`) or hide (`off`) the sessions under a folder from your teammates.
+    Folder {
+        path: String,
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
+    },
+    /// The relays this computer uses (with a URL, sets yours; from the founder or an admin,
+    /// the team's too). Relays carry encrypted traffic only, when no direct path exists.
+    Relay {
+        url: Option<String>,
+        /// Clear the relay you set.
+        #[arg(long, conflicts_with = "url")]
+        clear: bool,
+        /// Only this computer, not the team (founder and admins set the team's by default).
+        #[arg(long)]
+        local: bool,
+    },
     #[command(external_subcommand)]
     External(Vec<OsString>),
     /// Run by an agent's hook config: `hook <claude|codex|cursor|grok> <session-start|user-prompt-submit|post-tool-use|stop|session-end>`.
     ///
     /// Always exits 0; errors go to stderr.
     /// Debug builds only: LIGHTBULB_CONNECT_HOOK_CALLER=<pid>:<birth_micros> names the calling agent (tests).
+    #[command(hide = true)]
     Hook { agent: String, event: String },
     /// Run the stdio MCP server an agent talks to (find_sessions, send_message, ...).
     ///
     /// Debug builds only: LIGHTBULB_CONNECT_HOOK_CALLER=<pid>:<birth_micros> names the calling agent (tests).
+    #[command(hide = true)]
     Mcp {
         /// The name this server advertises: the one its MCP entry was installed under.
         #[arg(long, default_value = setup::DEFAULT_SERVER)]
@@ -138,9 +207,13 @@ enum Command {
         /// copy, ~/.lightbulb/connect/bin/lightbulb-connect, which setup installs from this one).
         #[arg(long)]
         executable: Option<std::path::PathBuf>,
-        /// The MCP server entry's name, also used in Cursor's and Grok's allow rules.
-        #[arg(long, default_value = setup::DEFAULT_SERVER)]
-        server_name: String,
+        /// The MCP server entry's name, also used in Cursor's and Grok's allow rules (default:
+        /// lightbulb, or lightbulb-connect where another program has that name).
+        #[arg(long)]
+        server_name: Option<String>,
+        /// Also list the files each agent's setup changed.
+        #[arg(long)]
+        verbose: bool,
     },
 }
 
@@ -151,7 +224,15 @@ fn exit(code: i32) {
     }
 }
 
-fn main() -> lightbulb_connect::Result<()> {
+fn main() {
+    // An error is a sentence for the person, never Rust's debug print.
+    if let Err(e) = run() {
+        eprintln!("{e}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> lightbulb_connect::Result<()> {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         // A hook must never fail its agent, even on bad arguments.
@@ -185,7 +266,11 @@ fn main() -> lightbulb_connect::Result<()> {
             request_id,
         )?),
         Command::Listen { name, once } => exit(cli::listen(&name, once)?),
-        Command::Receipt { request_id, from } => exit(cli::receipt(&request_id, from)?),
+        Command::Receipt {
+            request_id,
+            from,
+            json,
+        } => exit(cli::receipt(&request_id, from, json)?),
         Command::Doctor => exit(cli::doctor()?),
         Command::Invite { new, once, open } => exit(cli::invite(match (new, once, open) {
             (true, ..) => Invite::New,
@@ -197,59 +282,29 @@ fn main() -> lightbulb_connect::Result<()> {
         Command::Admin { name, founder } => exit(cli::admin(&name, founder)?),
         Command::Remove { name } => exit(cli::remove(&name)?),
         Command::Leave => exit(cli::leave()?),
-        Command::Join { link, name } => exit(cli::join(&link, name)?),
-        Command::Approve { request, always } if request.starts_with('H') => {
-            exit(cli::answer_hold(&request, true, always)?)
-        }
-        Command::Approve { request, .. } => exit(cli::answer_join(&request, true)?),
-        Command::Decline { request } if request.starts_with('H') => {
-            exit(cli::answer_hold(&request, false, false)?)
-        }
-        Command::Decline { request } => exit(cli::answer_join(&request, false)?),
+        Command::Join {
+            link,
+            name,
+            kind,
+            proof,
+        } => exit(cli::join(&link, name, &kind, proof)?),
+        Command::Signin => exit(cli::signin()?),
+        Command::Approve { request, always } => exit(cli::answer(&request, true, always)?),
+        Command::Decline { request } => exit(cli::answer(&request, false, false)?),
         Command::Held => exit(cli::held()?),
         Command::Policy { person, value } => exit(cli::policy(person, value)?),
+        Command::Folder { path, state } => exit(cli::folder(&path, state == "on")?),
+        Command::Relay { url, clear, local } => {
+            exit(cli::relay(clear.then(String::new).or(url), local)?)
+        }
         Command::External(args) => exit(cli::forward(args)?),
         Command::Mcp { server_name } => mcp::run(server_name)?,
         Command::Setup {
             remove,
             executable,
             server_name,
-        } => {
-            if !setup::valid_server_name(&server_name) {
-                return Err("--server-name takes letters, digits, - and _".into());
-            }
-            if let Some(e) = executable.as_ref().filter(|e| !remove && !e.exists()) {
-                return Err(format!("--executable {} does not exist", e.display()).into());
-            }
-            let home = cli::home()?;
-            if !remove {
-                cli::install_running(&home)?;
-            }
-            // Wired to the canonical copy, never to wherever this binary was built.
-            let executable = executable.unwrap_or_else(|| cli::canonical(&home));
-            for agent in setup::run(&home, &executable, &server_name, remove).agents {
-                println!("{}", agent.line());
-            }
-            if remove {
-                // legacy (Plan A install): its hook and MCP entries name the old binary.
-                for agent in
-                    setup::run(&home, &cli::legacy_canonical(&home), &server_name, true).agents
-                {
-                    if !agent.wrote.is_empty() {
-                        println!("{}", agent.line());
-                    }
-                }
-                cli::legacy_uninstall(&home)?;
-            }
-            if cfg!(target_os = "macos") {
-                // `--remove` is the off switch: the job and the running daemon go too.
-                exit(if remove {
-                    cli::daemon_uninstall()?
-                } else {
-                    cli::install_job(&home, &executable)?
-                });
-            }
-        }
+            verbose,
+        } => exit(cli::setup(remove, executable, server_name, verbose)?),
         Command::Hook { agent, event } => {
             let mut stdin = String::new();
             let ran = std::io::stdin()

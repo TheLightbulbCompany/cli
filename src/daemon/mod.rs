@@ -16,7 +16,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tokio::net::UnixListener;
 use tokio::sync::{broadcast, Notify};
 
@@ -25,10 +25,36 @@ pub struct TeamState {
     /// The replayed roster, replaced by every write (`net_ops`), never replayed per op.
     pub roster: roster::Roster,
     pub config: Config,
+    /// `config.folders_off`, as `folder` stored them (canonical): what `register` and the presence
+    /// compare a session's folder with. Set with `config` (`set_config`).
+    pub off: Vec<PathBuf>,
+}
+
+impl TeamState {
+    /// Takes `config` and its canonical `off` (computed before the lock: `canonical` is a
+    /// syscall); whether either changed (a folder may resolve anew with the file unchanged).
+    pub fn set_config(&mut self, config: Config, off: Vec<PathBuf>) -> bool {
+        let changed = self.config != config || self.off != off;
+        self.off = off;
+        self.config = config;
+        changed
+    }
+}
+
+/// `config.folders_off` as `folder` stored them (already canonical; lowercased again, a string
+/// change), so the daemon makes no filesystem call on them: `TeamState::set_config`'s `off`.
+pub fn canonical_off(config: &Config) -> Vec<PathBuf> {
+    config
+        .folders_off
+        .iter()
+        .map(|o| crate::presence::lower(o.clone()))
+        .collect()
 }
 
 /// What every connection handler shares.
 pub struct Daemon {
+    /// The state dir.
+    pub dir: PathBuf,
     pub store: Mutex<Store>,
     pub identity: Identity,
     pub team: Mutex<TeamState>,
@@ -46,12 +72,15 @@ pub struct Daemon {
     pub push_failed: Mutex<HashSet<String>>,
     /// The member connections (`net`).
     pub peers: net::Peers,
-    /// The person's OS dialogs, one at a time, none while `ui.claim` is live.
+    /// The person's OS dialogs, one at a time, none while `ui.claim` is live. An embedded
+    /// instance's answers every dialog "not shown" at once: it asks no one.
     pub dialogs: dialog::Queue,
     /// `dialogs`' answers, for the task that routes them (admission, holds) to take.
     pub dialog_answers: Mutex<Option<dialog::Answers>>,
     /// The join requests waiting for their person's answer (`admission`).
     pub admissions: crate::admission::Waiting,
+    /// Poked on every roster install (`net_ops::install`): waiters look again.
+    pub roster_changed: Notify,
     /// Held while a `team.join` runs: one at a time.
     pub joining: tokio::sync::Mutex<()>,
     /// Poked on a local session change: the presence sender (`presence::run`) looks again.
@@ -60,6 +89,71 @@ pub struct Daemon {
     pub built: Mutex<Option<net::frames::Frame>>,
     /// Each member's latest presence (`peers_sessions` is its copy across restarts).
     pub latest: Mutex<HashMap<String, crate::presence::Latest>>,
+    /// The open streams (`streams`).
+    pub streams: crate::streams::Streams,
+    /// What an embedded (cloud) instance is; `None` on a computer.
+    pub cloud: Option<Cloud>,
+    /// An instance's `daemon.lock` (`lock_dir`): released only when the last task holding the
+    /// daemon ends, so no second engine starts on this home while one still runs. The socket
+    /// daemon holds its own across `run`.
+    pub home_lock: Option<File>,
+}
+
+/// An embedded instance: a Lightbulb workspace's member.
+pub struct Cloud {
+    /// The workspace's display name: its solo network's member and team name.
+    pub name: String,
+    declared: Mutex<Declared>,
+    /// The last `Declared::version` the presence sender (`presence::run`) handed on.
+    pub sent: tokio::sync::watch::Sender<u64>,
+    /// The `app_*` requests out (`app_send`), by envelope id: the computer asked, the answer
+    /// kind expected, and where the answer goes.
+    pub apps: Mutex<HashMap<String, crate::app_send::Waiter>>,
+    /// The hold notices received and not yet answered (`decision`), by `(holding member, hold
+    /// id)`: their `hold_notice` events.
+    pub notices: Mutex<HashMap<(String, String), serde_json::Value>>,
+}
+
+/// The sessions an instance declared (`cloud.sessions.set`), as published; each set is a new
+/// `version`.
+#[derive(Clone, Default)]
+pub struct Declared {
+    pub version: u64,
+    pub sessions: Arc<Vec<net::frames::Remote>>,
+    pub ids: Arc<HashSet<String>>,
+}
+
+impl Cloud {
+    pub fn new(name: String) -> Cloud {
+        Cloud {
+            name,
+            declared: Mutex::default(),
+            sent: tokio::sync::watch::Sender::new(0),
+            apps: Mutex::default(),
+            notices: Mutex::default(),
+        }
+    }
+
+    pub fn declared(&self) -> Declared {
+        self.declared.lock().unwrap().clone()
+    }
+
+    /// Whether `addr` is one of the declared sessions.
+    pub fn declares(&self, addr: &str) -> bool {
+        self.declared.lock().unwrap().ids.contains(addr)
+    }
+
+    /// Makes `sessions` the declared list: its version.
+    pub fn set(&self, sessions: Vec<net::frames::Remote>) -> u64 {
+        let mut d = self.declared.lock().unwrap();
+        let ids = sessions.iter().map(|s| s.session_id.clone()).collect();
+        *d = Declared {
+            version: d.version + 1,
+            sessions: Arc::new(sessions),
+            ids: Arc::new(ids),
+        };
+        d.version
+    }
 }
 
 impl Daemon {
@@ -122,37 +216,34 @@ pub async fn deliver(daemon: Arc<Daemon>, to: Key) {
     }
 }
 
-/// Runs the daemon for `dir` until a `shutdown` op. While another daemon holds `daemon.lock`
-/// it waits, touching nothing, and takes over when that one exits: so launchd's copy, started
-/// while a spawned daemon serves, neither exits into a respawn loop nor serves twice.
-pub async fn run(dir: &Path) -> Result<()> {
+/// `dir`'s `daemon.lock`, held (and our pid written in it) until the file drops: one engine,
+/// daemon or embedded instance, per state dir. With `wait` it blocks until the holder is gone;
+/// without, it fails at once.
+pub(crate) fn lock_dir(dir: &Path, wait: bool) -> Result<File> {
     let mut lock = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .open(dir.join("daemon.lock"))?;
-    // Blocks this (otherwise idle) thread; nothing else runs until the lock is ours.
-    lock.lock()?;
+    if wait {
+        lock.lock()?;
+    } else if lock.try_lock().is_err() {
+        return Err("already running: another engine holds this state dir".into());
+    }
     lock.set_len(0)?;
     writeln!(lock, "{}", std::process::id())?;
+    Ok(lock)
+}
 
-    let identity = Identity::load_or_create(dir)?;
+/// Runs the daemon for `dir` until a `shutdown` op. While another daemon holds `daemon.lock`
+/// it waits, touching nothing, and takes over when that one exits: so launchd's copy, started
+/// while a spawned daemon serves, neither exits into a respawn loop nor serves twice.
+pub async fn run(dir: &Path) -> Result<()> {
+    // Blocks this (otherwise idle) thread; nothing else runs until the lock is ours.
+    let _lock = lock_dir(dir, true)?;
     let config = Config::load(dir)?;
-    let store = Store::open(&dir.join("state.db"))?;
-    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
-    // The solo network's genesis, written once: a computer that has a roster keeps it.
-    let mut entries = roster::entries(&store)?;
-    if entries.is_empty() {
-        let g = net_ops::genesis(&identity, &user_name(), &config.computer, &user_name(), now);
-        roster::accept(&store, &g, now)?;
-        entries.push(g);
-    }
-    let team = TeamState {
-        roster: roster::replay(&entries),
-        config,
-    };
-    net_ops::sync_team_row(&store, &roster::Roster::default(), &team.roster)?;
+    let (daemon, net) = crate::embed::boot(dir, config, None).await?;
 
     // We hold the lock, so any socket file left behind is stale.
     let sock = dir.join(paths::SOCKET);
@@ -163,38 +254,7 @@ pub async fn run(dir: &Path) -> Result<()> {
     let listener = UnixListener::bind(&sock)?;
     // Briefly wider than 0600 after bind; the 0700 state dir closes that window.
     fs::set_permissions(&sock, Permissions::from_mode(0o600))?;
-
-    let latest = crate::presence::load(&store);
-    let peers = net::Peers::default();
-    let (dialogs, answers) = dialog::Queue::new(peers.knobs().osascript.clone());
-    dialogs.set_knob(peers.knobs().dialog.clone());
-    let daemon = Arc::new(Daemon {
-        store: Mutex::new(store),
-        identity,
-        team: Mutex::new(team),
-        claude_home: std::env::var_os("LIGHTBULB_CONNECT_CLAUDE_HOME")
-            .map(PathBuf::from)
-            .or_else(dirs::home_dir)
-            .ok_or("no home directory")?,
-        events: broadcast::channel(256).0,
-        shutdown: Notify::new(),
-        mail: Notify::new(),
-        mailbox_locks: Mutex::default(),
-        push_failed: Mutex::default(),
-        peers,
-        dialogs,
-        dialog_answers: Mutex::new(Some(answers)),
-        admissions: Mutex::default(),
-        joining: tokio::sync::Mutex::new(()),
-        presence: Notify::new(),
-        built: Mutex::default(),
-        latest: Mutex::new(latest),
-    });
-    // No join connection outlives a restart: its open requests are over.
-    daemon.store.lock().unwrap().expire_joins(i64::MAX, now)?;
     tokio::spawn(crate::admission::route(daemon.clone()));
-    tokio::spawn(crate::presence::run(daemon.clone()));
-    let net = net::Net::start(daemon.clone()).await?;
     ipc::serve(listener, daemon).await;
     net.close().await;
     let _ = fs::remove_file(&sock);

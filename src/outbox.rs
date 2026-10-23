@@ -28,13 +28,18 @@ pub fn enqueue(store: &Store, p: Prepared, to: &Member) -> Result<Receipt> {
     Ok(r)
 }
 
-/// The envelopes to send at `now` to the `online` members, `(member, frame)`: still `queued`,
-/// and due.
-pub fn due(store: &Store, online: &[String], now: u64) -> Result<Vec<(String, Frame)>> {
+/// The frames to send at `now` to the `online` members, `(row id, member, frame)`: envelopes
+/// still `queued`, hold notices and decisions created after `since` (`decision`), all due.
+pub fn due(
+    store: &Store,
+    online: &[String],
+    now: u64,
+    since: u64,
+) -> Result<Vec<(String, String, Frame)>> {
     let now = i64::try_from(now).unwrap_or(i64::MAX);
     let mut out = vec![];
-    for (member, frame) in store.outbox_due(online, now)? {
-        out.push((member, serde_json::from_str(&frame)?));
+    for (id, member, frame) in store.outbox_due(online, now, since as i64)? {
+        out.push((id, member, serde_json::from_str(&frame)?));
     }
     Ok(out)
 }
@@ -44,43 +49,50 @@ pub fn sent(store: &Store, id: &str, now: u64) -> Result<()> {
     Ok(store.outbox_sent(id, now as i64)?)
 }
 
-/// `member`'s word on envelope `id`: its receipt moves forward only (`State::later_than`;
-/// `refused` and `expired` final). `false` when the envelope did not go to `member`: the one
-/// binding an `Ack` or `Receipt` is held to.
+/// `member`'s word on envelope `id` (with `limit`, the loop limit a refusal hit): its receipt
+/// moves forward only (`State::later_than`; `refused` and `expired` final). `None` when the
+/// envelope did not go to `member`: the one binding an `Ack` or `Receipt` is held to; else
+/// whether the receipt moved (to `state`).
 pub fn acked(
     store: &Store,
     member: &str,
     id: &str,
     state: State,
     reason: Option<&str>,
+    limit: Option<&str>,
     now: u64,
-) -> Result<bool> {
+) -> Result<Option<bool>> {
     let Some((from, request_id)) = store.outbox_sender(id, member)? else {
-        return Ok(false);
+        return Ok(None);
     };
-    mail::advance(store.conn(), &from, &request_id, state, reason, now)?;
-    Ok(true)
+    let moved = mail::advance(store.conn(), &from, &request_id, state, reason, limit, now)?;
+    Ok(Some(moved))
 }
 
 /// At `now`: mail queued `ttl` seconds becomes `expired` (`unreachable`); rows a week and a
 /// day past a final state, or past any answer (`HELD_S + KEEP_S` old), and `seen_ids` that
-/// old are dropped.
-pub fn expire(store: &Store, now: u64, ttl: u64) -> Result<()> {
+/// old are dropped. The envelope ids that expired.
+pub fn expire(store: &Store, now: u64, ttl: u64) -> Result<Vec<String>> {
     let tx = store.conn().unchecked_transaction()?;
-    for (from, request_id) in store.outbox_stale(now.saturating_sub(ttl) as i64)? {
-        mail::advance(
+    let mut expired = vec![];
+    for (from, request_id, id) in store.outbox_stale(now.saturating_sub(ttl) as i64)? {
+        let unreachable = Some("unreachable");
+        if mail::advance(
             &tx,
             &from,
             &request_id,
             State::Expired,
-            Some("unreachable"),
+            unreachable,
+            None,
             now,
-        )?;
+        )? {
+            expired.push(id);
+        }
     }
     let ago = |s: u64| now.saturating_sub(s) as i64;
     store.prune_mail(ago(KEEP_S), ago(mail::HELD_S + KEEP_S), ago(KEEP_S))?;
     tx.commit()?;
-    Ok(())
+    Ok(expired)
 }
 
 /// The receipts owed to members: `(member, Receipt frame)`.
@@ -138,7 +150,7 @@ mod tests {
     }
 
     fn due_n(s: &Store, now: u64) -> usize {
-        due(s, &["b".into()], now).unwrap().len()
+        due(s, &["b".into()], now, 0).unwrap().len()
     }
 
     #[test]
@@ -148,7 +160,7 @@ mod tests {
         let id = queue(&s, 100);
         assert_eq!(due_n(&s, 100), 1);
         assert!(
-            due(&s, &["c".into()], 100).unwrap().is_empty(),
+            due(&s, &["c".into()], 100, 0).unwrap().is_empty(),
             "only for the online"
         );
         sent(&s, &id, 100).unwrap();
@@ -156,7 +168,10 @@ mod tests {
         assert_eq!(due_n(&s, 101), 1);
         sent(&s, &id, 101).unwrap();
         assert_eq!(due_n(&s, 102), 0, "then 2 s");
-        assert!(!acked(&s, "c", &id, State::Read, None, 102).unwrap());
+        assert_eq!(
+            acked(&s, "c", &id, State::Read, None, None, 102).unwrap(),
+            None
+        );
         assert!(!bound(&s, &id, "c") && bound(&s, &id, "b"));
         for (st, want) in [
             (State::Held, State::Held),
@@ -165,7 +180,11 @@ mod tests {
             (State::Read, State::Read),
             (State::Delivered, State::Read),
         ] {
-            assert!(acked(&s, "b", &id, st, None, 103).unwrap());
+            let moved = state(&s).0 != want;
+            assert_eq!(
+                acked(&s, "b", &id, st, None, None, 103).unwrap(),
+                Some(moved)
+            );
             assert_eq!(state(&s).0, want);
         }
         assert_eq!(due_n(&s, 1_000), 0, "acked: never sent again");
@@ -181,7 +200,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = Store::open(&dir.path().join("state.db")).unwrap();
         let id = queue(&s, 100);
-        acked(&s, "b", &id, State::Delivered, None, 101).unwrap();
+        acked(&s, "b", &id, State::Delivered, None, None, 101).unwrap();
         let end = 100 + mail::HELD_S + KEEP_S;
         expire(&s, end, TTL_S).unwrap();
         assert!(bound(&s, &id, "b"));
@@ -200,7 +219,7 @@ mod tests {
         assert_eq!(state(&s), (State::Expired, Some("unreachable".into())));
         assert_eq!(due_n(&s, u64::MAX / 2), 0);
         // Final: a late ack changes nothing.
-        acked(&s, "b", &id, State::Stored, None, 100 + TTL_S).unwrap();
+        acked(&s, "b", &id, State::Stored, None, None, 100 + TTL_S).unwrap();
         assert_eq!(state(&s).0, State::Expired);
     }
 }

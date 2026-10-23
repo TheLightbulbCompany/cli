@@ -1,6 +1,8 @@
 //! The member transport: a QUIC endpoint (iroh) whose key is this computer's member key, one
 //! connection per member pair carrying one stream of `Frame`s, the membership gate, and delta
-//! roster sync. Relays are off; peers are found on the local network (mDNS, `config.lan`).
+//! roster sync. Peers are found on the local network (mDNS, `config.lan`) and through the
+//! relays in effect (`relay`), which also carry a connection when no direct path exists
+//! (ciphertext only: QUIC is end to end between the two member keys).
 //!
 //! Sync: each side's first frame is `hello {heads}`. A `hello` is answered with the entries
 //! that are not ancestors of its heads (the whole log when none is known), parents first,
@@ -14,15 +16,15 @@
 
 pub mod frames;
 
-use crate::daemon::{ipc, net_ops, Daemon};
+use crate::daemon::{ipc, net_ops, Daemon, TeamState};
 use crate::mail::{self, State};
 use crate::roster::{self, Entry, Roster};
 use crate::sessions::Key;
 use crate::Result;
-use crate::{holds, identity, outbox};
+use crate::{holds, identity, outbox, relay};
 use frames::Frame;
 use iroh::endpoint::{presets, Connection, VarInt};
-use iroh::{Endpoint, EndpointAddr, PublicKey, SecretKey};
+use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMode, RelayUrl, SecretKey, Watcher};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -37,7 +39,10 @@ pub const PROTOCOL: u32 = 1;
 /// A `roster` page closes before the next entry would take it past this (half the frame cap).
 const PAGE_BYTES: usize = 512 * 1024;
 const PAGE_ENTRIES: usize = 500;
+/// Every member is redialed this often (through each relay too), within the 60 s cap.
 const REDIAL: Duration = Duration::from_secs(30);
+/// How often the relay loop asks whether a fetch of ours is due (`relay::State::fetch_if_due`).
+const RELAY_FETCH: Duration = Duration::from_secs(3_600);
 /// Entries one connection may hold waiting for their parents.
 const MAX_PENDING: usize = 10_000;
 const JOIN_WAIT: Duration = Duration::from_secs(600);
@@ -66,6 +71,15 @@ pub struct Knobs {
     drop_acks: bool,
     /// How long the outbox keeps trying (`outbox::TTL_S`), or `LIGHTBULB_CONNECT_DEBUG_OUTBOX_S`.
     outbox_s: u64,
+    /// The keys `relays.json` may be signed by: `relay::KEYS`, or
+    /// `LIGHTBULB_CONNECT_DEBUG_RELAY_KEYS=<minisign public key>,…`.
+    pub relay_keys: Vec<String>,
+    /// `LIGHTBULB_CONNECT_DEBUG_RELAY_ONLY=1`: no direct (IP) transport, only the relays.
+    relay_only: bool,
+}
+
+fn compiled_keys() -> Vec<String> {
+    relay::KEYS.iter().map(|k| k.to_string()).collect()
 }
 
 const OSASCRIPT: &str = "/usr/bin/osascript";
@@ -103,6 +117,9 @@ impl Knobs {
             outbox_s: var("LIGHTBULB_CONNECT_DEBUG_OUTBOX_S")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(outbox::TTL_S),
+            relay_keys: var("LIGHTBULB_CONNECT_DEBUG_RELAY_KEYS")
+                .map_or_else(compiled_keys, |v| v.split(',').map(String::from).collect()),
+            relay_only: var("LIGHTBULB_CONNECT_DEBUG_RELAY_ONLY").is_some_and(|v| v == "1"),
         }
     }
 
@@ -117,6 +134,8 @@ impl Knobs {
             osascript: OSASCRIPT.into(),
             drop_acks: false,
             outbox_s: outbox::TTL_S,
+            relay_keys: compiled_keys(),
+            relay_only: false,
         }
     }
 }
@@ -134,16 +153,29 @@ pub struct Peers {
     pub outbox: Notify,
     /// Woken (`notify_waiters`) whenever a member's connection ends.
     pub disconnected: Notify,
+    /// Woken (`notify_waiters`) whenever a member answers for mail sent it (`outbox::acked`).
+    pub acked: Notify,
     /// The endpoint's UDP port.
     pub port: OnceLock<u16>,
     /// The endpoint, for the candidate side of a join.
     pub endpoint: OnceLock<Endpoint>,
+    /// Frames dropped by `frames::from_peer_ok`, by kind.
+    pub dropped: Mutex<std::collections::BTreeMap<&'static str, u64>>,
+    /// The relays in effect (`relay::list`; the relay loop brings the endpoint after).
+    pub relays: Mutex<relay::List>,
+    /// What is known of our list: loaded once at start, changed only by a fetch.
+    pub relay_state: Mutex<relay::State>,
+    /// Poked by `relays_changed`: the relay loop brings the endpoint to the list.
+    pub relay_changed: Notify,
 }
+
+/// A connection's outgoing frames, each with whoever waits to hear it was written.
+pub(crate) type Tx = mpsc::UnboundedSender<(Frame, Option<tokio::sync::oneshot::Sender<()>>)>;
 
 struct Link {
     conn: Connection,
     // ponytail: unbounded; only members get a queue, bound it if one shows up growing.
-    tx: mpsc::UnboundedSender<Frame>,
+    tx: Tx,
     /// The member key that dialed this connection.
     dialer: String,
     protocol: Protocol,
@@ -164,11 +196,53 @@ impl Peers {
         self.knobs.get_or_init(Knobs::read)
     }
 
-    /// Where to dial member `key`: its key, and the knob's addresses for it.
+    /// Where to dial member `key`: its key, the knob's addresses for it, and every relay in
+    /// effect (iroh tries them all, and upgrades to a direct path where it can).
     pub fn addr(&self, key: &str) -> Option<EndpointAddr> {
         let id = PublicKey::from_bytes(&identity::key_bytes(key)?).ok()?;
         let addrs = self.knobs().peers.get(key).into_iter().flatten();
-        Some(addrs.fold(EndpointAddr::new(id), |a, s| a.with_ip_addr(*s)))
+        let a = addrs.fold(EndpointAddr::new(id), |a, s| a.with_ip_addr(*s));
+        let relays = self.relays.lock().unwrap().urls.clone();
+        Some(relays.into_iter().fold(a, |a, u| a.with_relay_url(u)))
+    }
+
+    /// The one entry for a relay change (start, `relay.set`, a roster install whose team relay
+    /// changed, a fetch): makes the list for `t` and our state the one in effect at once
+    /// (`relay.get`, tickets and dials read it), and pokes the relay loop for the endpoint.
+    /// In memory only: no disk, no crypto.
+    pub fn relays_changed(&self, t: &TeamState) {
+        let new = relay::list(
+            &t.config.relay,
+            &t.roster.relay,
+            &self.relay_state.lock().unwrap(),
+        );
+        let mut l = self.relays.lock().unwrap();
+        if (&new.urls, new.source) != (&l.urls, l.source) {
+            log_relays(&new);
+        }
+        *l = new;
+        drop(l);
+        self.relay_changed.notify_one();
+    }
+
+    /// The first relay in effect, for a ticket's `relay_hint` (`""` when none).
+    pub fn relay_hint(&self) -> String {
+        let l = self.relays.lock().unwrap();
+        l.urls.first().map(|u| u.to_string()).unwrap_or_default()
+    }
+
+    /// `status.relay` and `status.relay_error`: `none` without relays, `ok` while a home relay
+    /// is connected, else `unreachable`; and why our list was refused, while it is.
+    pub fn relay_status(&self) -> (&'static str, Option<String>) {
+        let l = self.relays.lock().unwrap();
+        if l.urls.is_empty() {
+            return ("none", l.error.clone());
+        }
+        let up = self
+            .endpoint
+            .get()
+            .is_some_and(|e| e.home_relay_status().get().iter().any(|r| r.is_connected()));
+        (if up { "ok" } else { "unreachable" }, l.error.clone())
     }
 
     /// Members with a live connection that said `hello` in our protocol.
@@ -180,45 +254,79 @@ impl Peers {
             .collect()
     }
 
-    /// For `status`, in one pass: how many members are online, and `(key, their protocol)`
-    /// for each that needs an update, by key.
-    pub fn status(&self) -> (usize, Vec<(String, u32)>) {
+    /// Whether member `key` is `online`.
+    pub fn is_online(&self, key: &str) -> bool {
         let live = self.live.lock().unwrap();
-        let mut online = 0;
+        live.get(key)
+            .is_some_and(|l| matches!(l.protocol, Protocol::Ok(_)))
+    }
+
+    /// For `status`, in one pass: how many members are online, how many of those are reached
+    /// directly (their selected path is not a relay), and `(key, their protocol)` for each
+    /// that needs an update, by key.
+    pub fn status(&self) -> (usize, usize, Vec<(String, u32)>) {
+        let live = self.live.lock().unwrap();
+        let (mut online, mut direct) = (0, 0);
         let mut outdated = Vec::new();
         for (k, l) in live.iter() {
             match l.protocol {
-                Protocol::Ok(_) => online += 1,
+                Protocol::Ok(_) => {
+                    online += 1;
+                    if l.conn.paths().iter().any(|p| p.is_selected() && p.is_ip()) {
+                        direct += 1;
+                    }
+                }
                 Protocol::Outdated(p) => outdated.push((k.clone(), p)),
                 Protocol::Unknown => {}
             }
         }
         outdated.sort();
-        (online, outdated)
+        (online, direct, outdated)
+    }
+
+    /// `f` on `member`'s link, once it said `hello` in our protocol.
+    fn ok_link<R>(&self, member: &str, f: impl FnOnce(&Link) -> R) -> Option<R> {
+        let live = self.live.lock().unwrap();
+        live.get(member)
+            .filter(|l| matches!(l.protocol, Protocol::Ok(_)))
+            .map(f)
+    }
+
+    /// `member`'s connection (`streams` opens on it).
+    pub fn conn(&self, member: &str) -> Option<Connection> {
+        self.ok_link(member, |l| l.conn.clone())
     }
 
     /// Queues `f` on `member`'s connection; fails when it has none.
     pub fn send(&self, member: &str, f: Frame) -> Result<()> {
-        let live = self.live.lock().unwrap();
-        match live.get(member) {
-            Some(l) if matches!(l.protocol, Protocol::Ok(_)) => {
-                l.tx.send(f).map_err(|_| "connection closed".into())
-            }
-            _ => Err("not connected".into()),
+        match self.ok_link(member, |l| l.tx.send((f, None)).is_ok()) {
+            Some(true) => Ok(()),
+            Some(false) => Err("connection closed".into()),
+            None => Err("not connected".into()),
         }
+    }
+
+    /// `send` `f`, and hear once it was written to the stream (`app_send` marks mail read
+    /// only then); `None` when it could not be queued.
+    pub(crate) fn send_written(
+        &self,
+        member: &str,
+        f: Frame,
+    ) -> Option<tokio::sync::oneshot::Receiver<()>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let queued = self.ok_link(member, |l| l.tx.send((f, Some(tx))).is_ok());
+        queued.unwrap_or(false).then_some(rx)
+    }
+
+    /// Counts a dropped frame of `kind` (`status`'s `dropped`).
+    pub(crate) fn dropped(&self, kind: &'static str) {
+        *self.dropped.lock().unwrap().entry(kind).or_default() += 1;
     }
 
     /// Takes `conn` (dialed by `dialer`) as `key`'s connection, unless the one held wins: of
     /// two connections, the one the lower member key dialed; of two dialed by the same side,
     /// the newer. The loser is closed.
-    fn adopt(
-        &self,
-        key: &str,
-        me: &str,
-        conn: &Connection,
-        dialer: &str,
-        tx: &mpsc::UnboundedSender<Frame>,
-    ) -> bool {
+    fn adopt(&self, key: &str, me: &str, conn: &Connection, dialer: &str, tx: &Tx) -> bool {
         let lower = key.min(me);
         let mut live = self.live.lock().unwrap();
         if let Some(old) = live.get(key) {
@@ -301,14 +409,34 @@ struct Inner {
 }
 
 impl Net {
-    /// Binds the endpoint (secret = the member key, relays off, mDNS when `config.lan`) and
-    /// starts accepting and dialing every active member.
+    /// Binds the endpoint (secret = the member key, the relays known without the network,
+    /// mDNS when `config.lan`) and starts accepting, dialing every active member, and keeping
+    /// the relay list.
     pub async fn start(daemon: Arc<Daemon>) -> Result<Net> {
-        let lan = daemon.team.lock().unwrap().config.lan;
+        let state = relay::State::load(&daemon.dir, &daemon.peers.knobs().relay_keys);
+        *daemon.peers.relay_state.lock().unwrap() = state;
+        let lan = {
+            let t = daemon.team.lock().unwrap();
+            for v in [&t.config.relay, &t.roster.relay].into_iter().flatten() {
+                if !v.trim().is_empty() && relay::parse(v).is_none() {
+                    eprintln!("relay: ignored {v:?} (not an https relay URL)");
+                }
+            }
+            daemon.peers.relays_changed(&t);
+            t.config.lan
+        };
         let secret = SecretKey::from_bytes(&daemon.identity.signing.to_bytes());
+        // Always a relay transport (an empty map is direct only), so a list that comes later
+        // can be added at runtime.
+        let urls = daemon.peers.relays.lock().unwrap().urls.clone();
+        let map = urls.into_iter().map(relay_config);
         let mut b = Endpoint::builder(presets::Minimal)
             .secret_key(secret)
-            .alpns(vec![ALPN.to_vec(), JOIN_ALPN.to_vec()]);
+            .alpns(vec![ALPN.to_vec(), JOIN_ALPN.to_vec()])
+            .relay_mode(RelayMode::Custom(map.collect()));
+        if daemon.peers.knobs().relay_only {
+            b = b.clear_ip_transports();
+        }
         if lan {
             b = b.address_lookup(iroh_mdns_address_lookup::MdnsAddressLookup::builder());
         }
@@ -325,11 +453,80 @@ impl Net {
         tokio::spawn(net.clone().accept_loop());
         tokio::spawn(net.clone().keep_up());
         tokio::spawn(net.clone().flush_loop());
+        tokio::spawn(net.clone().relay_loop());
         Ok(net)
+    }
+
+    /// Brings the endpoint's relays to the list in effect (`peers.relays`) whenever
+    /// `relays_changed` pokes, and tries the fetch of ours hourly (`relay::State::
+    /// fetch_if_due` decides) on a blocking thread, swapping the state in after. iroh keeps
+    /// the connection to its home relay up itself (and the dial loop redials members through
+    /// every relay), so this only changes which relays there are.
+    async fn relay_loop(self) {
+        let d = &self.0.daemon;
+        // What the endpoint has.
+        let mut applied = d.peers.relays.lock().unwrap().urls.clone();
+        let mut first = true;
+        loop {
+            // A retry is due an hour after the last attempt, whatever started that attempt (a
+            // poke too); with none pending, the hourly look at the cache's age.
+            let now = std::time::Instant::now();
+            let last = d.peers.relay_state.lock().unwrap().last_fetch_at;
+            let due = last.map(|t| t + relay::RETRY).filter(|t| *t > now);
+            let wake = match (first, due) {
+                (true, _) => now,
+                (_, Some(t)) => t,
+                _ => now + RELAY_FETCH,
+            };
+            first = false;
+            tokio::select! {
+                _ = tokio::time::sleep_until(wake.into()) => {}
+                _ = d.peers.relay_changed.notified() => {}
+                _ = self.0.endpoint.closed() => return,
+            }
+            let (mut state, issuer, set) = {
+                let t = d.team.lock().unwrap();
+                let set = (t.config.relay.clone(), t.roster.relay.clone());
+                (
+                    d.peers.relay_state.lock().unwrap().clone(),
+                    t.config.issuer.clone(),
+                    set,
+                )
+            };
+            let d2 = d.clone();
+            let fetched = tokio::task::spawn_blocking(move || {
+                let keys = &d2.peers.knobs().relay_keys;
+                let f = state.fetch_if_due(&d2.dir, &issuer, (&set.0, &set.1), keys);
+                (f, state)
+            })
+            .await;
+            if let Ok((true, state)) = fetched {
+                *d.peers.relay_state.lock().unwrap() = state;
+                d.peers.relays_changed(&d.team.lock().unwrap());
+            }
+            let urls = d.peers.relays.lock().unwrap().urls.clone();
+            if urls == applied {
+                continue;
+            }
+            let ep = &self.0.endpoint;
+            for u in applied.iter().filter(|u| !urls.contains(u)) {
+                ep.remove_relay(u).await;
+            }
+            for u in urls.iter().filter(|u| !applied.contains(u)) {
+                ep.insert_relay(u.clone(), Arc::new(relay_config(u.clone())))
+                    .await;
+            }
+            applied = urls;
+        }
     }
 
     pub async fn close(&self) {
         self.0.endpoint.close().await;
+    }
+
+    /// Whether every task this endpoint started has ended (this handle is the last one).
+    pub fn idle(&self) -> bool {
+        Arc::strong_count(&self.0) == 1
     }
 
     async fn accept_loop(self) {
@@ -373,13 +570,14 @@ impl Net {
     /// Sends what members are owed: on each `hello` every queued envelope of an online member,
     /// and every second the envelopes due (`outbox::due`'s per-row backoff) and the receipts
     /// waiting; every 60 s (or the outbox knob, if shorter) expires what waited too long, here
-    /// and in the outbox.
+    /// and in the outbox, and lapses and renews sign-in proofs (`proof::tick`).
     // ponytail: a 1 s poll (two small queries) picks up receipts that mail state changes queue;
     // wake it from `mail` if that ever shows.
     async fn flush_loop(self) {
         let d = &self.0.daemon;
         let every = Duration::from_secs(d.peers.knobs().outbox_s.clamp(1, 60));
         let mut expired_at: Option<std::time::Instant> = None;
+        let mut renew_at = 0;
         loop {
             // Armed before the flush, so a `hello` during it is not missed.
             let connected = d.peers.connected.notified();
@@ -394,6 +592,7 @@ impl Net {
             let expire = expired_at.is_none_or(|t| t.elapsed() >= every);
             if expire {
                 expired_at = Some(std::time::Instant::now());
+                crate::proof::tick(d, &mut renew_at);
             }
             if let Err(e) = flush(d, all, expire) {
                 eprintln!("net: outbox: {e}");
@@ -425,7 +624,7 @@ impl Net {
                     continue;
                 };
                 push_delta(&l.tx, r, heads, &mut memo, true);
-                let _ = l.tx.send(hello(r, protocol));
+                let _ = l.tx.send((hello(r, protocol), None));
                 // After the push the peer holds all of ours: the next change sends only itself.
                 l.protocol = Protocol::Ok(r.heads.clone());
             }
@@ -478,7 +677,7 @@ impl Net {
                 }
                 if d.peers.adopt(&key, me, &conn, dialer, &tx) {
                     // The first frame, written once the stream is open.
-                    let _ = tx.send(hello(&team.roster, d.peers.knobs().protocol));
+                    let _ = tx.send((hello(&team.roster, d.peers.knobs().protocol), None));
                     None
                 } else {
                     Some((SUPERSEDED, b"superseded"))
@@ -500,9 +699,12 @@ impl Net {
         if let Ok((mut send, mut recv)) = streams {
             eprintln!("net: connected {}", short(&key));
             let writer = async {
-                while let Some(f) = rx.recv().await {
+                while let Some((f, done)) = rx.recv().await {
                     if frames::write(&mut send, &f).await.is_err() {
                         return;
+                    }
+                    if let Some(done) = done {
+                        let _ = done.send(());
                     }
                 }
             };
@@ -516,9 +718,26 @@ impl Net {
                     }
                 }
             };
+            // Every stream after the control one is a viewer's (`streams`); at most
+            // `streams::ACCEPTS` wait for their opener at once, the rest are reset.
+            let accepts = Arc::new(tokio::sync::Semaphore::new(crate::streams::ACCEPTS));
+            let viewers = async {
+                while let Ok((mut s, r)) = conn.accept_bi().await {
+                    let Ok(permit) = accepts.clone().try_acquire_owned() else {
+                        let _ = s.reset(VarInt::from_u32(crate::streams::BUSY));
+                        continue;
+                    };
+                    let (d, key) = (d.clone(), key.clone());
+                    tokio::spawn(async move {
+                        crate::streams::accept(d, key, s, r).await;
+                        drop(permit);
+                    });
+                }
+            };
             tokio::select! {
                 _ = writer => {}
                 _ = reader => {}
+                _ = viewers => {}
             }
         }
         d.peers.forget(&key, &conn);
@@ -534,7 +753,7 @@ impl Net {
         conn: &Connection,
         f: Frame,
         sync: &mut Incoming,
-        tx: &mpsc::UnboundedSender<Frame>,
+        tx: &Tx,
     ) -> bool {
         let d = &self.0.daemon;
         let team = d.team.lock().unwrap();
@@ -545,8 +764,10 @@ impl Net {
         let mut synced = false;
         let mut hello_ok = false;
         let (mut presence, mut envelope, mut answer) = (None, None, None);
-        if !frames::from_peer_ok(&f, peer, d) {
-            eprintln!("net: dropped a {} frame from {short}", f.kind());
+        let (mut grant, mut join, mut relayed) = (None, None, None);
+        if let Err(why) = frames::from_peer_ok(&f, peer, d) {
+            d.peers.dropped(f.kind());
+            eprintln!("net: dropped a {} frame from {short} ({why})", f.kind());
         } else if let Frame::Hello { protocol: p, heads } = f {
             // ponytail: a hello costs O(log) under `team`, and a member may send them back to
             // back; rate-limit per connection if one does.
@@ -572,10 +793,28 @@ impl Net {
             presence = Some(f);
         } else if matches!(f, Frame::Envelope { .. }) {
             envelope = Some(f);
+        } else if matches!(f, Frame::ShareGrant { .. }) {
+            grant = Some(f);
+        } else if matches!(f, Frame::JoinRequest { .. } | Frame::JoinDecision { .. }) {
+            join = Some(f);
+        } else if matches!(f, Frame::HoldNotice { .. } | Frame::Decision { .. }) {
+            relayed = Some(f);
         } else if matches!(f, Frame::Ack { .. }) && d.peers.knobs().drop_acks {
             eprintln!("net: dropped an ack from {short} (debug)");
-        } else if let Frame::Ack { id, state, reason } | Frame::Receipt { id, state, reason } = f {
-            answer = Some((id, state, reason));
+        } else if let Frame::Ack {
+            id,
+            state,
+            reason,
+            limit,
+        }
+        | Frame::Receipt {
+            id,
+            state,
+            reason,
+            limit,
+        } = f
+        {
+            answer = Some((id, state, reason, limit));
         }
         // Waiting entries are retried after each sync, and when the roster changed: another
         // connection may have brought their parents.
@@ -586,22 +825,45 @@ impl Net {
         if hello_ok {
             let (d, tx) = (d.clone(), tx.clone());
             tokio::task::spawn_blocking(move || {
-                let _ = tx.send(crate::presence::for_hello(&d));
+                let _ = tx.send((crate::presence::for_hello(&d), None));
             });
         }
         if let Some(p) = presence.filter(|_| d.peers.speaks_ours(key, conn)) {
             let first = !std::mem::replace(&mut sync.presence_stored, true);
             crate::presence::put(d, key, &p, ipc::now(), first);
         }
+        if let Some(f) = join {
+            tokio::spawn(crate::admission::from_member(d.clone(), key.to_string(), f));
+        }
         if let Some(env) = envelope.filter(|_| d.peers.speaks_ours(key, conn)) {
             receive(d, key, &env, tx);
         }
-        if let Some((id, state, reason)) = answer {
+        if let Some(f) = relayed.filter(|_| d.peers.speaks_ours(key, conn)) {
+            crate::decision::on_frame(d, key, &f, tx);
+        }
+        if let Some(g) = grant.filter(|_| d.peers.speaks_ours(key, conn)) {
+            if let Err(e) = crate::streams::store(&d.store.lock().unwrap(), &g, ipc::now() as i64) {
+                eprintln!("net: a share_grant from {short}: {e}");
+            }
+        }
+        if let Some((id, state, reason, _)) = answer
+            .as_ref()
+            .filter(|a| crate::decision::is_control(&a.0))
+        {
+            crate::decision::acked(d, key, id, state, reason.as_deref());
+        } else if let Some((id, state, reason, limit)) = answer {
             let store = d.store.lock().unwrap();
             let state = State::parse(&state).expect("checked by from_peer_ok");
-            match outbox::acked(&store, key, &id, state, reason.as_deref(), ipc::now()) {
-                Ok(true) => eprintln!("net: {id} at {short}: {}", state.name()),
-                Ok(false) => {
+            let (reason, limit) = (reason.as_deref(), limit.as_deref());
+            match outbox::acked(&store, key, &id, state, reason, limit, ipc::now()) {
+                Ok(Some(moved)) => {
+                    eprintln!("net: {id} at {short}: {}", state.name());
+                    d.peers.acked.notify_waiters();
+                    if moved {
+                        receipt_changed(d, &id, state.name(), reason);
+                    }
+                }
+                Ok(None) => {
                     eprintln!("net: dropped an answer from {short} for {id} (not sent there)")
                 }
                 Err(e) => eprintln!("net: {id} at {short}: {e}"),
@@ -619,38 +881,68 @@ impl Net {
 
 /// Member `key`'s envelope: checked and stored (`mail::receive`), answered with an `ack`.
 /// One whose `from` is not the member's own is dropped unanswered.
-fn receive(d: &Arc<Daemon>, key: &str, env: &Frame, tx: &mpsc::UnboundedSender<Frame>) {
-    let Frame::Envelope { id, to, .. } = env else {
+/// The `app_*` kinds go to `app_send` instead: no mailbox, hold, hop count or `ack`.
+fn receive(d: &Arc<Daemon>, key: &str, env: &Frame, tx: &Tx) {
+    let Frame::Envelope { id, to, kind, .. } = env else {
         return;
     };
+    if crate::app_send::is_app(kind) {
+        return crate::app_send::on_envelope(d, key, env.clone());
+    }
     let team = d.team.lock().unwrap();
     let Some(peer) = team.roster.members.get(key) else {
         return;
     };
     let short = &peer.short;
+    let ack = |state: State, reason: Option<String>, limit: Option<String>| {
+        let ack = Frame::Ack {
+            id: id.clone(),
+            state: state.name().into(),
+            reason,
+            limit,
+        };
+        let _ = tx.send((ack, None));
+    };
+    // An instance's sessions are the ones it declared: new mail for any other is refused.
+    let declared = d.cloud.as_ref().map(|c| c.declared().ids);
     let store = d.store.lock().unwrap();
     let me = &d.identity.short;
-    let fresh = matches!(store.seen_state(&peer.key, id), Ok(None));
-    match mail::receive(&store, env, peer, &team.roster, me, ipc::now()) {
-        Ok((state, reason)) => {
-            if fresh && state == State::Held {
-                if let Ok(Some(h)) = holds::by_message(&store, id) {
-                    holds::shown(d, &team.roster, &store, &h);
-                }
+    let now = ipc::now();
+    match mail::receive(
+        &store,
+        env,
+        peer,
+        &team.roster,
+        me,
+        declared.as_deref(),
+        now,
+    ) {
+        Ok(mail::Answer {
+            state,
+            reason,
+            limit,
+            held,
+            fresh,
+        }) => {
+            if let Some(h) = held {
+                holds::shown(d, &team.roster, &store, &h);
             }
             eprintln!("net: envelope {id} from {short}: {}", state.name());
-            let _ = tx.send(Frame::Ack {
-                id: id.clone(),
-                state: state.name().into(),
-                reason,
-            });
+            ack(state, reason, limit);
             if state == State::Stored {
                 drop((store, team));
-                ipc::stored(d, &Key(to.clone()));
+                ipc::stored(d, &Key(to.clone()), fresh.then_some(id.as_str()));
             }
         }
         Err(e) => eprintln!("net: dropped envelope {id} from {short}: {e}"),
     }
+}
+
+/// Every subscriber hears that envelope `id`'s receipt moved to `state`.
+fn receipt_changed(d: &Daemon, id: &str, state: &str, reason: Option<&str>) {
+    let e =
+        serde_json::json!({"event": "receipt_changed", "id": id, "state": state, "reason": reason});
+    let _ = d.events.send(e);
 }
 
 /// One flush (`Net::flush_loop`): with `all`, every queued envelope of an online member,
@@ -661,15 +953,14 @@ fn flush(d: &Daemon, all: bool, expire: bool) -> Result<()> {
     let store = d.store.lock().unwrap();
     if expire {
         mail::expire(&store, now)?;
-        outbox::expire(&store, now, d.peers.knobs().outbox_s)?;
+        for id in outbox::expire(&store, now, d.peers.knobs().outbox_s)? {
+            receipt_changed(d, &id, State::Expired.name(), Some("unreachable"));
+        }
         holds::expire_here(d, &store, now as i64)?;
     }
-    let due = outbox::due(&store, &online, if all { u64::MAX } else { now })?;
-    for (member, f) in due {
-        let Frame::Envelope { id, .. } = &f else {
-            continue;
-        };
-        let id = id.clone();
+    let since = now.saturating_sub(mail::HELD_S);
+    let due = outbox::due(&store, &online, if all { u64::MAX } else { now }, since)?;
+    for (id, member, f) in due {
         if d.peers.send(&member, f).is_ok() {
             outbox::sent(&store, &id, now)?;
         }
@@ -740,7 +1031,7 @@ fn hello(r: &Roster, protocol: u32) -> Frame {
 /// Queues on `tx` the `roster` pages of what `heads` lacks (`memo` keeps them by heads); with
 /// `quiet`, nothing when that is nothing.
 fn push_delta(
-    tx: &mpsc::UnboundedSender<Frame>,
+    tx: &Tx,
     r: &Roster,
     heads: &[String],
     memo: &mut HashMap<Vec<String>, Vec<Frame>>,
@@ -755,7 +1046,7 @@ fn push_delta(
         }
     });
     for f in frames.iter() {
-        let _ = tx.send(f.clone());
+        let _ = tx.send((f.clone(), None));
     }
 }
 
@@ -803,6 +1094,21 @@ pub(crate) fn pages(entries: Vec<Entry>) -> Vec<Frame> {
             more: i < last,
         })
         .collect()
+}
+
+/// Relay `url`, without QUIC address discovery (off in Phase 1: the relay serves HTTPS only).
+fn relay_config(url: RelayUrl) -> iroh::RelayConfig {
+    iroh::RelayConfig::new(url, None)
+}
+
+/// The relays in effect, in the log: their URLs and where they came from.
+fn log_relays(l: &relay::List) {
+    let source = serde_json::to_value(l.source).unwrap_or_default();
+    let urls: Vec<String> = l.urls.iter().map(ToString::to_string).collect();
+    match &l.error {
+        Some(e) => eprintln!("relay: {source} {urls:?} ({e})"),
+        None => eprintln!("relay: {source} {urls:?}"),
+    }
 }
 
 pub(crate) fn short(key: &str) -> &str {

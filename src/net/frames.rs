@@ -4,8 +4,8 @@
 use crate::daemon::{ipc, Daemon};
 use crate::doing::TEXT_MAX;
 use crate::frame::Sender;
-use crate::mail::State;
-use crate::roster::{Entry, Member};
+use crate::mail::{self, State};
+use crate::roster::{Entry, Member, MemberKind};
 use crate::sessions::Tier;
 use crate::{presence, sessions, Result};
 use serde::{Deserialize, Serialize};
@@ -56,11 +56,22 @@ impl Remote {
     }
 
     /// Whether member `peer_short` may publish this: its session id under that prefix, `agent`
-    /// the id's provider, a known `status` and `tier`, text at most `TEXT_MAX` characters.
-    pub fn valid(&self, peer_short: &str) -> bool {
+    /// the id's provider, a known `status` and `tier`, text at most `TEXT_MAX` characters. A
+    /// `cloud` member's sessions are names (a workspace's agents) with any printable `agent`.
+    pub fn valid(&self, peer_short: &str, cloud: bool) -> bool {
         let short = |t: &str| t.chars().count() <= TEXT_MAX;
+        let agent = match Sender::of(peer_short, &self.session_id) {
+            Sender::Agent(p) => p == self.agent,
+            Sender::Name(_) => {
+                cloud
+                    && !self.agent.is_empty()
+                    && short(&self.agent)
+                    && self.agent.chars().all(crate::label::printable)
+            }
+            Sender::Terminal => false,
+        };
         own(peer_short, &self.session_id)
-            && Sender::of(peer_short, &self.session_id) == Sender::Agent(&self.agent)
+            && agent
             && STATUSES.contains(&self.status.as_str())
             && Tier::ALL.iter().any(|t| t.as_str() == self.tier)
             && short(&self.folder)
@@ -72,7 +83,7 @@ impl Remote {
 
 /// Whether `a` is a well-formed address (`sessions::qualify`, which bounds its parts) under
 /// member `short`'s prefix.
-fn own(short: &str, a: &str) -> bool {
+pub(crate) fn own(short: &str, a: &str) -> bool {
     sessions::qualify(short, a).as_deref() == Some(a)
         && sessions::split_addr(a).is_some_and(|(m, _)| m == short)
 }
@@ -113,29 +124,45 @@ pub enum Frame {
         files: Vec<String>,
         sent_at: i64,
     },
+    /// `limit` (`hops` or `rate`) names the limit a `loop` refusal hit; a peer may leave it out.
     Ack {
         id: String,
         state: String,
         reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<String>,
     },
     Receipt {
         id: String,
         state: String,
         reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<String>,
     },
+    /// A computer's new hold, to its own workspace's member only (`decision`): ids and the
+    /// sender's label, never text (`preview` always empty). Signed by the holder.
     HoldNotice {
         hold_id: String,
+        /// `message` or `permission`.
+        kind: String,
+        holding_computer: String,
+        /// The holding computer's `person_id`.
+        for_person: String,
         target_session: String,
         from: String,
-        from_label_parts: Vec<String>,
+        label: String,
         preview: String,
         created_at: i64,
+        sig: String,
     },
+    /// The person's tap on a hold notice, from the workspace member (`decision`); `decided_by`
+    /// the person who tapped, covered by `sig`.
     Decision {
         hold_id: String,
         holding_member: String,
         verdict: String,
         scope: String,
+        decided_by: String,
         nonce: String,
         decided_at: i64,
         sig: String,
@@ -219,18 +246,60 @@ pub async fn read(recv: &mut (impl AsyncRead + Unpin)) -> Result<Frame> {
 /// `roster::accept` itself. A `presence` is the peer's own: at most `presence::MAX` of each
 /// list, every session `Remote::valid` for it and every address under its prefix, a `seq` at
 /// most a day ahead of now. An `envelope` is checked by `mail::receive`. An `ack` or `receipt`
-/// names a state past `queued`, with a known reason exactly when it is `refused` (that it
-/// is bound to this member is `outbox::acked`'s check). Task 14 adds the rules for the frames
-/// it serves, and until then every other kind is dropped.
-pub fn from_peer_ok(f: &Frame, peer: &Member, _daemon: &Daemon) -> bool {
+/// names a state past `queued`, with a known reason exactly when it is `refused`, and a `limit`
+/// only on a `loop` refusal (that it is bound to this member is `outbox::acked`'s check). A
+/// `join_request` or `join_decision` comes from a computer member. A `share_grant` passes
+/// `streams::grant_ok`. A `hold_notice` passes `decision::notice_ok`; a `decision` comes from
+/// a cloud member (`decision::accept` checks the rest). An `ack` of a notice or a
+/// decision (`decision::is_control` ids) carries `decision::ack_ok`'s states and reasons only, and a
+/// `receipt` never names one. A `stream` never rides the control stream. `Err` names the
+/// check.
+pub fn from_peer_ok(
+    f: &Frame,
+    peer: &Member,
+    daemon: &Daemon,
+) -> std::result::Result<(), &'static str> {
+    let check = |ok: bool, why| if ok { Ok(()) } else { Err(why) };
     match f {
-        Frame::Hello { .. } | Frame::Roster { .. } | Frame::Envelope { .. } => true,
-        Frame::Ack { state, reason, .. } | Frame::Receipt { state, reason, .. } => {
+        Frame::Hello { .. } | Frame::Roster { .. } | Frame::Envelope { .. } => Ok(()),
+        // A person's new computer, between its person's computers (`admission::from_member`
+        // checks the signatures).
+        Frame::JoinRequest { .. } | Frame::JoinDecision { .. } => {
+            check(peer.kind == MemberKind::Computer, "join")
+        }
+        Frame::Ack {
+            id,
+            state,
+            reason,
+            limit,
+        } if crate::decision::is_control(id) => check(
+            crate::decision::ack_ok(id, state, reason.as_deref()) && limit.is_none(),
+            "state",
+        ),
+        Frame::Receipt { id, .. } if crate::decision::is_control(id) => Err("state"),
+        Frame::HoldNotice { .. } => check(crate::decision::notice_ok(f, peer), "hold_notice"),
+        Frame::Decision { .. } => check(peer.kind == MemberKind::Cloud, "decision"),
+        Frame::Ack {
+            state,
+            reason,
+            limit,
+            ..
+        }
+        | Frame::Receipt {
+            state,
+            reason,
+            limit,
+            ..
+        } => {
             let refused = state == "refused";
-            State::parse(state).is_ok_and(|s| s != State::Queued)
+            let ok = State::parse(state).is_ok_and(|s| s != State::Queued)
                 && reason
                     .as_deref()
                     .map_or(!refused, |r| refused && REASONS.contains(&r))
+                && limit.as_deref().is_none_or(|l| {
+                    reason.as_deref() == Some("loop") && [mail::HOPS, mail::RATE].contains(&l)
+                });
+            check(ok, "state")
         }
         Frame::Presence {
             member,
@@ -239,21 +308,51 @@ pub fn from_peer_ok(f: &Frame, peer: &Member, _daemon: &Daemon) -> bool {
             known,
             kept,
         } => {
-            *member == peer.key
+            let ok = *member == peer.key
                 && *seq <= ipc::now_ms() + 86_400_000
                 && [sessions.len(), known.len(), kept.len()]
                     .iter()
                     .all(|n| *n <= presence::MAX)
-                && sessions.iter().all(|s| s.valid(&peer.short))
-                && known.iter().chain(kept).all(|a| own(&peer.short, a))
+                && sessions
+                    .iter()
+                    .all(|s| s.valid(&peer.short, peer.kind == MemberKind::Cloud))
+                && known.iter().chain(kept).all(|a| own(&peer.short, a));
+            check(ok, "presence")
         }
-        _ => false,
+        Frame::ShareGrant { .. } => {
+            crate::streams::grant_ok(f, peer, &daemon.identity.key, ipc::now() as i64)
+        }
+        _ => Err("not served"),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_ack_without_a_limit_reads_as_none_and_one_with_it_round_trips() {
+        let old: Frame =
+            serde_json::from_str(r#"{"t":"ack","id":"i","state":"refused","reason":"loop"}"#)
+                .unwrap();
+        assert!(matches!(old, Frame::Ack { limit: None, .. }));
+        let f = Frame::Ack {
+            id: "i".into(),
+            state: "refused".into(),
+            reason: Some("loop".into()),
+            limit: Some(mail::RATE.into()),
+        };
+        let text = serde_json::to_string(&f).unwrap();
+        assert!(text.contains(r#""limit":"rate""#), "{text}");
+        assert_eq!(serde_json::from_str::<Frame>(&text).unwrap(), f);
+        let stored = Frame::Ack {
+            id: "i".into(),
+            state: "stored".into(),
+            reason: None,
+            limit: None,
+        };
+        assert!(!serde_json::to_string(&stored).unwrap().contains("limit"));
+    }
 
     #[tokio::test]
     async fn frames_round_trip_and_cap_at_one_mib() {

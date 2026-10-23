@@ -1,0 +1,241 @@
+//! The engine in process: what the Lightbulb bridge links against. An embedded instance is one
+//! `kind: cloud` member, a Lightbulb workspace, whose declared sessions are the workspace's
+//! agents (`cloud.sessions.set`). It opens no socket, installs no launchd job or hooks and
+//! raises no dialog; otherwise it is the daemon: `boot` is the one start path both share.
+
+use crate::config::Config;
+use crate::daemon::ipc::{Caller, Request, Response, BAD_REQUEST, INTERNAL};
+use crate::daemon::{ipc, net_ops, Cloud, Daemon, TeamState};
+use crate::identity::Identity;
+use crate::roster::{self, MemberKind};
+use crate::sessions::{self, Key};
+use crate::store::Store;
+use crate::{dialog, mail, net, presence, Result};
+use iroh::RelayUrl;
+use serde_json::{json, Value};
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use tokio::sync::broadcast;
+
+pub struct EmbedOpts {
+    /// Always `Cloud`: an instance is a workspace's member.
+    pub kind: MemberKind,
+    /// The relay this instance uses (`config.toml: relay` for a computer).
+    pub relay: Option<RelayUrl>,
+    /// Where our signed relay list comes from (`config.toml: issuer`).
+    pub issuer: String,
+    /// Where `Instance::shutdown` leaves a final copy of `state.db`, if anywhere.
+    pub snapshot: Option<PathBuf>,
+    /// The workspace's display name: the name it joins as, and its solo network's.
+    pub name: String,
+}
+
+/// A running instance. Dropping it without `shutdown` closes its endpoint all the same (no
+/// final snapshot); its home is free once the last of its tasks ends.
+pub struct Instance {
+    daemon: Arc<Daemon>,
+    net: net::Net,
+    snapshot: Option<PathBuf>,
+    /// Set by `shutdown`: nothing is left for `drop` to close.
+    closed: bool,
+}
+
+/// Starts the instance whose state is `home` (made 0700 if missing): the daemon's roster,
+/// transport and outbox, with `opts`' relay and issuer and no LAN discovery. `Err` while
+/// another engine (instance or daemon) holds `home`.
+pub async fn start(home: &Path, opts: EmbedOpts) -> Result<Instance> {
+    if opts.kind != MemberKind::Cloud {
+        return Err("an embedded instance is a workspace's cloud member".into());
+    }
+    std::fs::create_dir_all(home)?;
+    std::fs::set_permissions(home, std::fs::Permissions::from_mode(0o700))?;
+    if let Some(p) = &opts.snapshot {
+        if !p.to_str().is_some_and(|s| net_ops::outside(home, s)) {
+            return Err(
+                "the snapshot path must be absolute and outside the instance's home".into(),
+            );
+        }
+    }
+    let lock = crate::daemon::lock_dir(home, false)?;
+    // An instance's computer is its workspace, never the host it runs on: the name lands in
+    // every peer's roster.
+    let config = Config {
+        computer: opts.name.clone(),
+        issuer: opts.issuer,
+        relay: opts.relay.map(|u| u.to_string()),
+        lan: false,
+        ..Config::load(home)?
+    };
+    let (daemon, net) = boot(home, config, Some((opts.name, lock))).await?;
+    Ok(Instance {
+        daemon,
+        net,
+        snapshot: opts.snapshot,
+        closed: false,
+    })
+}
+
+/// The start path the daemon and an instance share, under `dir`'s lock (the caller's):
+/// identity, store, the solo genesis on first start, the team, the transport and the presence
+/// sender. A `cloud` instance (its workspace's name, and the home lock it keeps) has no
+/// dialogs and declares its sessions; a computer's are its agents' (`claude_home`).
+pub(crate) async fn boot(
+    dir: &Path,
+    config: Config,
+    cloud: Option<(String, std::fs::File)>,
+) -> Result<(Arc<Daemon>, net::Net)> {
+    let (cloud, home_lock) = cloud.unzip();
+    let identity = Identity::load_or_create(dir)?;
+    let store = Store::open(&dir.join("state.db"))?;
+    let now = ipc::now() as i64;
+    // The solo network's genesis, written once: a computer that has a roster keeps it.
+    let mut entries = roster::entries(&store)?;
+    if entries.is_empty() {
+        let g = net_ops::solo_genesis(&identity, cloud.as_deref(), &config.computer, now);
+        roster::accept(&store, &g, now)?;
+        entries.push(g);
+    }
+    let mut roster = roster::replay(&entries);
+    roster.lapse(now);
+    let mut team = TeamState {
+        roster,
+        config: Config::default(),
+        off: vec![],
+    };
+    let off = crate::daemon::canonical_off(&config);
+    team.set_config(config, off);
+    net_ops::sync_team_row(&store, &roster::Roster::default(), &team.roster)?;
+    let latest = presence::load(&store);
+    let peers = net::Peers::default();
+    let (dialogs, answers) = if cloud.is_some() {
+        dialog::Queue::headless()
+    } else {
+        let (q, a) = dialog::Queue::new(peers.knobs().osascript.clone());
+        q.set_knob(peers.knobs().dialog.clone());
+        (q, a)
+    };
+    // An instance has no agents of its own to discover: its state dir holds no `.claude`.
+    let claude_home = match cloud {
+        Some(_) => dir.to_path_buf(),
+        None => (cfg!(debug_assertions)
+            .then(|| std::env::var_os("LIGHTBULB_CONNECT_CLAUDE_HOME"))
+            .flatten())
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)
+        .ok_or("no home directory")?,
+    };
+    let daemon = Arc::new(Daemon {
+        dir: dir.to_path_buf(),
+        store: Mutex::new(store),
+        identity,
+        team: Mutex::new(team),
+        claude_home,
+        events: broadcast::channel(256).0,
+        shutdown: Default::default(),
+        mail: Default::default(),
+        mailbox_locks: Mutex::default(),
+        push_failed: Mutex::default(),
+        peers,
+        dialogs,
+        dialog_answers: Mutex::new(Some(answers)),
+        admissions: Mutex::default(),
+        roster_changed: Default::default(),
+        joining: tokio::sync::Mutex::new(()),
+        presence: Default::default(),
+        built: Mutex::default(),
+        latest: Mutex::new(latest),
+        streams: Default::default(),
+        cloud: cloud.map(Cloud::new),
+        home_lock,
+    });
+    // No join connection outlives a restart: its open requests are over.
+    daemon.store.lock().unwrap().expire_joins(i64::MAX, now)?;
+    let net = net::Net::start(daemon.clone()).await?;
+    tokio::spawn(presence::run(daemon.clone()));
+    Ok((daemon, net))
+}
+
+impl Instance {
+    /// One IPC op (`{id, op, ...}`, as on the socket), answered in process. Every person-only
+    /// op is refused (`bad_request`, reason `not_a_person`) but `team.join` as the workspace's
+    /// cloud member (with its proof) and `team.leave`: the caller is the bridge, acting for a
+    /// workspace admin who confirmed in the app. `inbox {session}` takes a declared session's
+    /// mail as Task 10's records, read. `app.send`, `app.inbox` and `app.receipt` carry a
+    /// hosted app's call to its person's own computer (`app_send`); `decision.send` carries a
+    /// person's tap on a hold notice back to the holding computer (`decision`).
+    pub async fn call(&self, req: Value) -> Value {
+        let id = req["id"].as_u64().unwrap_or(0);
+        json!(match serde_json::from_value::<Request>(req) {
+            Ok(r) => ipc::op(id, &r.op, &r.body, &self.daemon, Caller::Instance).await,
+            Err(_) => Response::err(id, BAD_REQUEST),
+        })
+    }
+
+    /// Every event a socket subscriber gets (`message`, `held`, `hold_closed`,
+    /// `receipt_changed`, `member_removed`, `stream_*`, …), and an instance's own
+    /// (`hold_notice`, `decision_result`: `decision`), from now on.
+    pub fn events(&self) -> broadcast::Receiver<Value> {
+        self.daemon.events.subscribe()
+    }
+
+    /// Closes the endpoint and waits (up to 5 s) for the instance's tasks to end with it, then
+    /// leaves the final snapshot. The home is free when this returns, unless a task outlived
+    /// the wait.
+    pub async fn shutdown(mut self) {
+        self.closed = true;
+        let _ = self.daemon.events.send(json!({ "event": "shutdown" }));
+        self.net.close().await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        // Ours and the endpoint's hold the daemon; any other is a task still running.
+        let running = |i: &Instance| !i.net.idle() || Arc::strong_count(&i.daemon) > 2;
+        while running(&self) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        if let Some(p) = &self.snapshot {
+            if let Err(e) = self.daemon.store.lock().unwrap().snapshot(p) {
+                eprintln!("snapshot: {e}");
+            }
+        }
+    }
+}
+
+/// A dropped instance (a panic, a cancelled future) shuts down too: its endpoint is closed in
+/// the background, and its tasks, which hold the daemon and so the home lock, end with it.
+impl Drop for Instance {
+    fn drop(&mut self) {
+        if self.closed {
+            return;
+        }
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            let net = self.net.clone();
+            rt.spawn(async move { net.close().await });
+        }
+    }
+}
+
+/// `inbox {session}` -> `{messages}`: takes what waits for declared session `session` (a
+/// name), each marked read: the bridge hands it to that agent's turn.
+pub(crate) fn inbox(id: u64, body: &Value, d: &Daemon) -> Response {
+    let Some(name) = body["session"].as_str().filter(|n| sessions::valid_name(n)) else {
+        return Response::err(id, BAD_REQUEST);
+    };
+    match take_read(d, &Key(format!("{}/{name}", d.identity.short))) {
+        Ok(messages) => Response::ok(id, json!({ "messages": messages })),
+        Err(_) => Response::err(id, INTERNAL),
+    }
+}
+
+/// Takes what waits for `key`, each marked read, as Task 10's records (`ipc::INBOX_RECORD`).
+pub(crate) fn take_read(d: &Daemon, key: &Key) -> Result<Vec<Value>> {
+    let taken = {
+        let store = d.store.lock().unwrap();
+        let m = mail::take(&store, key, ipc::now())?;
+        m.iter().try_for_each(|m| mail::mark_read(&store, &m.id))?;
+        m
+    };
+    Ok(ipc::records(d, &taken)
+        .iter()
+        .map(ipc::inbox_record)
+        .collect())
+}

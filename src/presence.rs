@@ -2,7 +2,7 @@
 //! on change; the latest from each member (in memory, `peers_sessions` its copy across
 //! restarts); and the `directory` op that merges both.
 
-use crate::daemon::{ipc, Daemon};
+use crate::daemon::{ipc, Daemon, Declared};
 use crate::mail;
 use crate::net::frames::{Frame, Remote, STATUSES};
 use crate::roster::{Member, MemberKind, Role, Roster};
@@ -39,6 +39,15 @@ pub struct Latest {
     pub kept: Vec<String>,
 }
 
+/// The `agent` every member's latest presence declares, by session id (a workspace member's:
+/// `Friday`). One look per batch of labels.
+pub fn declared_agents(d: &Daemon) -> HashMap<String, String> {
+    let latest = d.latest.lock().unwrap();
+    let all = latest.values().flat_map(|l| &l.sessions);
+    all.map(|s| (s.session_id.clone(), s.agent.clone()))
+        .collect()
+}
+
 /// The stored presences, by member (read at daemon start).
 pub fn load(store: &Store) -> HashMap<String, Latest> {
     let rows = store.peers_presence().unwrap_or_default();
@@ -70,9 +79,9 @@ pub fn my_person(d: &Daemon, r: &Roster) -> String {
     r.person_of(&d.identity.key).to_string()
 }
 
-/// `s` as published: `folder` is `cwd`'s last part, or all of it with `share_paths`.
+/// `s` as published: `folder` is `cwd`'s last part, or all of it with `share_paths`; repo and
+/// branch as its hook reported them.
 fn remote(s: &Session, share_paths: bool) -> Remote {
-    let (repo, branch) = crate::mcp::git(&s.cwd);
     let folder = if share_paths {
         s.cwd.clone()
     } else {
@@ -84,8 +93,8 @@ fn remote(s: &Session, share_paths: bool) -> Remote {
     Remote {
         session_id: s.key.0.clone(),
         agent: s.provider.clone(),
-        repo,
-        branch,
+        repo: s.repo.clone(),
+        branch: s.branch.clone(),
         folder,
         status: STATUSES[usize::from(s.status != Status::Live)].into(),
         doing: s.doing.clone(),
@@ -95,9 +104,16 @@ fn remote(s: &Session, share_paths: bool) -> Remote {
     .clamp()
 }
 
-/// `p` resolved (symlinks, `..`), else as given; lowercased on macOS, whose volumes ignore case.
-fn canonical(p: &Path) -> PathBuf {
-    let p = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+/// Whether `cwd` is under one of `off` (`folders_off`, each `canonical`). A string compare, no
+/// filesystem call: a hook reports its cwd resolved (`resolved`), in the agent's process,
+/// which has the folder access the person gave it.
+pub(crate) fn hidden(off: &[PathBuf], cwd: &str) -> bool {
+    let cwd = lower(PathBuf::from(cwd));
+    off.iter().any(|o| cwd.starts_with(o))
+}
+
+/// `p` lowercased on macOS, whose volumes ignore case.
+pub(crate) fn lower(p: PathBuf) -> PathBuf {
     if cfg!(target_os = "macos") {
         PathBuf::from(p.to_string_lossy().to_lowercase())
     } else {
@@ -105,26 +121,42 @@ fn canonical(p: &Path) -> PathBuf {
     }
 }
 
+/// `p` resolved (symlinks, `..`); a path that does not exist (a deleted folder) is its nearest
+/// existing parent resolved, then the rest as given.
+pub fn resolved(p: &Path) -> PathBuf {
+    p.ancestors()
+        .find_map(|a| {
+            let rest = p.strip_prefix(a).ok()?;
+            Some(std::fs::canonicalize(a).ok()?.join(rest))
+        })
+        .unwrap_or_else(|| p.to_path_buf())
+}
+
+/// `resolved`, lowercased on macOS: how `folders_off` holds a folder.
+pub(crate) fn canonical(p: &Path) -> PathBuf {
+    lower(resolved(p))
+}
+
 /// This computer's presence: its live sessions (newest first), the non-live addresses still
 /// holding mail (`known`, newest mail first) and the kept ones (`kept`, newest first); nothing
 /// whose folder is under `folders_off`, nor an address whose folder it does not know.
+/// An embedded instance's is the sessions it declared (`declared`).
 fn build(d: &Daemon, seq: u64) -> Frame {
+    if let Some(c) = &d.cloud {
+        return declared(d, &c.declared(), seq);
+    }
     let now = ipc::now();
     let (share, off) = {
         let t = d.team.lock().unwrap();
-        (t.config.share_paths, t.config.folders_off.clone())
+        (t.config.share_paths, t.off.clone())
     };
-    let off: Vec<PathBuf> = off.iter().map(|o| canonical(o)).collect();
-    let publishable = |cwd: &str| {
-        off.is_empty() || {
-            let cwd = canonical(Path::new(cwd));
-            !off.iter().any(|o| cwd.starts_with(o))
-        }
-    };
+    let publishable = |cwd: &str| !hidden(&off, cwd);
     let mut live = ipc::live_sessions(d);
     let (rows, ended, waiting) = {
         let store = d.store.lock().unwrap();
         let since = now.saturating_sub(DAY) as i64;
+        let live_keys = live.iter().map(|s| s.key.0.as_str()).collect();
+        let _ = store.prune_hidden(since, &live_keys);
         (
             store.sessions().unwrap_or_default(),
             store.ended_since(since).unwrap_or_default(),
@@ -139,7 +171,13 @@ fn build(d: &Daemon, seq: u64) -> Frame {
         .filter(|(k, _, cwd)| k.starts_with(&mine) && publishable(cwd))
         .collect();
     candidates.sort_by_key(|(_, at, _)| std::cmp::Reverse(*at));
-    live.retain(|s| publishable(&s.cwd));
+    // A session whose register a hidden folder refused has no row, but Claude's own file may
+    // still name it (its folder spelled another way): its mark keeps that discovery from
+    // teammates too (`hidden`). The mark is cleared by its next register, so after `folder
+    // on` it stays hidden until its next hook event, or pruned a day after its last renewal
+    // once no live session carries it; a discovery that never registered is matched by
+    // Claude's cwd as given.
+    live.retain(|s| !s.hidden);
     live.sort_by_key(|s| std::cmp::Reverse(s.birth_micros));
     live.truncate(MAX);
     let live_keys: HashSet<&str> = live.iter().map(|s| s.key.0.as_str()).collect();
@@ -221,44 +259,82 @@ fn stamp(f: &mut Frame) {
     }
 }
 
-/// The sender: on a local change (`Daemon::presence`, coalesced over 250 ms) or every 5 s,
-/// at most once a second and only while a member is online, builds this computer's presence
-/// and sends it to every online member when it changed, and every 60 s regardless.
+/// An embedded instance's presence: the sessions it declared (`cloud.sessions.set`), nothing
+/// else.
+fn declared(d: &Daemon, list: &Declared, seq: u64) -> Frame {
+    Frame::Presence {
+        member: d.identity.key.clone(),
+        seq,
+        sessions: list.sessions.to_vec(),
+        known: vec![],
+        kept: vec![],
+    }
+}
+
+/// The sender, the only one: on a local change (`Daemon::presence`, coalesced over 250 ms) or
+/// every 5 s, at most once a second and only while a member is online, builds this computer's
+/// presence and sends it to every online member when it changed, and every 60 s regardless.
+/// On an instance, each pass then reports the declared version it handed on (`Cloud::sent`),
+/// which `cloud.sessions.set` waits for. Ends with the endpoint (started after it).
 pub async fn run(d: Arc<Daemon>) {
+    let Some(ep) = d.peers.endpoint.get().cloned() else {
+        return;
+    };
     let (mut built_at, mut sent_at): (Option<Instant>, Option<Instant>) = (None, None);
     loop {
         tokio::select! {
             _ = d.presence.notified() => tokio::time::sleep(COALESCE).await,
             _ = tokio::time::sleep(TICK) => {}
+            _ = ep.closed() => return,
         }
-        if d.peers.online().is_empty() {
-            continue;
+        let list = d.cloud.as_ref().map(|c| c.declared());
+        send_once(&d, list.as_ref(), &mut built_at, &mut sent_at).await;
+        if let (Some(c), Some(l)) = (&d.cloud, list) {
+            c.sent.send_replace(l.version);
         }
-        if let Some(at) = built_at {
-            tokio::time::sleep(GAP.saturating_sub(at.elapsed())).await;
-        }
-        built_at = Some(Instant::now());
-        let d2 = d.clone();
-        let Ok(mut f) = tokio::task::spawn_blocking(move || build(&d2, 0)).await else {
-            continue;
-        };
-        let unchanged = d
-            .built
-            .lock()
-            .unwrap()
-            .as_ref()
-            .is_some_and(|b| same(b, &f));
-        *d.built.lock().unwrap() = Some(f.clone());
-        if unchanged && sent_at.is_some_and(|at| at.elapsed() < RESEND) {
-            continue;
-        }
-        // Stamped at send, after the store: a later send (here or a hello's) carries a later seq.
-        stamp(&mut f);
-        for m in d.peers.online() {
-            let _ = d.peers.send(&m, f.clone());
-        }
-        sent_at = Some(Instant::now());
     }
+}
+
+/// One pass of `run`: an instance's presence is its `list`.
+async fn send_once(
+    d: &Arc<Daemon>,
+    list: Option<&Declared>,
+    built_at: &mut Option<Instant>,
+    sent_at: &mut Option<Instant>,
+) {
+    if d.peers.online().is_empty() {
+        return;
+    }
+    if let Some(at) = *built_at {
+        tokio::time::sleep(GAP.saturating_sub(at.elapsed())).await;
+    }
+    *built_at = Some(Instant::now());
+    let mut f = match list {
+        Some(l) => declared(d, l, 0),
+        None => {
+            let d2 = d.clone();
+            match tokio::task::spawn_blocking(move || build(&d2, 0)).await {
+                Ok(f) => f,
+                Err(_) => return,
+            }
+        }
+    };
+    let unchanged = d
+        .built
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|b| same(b, &f));
+    *d.built.lock().unwrap() = Some(f.clone());
+    if unchanged && sent_at.is_some_and(|at| at.elapsed() < RESEND) {
+        return;
+    }
+    // Stamped at send, after the store: a later send (here or a hello's) carries a later seq.
+    stamp(&mut f);
+    for m in d.peers.online() {
+        let _ = d.peers.send(&m, f.clone());
+    }
+    *sent_at = Some(Instant::now());
 }
 
 /// Takes `l` as `member`'s latest unless the one held is as new (`seq`), or always with
@@ -362,11 +438,14 @@ pub fn claim(d: &Daemon, key: &str) -> bool {
 }
 
 /// A directory record (architecture §9); `cwd` is empty for another computer's session.
-fn record(m: &Member, me: &str, s: &Remote, cwd: &str) -> Value {
+/// `verified` as its label says it (`label::verified`); `online`, whether its computer is
+/// connected now (this one always is).
+fn record(m: &Member, me: &str, s: &Remote, cwd: &str, verified: bool, online: bool) -> Value {
     json!({
         "session_id": s.session_id,
         "person": m.name,
-        "person_verified": m.proof.is_some(),
+        "person_id": m.person_id,
+        "person_verified": verified,
         "computer": m.computer,
         "agent": s.agent,
         "cwd": cwd,
@@ -374,16 +453,31 @@ fn record(m: &Member, me: &str, s: &Remote, cwd: &str) -> Value {
         "branch": s.branch,
         "status": s.status,
         "doing": s.doing.clone().unwrap_or_default(),
+        "title": s.title,
         "tier": s.tier,
+        "online": online,
         "can_send": true,
         "needs_owner_ok": m.person_id != me,
     })
 }
 
 /// `directory {query?}` -> `{sessions}`: this computer's sessions, then every member's latest
-/// presence; `query` matches session id, person, computer, agent, repo or folder, any case.
+/// presence; `query` matches session id, person, computer, agent, folder (and this computer's
+/// full path), repo, branch, what it is doing or its title, any case.
 pub fn directory(d: &Daemon, query: Option<&str>) -> Value {
-    let local = ipc::live_sessions(d);
+    // This computer's, with their folders; an instance's are the sessions it declared.
+    let local: Vec<(Remote, String, Option<String>, bool)> = match &d.cloud {
+        Some(c) => c
+            .declared()
+            .sessions
+            .iter()
+            .map(|r| (r.clone(), String::new(), None, false))
+            .collect(),
+        None => ipc::live_sessions(d)
+            .iter()
+            .map(|s| (remote(s, false), s.cwd.clone(), s.handle.clone(), s.hidden))
+            .collect(),
+    };
     let remote_ones = stored(d);
     let (me, own) = {
         let t = d.team.lock().unwrap();
@@ -403,24 +497,38 @@ pub fn directory(d: &Daemon, query: Option<&str>) -> Value {
         (my_person(d, &t.roster), own)
     };
     let q = query.map(str::to_lowercase).filter(|q| !q.is_empty());
-    let hit = |m: &Member, s: &Remote| {
+    let hit = |m: &Member, s: &Remote, cwd: &str| {
         q.as_ref().is_none_or(|q| {
             [&s.session_id, &m.name, &m.computer, &s.agent, &s.folder]
                 .into_iter()
-                .chain(s.repo.as_ref())
+                .map(String::as_str)
+                .chain(
+                    [&s.repo, &s.branch, &s.doing, &s.title]
+                        .into_iter()
+                        .flatten()
+                        .map(String::as_str),
+                )
+                .chain([cwd])
                 .any(|f| f.to_lowercase().contains(q))
         })
     };
+    let key = &d.identity.key;
     let mut out = vec![];
-    for s in &local {
-        let r = remote(s, false);
-        if hit(&own, &r) {
-            out.push(record(&own, &me, &r, &s.cwd));
+    for (r, cwd, handle, hidden) in &local {
+        if hit(&own, r, cwd) {
+            let mut v = record(&own, &me, r, cwd, true, true);
+            // `who --all`'s name for it (the MCP server leaves it out).
+            v["handle"] = handle.clone().into();
+            if *hidden {
+                v["hidden"] = true.into();
+            }
+            out.push(v);
         }
     }
     for (m, l) in &remote_ones {
-        for r in l.sessions.iter().filter(|r| hit(m, r)) {
-            out.push(record(m, &me, r, ""));
+        let (verified, up) = (crate::label::verified(m, key), d.peers.is_online(&m.key));
+        for r in l.sessions.iter().filter(|r| hit(m, r, "")) {
+            out.push(record(m, &me, r, "", verified, up));
         }
     }
     json!({ "sessions": out })

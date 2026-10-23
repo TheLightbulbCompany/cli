@@ -1,10 +1,12 @@
 //! What the CLI and network test files share: a temp state dir and HOME, a daemon shut down
 //! on drop, a person's shell (`detached`) and socket client (`person`), the daemon env knobs,
 //! a two-member team seeded before start, and a member played by the test (`Peer`).
-//! ponytail: only `cli.rs`, `team_cli.rs`, `net_two.rs`, `join.rs`, `ui_claim.rs`, `dialog.rs`,
+//! ponytail: only `cli.rs`, `team_cli.rs`, `net_two.rs`, `join.rs`, `ui_claim.rs`, `dialog.rs`, `signin.rs`,
 //! `directory.rs` and `envelope.rs` use it;
 //! the other test files keep their own copies.
 #![allow(dead_code)]
+
+pub mod issuer;
 
 use iroh::endpoint::{presets, Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, PublicKey, SecretKey};
@@ -41,7 +43,7 @@ impl Env {
     }
 
     /// `c` with this env's state dir, Claude home, HOME and user, launchctl off.
-    fn base_cmd(&self, mut c: Command) -> Command {
+    pub fn base_cmd(&self, mut c: Command) -> Command {
         c.env("LIGHTBULB_CONNECT_HOME", self.state.path())
             .env("LIGHTBULB_CONNECT_CLAUDE_HOME", self.home.path())
             .env("LIGHTBULB_CONNECT_NO_LAUNCHCTL", "1")
@@ -69,8 +71,15 @@ impl Env {
 
     /// Starts `lightbulb-connect daemon` on this state dir with `lan` (mDNS) and `config` as
     /// `config.toml`, and `env` set, and waits until it answers.
+    /// Unless `config` names an issuer, a closed port's: no test reaches ours (nor fetches our
+    /// relay list).
     pub fn daemon(&self, lan: bool, config: &str, env: &[(&str, String)]) {
-        let config = format!("lan = {lan}\n{config}");
+        let issuer = if config.contains("issuer") {
+            ""
+        } else {
+            "issuer = \"http://127.0.0.1:9/connect\"\n"
+        };
+        let config = format!("lan = {lan}\n{issuer}{config}");
         std::fs::write(self.state.path().join("config.toml"), config).unwrap();
         let log = std::fs::File::create(self.state.path().join("daemon.log")).unwrap();
         let mut c = self.base_cmd(Command::new(EXE));
@@ -80,6 +89,8 @@ impl Env {
             .env("LIGHTBULB_CONNECT_DIALOG", "")
             .env_remove("LIGHTBULB_CONNECT_PEERS")
             .env_remove("LIGHTBULB_CONNECT_DEBUG_PROTOCOL")
+            .env_remove("LIGHTBULB_CONNECT_DEBUG_RELAY_KEYS")
+            .env_remove("LIGHTBULB_CONNECT_DEBUG_RELAY_ONLY")
             .envs(env.iter().map(|(k, v)| (k, v)))
             .stdin(Stdio::null());
         if env
@@ -227,17 +238,132 @@ pub fn seed_pair(a: &Env, b: &Env) -> [Entry; 2] {
     let seeded = seed_team(a, b);
     for (env, other) in [(a, b), (b, a)] {
         let key = other.identity().key;
-        policy::set(
-            &env.store(),
-            None,
-            &key,
-            policy::Verdict::Accept,
-            "local",
-            1,
-        )
-        .unwrap();
+        let accept = policy::Verdict::Accept;
+        policy::set_person(&env.store(), &key, accept, "local", 1).unwrap();
     }
     seeded
+}
+
+/// `who` admitted by `by` after `parent` as `name` (its computer too), a computer member of
+/// its own person, with `extra`'s fields over those.
+pub fn admit(by: &Identity, parent: &Entry, who: &Identity, name: &str, extra: Value) -> Entry {
+    let mut body = json!({"member": who.key, "name": name, "computer": name,
+        "person_id": who.key, "kind": "computer", "role": "member"});
+    for (k, v) in extra.as_object().expect("an object") {
+        body[k] = v.clone();
+    }
+    Entry::signed(by, vec![parent.hash()], Kind::Admit, body, 2)
+}
+
+/// `who`'s computer proof (`issuer::computer_proof`), issued now: person `sub` called `name`,
+/// signed into workspace `ws` (named for its id) if any.
+pub fn person_proof(who: &Identity, sub: &str, name: &str, ws: Option<&str>) -> String {
+    issuer::computer_proof(&who.key, sub, name, ws.map(|w| (w, w)), now_s())
+}
+
+/// `who`'s workspace proof (`issuer::workspace_proof`) for workspace `ws` called `name`, with
+/// no agents, issued now.
+pub fn ws_proof(who: &Identity, ws: &str, name: &str) -> String {
+    issuer::workspace_proof(&who.key, ws, name, &[], now_s())
+}
+
+/// `LIGHTBULB_CONNECT_PEERS` is read from this process's environment when an instance starts:
+/// one start at a time.
+static STARTING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// An embedded instance on `home`, workspace `name`, with issuer `issuer`, that dials `envs`
+/// at their running daemons, leaving a final snapshot at `snapshot` on shutdown; `knobs` are
+/// set while it starts (its knobs are read then).
+pub async fn instance(
+    home: &std::path::Path,
+    envs: &[&Env],
+    name: &str,
+    issuer: &str,
+    snapshot: Option<&std::path::Path>,
+    knobs: &[(&str, String)],
+) -> lightbulb_connect::Result<lightbulb_connect::embed::Instance> {
+    let _one = STARTING.lock().await;
+    let knobs: Vec<(&str, String)> = [peers(envs)]
+        .into_iter()
+        .chain(knobs.iter().cloned())
+        .collect();
+    for (k, v) in &knobs {
+        std::env::set_var(k, v);
+    }
+    let opts = lightbulb_connect::embed::EmbedOpts {
+        kind: roster::MemberKind::Cloud,
+        relay: None,
+        issuer: issuer.into(),
+        snapshot: snapshot.map(std::path::Path::to_path_buf),
+        name: name.into(),
+    };
+    let i = lightbulb_connect::embed::start(home, opts).await;
+    for (k, _) in &knobs {
+        std::env::remove_var(k);
+    }
+    i
+}
+
+/// Instance `i`'s answer to `op` with `body`.
+pub async fn call(i: &lightbulb_connect::embed::Instance, op: &str, body: Value) -> Value {
+    let mut req = body;
+    req["id"] = 1.into();
+    req["op"] = op.into();
+    i.call(req).await
+}
+
+/// Waits (up to 10 s) until instance `i` has `n` members online.
+pub async fn online(i: &lightbulb_connect::embed::Instance, n: u64) {
+    for _ in 0..500 {
+        if call(i, "status", json!({})).await["peers"]["online"] == n {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("{n} online");
+}
+
+/// `who` played by the test, dialing instance `i` on the member ALPN, `hello` sent.
+pub async fn dial_instance(
+    i: &lightbulb_connect::embed::Instance,
+    who: &Identity,
+) -> (Peer, Endpoint) {
+    let key = call(i, "identity.get", json!({})).await["member_key"].clone();
+    let port = call(i, "status", json!({})).await["port"].as_u64().unwrap();
+    let key = PublicKey::from_bytes(&identity::key_bytes(key.as_str().unwrap()).unwrap()).unwrap();
+    let addr = EndpointAddr::new(key).with_ip_addr(format!("127.0.0.1:{port}").parse().unwrap());
+    let ep = endpoint(who).await;
+    let conn = ep.connect(addr, ALPN).await.unwrap();
+    let (send, recv) = conn.open_bi().await.unwrap();
+    let mut p = Peer { conn, send, recv };
+    p.hello(vec![]).await;
+    (p, ep)
+}
+
+/// `<short>/codex:<conv>` on `e`.
+pub fn session(e: &Env, conv: &str) -> String {
+    format!("{}/codex:{conv}", e.short())
+}
+
+/// Unix seconds.
+pub fn now_s() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+/// `e`'s invite link of `mode` (`team.invite`): its ticket.
+pub fn invite(e: &Env, mode: &str) -> String {
+    let r = e.ask(json!({"id": 1, "op": "team.invite", "mode": mode}));
+    assert_eq!(r["ok"], true, "{r}");
+    r["ticket"].as_str().unwrap().into()
+}
+
+/// `e`'s members (`team.get`).
+pub fn members(e: &Env) -> Vec<Value> {
+    let r = e.ask(json!({"id": 1, "op": "team.get"}));
+    r["members"].as_array().unwrap().clone()
 }
 
 /// The same team in both stores before either daemon starts: `a` founds "acme" (computer
@@ -245,14 +371,7 @@ pub fn seed_pair(a: &Env, b: &Env) -> [Entry; 2] {
 pub fn seed_team(a: &Env, b: &Env) -> [Entry; 2] {
     let (ia, ib) = (a.identity(), b.identity());
     let g = net_ops::genesis(&ia, "prasiddha", "mac", "acme", 1);
-    let admit = Entry::signed(
-        &ia,
-        vec![g.hash()],
-        Kind::Admit,
-        json!({"member": ib.key, "name": "bob", "computer": "mbp", "person_id": ib.key,
-               "kind": "computer", "role": "member"}),
-        2,
-    );
+    let admit = admit(&ia, &g, &ib, "bob", json!({"computer": "mbp"}));
     for env in [a, b] {
         let store = env.store();
         roster::accept(&store, &g, 10).unwrap();
@@ -457,4 +576,19 @@ pub fn sees(env: &Env, session_id: &str) -> bool {
         .into_iter()
         .flatten()
         .any(|s| s["session_id"] == session_id)
+}
+
+/// A member `who` played by the test, dialed in: `hello`, then `presence`.
+pub async fn played(who: &Identity, env: &Env) -> (Peer, Endpoint) {
+    let ep = endpoint(who).await;
+    let mut p = Peer::dial(&ep, env).await;
+    p.hello(vec![]).await;
+    p.presence().await;
+    (p, ep)
+}
+
+/// The one number `sql` selects from the database at `db`.
+pub fn count(db: &std::path::Path, sql: &str) -> i64 {
+    let c = rusqlite::Connection::open(db).unwrap();
+    c.query_row(sql, [], |r| r.get(0)).unwrap()
 }

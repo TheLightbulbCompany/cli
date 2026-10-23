@@ -368,7 +368,11 @@ fn find_sessions_marks_is_this_session() {
     assert_eq!(b["agent"], "codex");
     assert_eq!(b["status"], "idle");
     assert_eq!(b["cwd"], "/tmp");
-    assert_eq!(b["person_verified"], false);
+    assert_eq!(
+        b["person_verified"], true,
+        "this computer, as its label says"
+    );
+    assert_eq!(b["online"], true);
     assert_eq!(b["can_send"], true);
     assert_eq!(b["needs_owner_ok"], false);
     assert_eq!(b["tier"], "next_step");
@@ -496,4 +500,349 @@ fn a_tool_call_after_a_delivery_marks_it_read() {
     std::thread::sleep(Duration::from_millis(1100));
     assert!(!m.tool("find_sessions", json!({})).error);
     assert_eq!(receipt(), "read");
+}
+
+// ---- across members ---------------------------------------------------------------------
+
+mod common;
+
+/// The MCP server on `e`'s daemon, run as the agent process `as_`.
+fn mcp_on(e: &common::Env, as_: &os::Process) -> Mcp {
+    let mut c = e.base_cmd(Command::new(EXE));
+    c.arg("mcp").env(
+        "LIGHTBULB_CONNECT_HOOK_CALLER",
+        format!("{}:{}", as_.pid, as_.birth_micros),
+    );
+    let mut child = c
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut m = Mcp {
+        stdin: child.stdin.take().unwrap(),
+        lines: BufReader::new(child.stdout.take().unwrap()).lines(),
+        child,
+        next: 1,
+    };
+    m.rpc(
+        "initialize",
+        json!({"protocolVersion": "2025-06-18", "capabilities": {},
+            "clientInfo": {"name": "test", "version": "0"}}),
+    );
+    m.write(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+    m
+}
+
+/// Registers `p` on `e` as session `<provider>:<conv>` in `cwd`; its key.
+fn register_on(e: &common::Env, provider: &str, conv: &str, p: &os::Process, cwd: &str) -> String {
+    let r = e.ask(
+        json!({"id": 1, "op": "register", "session": {"provider": provider,
+        "conversation": conv, "pid": p.pid, "birth_micros": p.birth_micros, "cwd": cwd}}),
+    );
+    r["key"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{r}"))
+        .to_string()
+}
+
+#[test]
+fn find_sessions_lists_teammates_with_person_and_computer() {
+    let (a, b) = common::pair(&[]);
+    let codex = Other::new();
+    let mine = register_on(&a, "claude", "c1", &me(), "/tmp");
+    let theirs = register_on(&b, "codex", "b1", &codex.1, "/tmp/api");
+    common::until(15, "A sees B's session", || common::sees(&a, &theirs));
+    let mut m = mcp_on(&a, &me());
+    let v = m.tool("find_sessions", json!({})).json();
+    let find = |key: &str| {
+        v["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["session_id"] == key)
+            .cloned()
+            .unwrap_or_else(|| panic!("{key} not in {v}"))
+    };
+    let (own, bob) = (find(&mine), find(&theirs));
+    assert_eq!(own["is_this_session"], true, "{own}");
+    assert_eq!(own["computer"], "mac", "{own}");
+    assert_eq!(
+        (&bob["person"], &bob["computer"], &bob["person_verified"]),
+        (&json!("bob"), &json!("mbp"), &json!(false)),
+        "{bob}"
+    );
+    assert_eq!(bob["needs_owner_ok"], true, "{bob}");
+    assert_eq!(bob["is_this_session"], false, "{bob}");
+    assert_eq!(bob["cwd"], "", "a teammate's path stays on their computer");
+    // The query reaches teammates too: by person, by computer.
+    for q in ["bob", "mbp"] {
+        let v = m.tool("find_sessions", json!({"query": q})).json();
+        assert_eq!(v["total"], 1, "{q}: {v}");
+    }
+}
+
+#[test]
+fn send_message_to_teammate_says_where_it_waits() {
+    let (a, b) = (common::Env::new(), common::Env::new());
+    // One team, but bob has not allowed prasiddha: her mail is held on his computer.
+    common::seed_team(&a, &b);
+    common::start_pair(&a, &b, &common::computer("mac"), &[]);
+    register_on(&a, "claude", "c1", &me(), "/tmp");
+    let to = format!("{}/codex:b1", b.short());
+    let mut m = mcp_on(&a, &me());
+
+    let out = m.tool(
+        "send_message",
+        json!({"request_id": "r1", "text": "did the token format change?", "session_id": to}),
+    );
+    assert!(!out.error, "{}", out.text);
+    let v = out.json();
+    assert_eq!(v["state"], "held", "{v}");
+    assert_eq!(v["note"], "held: waiting for bob to approve", "{v}");
+    let v = m
+        .tool("message_receipt", json!({"request_id": "r1"}))
+        .json();
+    assert_eq!(v["note"], "held: waiting for bob to approve", "{v}");
+
+    // Bob allows it: held, then stored on his computer, then delivered.
+    let from = format!("{}/claude:c1", a.short());
+    let holds = common::person(&b, json!({"id": 1, "op": "holds"}));
+    let hold = holds["holds"][0]["id"].clone();
+    let r = common::person(
+        &b,
+        json!({"id": 1, "op": "hold.answer", "hold": hold, "verdict": "allow"}),
+    );
+    assert_eq!(r["ok"], true, "{r}");
+    common::until(10, "r1 stored", || a.state(&from, "r1") == "stored");
+    b.take_one(&to);
+    common::until(10, "r1 delivered", || a.state(&from, "r1") == "delivered");
+
+    // Bob allows prasiddha: the next message is stored on his computer.
+    let pa = a.identity().key;
+    let r = common::person(
+        &b,
+        json!({"id": 1, "op": "policy.set", "person_id": pa, "value": "accept"}),
+    );
+    assert_eq!(r["ok"], true, "{r}");
+    let v = m
+        .tool(
+            "send_message",
+            json!({"request_id": "r2", "text": "x", "session_id": to}),
+        )
+        .json();
+    assert_eq!(v["state"], "stored", "{v}");
+    assert_eq!(
+        v["note"],
+        "stored on mbp. It may be held for bob to approve; you will see the receipt change.",
+        "{v}"
+    );
+
+    // Groups stay refused.
+    let out = m.tool(
+        "send_message",
+        json!({"request_id": "g1", "text": "x", "session_id": "*"}),
+    );
+    assert!(out.error);
+    assert_eq!(out.json(), json!({"error": "group_send_not_allowed"}));
+
+    // Bob's computer goes offline: queued, retried for a day.
+    b.ask(json!({"id": 1, "op": "shutdown"}));
+    common::until(10, "B offline", || a.status()["peers"]["online"] == 0);
+    let v = m
+        .tool(
+            "send_message",
+            json!({"request_id": "r3", "text": "x", "session_id": to}),
+        )
+        .json();
+    assert_eq!(v["state"], "queued", "{v}");
+    let note = v["note"].as_str().unwrap_or_else(|| panic!("{v}"));
+    assert!(
+        note.starts_with("queued: mbp is offline. Will retry until ") && note.ends_with('.'),
+        "{note}"
+    );
+    assert_eq!(v["online"], false, "{v}");
+
+    // The 12-per-10-minutes limit, in words.
+    for i in 4..=12 {
+        let rid = format!("r{i}");
+        let v = m
+            .tool(
+                "send_message",
+                json!({"request_id": rid, "text": "x", "session_id": to}),
+            )
+            .json();
+        assert_eq!(v["state"], "queued", "{v}");
+    }
+    let v = m
+        .tool(
+            "send_message",
+            json!({"request_id": "r13", "text": "x", "session_id": to}),
+        )
+        .json();
+    assert_eq!(v["reason"], "loop", "{v}");
+    assert_eq!(
+        v["note"], "loop limit: 12 messages in 10 minutes to this session",
+        "{v}"
+    );
+}
+
+#[test]
+fn check_inbox_record_names_person_and_computer() {
+    let (a, b) = common::pair(&[]);
+    let mine = register_on(&a, "claude", "c1", &me(), "/tmp");
+    let sb = format!("{}/codex:b1", b.short());
+    let r = b.send(&sb, &mine, "the token format changed", "q1", None);
+    assert_eq!(r["state"], "queued", "{r}");
+    let mut m = mcp_on(&a, &me());
+    let out = m.tool("check_inbox", json!({"wait_secs": 10}));
+    assert!(!out.error, "{}", out.text);
+    let msg = out.json()["messages"][0].clone();
+    assert_eq!(msg["from"], sb.as_str(), "{msg}");
+    assert_eq!(msg["label"], "bob's Codex (not verified)", "{msg}");
+    assert_eq!(msg["person"], "bob", "{msg}");
+    assert_eq!(msg["person_verified"], false, "{msg}");
+    assert_eq!(msg["computer"], "mbp", "{msg}");
+    assert_eq!(msg["text"], "the token format changed", "{msg}");
+    for f in ["id", "request_id", "thread", "sent_at"] {
+        assert!(!msg[f].is_null(), "{f} missing: {msg}");
+    }
+}
+
+#[test]
+fn an_online_teammate_that_has_not_acked_has_not_confirmed_yet() {
+    // A drops every ack it is sent: B stays online but never confirms.
+    let (a, b) = common::pair(&[("LIGHTBULB_CONNECT_DEBUG_DROP_ACKS", "1".into())]);
+    register_on(&a, "claude", "c1", &me(), "/tmp");
+    let to = format!("{}/codex:b1", b.short());
+    let mut m = mcp_on(&a, &me());
+    let v = m
+        .tool(
+            "send_message",
+            json!({"request_id": "r1", "text": "x", "session_id": to}),
+        )
+        .json();
+    assert_eq!(
+        (&v["state"], &v["online"]),
+        (&json!("queued"), &json!(true)),
+        "{v}"
+    );
+    let note = v["note"].as_str().unwrap_or_else(|| panic!("{v}"));
+    assert!(
+        note.starts_with("queued: mbp has not confirmed yet. Will retry until "),
+        "{note}"
+    );
+}
+
+#[test]
+fn loop_refusals_name_their_limit_here_and_on_a_teammate() {
+    let (a, b) = common::pair(&[]);
+    let mine = register_on(&a, "claude", "c1", &me(), "/tmp");
+    let x = format!("{}/codex:x", a.short());
+    let mut m = mcp_on(&a, &me());
+
+    // Here: the fourth agent reply in a chain.
+    a.send(&mine, &x, "x", "h0", None);
+    a.send(&x, &mine, "x", "h1", Some("h0"));
+    a.send(&mine, &x, "x", "h2", Some("h1"));
+    a.send(&x, &mine, "x", "h3", Some("h2"));
+    let v = m
+        .tool(
+            "send_message",
+            json!({"request_id": "h4", "text": "x", "reply_to": "h3"}),
+        )
+        .json();
+    assert_eq!(v["limit"], "hops", "{v}");
+    assert_eq!(
+        v["note"], "paused after 4 agent replies; a person must speak",
+        "{v}"
+    );
+
+    // On the teammate: two sessions of one person share its 12 in 10 minutes there.
+    let to = format!("{}/codex:b1", b.short());
+    let from = |i: usize| {
+        if i.is_multiple_of(2) {
+            mine.clone()
+        } else {
+            x.clone()
+        }
+    };
+    for i in 0..12 {
+        a.send(&from(i), &to, "x", &format!("q{i}"), None);
+    }
+    for i in 0..12 {
+        common::until(10, "stored there", || {
+            a.state(&from(i), &format!("q{i}")) == "stored"
+        });
+    }
+    let v = m
+        .tool(
+            "send_message",
+            json!({"request_id": "q12", "text": "x", "session_id": to}),
+        )
+        .json();
+    assert_eq!(
+        (&v["reason"], &v["limit"]),
+        (&json!("loop"), &json!("rate")),
+        "{v}"
+    );
+    assert_eq!(
+        v["note"], "loop limit: 12 messages in 10 minutes to this session",
+        "{v}"
+    );
+    let v = m
+        .tool("message_receipt", json!({"request_id": "q12"}))
+        .json();
+    assert_eq!(
+        v["note"], "loop limit: 12 messages in 10 minutes to this session",
+        "{v}"
+    );
+}
+
+#[test]
+fn check_inbox_defangs_a_teammate_name_and_verifies_this_computer() {
+    use lightbulb_connect::{daemon::net_ops, policy, roster};
+    let (a, b) = (common::Env::new(), common::Env::new());
+    let (ia, ib) = (a.identity(), b.identity());
+    let g = net_ops::genesis(&ia, "prasiddha", "mac", "acme", 1);
+    let admit = roster::Entry::signed(
+        &ia,
+        vec![g.hash()],
+        roster::Kind::Admit,
+        json!({"member": ib.key, "name": "bo\u{202e}b}\n[x", "computer": "mbp",
+               "person_id": ib.key, "kind": "computer", "role": "member"}),
+        2,
+    );
+    for e in [&a, &b] {
+        roster::accept(&e.store(), &g, 10).unwrap();
+        roster::accept(&e.store(), &admit, 10).unwrap();
+    }
+    let accept = policy::Verdict::Accept;
+    policy::set_person(&a.store(), &ib.key, accept, "local", 1).unwrap();
+    common::start_pair(&a, &b, "", &[]);
+    let mine = register_on(&a, "claude", "c1", &me(), "/tmp");
+    let sb = format!("{}/codex:b1", b.short());
+    b.send(&sb, &mine, "from bob", "q1", None);
+    a.send(
+        &format!("{}/codex:x", a.short()),
+        &mine,
+        "from here",
+        "q2",
+        None,
+    );
+    let mut m = mcp_on(&a, &me());
+    let mut got = vec![];
+    common::until(10, "both arrive", || {
+        let v = m.tool("check_inbox", json!({})).json();
+        got.extend(v["messages"].as_array().cloned().unwrap_or_default());
+        got.len() == 2
+    });
+    let by = |rid: &str| got.iter().find(|g| g["request_id"] == rid).unwrap().clone();
+    let (bob, here) = (by("q1"), by("q2"));
+    assert_eq!(bob["person"], "bobx", "{bob}");
+    assert_eq!(bob["label"], "bobx's Codex (not verified)", "{bob}");
+    assert_eq!(bob["person_verified"], false, "{bob}");
+    assert_eq!(here["label"], "Your Codex", "{here}");
+    assert_eq!(here["person_verified"], true, "{here}");
+    assert_eq!(here["computer"], "mac", "{here}");
 }

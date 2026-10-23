@@ -10,7 +10,7 @@ use crate::Result;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-pub(super) fn configure(ctx: &Ctx, r: &mut AgentReport) -> Result<()> {
+pub(super) fn configure(ctx: &Ctx, r: &mut AgentReport) -> Result<Owner> {
     let dir = ctx.home.join(".codex");
     let hooks = dir.join("hooks.json");
     // Trust key -> the hash to trust, or None to drop the key.
@@ -42,6 +42,7 @@ pub(super) fn configure(ctx: &Ctx, r: &mut AgentReport) -> Result<()> {
     })?;
     r.notes.append(&mut shared);
     let config = dir.join("config.toml");
+    let mut fresh = false;
     let mut owner = Owner::Absent;
     edit_toml(&config, !ctx.remove, r, |doc| {
         let args = toml_edit::Array::from_iter(ctx.mcp_args());
@@ -58,7 +59,11 @@ pub(super) fn configure(ctx: &Ctx, r: &mut AgentReport) -> Result<()> {
                         "state",
                         true,
                     )?;
-                    toml_table(state, key, false)?["trusted_hash"] = toml_edit::value(hash);
+                    let t = toml_table(state, key, false)?;
+                    if t.get("trusted_hash").and_then(toml_edit::Item::as_str) != Some(hash) {
+                        t["trusted_hash"] = toml_edit::value(hash);
+                        fresh = true;
+                    }
                 }
                 None => {
                     if let Some(state) = doc
@@ -73,14 +78,8 @@ pub(super) fn configure(ctx: &Ctx, r: &mut AgentReport) -> Result<()> {
         }
         Ok(())
     })?;
-    if owner == Owner::Foreign {
-        r.notes.push(ctx.foreign_note(&config));
-    }
-    if !ctx.remove && !trust.is_empty() && r.wrote.contains(&config) {
-        r.notes
-            .push("Codex hooks trusted on your behalf (Codex would otherwise ask once)".into());
-    }
-    Ok(())
+    r.trusted |= fresh;
+    Ok(owner)
 }
 
 /// Codex's hook-trust hash: `{event_name, hooks: [hook]}` with keys sorted, compact JSON,

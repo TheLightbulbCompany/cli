@@ -11,6 +11,7 @@ use crate::dialog;
 use crate::identity::{self, Identity};
 use crate::net::frames::{self, Frame};
 use crate::net::{self, JOIN_ALPN};
+use crate::proof::{self, Proof, ProofKind};
 use crate::roster::{self, Collision, Entry, Kind, MemberKind, Role, Roster};
 use crate::store::{Join, Store};
 use crate::ticket::{self, Ticket};
@@ -19,6 +20,7 @@ use iroh::endpoint::{Connection, SendStream, VarInt};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::oneshot;
@@ -31,9 +33,15 @@ pub const NAME_TAKEN: &str = "name_taken";
 pub const KEY_COLLISION: &str = "key_collision";
 pub const UNREACHABLE: &str = "unreachable";
 pub const DECLINED: &str = "declined";
+/// A name or computer name with characters a dialog cannot show as they are (`fits`).
+pub const BAD_NAME: &str = "bad_name";
 pub const TOO_MANY: &str = "too_many_requests";
 /// The person did not answer within the wait: the candidate is told so and stops asking.
 pub const NOT_ANSWERED: &str = "not_answered";
+/// A new computer of a signed-in person whose other computers are all offline (a `decline`).
+pub const YOUR_COMPUTER_OFFLINE: &str = "your_computer_offline";
+/// Not on the wire: `check`'s word that another computer of the candidate's person decides.
+const FORWARD: &str = "forward";
 /// Every reason a `join_decision` may carry; another reads as `refused`.
 const REASONS: &[&str] = &[
     BAD_TICKET,
@@ -41,8 +49,10 @@ const REASONS: &[&str] = &[
     NAME_TAKEN,
     KEY_COLLISION,
     DECLINED,
+    BAD_NAME,
     TOO_MANY,
     NOT_ANSWERED,
+    YOUR_COMPUTER_OFFLINE,
     UNSUPPORTED,
     BAD_REQUEST,
     INTERNAL,
@@ -57,38 +67,126 @@ const LIMITS: (usize, usize, usize) = (20, 5, 1);
 const MAX_ENTRIES: usize = 100_000;
 
 /// `Ok` allows; `Err(reason)` refuses (`declined`: the person said no).
-type Verdict = Result<(), &'static str>;
+pub type Verdict = Result<(), &'static str>;
 
 /// `v` as the decision's `verdict` and as the request's state.
 fn words(v: Verdict) -> (&'static str, &'static str) {
     match v {
         Ok(()) => ("allow", "admitted"),
-        Err(DECLINED) => ("decline", "declined"),
+        Err(DECLINED | YOUR_COMPUTER_OFFLINE) => ("decline", "declined"),
         Err(_) => ("refused", "refused"),
     }
 }
 
-/// `J<n>`'s `n`.
-fn parse_jid(id: &str) -> Option<i64> {
-    id.strip_prefix('J')?.parse().ok()
-}
-
-/// A request waiting for its person, and the connection task to tell.
-pub struct Pending {
-    req: Request,
-    tx: oneshot::Sender<Verdict>,
+/// A request waiting for an answer, and the connection task to tell.
+pub enum Pending {
+    /// Its person's, here (the dialog or `team.admit`).
+    Local {
+        req: Box<Request>,
+        tx: oneshot::Sender<Verdict>,
+    },
+    /// Forwarded to `to`, a computer of the candidate's person (`forward`): its decision.
+    Forwarded {
+        to: String,
+        candidate: String,
+        ticket_id: String,
+        tx: oneshot::Sender<Verdict>,
+    },
 }
 
 /// The waiting requests by row id (`J<id>`). First answer wins: whoever takes the entry.
 pub type Waiting = Mutex<HashMap<i64, Pending>>;
 
-struct Request {
+#[derive(Clone)]
+pub struct Request {
     ticket: Ticket,
     proof: String,
     candidate: String,
     name: String,
     computer: String,
     kind: String,
+    /// The candidate's sign-in proof (`kind=workspace` for a cloud member), verified once when
+    /// the request came in: `Err` when it does not verify.
+    claims: Option<Result<Proof, ()>>,
+}
+
+impl Request {
+    /// The request in join frame `f` (verifying its proof now), when it is one and its ticket
+    /// decodes; that the candidate signed it is the caller's check.
+    fn from_frame(f: &Frame) -> Option<Request> {
+        let Frame::JoinRequest {
+            ticket,
+            secret_proof,
+            candidate,
+            name,
+            computer,
+            kind,
+            proof,
+            ..
+        } = f
+        else {
+            return None;
+        };
+        let now = ipc::now() as i64;
+        Some(Request {
+            ticket: ticket::decode(ticket).ok()?,
+            proof: secret_proof.clone(),
+            candidate: candidate.clone(),
+            name: name.clone(),
+            computer: computer.clone(),
+            kind: kind.clone(),
+            claims: (proof.as_deref()).map(|t| proof::verify(t, candidate, now).map_err(|_| ())),
+        })
+    }
+
+    /// The verified proof, if any.
+    fn verified(&self) -> Option<&Proof> {
+        self.claims.as_ref()?.as_ref().ok()
+    }
+}
+
+/// The person `req`'s verified computer proof names, when one of `r`'s computers is theirs:
+/// the candidate is that person's new computer.
+fn same_person<'a>(r: &Roster, req: &'a Request) -> Option<&'a str> {
+    let c = req.verified().filter(|c| c.kind == ProofKind::Computer)?;
+    let theirs = |m: &crate::roster::Member| m.kind == MemberKind::Computer && m.person_id == c.sub;
+    (req.kind == "computer" && r.members.values().any(theirs)).then_some(c.sub.as_str())
+}
+
+/// The admission dialog's text for a workspace proof: from the proof alone (`proof::parse`
+/// let only plain text in).
+pub fn workspace_prompt(c: &Proof) -> String {
+    let ws = c.workspace.as_ref().map_or("", |w| w.name.as_str());
+    let mut agents: Vec<&str> = c.agents.iter().take(3).map(String::as_str).collect();
+    if c.agents.len() > 3 {
+        agents.push("…");
+    }
+    let them = if agents.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", agents.join(", "))
+    };
+    format!(
+        "Lightbulb workspace \"{ws}\" wants to join as a member. Its agents{them} will appear in your directory, and it will see this network's directory."
+    )
+}
+
+/// What the person is asked about request `n` (`req`): plain text (`check` let only that in),
+/// and the command that answers it too.
+fn prompt(r: &Roster, req: &Request, n: i64) -> String {
+    let ask = match req.verified() {
+        Some(c) if c.kind == ProofKind::Workspace => workspace_prompt(c),
+        _ if same_person(r, req).is_some() => {
+            format!("Your new Mac {} wants to join. Allow?", req.computer)
+        }
+        _ => join_text(&req.name, &req.computer),
+    };
+    format!("{ask}\nOr run: {} approve J{n}", crate::cli::command())
+}
+
+/// The join dialog's words for a candidate called `name` on computer `computer`.
+fn join_text(name: &str, computer: &str) -> String {
+    format!("{name} (computer \"{computer}\") wants to join your team using your invite link. Allow only if you sent them the link.")
 }
 
 /// What a `join_request` proves it holds: hex sha256(secret ‖ candidate).
@@ -96,8 +194,15 @@ pub fn proof(secret: &str, candidate: &str) -> String {
     HEXLOWER.encode(&Sha256::digest(format!("{secret}{candidate}").as_bytes()))
 }
 
-/// `id`'s signed `join_request` for ticket `t`.
-pub fn request(id: &Identity, t: &Ticket, name: &str, computer: &str, kind: &str) -> Frame {
+/// `id`'s signed `join_request` for ticket `t`, carrying its sign-in proof `token`.
+pub fn request(
+    id: &Identity,
+    t: &Ticket,
+    name: &str,
+    computer: &str,
+    kind: &str,
+    token: Option<&str>,
+) -> Frame {
     signed(
         id,
         Frame::JoinRequest {
@@ -107,19 +212,19 @@ pub fn request(id: &Identity, t: &Ticket, name: &str, computer: &str, kind: &str
             name: name.into(),
             computer: computer.into(),
             kind: kind.into(),
-            proof: None,
+            proof: token.map(Into::into),
             sig: String::new(),
         },
     )
 }
 
-fn signed(id: &Identity, f: Frame) -> Frame {
-    let mut v = serde_json::to_value(&f).expect("a frame serializes");
-    v["sig"] = id.sign(&v).into();
+/// `f` with its `sig`: `id`'s signature over it (`sig` left out).
+pub fn signed(id: &Identity, f: Frame) -> Frame {
+    let v = id.signed(serde_json::to_value(&f).expect("a frame serializes"));
     serde_json::from_value(v).expect("the same frame")
 }
 
-fn signed_by(key: &str, f: &Frame) -> bool {
+pub(crate) fn signed_by(key: &str, f: &Frame) -> bool {
     let v = serde_json::to_value(f).expect("a frame serializes");
     identity::verify(key, &v, v["sig"].as_str().unwrap_or_default())
 }
@@ -140,20 +245,11 @@ pub async fn serve(d: Arc<Daemon>, conn: Connection) {
         return;
     };
     let genuine = signed_by(&peer, &f);
-    let Frame::JoinRequest {
-        ticket,
-        secret_proof,
-        candidate,
-        name,
-        computer,
-        kind,
-        ..
-    } = f
-    else {
+    let Frame::JoinRequest { candidate, .. } = &f else {
         conn.close(VarInt::from_u32(0), b"");
         return;
     };
-    if candidate != peer || !genuine {
+    if *candidate != peer || !genuine {
         eprintln!(
             "join: dropped a forged join request from {}",
             net::short(&peer)
@@ -161,11 +257,11 @@ pub async fn serve(d: Arc<Daemon>, conn: Connection) {
         conn.close(VarInt::from_u32(0), b"");
         return;
     }
-    let Ok(ticket) = ticket::decode(&ticket) else {
+    let Some(req) = Request::from_frame(&f) else {
         eprintln!("join: refused {} ({BAD_TICKET})", net::short(&peer));
         return tell(&d, &conn, send, "", &peer, Err(BAD_TICKET)).await;
     };
-    let ticket_id = ticket.ticket_id.clone();
+    let ticket_id = req.ticket.ticket_id.clone();
     // Admitted already (its roster lost on the way): the roster again, nothing written.
     if d.team.lock().unwrap().roster.members.contains_key(&peer) {
         eprintln!(
@@ -174,21 +270,14 @@ pub async fn serve(d: Arc<Daemon>, conn: Connection) {
         );
         return tell(&d, &conn, send, &ticket_id, &peer, Ok(())).await;
     }
-    let req = Request {
-        ticket,
-        proof: secret_proof,
-        candidate,
-        name,
-        computer,
-        kind,
-    };
     let verdict = match open(&d, &req) {
-        Err(r) => Err(r),
-        Ok((_, Some(v))) => v,
-        Ok((n, None)) => match wait(&d, &conn, n, req).await {
-            Some(v) => v,
-            None => return conn.close(VarInt::from_u32(0), b""),
-        },
+        Err(FORWARD) => forward(&d, &conn, f, &req).await,
+        Err(r) => Some(Err(r)),
+        Ok((_, Some(v))) => Some(v),
+        Ok((n, None)) => wait(&d, conn.closed(), n, req).await,
+    };
+    let Some(verdict) = verdict else {
+        return conn.close(VarInt::from_u32(0), b"");
     };
     if let Err(r) = verdict {
         eprintln!("join: refused {} ({r})", net::short(&peer));
@@ -217,7 +306,23 @@ fn open(d: &Daemon, req: &Request) -> Result<(i64, Option<Verdict>), &'static st
     if all >= LIMITS.0 || by_inviter >= LIMITS.1 || by_candidate >= LIMITS.2 {
         return Err(TOO_MANY);
     }
-    let row = Join {
+    // A cloud candidate, and a person's new computer, always wait for an Allow.
+    let ask = req.ticket.mode != "open"
+        || req.kind == "cloud"
+        || same_person(&team.roster, req).is_some();
+    let n = store.put_join(&row(req, now)).map_err(fail)?;
+    eprintln!("join: J{n} open for {}", net::short(&req.candidate));
+    if ask {
+        return Ok((n, None));
+    }
+    let v = try_admit(d, &mut team, &store, n, req, once, now);
+    close(&store, n, v);
+    Ok((n, Some(v)))
+}
+
+/// `req`'s `join_requests` row, made at `now`.
+fn row(req: &Request, now: i64) -> Join {
+    Join {
         id: 0,
         ticket_id: req.ticket.ticket_id.clone(),
         inviter: req.ticket.inviter.clone(),
@@ -226,20 +331,13 @@ fn open(d: &Daemon, req: &Request) -> Result<(i64, Option<Verdict>), &'static st
         computer: req.computer.clone(),
         kind: req.kind.clone(),
         created_at: now,
-    };
-    let n = store.put_join(&row).map_err(fail)?;
-    eprintln!("join: J{n} open for {}", net::short(&req.candidate));
-    if req.ticket.mode != "open" {
-        return Ok((n, None));
     }
-    let v = try_admit(d, &mut team, &store, n, req, once, now);
-    close(&store, n, v);
-    Ok((n, Some(v)))
 }
 
 /// Whether this computer may admit `req` into `r` now: the ticket and its live link, the
-/// secret, the kind, a free name and prefix, and our authority over that link. Whether the
-/// link is a once link.
+/// secret, the kind and its proof (a cloud member needs a `workspace` one, for a workspace with
+/// no member yet; a computer's, if any, must verify), a free name and prefix, and our authority: over that link, or (a person's
+/// new computer) being that person's computer, else `FORWARD`. Whether the link is a once link.
 fn check(
     r: &Roster,
     store: &Store,
@@ -260,20 +358,54 @@ fn check(
     {
         return Err(BAD_TICKET);
     }
-    // ponytail: a cloud member needs a `kind=bridge` proof (Task 13).
-    if req.kind != "computer" {
-        return Err(UNSUPPORTED);
+    let cloud = match req.kind.as_str() {
+        "computer" => false,
+        "cloud" => true,
+        _ => return Err(UNSUPPORTED),
+    };
+    // Decided from the proof, never from what the request says of itself; one that expired
+    // while its dialog waited is not in force at the Allow.
+    let c = match &req.claims {
+        // A cloud candidate with no proof at all is not a workspace this engine knows.
+        None if cloud => return Err(UNSUPPORTED),
+        None => None,
+        Some(Ok(c)) if now > c.exp => return Err(if cloud { UNSUPPORTED } else { BAD_REQUEST }),
+        Some(Ok(c)) if (c.kind == ProofKind::Workspace) == cloud => Some(c),
+        // Another kind's proof: a computer's person cannot take a workspace's place.
+        Some(Ok(_)) if cloud => return Err(UNSUPPORTED),
+        Some(_) => return Err(BAD_REQUEST),
+    };
+    let name = match c.and_then(|c| c.workspace.as_ref()) {
+        Some(w) if cloud => w.name.as_str(),
+        _ => req.name.as_str(),
+    };
+    if !fits(name) || !fits(&req.computer) {
+        return Err(BAD_NAME);
     }
-    if !fits(&req.name) || !fits(&req.computer) {
-        return Err(BAD_REQUEST);
+    // One member per workspace (on a fork, the roster's replay keeps the first).
+    let taken = |sub: &str| {
+        r.members
+            .values()
+            .any(|m| m.kind == MemberKind::Cloud && m.person_id == sub)
+    };
+    if c.is_some_and(|c| cloud && taken(&c.sub)) {
+        return Err(NAME_TAKEN);
     }
-    match r.collides(&req.name, &req.candidate) {
+    let same = same_person(r, req);
+    match r.collides(name, &req.candidate, same) {
         Some(Collision::Name) => return Err(NAME_TAKEN),
         Some(Collision::Key) => return Err(KEY_COLLISION),
         None => {}
     }
-    let authorised = r.members.get(me).is_some_and(|m| {
-        m.kind == MemberKind::Computer && (m.role != Role::Member || link.signer == me)
+    let mine = r.members.get(me);
+    if let Some(p) = same {
+        return match mine {
+            Some(m) if m.kind == MemberKind::Computer && m.person_id == p => Ok(link.once),
+            _ => Err(FORWARD),
+        };
+    }
+    let authorised = mine.is_some_and(|m| {
+        m.kind == MemberKind::Computer && (m.role != Role::Member || (link.signer == me && !cloud))
     });
     if !authorised {
         return Err(net_ops::NOT_ADMIN);
@@ -281,9 +413,13 @@ fn check(
     Ok(link.once)
 }
 
-/// A name or computer name: trimmed, 1-64 characters, no control characters.
-fn fits(s: &str) -> bool {
-    !s.is_empty() && s.trim() == s && s.chars().count() <= 64 && !s.chars().any(char::is_control)
+/// A name or computer name: trimmed, 1-64 characters, all `label::printable` (so the dialog
+/// shows it as is).
+pub fn fits(s: &str) -> bool {
+    !s.is_empty()
+        && s.trim() == s
+        && s.chars().count() <= 64
+        && s.chars().all(crate::label::printable)
 }
 
 /// Writes request `n`'s checked `admit`; for a `once` link, marks it used here.
@@ -296,9 +432,17 @@ fn try_admit(
     once: bool,
     now: i64,
 ) -> Verdict {
-    let body = json!({"member": req.candidate, "name": req.name, "computer": req.computer,
-        "person_id": req.candidate, "kind": "computer", "role": "member",
+    let mut body = json!({"member": req.candidate, "name": req.name, "computer": req.computer,
+        "person_id": req.candidate, "kind": req.kind, "role": "member",
         "ticket_id": req.ticket.ticket_id});
+    // `check` took it: the person (or `ws:<id>`) it names, and a workspace's own name.
+    if let Some(c) = req.verified() {
+        if let Some(w) = c.workspace.as_ref().filter(|_| req.kind == "cloud") {
+            body["name"] = w.name.clone().into();
+        }
+        body["person_id"] = c.sub.clone().into();
+        body["proof"] = c.token.clone().into();
+    }
     if let Err(e) = net_ops::write(d, team, store, Kind::Admit, body, now) {
         eprintln!("join: J{n}: {e}");
         return Err(INTERNAL);
@@ -331,45 +475,73 @@ fn admit(d: &Daemon, n: i64, req: &Request) -> Verdict {
 }
 
 /// Shows request `n` to the person and waits for an answer (dialog or `team.admit`), the
-/// candidate to hang up, or the wait to run out (`not_answered`); `None` when the candidate is
-/// gone.
-async fn wait(d: &Daemon, conn: &Connection, n: i64, req: Request) -> Option<Verdict> {
-    let (tx, mut rx) = oneshot::channel();
-    let text = format!("{} wants to join your network", req.name);
+/// candidate to hang up (`gone`), or the wait to run out (`not_answered`); `None` when the
+/// candidate is gone.
+async fn wait(d: &Daemon, gone: impl Future, n: i64, req: Request) -> Option<Verdict> {
+    let (tx, rx) = oneshot::channel();
+    let text = prompt(&d.team.lock().unwrap().roster, &req, n);
     // Before the dialog: a headless one answers at once.
-    d.admissions.lock().unwrap().insert(n, Pending { req, tx });
-    let id = format!("J{n}");
+    d.admissions.lock().unwrap().insert(
+        n,
+        Pending::Local {
+            req: Box::new(req),
+            tx,
+        },
+    );
     let buttons = ["Decline", "Allow"];
-    d.dialogs
-        .show(&id, dialog::args("Lightbulb Connect", &text, &buttons));
+    d.dialogs.show(
+        &format!("J{n}"),
+        dialog::args("Lightbulb Connect", &text, &buttons),
+    );
+    answered(d, n, rx, gone, d.peers.knobs().join_wait).await
+}
+
+/// Request `n`'s answer on `rx`, unless the candidate hangs up (`gone`, then `None`) or `wait`
+/// passes (`not_answered`): a request given up on leaves `admissions` (its dialog withdrawn,
+/// its open row `expired`) unless an answer took it first, whose verdict is then on the way.
+async fn answered(
+    d: &Daemon,
+    n: i64,
+    mut rx: oneshot::Receiver<Verdict>,
+    gone: impl Future,
+    wait: Duration,
+) -> Option<Verdict> {
     let gone = tokio::select! {
         v = &mut rx => return v.ok(),
-        _ = conn.closed() => true,
-        _ = tokio::time::sleep(d.peers.knobs().join_wait) => false,
+        _ = gone => true,
+        _ = tokio::time::sleep(wait) => false,
     };
-    // Gave up, unless an answer took it first: then its verdict is on the way.
     if d.admissions.lock().unwrap().remove(&n).is_none() {
         return rx.await.ok();
     }
-    d.dialogs.withdraw(&id);
+    d.dialogs.withdraw(&format!("J{n}"));
     let _ = d.store.lock().unwrap().close_join(n, "expired");
     eprintln!("join: J{n} expired");
     (!gone).then_some(Err(NOT_ANSWERED))
 }
 
 /// The person's answer to request `n`, from the dialog or `team.admit`: its name and verdict,
-/// or `None` when it is not waiting (answered, or its candidate gone).
+/// or `None` when it is not waiting here (answered, its candidate gone, or forwarded).
 fn answer(d: &Daemon, n: i64, allow: bool) -> Option<(String, Verdict)> {
-    let p = d.admissions.lock().unwrap().remove(&n)?;
+    let (req, tx) = {
+        let mut waiting = d.admissions.lock().unwrap();
+        match waiting.remove(&n)? {
+            Pending::Local { req, tx } => (req, tx),
+            forwarded => {
+                waiting.insert(n, forwarded);
+                return None;
+            }
+        }
+    };
     d.dialogs.withdraw(&format!("J{n}"));
     let v = if allow {
-        admit(d, n, &p.req)
+        admit(d, n, &req)
     } else {
         close(&d.store.lock().unwrap(), n, Err(DECLINED));
         Err(DECLINED)
     };
-    let _ = p.tx.send(v);
-    Some((p.req.name, v))
+    let _ = tx.send(v);
+    Some((req.name, v))
 }
 
 /// Sends the signed decision (after an allow, the whole roster), then waits for the candidate
@@ -403,21 +575,169 @@ async fn tell(
     conn.close(VarInt::from_u32(0), b"");
 }
 
-/// Routes the person's dialog answers by id: `J<n>` to admission, `H<n>` to holds. `None` (gave up, no GUI)
-/// leaves the request waiting for `approve`/`decline` until its candidate gives up.
+/// A person's new computer, asking this computer: hands the candidate's own signed request to
+/// that person's first online computer (replay order) and waits for its decision, as `wait`
+/// does for the person here (its row closed `forwarded`: the person here does not answer it);
+/// after an allow, until its `admit` has synced here. `None` when the candidate is gone;
+/// `your_computer_offline` when none of the person's is online.
+async fn forward(d: &Daemon, conn: &Connection, raw: Frame, req: &Request) -> Option<Verdict> {
+    let now = ipc::now() as i64;
+    let to = {
+        let t = d.team.lock().unwrap();
+        let ms = t.roster.computers_of(same_person(&t.roster, req)?);
+        ms.into_iter()
+            .map(|m| m.key.clone())
+            .find(|k| d.peers.is_online(k))
+    };
+    let cand = net::short(&req.candidate).to_string();
+    let Some(to) = to else {
+        eprintln!("join: {cand}'s person has no computer online");
+        return Some(Err(YOUR_COMPUTER_OFFLINE));
+    };
+    let n = {
+        let store = d.store.lock().unwrap();
+        let n = store.put_join(&row(req, now)).ok()?;
+        let _ = store.close_join(n, "forwarded");
+        n
+    };
+    let (tx, rx) = oneshot::channel();
+    let pending = Pending::Forwarded {
+        to: to.clone(),
+        candidate: req.candidate.clone(),
+        ticket_id: req.ticket.ticket_id.clone(),
+        tx,
+    };
+    d.admissions.lock().unwrap().insert(n, pending);
+    if d.peers.send(&to, raw).is_err() {
+        d.admissions.lock().unwrap().remove(&n);
+        return Some(Err(YOUR_COMPUTER_OFFLINE));
+    }
+    eprintln!("join: J{n} ({cand}) forwarded to {}", net::short(&to));
+    // That computer gives up at its wait; we a step later.
+    let wait = d.peers.knobs().join_wait + STEP;
+    let v = answered(d, n, rx, conn.closed(), wait).await?;
+    let synced = async {
+        loop {
+            let changed = d.roster_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if is_member(d, &req.candidate) {
+                return;
+            }
+            changed.await;
+        }
+    };
+    if v.is_ok() && tokio::time::timeout(STEP, synced).await.is_err() {
+        eprintln!("join: {cand}'s admit did not arrive");
+        return Some(Err(INTERNAL));
+    }
+    Some(v)
+}
+
+fn is_member(d: &Daemon, key: &str) -> bool {
+    d.team.lock().unwrap().roster.members.contains_key(key)
+}
+
+/// A join frame member `from` sent: a `join_request` it forwarded (a new computer of this
+/// computer's person, `forward`), checked, asked and admitted as one that came here, and
+/// answered with a signed `join_decision`; or that decision, for a request we forwarded to it.
+/// Either signed otherwise is dropped.
+pub async fn from_member(d: Arc<Daemon>, from: String, f: Frame) {
+    match f {
+        Frame::JoinRequest { .. } => {
+            let Some((req, ticket_id)) = forwarded(&f) else {
+                return eprintln!("join: dropped a forged request from {}", net::short(&from));
+            };
+            let verdict = match open(&d, &req) {
+                // Never forwarded twice: we are not that person's computer.
+                Err(FORWARD) => Some(Err(net_ops::NOT_ADMIN)),
+                Err(r) => Some(Err(r)),
+                Ok((_, Some(v))) => Some(v),
+                Ok((n, None)) => wait(&d, std::future::pending::<()>(), n, req.clone()).await,
+            };
+            let Some(v) = verdict else { return };
+            let decision = Frame::JoinDecision {
+                ticket_id,
+                candidate: req.candidate,
+                verdict: words(v).0.into(),
+                reason: v.err().map(Into::into),
+                sig: String::new(),
+            };
+            let _ = d.peers.send(&from, signed(&d.identity, decision));
+        }
+        Frame::JoinDecision {
+            ref ticket_id,
+            ref candidate,
+            ref verdict,
+            ref reason,
+            ..
+        } if signed_by(&from, &f) => {
+            let mut waiting = d.admissions.lock().unwrap();
+            let Some(n) = forwarded_to(&waiting, &from, candidate, ticket_id) else {
+                return;
+            };
+            let Some(Pending::Forwarded { tx, .. }) = waiting.remove(&n) else {
+                return;
+            };
+            let v = match verdict.as_str() {
+                "allow" => Ok(()),
+                "decline" => Err(DECLINED),
+                _ => Err(known(reason.as_deref())),
+            };
+            let _ = tx.send(v);
+        }
+        _ => {}
+    }
+}
+
+/// Paired by ticket id: the wire's decision carries no request id of ours.
+/// The oldest request forwarded to `to` for `candidate` with `ticket_id`: what its decision
+/// answers (the decision names no request of ours, so the oldest goes first).
+fn forwarded_to(
+    waiting: &HashMap<i64, Pending>,
+    to: &str,
+    candidate: &str,
+    ticket_id: &str,
+) -> Option<i64> {
+    let ours = |p: &Pending| {
+        matches!(p, Pending::Forwarded { to: t, candidate: c, ticket_id: i, .. }
+            if t == to && c == candidate && i == ticket_id)
+    };
+    waiting
+        .iter()
+        .filter(|(_, p)| ours(p))
+        .map(|(n, _)| *n)
+        .min()
+}
+
+/// The request in a forwarded `join_request`, when its candidate signed it, and its ticket id.
+fn forwarded(f: &Frame) -> Option<(Request, String)> {
+    let req = Request::from_frame(f).filter(|r| signed_by(&r.candidate, f))?;
+    let id = req.ticket.ticket_id.clone();
+    Some((req, id))
+}
+
+/// `reason` when it is one a `join_decision` may carry, else `refused`.
+fn known(reason: Option<&str>) -> &'static str {
+    REASONS
+        .iter()
+        .find(|r| reason == Some(**r))
+        .copied()
+        .unwrap_or("refused")
+}
+
+/// Routes the person's dialog answers by id: `J<n>` to admission, `H<n>` to holds. `None`
+/// (gave up, no GUI) leaves the request waiting for `approve`/`decline` until its candidate gives up.
 pub async fn route(d: Arc<Daemon>) {
     let Some(mut answers) = d.dialog_answers.lock().unwrap().take() else {
         return;
     };
     while let Some((id, button)) = answers.recv().await {
-        if let Some(n) = parse_jid(&id) {
-            if let Some(b) = button {
-                answer(&d, n, b == "Allow");
-            }
-        } else if let Some(n) = crate::holds::parse_id(&id) {
-            if let Some(b) = button {
-                crate::holds::on_dialog(&d, n, &b);
-            }
+        let Some(b) = button else { continue };
+        if let Some(n) = dialog::number(&id, 'J') {
+            answer(&d, n, b == "Allow");
+        } else if let Some(n) = dialog::number(&id, 'H') {
+            crate::holds::on_dialog(&d, n, &b);
         } else {
             eprintln!("dialog {id}: nothing waits for it");
         }
@@ -450,7 +770,10 @@ pub fn admit_op(id: u64, body: &Value, d: &Daemon) -> Response {
         Some("decline") => false,
         _ => return Response::err(id, BAD_REQUEST),
     };
-    let Some(n) = body["request"].as_str().and_then(parse_jid) else {
+    let Some(n) = body["request"]
+        .as_str()
+        .and_then(|r| dialog::number(r, 'J'))
+    else {
         return Response::err(id, BAD_REQUEST);
     };
     match answer(d, n, allow) {
@@ -477,8 +800,9 @@ enum Outcome {
     Next(Option<&'static str>),
 }
 
-/// `team.join {ticket, name?, kind?}` -> `{state: admitted|waiting|refused, reason?, team,
-/// online}`. Only a solo computer joins; it asks the ticket's members in order, one at a time.
+/// `team.join {ticket, name?, kind?, proof?}` -> `{state: admitted|waiting|refused, reason?,
+/// team, online}`. Only a solo computer joins; it asks the ticket's members in order, one at a
+/// time, carrying `proof` (else this computer's own sign-in proof, if any).
 pub async fn join(id: u64, body: &Value, d: &Arc<Daemon>) -> Response {
     let Some(link) = body["ticket"].as_str() else {
         return Response::err(id, BAD_REQUEST);
@@ -492,6 +816,12 @@ pub async fn join(id: u64, body: &Value, d: &Arc<Daemon>) -> Response {
         .trim()
         .to_string();
     let kind = body["kind"].as_str().unwrap_or("computer");
+    // Only an embedded instance joins as a workspace's member, only as that, and with its
+    // proof.
+    let unproven = kind == "cloud" && !body["proof"].is_string();
+    if (kind == "cloud") != d.cloud.is_some() || unproven {
+        return Response::err(id, BAD_REQUEST);
+    }
     let me = &d.identity.key;
     let done = |state: &str, reason: Option<&str>, team: &str, online: usize| {
         Response::ok(
@@ -507,19 +837,33 @@ pub async fn join(id: u64, body: &Value, d: &Arc<Daemon>) -> Response {
     if !solo {
         return done("refused", Some(ALREADY_IN_TEAM), &team, 0);
     }
+    // What every member would refuse, refused before any dial.
+    if !fits(&name) || !fits(&computer) {
+        return done("refused", Some(BAD_NAME), "", 0);
+    }
     let Ok(t) = ticket::decode(link) else {
         return done("refused", Some(BAD_TICKET), "", 0);
     };
     let Some(ep) = d.peers.endpoint.get() else {
         return Response::err(id, INTERNAL);
     };
-    let req = request(&d.identity, &t, &name, &computer, kind);
+    // Its proof: the one given (the workspace member's), else this computer's sign-in.
+    let token = body["proof"].as_str().map(String::from).or_else(|| {
+        let t = d.team.lock().unwrap();
+        let own = t.roster.members.get(me).and_then(|m| m.proof.as_ref());
+        own.map(|p| p.token.clone())
+    });
+    let req = request(&d.identity, &t, &name, &computer, kind, token.as_deref());
     // The last listed member's refusal, when every reachable one refused.
     let mut last = None;
     for m in t.members.iter().filter(|m| *m != me) {
-        let Some(addr) = d.peers.addr(m) else {
+        let Some(mut addr) = d.peers.addr(m) else {
             continue;
         };
+        // The inviter's relay, before this computer knows its own list (an https one only).
+        if let Some(u) = crate::relay::parse(&t.relay_hint) {
+            addr = addr.with_relay_url(u);
+        }
         let Ok(Ok(conn)) = tokio::time::timeout(STEP, ep.connect(addr, JOIN_ALPN)).await else {
             eprintln!("join: dial {} failed", net::short(m));
             continue;
@@ -580,13 +924,10 @@ async fn attempt(d: &Daemon, conn: &Connection, req: &Frame, m: &str, t: &Ticket
     if !genuine || candidate != d.identity.key || ticket_id != t.ticket_id {
         return Outcome::Next(None);
     }
-    let reason = REASONS
-        .iter()
-        .find(|r| reason.as_deref() == Some(**r))
-        .copied()
-        .unwrap_or("refused");
+    let reason = known(reason.as_deref());
     match verdict.as_str() {
         "allow" => {}
+        "decline" if reason == YOUR_COMPUTER_OFFLINE => return Outcome::Refused(reason),
         "decline" => return Outcome::Refused(DECLINED),
         _ if reason == net_ops::NOT_ADMIN || reason == BAD_TICKET => {
             return Outcome::Next(Some(reason))
@@ -642,4 +983,37 @@ fn take_roster(d: &Daemon, entries: &[Entry], team_id: &str) -> crate::Result<bo
     tx.commit()?;
     net_ops::install(d, &mut team, &store, new)?;
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_join_dialog_says_who_from_where_and_how_they_got_in() {
+        assert_eq!(
+            join_text("demo2", "demo-laptop"),
+            "demo2 (computer \"demo-laptop\") wants to join your team using your invite link. Allow only if you sent them the link."
+        );
+    }
+
+    #[test]
+    fn a_forwarded_decision_answers_its_own_request_the_oldest_first() {
+        let forwarded = |to: &str, ticket: &str| Pending::Forwarded {
+            to: to.into(),
+            candidate: "cand".into(),
+            ticket_id: ticket.into(),
+            tx: oneshot::channel().0,
+        };
+        let waiting: HashMap<i64, Pending> = [
+            (7, forwarded("x", "t2")),
+            (9, forwarded("x", "t1")),
+            (4, forwarded("y", "t1")),
+            (8, forwarded("x", "t1")),
+        ]
+        .into();
+        assert_eq!(forwarded_to(&waiting, "x", "cand", "t1"), Some(8));
+        assert_eq!(forwarded_to(&waiting, "x", "cand", "t2"), Some(7));
+        assert_eq!(forwarded_to(&waiting, "x", "other", "t1"), None);
+    }
 }

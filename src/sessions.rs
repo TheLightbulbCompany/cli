@@ -103,6 +103,18 @@ pub struct Session {
     /// that serves the thread. `tier` is `push` exactly when this is set.
     #[serde(skip)]
     pub push_via: Option<PathBuf>,
+    /// The short name `who` shows and `send` takes (`codex-1`): its row's place (`store`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle: Option<String>,
+    /// Its repo and branch as its hook read them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// Computed at read time (`ipc::live_sessions`): kept from teammates (its folder is
+    /// hidden, or its register was refused for one). Local listings show it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hidden: bool,
 }
 
 /// Alive means the pid exists AND was born at `birth_micros`; a reused pid is not the session.
@@ -136,6 +148,10 @@ fn from_row(r: &store::Session, home: &Path) -> Option<Session> {
             Tier::NextStep
         },
         push_via,
+        handle: r.handle.clone(),
+        repo: r.repo.clone(),
+        branch: r.branch.clone(),
+        hidden: false,
         provider,
         conversation,
         pid,
@@ -208,13 +224,20 @@ pub fn scan_claude(home: &Path, member_short: &str) -> Vec<Session> {
                 Tier::NextStep
             },
             push_via: socket,
+            handle: None,
+            repo: None,
+            branch: None,
+            hidden: false,
         });
     }
     out
 }
 
-/// Registered rows plus Claude discoveries, deduplicated by key (a discovery wins:
-/// its status is fresher), `Gone` dropped, `title`/`doing` filled from the transcript.
+/// Registered rows plus Claude discoveries, deduplicated by key (a discovery wins for its
+/// status, which is fresher; the row for its folder, which its hook reported resolved, and its
+/// handle, repo and branch), `Gone` dropped, `title`/`doing` filled from the transcript. A
+/// session found only by discovery keeps Claude's own cwd as given (not resolved) and has no
+/// handle until its hook registers it.
 pub fn all(rows: &[store::Session], home: &Path, member_short: &str) -> Vec<Session> {
     let mut out: Vec<Session> = rows.iter().filter_map(|r| from_row(r, home)).collect();
     for found in scan_claude(home, member_short) {
@@ -222,6 +245,10 @@ pub fn all(rows: &[store::Session], home: &Path, member_short: &str) -> Vec<Sess
             Some(s) => {
                 *s = Session {
                     title: found.title.or(s.title.take()),
+                    cwd: std::mem::take(&mut s.cwd),
+                    handle: s.handle.take(),
+                    repo: s.repo.take(),
+                    branch: s.branch.take(),
                     ..found
                 }
             }

@@ -1,6 +1,6 @@
 mod common;
 
-use common::{script, Env};
+use common::{person, script, Env};
 use lightbulb_connect::daemon::ipc;
 use lightbulb_connect::dialog::{self, Queue};
 use serde_json::json;
@@ -11,7 +11,7 @@ fn ui_claim_returns_its_lease() {
     let env = Env::new();
     env.daemon(false, "", &[]);
     assert_eq!(env.status()["claim_live"], false);
-    let r = env.ask(json!({"id": 1, "op": "ui.claim"}));
+    let r = person(&env, json!({"id": 1, "op": "ui.claim"}));
     assert_eq!(r["ok"], true, "{r}");
     assert_eq!(r["lease_s"], 20);
     assert_eq!(env.status()["claim_live"], true);
@@ -42,4 +42,20 @@ async fn claim_suppresses_dialog_for_20_seconds() {
         .await
         .unwrap();
     assert_eq!(a, Some(("1".into(), Some("Allow".into()))));
+}
+
+#[test]
+fn ui_claim_is_person_only() {
+    let env = Env::new();
+    // The daemon takes this test process for an agent.
+    let me = std::process::id();
+    let birth = lightbulb_connect::os::process(me).unwrap().birth_micros;
+    env.daemon(
+        false,
+        "",
+        &[("LIGHTBULB_CONNECT_HOOK_CALLER", format!("{me}:{birth}"))],
+    );
+    let r = env.ask(json!({"id": 1, "op": "ui.claim"}));
+    assert_eq!(r["reason"], "not_a_person", "{r}");
+    assert_eq!(env.status()["claim_live"], false);
 }

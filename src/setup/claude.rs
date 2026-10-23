@@ -6,7 +6,7 @@ use crate::hook::{Event, EVENTS};
 use crate::Result;
 use serde_json::json;
 
-pub(super) fn configure(ctx: &Ctx, r: &mut AgentReport) -> Result<()> {
+pub(super) fn configure(ctx: &Ctx, r: &mut AgentReport) -> Result<Owner> {
     let mut notes = vec![];
     edit_json(
         &ctx.home.join(".claude/settings.json"),
@@ -35,8 +35,5 @@ pub(super) fn configure(ctx: &Ctx, r: &mut AgentReport) -> Result<()> {
         owner = set_json_server(ctx, doc, "mcpServers", entry)?;
         Ok(())
     })?;
-    if owner == Owner::Foreign {
-        r.notes.push(ctx.foreign_note(&config));
-    }
-    Ok(())
+    Ok(owner)
 }
