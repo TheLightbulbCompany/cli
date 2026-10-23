@@ -444,8 +444,13 @@ const SIGNIN_WAIT: Duration = Duration::from_secs(900);
 pub fn signin() -> Result<i32> {
     let issuer = crate::config::Config::load(&paths::state_dir())?.issuer;
     let mut conn = connect()?;
-    let me = ask(&mut conn, "identity.get", json!({}))?;
-    let start = json!({"member_key": me["member_key"], "computer": me["computer"]});
+    let r = conn.call("identity.device_start", json!({}))?;
+    if r["reason"] == "not_a_person" {
+        eprintln!("Sign in from your own terminal, not from an agent.");
+        return Ok(1);
+    }
+    let start = json!({"member_key": r["member_key"], "computer": r["computer"], "at": r["at"],
+        "sig": r["sig"]});
     let (status, s) = crate::proof::post(&crate::proof::route(&issuer, "device/start"), &start)?;
     let (Some(code), Some(uri)) = (
         s["device_code"].as_str(),
@@ -456,10 +461,25 @@ pub fn signin() -> Result<i32> {
         );
         return Ok(1);
     };
-    let user_code = s["user_code"].as_str().unwrap_or_default();
-    println!("Confirm the code {user_code} in your browser: {uri}");
-    // A person at a terminal gets the browser; a script reads the line above.
-    if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+    // The issuer's words, as plain text: `config.toml` (its URL) is the agent's to write.
+    let shown = |t: &str, max: usize| -> String {
+        t.chars()
+            .filter(|c| crate::label::printable(*c))
+            .take(max)
+            .collect()
+    };
+    let user_code = shown(s["user_code"].as_str().unwrap_or_default(), 32);
+    println!(
+        "Confirm the code {user_code} in your browser: {}",
+        shown(uri, 512)
+    );
+    // A person at a terminal gets the browser (an https page only; debug: the tests' http);
+    // a script reads the line above.
+    let web = uri.starts_with("https://") || (cfg!(debug_assertions) && uri.starts_with("http://"));
+    if web
+        && uri.chars().all(crate::label::printable)
+        && std::io::IsTerminal::is_terminal(&std::io::stdout())
+    {
         let _ = Command::new("open").arg(uri).status();
     }
     let every = Duration::from_secs(s["interval"].as_u64().unwrap_or(5).clamp(1, 60));
@@ -485,11 +505,15 @@ pub fn signin() -> Result<i32> {
     };
     // A fresh connection: the first may have sat idle through the wait.
     let r = connect()?.call("identity.proof", json!({ "proof": token }))?;
+    if r["reason"] == "other_person" {
+        eprintln!("This sign-in is for a different person than this computer already belongs to.");
+        return Ok(1);
+    }
     if r["ok"] != true {
         eprintln!("The issuer's answer did not verify for this computer. Try again later.");
         return Ok(1);
     }
-    let name = r["name"].as_str().unwrap_or_default();
+    let name = shown(r["name"].as_str().unwrap_or_default(), 64);
     if r["solo"] == true {
         println!("Signed in as {name}. To join your network, paste its join line: lightbulb-connect join '<link>'");
     } else {

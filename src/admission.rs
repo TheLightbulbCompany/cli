@@ -136,15 +136,18 @@ pub fn workspace_prompt(c: &Proof) -> String {
     )
 }
 
-/// What the person is asked about `req`.
+/// What the person is asked about `req`, as plain text (`label::printable`).
 fn prompt(r: &Roster, req: &Request, now: i64) -> String {
-    match claims(req, now).and_then(|c| c.ok()) {
+    let text = match claims(req, now).and_then(|c| c.ok()) {
         Some(c) if c.kind == ProofKind::Workspace => workspace_prompt(&c),
         _ if same_person(r, req, now).is_some() => {
             format!("Your new Mac {} wants to join. Allow?", req.computer)
         }
         _ => format!("{} wants to join your network", req.name),
-    }
+    };
+    text.chars()
+        .filter(|c| crate::label::printable(*c))
+        .collect()
 }
 
 /// What a `join_request` proves it holds: hex sha256(secret ‖ candidate).

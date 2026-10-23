@@ -16,7 +16,7 @@ type Asked = Arc<Mutex<Vec<(String, Value)>>>;
 
 /// A plain HTTP/1.1 issuer on the loopback: `device/start` (code `D1`, interval 0),
 /// `device/token` (pending once, then a computer proof for the started key as `user_1`
-/// "Prasiddha"), `proof/refresh` (a new proof, issued now). Its `issuer` URL.
+/// "Prasiddha"), `proof/refresh` (the old proof's claims, issued now). Its `issuer` URL.
 fn issuer() -> (String, Asked) {
     let l = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let url = format!("http://{}/connect", l.local_addr().unwrap());
@@ -58,7 +58,15 @@ fn issuer() -> (String, Asked) {
                     _ => ("410 Gone", json!({})),
                 }
             } else if path.ends_with("/proof/refresh") {
-                ("200 OK", json!({"proof": proof(&key)}))
+                // The same claims, issued now.
+                let old = body["proof"].as_str().unwrap_or_default();
+                let payload = old.split('.').nth(1).unwrap_or_default();
+                let bytes = data_encoding::BASE64URL_NOPAD.decode(payload.as_bytes());
+                let mut c: Value =
+                    serde_json::from_slice(&bytes.unwrap_or_default()).unwrap_or_default();
+                c["iat"] = json!(now_s());
+                c["exp"] = json!(now_s() + 86_400);
+                ("200 OK", json!({"proof": common::issuer::mint(&c)}))
             } else {
                 ("404 Not Found", json!({}))
             };
@@ -81,7 +89,7 @@ fn identity_of(e: &Env) -> Value {
 /// `e` signs in as `sub` with a proof minted here (`identity.proof`).
 fn sign_in(e: &Env, sub: &str, ws: Option<(&str, &str)>) {
     let token = computer_proof(&e.identity().key, sub, "Prasiddha", ws, now_s());
-    let r = e.ask(json!({"id": 1, "op": "identity.proof", "proof": token}));
+    let r = person(e, json!({"id": 1, "op": "identity.proof", "proof": token}));
     assert_eq!(r["ok"], true, "{r}");
 }
 
@@ -125,7 +133,11 @@ fn signin_writes_a_merge_and_renews_before_expiry() {
     let e = Env::new();
     // The 60 s timer, every second.
     let fast = ("LIGHTBULB_CONNECT_DEBUG_OUTBOX_S", "1".to_string());
-    e.daemon(false, &format!("issuer = \"{url}\"\n"), &[fast]);
+    e.daemon(
+        false,
+        &format!("issuer = \"{url}\"\n"),
+        std::slice::from_ref(&fast),
+    );
     let me = e.identity().key;
     let o = e.detached(&[EXE, "signin"], "");
     assert!(o.status.success(), "{}{}", out(&o), err(&o));
@@ -140,12 +152,26 @@ fn signin_writes_a_merge_and_renews_before_expiry() {
         (&json!("user_1"), &json!(true), &json!("Prasiddha")),
         "{id}"
     );
-    let starts = asked.lock().unwrap()[0].clone();
-    assert_eq!(starts.0, "/connect/device/start");
-    assert_eq!(starts.1["member_key"], me);
+    // `device/start` is signed by this computer's key over {member_key, computer, at}.
+    let (path, start) = asked.lock().unwrap()[0].clone();
+    assert_eq!(path, "/connect/device/start");
+    assert_eq!(start["member_key"], me);
+    assert!(
+        (start["at"].as_i64().unwrap() - now_s()).abs() < 60,
+        "{start}"
+    );
+    let sig = start["sig"].as_str().unwrap();
+    assert!(lightbulb_connect::identity::verify(&me, &start, sig));
+    let mut forged = start.clone();
+    forged["member_key"] = json!(common::identity().key);
+    assert!(!lightbulb_connect::identity::verify(&me, &forged, sig));
     // A proof 21 hours old is renewed on the timer, signed by this computer over {proof, at}.
+    // (Another computer: the older proof would not replace this one's newer one.)
+    let e = Env::new();
+    e.daemon(false, &format!("issuer = \"{url}\"\n"), &[fast]);
+    let me = e.identity().key;
     let old = computer_proof(&me, "user_1", "Prasiddha", None, now_s() - 21 * 3600);
-    let r = e.ask(json!({"id": 1, "op": "identity.proof", "proof": old}));
+    let r = person(&e, json!({"id": 1, "op": "identity.proof", "proof": old}));
     assert_eq!(r["ok"], true, "{r}");
     until(10, "renewed", || {
         identity_of(&e)["expires_at"].as_i64().unwrap() > now_s() + 23 * 3600
@@ -164,14 +190,51 @@ fn a_proof_for_another_computer_or_person_is_refused() {
     let e = Env::new();
     e.daemon(false, "", &[]);
     let other = common::identity();
-    let r = e.ask(json!({"id": 1, "op": "identity.proof",
-        "proof": computer_proof(&other.key, "user_1", "P", None, now_s())}));
+    let r = person(
+        &e,
+        json!({"id": 1, "op": "identity.proof",
+        "proof": computer_proof(&other.key, "user_1", "P", None, now_s())}),
+    );
+    assert_eq!(r["error"], "bad_request", "{r}");
+    // A person is never a `ws:` id (it would make this computer the workspace's).
+    let ws = computer_proof(&e.identity().key, "ws:W1", "P", None, now_s());
+    let r = person(&e, json!({"id": 1, "op": "identity.proof", "proof": ws}));
     assert_eq!(r["error"], "bad_request", "{r}");
     sign_in(&e, "user_1", None);
-    let r = e.ask(json!({"id": 1, "op": "identity.proof",
-        "proof": computer_proof(&e.identity().key, "user_2", "P", None, now_s())}));
-    assert_eq!(r["error"], "bad_request", "{r}");
+    let r = person(
+        &e,
+        json!({"id": 1, "op": "identity.proof",
+        "proof": computer_proof(&e.identity().key, "user_2", "P", None, now_s())}),
+    );
+    assert_eq!(
+        (&r["error"], &r["reason"]),
+        (&json!("bad_request"), &json!("other_person")),
+        "{r}"
+    );
     assert_eq!(identity_of(&e)["person_id"], "user_1");
+}
+
+#[test]
+fn an_agent_cannot_sign_this_computer_in() {
+    // The daemon takes this test process for an agent.
+    let e = Env::new();
+    let me = std::process::id();
+    let birth = lightbulb_connect::os::process(me).unwrap().birth_micros;
+    let pin = ("LIGHTBULB_CONNECT_HOOK_CALLER", format!("{me}:{birth}"));
+    e.daemon(false, "", &[pin]);
+    let token = computer_proof(&e.identity().key, "user_evil", "Mallory", None, now_s());
+    for op in [
+        json!({"id": 1, "op": "identity.proof", "proof": token}),
+        json!({"id": 1, "op": "identity.device_start"}),
+    ] {
+        let r = e.ask(op);
+        assert_eq!(
+            (&r["error"], &r["reason"]),
+            (&json!("bad_request"), &json!("not_a_person")),
+            "{r}"
+        );
+    }
+    assert_eq!(identity_of(&e)["person_id"], e.identity().key);
 }
 
 #[test]
@@ -262,10 +325,39 @@ fn workspace_member_joins_with_a_workspace_proof() {
 }
 
 #[test]
+fn workspace_member_renews_its_workspace_proof() {
+    let (url, _asked) = issuer();
+    let (f, w) = (Env::new(), Env::new());
+    let dir = tempfile::tempdir().unwrap();
+    f.daemon(false, &computer("mac"), &[allowing(dir.path())]);
+    let t = invite(&f);
+    let fast = ("LIGHTBULB_CONNECT_DEBUG_OUTBOX_S", "1".to_string());
+    let config = format!("issuer = \"{url}\"\n{}", computer("cloud"));
+    w.daemon(false, &config, &[peers(&[&f]), fast]);
+    let wk = w.identity().key;
+    let old = workspace_proof(
+        &wk,
+        "W1",
+        "The Lightbulb Company",
+        &["Friday"],
+        now_s() - 21 * 3600,
+    );
+    let o = w.detached(&[EXE, "join", &t, "--kind", "cloud", "--proof", &old], "");
+    assert!(o.status.success(), "{}{}", out(&o), err(&o));
+    until(10, "renewed on F", || {
+        let ms = members(&f);
+        let m = member(&ms, &wk);
+        m["proof"]["iat"].as_i64().unwrap() > now_s() - 60 && m["proof"]["kind"] == "workspace"
+    });
+    assert_eq!(member(&members(&f), &wk)["person_id"], "ws:W1");
+}
+
+#[test]
 #[ignore = "lands with the Lane B merge"]
 fn second_member_for_one_workspace_is_refused() {
     let (f, w, _dir, t) = founder_and_workspace();
-    let proof = |k: &str| workspace_proof(k, "W1", "The Lightbulb Company", &[], now_s());
+    // Another name, so only the one-member-per-`sub` rule can refuse the second.
+    let proof = |k: &str, name: &str| workspace_proof(k, "W1", name, &[], now_s());
     let o = w.detached(
         &[
             EXE,
@@ -274,7 +366,7 @@ fn second_member_for_one_workspace_is_refused() {
             "--kind",
             "cloud",
             "--proof",
-            &proof(&w.identity().key),
+            &proof(&w.identity().key, "The Lightbulb Company"),
         ],
         "",
     );
@@ -284,7 +376,7 @@ fn second_member_for_one_workspace_is_refused() {
     let r = person(
         &w2,
         json!({"id": 1, "op": "team.join", "ticket": t, "kind": "cloud",
-               "proof": proof(&w2.identity().key)}),
+               "proof": proof(&w2.identity().key, "Lightbulb, renamed")}),
     );
     assert_eq!(
         (&r["state"], &r["reason"]),

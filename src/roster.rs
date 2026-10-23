@@ -435,7 +435,9 @@ fn pass(
                         MemberKind::Computer => ProofKind::Computer,
                         MemberKind::Cloud => ProofKind::Workspace,
                     };
-                    if p.sub == m.person_id && p.kind == kind {
+                    // The newest stands, whatever order a fork replays in.
+                    let newer = m.proof.as_ref().is_none_or(|c| p.iat >= c.iat);
+                    if p.sub == m.person_id && p.kind == kind && newer {
                         m.prove(p);
                     }
                 }
@@ -1181,7 +1183,15 @@ mod tests {
             Kind::Proof,
             json!({"member": b.key, "proof": cp(&b, "p2", None)}),
         );
-        let mut r = replay(&[g, ab, by_founder, m1, m2, pr, pr2]);
+        // An older renewal concurrent with the newer one does not replace it.
+        let stale = computer_proof(&b.key, "p1", "Prasiddha", None, IAT + 60);
+        let pr3 = op(
+            &b,
+            &m2,
+            Kind::Proof,
+            json!({"member": b.key, "proof": stale}),
+        );
+        let mut r = replay(&[g, ab, by_founder, m1, m2, pr, pr2, pr3]);
         assert_eq!(r.members[&b.key].person_id, "p1");
         assert_eq!(r.members[&b.key].proof.as_ref().unwrap().iat, IAT + 3600);
         r.lapse(IAT + 3600 + 86_401);

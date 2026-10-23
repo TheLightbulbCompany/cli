@@ -5,7 +5,7 @@
 
 use crate::daemon::{ipc, net_ops, Daemon};
 use crate::identity::Identity;
-use crate::roster::Kind;
+use crate::roster::{Kind, MemberKind};
 use crate::Result;
 use data_encoding::BASE64URL_NOPAD;
 use ed25519_dalek::{Signature, VerifyingKey};
@@ -154,7 +154,8 @@ pub fn parse(token: &str, member_key: &str) -> Result<Proof> {
             .workspace
             .as_ref()
             .is_some_and(|w| !w.id.is_empty() && c.sub == format!("ws:{}", w.id)),
-        ProofKind::Computer => c.agents.is_empty(),
+        // A person is never a `ws:` id: that is the workspace member's alone.
+        ProofKind::Computer => c.agents.is_empty() && !c.sub.starts_with("ws:"),
     };
     let bounded = sized(&c.sub, 256)
         && sized(&c.name, 64)
@@ -163,11 +164,17 @@ pub fn parse(token: &str, member_key: &str) -> Result<Proof> {
             .is_none_or(|w| sized(&w.id, 128) && sized(&w.name, 64))
         && c.agents.len() <= 6
         && c.agents.iter().all(|a| sized(a, 32));
+    // Shown to people: no control or bidi character in any text a dialog or label reads.
+    let shown = [&c.name, &c.computer]
+        .into_iter()
+        .chain(c.workspace.as_ref().map(|w| &w.name))
+        .chain(&c.agents)
+        .all(|t| t.chars().all(crate::label::printable));
     if c.iat >= c.exp || c.exp - c.iat > MAX_LIFE_S {
         Err("proof lives more than a day".into())
     } else if c.computer != member_key {
         Err("proof is for another computer".into())
-    } else if !ws_ok || !bounded {
+    } else if !ws_ok || !bounded || !shown {
         Err("proof claims do not fit".into())
     } else {
         Ok(c)
@@ -265,25 +272,39 @@ fn renew(d: &Daemon, token: &str, issuer: &str, now: i64) -> Result<String> {
     Ok(kid)
 }
 
+/// `record`'s refusal of a proof for another person than this computer's.
+pub const OTHER_PERSON: &str = "proof is for another person";
+
+/// `device/start`'s body: `{member_key, computer, at, sig}`, `sig` by `id` over the rest, so
+/// the issuer starts a flow only for the holder of the key it will name.
+pub fn start_body(id: &Identity, computer: &str, at: i64) -> Value {
+    let mut v = json!({"member_key": id.key, "computer": computer, "at": at});
+    v["sig"] = id.sign(&v).into();
+    v
+}
+
 /// `identity.proof`'s write: `merge` while this computer's `person_id` is its own key, else a
-/// `proof` renewal. Refuses a proof of another kind, or for another person than the merged one.
+/// `proof` renewal. The kind must be the member's own: `computer`, or `workspace` on the
+/// workspace member (its renewals; it joined with its proof, so it never merges). Refuses
+/// another kind, or another person than the merged one.
 pub fn record(d: &Daemon, token: &str) -> Result<Proof> {
     let me = &d.identity.key;
     let now = ipc::now() as i64;
     let c = verify(token, me, now)?;
-    if c.kind != ProofKind::Computer {
-        return Err("not a computer proof".into());
-    }
     let mut team = d.team.lock().unwrap();
     let store = d.store.lock().unwrap();
+    let cloud = (team.roster.members.get(me)).is_some_and(|m| m.kind == MemberKind::Cloud);
+    if (c.kind == ProofKind::Workspace) != cloud {
+        return Err("proof is of another kind than this member".into());
+    }
     let pid = team.roster.person_of(me).to_string();
-    let (kind, body) = if pid == *me {
+    let (kind, body) = if pid == *me && !cloud {
         let body = json!({"member": me, "person_id": c.sub, "proof": token});
         (Kind::Merge, body)
     } else if pid == c.sub {
         (Kind::Proof, json!({"member": me, "proof": token}))
     } else {
-        return Err("proof is for another person".into());
+        return Err(OTHER_PERSON.into());
     };
     net_ops::write(d, &mut team, &store, kind, body, now)?;
     eprintln!("proof: recorded (kid {}, sub {})", c.kid, c.sub);
@@ -329,9 +350,17 @@ mod tests {
         let forged = t.replacen('.', ".e30", 1);
         assert!(verify(&forged, "k1", NOW).is_err());
         assert!(verify(&"a".repeat(MAX_TOKEN + 1), "k1", NOW).is_err());
-        // A computer proof names no agents.
+        // A computer proof names no agents, and no `ws:` person; no control character shows.
         let mut c = claims("k1");
         c["agents"] = json!(["Friday"]);
+        assert!(verify(&issuer::mint(&c), "k1", NOW).is_err());
+        let mut c = claims("k1");
+        c["sub"] = json!("ws:W1");
+        assert!(verify(&issuer::mint(&c), "k1", NOW).is_err());
+        let mut c = claims("k1");
+        c["name"] = json!("Pras\u{1b}[2Jiddha");
+        assert!(verify(&issuer::mint(&c), "k1", NOW).is_err());
+        c["name"] = json!("Pras\u{202e}iddha");
         assert!(verify(&issuer::mint(&c), "k1", NOW).is_err());
     }
 

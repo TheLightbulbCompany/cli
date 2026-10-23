@@ -131,8 +131,23 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, peer_pid: Option
                 }),
             )
         }
+        // An agent fed a hostile sign-in must not move this computer into another person.
+        "identity.proof" | "identity.device_start" if !peer_pid.is_some_and(person_only) => {
+            refused(id, "not_a_person")
+        }
+        // `identity.device_start {}` -> `{member_key, computer, at, sig}`: `device/start`'s
+        // body, `sig` by this computer's key over the rest (person-only).
+        "identity.device_start" => {
+            let computer = daemon.team.lock().unwrap().config.computer.clone();
+            let at = super::ipc::now() as i64;
+            Response::ok(
+                id,
+                crate::proof::start_body(&daemon.identity, &computer, at),
+            )
+        }
         // `identity.proof {proof}` -> `{name, person_id, solo}`: this computer's sign-in proof,
-        // written to the roster (`proof::record`); `bad_request` when it does not verify.
+        // written to the roster (`proof::record`), person-only; `bad_request` when it does not
+        // verify (reason `other_person` when it names another person than this computer's).
         "identity.proof" => match body["proof"]
             .as_str()
             .map(|t| crate::proof::record(daemon, t))
@@ -151,7 +166,11 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, peer_pid: Option
             }
             Some(Err(e)) => {
                 eprintln!("identity.proof: refused: {e}");
-                Response::err(id, BAD_REQUEST)
+                if e.to_string() == crate::proof::OTHER_PERSON {
+                    refused(id, "other_person")
+                } else {
+                    Response::err(id, BAD_REQUEST)
+                }
             }
             None => Response::err(id, BAD_REQUEST),
         },
