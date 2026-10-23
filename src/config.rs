@@ -100,7 +100,7 @@ fn read(dir: &Path) -> Result<DocumentMut> {
 }
 
 /// `p` with a leading `~` (alone or before `/`) as the home directory.
-fn expand_home(p: &str) -> PathBuf {
+pub(crate) fn expand_home(p: &str) -> PathBuf {
     match (p.strip_prefix('~'), dirs::home_dir()) {
         (Some(rest), Some(home)) if rest.is_empty() || rest.starts_with('/') => {
             home.join(rest.trim_start_matches('/'))

@@ -3,7 +3,7 @@ use std::path::Path;
 
 /// Migration `i` takes the db to `user_version` `i + 1`. Forward only; each one only adds
 /// tables or columns, and runs once (in the transaction that moves `user_version`).
-const MIGRATIONS: &[&str] = &[V1, V2, V3, V4];
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5];
 
 const V1: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
@@ -72,6 +72,8 @@ const V3: &str = "ALTER TABLE sessions ADD COLUMN ended_at INTEGER;";
 
 /// The text a hold's dialog showed, which its `approvals` record signs.
 const V4: &str = "ALTER TABLE holds ADD COLUMN shown TEXT;";
+/// Which loop limit a `loop` refusal hit (`mail::HOPS`, `mail::RATE`), when known.
+const V5: &str = "ALTER TABLE receipts ADD COLUMN \"limit\" TEXT;";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Session {

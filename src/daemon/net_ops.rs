@@ -138,7 +138,7 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, peer_pid: Option
 
 /// `reload {}` -> `{}`: re-reads `config.toml` into `TeamState`, and rebuilds the presence (a
 /// session under a folder turned off leaves it). Every file the daemon reads at start and may
-/// read again is re-read here.
+/// read again is re-read here. Not person-only: `config.toml` is the agent's to write anyway.
 pub fn reload(daemon: &Daemon) -> crate::Result<()> {
     let config = crate::config::Config::load(&crate::paths::state_dir())?;
     daemon.team.lock().unwrap().config = config;

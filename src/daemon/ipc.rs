@@ -461,19 +461,20 @@ pub(crate) fn sender_label(daemon: &Daemon, m: &store::Message) -> String {
 }
 
 /// `m`'s sender for an inbox record: `label`, and its member's `person`, `person_verified` and
-/// `computer` (this computer's own name and user before it is in a team).
+/// `computer` (this computer's own name and user before it is in a team). Verified as the label
+/// says it (`label::render`): a member with a proof, or this computer itself.
 fn sender_fields(daemon: &Daemon, m: &store::Message) -> Value {
     let label = sender_label(daemon, m);
     let from = label::from(&daemon.identity.short, m);
     let team = daemon.team.lock().unwrap();
     let mut v = json!({ "label": label, "person": super::user_name(),
-        "person_verified": false, "computer": team.config.computer });
+        "person_verified": true, "computer": team.config.computer });
     if let Some(s) = team
         .roster
         .by_short(sessions::member_of(&from).unwrap_or(""))
     {
         v["person"] = label::name(s).into();
-        v["person_verified"] = s.proof.is_some().into();
+        v["person_verified"] = (s.proof.is_some() || s.key == daemon.identity.key).into();
         v["computer"] = s.computer.clone().into();
     }
     v
@@ -602,33 +603,20 @@ async fn settle(daemon: &Daemon, from: &Key, r: &mut Value) {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let now = mail::receipt(&daemon.store.lock().unwrap(), from, &rid);
         if let Ok(Some(now)) = now {
-            r["state"] = json!(now.state);
-            r["reason"] = json!(now.reason);
+            *r = json!(now);
         }
     }
 }
 
-/// Adds to receipt `r` (of `from`'s `request_id`) what its reader is told. For mail under another
+/// Adds to receipt `r` (of `from`'s `request_id`) what its reader is told, for mail under another
 /// member's prefix: `where` (that member's computer), `person` (its person's name, `you` for
-/// this computer's own), `tier` (the session's, from that member's presence) and, while
-/// queued, `until` (when the outbox gives up). For a `loop` refusal: `loop`, `hops` or `rate`
-/// (`mail::loop_kind`).
+/// this computer's own), `online` (whether that computer is connected now), `tier` (the
+/// session's, from that member's presence) and, while queued, `until` (when the outbox gives up).
 fn annotate(daemon: &Daemon, from: &Key, r: &mut Value) {
     let Some(rid) = r["request_id"].as_str().map(String::from) else {
         return;
     };
-    let (kind, at) = {
-        let store = daemon.store.lock().unwrap();
-        let looped = r["state"] == "refused" && r["reason"] == "loop";
-        let kind = looped.then(|| mail::loop_kind(&store, from, &rid).ok());
-        (
-            kind.flatten(),
-            mail::receipt_at(&store, from, &rid).ok().flatten(),
-        )
-    };
-    if let Some(k) = kind {
-        r["loop"] = k.into();
-    }
+    let at = mail::receipt_at(&daemon.store.lock().unwrap(), from, &rid);
     let Some((member, to)) = member_for(daemon, from, &rid) else {
         return;
     };
@@ -641,14 +629,17 @@ fn annotate(daemon: &Daemon, from: &Key, r: &mut Value) {
         r["where"] = m.computer.clone().into();
         r["person"] = if mine { "you".into() } else { label::name(m) }.into();
     }
-    let latest = daemon.latest.lock().unwrap();
-    if let Some(s) = latest
+    if let Some(s) = daemon
+        .latest
+        .lock()
+        .unwrap()
         .get(&member)
         .and_then(|l| l.sessions.iter().find(|s| s.session_id == to))
     {
         r["tier"] = s.tier.clone().into();
     }
-    if let (true, Some(at)) = (r["state"] == "queued", at) {
+    r["online"] = daemon.peers.online().contains(&member).into();
+    if let (true, Ok(Some(at))) = (r["state"] == "queued", at) {
         r["until"] = (at + outbox::TTL_S as i64).into();
     }
 }

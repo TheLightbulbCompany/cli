@@ -574,8 +574,20 @@ impl Net {
             envelope = Some(f);
         } else if matches!(f, Frame::Ack { .. }) && d.peers.knobs().drop_acks {
             eprintln!("net: dropped an ack from {short} (debug)");
-        } else if let Frame::Ack { id, state, reason } | Frame::Receipt { id, state, reason } = f {
-            answer = Some((id, state, reason));
+        } else if let Frame::Ack {
+            id,
+            state,
+            reason,
+            limit,
+        }
+        | Frame::Receipt {
+            id,
+            state,
+            reason,
+            limit,
+        } = f
+        {
+            answer = Some((id, state, reason, limit));
         }
         // Waiting entries are retried after each sync, and when the roster changed: another
         // connection may have brought their parents.
@@ -596,10 +608,11 @@ impl Net {
         if let Some(env) = envelope.filter(|_| d.peers.speaks_ours(key, conn)) {
             receive(d, key, &env, tx);
         }
-        if let Some((id, state, reason)) = answer {
+        if let Some((id, state, reason, limit)) = answer {
             let store = d.store.lock().unwrap();
             let state = State::parse(&state).expect("checked by from_peer_ok");
-            match outbox::acked(&store, key, &id, state, reason.as_deref(), ipc::now()) {
+            let (reason, limit) = (reason.as_deref(), limit.as_deref());
+            match outbox::acked(&store, key, &id, state, reason, limit, ipc::now()) {
                 Ok(true) => eprintln!("net: {id} at {short}: {}", state.name()),
                 Ok(false) => {
                     eprintln!("net: dropped an answer from {short} for {id} (not sent there)")
@@ -631,7 +644,7 @@ fn receive(d: &Arc<Daemon>, key: &str, env: &Frame, tx: &mpsc::UnboundedSender<F
     let store = d.store.lock().unwrap();
     let me = &d.identity.short;
     match mail::receive(&store, env, peer, &team.roster, me, ipc::now()) {
-        Ok((state, reason, held)) => {
+        Ok((state, reason, limit, held)) => {
             if let Some(h) = held {
                 holds::shown(d, &team.roster, &store, &h);
             }
@@ -640,6 +653,7 @@ fn receive(d: &Arc<Daemon>, key: &str, env: &Frame, tx: &mpsc::UnboundedSender<F
                 id: id.clone(),
                 state: state.name().into(),
                 reason,
+                limit,
             });
             if state == State::Stored {
                 drop((store, team));

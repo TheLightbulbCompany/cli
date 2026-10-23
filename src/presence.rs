@@ -364,12 +364,14 @@ pub fn claim(d: &Daemon, key: &str) -> bool {
     held || !kept_elsewhere(d, split_addr(key).map_or(key, |(_, r)| r))
 }
 
-/// A directory record (architecture §9); `cwd` is empty for another computer's session.
-fn record(m: &Member, me: &str, s: &Remote, cwd: &str) -> Value {
+/// A directory record (architecture §9); `cwd` is empty for another computer's session. This
+/// computer (`own`) is verified, as its label is (`label::render`), and online; another member's
+/// `online` is whether its computer is connected now.
+fn record(m: &Member, me: &str, s: &Remote, cwd: &str, own: bool, online: bool) -> Value {
     json!({
         "session_id": s.session_id,
         "person": m.name,
-        "person_verified": m.proof.is_some(),
+        "person_verified": own || m.proof.is_some(),
         "computer": m.computer,
         "agent": s.agent,
         "cwd": cwd,
@@ -377,7 +379,9 @@ fn record(m: &Member, me: &str, s: &Remote, cwd: &str) -> Value {
         "branch": s.branch,
         "status": s.status,
         "doing": s.doing.clone().unwrap_or_default(),
+        "title": s.title,
         "tier": s.tier,
+        "online": own || online,
         "can_send": true,
         "needs_owner_ok": m.person_id != me,
     })
@@ -418,12 +422,14 @@ pub fn directory(d: &Daemon, query: Option<&str>) -> Value {
     for s in &local {
         let r = remote(s, false);
         if hit(&own, &r) {
-            out.push(record(&own, &me, &r, &s.cwd));
+            out.push(record(&own, &me, &r, &s.cwd, true, true));
         }
     }
+    let online = d.peers.online();
     for (m, l) in &remote_ones {
+        let up = online.contains(&m.key);
         for r in l.sessions.iter().filter(|r| hit(m, r)) {
-            out.push(record(m, &me, r, ""));
+            out.push(record(m, &me, r, "", false, up));
         }
     }
     json!({ "sessions": out })

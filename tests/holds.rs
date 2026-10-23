@@ -156,7 +156,7 @@ async fn decline_refuses_and_delivers_nothing() {
     let id = ulid();
     p.send(&envelope(&id, "r1", &sb, &sa, "x")).await;
     assert_eq!(p.ack(&id).await.0, "held");
-    p.recv_where(|f| matches!(f, Frame::Receipt { id: i, state, reason } if *i == id && state == "refused" && reason.as_deref() == Some("declined")))
+    p.recv_where(|f| matches!(f, Frame::Receipt { id: i, state, reason, .. } if *i == id && state == "refused" && reason.as_deref() == Some("declined")))
         .await;
     assert!(held(&a).is_empty());
     assert_eq!(a.unread(&sa), 0);
@@ -348,7 +348,7 @@ fn held_lib(
 ) -> holds::Hold {
     let peer = &roster.members[&aden.key];
     let env = from_aden(aden, "r1", to, "secret");
-    let (state, reason, h) = mail::receive(s, &env, peer, roster, &me.short, now).unwrap();
+    let (state, reason, _, h) = mail::receive(s, &env, peer, roster, &me.short, now).unwrap();
     assert_eq!((state, reason), (State::Held, None));
     let h = h.unwrap();
     assert_eq!(holds::open(s).unwrap(), std::slice::from_ref(&h));

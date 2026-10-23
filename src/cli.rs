@@ -242,6 +242,7 @@ pub fn send(
                 receipt["where"].as_str().unwrap_or_default(),
                 receipt["tier"].as_str().unwrap_or("unknown"),
             ),
+            Some(note) if matches!(state, "queued" | "held") => format!("{rid} {note}"),
             Some(note) => note,
             None => {
                 let mut line = match receipt["reason"].as_str() {
@@ -317,9 +318,16 @@ pub fn receipt(request_id: &str, from: Option<String>) -> Result<i32> {
 
 /// `folder <path> on|off`: whether the sessions under `path` are shown to teammates
 /// (`folders_off` in `config.toml`, canonical as presence compares them), then `reload`.
+/// A folder that does not exist cannot be turned off; one turned off before it went away can
+/// still be turned on.
 pub fn folder(path: &str, on: bool) -> Result<i32> {
     let dir = paths::state_dir();
-    let p = crate::presence::canonical(Path::new(path));
+    let full = std::env::current_dir()?.join(crate::config::expand_home(path));
+    if !on && !full.is_dir() {
+        eprintln!("no such folder: {path}");
+        return Ok(1);
+    }
+    let p = crate::presence::canonical(&full);
     let mut off = crate::config::Config::load(&dir)?.folders_off;
     off.retain(|o| crate::presence::canonical(o) != p);
     if !on {
@@ -329,8 +337,14 @@ pub fn folder(path: &str, on: bool) -> Result<i32> {
         .iter()
         .map(|o| o.to_string_lossy().into_owned())
         .collect();
+    // Not locked: the write is atomic, and one person's concurrent `folder` calls are not a case.
     crate::config::Config::set(&dir, "folders_off", &list.to_string())?;
-    ask(&mut connect()?, "reload", json!({}))?;
+    let r = connect()?.call("reload", json!({}))?;
+    if r["ok"] != true {
+        let code = r["error"].as_str().unwrap_or("failed");
+        eprintln!("Saved to config.toml, but the background service did not reload: {code}");
+        return Ok(1);
+    }
     if on {
         println!("Sessions in {path} are shown to your teammates.");
     } else {

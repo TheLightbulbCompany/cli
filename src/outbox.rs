@@ -44,7 +44,7 @@ pub fn sent(store: &Store, id: &str, now: u64) -> Result<()> {
     Ok(store.outbox_sent(id, now as i64)?)
 }
 
-/// `member`'s word on envelope `id`: its receipt moves forward only (`State::later_than`;
+/// `member`'s word on envelope `id` (with `limit`, the loop limit a refusal hit): its receipt moves forward only (`State::later_than`;
 /// `refused` and `expired` final). `false` when the envelope did not go to `member`: the one
 /// binding an `Ack` or `Receipt` is held to.
 pub fn acked(
@@ -53,12 +53,14 @@ pub fn acked(
     id: &str,
     state: State,
     reason: Option<&str>,
+    limit: Option<&str>,
     now: u64,
 ) -> Result<bool> {
     let Some((from, request_id)) = store.outbox_sender(id, member)? else {
         return Ok(false);
     };
     mail::advance(store.conn(), &from, &request_id, state, reason, now)?;
+    mail::set_limit(store.conn(), &from, &request_id, limit)?;
     Ok(true)
 }
 
@@ -156,7 +158,7 @@ mod tests {
         assert_eq!(due_n(&s, 101), 1);
         sent(&s, &id, 101).unwrap();
         assert_eq!(due_n(&s, 102), 0, "then 2 s");
-        assert!(!acked(&s, "c", &id, State::Read, None, 102).unwrap());
+        assert!(!acked(&s, "c", &id, State::Read, None, None, 102).unwrap());
         assert!(!bound(&s, &id, "c") && bound(&s, &id, "b"));
         for (st, want) in [
             (State::Held, State::Held),
@@ -165,7 +167,7 @@ mod tests {
             (State::Read, State::Read),
             (State::Delivered, State::Read),
         ] {
-            assert!(acked(&s, "b", &id, st, None, 103).unwrap());
+            assert!(acked(&s, "b", &id, st, None, None, 103).unwrap());
             assert_eq!(state(&s).0, want);
         }
         assert_eq!(due_n(&s, 1_000), 0, "acked: never sent again");
@@ -181,7 +183,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = Store::open(&dir.path().join("state.db")).unwrap();
         let id = queue(&s, 100);
-        acked(&s, "b", &id, State::Delivered, None, 101).unwrap();
+        acked(&s, "b", &id, State::Delivered, None, None, 101).unwrap();
         let end = 100 + mail::HELD_S + KEEP_S;
         expire(&s, end, TTL_S).unwrap();
         assert!(bound(&s, &id, "b"));
@@ -200,7 +202,7 @@ mod tests {
         assert_eq!(state(&s), (State::Expired, Some("unreachable".into())));
         assert_eq!(due_n(&s, u64::MAX / 2), 0);
         // Final: a late ack changes nothing.
-        acked(&s, "b", &id, State::Stored, None, 100 + TTL_S).unwrap();
+        acked(&s, "b", &id, State::Stored, None, None, 100 + TTL_S).unwrap();
         assert_eq!(state(&s).0, State::Expired);
     }
 }

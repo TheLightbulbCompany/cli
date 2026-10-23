@@ -471,7 +471,7 @@ fn folder_off_hides_sessions_after_reload() {
     let o = b.person(&["send", &s1, "hello"]);
     let line = out(&o);
     assert!(
-        line.contains(" stored on mac (tier ")
+        line.contains(" stored on mac (tier next_step)")
             && line.contains("). Receipt: lightbulb-connect receipt "),
         "{line}{}",
         err(&o)
@@ -493,4 +493,28 @@ fn folder_off_hides_sessions_after_reload() {
     let o = a.person(&["folder", &dir, "on"]);
     assert!(o.status.success(), "{}{}", out(&o), err(&o));
     common::until(15, "B sees it again", || common::sees(&b, &s1));
+
+    // A relative path is the folder under the shell's own; a missing one is refused.
+    let o = a
+        .cmd(&["folder", "sub", "off"])
+        .current_dir(proj.path())
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}{}", out(&o), err(&o));
+    let config = std::fs::read_to_string(a.state.path().join("config.toml")).unwrap();
+    let want = std::fs::canonicalize(&sub).unwrap();
+    let want = want.to_str().unwrap().to_lowercase();
+    assert!(config.to_lowercase().contains(&want), "{config}");
+    let o = a.run(&["folder", "/nonexistent/zz", "off"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(err(&o).trim(), "no such folder: /nonexistent/zz");
+    // `on` takes it out again however it is spelled.
+    let o = a
+        .cmd(&["folder", "./sub/", "on"])
+        .current_dir(proj.path())
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}{}", out(&o), err(&o));
+    let config = std::fs::read_to_string(a.state.path().join("config.toml")).unwrap();
+    assert!(!config.to_lowercase().contains(&want), "{config}");
 }

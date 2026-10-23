@@ -115,9 +115,19 @@ impl Peer {
     async fn answer(&mut self, ack: bool, id: &str, state: &str) {
         let (id, state, reason) = (id.to_string(), state.to_string(), None);
         let f = if ack {
-            Frame::Ack { id, state, reason }
+            Frame::Ack {
+                id,
+                state,
+                reason,
+                limit: None,
+            }
         } else {
-            Frame::Receipt { id, state, reason }
+            Frame::Receipt {
+                id,
+                state,
+                reason,
+                limit: None,
+            }
         };
         self.send(&f).await;
     }

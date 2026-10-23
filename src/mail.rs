@@ -20,6 +20,19 @@ pub const MAX_TEXT: usize = 65_536;
 pub const MAX_REQUEST_ID: usize = 128;
 /// A message `MAX_HOPS` agent replies deep is refused `loop`: a person must speak.
 pub const MAX_HOPS: i64 = 4;
+/// What `receive` decided: the state, the refusal reason, the loop limit a `loop` refusal hit,
+/// and the hold it opened.
+pub type Answer = (
+    State,
+    Option<String>,
+    Option<String>,
+    Option<crate::holds::Hold>,
+);
+
+/// Which loop limit a `loop` refusal hit (`Receipt::limit`, the wire's `limit`): `MAX_HOPS` agent
+/// replies, or `LOOP_LIMIT` messages in the window.
+pub const HOPS: &str = "hops";
+pub const RATE: &str = "rate";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -84,6 +97,9 @@ pub struct Receipt {
     /// `"recipient"` (live session) or `"mailbox"` (not live); only while `stored`.
     #[serde(rename = "where")]
     pub where_: Option<String>,
+    /// For a `loop` refusal, `HOPS` or `RATE`; `None` when the refuser did not say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<String>,
 }
 
 /// Live means a registered row whose process is the registered one.
@@ -130,10 +146,28 @@ pub(crate) fn advance(
             )?;
         } else {
             conn.execute(
-                "INSERT OR REPLACE INTO receipts VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT OR REPLACE INTO receipts (from_key, request_id, state, reason, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![from, request_id, state.name(), reason, now as i64],
             )?;
         }
+    }
+    Ok(())
+}
+
+/// Records which loop limit refused `from`'s `request_id` (nothing for `None`).
+pub(crate) fn set_limit(
+    conn: &Connection,
+    from: &str,
+    request_id: &str,
+    limit: Option<&str>,
+) -> Result<()> {
+    if let Some(l) = limit {
+        conn.execute(
+            "UPDATE receipts SET \"limit\" = ?3 WHERE from_key = ?1 AND request_id = ?2 \
+             AND state = 'refused'",
+            [from, request_id, l],
+        )?;
     }
     Ok(())
 }
@@ -162,39 +196,23 @@ pub fn receipt_at(store: &Store, from: &Key, request_id: &str) -> Result<Option<
         .optional()?)
 }
 
-/// Which limit refused `from`'s `request_id` with `loop`: `"rate"` when `from` had sent
-/// `LOOP_LIMIT` messages to one session in the window before the refusal, else `"hops"`.
-/// ponytail: recounted from the messages kept here, so a refusal read back after they are
-/// pruned, or a teammate's per-person count, reads `hops`; a stored kind needs a column.
-pub fn loop_kind(store: &Store, from: &Key, request_id: &str) -> Result<&'static str> {
-    let at = receipt_at(store, from, request_id)?.unwrap_or(0);
-    let most: Option<u32> = store
-        .conn()
-        .query_row(
-            "SELECT COUNT(*) AS n FROM messages WHERE from_key = ?1 AND sent_at > ?2 \
-             AND sent_at <= ?3 GROUP BY to_key ORDER BY n DESC LIMIT 1",
-            params![from.0, at - LOOP_WINDOW_S as i64, at],
-            |r| r.get(0),
-        )
-        .optional()?;
-    Ok(if loop_refused(most.unwrap_or(0) as usize) {
-        "rate"
-    } else {
-        "hops"
-    })
-}
-
 /// The stored receipt for `from`'s `request_id`, with `where_` worked out from the recipient's liveness now.
 pub fn receipt(store: &Store, from: &Key, request_id: &str) -> Result<Option<Receipt>> {
     let conn = store.conn();
     let row = conn
         .query_row(
-            "SELECT state, reason FROM receipts WHERE from_key = ?1 AND request_id = ?2",
+            "SELECT state, reason, \"limit\" FROM receipts WHERE from_key = ?1 AND request_id = ?2",
             [&from.0, request_id],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            },
         )
         .optional()?;
-    let Some((state, reason)) = row else {
+    let Some((state, reason, limit)) = row else {
         return Ok(None);
     };
     let state = State::parse(&state)?;
@@ -215,6 +233,7 @@ pub fn receipt(store: &Store, from: &Key, request_id: &str) -> Result<Option<Rec
         state,
         reason,
         where_,
+        limit,
     }))
 }
 
@@ -223,14 +242,17 @@ fn refuse(
     from: &Key,
     request_id: &str,
     reason: &str,
+    limit: Option<&str>,
     now: u64,
 ) -> Result<Receipt> {
     advance(conn, &from.0, request_id, State::Refused, Some(reason), now)?;
+    set_limit(conn, &from.0, request_id, limit)?;
     Ok(Receipt {
         request_id: request_id.into(),
         state: State::Refused,
         reason: Some(reason.into()),
         where_: None,
+        limit: limit.map(Into::into),
     })
 }
 
@@ -358,9 +380,18 @@ pub fn prepare(
             state: State::Refused,
             reason: Some(reason.into()),
             where_: None,
+            limit: None,
         }))
     };
-    let refused = |reason: &str| Ok(Prep::Done(refuse(conn, from, request_id, reason, now)?));
+    let refused = |reason: &str| {
+        Ok(Prep::Done(refuse(
+            conn, from, request_id, reason, None, now,
+        )?))
+    };
+    let looped = |limit: &str| {
+        let r = refuse(conn, from, request_id, "loop", Some(limit), now)?;
+        Ok(Prep::Done(r))
+    };
     if !sessions::word(request_id, MAX_REQUEST_ID) {
         return unstored("bad_request_id"); // nothing safe to key a receipt on
     }
@@ -404,7 +435,7 @@ pub fn prepare(
         |r| r.get(0),
     )?;
     if loop_refused(recent as usize) {
-        return refused("loop");
+        return looped(RATE);
     }
 
     let id = ulid::Ulid::generate().to_string();
@@ -436,7 +467,7 @@ pub fn prepare(
     let person = is_person(&from.0);
     let hops = if person { 0 } else { hops };
     if !hops_ok(hops, None, person) {
-        return refused("loop");
+        return looped(HOPS);
     }
     Ok(Prep::Go(Prepared {
         message_id: id,
@@ -547,7 +578,7 @@ pub fn receive(
     roster: &Roster,
     me: &str,
     now: u64,
-) -> Result<(State, Option<String>, Option<crate::holds::Hold>)> {
+) -> Result<Answer> {
     let Frame::Envelope {
         id,
         request_id,
@@ -564,7 +595,8 @@ pub fn receive(
     else {
         return Err("not an envelope".into());
     };
-    let refused = |r: &str| Ok((State::Refused, Some(r.to_string()), None));
+    let refused = |r: &str| Ok((State::Refused, Some(r.to_string()), None, None));
+    let looped = |l: &str| Ok((State::Refused, Some("loop".into()), Some(l.into()), None));
     let address = |a: &str| sessions::qualify("", a).as_deref() == Some(a);
     let ulid = |a: &str| ulid::Ulid::from_string(a).is_ok();
     if !address(from) || sessions::member_of(from) != Some(peer.short.as_str()) {
@@ -589,7 +621,7 @@ pub fn receive(
         return refused("not_member");
     }
     if let Some((state, reason)) = store.seen_state(&peer.key, id)? {
-        return Ok((State::parse(&state)?, reason, None));
+        return Ok((State::parse(&state)?, reason, None, None));
     }
     if let Some((old_to, old_body)) = store.sent_as(from, request_id)? {
         if old_to != *to || old_body != *body {
@@ -598,7 +630,7 @@ pub fn receive(
         // The same message under another envelope id: where it is now.
         let sender = Key(from.clone());
         let r = receipt(store, &sender, request_id)?.ok_or("message without a receipt")?;
-        return Ok((r.state, r.reason, None));
+        return Ok((r.state, r.reason, r.limit, None));
     }
     // An answer to (or in the thread of) a message this computer sent is at least one hop
     // past it, whatever `hops` the peer claims; only a person (`/terminal`, fenced by the
@@ -606,7 +638,7 @@ pub fn receive(
     let floor = store.hop_floor([reply_to.as_deref(), thread.as_deref()])?;
     let hops = i64::from(*hops);
     if !hops_ok(hops, floor, is_person(from)) {
-        return refused("loop");
+        return looped(HOPS);
     }
     let since = now.saturating_sub(LOOP_WINDOW_S) as i64;
     let same_principal = |(f, origin): &(String, String)| match peer.kind {
@@ -617,7 +649,7 @@ pub fn receive(
     };
     let recent = store.net_mail_to(to, since)?;
     if loop_refused(recent.iter().filter(|r| same_principal(r)).count()) {
-        return refused("loop");
+        return looped(RATE);
     }
     // Not in my own roster (removed): nothing is mine to accept.
     let verdict = match roster.by_short(me) {
@@ -650,7 +682,7 @@ pub fn receive(
     };
     store.put_seen(&peer.key, id, state.name(), now as i64)?;
     tx.commit()?;
-    Ok((state, None, held))
+    Ok((state, None, None, held))
 }
 
 /// Whether `member`'s latest presence names `address` among its sessions, `known` or `kept`
@@ -677,8 +709,16 @@ pub fn untold(store: &Store) -> Result<Vec<(String, Frame)>> {
     let mut out = vec![];
     for u in store.untold()? {
         if State::parse(&u.state)?.later_than(State::parse(&u.told)?) {
-            let (id, state, reason) = (u.id, u.state, u.reason);
-            out.push((u.sender, Frame::Receipt { id, state, reason }));
+            let (id, state, reason, limit) = (u.id, u.state, u.reason, None);
+            out.push((
+                u.sender,
+                Frame::Receipt {
+                    id,
+                    state,
+                    reason,
+                    limit,
+                },
+            ));
         }
     }
     Ok(out)
@@ -923,7 +963,15 @@ mod tests {
             (State::Refused, Some("loop"))
         );
         assert_eq!(state(&s, "r12"), State::Refused);
-        assert_eq!(loop_kind(&s, &k("a"), "r12").unwrap(), "rate");
+        assert_eq!(r.limit.as_deref(), Some(RATE));
+        assert_eq!(
+            receipt(&s, &k("a"), "r12")
+                .unwrap()
+                .unwrap()
+                .limit
+                .as_deref(),
+            Some(RATE)
+        );
         let r = send(&s, &k("a"), Some(&k("b")), "x", "r13", None, t + 600).unwrap();
         assert_eq!(r.state, State::Stored);
     }
@@ -1230,7 +1278,8 @@ mod tests {
         }
         let (from, rid, got) = r.unwrap();
         assert_eq!(got.reason.as_deref(), Some("loop"));
-        assert_eq!(loop_kind(&s, &k(from), &rid).unwrap(), "hops");
+        let stored = receipt(&s, &k(from), &rid).unwrap().unwrap();
+        assert_eq!(stored.limit.as_deref(), Some(HOPS));
     }
 
     #[test]
@@ -1348,7 +1397,7 @@ mod tests {
         for (i, to) in ["m/terminal", "m/codex:c"].iter().enumerate() {
             let (peer, roster, env) = peer_mail(to, &format!("r{i}"));
             let got = receive(&s, &env, &peer, &roster, "m", 1000).unwrap();
-            assert_eq!(got, (State::Stored, None, None));
+            assert_eq!(got, (State::Stored, None, None, None));
         }
         let later = 1000 + 100 * HOLD_S;
         expire(&s, later).unwrap();
@@ -1372,12 +1421,15 @@ mod tests {
             1000,
         )
         .unwrap();
-        assert_eq!(again(), (State::Refused, Some("declined".into()), None));
+        assert_eq!(
+            again(),
+            (State::Refused, Some("declined".into()), None, None)
+        );
         // With its message and receipt rows gone, what the sender was told stands.
         s.conn()
             .execute_batch("DELETE FROM messages; DELETE FROM receipts; DELETE FROM mailbox;")
             .unwrap();
-        assert_eq!(again(), (State::Stored, None, None));
+        assert_eq!(again(), (State::Stored, None, None, None));
         assert_eq!(
             unread(&s, &k("m/codex:c"), 1001).unwrap(),
             0,

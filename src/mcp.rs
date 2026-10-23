@@ -202,15 +202,24 @@ pub(crate) fn note(r: &Value) -> Option<String> {
     let (computer, person) = (at("where"), at("person"));
     let remote = r["person"].is_string();
     Some(match at("state") {
-        "refused" if at("reason") == "loop" && at("loop") == "rate" => {
-            format!("loop limit: {} messages in 10 minutes to this session", mail::LOOP_LIMIT)
-        }
-        "refused" if at("reason") == "loop" => {
-            format!("paused after {} agent replies; a person must speak", mail::MAX_HOPS)
-        }
+        "refused" if at("reason") == "loop" => match at("limit") {
+            mail::RATE => format!(
+                "loop limit: {} messages in 10 minutes to this session",
+                mail::LOOP_LIMIT
+            ),
+            mail::HOPS => {
+                format!("paused after {} agent replies; a person must speak", mail::MAX_HOPS)
+            }
+            _ => "paused by a loop limit".into(),
+        },
         "queued" if remote => {
             let until = local_time(r["until"].as_i64().unwrap_or_default());
-            format!("queued: {computer} is offline. Will retry until {until}.")
+            let why = if r["online"] == true {
+                "has not confirmed yet"
+            } else {
+                "is offline"
+            };
+            format!("queued: {computer} {why}. Will retry until {until}.")
         }
         "stored" if remote => format!(
             "stored on {computer}. It may be held for {person} to approve; you will see the receipt change."
@@ -323,6 +332,7 @@ impl Server {
             "repo",
             "branch",
             "doing",
+            "title",
         ];
         let found: Vec<Value> = r["sessions"]
             .as_array()
@@ -513,6 +523,27 @@ mod tests {
         fs::create_dir_all(&linked).unwrap();
         std::os::unix::fs::symlink(main.join(".git"), linked.join(".git")).unwrap();
         assert_eq!(git(linked.to_str().unwrap()), (None, None));
+    }
+
+    #[test]
+    fn notes_name_the_loop_limit_or_say_a_limit() {
+        let r = |limit: Option<&str>| {
+            note(&json!({"state": "refused", "reason": "loop", "limit": limit})).unwrap()
+        };
+        assert_eq!(
+            r(Some("hops")),
+            "paused after 4 agent replies; a person must speak"
+        );
+        assert_eq!(
+            r(Some("rate")),
+            "loop limit: 12 messages in 10 minutes to this session"
+        );
+        assert_eq!(r(None), "paused by a loop limit");
+        assert_eq!(note(&json!({"state": "refused", "reason": "policy"})), None);
+        assert_eq!(
+            note(&json!({"state": "stored", "where": "recipient"})),
+            None
+        );
     }
 
     #[test]

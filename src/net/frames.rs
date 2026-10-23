@@ -4,7 +4,7 @@
 use crate::daemon::{ipc, Daemon};
 use crate::doing::TEXT_MAX;
 use crate::frame::Sender;
-use crate::mail::State;
+use crate::mail::{self, State};
 use crate::roster::{Entry, Member};
 use crate::sessions::Tier;
 use crate::{presence, sessions, Result};
@@ -113,15 +113,20 @@ pub enum Frame {
         files: Vec<String>,
         sent_at: i64,
     },
+    /// `limit` (`hops` or `rate`) names the limit a `loop` refusal hit; a peer may leave it out.
     Ack {
         id: String,
         state: String,
         reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<String>,
     },
     Receipt {
         id: String,
         state: String,
         reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<String>,
     },
     HoldNotice {
         hold_id: String,
@@ -219,18 +224,33 @@ pub async fn read(recv: &mut (impl AsyncRead + Unpin)) -> Result<Frame> {
 /// `roster::accept` itself. A `presence` is the peer's own: at most `presence::MAX` of each
 /// list, every session `Remote::valid` for it and every address under its prefix, a `seq` at
 /// most a day ahead of now. An `envelope` is checked by `mail::receive`. An `ack` or `receipt`
-/// names a state past `queued`, with a known reason exactly when it is `refused` (that it
+/// names a state past `queued`, with a known reason exactly when it is `refused`, and a `limit`
+/// only on a `loop` refusal (that it
 /// is bound to this member is `outbox::acked`'s check). Task 14 adds the rules for the frames
 /// it serves, and until then every other kind is dropped.
 pub fn from_peer_ok(f: &Frame, peer: &Member, _daemon: &Daemon) -> bool {
     match f {
         Frame::Hello { .. } | Frame::Roster { .. } | Frame::Envelope { .. } => true,
-        Frame::Ack { state, reason, .. } | Frame::Receipt { state, reason, .. } => {
+        Frame::Ack {
+            state,
+            reason,
+            limit,
+            ..
+        }
+        | Frame::Receipt {
+            state,
+            reason,
+            limit,
+            ..
+        } => {
             let refused = state == "refused";
             State::parse(state).is_ok_and(|s| s != State::Queued)
                 && reason
                     .as_deref()
                     .map_or(!refused, |r| refused && REASONS.contains(&r))
+                && limit.as_deref().is_none_or(|l| {
+                    reason.as_deref() == Some("loop") && [mail::HOPS, mail::RATE].contains(&l)
+                })
         }
         Frame::Presence {
             member,
@@ -254,6 +274,30 @@ pub fn from_peer_ok(f: &Frame, peer: &Member, _daemon: &Daemon) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_ack_without_a_limit_reads_as_none_and_one_with_it_round_trips() {
+        let old: Frame =
+            serde_json::from_str(r#"{"t":"ack","id":"i","state":"refused","reason":"loop"}"#)
+                .unwrap();
+        assert!(matches!(old, Frame::Ack { limit: None, .. }));
+        let f = Frame::Ack {
+            id: "i".into(),
+            state: "refused".into(),
+            reason: Some("loop".into()),
+            limit: Some(mail::RATE.into()),
+        };
+        let text = serde_json::to_string(&f).unwrap();
+        assert!(text.contains(r#""limit":"rate""#), "{text}");
+        assert_eq!(serde_json::from_str::<Frame>(&text).unwrap(), f);
+        let stored = Frame::Ack {
+            id: "i".into(),
+            state: "stored".into(),
+            reason: None,
+            limit: None,
+        };
+        assert!(!serde_json::to_string(&stored).unwrap().contains("limit"));
+    }
 
     #[tokio::test]
     async fn frames_round_trip_and_cap_at_one_mib() {
