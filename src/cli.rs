@@ -37,46 +37,6 @@ pub fn canonical(home: &Path) -> PathBuf {
     home.join(".lightbulb/connect/bin/lightbulb")
 }
 
-/// legacy (Plan A install): the names `setup --remove` still cleans up.
-pub const LEGACY_LABEL: &str = "company.thelightbulb.network";
-
-/// legacy (Plan A install): the old canonical binary.
-pub fn legacy_canonical(home: &Path) -> PathBuf {
-    home.join(".lightbulb/network/bin/lightbulb-network")
-}
-
-/// legacy (Plan A install): stops the old daemon (its socket, then its launchd job) and
-/// removes the job and the old binary.
-pub fn legacy_uninstall(home: &Path) -> Result<()> {
-    if cfg!(target_os = "macos") {
-        // A bootout alone leaves a daemon whose job is already gone running.
-        if let Ok(mut s) = legacy_socket(home) {
-            let _ = s.set_read_timeout(Some(Duration::from_secs(1)));
-            let _ = writeln!(s, r#"{{"id":1,"op":"shutdown"}}"#);
-            let _ = std::io::Read::read(&mut s, &mut [0; 64]);
-        }
-        if use_launchctl() {
-            let target = format!("gui/{}/{LEGACY_LABEL}", unsafe { libc::getuid() });
-            launchctl(&["bootout", &target]);
-        }
-        let plist = home
-            .join("Library/LaunchAgents")
-            .join(format!("{LEGACY_LABEL}.plist"));
-        for path in [plist, legacy_canonical(home)] {
-            match fs::remove_file(&path) {
-                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
-                _ => {}
-            }
-        }
-    }
-    Ok(())
-}
-
-/// legacy (Plan A install): a connection to the old daemon, when one is running.
-fn legacy_socket(home: &Path) -> std::io::Result<std::os::unix::net::UnixStream> {
-    std::os::unix::net::UnixStream::connect(home.join(".lightbulb/network/sock"))
-}
-
 pub(crate) fn plist_path(home: &Path) -> PathBuf {
     home.join("Library/LaunchAgents")
         .join(format!("{LABEL}.plist"))
@@ -1468,10 +1428,6 @@ pub fn doctor() -> Result<i32> {
         named.err().unwrap_or_default(),
         &setup,
     );
-    if legacy_socket(&home).is_ok() {
-        let fix = format!("Run: {cmd} setup --remove, then {cmd} setup");
-        row("Old version", false, "", "still running", &fix);
-    }
     for (name, state, _) in &rows {
         println!("{name:<20} {state}");
     }
@@ -1521,22 +1477,10 @@ pub fn setup(
         }
     };
     if remove {
-        // legacy (Plan A install): its hook and MCP entries name the old binary.
-        let legacy = setup::run(&home, &legacy_canonical(&home), server.as_deref(), true);
-        let mut said = vec![];
-        for a in report
-            .agents
-            .iter()
-            .chain(&legacy.agents)
-            .filter(|a| !a.wrote.is_empty())
-        {
-            if !said.contains(&a.name) {
-                println!("{}: removed", a.product());
-                said.push(a.name);
-            }
+        for a in report.agents.iter().filter(|a| !a.wrote.is_empty()) {
+            println!("{}: removed", a.product());
             files(a);
         }
-        legacy_uninstall(&home)?;
         return if cfg!(target_os = "macos") {
             daemon_uninstall()
         } else {

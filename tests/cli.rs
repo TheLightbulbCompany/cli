@@ -619,20 +619,9 @@ fn setup_remove_also_stops_the_daemon_and_removes_the_job() {
     assert!(e.run(&["setup"]).status.success());
     let plist = h.join("Library/LaunchAgents/company.thelightbulb.connect.plist");
     assert!(plist.exists());
-    // A Plan A daemon still running on its old socket is told to stop.
-    let old = h.join(".lightbulb/network");
-    std::fs::create_dir_all(&old).unwrap();
-    let listener = std::os::unix::net::UnixListener::bind(old.join("sock")).unwrap();
-    let told = std::thread::spawn(move || {
-        let (s, _) = listener.accept().unwrap();
-        let mut line = String::new();
-        BufReader::new(s).read_line(&mut line).unwrap();
-        line
-    });
     let o = e.run(&["setup", "--remove"]);
     assert!(o.status.success(), "{}", err(&o));
     assert!(!plist.exists());
-    assert!(told.join().unwrap().contains("\"op\":\"shutdown\""));
     assert!(
         out(&o).contains("Lightbulb is off. Your settings and messages are kept in"),
         "{}",

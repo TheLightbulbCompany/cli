@@ -541,21 +541,6 @@ fn a_codex_hook_in_a_shared_group_says_codex_will_ask() {
 }
 
 #[test]
-fn remove_takes_out_a_plan_a_era_install() {
-    let home = tempfile::tempdir().unwrap();
-    let h = home.path();
-    fs::create_dir(h.join(".grok")).unwrap();
-    // legacy (Plan A install)
-    put(h, ".grok/hooks/lightbulb-network.json", "{}");
-    let old = Path::new("/opt/lb/bin/lightbulb-network");
-    run(h, old, Some("lightbulb"), false);
-    let r = run(h, old, Some("lightbulb"), true);
-    assert!(!h.join(".grok/hooks/lightbulb-network.json").exists());
-    assert!(!agent(&r, "grok").wrote.is_empty());
-    assert!(toml_at(h, ".grok/config.toml").get("mcp_servers").is_none());
-}
-
-#[test]
 fn the_closing_words_name_what_is_connected_and_the_command_to_type() {
     assert_eq!(
         summary(&["Claude Code", "Codex", "Cursor", "Grok CLI"], "lightbulb"),

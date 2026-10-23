@@ -14,12 +14,9 @@ pub(super) fn configure(ctx: &Ctx, r: &mut AgentReport) -> Result<Owner> {
     // deleted on remove, never backed up.
     let hooks = dir.join("hooks/lightbulb.json");
     if ctx.remove {
-        // legacy (Plan A install): the old hook file name.
-        for file in [hooks, dir.join("hooks/lightbulb-network.json")] {
-            if file.exists() {
-                fs::remove_file(&file)?;
-                r.wrote.push(file);
-            }
+        if hooks.exists() {
+            fs::remove_file(&hooks)?;
+            r.wrote.push(hooks);
         }
     } else {
         let mut doc = json!({});

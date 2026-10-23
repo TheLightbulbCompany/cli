@@ -443,8 +443,7 @@ async fn loopback_file_is_withdrawn_on_sigterm() {
     let a = Env::new();
     a.daemon(true, "", &[]);
     let uid = unsafe { libc::getuid() };
-    let file =
-        std::path::PathBuf::from(format!("/tmp/lightbulb-connect-{uid}")).join(a.identity().key);
+    let file = std::path::PathBuf::from(format!("/tmp/lightbulb-{uid}")).join(a.identity().key);
     let pid: i32 = std::fs::read_to_string(a.state.path().join("daemon.lock"))
         .unwrap()
         .trim()
@@ -512,8 +511,7 @@ async fn loopback_file_is_kept_fresh() {
     let a = Env::new();
     a.daemon(true, "", &[]);
     let uid = unsafe { libc::getuid() };
-    let file =
-        std::path::PathBuf::from(format!("/tmp/lightbulb-connect-{uid}")).join(a.identity().key);
+    let file = std::path::PathBuf::from(format!("/tmp/lightbulb-{uid}")).join(a.identity().key);
     let text = std::fs::read_to_string(&file).unwrap();
     std::fs::remove_file(&file).unwrap();
     common::invite(&a, "reusable");
