@@ -65,9 +65,16 @@ pub struct Daemon {
     pub latest: Mutex<HashMap<String, crate::presence::Latest>>,
     /// The open streams (`streams`).
     pub streams: crate::streams::Streams,
-    /// On an embedded (cloud) instance, the sessions it declared (`cloud.sessions.set`), as
-    /// published; `None` on a computer.
-    pub cloud: Option<Mutex<Vec<net::frames::Remote>>>,
+    /// What an embedded (cloud) instance is; `None` on a computer.
+    pub cloud: Option<Cloud>,
+}
+
+/// An embedded instance: a Lightbulb workspace's member.
+pub struct Cloud {
+    /// The workspace's display name: its solo network's member and team name.
+    pub name: String,
+    /// The sessions it declared (`cloud.sessions.set`), as published.
+    pub sessions: Mutex<Vec<net::frames::Remote>>,
 }
 
 impl Daemon {
@@ -143,23 +150,34 @@ pub async fn deliver(daemon: Arc<Daemon>, to: Key) {
     }
 }
 
-/// Runs the daemon for `dir` until a `shutdown` op. While another daemon holds `daemon.lock`
-/// it waits, touching nothing, and takes over when that one exits: so launchd's copy, started
-/// while a spawned daemon serves, neither exits into a respawn loop nor serves twice.
-pub async fn run(dir: &Path) -> Result<()> {
+/// `dir`'s `daemon.lock`, held (and our pid written in it) until the file drops: one engine,
+/// daemon or embedded instance, per state dir. With `wait` it blocks until the holder is gone;
+/// without, it fails at once.
+pub(crate) fn lock_dir(dir: &Path, wait: bool) -> Result<File> {
     let mut lock = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .open(dir.join("daemon.lock"))?;
-    // Blocks this (otherwise idle) thread; nothing else runs until the lock is ours.
-    lock.lock()?;
+    if wait {
+        lock.lock()?;
+    } else if lock.try_lock().is_err() {
+        return Err("already running: another engine holds this state dir".into());
+    }
     lock.set_len(0)?;
     writeln!(lock, "{}", std::process::id())?;
+    Ok(lock)
+}
 
+/// Runs the daemon for `dir` until a `shutdown` op. While another daemon holds `daemon.lock`
+/// it waits, touching nothing, and takes over when that one exits: so launchd's copy, started
+/// while a spawned daemon serves, neither exits into a respawn loop nor serves twice.
+pub async fn run(dir: &Path) -> Result<()> {
+    // Blocks this (otherwise idle) thread; nothing else runs until the lock is ours.
+    let _lock = lock_dir(dir, true)?;
     let config = Config::load(dir)?;
-    let (daemon, net) = crate::embed::boot(dir, config, false).await?;
+    let (daemon, net) = crate::embed::boot(dir, config, None).await?;
 
     // We hold the lock, so any socket file left behind is stale.
     let sock = dir.join(paths::SOCKET);

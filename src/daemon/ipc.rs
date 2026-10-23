@@ -577,8 +577,8 @@ fn send(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
         None => return Response::err(id, BAD_REQUEST),
     };
     // A workspace member sends only as the agents it declared.
-    if let Some(declared) = &daemon.cloud {
-        let declared = declared.lock().unwrap();
+    if let Some(c) = &daemon.cloud {
+        let declared = c.sessions.lock().unwrap();
         if !declared.iter().any(|s| s.session_id == from) {
             return refused(id, "not_declared");
         }
@@ -614,7 +614,7 @@ fn send(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
     match sent {
         Ok(receipt) => {
             if receipt.state == mail::State::Stored {
-                stored(daemon, to, &p.message_id);
+                stored(daemon, to, Some(&p.message_id));
             }
             Response::ok(id, json!({ "receipt": receipt }))
         }
@@ -622,12 +622,12 @@ fn send(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
     }
 }
 
-/// Mail `id` was stored for `to` here: a waiting `inbox` looks again, a Claude or Codex
-/// session is pushed it (`super::deliver`) if its tier is `push`, and an embedded instance's
-/// caller hears `message {to_session, id}` (`to_session`: the declared name).
-pub(crate) fn stored(daemon: &Arc<Daemon>, to: &Key, id: &str) {
+/// Mail was stored for `to` here: a waiting `inbox` looks again, a Claude or Codex session is
+/// pushed it (`super::deliver`) if its tier is `push`, and for new mail `id` (not a resend)
+/// an embedded instance's caller hears `message {to_session, id}` (the declared name).
+pub(crate) fn stored(daemon: &Arc<Daemon>, to: &Key, id: Option<&str>) {
     daemon.mail.notify_waiters();
-    if daemon.cloud.is_some() {
+    if let (Some(_), Some(id)) = (&daemon.cloud, id) {
         if let Some((_, name)) = sessions::split_addr(&to.0) {
             let e = json!({"event": "message", "to_session": name, "id": id});
             let _ = daemon.events.send(e);

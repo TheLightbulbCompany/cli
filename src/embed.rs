@@ -5,7 +5,7 @@
 
 use crate::config::Config;
 use crate::daemon::ipc::{Request, Response, BAD_REQUEST, INTERNAL};
-use crate::daemon::{ipc, net_ops, user_name, Daemon, TeamState};
+use crate::daemon::{ipc, net_ops, Cloud, Daemon, TeamState};
 use crate::identity::Identity;
 use crate::roster::{self, MemberKind};
 use crate::sessions::{self, Key};
@@ -27,6 +27,8 @@ pub struct EmbedOpts {
     pub issuer: String,
     /// Where `Instance::shutdown` leaves a final copy of `state.db`, if anywhere.
     pub snapshot: Option<PathBuf>,
+    /// The workspace's display name: the name it joins as, and its solo network's.
+    pub name: String,
 }
 
 /// A running instance. Dropping it without `shutdown` leaves its endpoint up.
@@ -34,37 +36,43 @@ pub struct Instance {
     daemon: Arc<Daemon>,
     net: net::Net,
     snapshot: Option<PathBuf>,
+    /// `home`'s `daemon.lock`: a second start on one home fails.
+    _lock: std::fs::File,
 }
 
 /// Starts the instance whose state is `home` (made 0700 if missing): the daemon's roster,
-/// transport and outbox, with `opts`' relay and issuer and no LAN discovery.
+/// transport and outbox, with `opts`' relay and issuer and no LAN discovery. `Err` while
+/// another engine (instance or daemon) holds `home`.
 pub async fn start(home: &Path, opts: EmbedOpts) -> Result<Instance> {
     if opts.kind != MemberKind::Cloud {
         return Err("an embedded instance is a workspace's cloud member".into());
     }
     std::fs::create_dir_all(home)?;
     std::fs::set_permissions(home, std::fs::Permissions::from_mode(0o700))?;
+    let lock = crate::daemon::lock_dir(home, false)?;
     let config = Config {
         issuer: opts.issuer,
         relay: opts.relay.map(|u| u.to_string()),
         lan: false,
         ..Config::load(home)?
     };
-    let (daemon, net) = boot(home, config, true).await?;
+    let (daemon, net) = boot(home, config, Some(opts.name)).await?;
     Ok(Instance {
         daemon,
         net,
         snapshot: opts.snapshot,
+        _lock: lock,
     })
 }
 
-/// The start path the daemon and an instance share: identity, store, the solo genesis on
-/// first start, the team, the transport and the presence sender. A `cloud` instance has no
-/// dialogs and declares its sessions; a computer's are its agents' (`claude_home`).
+/// The start path the daemon and an instance share, under `dir`'s lock (the caller's):
+/// identity, store, the solo genesis on first start, the team, the transport and the presence
+/// sender. A `cloud` instance (its workspace's name) has no dialogs and declares its sessions;
+/// a computer's are its agents' (`claude_home`).
 pub(crate) async fn boot(
     dir: &Path,
     config: Config,
-    cloud: bool,
+    cloud: Option<String>,
 ) -> Result<(Arc<Daemon>, net::Net)> {
     let identity = Identity::load_or_create(dir)?;
     let store = Store::open(&dir.join("state.db"))?;
@@ -72,7 +80,7 @@ pub(crate) async fn boot(
     // The solo network's genesis, written once: a computer that has a roster keeps it.
     let mut entries = roster::entries(&store)?;
     if entries.is_empty() {
-        let g = net_ops::genesis(&identity, &user_name(), &config.computer, &user_name(), now);
+        let g = net_ops::solo_genesis(&identity, cloud.as_deref(), &config.computer, now);
         roster::accept(&store, &g, now)?;
         entries.push(g);
     }
@@ -83,7 +91,7 @@ pub(crate) async fn boot(
     net_ops::sync_team_row(&store, &roster::Roster::default(), &team.roster)?;
     let latest = presence::load(&store);
     let peers = net::Peers::default();
-    let (dialogs, answers) = if cloud {
+    let (dialogs, answers) = if cloud.is_some() {
         (None, None)
     } else {
         let (q, a) = dialog::Queue::new(peers.knobs().osascript.clone());
@@ -92,8 +100,8 @@ pub(crate) async fn boot(
     };
     // An instance has no agents of its own to discover: its state dir holds no `.claude`.
     let claude_home = match cloud {
-        true => dir.to_path_buf(),
-        false => std::env::var_os("LIGHTBULB_CONNECT_CLAUDE_HOME")
+        Some(_) => dir.to_path_buf(),
+        None => std::env::var_os("LIGHTBULB_CONNECT_CLAUDE_HOME")
             .map(PathBuf::from)
             .or_else(dirs::home_dir)
             .ok_or("no home directory")?,
@@ -118,7 +126,10 @@ pub(crate) async fn boot(
         built: Mutex::default(),
         latest: Mutex::new(latest),
         streams: Default::default(),
-        cloud: cloud.then(Mutex::default),
+        cloud: cloud.map(|name| Cloud {
+            name,
+            sessions: Mutex::default(),
+        }),
     });
     // No join connection outlives a restart: its open requests are over.
     daemon.store.lock().unwrap().expire_joins(i64::MAX, now)?;
@@ -145,6 +156,8 @@ impl Instance {
             }
             "team.join" => crate::admission::join(id, body, d).await,
             "team.leave" => net_ops::leave(id, d, true).await,
+            // The bridge stops an instance with `Instance::shutdown`.
+            "shutdown" => Response::err(id, ipc::UNSUPPORTED),
             "inbox" => inbox(id, body, d),
             // Events come from `events`.
             "subscribe" => Response::ok(id, json!({})),

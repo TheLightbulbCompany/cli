@@ -289,7 +289,7 @@ fn check(
     let cloud = match req.kind.as_str() {
         "computer" => false,
         "cloud" => {
-            let (sub, _) = workspace_claim(req.token.as_deref()).ok_or(UNSUPPORTED)?;
+            let (sub, _) = workspace_claim(req.token.as_deref()).ok_or(BAD_REQUEST)?;
             // One member per workspace.
             let ms = || r.members.values();
             if ms().any(|m| m.kind == MemberKind::Cloud && m.person_id == sub) {
@@ -537,6 +537,10 @@ pub async fn join(id: u64, body: &Value, d: &Arc<Daemon>) -> Response {
         .trim()
         .to_string();
     let kind = body["kind"].as_str().unwrap_or("computer");
+    // Only an embedded instance joins as a workspace's member, and only as that.
+    if (kind == "cloud") != d.cloud.is_some() {
+        return Response::err(id, BAD_REQUEST);
+    }
     let me = &d.identity.key;
     let done = |state: &str, reason: Option<&str>, team: &str, online: usize| {
         Response::ok(

@@ -339,10 +339,18 @@ fn link_replaced_on_removal_no_longer_joins() {
     assert_eq!(join(&c, &line, "carol", "computer")["state"], "admitted");
 }
 
+/// Only an embedded instance joins as a cloud member (`tests/embed.rs`): a computer's person
+/// cannot take a workspace's one place.
 #[test]
-fn cloud_candidate_without_bridge_proof_is_refused() {
+fn a_computer_cannot_join_as_cloud() {
     let (a, b, t) = pair("Allow", "reusable");
-    refused(&join(&b, &t, "bot", "cloud"), "unsupported");
+    let proof = json!({"kind": "workspace", "sub": "ws:W1", "workspace": {"id": "W1"}});
+    let r = person(
+        &b,
+        json!({"id": 1, "op": "team.join", "ticket": t, "name": "bot", "kind": "cloud",
+            "proof": proof.to_string()}),
+    );
+    assert_eq!(r["error"], "bad_request", "{r}");
     assert_eq!(members(&a), 1);
 }
 

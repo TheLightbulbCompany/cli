@@ -167,6 +167,9 @@ impl Store {
         let _ = std::fs::remove_file(&tmp);
         let to = tmp.to_str().ok_or("the snapshot path is not UTF-8")?;
         self.conn.execute("VACUUM INTO ?1", [to])?;
+        // Mail bodies: the person's own, like the state dir.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
         std::fs::rename(&tmp, path)?;
         Ok(())
     }

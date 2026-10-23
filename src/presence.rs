@@ -116,16 +116,10 @@ pub(crate) fn canonical(p: &Path) -> PathBuf {
 /// This computer's presence: its live sessions (newest first), the non-live addresses still
 /// holding mail (`known`, newest mail first) and the kept ones (`kept`, newest first); nothing
 /// whose folder is under `folders_off`, nor an address whose folder it does not know.
-/// An embedded instance's is the sessions it declared (`cloud.sessions.set`), nothing else.
+/// An embedded instance's is the sessions it declared (`declared`).
 fn build(d: &Daemon, seq: u64) -> Frame {
-    if let Some(declared) = &d.cloud {
-        return Frame::Presence {
-            member: d.identity.key.clone(),
-            seq,
-            sessions: declared.lock().unwrap().clone(),
-            known: vec![],
-            kept: vec![],
-        };
+    if let Some(c) = &d.cloud {
+        return declared(d, &c.sessions.lock().unwrap(), seq);
     }
     let now = ipc::now();
     let (share, off) = {
@@ -234,10 +228,27 @@ fn stamp(f: &mut Frame) {
     }
 }
 
-/// Builds this computer's presence now and queues it to every online member (`cloud.sessions.
-/// set`, which answers only after).
+/// An embedded instance's presence: the sessions it declared (`cloud.sessions.set`), nothing
+/// else.
+fn declared(d: &Daemon, sessions: &[Remote], seq: u64) -> Frame {
+    Frame::Presence {
+        member: d.identity.key.clone(),
+        seq,
+        sessions: sessions.to_vec(),
+        known: vec![],
+        kept: vec![],
+    }
+}
+
+/// Builds an instance's presence now and queues it to every online member (`cloud.sessions.
+/// set`, which answers only after): built, stamped and queued under the list's lock, so a
+/// send of an older list (`run`) cannot carry a later seq.
 pub fn publish(d: &Daemon) {
-    let mut f = build(d, 0);
+    let Some(c) = &d.cloud else {
+        return d.presence.notify_one();
+    };
+    let list = c.sessions.lock().unwrap();
+    let mut f = declared(d, &list, 0);
     *d.built.lock().unwrap() = Some(f.clone());
     stamp(&mut f);
     for m in d.peers.online() {
@@ -271,6 +282,14 @@ pub async fn run(d: Arc<Daemon>) {
         let Ok(mut f) = tokio::task::spawn_blocking(move || build(&d2, 0)).await else {
             continue;
         };
+        // An instance's list may have moved since the build (`publish` sent the new one): only
+        // the list in effect goes out, checked and sent under its lock.
+        let list = d.cloud.as_ref().map(|c| c.sessions.lock().unwrap());
+        if let (Some(l), Frame::Presence { sessions, .. }) = (&list, &f) {
+            if **l != *sessions {
+                continue;
+            }
+        }
         let unchanged = d
             .built
             .lock()
@@ -286,6 +305,7 @@ pub async fn run(d: Arc<Daemon>) {
         for m in d.peers.online() {
             let _ = d.peers.send(&m, f.clone());
         }
+        drop(list);
         sent_at = Some(Instant::now());
     }
 }
@@ -416,6 +436,7 @@ pub fn directory(d: &Daemon, query: Option<&str>) -> Value {
     // This computer's, with their folders; an instance's are the sessions it declared.
     let local: Vec<(Remote, String)> = match &d.cloud {
         Some(c) => c
+            .sessions
             .lock()
             .unwrap()
             .iter()

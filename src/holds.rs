@@ -461,7 +461,11 @@ fn answer_here(
     if let Ok(c) = &r {
         closed(d, &c.hold, c.verdict(), Some(by));
         if allow && c.hold.kind() == Kind::Message {
-            ipc::stored(d, &Key(c.hold.message.to_key.clone()), &c.hold.message.id);
+            ipc::stored(
+                d,
+                &Key(c.hold.message.to_key.clone()),
+                Some(&c.hold.message.id),
+            );
         }
     }
     Ok(r)

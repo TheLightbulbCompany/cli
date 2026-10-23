@@ -133,7 +133,8 @@ const REPLY_S: u64 = 86_400;
 /// The fixed rule on a workspace member (`mine`, an embedded instance) for `from`'s envelope
 /// from session `from_addr` (ruling §4): a computer of its own workspace starts a
 /// conversation; anyone else may only answer, within a day, a session one of its agents wrote
-/// to (its sent mail is the record); everyone else is refused. It never holds.
+/// to and that took it (its sent mail, with a `stored`, `delivered` or `read` receipt, is the
+/// record); everyone else is refused. It never holds.
 pub fn cloud_inbound(
     store: &Store,
     mine: &Member,
@@ -150,8 +151,10 @@ pub fn cloud_inbound(
         Ok(store
             .conn()
             .prepare(
-                "SELECT 1 FROM messages WHERE to_key = ?1 AND substr(from_key, 1, ?2) = ?3 \
-                 AND sent_at >= ?4",
+                "SELECT 1 FROM messages m JOIN receipts r ON r.from_key = m.from_key \
+                 AND r.request_id = m.request_id WHERE m.to_key = ?1 \
+                 AND substr(m.from_key, 1, ?2) = ?3 AND m.sent_at >= ?4 \
+                 AND r.state IN ('stored', 'delivered', 'read')",
             )?
             .exists(rusqlite::params![
                 from_addr,

@@ -71,7 +71,8 @@ fn gate(op: &str, invite: Invite) -> Gate {
 
 pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, peer_pid: Option<u32>) -> Response {
     // Retired: a cloud member is removed by an admin like any member.
-    if op == "team.unlink" {
+    // A workspace member never mints a link.
+    if op == "team.unlink" || (op == "team.invite" && daemon.cloud.is_some()) {
         return Response::err(id, UNSUPPORTED);
     }
     if op.starts_with("team.") {
@@ -111,18 +112,29 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, peer_pid: Option
         };
     }
     match op {
-        // `identity.get {}` -> who this computer is. Until sign-in, `person_id` is its own key.
-        "identity.get" => Response::ok(
-            id,
-            json!({
-                "member_key": daemon.identity.key,
-                "member_key_short": daemon.identity.short,
-                "name": super::user_name(),
-                "computer": daemon.team.lock().unwrap().config.computer,
-                "person_id": daemon.identity.key,
-                "verified": false,
-            }),
-        ),
+        // `identity.get {}` -> who this computer (or instance: `kind` `cloud`, named for its
+        // workspace) is. Until sign-in, a computer's `person_id` is its own key; an instance's is
+        // its roster member's (`ws:<id>` once admitted).
+        "identity.get" => {
+            let t = daemon.team.lock().unwrap();
+            let key = &daemon.identity.key;
+            let (name, kind, person_id) = match &daemon.cloud {
+                Some(c) => (c.name.clone(), "cloud", t.roster.person_of(key)),
+                None => (super::user_name(), "computer", key.as_str()),
+            };
+            Response::ok(
+                id,
+                json!({
+                    "member_key": key,
+                    "member_key_short": daemon.identity.short,
+                    "name": name,
+                    "kind": kind,
+                    "computer": t.config.computer,
+                    "person_id": person_id,
+                    "verified": false,
+                }),
+            )
+        }
         // `relay.get {}` -> `{urls, source, error}`: the relays in effect and where they came
         // from (`config`, `team`, `lightbulb` or `none`); the snapshot `status` reads too.
         "relay.get" => Response::ok(id, json!(*daemon.peers.relays.lock().unwrap())),
@@ -137,8 +149,12 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, peer_pid: Option
             None => Response::err(id, UNSUPPORTED),
         },
         "cloud.sessions.set" => cloud_sessions_set(id, body, daemon),
-        // `snapshot {path}` -> `{}`: a consistent copy of `state.db` at `path`.
-        "snapshot" => match body["path"].as_str() {
+        // `snapshot {path}` -> `{}`: a consistent copy of `state.db` at `path` (absolute, outside
+        // the state dir). A person only on a computer: it copies every message out.
+        "snapshot" if daemon.cloud.is_none() && !peer_pid.is_some_and(person_only) => {
+            refused(id, "not_a_person")
+        }
+        "snapshot" => match body["path"].as_str().filter(|p| outside(&daemon.dir, p)) {
             Some(p) => match daemon
                 .store
                 .lock()
@@ -278,15 +294,10 @@ pub async fn leave(id: u64, daemon: &Daemon, person: bool) -> Response {
     let mut solo = || -> crate::Result<()> {
         store.clear_roster()?;
         // Stamped after the old root, so the new network never repeats its `team_id`.
-        let user = super::user_name();
         let now = super::ipc::now() as i64;
-        let g = genesis(
-            &daemon.identity,
-            &user,
-            &team.config.computer,
-            &user,
-            now.max(root_at + 1),
-        );
+        let cloud = daemon.cloud.as_ref().map(|c| c.name.as_str());
+        let at = now.max(root_at + 1);
+        let g = solo_genesis(&daemon.identity, cloud, &team.config.computer, at);
         roster::accept(&store, &g, now)?;
         install(daemon, &mut team, &store, roster::replay(&[g]))
     };
@@ -341,6 +352,33 @@ pub fn genesis(me: &Identity, name: &str, computer: &str, team_name: &str, at: i
     Entry::signed(me, vec![], Kind::Admit, body, at)
 }
 
+/// This engine's solo network: a computer's (`genesis`, as its person), or a workspace
+/// member's (`cloud`: the workspace's name, member and team alike).
+pub(crate) fn solo_genesis(me: &Identity, cloud: Option<&str>, computer: &str, at: i64) -> Entry {
+    let Some(name) = cloud else {
+        let user = super::user_name();
+        return genesis(me, &user, computer, &user, at);
+    };
+    let body = json!({"member": me.key, "name": name, "computer": computer,
+        "person_id": me.key, "kind": "cloud", "role": "founder", "ticket_id": "",
+        "team_name": name});
+    Entry::signed(me, vec![], Kind::Admit, body, at)
+}
+
+/// Whether `path` is absolute and names nothing in (or of) state dir `dir`: a snapshot never
+/// lands on the live database.
+fn outside(dir: &std::path::Path, path: &str) -> bool {
+    let p = std::path::Path::new(path);
+    let canon = |q: &std::path::Path| std::fs::canonicalize(q).ok();
+    let (Some(dir), Some(parent)) = (canon(dir), p.parent().and_then(canon)) else {
+        return false;
+    };
+    p.is_absolute()
+        && p.file_name().is_some()
+        && !parent.starts_with(&dir)
+        && !canon(p).is_some_and(|c| c.starts_with(&dir))
+}
+
 /// Rewrites Plan A's `team` row from `new` when its id, name or founder differs from `old`'s.
 pub(crate) fn sync_team_row(store: &Store, old: &Roster, new: &Roster) -> crate::Result<()> {
     fn row(r: &Roster) -> (&str, &str, &str) {
@@ -365,14 +403,21 @@ pub fn install(
 ) -> crate::Result<()> {
     sync_team_row(store, &team.roster, &new)?;
     let relay_changed = team.roster.relay != new.relay;
-    // A removal or leave applied in this team (not a team left or joined): every subscriber
-    // hears of each member gone.
+    // A removal or leave applied in this team (not a team left or joined, nor a member a fork's
+    // resolution dropped): every subscriber hears of each member it took.
     if team.roster.team_id == new.team_id {
+        let took = |k: &str| {
+            new.log().iter().any(|(h, e)| {
+                matches!(e.kind, Kind::Remove | Kind::Leave)
+                    && !team.roster.knows(h)
+                    && e.body["member"] == k
+            })
+        };
         for k in team
             .roster
             .members
             .keys()
-            .filter(|k| !new.members.contains_key(*k))
+            .filter(|k| !new.members.contains_key(*k) && took(k))
         {
             let _ = daemon
                 .events
@@ -616,7 +661,7 @@ fn cloud_sessions_set(id: u64, body: &Value, daemon: &Daemon) -> Response {
         }
         out.push(r);
     }
-    *cloud.lock().unwrap() = out;
+    *cloud.sessions.lock().unwrap() = out;
     crate::presence::publish(daemon);
     Response::ok(id, json!({}))
 }

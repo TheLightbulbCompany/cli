@@ -33,6 +33,14 @@ static STARTING: Mutex<()> = Mutex::const_new(());
 /// An instance on `home` that dials `envs` at their running daemons, with a final snapshot to
 /// `snapshot` at shutdown.
 async fn start(home: &Path, envs: &[&Env], snapshot: Option<&Path>) -> Instance {
+    try_start(home, envs, snapshot).await.unwrap()
+}
+
+async fn try_start(
+    home: &Path,
+    envs: &[&Env],
+    snapshot: Option<&Path>,
+) -> lightbulb_connect::Result<Instance> {
     let _one = STARTING.lock().await;
     std::env::set_var("LIGHTBULB_CONNECT_PEERS", peers(envs).1);
     let opts = EmbedOpts {
@@ -40,8 +48,9 @@ async fn start(home: &Path, envs: &[&Env], snapshot: Option<&Path>) -> Instance 
         relay: None,
         issuer: "http://127.0.0.1:9/connect".into(),
         snapshot: snapshot.map(Path::to_path_buf),
+        name: NAME.into(),
     };
-    let i = embed::start(home, opts).await.unwrap();
+    let i = embed::start(home, opts).await;
     std::env::remove_var("LIGHTBULB_CONNECT_PEERS");
     i
 }
@@ -205,16 +214,37 @@ async fn person_only_ops_are_refused_in_process() {
         ("team.admin", json!({"member": x})),
         ("hold.answer", json!({"hold": "H1", "verdict": "allow"})),
         ("hold.get", json!({"hold": "H1"})),
-        ("team.invite", json!({"mode": "open"})),
         ("policy.set", json!({"person_id": x, "value": "accept"})),
         ("share.grant", json!({"session": "x", "to": x})),
     ] {
         refused(&call(&i, op, body).await, "not_a_person");
     }
+    // A workspace member mints no link, unlinks nothing, and stops only by `shutdown()`.
+    for (op, body) in [
+        ("team.unlink", json!({})),
+        ("team.invite", json!({})),
+        ("team.invite", json!({"mode": "once"})),
+        ("team.invite", json!({"mode": "open"})),
+        ("shutdown", json!({})),
+    ] {
+        assert_eq!(call(&i, op, body).await["error"], "unsupported", "{op}");
+    }
+    // Its solo network is the workspace's.
+    let me = ok(&i, "identity.get", json!({})).await;
     assert_eq!(
-        call(&i, "team.unlink", json!({})).await["error"],
-        "unsupported"
+        (me["kind"].as_str(), me["name"].as_str()),
+        (Some("cloud"), Some(NAME))
     );
+    // One engine per home; a snapshot never lands in it.
+    assert!(try_start(home.path(), &[], None).await.is_err());
+    for p in [
+        home.path().join("state.db"),
+        home.path().join("x.db"),
+        "rel.db".into(),
+    ] {
+        let r = call(&i, "snapshot", json!({ "path": p })).await;
+        assert_eq!(r["error"], "bad_request", "{p:?}: {r}");
+    }
     i.shutdown().await;
 }
 
@@ -254,8 +284,39 @@ async fn workspace_instance_joins_and_leaves_in_process() {
     )
     .await;
     assert_eq!(r["error"], "bad_request", "{r}");
+    // No proof, or one whose `sub` is not its workspace's: refused.
+    let r = call(
+        &i,
+        "team.join",
+        json!({"ticket": t["ticket"], "name": NAME, "kind": "cloud"}),
+    )
+    .await;
+    assert_eq!(r["error"], "bad_request", "{r}");
+    let bad = json!({"kind": "workspace", "sub": "ws:W2", "workspace": {"id": "W1"}}).to_string();
+    let r = ok(
+        &i,
+        "team.join",
+        json!({"ticket": t["ticket"], "name": NAME, "kind": "cloud", "proof": bad}),
+    )
+    .await;
+    assert_eq!(
+        (r["state"].as_str(), r["reason"].as_str()),
+        (Some("refused"), Some("bad_request")),
+        "{r}"
+    );
     assert_eq!(join(&i, &a).await["state"], "admitted");
-    let key = ok(&i, "identity.get", json!({})).await["member_key"].clone();
+    let again = join(&i, &a).await;
+    assert_eq!(again["reason"], "already_in_team", "{again}");
+    let me = ok(&i, "identity.get", json!({})).await;
+    assert_eq!(
+        (me["kind"].as_str(), me["person_id"].as_str()),
+        (Some("cloud"), Some("ws:W1"))
+    );
+    assert_eq!(
+        call(&i, "team.invite", json!({})).await["error"],
+        "unsupported"
+    );
+    let key = me["member_key"].clone();
     let team = ok(&i, "team.get", json!({})).await;
     let mine = team["members"]
         .as_array()
@@ -385,8 +446,30 @@ async fn only_own_workspace_computers_start_a_conversation() {
         json!({"from": friday, "to": to, "text": "hello carol", "request_id": "f1"}),
     )
     .await;
-    pc.recv_where(|f| matches!(f, Frame::Envelope { .. })).await;
-    assert_eq!(ask(&mut pc, &ic, "c2", &friday).await.0, "stored");
+    let id = match pc.recv_where(|f| matches!(f, Frame::Envelope { .. })).await {
+        Frame::Envelope { id, .. } => id,
+        _ => unreachable!(),
+    };
+    // Until C's computer has taken it, C has not received it.
+    assert_eq!(
+        ask(&mut pc, &ic, "c2", &friday).await,
+        ("refused".into(), policy.clone())
+    );
+    let stored = Frame::Ack {
+        id,
+        state: "stored".into(),
+        reason: None,
+    };
+    pc.send(&stored).await;
+    let mut accepted = false;
+    for n in 0..50 {
+        if ask(&mut pc, &ic, &format!("c2-{n}"), &friday).await.0 == "stored" {
+            accepted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(accepted, "C's answer is taken once friday's mail is stored");
     let db = rusqlite::Connection::open(home.path().join("state.db")).unwrap();
     db.execute(
         "UPDATE messages SET sent_at = sent_at - 90000 WHERE from_key = ?1",
@@ -455,10 +538,58 @@ async fn snapshot_and_events() {
 
     let copy = out.path().join("copy.db");
     ok(&i, "snapshot", json!({"path": copy})).await;
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::metadata(&copy).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
     let snap = Store::open(&copy).unwrap();
     assert!(!roster::entries(&snap).unwrap().is_empty());
     i.shutdown().await;
+    // The home is free again once the instance is down.
+    try_start(home.path(), &[], None)
+        .await
+        .unwrap()
+        .shutdown()
+        .await;
     assert!(!roster::entries(&Store::open(&last).unwrap())
         .unwrap()
         .is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_message_event_per_message_and_none_for_an_undeclared_name() {
+    let (_home, i, [(ia, mut pa, _a), _b, _c]) = seeded(None).await;
+    let mut events = i.events();
+    declare(&i, &["friday"]).await;
+    let w = me(&i).await;
+    let friday = format!("{w}/friday");
+    let from = format!("{}/codex:c1", ia.short);
+    // Mail for a name the instance did not declare is refused as unadvertised.
+    let ghost = ulid();
+    pa.send(&envelope(&ghost, "g1", &from, &format!("{w}/ghost")))
+        .await;
+    let ack = |id: String| move |f: &Frame| matches!(f, Frame::Ack { id: i, .. } if *i == id);
+    match pa.recv_where(ack(ghost)).await {
+        Frame::Ack { state, reason, .. } => {
+            assert_eq!(
+                (state.as_str(), reason.as_deref()),
+                ("refused", Some("policy"))
+            )
+        }
+        _ => unreachable!(),
+    }
+    // The same envelope twice (a lost ack), then another: two events, one for each message.
+    let (first, second) = (ulid(), ulid());
+    for (id, rid) in [(&first, "a1"), (&first, "a1"), (&second, "a2")] {
+        pa.send(&envelope(id, rid, &from, &friday)).await;
+        pa.recv_where(ack(id.clone())).await;
+    }
+    let e1 = event(&mut events, |e| e["event"] == "message").await;
+    let e2 = event(&mut events, |e| e["event"] == "message").await;
+    assert_eq!(
+        (e1["id"].as_str(), e2["id"].as_str()),
+        (Some(first.as_str()), Some(second.as_str()))
+    );
+    i.shutdown().await;
 }
