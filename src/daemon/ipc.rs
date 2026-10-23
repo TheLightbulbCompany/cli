@@ -187,17 +187,25 @@ async fn handle(
         {
             refused(id, "not_a_person")
         }
-        "send" => send(id, &req.body, daemon),
+        "send" => {
+            let mut r = send(id, &req.body, daemon);
+            if let (true, Some(from)) = (r.ok, req.body["from"].as_str()) {
+                let from = Key(from.into());
+                if req.body["wait"] == true {
+                    settle(daemon, &from, &mut r.body["receipt"]).await;
+                }
+                annotate(daemon, &from, &mut r.body["receipt"]);
+            }
+            r
+        }
         "receipt" => match (req.body["from"].as_str(), req.body["request_id"].as_str()) {
             (Some(from), Some(rid)) => {
-                let team = daemon.team.lock().unwrap();
-                let store = daemon.store.lock().unwrap();
                 let from = Key(from.into());
-                match mail::receipt(&store, &from, rid) {
-                    Ok(Some(mut r)) => {
-                        if let Ok(Some(to)) = mail::recipient(&store, &from, rid) {
-                            locate(daemon, &team.roster, &to, &mut r);
-                        }
+                let got = mail::receipt(&daemon.store.lock().unwrap(), &from, rid);
+                match got {
+                    Ok(Some(r)) => {
+                        let mut r = json!(r);
+                        annotate(daemon, &from, &mut r);
                         Response::ok(id, json!({ "receipt": r }))
                     }
                     Ok(None) => Response::err(id, NOT_FOUND),
@@ -339,7 +347,8 @@ struct Register {
 }
 
 /// `register {session: {provider, conversation, pid, birth_micros, cwd, title?, status?, executable?}, caller?}`
-/// upserts by key; the daemon supplies the member prefix. A key whose row names another
+/// upserts by key; the daemon supplies the member prefix. A `cwd` under `folders_off` is
+/// answered `{key, ignored: true}` and nothing is written. A key whose row names another
 /// live process is refused (`bad_request`, reason `owned_by_live_process`). `status` is `idle` (default) or
 /// `busy` (stored as live); `conversation` is `[A-Za-z0-9._-]{1,128}`.
 fn register(id: u64, body: &Value, daemon: &Daemon) -> Response {
@@ -360,6 +369,14 @@ fn register(id: u64, body: &Value, daemon: &Daemon) -> Response {
     };
     let me = caller.unwrap_or((r.pid, r.birth_micros));
     let key = Key::new(&daemon.identity.short, &r.provider, &r.conversation);
+    // A folder turned off is not shown to anyone: its sessions are not registered at all.
+    let off: Vec<_> = {
+        let folders = daemon.team.lock().unwrap().config.folders_off.clone();
+        folders.iter().map(|o| presence::canonical(o)).collect()
+    };
+    if presence::hidden(&off, &r.cwd) {
+        return Response::ok(id, json!({ "key": key, "ignored": true }));
+    }
     let mut store = daemon.store.lock().unwrap();
     match row_process(&store, &key.0) {
         Ok(Some(owner)) if owner != me && sessions::alive(owner.0, owner.1) => {
@@ -443,6 +460,25 @@ pub(crate) fn sender_label(daemon: &Daemon, m: &store::Message) -> String {
     label::sender(&team.roster, me, m)
 }
 
+/// `m`'s sender for an inbox record: `label`, and its member's `person`, `person_verified` and
+/// `computer` (this computer's own name and user before it is in a team).
+fn sender_fields(daemon: &Daemon, m: &store::Message) -> Value {
+    let label = sender_label(daemon, m);
+    let from = label::from(&daemon.identity.short, m);
+    let team = daemon.team.lock().unwrap();
+    let mut v = json!({ "label": label, "person": super::user_name(),
+        "person_verified": false, "computer": team.config.computer });
+    if let Some(s) = team
+        .roster
+        .by_short(sessions::member_of(&from).unwrap_or(""))
+    {
+        v["person"] = label::name(s).into();
+        v["person_verified"] = s.proof.is_some().into();
+        v["computer"] = s.computer.clone().into();
+    }
+    v
+}
+
 pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -493,12 +529,7 @@ fn send(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
     };
     let p = match prepared {
         mail::Prep::Go(p) => p,
-        mail::Prep::Done(mut r) => {
-            if let Ok(Some(to)) = mail::recipient(&store, &from, rid) {
-                locate(daemon, &team.roster, &to, &mut r);
-            }
-            return Response::ok(id, json!({ "receipt": r }));
-        }
+        mail::Prep::Done(r) => return Response::ok(id, json!({ "receipt": r })),
     };
     let prefix = sessions::member_of(&p.to.0).unwrap_or("");
     if prefix != daemon.identity.short {
@@ -540,18 +571,90 @@ pub(crate) fn stored(daemon: &Arc<Daemon>, to: &Key) {
     }
 }
 
-/// A receipt for mail to `to` under another member's prefix is `where` that member's computer.
-fn locate(daemon: &Daemon, roster: &crate::roster::Roster, to: &str, r: &mut mail::Receipt) {
-    let prefix = sessions::member_of(to).unwrap_or("");
-    if prefix != daemon.identity.short {
-        if let Some(m) = roster.by_short(prefix) {
-            r.where_ = Some(m.computer.clone());
+/// How long a `send` with `wait` waits for a teammate's online computer to answer.
+const SETTLE: Duration = Duration::from_secs(5);
+
+/// The member key mail `from`'s `request_id` went to, when that is another member.
+fn member_for(daemon: &Daemon, from: &Key, rid: &str) -> Option<(String, String)> {
+    let to = mail::recipient(&daemon.store.lock().unwrap(), from, rid).ok()??;
+    let prefix = sessions::member_of(&to)?;
+    if prefix == daemon.identity.short {
+        return None;
+    }
+    let team = daemon.team.lock().unwrap();
+    Some((team.roster.by_short(prefix)?.key.clone(), to))
+}
+
+/// Waits up to `SETTLE` for queued receipt `r` to move while its member is online: a teammate's
+/// computer that is up stores (or holds) the mail within a moment.
+async fn settle(daemon: &Daemon, from: &Key, r: &mut Value) {
+    let Some(rid) = r["request_id"].as_str().map(String::from) else {
+        return;
+    };
+    let Some((member, _)) = member_for(daemon, from, &rid) else {
+        return;
+    };
+    let deadline = tokio::time::Instant::now() + SETTLE;
+    while r["state"] == "queued"
+        && tokio::time::Instant::now() < deadline
+        && daemon.peers.online().contains(&member)
+    {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let now = mail::receipt(&daemon.store.lock().unwrap(), from, &rid);
+        if let Ok(Some(now)) = now {
+            r["state"] = json!(now.state);
+            r["reason"] = json!(now.reason);
         }
     }
 }
 
+/// Adds to receipt `r` (of `from`'s `request_id`) what its reader is told. For mail under another
+/// member's prefix: `where` (that member's computer), `person` (its person's name, `you` for
+/// this computer's own), `tier` (the session's, from that member's presence) and, while
+/// queued, `until` (when the outbox gives up). For a `loop` refusal: `loop`, `hops` or `rate`
+/// (`mail::loop_kind`).
+fn annotate(daemon: &Daemon, from: &Key, r: &mut Value) {
+    let Some(rid) = r["request_id"].as_str().map(String::from) else {
+        return;
+    };
+    let (kind, at) = {
+        let store = daemon.store.lock().unwrap();
+        let looped = r["state"] == "refused" && r["reason"] == "loop";
+        let kind = looped.then(|| mail::loop_kind(&store, from, &rid).ok());
+        (
+            kind.flatten(),
+            mail::receipt_at(&store, from, &rid).ok().flatten(),
+        )
+    };
+    if let Some(k) = kind {
+        r["loop"] = k.into();
+    }
+    let Some((member, to)) = member_for(daemon, from, &rid) else {
+        return;
+    };
+    {
+        let team = daemon.team.lock().unwrap();
+        let Some(m) = team.roster.members.get(&member) else {
+            return;
+        };
+        let mine = m.person_id == team.roster.person_of(&daemon.identity.key);
+        r["where"] = m.computer.clone().into();
+        r["person"] = if mine { "you".into() } else { label::name(m) }.into();
+    }
+    let latest = daemon.latest.lock().unwrap();
+    if let Some(s) = latest
+        .get(&member)
+        .and_then(|l| l.sessions.iter().find(|s| s.session_id == to))
+    {
+        r["tier"] = s.tier.clone().into();
+    }
+    if let (true, Some(at)) = (r["state"] == "queued", at) {
+        r["until"] = (at + outbox::TTL_S as i64).into();
+    }
+}
+
 /// `inbox {key, wait_secs?}` -> `{messages}`, each with `framed`, the text as the agent
-/// is shown it (`frame::framed`): takes (and so delivers) what waits for `key`;
+/// is shown it (`frame::framed`), and who sent it (`sender_fields`): takes (and so delivers) what waits for `key`;
 /// with `wait_secs` (at most 600) it first waits for something to arrive. With `caller`, only
 /// the row's own process may take it (`bad_request`, reason `not_owner`, otherwise).
 async fn inbox(
@@ -638,10 +741,24 @@ async fn inbox(
                 let messages: Vec<Value> = m
                     .iter()
                     .map(|m| {
-                        json!({ "id": m.id, "request_id": m.request_id, "from": m.from_key,
-                            "to": m.to_key, "kind": m.kind, "thread": m.thread, "hops": m.hops,
-                            "text": m.body, "sent_at": m.sent_at,
-                            "framed": frame::framed(&sender_label(daemon, m), &m.request_id, &m.body) })
+                        let mut v = sender_fields(daemon, m);
+                        let label = v["label"].as_str().unwrap_or_default();
+                        let framed = frame::framed(label, &m.request_id, &m.body);
+                        for (k, x) in [
+                            ("id", json!(m.id)),
+                            ("request_id", json!(m.request_id)),
+                            ("from", json!(m.from_key)),
+                            ("to", json!(m.to_key)),
+                            ("kind", json!(m.kind)),
+                            ("thread", json!(m.thread)),
+                            ("hops", json!(m.hops)),
+                            ("text", json!(m.body)),
+                            ("sent_at", json!(m.sent_at)),
+                            ("framed", json!(framed)),
+                        ] {
+                            v[k] = x;
+                        }
+                        v
                     })
                     .collect();
                 return Response::ok(id, json!({ "messages": messages }));

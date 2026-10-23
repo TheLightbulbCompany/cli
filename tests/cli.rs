@@ -452,3 +452,45 @@ fn setup_remove_also_stops_the_daemon_and_removes_the_job() {
         out(&o)
     );
 }
+
+#[test]
+fn folder_off_hides_sessions_after_reload() {
+    let (a, b) = common::pair(&[]);
+    let proj = tempfile::tempdir().unwrap();
+    let dir = proj.path().to_str().unwrap().to_string();
+    let p = os::process(std::process::id()).unwrap();
+    let register = |conv: &str, cwd: &str| {
+        a.ask(
+            json!({"id": 1, "op": "register", "session": {"provider": "codex",
+            "conversation": conv, "pid": p.pid, "birth_micros": p.birth_micros, "cwd": cwd}}),
+        )
+    };
+    let s1 = register("f1", &dir)["key"].as_str().unwrap().to_string();
+    common::until(15, "B sees the session", || common::sees(&b, &s1));
+    // A send from B's terminal to it says where it waits.
+    let o = b.person(&["send", &s1, "hello"]);
+    let line = out(&o);
+    assert!(
+        line.contains(" stored on mac (tier ")
+            && line.contains("). Receipt: lightbulb-connect receipt "),
+        "{line}{}",
+        err(&o)
+    );
+
+    let o = a.person(&["folder", &dir, "off"]);
+    assert!(o.status.success(), "{}{}", out(&o), err(&o));
+    let config = std::fs::read_to_string(a.state.path().join("config.toml")).unwrap();
+    assert!(config.contains("folders_off"), "{config}");
+    common::until(15, "B no longer sees it", || !common::sees(&b, &s1));
+    // A new session under the folder is not registered at all.
+    let sub = proj.path().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    let r = register("f2", sub.to_str().unwrap());
+    assert_eq!(r["ignored"], true, "{r}");
+    let local = a.ask(json!({"id": 1, "op": "sessions"}));
+    assert!(!local.to_string().contains("codex:f2"), "{local}");
+
+    let o = a.person(&["folder", &dir, "on"]);
+    assert!(o.status.success(), "{}{}", out(&o), err(&o));
+    common::until(15, "B sees it again", || common::sees(&b, &s1));
+}

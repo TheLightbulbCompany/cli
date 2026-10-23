@@ -1,7 +1,7 @@
 //! Who a message is from, as its reader is told: rendered from the roster alone.
 
 use crate::frame::{agent_name, Sender};
-use crate::roster::Roster;
+use crate::roster::{Member, Roster};
 use crate::sessions::{member_of, split_addr};
 use crate::store::Message;
 
@@ -25,17 +25,7 @@ pub fn render(roster: &Roster, viewer: &str, from: &str) -> String {
     let (who, possessive) = if m.person_id == roster.person_of(viewer) {
         ("You".to_string(), "Your".to_string())
     } else {
-        // Display text: drop characters that could pass for the frame header's delimiters.
-        let name: String = m
-            .name
-            .chars()
-            .filter(|c| printable(*c) && !matches!(c, '{' | '}' | '[' | ']'))
-            .collect();
-        let name = if name.trim().is_empty() {
-            "a member".to_string()
-        } else {
-            name
-        };
+        let name = name(m);
         (name.clone(), format!("{name}'s"))
     };
     let label = match Sender::of(prefix, from) {
@@ -51,23 +41,42 @@ pub fn render(roster: &Roster, viewer: &str, from: &str) -> String {
     }
 }
 
+/// `m`'s name as display text: without the characters that could pass for the frame header's
+/// delimiters, `a member` when nothing is left.
+pub fn name(m: &Member) -> String {
+    let name: String = m
+        .name
+        .chars()
+        .filter(|c| printable(*c) && !matches!(c, '{' | '}' | '[' | ']'))
+        .collect();
+    if name.trim().is_empty() {
+        "a member".to_string()
+    } else {
+        name
+    }
+}
+
 /// `m`'s sender as the agents of the computer `me` (key, short) are told it. Mail that came in
 /// over the IPC (`origin` other than `net:`) is that computer's by construction, whatever
 /// member prefix its `from` carries.
 pub fn sender(roster: &Roster, me: (&str, &str), m: &Message) -> String {
-    let from = if m.origin.as_deref().is_some_and(|o| o.starts_with("net:")) {
+    render(roster, me.0, &from(me.1, m))
+}
+
+/// The address `m` is from as its reader at member `short` labels it (`sender`).
+pub fn from(short: &str, m: &Message) -> String {
+    if m.origin.as_deref().is_some_and(|o| o.starts_with("net:")) {
         m.from_key.clone()
     } else {
         let rest = split_addr(&m.from_key).map_or(m.from_key.as_str(), |(_, r)| r);
-        format!("{}/{rest}", me.1)
-    };
-    render(roster, me.0, &from)
+        format!("{short}/{rest}")
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::roster::{Member, MemberKind, Role};
+    use crate::roster::{MemberKind, Role};
 
     fn member(key: &str, short: &str, name: &str, person: &str, proof: Option<&str>) -> Member {
         Member {

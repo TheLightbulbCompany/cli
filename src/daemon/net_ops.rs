@@ -125,8 +125,25 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, peer_pid: Option
             daemon.dialogs.claim(super::ipc::now() as i64);
             Response::ok(id, json!({ "lease_s": crate::dialog::LEASE_S }))
         }
+        "reload" => match reload(daemon) {
+            Ok(()) => Response::ok(id, json!({})),
+            Err(e) => {
+                eprintln!("reload: {e}");
+                Response::err(id, INTERNAL)
+            }
+        },
         _ => Response::err(id, UNKNOWN_OP),
     }
+}
+
+/// `reload {}` -> `{}`: re-reads `config.toml` into `TeamState`, and rebuilds the presence (a
+/// session under a folder turned off leaves it). Every file the daemon reads at start and may
+/// read again is re-read here.
+pub fn reload(daemon: &Daemon) -> crate::Result<()> {
+    let config = crate::config::Config::load(&crate::paths::state_dir())?;
+    daemon.team.lock().unwrap().config = config;
+    daemon.presence.notify_one();
+    Ok(())
 }
 
 /// How long `team.leave` waits for a peer to take the `leave` entry.

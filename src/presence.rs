@@ -95,8 +95,16 @@ fn remote(s: &Session, share_paths: bool) -> Remote {
     .clamp()
 }
 
+/// Whether `cwd` is under one of `off` (`folders_off`, each `canonical`).
+pub(crate) fn hidden(off: &[PathBuf], cwd: &str) -> bool {
+    !off.is_empty() && {
+        let cwd = canonical(Path::new(cwd));
+        off.iter().any(|o| cwd.starts_with(o))
+    }
+}
+
 /// `p` resolved (symlinks, `..`), else as given; lowercased on macOS, whose volumes ignore case.
-fn canonical(p: &Path) -> PathBuf {
+pub(crate) fn canonical(p: &Path) -> PathBuf {
     let p = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     if cfg!(target_os = "macos") {
         PathBuf::from(p.to_string_lossy().to_lowercase())
@@ -115,12 +123,7 @@ fn build(d: &Daemon, seq: u64) -> Frame {
         (t.config.share_paths, t.config.folders_off.clone())
     };
     let off: Vec<PathBuf> = off.iter().map(|o| canonical(o)).collect();
-    let publishable = |cwd: &str| {
-        off.is_empty() || {
-            let cwd = canonical(Path::new(cwd));
-            !off.iter().any(|o| cwd.starts_with(o))
-        }
-    };
+    let publishable = |cwd: &str| !hidden(&off, cwd);
     let mut live = ipc::live_sessions(d);
     let (rows, ended, waiting) = {
         let store = d.store.lock().unwrap();

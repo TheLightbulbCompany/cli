@@ -228,21 +228,33 @@ pub fn send(
         let r = ask(
             &mut conn,
             "send",
-            json!({ "from": from, "to": to, "text": text, "request_id": rid, "reply_to": reply_to }),
+            json!({ "from": from, "to": to, "text": text, "request_id": rid,
+                "reply_to": reply_to, "wait": true }),
         )?;
         let receipt = &r["receipt"];
         let state = receipt["state"].as_str().unwrap_or("unknown");
-        let mut line = match receipt["reason"].as_str() {
-            Some(reason) if state == "refused" => format!("refused: {reason}"),
-            _ => state.to_string(),
-        };
         if state == "refused" {
             code = 1;
         }
-        line.push_str(&format!(" {rid}"));
-        if group {
-            line.push_str(&format!(" {to}"));
-        }
+        let line = match crate::mcp::note(receipt) {
+            Some(_) if state == "stored" => format!(
+                "{rid} stored on {} (tier {}). Receipt: lightbulb-connect receipt {rid}",
+                receipt["where"].as_str().unwrap_or_default(),
+                receipt["tier"].as_str().unwrap_or("unknown"),
+            ),
+            Some(note) => note,
+            None => {
+                let mut line = match receipt["reason"].as_str() {
+                    Some(reason) if state == "refused" => format!("refused: {reason}"),
+                    _ => state.to_string(),
+                };
+                line.push_str(&format!(" {rid}"));
+                if group {
+                    line.push_str(&format!(" {to}"));
+                }
+                line
+            }
+        };
         println!("{line}");
     }
     Ok(code)
@@ -301,6 +313,30 @@ pub fn receipt(request_id: &str, from: Option<String>) -> Result<i32> {
     } else {
         Err(format!("receipt: {r}").into())
     }
+}
+
+/// `folder <path> on|off`: whether the sessions under `path` are shown to teammates
+/// (`folders_off` in `config.toml`, canonical as presence compares them), then `reload`.
+pub fn folder(path: &str, on: bool) -> Result<i32> {
+    let dir = paths::state_dir();
+    let p = crate::presence::canonical(Path::new(path));
+    let mut off = crate::config::Config::load(&dir)?.folders_off;
+    off.retain(|o| crate::presence::canonical(o) != p);
+    if !on {
+        off.push(p);
+    }
+    let list: toml_edit::Array = off
+        .iter()
+        .map(|o| o.to_string_lossy().into_owned())
+        .collect();
+    crate::config::Config::set(&dir, "folders_off", &list.to_string())?;
+    ask(&mut connect()?, "reload", json!({}))?;
+    if on {
+        println!("Sessions in {path} are shown to your teammates.");
+    } else {
+        println!("Sessions in {path} are hidden from your teammates.");
+    }
+    Ok(0)
 }
 
 // ---- team -------------------------------------------------------------------------------

@@ -3,9 +3,9 @@
 //! session it comes from (`agents::source`); the model never names its own source.
 
 use crate::agents::source::{self, SourceError};
-use crate::os::{self, Process};
-use crate::sessions::{Key, Session, Status, Tier};
-use crate::{daemon, hook, paths};
+use crate::os::Process;
+use crate::sessions::{Key, Session, Tier};
+use crate::{daemon, hook, mail, paths};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, RequestMetaObject};
 use rmcp::{tool, tool_handler, tool_router, ServerHandler, ServiceExt};
@@ -195,24 +195,58 @@ fn git_in(cwd: &Path) -> Option<(Option<String>, Option<String>)> {
     Some((repo, branch))
 }
 
-fn record(s: &Session, from: &Key, person: &str, computer: &str) -> Value {
-    let (repo, branch) = git(&s.cwd);
-    json!({
-        "session_id": s.key,
-        "person": person,
-        "person_verified": false,
-        "computer": computer,
-        "agent": s.provider,
-        "cwd": s.cwd,
-        "repo": repo,
-        "branch": branch,
-        "status": match s.status { Status::Live => "busy", Status::Idle => "idle", Status::Gone => "gone" },
-        "doing": s.doing.clone().unwrap_or_default(),
-        "tier": s.tier,
-        "can_send": true,
-        "needs_owner_ok": false,
-        "is_this_session": &s.key == from,
+/// What receipt `r` (as `send` and `receipt` answer, `ipc::annotate`) means, in words, when it
+/// needs them: mail on a teammate's computer, or a `loop` refusal.
+pub(crate) fn note(r: &Value) -> Option<String> {
+    let at = |f: &str| r[f].as_str().unwrap_or_default();
+    let (computer, person) = (at("where"), at("person"));
+    let remote = r["person"].is_string();
+    Some(match at("state") {
+        "refused" if at("reason") == "loop" && at("loop") == "rate" => {
+            format!("loop limit: {} messages in 10 minutes to this session", mail::LOOP_LIMIT)
+        }
+        "refused" if at("reason") == "loop" => {
+            format!("paused after {} agent replies; a person must speak", mail::MAX_HOPS)
+        }
+        "queued" if remote => {
+            let until = local_time(r["until"].as_i64().unwrap_or_default());
+            format!("queued: {computer} is offline. Will retry until {until}.")
+        }
+        "stored" if remote => format!(
+            "stored on {computer}. It may be held for {person} to approve; you will see the receipt change."
+        ),
+        "held" if remote => format!("held: waiting for {person} to approve"),
+        _ => return None,
     })
+}
+
+/// `secs` in local time: `HH:MM`, after the date (`YYYY-MM-DD HH:MM`) when it is not today.
+pub(crate) fn local_time(secs: i64) -> String {
+    let tm = |t: i64| {
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        unsafe { libc::localtime_r(&(t as libc::time_t), &mut tm) };
+        tm
+    };
+    let (t, today) = (tm(secs), tm(crate::daemon::ipc::now() as i64));
+    let hm = format!("{:02}:{:02}", t.tm_hour, t.tm_min);
+    if (t.tm_year, t.tm_yday) == (today.tm_year, today.tm_yday) {
+        hm
+    } else {
+        format!(
+            "{:04}-{:02}-{:02} {hm}",
+            t.tm_year + 1900,
+            t.tm_mon + 1,
+            t.tm_mday
+        )
+    }
+}
+
+/// Receipt `r` with its `note`, when it has one.
+fn with_note(mut r: Value) -> Value {
+    if let Some(n) = note(&r) {
+        r["note"] = n.into();
+    }
+    r
 }
 
 impl Server {
@@ -265,7 +299,7 @@ impl Server {
 
 #[tool_router]
 impl Server {
-    /// The coding sessions on this computer you can message.
+    /// The coding sessions you can message: this computer's, then your teammates'.
     #[tool]
     async fn find_sessions(
         &self,
@@ -276,28 +310,43 @@ impl Server {
             Ok(c) => c,
             Err(e) => return e,
         };
-        let person = std::env::var("USER").unwrap_or_default();
-        let computer = os::hostname();
+        let Ok(r) = ask("directory", json!({})).await else {
+            return code("internal");
+        };
         let query = a.query.to_lowercase();
-        let found: Vec<Value> = call
-            .sessions
-            .iter()
-            .map(|s| (s, record(s, &call.from, &person, &computer)))
-            .filter(|(s, r)| {
-                ["session_id", "agent", "cwd", "repo", "branch", "doing"]
+        let fields = [
+            "session_id",
+            "person",
+            "computer",
+            "agent",
+            "cwd",
+            "repo",
+            "branch",
+            "doing",
+        ];
+        let found: Vec<Value> = r["sessions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|r| {
+                fields
                     .iter()
                     .filter_map(|f| r[f].as_str())
-                    .chain(s.title.as_deref())
                     .any(|v| v.to_lowercase().contains(&query))
             })
-            .map(|(_, r)| r)
+            .map(|r| {
+                let mut r = r.clone();
+                r["is_this_session"] = (r["session_id"] == call.from.0.as_str()).into();
+                r
+            })
             .collect();
         let total = found.len();
         let sessions: Vec<Value> = found.into_iter().take(a.limit as usize).collect();
         Self::done(&call, json!({ "sessions": sessions, "total": total })).await
     }
 
-    /// Sends text to another session. Returns its receipt.
+    /// Sends text to another session, here or on a teammate's computer. Returns its receipt; its
+    /// note says where the message waits.
     #[tool]
     async fn send_message(
         &self,
@@ -314,14 +363,20 @@ impl Server {
         if a.session_id.is_none() && a.reply_to.is_none() {
             return code("bad_request");
         }
+        if a.session_id
+            .as_deref()
+            .is_some_and(|t| t == "*" || t.ends_with("/*"))
+        {
+            return code("group_send_not_allowed");
+        }
         let r = ask(
             "send",
             json!({ "from": call.from, "to": a.session_id, "text": a.text,
-                "request_id": a.request_id, "reply_to": a.reply_to }),
+                "request_id": a.request_id, "reply_to": a.reply_to, "wait": true }),
         )
         .await;
         match r {
-            Ok(r) if r["ok"] == true => Self::done(&call, r["receipt"].clone()).await,
+            Ok(r) if r["ok"] == true => Self::done(&call, with_note(r["receipt"].clone())).await,
             Ok(r) => refused(r),
             Err(_) => code("internal"),
         }
@@ -344,7 +399,7 @@ impl Server {
         )
         .await
         {
-            Ok(r) if r["ok"] == true => Self::done(&call, r["receipt"].clone()).await,
+            Ok(r) if r["ok"] == true => Self::done(&call, with_note(r["receipt"].clone())).await,
             Ok(r) => refused(r),
             Err(_) => code("internal"),
         }
@@ -379,9 +434,20 @@ impl Server {
                     .unwrap_or_default()
                     .iter()
                     .map(|m| {
-                        json!({ "id": m["id"], "request_id": m["request_id"],
-                            "thread": m["thread"], "from": m["from"],
-                            "text": m["text"], "framed": m["framed"], "sent_at": m["sent_at"] })
+                        let keep = [
+                            "id",
+                            "request_id",
+                            "thread",
+                            "from",
+                            "label",
+                            "person",
+                            "person_verified",
+                            "computer",
+                            "text",
+                            "framed",
+                            "sent_at",
+                        ];
+                        keep.iter().map(|k| (k.to_string(), m[k].clone())).collect()
                     })
                     .collect();
                 Self::done(&call, json!({ "messages": messages })).await
@@ -408,7 +474,7 @@ impl ServerHandler for Server {
     }
 }
 
-const INSTRUCTIONS: &str = "These tools message the other coding sessions (Claude Code, Codex, Cursor, Grok CLI) on this computer. Call find_sessions to see them, then send_message to one by its session_id. Every send_message needs a request_id: a new [A-Za-z0-9._-]{1,128} string, reused only to retry that same send. Messages delivered to you show a requestId; pass it as reply_to to answer one.";
+const INSTRUCTIONS: &str = "These tools message the other coding sessions (Claude Code, Codex, Cursor, Grok CLI) on this computer and your teammates' computers. Call find_sessions to see them, then send_message to one by its session_id. Every send_message needs a request_id: a new [A-Za-z0-9._-]{1,128} string, reused only to retry that same send. Messages delivered to you show a requestId; pass it as reply_to to answer one.";
 
 #[cfg(test)]
 mod tests {

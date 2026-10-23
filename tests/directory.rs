@@ -257,8 +257,7 @@ async fn off_folder_sessions_are_not_published() {
     // The off folder spelled through `..`, its sessions through a symlink: both resolve.
     std::os::unix::fs::symlink(&secret, root.path().join("alias")).unwrap();
     let off = root.path().join("x/../secret");
-    let config = format!("folders_off = [{:?}]\n", off.to_str().unwrap());
-    a.daemon(false, &config, &[]);
+    a.daemon(false, "", &[]);
     let sa = a.short();
     let (open, hidden) = (
         open.to_str().unwrap().to_string(),
@@ -281,6 +280,11 @@ async fn off_folder_sessions_are_not_published() {
         let r = a.ask(json!({"id": 1, "op": "end", "key": to}));
         assert_eq!(r["ended"], true, "{r}");
     }
+    // The folder is turned off after its sessions registered (`reload`); a new one is ignored.
+    let config = format!("lan = false\nfolders_off = [{:?}]\n", off.to_str().unwrap());
+    std::fs::write(a.state.path().join("config.toml"), config).unwrap();
+    assert_eq!(a.ask(json!({"id": 1, "op": "reload"}))["ok"], true);
+    assert_eq!(register(&a, "codex", "h3", &hidden)["ignored"], true);
 
     let (_ep, mut p) = played(&b.identity(), &a, &admit).await;
     let Frame::Presence {

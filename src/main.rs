@@ -113,6 +113,12 @@ enum Command {
         /// accept, hold or refuse.
         value: Option<String>,
     },
+    /// Show (`on`) or hide (`off`) the sessions under a folder from your teammates.
+    Folder {
+        path: String,
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
+    },
     #[command(external_subcommand)]
     External(Vec<OsString>),
     /// Run by an agent's hook config: `hook <claude|codex|cursor|grok> <session-start|user-prompt-submit|post-tool-use|stop|session-end>`.
@@ -202,6 +208,7 @@ fn main() -> lightbulb_connect::Result<()> {
         Command::Decline { request } => exit(cli::answer(&request, false, false)?),
         Command::Held => exit(cli::held()?),
         Command::Policy { person, value } => exit(cli::policy(person, value)?),
+        Command::Folder { path, state } => exit(cli::folder(&path, state == "on")?),
         Command::External(args) => exit(cli::forward(args)?),
         Command::Mcp { server_name } => mcp::run(server_name)?,
         Command::Setup {

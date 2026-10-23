@@ -150,6 +150,40 @@ pub fn recipient(store: &Store, from: &Key, request_id: &str) -> Result<Option<S
         .optional()?)
 }
 
+/// When `from`'s receipt for `request_id` last moved (unix seconds).
+pub fn receipt_at(store: &Store, from: &Key, request_id: &str) -> Result<Option<i64>> {
+    Ok(store
+        .conn()
+        .query_row(
+            "SELECT updated_at FROM receipts WHERE from_key = ?1 AND request_id = ?2",
+            [&from.0, request_id],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+/// Which limit refused `from`'s `request_id` with `loop`: `"rate"` when `from` had sent
+/// `LOOP_LIMIT` messages to one session in the window before the refusal, else `"hops"`.
+/// ponytail: recounted from the messages kept here, so a refusal read back after they are
+/// pruned, or a teammate's per-person count, reads `hops`; a stored kind needs a column.
+pub fn loop_kind(store: &Store, from: &Key, request_id: &str) -> Result<&'static str> {
+    let at = receipt_at(store, from, request_id)?.unwrap_or(0);
+    let most: Option<u32> = store
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) AS n FROM messages WHERE from_key = ?1 AND sent_at > ?2 \
+             AND sent_at <= ?3 GROUP BY to_key ORDER BY n DESC LIMIT 1",
+            params![from.0, at - LOOP_WINDOW_S as i64, at],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(if loop_refused(most.unwrap_or(0) as usize) {
+        "rate"
+    } else {
+        "hops"
+    })
+}
+
 /// The stored receipt for `from`'s `request_id`, with `where_` worked out from the recipient's liveness now.
 pub fn receipt(store: &Store, from: &Key, request_id: &str) -> Result<Option<Receipt>> {
     let conn = store.conn();
@@ -889,6 +923,7 @@ mod tests {
             (State::Refused, Some("loop"))
         );
         assert_eq!(state(&s, "r12"), State::Refused);
+        assert_eq!(loop_kind(&s, &k("a"), "r12").unwrap(), "rate");
         let r = send(&s, &k("a"), Some(&k("b")), "x", "r13", None, t + 600).unwrap();
         assert_eq!(r.state, State::Stored);
     }
@@ -1179,6 +1214,23 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .unwrap()
+    }
+
+    #[test]
+    fn the_fourth_agent_reply_is_refused_as_hops() {
+        let (_d, s) = setup();
+        send(&s, &k("a"), Some(&k("b")), "x", "r0", None, 1).unwrap();
+        let mut r = None;
+        for i in 1..=4 {
+            let (from, to) = if i % 2 == 1 { ("b", "a") } else { ("a", "b") };
+            let parent = format!("r{}", i - 1);
+            let rid = format!("r{i}");
+            let got = send(&s, &k(from), Some(&k(to)), "x", &rid, Some(&parent), 2).unwrap();
+            r = Some((from, rid, got));
+        }
+        let (from, rid, got) = r.unwrap();
+        assert_eq!(got.reason.as_deref(), Some("loop"));
+        assert_eq!(loop_kind(&s, &k(from), &rid).unwrap(), "hops");
     }
 
     #[test]

@@ -41,7 +41,7 @@ impl Env {
     }
 
     /// `c` with this env's state dir, Claude home, HOME and user, launchctl off.
-    fn base_cmd(&self, mut c: Command) -> Command {
+    pub fn base_cmd(&self, mut c: Command) -> Command {
         c.env("LIGHTBULB_CONNECT_HOME", self.state.path())
             .env("LIGHTBULB_CONNECT_CLAUDE_HOME", self.home.path())
             .env("LIGHTBULB_CONNECT_NO_LAUNCHCTL", "1")
