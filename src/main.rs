@@ -37,7 +37,7 @@ Team:
   folder    Show or hide the sessions in a folder from your teammates: folder <path> on|off
 
 The Lightbulb app:
-  claude, codex, continue   Run by the Lightbulb app, when it is installed
+  claude, codex, continue, share   Run by the Lightbulb app, when it is installed
 
 Run lightbulb <command> --help for its options; lightbulb --version for the version.
 ";

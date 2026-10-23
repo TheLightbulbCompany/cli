@@ -380,12 +380,21 @@ fn only_the_apps_own_commands_forward_and_the_rest_are_unknown() {
         );
         assert!(out(o).is_empty(), "{}", out(o));
     };
-    let missing = e
-        .cmd(&["claude", "--resume"])
-        .env("LIGHTBULB_CONNECT_DESKTOP", "/nonexistent/app")
-        .output()
-        .unwrap();
-    unknown(&missing, "claude");
+    // No app: `claude`/`codex` with nothing on PATH, and the app-only verbs, say so.
+    let missing = |sub: &str| {
+        e.cmd(&[sub, "--resume"])
+            .env("PATH", e.home.path())
+            .output()
+            .unwrap()
+    };
+    let o = missing("claude");
+    assert_eq!(o.status.code(), Some(127));
+    assert_eq!(err(&o).trim(), "claude is not installed.");
+    for sub in ["continue", "share"] {
+        let o = missing(sub);
+        assert_eq!(o.status.code(), Some(2));
+        assert_eq!(err(&o).trim(), format!("{sub} needs the Lightbulb app."));
+    }
 
     let app = e.home.path().join("fake-app");
     std::fs::write(&app, "#!/bin/sh\necho \"forwarded: $@\"\n").unwrap();
@@ -407,6 +416,31 @@ fn only_the_apps_own_commands_forward_and_the_rest_are_unknown() {
         );
     }
     unknown(&run("launch"), "launch");
+}
+
+/// The retired app's shell function runs `lightbulb claude "$@"`: with no app, the real
+/// `claude` on PATH runs with the same arguments.
+#[test]
+fn with_no_app_claude_runs_the_real_claude_from_path() {
+    let e = Env::new();
+    let dir = e.home.path().join("tools");
+    std::fs::create_dir(&dir).unwrap();
+    let argv = e.home.path().join("argv");
+    let fake = dir.join("claude");
+    std::fs::write(
+        &fake,
+        format!("#!/bin/sh\necho \"$@\" > '{}'\n", argv.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let o = e
+        .cmd(&["claude", "--fake-arg"])
+        .env("LIGHTBULB_CONNECT_DESKTOP", "/nonexistent/app")
+        .env("PATH", &dir)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(std::fs::read_to_string(&argv).unwrap(), "--fake-arg\n");
 }
 
 #[test]
@@ -1173,6 +1207,91 @@ fn setup_takes_lightbulb_from_the_app_and_still_forwards_its_verbs() {
         );
     }
     assert!(out(&e.run(&["doctor"])).contains("Command name         \"lightbulb\"\n"));
+}
+
+/// A 0.2.1 install: its binary at `bin/lightbulb-connect`, its hooks and its tool server
+/// (`lightbulb-connect`) wired to that path, and the app's `session-mcp` under `lightbulb`.
+/// Setup leaves one set of hooks and one `lightbulb` server on the new binary, and a second
+/// run changes nothing.
+#[test]
+fn setup_upgrades_a_0_2_1_install_once() {
+    let e = Env::new();
+    let h = e.home.path();
+    let app = "/Applications/Lightbulb.app/Contents/MacOS/lightbulb-desktop";
+    let old = h.join(".lightbulb/connect/bin/lightbulb-connect");
+    std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+    std::fs::copy(EXE, &old).unwrap();
+    std::fs::create_dir_all(h.join(".claude")).unwrap();
+    std::fs::create_dir_all(h.join(".codex")).unwrap();
+    let app_json = json!({"mcpServers": {"lightbulb": {"command": app, "args": ["session-mcp"]}}});
+    std::fs::write(h.join(".claude.json"), app_json.to_string()).unwrap();
+    std::fs::write(
+        h.join(".codex/config.toml"),
+        format!("[mcp_servers.lightbulb]\ncommand = \"{app}\"\nargs = [\"session-mcp\"]\n"),
+    )
+    .unwrap();
+    lightbulb_connect::setup::run(h, &old, Some("lightbulb-connect"), false);
+    let files = [
+        ".claude.json",
+        ".claude/settings.json",
+        ".codex/hooks.json",
+        ".codex/config.toml",
+    ];
+    let read = || files.map(|f| std::fs::read_to_string(h.join(f)).unwrap());
+    let before = read();
+    assert!(
+        before.iter().all(|t| t.contains("bin/lightbulb-connect")),
+        "{before:?}"
+    );
+    assert!(before[0].contains("session-mcp") && before[3].contains("session-mcp"));
+
+    let o = e.run(&["setup"]);
+    assert!(o.status.success(), "{}", err(&o));
+    let after = read();
+    let canon = h.join(".lightbulb/connect/bin/lightbulb");
+    let canon = canon.to_str().unwrap();
+    for (agent, text) in [("claude", &after[1]), ("codex", &after[2])] {
+        let hooks: Value = serde_json::from_str(text).unwrap();
+        let commands: Vec<&str> = hooks["hooks"]
+            .as_object()
+            .unwrap()
+            .values()
+            .flat_map(|groups| groups.as_array().unwrap())
+            .flat_map(|g| g["hooks"].as_array().unwrap())
+            .map(|c| c["command"].as_str().unwrap())
+            .collect();
+        assert_eq!(commands.len(), 5, "{agent}: {commands:?}");
+        let mut unique = commands.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), 5, "{agent}: {commands:?}");
+        assert!(
+            commands
+                .iter()
+                .all(|c| c.starts_with(&format!("'{canon}' hook {agent} "))),
+            "{agent}: {commands:?}"
+        );
+    }
+    for t in &after {
+        assert!(!t.contains("bin/lightbulb-connect"), "{t}");
+    }
+    let claude: Value = serde_json::from_str(&after[0]).unwrap();
+    assert_eq!(
+        claude["mcpServers"],
+        json!({"lightbulb": {"command": canon, "args": ["mcp"]}})
+    );
+    let codex: toml_edit::DocumentMut = after[3].parse().unwrap();
+    let servers = codex["mcp_servers"].as_table().unwrap();
+    assert_eq!(servers.iter().count(), 1, "{}", after[3]);
+    assert_eq!(servers["lightbulb"]["command"].as_str(), Some(canon));
+    assert_eq!(
+        std::fs::read_link(&old).unwrap(),
+        std::path::Path::new("lightbulb")
+    );
+
+    let o = e.run(&["setup"]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(read(), after);
 }
 
 /// Old hooks, launchd jobs and links run `lightbulb-connect`: the same program.

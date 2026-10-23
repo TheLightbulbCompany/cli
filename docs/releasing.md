@@ -9,10 +9,11 @@
      always takes the latest release, so it is live as soon as this job ends.
    - `publish-npm` sets `npm/package.json` to the tag's version and runs
      `npm publish --provenance --access public`. Needs the `NPM_TOKEN` secret.
-   - `bump-brew` rewrites `url`, `sha256` and the test's version in
-     `Formula/lightbulb-connect.rb` in `TheLightbulbCompany/homebrew-tap` (the test line reads
-     `lightbulb <x.y.z>`, what `lightbulb version` prints), commits `lightbulb-connect <x.y.z>`
-     and pushes. Needs the `HOMEBREW_TAP_TOKEN` secret.
+   - `bump-brew` updates `Formula/lightbulb-connect.rb` in `TheLightbulbCompany/homebrew-tap`,
+     commits `lightbulb-connect <x.y.z>` and pushes. Needs the `HOMEBREW_TAP_TOKEN` secret. The
+     tap formula installs whichever binary the tarball holds (`lightbulb` from 0.2.2 on,
+     `lightbulb-connect` before) and links the other name beside it, so the bump job only ever
+     rewrites `url`, `sha256` and the version in the test line.
 4. A job whose secret is missing passes with `NPM_TOKEN not set; skipping npm publish` or
    `HOMEBREW_TAP_TOKEN not set; skipping brew bump` in its log. Then do it by hand:
    - npm: `cd npm && npm version <x.y.z> --no-git-tag-version --allow-same-version && npm publish --access public`

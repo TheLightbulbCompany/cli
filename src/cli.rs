@@ -1250,22 +1250,49 @@ fn relay_host(url: &str) -> String {
 }
 
 /// Hands one of the app's verbs to the Lightbulb app's binary as its CLI (`cli` first, as the
-/// app reads it), replacing this process; anything else, or no app, is an unknown command.
+/// app reads it), replacing this process. With no app, `claude`/`codex` run the real tool from
+/// PATH (the retired app's shell functions call `lightbulb claude`), and `continue`/`share` say
+/// they need the app. Anything else is an unknown command.
 pub fn forward(args: Vec<OsString>) -> Result<i32> {
     let verb = args
         .first()
         .map(|a| a.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let app = app_binary(&home()?).filter(|_| APP_VERBS.contains(&verb.as_str()));
-    let Some(app) = app else {
+    if !APP_VERBS.contains(&verb.as_str()) {
         eprintln!(
             "Unknown command: {}. Run {} --help.",
             cell(&verb),
             command()
         );
         return Ok(2);
+    }
+    let home = home()?;
+    if let Some(app) = app_binary(&home) {
+        return Err(Command::new(app).arg("cli").args(args).exec().into());
+    }
+    if verb != "claude" && verb != "codex" {
+        eprintln!("{verb} needs the Lightbulb app.");
+        return Ok(2);
+    }
+    // The first `claude`/`codex` on PATH that is not this program or the app's link.
+    let me = std::env::current_exe().and_then(fs::canonicalize).ok();
+    let skip = [me, fs::canonicalize(app_link(&home)).ok()];
+    let real = std::env::var_os("PATH")
+        .iter()
+        .flat_map(std::env::split_paths)
+        .map(|d| d.join(&verb))
+        .find(|p| {
+            let c = fs::canonicalize(p).ok();
+            c.is_some()
+                && !skip.contains(&c)
+                && p.metadata()
+                    .is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+        });
+    let Some(real) = real else {
+        eprintln!("{verb} is not installed.");
+        return Ok(127);
     };
-    Err(Command::new(app).arg("cli").args(args).exec().into())
+    Err(Command::new(real).args(&args[1..]).exec().into())
 }
 
 // ---- alias and launchd ------------------------------------------------------------------
@@ -1298,7 +1325,10 @@ pub fn install_alias(home: &Path, exe: &Path) -> Result<String> {
     let bin = home.join(".local/bin");
     let short = bin.join("lightbulb");
     if Alias::read(home).short == Link::App {
-        relink(&app_link(home), &fs::read_link(&short)?)?;
+        relink(
+            &app_link(home),
+            &short.parent().unwrap().join(fs::read_link(&short)?),
+        )?;
         relink(&short, &canon)?;
     }
     for name in ["lightbulb-connect", "lightbulb"] {

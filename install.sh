@@ -25,7 +25,8 @@ BIN="$HOME/.lightbulb/connect/bin"
 mkdir -p "$BIN"
 tar -xzf "$TMP/$ASSET" -C "$TMP"
 install -m 0755 "$TMP/lightbulb" "$BIN/lightbulb"
-# The old name: hooks and launchd jobs from 0.2.1 run it. -n replaces 0.2.1's binary there.
+# The old name: hooks and launchd jobs from 0.2.1 run it. -f replaces 0.2.1's binary there
+# (-n only matters if it were a link to a directory).
 ln -sfn lightbulb "$BIN/lightbulb-connect"
 echo "Installed $BIN/lightbulb"
 exec "$BIN/lightbulb" setup
