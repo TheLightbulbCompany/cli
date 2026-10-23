@@ -42,13 +42,17 @@ pub const REFUSED: u32 = 1;
 pub const BUSY: u32 = 2;
 /// Streams one connection may have waiting for their opener (`net`).
 pub const ACCEPTS: usize = 8;
-/// Why a stream ended at its grant's end: its record stays, so the next send says `no_grant`.
+/// Why a stream ended at its grant's end (`Streams::ended` keeps its id a while).
 const ENDED: &str = "the grant ended";
+/// How long a stream closed at its grant's end answers `no_grant` rather than `not_found`.
+const ENDED_KEEP: Duration = Duration::from_secs(600);
 
 /// The open streams, and the viewer frames dropped.
 #[derive(Default)]
 pub struct Streams {
     open: Mutex<HashMap<String, Open>>,
+    /// The streams closed at their grant's end, and when.
+    ended: Mutex<HashMap<String, Instant>>,
     /// Viewer→owner frames not taken as input.
     pub dropped_input: AtomicU64,
 }
@@ -478,7 +482,10 @@ async fn run(
         Role::Owner {
             expires_at: Some(e),
             ..
-        } => Some(Instant::now() + Duration::from_secs((e - ipc::now() as i64).max(0) as u64)),
+        } => {
+            let left = (e * 1000).saturating_sub(ipc::now_ms() as i64).max(0);
+            Some(Instant::now() + Duration::from_millis(left as u64))
+        }
         _ => None,
     };
     let ended = async move {
@@ -520,6 +527,11 @@ async fn run(
     };
     let reader = async {
         while let Ok(f) = frames::read(&mut recv).await {
+            // The timer can run late (or not at all through a sleep): the clock decides.
+            if role.expired(ipc::now() as i64) {
+                d.streams.dropped_input.fetch_add(1, Ordering::Relaxed);
+                return ENDED;
+            }
             on_frame(&d, &sid, role, f);
         }
         "the other end went"
@@ -529,7 +541,9 @@ async fn run(
         r = reader => r,
     };
     let _ = send.finish();
-    if why != ENDED {
+    if why == ENDED {
+        d.streams.end(&sid);
+    } else {
         d.streams.close(&sid);
     }
     eprintln!("streams: {sid} closed ({why})");
@@ -567,6 +581,14 @@ impl Streams {
     pub fn close(&self, sid: &str) -> bool {
         self.open.lock().unwrap().remove(sid).is_some()
     }
+
+    /// Closes stream `sid` at its grant's end: for `ENDED_KEEP` a send on it is `no_grant`.
+    fn end(&self, sid: &str) {
+        self.close(sid);
+        let mut ended = self.ended.lock().unwrap();
+        ended.retain(|_, at| at.elapsed() < ENDED_KEEP);
+        ended.insert(sid.into(), Instant::now());
+    }
 }
 
 /// `stream.send {stream_id, data_b64}` -> `{}`: a chunk on an open stream, at most 64 KB
@@ -586,20 +608,24 @@ async fn send(id: u64, body: &Value, d: &Arc<Daemon>) -> Response {
         .unwrap()
         .get(sid)
         .map(|o| (o.tx.clone(), o.role));
+    let gone = |d: &Daemon| {
+        let ended = d.streams.ended.lock().unwrap().contains_key(sid);
+        Response::err(id, if ended { NO_GRANT } else { NOT_FOUND })
+    };
     let Some((tx, role)) = found else {
-        return Response::err(id, NOT_FOUND);
+        return gone(d);
     };
     if n > role.cap() {
         return Response::err(id, BAD_REQUEST);
+    }
+    // The timer can run late: the clock decides.
+    if role.expired(ipc::now() as i64) {
+        d.streams.end(sid);
+        return Response::err(id, NO_GRANT);
     }
     if tx.send(data.into()).await.is_ok() {
         return Response::ok(id, json!({}));
     }
     d.streams.close(sid);
-    let code = if role.expired(ipc::now() as i64) {
-        NO_GRANT
-    } else {
-        NOT_FOUND
-    };
-    Response::err(id, code)
+    gone(d)
 }

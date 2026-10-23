@@ -607,3 +607,51 @@ async fn close_unblocks_a_send_waiting_on_flow_control() {
         .expect("the blocked send returns");
     assert_eq!(blocked["ok"], false, "{blocked}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_input_at_or_after_the_grants_end() {
+    let (a, _j, mut s, _r, sa, end) = input_stream(2).await;
+    // Each frame carries its send time (Unix ms); one every 50 ms until a second past the end.
+    let mut seq = 1;
+    while now_ms() < end as u64 * 1000 + 1000 {
+        let f = Frame::Stream {
+            grant_id: String::new(),
+            session: c1(&a),
+            seq,
+            bytes: b64(now_ms().to_string().as_bytes()),
+        };
+        if frames::write(&mut s, &f).await.is_err() {
+            break; // closed at the end
+        }
+        seq += 1;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let mut last = 0;
+    loop {
+        let v =
+            sa.0.recv_timeout(Duration::from_secs(10))
+                .expect("an event");
+        if v["event"] == "stream_input" {
+            let sent = data_encoding::BASE64
+                .decode(v["data_b64"].as_str().unwrap().as_bytes())
+                .unwrap();
+            last = String::from_utf8(sent).unwrap().parse().unwrap();
+        }
+        if v["event"] == "stream_closed" {
+            break;
+        }
+    }
+    assert!(last > 0, "some input before the end");
+    assert!(
+        last < end as u64 * 1000,
+        "input sent at {last}, the grant ended at {end}"
+    );
+}
+
+/// Unix milliseconds.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
