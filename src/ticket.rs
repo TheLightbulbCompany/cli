@@ -135,6 +135,12 @@ pub fn decode(s: &str) -> Result<Ticket> {
     Ok(t)
 }
 
+/// Whether `t` is signed by the key it names as its inviter: all a joiner, which has no
+/// roster yet, can check.
+pub fn signed_by_inviter(t: &Ticket) -> bool {
+    identity::verify(&t.inviter, &value(t), &t.sig)
+}
+
 /// `Ok` when `t` is signed by its inviter, names this team, and names a live link of the
 /// roster that its inviter signed, in its mode and with its secret (hashed for a once link).
 pub fn verify(t: &Ticket, roster: &Roster) -> Result<()> {

@@ -183,14 +183,24 @@ const ADDRS: &str = "addrs.json";
 pub const MAX_ADDRS: usize = 8;
 
 /// `v` as direct addresses: IP literals with a port (never a host name), at most
-/// `MAX_ADDRS`, none unspecified nor port 0; `None` when any is not.
+/// `MAX_ADDRS`, none port 0, unspecified, multicast, loopback (ours come only from the
+/// private local file) or the IPv4 broadcast, judged on the IPv4 inside an IPv4-mapped
+/// IPv6 too; link-local stays (a real LAN path). `None` when any is not.
 pub fn parse_addrs(v: &[String]) -> Option<Vec<SocketAddr>> {
     if v.len() > MAX_ADDRS {
         return None;
     }
+    let ok = |a: &SocketAddr| {
+        let ip = a.ip().to_canonical();
+        let broadcast = ip == std::net::IpAddr::V4(std::net::Ipv4Addr::BROADCAST);
+        a.port() != 0
+            && !ip.is_unspecified()
+            && !ip.is_multicast()
+            && !ip.is_loopback()
+            && !broadcast
+    };
     v.iter()
-        .map(|s| s.parse::<SocketAddr>().ok())
-        .map(|a| a.filter(|a| a.port() != 0 && !a.ip().is_unspecified()))
+        .map(|s| s.parse::<SocketAddr>().ok().filter(ok))
         .collect()
 }
 
@@ -295,26 +305,35 @@ impl Peers {
     }
 
     /// Member `key` told its direct addresses `addrs` (already checked, `parse_addrs`):
-    /// kept for its dials, and in `dir`'s `ADDRS` when they changed.
-    pub fn learn(&self, dir: &std::path::Path, key: &str, addrs: Vec<SocketAddr>) {
+    /// kept for its dials, and in `dir`'s `ADDRS` when they changed. Only the keys `keep`
+    /// names stay (the roster's members, and a join's inviter), so the file has no stale ones.
+    pub fn learn(
+        &self,
+        dir: &std::path::Path,
+        key: &str,
+        addrs: Vec<SocketAddr>,
+        keep: impl Fn(&str) -> bool,
+    ) {
         let mut known = self.known.lock().unwrap();
         if addrs.is_empty() || known.get(key) == Some(&addrs) {
             return;
         }
+        known.retain(|k, _| keep(k));
         known.insert(key.to_string(), addrs);
         if let Ok(b) = serde_json::to_vec(&*known) {
             let _ = std::fs::write(dir.join(ADDRS), b);
         }
     }
 
-    /// Loads `ADDRS` from `dir`, keeping the entries that still check.
-    fn load_known(&self, dir: &std::path::Path) {
+    /// Loads `ADDRS` from `dir`, keeping the entries of `members` that still check.
+    fn load_known(&self, dir: &std::path::Path, members: &Roster) {
         let read: HashMap<String, Vec<String>> = std::fs::read(dir.join(ADDRS))
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
         let ok = read
             .into_iter()
+            .filter(|(k, _)| members.members.contains_key(k))
             .filter_map(|(k, v)| Some((k, parse_addrs(&v)?)));
         *self.known.lock().unwrap() = ok.collect();
     }
@@ -501,7 +520,9 @@ impl Net {
     /// mDNS when `config.lan`) and starts accepting, dialing every active member, and keeping
     /// the relay list.
     pub async fn start(daemon: Arc<Daemon>) -> Result<Net> {
-        daemon.peers.load_known(&daemon.dir);
+        daemon
+            .peers
+            .load_known(&daemon.dir, &daemon.team.lock().unwrap().roster);
         let state = relay::State::load(&daemon.dir, &daemon.peers.knobs().relay_keys);
         *daemon.peers.relay_state.lock().unwrap() = state;
         let lan = {
@@ -892,9 +913,11 @@ impl Net {
             addrs,
         } = f
         {
-            // Checked by `from_peer_ok`.
+            // A hint: bad ones are dropped, the hello is served.
+            let addrs = parse_addrs(&addrs).unwrap_or_default();
+            let r = &team.roster;
             d.peers
-                .learn(&d.dir, key, parse_addrs(&addrs).unwrap_or_default());
+                .learn(&d.dir, key, addrs, |k| r.members.contains_key(k));
             // ponytail: a hello costs O(log) under `team`, and a member may send them back to
             // back; rate-limit per connection if one does.
             if p != d.peers.knobs().protocol {

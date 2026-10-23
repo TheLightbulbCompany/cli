@@ -925,18 +925,27 @@ fn the_daemon_starts_from_the_canonical_binary() {
 }
 
 /// `daemon --install` (and so `setup`) stops the daemon that runs now, and waits for it to
-/// exit, before it loads the job: a daemon launchd did not start would hold the lock.
+/// let go of the lock, before it loads the job: a daemon launchd did not start would hold it.
 #[test]
 fn install_stops_the_running_daemon_first() {
     let e = Env::new();
     assert!(e.run(&["who"]).status.success());
-    let pid: i32 = std::fs::read_to_string(e.state.path().join("daemon.lock"))
+    let path = e.state.path().join("daemon.lock");
+    let pid: i32 = std::fs::read_to_string(&path)
         .unwrap()
         .trim()
         .parse()
         .unwrap();
     let o = e.run(&["daemon", "--install"]);
     assert!(o.status.success(), "{}", err(&o));
+    let free = std::fs::File::open(&path).unwrap().try_lock().is_ok();
+    assert!(free, "the old daemon still holds the lock");
+    // It drops the lock as its last step; its process ends just after.
+    common::until(
+        5,
+        "the old daemon exits",
+        || unsafe { libc::kill(pid, 0) } != 0,
+    );
     assert_ne!(
         unsafe { libc::kill(pid, 0) },
         0,
@@ -944,26 +953,47 @@ fn install_stops_the_running_daemon_first() {
     );
 }
 
-/// A daemon that holds the lock and does not exit (here one that never answers the socket)
-/// is reported, and no job is installed behind it.
+/// A daemon that holds the lock and does not let go (here this test, holding it) is
+/// reported by the pid in the file, and no job is installed behind it.
 #[test]
 fn install_refuses_while_the_old_daemon_will_not_stop() {
     let e = Env::new();
-    let mut stuck = Command::new("/bin/sleep").arg("60").spawn().unwrap();
-    std::fs::write(e.state.path().join("daemon.lock"), stuck.id().to_string()).unwrap();
+    let path = e.state.path().join("daemon.lock");
+    std::fs::write(&path, "4242\n").unwrap();
+    let holder = std::fs::File::open(&path).unwrap();
+    holder.try_lock().unwrap();
     let o = e.run(&["daemon", "--install"]);
-    let _ = stuck.kill();
-    let _ = stuck.wait();
+    drop(holder);
     assert_eq!(o.status.code(), Some(1));
-    let pid = stuck.id();
     let text = err(&o);
     assert!(
-        text.starts_with(&format!(
-            "The old background service did not stop (pid {pid}). Run: kill {pid}, then "
-        )) && text.trim_end().ends_with(" setup again."),
+        text.starts_with(
+            "The old background service did not stop (pid 4242). Run: kill 4242, then "
+        ) && text.trim_end().ends_with(" setup again."),
         "{text}"
     );
     assert!(!out(&o).contains("Background service"), "{}", out(&o));
+}
+
+/// A pid left in the file by a daemon long gone, now some live process that holds no lock,
+/// is no daemon: the install goes ahead at once.
+#[test]
+fn install_ignores_a_stale_pid_of_a_live_process() {
+    let e = Env::new();
+    let mut other = Command::new("/bin/sleep").arg("60").spawn().unwrap();
+    std::fs::write(e.state.path().join("daemon.lock"), other.id().to_string()).unwrap();
+    let t = std::time::Instant::now();
+    let o = e.run(&["daemon", "--install"]);
+    let alive = unsafe { libc::kill(other.id() as i32, 0) } == 0;
+    let _ = other.kill();
+    let _ = other.wait();
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(
+        t.elapsed() < std::time::Duration::from_secs(5),
+        "{:?}",
+        t.elapsed()
+    );
+    assert!(alive, "the unrelated process was left alone");
 }
 
 #[test]
@@ -980,8 +1010,29 @@ fn policy_refuses_your_own_person_and_forgets_an_old_row() {
         err(&o).trim(),
         "That is you; your own computers always get through."
     );
-    // A row an older build stored under a literal name is marked, and forgotten on request.
+    // A row an older build stored for my own person is shown as ignored.
     let store = lightbulb_connect::store::Store::open(&e.state.path().join("state.db")).unwrap();
+    let mine = e.ask(json!({"id": 1, "op": "team.get"}))["members"][0]["person_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    lightbulb_connect::policy::set_person(
+        &store,
+        &mine,
+        lightbulb_connect::policy::Verdict::Hold,
+        "local",
+        1,
+    )
+    .unwrap();
+    let o = e.person(&["policy"]);
+    assert!(
+        out(&o).contains(
+            ": held for your Allow. (ignored: your own computers always get through — run: "
+        ) && out(&o).contains(&format!(" policy {mine} forget)")),
+        "{}",
+        out(&o)
+    );
+    // A row an older build stored under a literal name is marked, and forgotten on request.
     lightbulb_connect::policy::set_person(
         &store,
         "aden",

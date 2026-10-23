@@ -369,3 +369,12 @@ A's side records each row with the dialog text, labels and `receipt --json`, the
 - **F4.** A removed member is told its removal (the `remove` entry and the ancestors it lacks, never a later entry) on its live link or on its next dial. Its queued mail becomes `refused not_member`, it logs one line, and it goes solo. `team` says `You were removed from "<team>" by <name> on <date>. This computer is on its own network again.`
 - Small: version 0.2.0. The debug env name is no longer in the hidden help. `There is no folder at <path>.`
 - Tests: 383 pass, and `fmt` and `clippy -D warnings` are clean. `--test relay`, `--test join` and `--test net_two` each passed 3 times in a row.
+- **Review round 1.**
+  - `stop_daemon` uses the lock to decide whether a daemon runs: it polls `try_lock` on `daemon.lock`. It uses the pid in the file only in the message. A stale pid that now belongs to some other process no longer blocks `setup`.
+  - `parse_addrs` refuses multicast, loopback and IPv4 broadcast addresses. It also applies these checks to the IPv4 inside an IPv4-mapped IPv6 address. Link-local addresses stay.
+  - `addrs.json` keeps only roster members, plus the inviter of a join in progress.
+  - `join` checks the inviter's signature on the ticket before it keeps or dials the ticket's addresses.
+  - Bad `addrs` in a `hello` are dropped. The `hello` itself is still served.
+  - A policy row for your own person that an older build stored is listed as ignored, with the `forget` hint.
+  - The removal test now also proves that a member admitted after the removal is never sent to the removed member.
+  - 385 tests pass.

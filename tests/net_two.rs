@@ -439,6 +439,16 @@ async fn removed_member_hears_its_removal_and_nothing_after() {
     assert!(o.status.success(), "{}", common::err(&o));
     let later = common::invite(&a, "reusable");
     let later = lightbulb_connect::ticket::decode(&later).unwrap().ticket_id;
+    // And a member admitted after the removal: carol, through an open link (no dialog).
+    let open = common::person(&a, json!({"id": 1, "op": "team.invite", "mode": "open"}));
+    let c = Env::new();
+    c.daemon(false, "", &[common::peers(&[&a])]);
+    let r = common::person(
+        &c,
+        json!({"id": 1, "op": "team.join", "ticket": open["line"], "name": "carol", "kind": "computer"}),
+    );
+    assert_eq!(r["state"], "admitted", "{r}");
+    let carol = c.identity().key;
     let ep = endpoint(&b.identity()).await;
     // Claiming to know only the genesis: everything after it would be the whole log.
     for heads in [vec![genesis.hash()], vec![]] {
@@ -451,6 +461,10 @@ async fn removed_member_hears_its_removal_and_nothing_after() {
                 .iter()
                 .any(|e| e.kind == Kind::Link && e.body["ticket_id"] == later.as_str()),
             "a later link leaked: {told:?}"
+        );
+        assert!(
+            !told.iter().any(|e| e.body.to_string().contains(&carol)),
+            "a later member leaked: {told:?}"
         );
         p.conn.close(0u32.into(), b"");
     }

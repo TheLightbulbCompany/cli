@@ -590,8 +590,17 @@ fn bad_ticket_addresses_are_refused() {
     use lightbulb_connect::net::parse_addrs;
     let ok = |v: &[&str]| parse_addrs(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
     assert!(ok(&["192.168.0.2:4000", "[fe80::1]:4000"]).is_some());
+    assert!(ok(&["169.254.1.1:9"]).is_some(), "link-local stays");
     for bad in [
         &["example.com:4000"][..],
+        &["224.0.0.251:5353"],
+        &["[ff02::1]:9"],
+        &["255.255.255.255:9"],
+        &["127.0.0.1:22"],
+        &["[::1]:22"],
+        &["[::ffff:127.0.0.1]:22"],
+        &["[::ffff:224.0.0.251]:5353"],
+        &["[::ffff:255.255.255.255]:9"],
         &["0.0.0.0:4000"],
         &["10.0.0.1:0"],
         &["10.0.0.1"],
@@ -599,4 +608,21 @@ fn bad_ticket_addresses_are_refused() {
     ] {
         assert!(ok(bad).is_none(), "{bad:?}");
     }
+}
+
+/// A forged ticket (its signature is not its inviter's) is refused before its addresses are
+/// kept or dialed.
+#[test]
+fn a_forged_ticket_leaves_no_address_behind() {
+    let (a, b) = (Env::new(), Env::new());
+    a.daemon(false, &computer("mac"), &[dialog("")]);
+    let mut t = ticket::decode(&invite(&a, "reusable")).unwrap();
+    t.addrs = vec!["192.0.2.7:4000".into()];
+    b.daemon(false, &computer("mbp"), &[]);
+    refused(
+        &join(&b, &ticket::encode(&t), "bob", "computer"),
+        "bad_ticket",
+    );
+    let kept = std::fs::read_to_string(b.state.path().join("addrs.json")).unwrap_or_default();
+    assert!(!kept.contains("192.0.2.7"), "{kept}");
 }

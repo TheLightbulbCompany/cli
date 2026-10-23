@@ -262,8 +262,8 @@ pub fn from_peer_ok(
 ) -> std::result::Result<(), &'static str> {
     let check = |ok: bool, why| if ok { Ok(()) } else { Err(why) };
     match f {
-        Frame::Hello { addrs, .. } => check(super::parse_addrs(addrs).is_some(), "addrs"),
-        Frame::Roster { .. } | Frame::Envelope { .. } => Ok(()),
+        // Its `addrs` are a hint, checked where they are kept (`parse_addrs`).
+        Frame::Hello { .. } | Frame::Roster { .. } | Frame::Envelope { .. } => Ok(()),
         // A person's new computer, between its person's computers (`admission::from_member`
         // checks the signatures).
         Frame::JoinRequest { .. } | Frame::JoinDecision { .. } => {

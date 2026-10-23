@@ -930,12 +930,15 @@ pub fn policy(person: Option<String>, value: Option<String>) -> Result<i32> {
             };
             // A `people` row no member has: an old one, stored under a literal name.
             let old = scope == "people" && !members.iter().any(|m| m["person_id"] == pid.as_str());
-            let old = if old {
-                format!(
-                    " (old entry — run: {} policy {} forget)",
-                    command(),
-                    cell(pid)
-                )
+            // A row for my own person: `decide` never reads it.
+            let mine = members
+                .iter()
+                .any(|m| m["short"] == me.as_str() && m["person_id"] == pid.as_str());
+            let forget = format!("run: {} policy {} forget", command(), cell(pid));
+            let old = if mine {
+                format!(" (ignored: your own computers always get through — {forget})")
+            } else if old {
+                format!(" (old entry — {forget})")
             } else {
                 String::new()
             };
@@ -1291,35 +1294,35 @@ pub fn daemon_install() -> Result<i32> {
     install_job(&home, &canonical(&home))
 }
 
-/// Stops the daemon that holds this state dir's lock (its pid is in `daemon.lock`): asks it
-/// over the socket when it answers, and waits up to 10 s for its process to exit either way
-/// (one still booting does not answer yet). One launchd did not start (a hook's, during an
-/// upgrade) survives a bootout and would hold the lock against the new job, so one that does
-/// not exit is an error: nothing is installed behind it.
+/// Stops the daemon that holds this state dir's lock: asks it over the socket when it
+/// answers, and waits up to 10 s for the lock to be free either way (one still booting does
+/// not answer yet). Whether a daemon runs is the lock (`daemon::lock_dir`), never the pid in
+/// the file: that pid stays after an exit and may be any process by now. One launchd did not
+/// start (a hook's, during an upgrade) survives a bootout and would hold the lock against the
+/// new job, so one that does not let go is an error: nothing is installed behind it.
 pub fn stop_daemon() -> Result<()> {
-    let alive = |pid: libc::pid_t| unsafe { libc::kill(pid, 0) } == 0;
-    let pid = fs::read_to_string(paths::state_path().join("daemon.lock"))
-        .ok()
-        .and_then(|p| p.trim().parse::<libc::pid_t>().ok())
-        .filter(|p| *p > 0 && alive(*p));
+    let path = paths::state_path().join("daemon.lock");
+    // Our probe lock, if it gets one, drops with the file at once.
+    let held = || fs::File::open(&path).is_ok_and(|f| f.try_lock().is_err());
+    if !held() {
+        return Ok(());
+    }
     if let Ok(mut conn) = Conn::open() {
         let _ = conn.call("shutdown", json!({}));
     }
-    let Some(pid) = pid else {
-        return Ok(());
-    };
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while alive(pid) && std::time::Instant::now() < deadline {
+    while held() && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(50));
     }
-    if alive(pid) {
-        let cmd = command();
-        return Err(format!(
-            "The old background service did not stop (pid {pid}). Run: kill {pid}, then {cmd} setup again."
-        )
-        .into());
+    if !held() {
+        return Ok(());
     }
-    Ok(())
+    let pid = fs::read_to_string(&path).unwrap_or_default();
+    let (pid, cmd) = (pid.trim(), command());
+    Err(format!(
+        "The old background service did not stop (pid {pid}). Run: kill {pid}, then {cmd} setup again."
+    )
+    .into())
 }
 
 /// Writes and loads the launchd job that runs `exe daemon`, after stopping the daemon that
