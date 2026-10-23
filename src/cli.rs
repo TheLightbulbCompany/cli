@@ -1165,11 +1165,24 @@ pub fn install_alias(home: &Path, exe: &Path) -> Result<String> {
     let short = home.join(".local/bin/lightbulb");
     match short_link(home) {
         Link::File => Ok("~/.local/bin/lightbulb belongs to another program and was left alone; put ~/.lightbulb/connect/bin on your PATH to type lightbulb.".into()),
-        Link::Ours => Ok("Command: lightbulb".into()),
+        Link::Ours => Ok(command_lines(home)),
         _ => {
             relink(&short, &canon)?;
-            Ok("Command: lightbulb".into())
+            Ok(command_lines(home))
         }
+    }
+}
+
+/// `Command: lightbulb`, plus the PATH line when `~/.local/bin` is not on this shell's PATH
+/// (a fresh Mac: the curl install lands there, and nothing else puts it on PATH).
+fn command_lines(home: &Path) -> String {
+    let bin = home.join(".local/bin");
+    let on_path =
+        std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d == bin));
+    if on_path {
+        "Command: lightbulb".into()
+    } else {
+        "Command: lightbulb\nAdd this line to your shell profile (~/.zshrc), then open a new terminal: export PATH=\"$HOME/.local/bin:$PATH\"".into()
     }
 }
 

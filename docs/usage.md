@@ -39,7 +39,7 @@ Run `lightbulb <command> --help` for the options of each one.
 | `doctor` | Check the service, the local network, the state folder and each agent, and say how to fix what is not right. |
 | `who` | List the sessions on this computer. `who --all` adds your teammates' sessions. |
 | `invite` | Print the join command that adds your other computer or a teammate (`lightbulb join '<ticket>' --name NAME`; replace `NAME` with the name they go by), and a `lightbulb://join/…` link. `--once`: one join, valid 24 hours. `--new`: replace the invite; the old one stops working. |
-| `join '<ticket>'` | Join the team the invite is for. Takes the ticket, the join command or the whole `lightbulb://join/…` link. `--name <name>` sets the name you go by (default: your user name). The computer must be on its own first. |
+| `join '<ticket>'` | Join the team the invite is for. Takes the ticket or the whole `lightbulb://join/…` link. `--name <name>` sets the name you go by (default: your user name). The computer must be on its own first. |
 | `approve J1` / `approve H1` | Allow a join request (`J`) or a held message (`H`). |
 | `decline J1` / `decline H1` | Decline one. |
 | `held` | The join requests and messages waiting for your Allow. |

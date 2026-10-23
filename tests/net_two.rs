@@ -478,7 +478,7 @@ async fn removed_member_hears_its_removal_and_nothing_after() {
     c.daemon(false, "", &[common::peers(&[&a])]);
     let r = common::person(
         &c,
-        json!({"id": 1, "op": "team.join", "ticket": open["line"], "name": "carol", "kind": "computer"}),
+        json!({"id": 1, "op": "team.join", "ticket": open["ticket"], "name": "carol", "kind": "computer"}),
     );
     assert_eq!(r["state"], "admitted", "{r}");
     let carol = c.identity().key;

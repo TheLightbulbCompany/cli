@@ -119,14 +119,10 @@ pub fn encode(t: &Ticket) -> String {
     BASE64URL_NOPAD.encode(&canonical(&value(t)))
 }
 
-/// A ticket from the bare ticket, the join line (the command) or its `lightbulb://join/` link.
+/// A ticket from the bare ticket or its `lightbulb://join/` link.
 pub fn decode(s: &str) -> Result<Ticket> {
     let s = s.trim();
-    let bare = if let Some((_, t)) = s.split_once(" join '") {
-        t.split('\'').next().unwrap_or_default()
-    } else {
-        s.strip_prefix(APP).unwrap_or(s)
-    };
+    let bare = s.strip_prefix(APP).unwrap_or(s);
     let t: Ticket = BASE64URL_NOPAD
         .decode(bare.trim().as_bytes())
         .ok()
@@ -226,9 +222,13 @@ mod tests {
         let (_, x, r, t) = team("ask", false);
         let bare = encode(&t);
         assert_eq!(line(&t), format!("lightbulb join '{bare}' --name NAME"));
-        for s in [bare.clone(), line(&t), app_link(&bare)] {
+        for s in [bare.clone(), app_link(&bare)] {
             assert_eq!(decode(&s).unwrap(), t);
         }
+        assert!(
+            decode(&line(&t)).is_err(),
+            "the join command itself is not a ticket"
+        );
         verify(&t, &r).unwrap();
         assert_eq!(t.members[0], x.key);
         assert_eq!(t.members.len(), 2);
