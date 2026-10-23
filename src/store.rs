@@ -2,8 +2,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
 /// Migration `i` takes the db to `user_version` `i + 1`. Forward only; each one only adds
-/// tables, so it is safe to run again.
-const MIGRATIONS: &[&str] = &[V1, V2];
+/// tables or columns, and runs once (in the transaction that moves `user_version`).
+const MIGRATIONS: &[&str] = &[V1, V2, V3];
 
 const V1: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
@@ -66,6 +66,9 @@ CREATE TABLE IF NOT EXISTS approvals (
 );
 CREATE TABLE IF NOT EXISTS grants (grant_id TEXT PRIMARY KEY, \"grant\" TEXT, expires_at INTEGER);
 ";
+
+/// A session's end: its row stays a day (`presence`'s `kept`) with `ended_at` set.
+const V3: &str = "ALTER TABLE sessions ADD COLUMN ended_at INTEGER;";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Session {
@@ -142,9 +145,11 @@ impl Store {
         &self.conn
     }
 
+    /// Writes `s` as a live row (an ended one is live again).
     pub fn put_session(&self, s: &Session) -> rusqlite::Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO sessions VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT OR REPLACE INTO sessions (key, provider, conversation, pid, birth_micros, cwd, \
+             title, status, seen_at, executable) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 s.key,
                 s.provider,
@@ -161,23 +166,94 @@ impl Store {
         Ok(())
     }
 
+    /// `key`'s row, unless it ended.
     pub fn session(&self, key: &str) -> rusqlite::Result<Option<Session>> {
         self.conn
-            .query_row("SELECT * FROM sessions WHERE key = ?1", [key], row_session)
+            .query_row(
+                "SELECT * FROM sessions WHERE key = ?1 AND ended_at IS NULL",
+                [key],
+                row_session,
+            )
             .optional()
     }
 
+    /// The rows that have not ended.
     pub fn sessions(&self) -> rusqlite::Result<Vec<Session>> {
-        let mut stmt = self.conn.prepare("SELECT * FROM sessions")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT * FROM sessions WHERE ended_at IS NULL")?;
         let rows = stmt.query_map([], row_session)?;
         rows.collect()
     }
 
-    pub fn delete_session(&self, key: &str) -> rusqlite::Result<bool> {
-        Ok(self
+    /// Whether this computer has a row for `key`, ended or not.
+    pub fn holds(&self, key: &str) -> rusqlite::Result<bool> {
+        self.conn
+            .query_row("SELECT 1 FROM sessions WHERE key = ?1", [key], |_| Ok(()))
+            .optional()
+            .map(|r| r.is_some())
+    }
+
+    /// Ends `key`'s row at `now`; `false` when there is no live one.
+    pub fn end_session(&self, key: &str, now: i64) -> rusqlite::Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE sessions SET ended_at = ?2 WHERE key = ?1 AND ended_at IS NULL",
+            params![key, now],
+        )? > 0)
+    }
+
+    /// The rows that ended at `since` or later, `(key, ended_at, cwd)`; deletes older ends.
+    pub fn ended_since(&self, since: i64) -> rusqlite::Result<Vec<(String, i64, String)>> {
+        self.conn
+            .execute("DELETE FROM sessions WHERE ended_at < ?1", [since])?;
+        let mut stmt = self
             .conn
-            .execute("DELETE FROM sessions WHERE key = ?1", [key])?
-            > 0)
+            .prepare("SELECT key, ended_at, cwd FROM sessions WHERE ended_at IS NOT NULL")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        rows.collect()
+    }
+
+    /// Writes `member`'s latest presence (`text`, its JSON).
+    pub fn put_presence(
+        &self,
+        member: &str,
+        seq: u64,
+        text: &str,
+        seen_at: i64,
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO peers_sessions VALUES (?1, ?2, ?3, ?4)",
+            params![
+                member,
+                i64::try_from(seq).unwrap_or(i64::MAX),
+                text,
+                seen_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Every stored presence, `(member, JSON, seen_at)`.
+    pub fn peers_presence(&self) -> rusqlite::Result<Vec<(String, String, i64)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT member, presence, seen_at FROM peers_sessions")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        rows.collect()
+    }
+
+    pub fn touch_presence(&self, member: &str, seen_at: i64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE peers_sessions SET seen_at = ?2 WHERE member = ?1",
+            params![member, seen_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn drop_presence(&self, member: &str) -> rusqlite::Result<()> {
+        self.conn
+            .execute("DELETE FROM peers_sessions WHERE member = ?1", [member])?;
+        Ok(())
     }
 
     pub fn put_message(&self, m: &Message) -> rusqlite::Result<()> {
@@ -444,7 +520,7 @@ mod tests {
         };
         Store::open(&path).unwrap();
         let store = Store::open(&path).unwrap();
-        assert_eq!(user_version(&path), 2);
+        assert_eq!(user_version(&path), MIGRATIONS.len() as i64);
         assert_eq!(store.message("m1").unwrap(), Some(message));
         let holds: i64 = store
             .conn()
@@ -455,6 +531,35 @@ mod tests {
             )
             .unwrap();
         assert_eq!(holds, 1);
+    }
+
+    #[test]
+    fn v2_db_migrates_to_v3_keeping_its_sessions_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(MIGRATIONS[0]).unwrap();
+            conn.execute_batch(MIGRATIONS[1]).unwrap();
+            conn.execute_batch(
+                "INSERT INTO sessions VALUES ('k', 'codex', 'c', 1, 1, '/p', NULL, 'idle', 7, NULL);
+                 PRAGMA user_version = 2;",
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(user_version(&path), 3);
+        assert_eq!(store.sessions().unwrap().len(), 1);
+        assert!(store.end_session("k", 9).unwrap());
+        assert!(!store.end_session("k", 9).unwrap());
+        assert_eq!(store.session("k").unwrap(), None);
+        assert!(store.holds("k").unwrap());
+        assert_eq!(
+            store.ended_since(9).unwrap(),
+            [("k".into(), 9, "/p".into())]
+        );
+        assert!(store.ended_since(10).unwrap().is_empty());
+        assert!(!store.holds("k").unwrap());
     }
 
     #[test]

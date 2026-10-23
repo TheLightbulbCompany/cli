@@ -275,8 +275,8 @@ pub(super) fn refused(id: u64, reason: &str) -> Response {
     Response::err_with(id, BAD_REQUEST, json!({ "reason": reason }))
 }
 
-/// `end {key, caller?, if_gone?}` -> `{ended}`: deletes the session row; its mail stays for
-/// the hold. With `caller`, only the row's own process may end it; with `if_gone`, also
+/// `end {key, caller?, if_gone?}` -> `{ended}`: ends the session row (kept a day, ended);
+/// its mail stays for the hold. With `caller`, only the row's own process may end it; with `if_gone`, also
 /// anyone once the row's process is dead. `ended: false` when refused. Neither field (the
 /// CLI) ends it outright.
 fn end(id: u64, key: &str, body: &Value, daemon: &Daemon) -> Response {
@@ -296,11 +296,10 @@ fn end(id: u64, key: &str, body: &Value, daemon: &Daemon) -> Response {
             return Response::ok(id, json!({ "ended": false }));
         }
     }
-    let cwd = store.session(key).ok().flatten().map(|s| s.cwd);
-    match store.delete_session(key) {
+    // The row stays a day, ended: its address is kept (`presence`).
+    match store.end_session(key, now() as i64) {
         Ok(true) => {
-            drop(store);
-            presence::keep(daemon, key, &cwd.unwrap_or_default());
+            daemon.presence.notify_one();
             Response::ok(id, json!({ "ended": true }))
         }
         Ok(false) => Response::err(id, NOT_FOUND),
@@ -347,12 +346,10 @@ fn register(id: u64, body: &Value, daemon: &Daemon) -> Response {
         Ok(Some(owner)) if owner != me && sessions::alive(owner.0, owner.1) => {
             return refused(id, "owned_by_live_process")
         }
-        // A new session may not take what the person's other computer keeps (read with
-        // `store` let go: `kept_elsewhere` takes `team`, then `store`).
+        // A new session may not take what the person's other computer keeps.
         Ok(None) => {
             drop(store);
-            let rest = format!("{}:{}", r.provider, r.conversation);
-            if presence::kept_elsewhere(daemon, &rest) {
+            if !presence::claim(daemon, &key.0) {
                 return Response::err(id, admission::NAME_TAKEN);
             }
             store = daemon.store.lock().unwrap();
@@ -375,17 +372,23 @@ fn register(id: u64, body: &Value, daemon: &Daemon) -> Response {
         executable: r.executable,
     };
     // Every hook event registers: mail delivered before it has been seen.
-    match store
-        .put_session(&row)
-        .map_err(Into::into)
-        .and_then(|()| mail::mark_read_for(&store, &key, now()))
-    {
-        Ok(()) => {
-            daemon.presence.notify_one();
-            Response::ok(id, json!({ "key": key }))
-        }
+    match put_row(daemon, &store, &row).and_then(|()| mail::mark_read_for(&store, &key, now())) {
+        Ok(()) => Response::ok(id, json!({ "key": key })),
         Err(_) => Response::err(id, INTERNAL),
     }
+}
+
+/// Writes `row`, and wakes the presence sender when that changes what it publishes: a new
+/// (or revived) row, or another folder, process or executable.
+fn put_row(daemon: &Daemon, store: &store::Store, row: &store::Session) -> crate::Result<()> {
+    let old = store.session(&row.key)?;
+    store.put_session(row)?;
+    let same =
+        |o: &store::Session| (&o.cwd, o.pid, &o.executable) == (&row.cwd, row.pid, &row.executable);
+    if !old.as_ref().is_some_and(same) {
+        daemon.presence.notify_one();
+    }
+    Ok(())
 }
 
 /// Registered and discovered sessions, `gone` ones left out (their rows stay until `end`).
@@ -406,21 +409,17 @@ fn live_count(daemon: &Daemon) -> usize {
     live_sessions(daemon).len()
 }
 
-/// `m`'s sender as this computer's agents are told it (`label::render`, this computer
-/// reading). Mail that came in over the IPC (`origin` other than `net:`) is this
-/// computer's by construction, whatever member prefix its `from` carries.
+/// `m`'s sender as this computer's agents are told it (`label::sender`).
 pub(crate) fn sender_label(daemon: &Daemon, m: &store::Message) -> String {
-    let from = if m.origin.as_deref().is_some_and(|o| o.starts_with("net:")) {
-        m.from_key.clone()
-    } else {
-        let rest = m
-            .from_key
-            .split_once('/')
-            .map_or(m.from_key.as_str(), |(_, r)| r);
-        format!("{}/{rest}", daemon.identity.short)
-    };
     let team = daemon.team.lock().unwrap();
-    label::render(&team.roster, &daemon.identity.key, &from)
+    let me = (daemon.identity.key.as_str(), daemon.identity.short.as_str());
+    label::sender(&team.roster, me, m)
+}
+
+pub fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 pub fn now() -> u64 {
@@ -505,16 +504,29 @@ async fn inbox(
             _ => return Response::err(id, BAD_REQUEST),
         },
     };
-    // A name (`listen --as`) is this computer's while it is in use here, and kept a day after;
-    // one the person's other computer keeps is refused.
+    // A name (`listen --as`) holds a row (no process, no folder) while it is in use here, so
+    // it is kept a day after; one the person's other computer keeps is refused.
     let short = &daemon.identity.short;
-    if let frame::Sender::Name(name) = frame::Sender::of(short, &key.0) {
-        if key.0.starts_with(&format!("{short}/")) {
-            let ours = daemon.kept.lock().unwrap().contains_key(&key.0);
-            if !ours && presence::kept_elsewhere(daemon, name) {
+    if let frame::Sender::Name(_) = frame::Sender::of(short, &key.0) {
+        if sessions::split_addr(&key.0).is_some_and(|(m, _)| m == short) {
+            if !presence::claim(daemon, &key.0) {
                 return Response::err(id, admission::NAME_TAKEN);
             }
-            presence::keep(daemon, &key.0, "");
+            let row = store::Session {
+                key: key.0.clone(),
+                provider: String::new(),
+                conversation: None,
+                pid: None,
+                birth_micros: None,
+                cwd: String::new(),
+                title: None,
+                status: "idle".into(),
+                seen_at: now() as i64,
+                executable: None,
+            };
+            if put_row(daemon, &daemon.store.lock().unwrap(), &row).is_err() {
+                return Response::err(id, INTERNAL);
+            }
         }
     }
     let deadline = tokio::time::Instant::now() + Duration::from_secs(wait);

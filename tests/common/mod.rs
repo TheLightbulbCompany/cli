@@ -1,13 +1,16 @@
 //! What the CLI and network test files share: a temp state dir and HOME, a daemon shut down
 //! on drop, a person's shell (`detached`) and socket client (`person`), the daemon env knobs,
-//! and a two-member team seeded before start.
+//! a two-member team seeded before start, and a member played by the test (`Peer`).
 //! ponytail: only `cli.rs`, `team_cli.rs`, `net_two.rs`, `join.rs`, `ui_claim.rs` and `dialog.rs` use it;
 //! the other test files keep their own copies.
 #![allow(dead_code)]
 
-use iroh::{EndpointAddr, PublicKey};
+use iroh::endpoint::{presets, Connection, RecvStream, SendStream};
+use iroh::{Endpoint, EndpointAddr, PublicKey, SecretKey};
 use lightbulb_network::daemon::net_ops;
 use lightbulb_network::identity::{self, Identity};
+use lightbulb_network::net::frames::{self, Frame, Remote};
+use lightbulb_network::net::{ALPN, PROTOCOL};
 use lightbulb_network::roster::{self, Entry, Kind};
 use lightbulb_network::store::Store;
 use serde_json::{json, Value};
@@ -247,4 +250,99 @@ pub fn addr(env: &Env) -> EndpointAddr {
     let key = PublicKey::from_bytes(&identity::key_bytes(&env.identity().key).unwrap()).unwrap();
     let port = env.status()["port"].as_u64().unwrap();
     EndpointAddr::new(key).with_ip_addr(format!("127.0.0.1:{port}").parse().unwrap())
+}
+
+/// A member played by the test: its own endpoint, holding `id`'s key.
+pub async fn endpoint(id: &Identity) -> Endpoint {
+    Endpoint::builder(presets::Minimal)
+        .secret_key(SecretKey::from_bytes(&id.signing.to_bytes()))
+        .bind()
+        .await
+        .unwrap()
+}
+
+/// One member connection played by the test: the connection and its one stream.
+pub struct Peer {
+    pub conn: Connection,
+    pub send: SendStream,
+    pub recv: RecvStream,
+}
+
+impl Peer {
+    /// Dials `env`'s daemon on the member ALPN and opens the connection's one stream.
+    pub async fn dial(ep: &Endpoint, env: &Env) -> Peer {
+        let conn = ep.connect(addr(env), ALPN).await.unwrap();
+        let (send, recv) = conn.open_bi().await.unwrap();
+        Peer { conn, send, recv }
+    }
+
+    pub async fn send(&mut self, f: &Frame) {
+        frames::write(&mut self.send, f).await.unwrap();
+    }
+
+    pub async fn hello(&mut self, heads: Vec<String>) {
+        let protocol = PROTOCOL;
+        self.send(&Frame::Hello { protocol, heads }).await;
+    }
+
+    /// The next frame `pred` holds for (the others are skipped), within 5 s.
+    pub async fn recv_where(&mut self, pred: impl Fn(&Frame) -> bool) -> Frame {
+        loop {
+            let f = tokio::time::timeout(Duration::from_secs(5), frames::read(&mut self.recv))
+                .await
+                .expect("a frame within 5 s")
+                .unwrap();
+            if pred(&f) {
+                return f;
+            }
+        }
+    }
+
+    /// The next frame other than a `presence` (each `hello` is also answered with one).
+    pub async fn recv(&mut self) -> Frame {
+        self.recv_where(|f| !matches!(f, Frame::Presence { .. }))
+            .await
+    }
+
+    /// The next `presence`.
+    pub async fn presence(&mut self) -> Frame {
+        self.recv_where(|f| matches!(f, Frame::Presence { .. }))
+            .await
+    }
+}
+
+/// A valid published session `session_id` (a codex one, idle).
+pub fn remote(session_id: &str) -> Remote {
+    Remote {
+        session_id: session_id.into(),
+        agent: "codex".into(),
+        repo: None,
+        branch: None,
+        folder: "x".into(),
+        status: "idle".into(),
+        doing: None,
+        tier: "pull".into(),
+        title: None,
+    }
+}
+
+/// `member`'s presence `seq` of `sessions`, nothing known or kept.
+pub fn presence_with(member: &str, seq: u64, sessions: Vec<Remote>) -> Frame {
+    Frame::Presence {
+        member: member.into(),
+        seq,
+        sessions,
+        known: vec![],
+        kept: vec![],
+    }
+}
+
+/// Whether `env`'s `directory` lists `session_id`.
+pub fn sees(env: &Env, session_id: &str) -> bool {
+    let r = env.ask(json!({"id": 1, "op": "directory"}));
+    r["sessions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|s| s["session_id"] == session_id)
 }

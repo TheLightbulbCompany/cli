@@ -514,20 +514,17 @@ impl Net {
         // connection may have brought their parents.
         let due = !sync.pending.is_empty() && (synced || team.roster.heads != sync.tried);
         drop(team);
-        // Outside `team`: building ours reads transcripts and git files (so off the async
-        // threads), storing theirs takes `store`.
+        // Outside `team`: ours may need a build (transcripts, git files: off the async
+        // threads); storing theirs takes `store`.
         if hello_ok {
             let (d, tx) = (d.clone(), tx.clone());
             tokio::task::spawn_blocking(move || {
-                let _ = tx.send(crate::presence::current(&d));
+                let _ = tx.send(crate::presence::for_hello(&d));
             });
         }
         if let Some(p) = presence.filter(|_| d.peers.speaks_ours(key, conn)) {
             let first = !std::mem::replace(&mut sync.presence_stored, true);
-            let stored = crate::presence::put(&d.store.lock().unwrap(), key, &p, ipc::now(), first);
-            if let Err(e) = stored {
-                eprintln!("net: storing presence from {short}: {e}");
-            }
+            crate::presence::put(d, key, &p, ipc::now(), first);
         }
         if due {
             match apply(d, &mut sync.pending, &short) {

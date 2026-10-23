@@ -1,19 +1,18 @@
 //! Presence: this computer's sessions as its teammates see them, sent after each `hello` and
-//! on change; the latest from each member, kept in `peers_sessions`; and the `directory` op
-//! that merges both.
+//! on change; the latest from each member (in memory, `peers_sessions` its copy across
+//! restarts); and the `directory` op that merges both.
 
 use crate::daemon::{ipc, Daemon};
-use crate::doing::TEXT_MAX;
-use crate::net::frames::{Frame, Remote};
+use crate::mail;
+use crate::net::frames::{Frame, Remote, STATUSES};
 use crate::roster::{Member, MemberKind, Role, Roster};
-use crate::sessions::{Session, Status};
+use crate::sessions::{split_addr, Session, Status};
 use crate::store::Store;
-use rusqlite::params;
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 /// At most this many sessions, `known` and `kept` addresses each per presence.
 pub const MAX: usize = 100;
@@ -27,29 +26,50 @@ const COALESCE: Duration = Duration::from_millis(250);
 const TICK: Duration = Duration::from_secs(5);
 /// An unchanged presence is sent again this often.
 const RESEND: Duration = Duration::from_secs(60);
+/// The least time between two builds.
+const GAP: Duration = Duration::from_secs(1);
 
-/// This computer's person: its roster member's `person_id`, else its own key.
+/// A member's latest presence, as held.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Latest {
+    pub seq: u64,
+    pub seen_at: u64,
+    pub sessions: Vec<Remote>,
+    pub kept: Vec<String>,
+}
+
+/// The stored presences, by member (read at daemon start).
+pub fn load(store: &Store) -> HashMap<String, Latest> {
+    let rows = store.peers_presence().unwrap_or_default();
+    rows.into_iter()
+        .filter_map(
+            |(member, text, seen_at)| match serde_json::from_str(&text).ok()? {
+                Frame::Presence {
+                    seq,
+                    sessions,
+                    kept,
+                    ..
+                } => Some((
+                    member,
+                    Latest {
+                        seq,
+                        seen_at: u64::try_from(seen_at).unwrap_or(0),
+                        sessions,
+                        kept,
+                    },
+                )),
+                _ => None,
+            },
+        )
+        .collect()
+}
+
+/// This computer's person (`Roster::person_of` its key).
 pub fn my_person(d: &Daemon, r: &Roster) -> String {
-    r.members
-        .get(&d.identity.key)
-        .map_or_else(|| d.identity.key.clone(), |m| m.person_id.clone())
+    r.person_of(&d.identity.key).to_string()
 }
 
-/// Keeps `key` (an ended session in `cwd`, or a name, `cwd` empty) for a day from now, and
-/// wakes the sender.
-pub fn keep(d: &Daemon, key: &str, cwd: &str) {
-    let at = (ipc::now(), cwd.to_string());
-    d.kept.lock().unwrap().insert(key.into(), at);
-    d.presence.notify_one();
-}
-
-/// At most `TEXT_MAX` characters of `s`.
-fn capped(s: &str) -> String {
-    s.chars().take(TEXT_MAX).collect()
-}
-
-/// `s` as published: `folder` is `cwd`'s last part, or all of it with `share_paths`; text
-/// longer than a peer accepts is cut.
+/// `s` as published: `folder` is `cwd`'s last part, or all of it with `share_paths`.
 fn remote(s: &Session, share_paths: bool) -> Remote {
     let (repo, branch) = crate::mcp::git(&s.cwd);
     let folder = if share_paths {
@@ -63,91 +83,15 @@ fn remote(s: &Session, share_paths: bool) -> Remote {
     Remote {
         session_id: s.key.0.clone(),
         agent: s.provider.clone(),
-        repo: repo.as_deref().map(capped),
-        branch: branch.as_deref().map(capped),
-        folder: capped(&folder),
-        status: if s.status == Status::Live {
-            "busy"
-        } else {
-            "idle"
-        }
-        .into(),
-        doing: s.doing.as_deref().map(capped),
-        tier: serde_json::to_value(s.tier)
-            .ok()
-            .and_then(|t| t.as_str().map(String::from))
-            .unwrap_or_default(),
-        title: s.title.as_deref().map(capped),
+        repo,
+        branch,
+        folder,
+        status: STATUSES[usize::from(s.status != Status::Live)].into(),
+        doing: s.doing.clone(),
+        tier: s.tier.as_str().into(),
+        title: s.title.clone(),
     }
-}
-
-/// This computer's presence, `seq` 0: its live sessions (newest first), the non-live
-/// addresses still holding mail (`known`, newest mail first) and the kept ones (`kept`,
-/// newest first); nothing under a `folders_off` folder.
-fn build(d: &Daemon) -> Frame {
-    let now = ipc::now();
-    let (share, off) = {
-        let t = d.team.lock().unwrap();
-        (t.config.share_paths, t.config.folders_off.clone())
-    };
-    let off: Vec<PathBuf> = off.iter().map(|o| canonical(o)).collect();
-    let is_off = |cwd: &str| {
-        let cwd = canonical(Path::new(cwd));
-        off.iter().any(|o| cwd.starts_with(o))
-    };
-    let mut live = ipc::live_sessions(d);
-    live.retain(|s| !is_off(&s.cwd));
-    live.sort_by_key(|s| std::cmp::Reverse(s.birth_micros));
-    live.truncate(MAX);
-    let live_keys: HashSet<&str> = live.iter().map(|s| s.key.0.as_str()).collect();
-    let mine = format!("{}/", d.identity.short);
-    let store = d.store.lock().unwrap();
-    let rows = store.sessions().unwrap_or_default();
-    let held: Vec<(String, (u64, String))> = {
-        let mut map = d.kept.lock().unwrap();
-        map.retain(|_, (at, _)| *at + DAY >= now);
-        map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
-    };
-    // Only an address this computer knows the folder of: a row, or a kept entry.
-    let shown = |k: &str| {
-        let cwd = rows.iter().find(|r| r.key == k).map(|r| &r.cwd);
-        let cwd = cwd.or_else(|| held.iter().find(|(h, _)| h == k).map(|(_, (_, c))| c));
-        cwd.is_some_and(|c| !is_off(c))
-    };
-    let known: Vec<String> = waiting_keys(&store, now)
-        .into_iter()
-        .filter(|k| k.starts_with(&mine) && !live_keys.contains(k.as_str()) && shown(k))
-        .take(MAX)
-        .collect();
-    // Ended (`keep`) and gone (a row whose process died) addresses seen within the day.
-    let mut kept: Vec<(u64, String)> = held
-        .iter()
-        .filter(|(_, (_, cwd))| !is_off(cwd))
-        .map(|(k, (at, _))| (*at, k.clone()))
-        .collect();
-    for r in rows.iter().filter(|r| !is_off(&r.cwd)) {
-        kept.push((u64::try_from(r.seen_at).unwrap_or(0), r.key.clone()));
-    }
-    kept.sort_by(|a, b| b.cmp(a));
-    let mut seen = HashSet::new();
-    let kept: Vec<String> = kept
-        .into_iter()
-        .filter(|(at, k)| {
-            at + DAY >= now
-                && k.starts_with(&mine)
-                && !live_keys.contains(k.as_str())
-                && seen.insert(k.clone())
-        })
-        .map(|(_, k)| k)
-        .take(MAX)
-        .collect();
-    Frame::Presence {
-        member: d.identity.key.clone(),
-        seq: 0,
-        sessions: live.iter().map(|s| remote(s, share)).collect(),
-        known,
-        kept,
-    }
+    .clamp()
 }
 
 /// `p` resolved (symlinks, `..`), else as given; lowercased on macOS, whose volumes ignore case.
@@ -160,139 +104,240 @@ fn canonical(p: &Path) -> PathBuf {
     }
 }
 
-/// The addresses with waiting mail, newest mail first.
-fn waiting_keys(store: &Store, now: u64) -> Vec<String> {
-    let q =
-        "SELECT to_key FROM mailbox WHERE expires_at >= ?1 GROUP BY to_key ORDER BY MAX(id) DESC";
-    let Ok(mut stmt) = store.conn().prepare(q) else {
-        return vec![];
+/// This computer's presence: its live sessions (newest first), the non-live addresses still
+/// holding mail (`known`, newest mail first) and the kept ones (`kept`, newest first); nothing
+/// whose folder is under `folders_off`, nor an address whose folder it does not know.
+fn build(d: &Daemon, seq: u64) -> Frame {
+    let now = ipc::now();
+    let (share, off) = {
+        let t = d.team.lock().unwrap();
+        (t.config.share_paths, t.config.folders_off.clone())
     };
-    stmt.query_map([now as i64], |r| r.get(0))
-        .map(|rows| rows.flatten().collect())
-        .unwrap_or_default()
+    let off: Vec<PathBuf> = off.iter().map(|o| canonical(o)).collect();
+    let publishable = |cwd: &str| {
+        off.is_empty() || {
+            let cwd = canonical(Path::new(cwd));
+            !off.iter().any(|o| cwd.starts_with(o))
+        }
+    };
+    let mut live = ipc::live_sessions(d);
+    let (rows, ended, waiting) = {
+        let store = d.store.lock().unwrap();
+        let since = now.saturating_sub(DAY) as i64;
+        (
+            store.sessions().unwrap_or_default(),
+            store.ended_since(since).unwrap_or_default(),
+            mail::waiting_keys(&store, now).unwrap_or_default(),
+        )
+    };
+    // Every address with a row here, `(key, last seen or ended, folder)`, if publishable.
+    let mine = format!("{}/", d.identity.short);
+    let rows = rows.into_iter().map(|r| (r.key, r.seen_at, r.cwd));
+    let mut candidates: Vec<(String, i64, String)> = rows
+        .chain(ended)
+        .filter(|(k, _, cwd)| k.starts_with(&mine) && publishable(cwd))
+        .collect();
+    candidates.sort_by_key(|(_, at, _)| std::cmp::Reverse(*at));
+    live.retain(|s| publishable(&s.cwd));
+    live.sort_by_key(|s| std::cmp::Reverse(s.birth_micros));
+    live.truncate(MAX);
+    let live_keys: HashSet<&str> = live.iter().map(|s| s.key.0.as_str()).collect();
+    let others = || {
+        candidates
+            .iter()
+            .filter(|(k, ..)| !live_keys.contains(k.as_str()))
+    };
+    let known = waiting
+        .into_iter()
+        .filter(|k| others().any(|(c, ..)| c == k))
+        .take(MAX)
+        .collect();
+    let kept = others()
+        .filter(|(_, at, _)| *at + DAY as i64 >= now as i64)
+        .map(|(k, ..)| k.clone())
+        .take(MAX)
+        .collect();
+    Frame::Presence {
+        member: d.identity.key.clone(),
+        seq,
+        sessions: live.iter().map(|s| remote(s, share)).collect(),
+        known,
+        kept,
+    }
 }
 
-/// `f` stamped with the time.
-fn stamped(mut f: Frame) -> Frame {
+/// Whether `a` and `b` say the same, whatever their `seq`.
+fn same(a: &Frame, b: &Frame) -> bool {
+    match (a, b) {
+        (
+            Frame::Presence {
+                sessions,
+                known,
+                kept,
+                ..
+            },
+            Frame::Presence {
+                sessions: s,
+                known: k,
+                kept: p,
+                ..
+            },
+        ) => sessions == s && known == k && kept == p,
+        _ => false,
+    }
+}
+
+/// The presence to send a peer after its `hello`: the last built, stamped now; built here
+/// only when there is none yet.
+pub fn for_hello(d: &Daemon) -> Frame {
+    let cached = d.built.lock().unwrap().clone();
+    let mut f = cached.unwrap_or_else(|| {
+        let f = build(d, 0);
+        *d.built.lock().unwrap() = Some(f.clone());
+        f
+    });
     if let Frame::Presence { seq, .. } = &mut f {
-        *seq = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_millis() as u64);
+        *seq = ipc::now_ms();
     }
     f
 }
 
-/// The presence to send one peer now (after its `hello`).
-pub fn current(d: &Daemon) -> Frame {
-    stamped(build(d))
-}
-
 /// The sender: on a local change (`Daemon::presence`, coalesced over 250 ms) or every 5 s,
-/// sends this computer's presence to every online member when it changed, and every 60 s
-/// regardless.
+/// at most once a second and only while a member is online, builds this computer's presence
+/// and sends it to every online member when it changed, and every 60 s regardless.
 pub async fn run(d: Arc<Daemon>) {
-    let mut last: Option<(Frame, Instant)> = None;
+    let (mut built_at, mut sent_at): (Option<Instant>, Option<Instant>) = (None, None);
     loop {
         tokio::select! {
             _ = d.presence.notified() => tokio::time::sleep(COALESCE).await,
             _ = tokio::time::sleep(TICK) => {}
         }
+        if d.peers.online().is_empty() {
+            continue;
+        }
+        if let Some(at) = built_at {
+            tokio::time::sleep(GAP.saturating_sub(at.elapsed())).await;
+        }
+        built_at = Some(Instant::now());
         let d2 = d.clone();
-        let Ok(f) = tokio::task::spawn_blocking(move || build(&d2)).await else {
+        let Ok(f) = tokio::task::spawn_blocking(move || build(&d2, ipc::now_ms())).await else {
             continue;
         };
-        if last
+        let unchanged = d
+            .built
+            .lock()
+            .unwrap()
             .as_ref()
-            .is_some_and(|(l, at)| *l == f && at.elapsed() < RESEND)
-        {
+            .is_some_and(|b| same(b, &f));
+        *d.built.lock().unwrap() = Some(f.clone());
+        if unchanged && sent_at.is_some_and(|at| at.elapsed() < RESEND) {
             continue;
         }
-        let out = stamped(f.clone());
         for m in d.peers.online() {
-            let _ = d.peers.send(&m, out.clone());
+            let _ = d.peers.send(&m, f.clone());
         }
-        last = Some((f, Instant::now()));
+        sent_at = Some(Instant::now());
     }
 }
 
-/// Stores `member`'s presence `f`: unless the one stored is as new (`seq`), or always with
+/// Takes `l` as `member`'s latest unless the one held is as new (`seq`), or always with
 /// `first` (the first on a connection, so a peer whose clock stepped back is not frozen).
-pub fn put(store: &Store, member: &str, f: &Frame, now: u64, first: bool) -> rusqlite::Result<()> {
-    let Frame::Presence { seq, .. } = f else {
-        return Ok(());
+fn accept(held: &mut HashMap<String, Latest>, member: &str, l: Latest, first: bool) -> bool {
+    if !first && held.get(member).is_some_and(|o| l.seq <= o.seq) {
+        return false;
+    }
+    held.insert(member.into(), l);
+    true
+}
+
+/// Holds and stores `member`'s presence `f` by the `seq` rule (`accept`).
+pub fn put(d: &Daemon, member: &str, f: &Frame, now: u64, first: bool) {
+    let Frame::Presence {
+        seq,
+        sessions,
+        kept,
+        ..
+    } = f
+    else {
+        return;
     };
-    let text = serde_json::to_string(f).unwrap_or_default();
-    store.conn().execute(
-        "INSERT INTO peers_sessions VALUES (?1, ?2, ?3, ?4) ON CONFLICT(member) DO UPDATE SET \
-         seq = excluded.seq, presence = excluded.presence, seen_at = excluded.seen_at \
-         WHERE ?5 OR excluded.seq > peers_sessions.seq",
-        params![
-            member,
-            i64::try_from(*seq).unwrap_or(i64::MAX),
-            text,
-            now as i64,
-            first
-        ],
-    )?;
-    Ok(())
+    let l = Latest {
+        seq: *seq,
+        seen_at: now,
+        sessions: sessions.clone(),
+        kept: kept.clone(),
+    };
+    if accept(&mut d.latest.lock().unwrap(), member, l, first) {
+        let text = serde_json::to_string(f).unwrap_or_default();
+        let stored = d
+            .store
+            .lock()
+            .unwrap()
+            .put_presence(member, *seq, &text, now as i64);
+        if let Err(e) = stored {
+            eprintln!("presence: storing {}: {e}", crate::net::short(member));
+        }
+    }
 }
 
 /// `member` was last seen now (its connection closed): its presence is listed a day more.
 pub fn seen(d: &Daemon, member: &str) {
-    let store = d.store.lock().unwrap();
-    let _ = store.conn().execute(
-        "UPDATE peers_sessions SET seen_at = ?2 WHERE member = ?1",
-        params![member, ipc::now() as i64],
-    );
+    let now = ipc::now();
+    if let Some(l) = d.latest.lock().unwrap().get_mut(member) {
+        l.seen_at = now;
+    }
+    let _ = d.store.lock().unwrap().touch_presence(member, now as i64);
 }
 
-/// The stored presences of current members, `(member, sessions, kept)`; a member offline
-/// and unseen for a day is dropped.
-fn stored(d: &Daemon) -> Vec<(Member, Vec<Remote>, Vec<String>)> {
+/// The latest presences of current members; one offline and unseen for a day is dropped.
+fn stored(d: &Daemon) -> Vec<(Member, Latest)> {
     let online: HashSet<String> = d.peers.online().into_iter().collect();
-    let now = ipc::now() as i64;
-    let team = d.team.lock().unwrap();
-    let store = d.store.lock().unwrap();
-    let rows: Vec<(String, String, i64)> = store
-        .conn()
-        .prepare("SELECT member, presence, seen_at FROM peers_sessions")
-        .and_then(|mut s| {
-            s.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-                .collect()
-        })
-        .unwrap_or_default();
-    let mut out = vec![];
-    for (member, text, seen_at) in rows {
-        if seen_at + (DAY as i64) < now && !online.contains(&member) {
-            let _ = store
-                .conn()
-                .execute("DELETE FROM peers_sessions WHERE member = ?1", [&member]);
-            continue;
-        }
-        let Some(m) = team.roster.members.get(&member) else {
-            continue;
-        };
-        if let Ok(Frame::Presence { sessions, kept, .. }) = serde_json::from_str(&text) {
-            out.push((m.clone(), sessions, kept));
+    let now = ipc::now();
+    let mut stale = vec![];
+    let held: Vec<(String, Latest)> = {
+        let mut held = d.latest.lock().unwrap();
+        held.retain(|m, l| {
+            let keep = l.seen_at + DAY >= now || online.contains(m);
+            if !keep {
+                stale.push(m.clone());
+            }
+            keep
+        });
+        held.iter().map(|(m, l)| (m.clone(), l.clone())).collect()
+    };
+    if !stale.is_empty() {
+        let store = d.store.lock().unwrap();
+        for m in &stale {
+            let _ = store.drop_presence(m);
         }
     }
-    out
+    let team = d.team.lock().unwrap();
+    held.into_iter()
+        .filter_map(|(m, l)| Some((team.roster.members.get(&m)?.clone(), l)))
+        .collect()
 }
 
 /// Whether another computer of this person keeps `rest` (the part of an address after the
-/// member prefix), by its latest presence here. Best effort: only what is stored.
-pub fn kept_elsewhere(d: &Daemon, rest: &str) -> bool {
+/// member prefix), by its latest presence here. Best effort: only what is held.
+fn kept_elsewhere(d: &Daemon, rest: &str) -> bool {
     let me = {
         let t = d.team.lock().unwrap();
         my_person(d, &t.roster)
     };
-    stored(d).iter().any(|(m, _, kept)| {
+    stored(d).iter().any(|(m, l)| {
         m.key != d.identity.key
             && m.person_id == me
-            && kept
+            && l.kept
                 .iter()
-                .any(|k| k.split_once('/').is_some_and(|(_, r)| r == rest))
+                .any(|k| split_addr(k).is_some_and(|(_, r)| r == rest))
     })
+}
+
+/// Whether this computer may take the address `key` (`register`, `inbox --as`): it has a row
+/// for it already, or no other computer of this person keeps it. Call it without `store`.
+pub fn claim(d: &Daemon, key: &str) -> bool {
+    let held = d.store.lock().unwrap().holds(key).unwrap_or(false);
+    held || !kept_elsewhere(d, split_addr(key).map_or(key, |(_, r)| r))
 }
 
 /// A directory record (architecture §9); `cwd` is empty for another computer's session.
@@ -351,8 +396,8 @@ pub fn directory(d: &Daemon, query: Option<&str>) -> Value {
             out.push(record(&own, &me, &r, &s.cwd));
         }
     }
-    for (m, sessions, _) in &remote_ones {
-        for r in sessions.iter().filter(|r| hit(m, r)) {
+    for (m, l) in &remote_ones {
+        for r in l.sessions.iter().filter(|r| hit(m, r)) {
             out.push(record(m, &me, r, ""));
         }
     }
@@ -365,29 +410,21 @@ mod tests {
 
     #[test]
     fn an_older_presence_is_ignored() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(&dir.path().join("state.db")).unwrap();
-        let p = |seq, member: &str| Frame::Presence {
-            member: member.into(),
+        let l = |seq| Latest {
             seq,
+            seen_at: 1,
             sessions: vec![],
-            known: vec![format!("x/{seq}")],
-            kept: vec![],
+            kept: vec![format!("x/{seq}")],
         };
-        for seq in [5, 3, 5, 7] {
-            put(&store, "m", &p(seq, "m"), 1, false).unwrap();
-        }
-        let text: String = store
-            .conn()
-            .query_row("SELECT presence FROM peers_sessions", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(serde_json::from_str::<Frame>(&text).unwrap(), p(7, "m"));
+        let mut held = HashMap::new();
+        let took: Vec<bool> = [5, 3, 5, 7]
+            .into_iter()
+            .map(|s| accept(&mut held, "m", l(s), false))
+            .collect();
+        assert_eq!(took, [true, false, false, true]);
+        assert_eq!(held["m"], l(7));
         // A connection's first presence is taken whatever its seq.
-        put(&store, "m", &p(2, "m"), 1, true).unwrap();
-        let text: String = store
-            .conn()
-            .query_row("SELECT presence FROM peers_sessions", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(serde_json::from_str::<Frame>(&text).unwrap(), p(2, "m"));
+        assert!(accept(&mut held, "m", l(2), true));
+        assert_eq!(held["m"], l(2));
     }
 }

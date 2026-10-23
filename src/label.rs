@@ -2,6 +2,8 @@
 
 use crate::frame::{agent_name, Sender};
 use crate::roster::Roster;
+use crate::sessions::split_addr;
+use crate::store::Message;
 
 /// Whether `c` is safe to show a person or an agent: no control character (C0, C1, U+0085),
 /// line or paragraph separator, or bidi control that could reorder or hide what is around it.
@@ -10,23 +12,18 @@ pub fn printable(c: char) -> bool {
         && !matches!(c, '\u{2028}' | '\u{2029}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
 }
 
-/// `from`'s label for the reader at member `viewer` (its person is its roster `person_id`, else
-/// its key): `Your Codex`, `You, at the terminal`, `Your desk mailbox` for the reader's own
-/// person; `aden's Codex`, `aden, at the terminal`, `aden's desk mailbox` for another's;
+/// `from`'s label for the reader at member `viewer` (its person is `Roster::person_of`):
+/// `Your Codex`, `You, at the terminal`, `Your desk mailbox` for the reader's own person;
+/// `aden's Codex`, `aden, at the terminal`, `aden's desk mailbox` for another's;
 /// ` (not verified)` after a member with no proof other than the reader's own computer;
 /// `an unknown member (not verified)` for a prefix the roster does not hold.
 pub fn render(roster: &Roster, viewer: &str, from: &str) -> String {
-    let viewer_person = roster.members.get(viewer).map_or(viewer, |m| &m.person_id);
-    let prefix = from.split_once('/').map_or(from, |(m, _)| m);
+    let prefix = split_addr(from).map_or(from, |(m, _)| m);
     let Some(m) = roster.members.values().find(|m| m.short == prefix) else {
         return "an unknown member (not verified)".into();
     };
-    let label = if m.person_id == viewer_person {
-        match Sender::of(prefix, from) {
-            Sender::Terminal => "You, at the terminal".into(),
-            Sender::Name(n) => format!("Your {n} mailbox"),
-            Sender::Agent(p) => format!("Your {}", agent_name(p)),
-        }
+    let (who, possessive) = if m.person_id == roster.person_of(viewer) {
+        ("You".to_string(), "Your".to_string())
     } else {
         // Display text: drop characters that could pass for the frame header's delimiters.
         let name: String = m
@@ -35,15 +32,16 @@ pub fn render(roster: &Roster, viewer: &str, from: &str) -> String {
             .filter(|c| printable(*c) && !matches!(c, '{' | '}' | '[' | ']'))
             .collect();
         let name = if name.trim().is_empty() {
-            "a member"
+            "a member".to_string()
         } else {
-            &name
+            name
         };
-        match Sender::of(prefix, from) {
-            Sender::Terminal => format!("{name}, at the terminal"),
-            Sender::Name(n) => format!("{name}'s {n} mailbox"),
-            Sender::Agent(p) => format!("{name}'s {}", agent_name(p)),
-        }
+        (name.clone(), format!("{name}'s"))
+    };
+    let label = match Sender::of(prefix, from) {
+        Sender::Terminal => format!("{who}, at the terminal"),
+        Sender::Name(n) => format!("{possessive} {n} mailbox"),
+        Sender::Agent(p) => format!("{possessive} {}", agent_name(p)),
     };
     // The reader's own computer has nothing to prove to itself.
     if m.proof.is_some() || m.key == viewer {
@@ -51,6 +49,19 @@ pub fn render(roster: &Roster, viewer: &str, from: &str) -> String {
     } else {
         format!("{label} (not verified)")
     }
+}
+
+/// `m`'s sender as the agents of the computer `me` (key, short) are told it. Mail that came in
+/// over the IPC (`origin` other than `net:`) is that computer's by construction, whatever
+/// member prefix its `from` carries.
+pub fn sender(roster: &Roster, me: (&str, &str), m: &Message) -> String {
+    let from = if m.origin.as_deref().is_some_and(|o| o.starts_with("net:")) {
+        m.from_key.clone()
+    } else {
+        let rest = split_addr(&m.from_key).map_or(m.from_key.as_str(), |(_, r)| r);
+        format!("{}/{rest}", me.1)
+    };
+    render(roster, me.0, &from)
 }
 
 #[cfg(test)]

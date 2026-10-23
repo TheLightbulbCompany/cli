@@ -31,13 +31,18 @@ pub fn valid_name(s: &str) -> bool {
     word(s, 64)
 }
 
+/// An address as `(member prefix, the rest)`; `None` without a `/`.
+pub fn split_addr(a: &str) -> Option<(&str, &str)> {
+    a.split_once('/')
+}
+
 /// The one address grammar: `to` as `<member>/<provider>:<conversation>` or `<member>/<name>`,
 /// a bare name taken as `member`'s. `None` for anything else (groups included).
 pub fn qualify(member: &str, to: &str) -> Option<String> {
     if valid_name(to) {
         return Some(format!("{member}/{to}"));
     }
-    let (m, rest) = to.split_once('/')?;
+    let (m, rest) = split_addr(to)?;
     let ok = valid_name(m)
         && match rest.split_once(':') {
             Some((p, c)) => PROVIDERS.contains(&p) && word(c, 128),
@@ -60,6 +65,19 @@ pub enum Tier {
     Push,
     NextStep,
     Pull,
+}
+
+impl Tier {
+    pub const ALL: [Tier; 3] = [Tier::Push, Tier::NextStep, Tier::Pull];
+
+    /// The wire name (as serde writes it).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Tier::Push => "push",
+            Tier::NextStep => "next_step",
+            Tier::Pull => "pull",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -279,5 +297,8 @@ mod tests {
             "\"next_step\""
         );
         assert_eq!(serde_json::to_string(&Status::Gone).unwrap(), "\"gone\"");
+        for t in Tier::ALL {
+            assert_eq!(serde_json::to_value(t).unwrap(), t.as_str());
+        }
     }
 }

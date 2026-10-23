@@ -56,9 +56,10 @@ pub struct Daemon {
     pub joining: tokio::sync::Mutex<()>,
     /// Poked on a local session change: the presence sender (`presence::run`) looks again.
     pub presence: Notify,
-    /// Ended sessions' and names' addresses, kept a day: `(when, cwd)` (`presence::keep`).
-    /// ponytail: in memory, so a restart forgets them; persist if that bites.
-    pub kept: Mutex<HashMap<String, (u64, String)>>,
+    /// The presence last built (`presence::run`), sent stamped after each `hello`.
+    pub built: Mutex<Option<net::frames::Frame>>,
+    /// Each member's latest presence (`peers_sessions` is its copy across restarts).
+    pub latest: Mutex<HashMap<String, crate::presence::Latest>>,
 }
 
 impl Daemon {
@@ -163,6 +164,7 @@ pub async fn run(dir: &Path) -> Result<()> {
     // Briefly wider than 0600 after bind; the 0700 state dir closes that window.
     fs::set_permissions(&sock, Permissions::from_mode(0o600))?;
 
+    let latest = crate::presence::load(&store);
     let peers = net::Peers::default();
     let (dialogs, answers) = dialog::Queue::new("/usr/bin/osascript".into());
     dialogs.set_knob(peers.knobs().dialog.clone());
@@ -185,7 +187,8 @@ pub async fn run(dir: &Path) -> Result<()> {
         admissions: Mutex::default(),
         joining: tokio::sync::Mutex::new(()),
         presence: Notify::new(),
-        kept: Mutex::default(),
+        built: Mutex::default(),
+        latest: Mutex::new(latest),
     });
     // No join connection outlives a restart: its open requests are over.
     daemon.store.lock().unwrap().expire_joins(i64::MAX, now)?;

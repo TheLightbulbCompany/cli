@@ -2,20 +2,17 @@
 //! presence that names another member's prefix is dropped, a name one computer keeps is
 //! refused on the same person's other computer, and an `off` folder is never published.
 
-use iroh::endpoint::{presets, RecvStream, SendStream};
-use iroh::{Endpoint, SecretKey};
-use lightbulb_network::daemon::net_ops;
+use iroh::Endpoint;
+use lightbulb_network::daemon::{ipc, net_ops};
 use lightbulb_network::identity::Identity;
-use lightbulb_network::net::frames::{self, Frame, Remote};
-use lightbulb_network::net::{ALPN, PROTOCOL};
+use lightbulb_network::net::frames::{Frame, Remote};
 use lightbulb_network::os;
 use lightbulb_network::roster::{self, Entry, Kind};
 use serde_json::{json, Value};
-use std::time::Duration;
 
 mod common;
 
-use common::{addr, out, peers, seed_pair, until, Env, EXE};
+use common::{endpoint, out, peers, presence_with, remote, seed_pair, sees, until, Env, Peer, EXE};
 
 /// This test process as a `provider` session `conversation` in `cwd`.
 fn register(e: &Env, provider: &str, conversation: &str, cwd: &str) -> Value {
@@ -109,14 +106,10 @@ async fn each_member_sees_the_whole_directory() {
     // A change on B reaches A: a new session, then an ended one.
     assert_eq!(register(&b, "codex", "b2", "/tmp/work/cli")["ok"], true);
     let kb2 = format!("{sb}/codex:b2");
-    until(10, "A sees B's new session", || {
-        ids(&directory(&a, None)).contains(&kb2)
-    });
+    until(10, "A sees B's new session", || sees(&a, &kb2));
     let r = b.ask(json!({"id": 1, "op": "end", "key": kb}));
     assert_eq!(r["ended"], true, "{r}");
-    until(10, "A sees B's session end", || {
-        !ids(&directory(&a, None)).contains(&kb)
-    });
+    until(10, "A sees B's session end", || !sees(&a, &kb));
 
     // `team.get` says who is online; `who --all` lists B's sessions after A's.
     let members = a.ask(json!({"id": 1, "op": "team.get"}))["members"].clone();
@@ -135,75 +128,17 @@ async fn each_member_sees_the_whole_directory() {
     assert!(line.contains("bob") && line.contains("mbp"), "{text}");
 }
 
-/// A member played by the test over its own endpoint, holding `id`'s key.
-struct Peer {
-    send: SendStream,
-    recv: RecvStream,
-    _ep: Endpoint,
+/// `id` played over its own endpoint: dialed into `env` and past its `hello` (at `head`).
+async fn played(id: &Identity, env: &Env, head: &Entry) -> (Endpoint, Peer) {
+    let ep = endpoint(id).await;
+    let mut p = Peer::dial(&ep, env).await;
+    p.hello(vec![head.hash()]).await;
+    (ep, p)
 }
 
-impl Peer {
-    async fn dial(id: &Identity, env: &Env, head: &Entry) -> Peer {
-        let ep = Endpoint::builder(presets::Minimal)
-            .secret_key(SecretKey::from_bytes(&id.signing.to_bytes()))
-            .bind()
-            .await
-            .unwrap();
-        let conn = ep.connect(addr(env), ALPN).await.unwrap();
-        let (send, recv) = conn.open_bi().await.unwrap();
-        let mut p = Peer {
-            send,
-            recv,
-            _ep: ep,
-        };
-        let hello = Frame::Hello {
-            protocol: PROTOCOL,
-            heads: vec![head.hash()],
-        };
-        p.send(&hello).await;
-        p
-    }
-
-    async fn send(&mut self, f: &Frame) {
-        frames::write(&mut self.send, f).await.unwrap();
-    }
-
-    /// The first `presence` the daemon sends.
-    async fn presence(&mut self) -> Frame {
-        loop {
-            let f = tokio::time::timeout(Duration::from_secs(10), frames::read(&mut self.recv))
-                .await
-                .expect("a frame within 10 s")
-                .unwrap();
-            if matches!(f, Frame::Presence { .. }) {
-                return f;
-            }
-        }
-    }
-}
-
-fn remote(session_id: &str) -> Remote {
-    Remote {
-        session_id: session_id.into(),
-        agent: "codex".into(),
-        repo: None,
-        branch: None,
-        folder: "x".into(),
-        status: "idle".into(),
-        doing: None,
-        tier: "pull".into(),
-        title: None,
-    }
-}
-
-fn presence(member: &str, seq: u64, sessions: &[&str], kept: &[String]) -> Frame {
-    Frame::Presence {
-        member: member.into(),
-        seq,
-        sessions: sessions.iter().map(|s| remote(s)).collect(),
-        known: vec![],
-        kept: kept.to_vec(),
-    }
+/// `member`'s presence `seq` of the sessions `ids`.
+fn presence(member: &str, seq: u64, ids: &[&str]) -> Frame {
+    presence_with(member, seq, ids.iter().map(|s| remote(s)).collect())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -213,57 +148,44 @@ async fn presence_naming_another_prefix_is_dropped() {
     a.daemon(false, "", &[]);
     let (ia, ib) = (a.identity(), b.identity());
     let (sa, sb) = (ia.short.clone(), ib.short.clone());
-    let mut p = Peer::dial(&ib, &a, &admit).await;
+    let (_ep, mut p) = played(&ib, &a, &admit).await;
     until(5, "A sees B online", || a.status()["peers"]["online"] == 1);
 
     let good = format!("{sb}/codex:ok");
-    p.send(&presence(&ib.key, 1, &[&good], &[])).await;
-    until(5, "A stores B's presence", || {
-        ids(&directory(&a, None)).contains(&good)
-    });
+    p.send(&presence(&ib.key, 1, &[&good])).await;
+    until(5, "A stores B's presence", || sees(&a, &good));
     // Higher seqs, so only the gate can keep them out: A's key as `member`, a session or a
     // kept name under A's prefix, then a fence under B's own.
     let forged = format!("{sa}/codex:forged");
-    p.send(&presence(&ia.key, 2, &[&good, &forged], &[])).await;
-    p.send(&presence(&ib.key, 3, &[&good, &forged], &[])).await;
-    p.send(&presence(&ib.key, 4, &[&good], &[format!("{sa}/desk")]))
-        .await;
+    p.send(&presence(&ia.key, 2, &[&good, &forged])).await;
+    p.send(&presence(&ib.key, 3, &[&good, &forged])).await;
+    let mut kept_forged = presence(&ib.key, 4, &[&good]);
+    if let Frame::Presence { kept, .. } = &mut kept_forged {
+        kept.push(format!("{sa}/desk"));
+    }
+    p.send(&kept_forged).await;
     // Malformed sessions: text past the cap, an agent other than the id's provider, an unknown
     // status; and a seq more than a day ahead.
     let bad = |f: fn(&mut Remote)| {
         let mut r = remote(&good);
         f(&mut r);
-        Frame::Presence {
-            member: ib.key.clone(),
-            seq: 4,
-            sessions: vec![r],
-            known: vec![],
-            kept: vec![],
-        }
+        presence_with(&ib.key, 4, vec![r])
     };
     p.send(&bad(|r| r.doing = Some("x".repeat(257)))).await;
     p.send(&bad(|r| r.agent = "claude".into())).await;
     p.send(&bad(|r| r.status = "gone".into())).await;
-    let ahead = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64
-        + 2 * 86_400_000;
-    p.send(&presence(&ib.key, ahead, &[&good], &[])).await;
+    let ahead = ipc::now_ms() + 2 * 86_400_000;
+    p.send(&presence(&ib.key, ahead, &[&good])).await;
     let fence = format!("{sb}/codex:fence");
-    p.send(&presence(&ib.key, 5, &[&fence], &[])).await;
-    until(5, "A applies the fence", || {
-        ids(&directory(&a, None)).contains(&fence)
-    });
-    assert!(!ids(&directory(&a, None)).contains(&forged));
+    p.send(&presence(&ib.key, 5, &[&fence])).await;
+    until(5, "A applies the fence", || sees(&a, &fence));
+    assert!(!sees(&a, &forged));
     // An older presence is ignored.
-    p.send(&presence(&ib.key, 4, &[&good], &[])).await;
+    p.send(&presence(&ib.key, 4, &[&good])).await;
     let late = format!("{sb}/codex:late");
-    p.send(&presence(&ib.key, 6, &[&fence, &late], &[])).await;
-    until(5, "A applies the next one", || {
-        ids(&directory(&a, None)).contains(&late)
-    });
-    assert!(!ids(&directory(&a, None)).contains(&good));
+    p.send(&presence(&ib.key, 6, &[&fence, &late])).await;
+    until(5, "A applies the next one", || sees(&a, &late));
+    assert!(!sees(&a, &good));
 
     let log = std::fs::read_to_string(a.state.path().join("daemon.log")).unwrap();
     let line = format!("net: dropped a presence frame from {sb}");
@@ -272,14 +194,7 @@ async fn presence_naming_another_prefix_is_dropped() {
     // A teammate's text reaches the person's terminal without what a terminal acts on.
     let mut r = remote(&late);
     r.doing = Some("\u{1b}]0;pwned\u{7}red\u{1b}[31m\u{202e}txt".into());
-    p.send(&Frame::Presence {
-        member: ib.key.clone(),
-        seq: 7,
-        sessions: vec![r],
-        known: vec![],
-        kept: vec![],
-    })
-    .await;
+    p.send(&presence_with(&ib.key, 7, vec![r])).await;
     until(5, "A applies it", || {
         ids(&directory(&a, None)) == [late.clone()]
     });
@@ -320,9 +235,7 @@ async fn kept_name_is_refused_on_the_persons_other_computer() {
     // A later session as a fence: once B lists it, B holds the presence that keeps both.
     assert_eq!(register(&a, "codex", "fence", "/tmp/k")["ok"], true);
     let fence = format!("{}/codex:fence", ia.short);
-    until(10, "B has A's latest presence", || {
-        ids(&directory(&b, None)).contains(&fence)
-    });
+    until(10, "B has A's latest presence", || sees(&b, &fence));
     let r = register(&b, "codex", "c1", "/tmp/k");
     assert_eq!(r["error"], "name_taken", "{r}");
     let r = b.ask(json!({"id": 1, "op": "inbox", "key": format!("{}/desk", ib.short)}));
@@ -374,7 +287,7 @@ async fn off_folder_sessions_are_not_published() {
         assert_eq!(r["ended"], true, "{r}");
     }
 
-    let mut p = Peer::dial(&b.identity(), &a, &admit).await;
+    let (_ep, mut p) = played(&b.identity(), &a, &admit).await;
     let Frame::Presence {
         member,
         sessions,

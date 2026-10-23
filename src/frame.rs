@@ -52,7 +52,7 @@ impl<'a> Sender<'a> {
     /// The kind of `from`, read against this computer's `member`. A key that fits no kind
     /// (only raw IPC can store one) reads as an agent of provider `unknown`.
     pub fn of(member: &str, from: &'a str) -> Sender<'a> {
-        let Some((m, rest)) = from.split_once('/') else {
+        let Some((m, rest)) = sessions::split_addr(from) else {
             return Sender::Agent("unknown");
         };
         match rest.split_once(':') {

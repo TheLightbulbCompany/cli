@@ -2,8 +2,7 @@
 //! Each test runs real daemons; a test that needs to see (or hand-build) frames plays one
 //! member itself, with that member's key, over its own iroh endpoint.
 
-use iroh::endpoint::{presets, Connection, RecvStream, SendStream};
-use iroh::{Endpoint, SecretKey};
+use iroh::Endpoint;
 use lightbulb_network::identity::Identity;
 use lightbulb_network::net::frames::{self, Frame};
 use lightbulb_network::net::{ALPN, PROTOCOL};
@@ -14,55 +13,11 @@ use std::time::Duration;
 
 mod common;
 
-use common::{addr, seed_pair, until, Env, EXE};
+use common::{addr, endpoint, seed_pair, until, Env, Peer, EXE};
 
 const PAGE_BYTES: usize = 512 * 1024;
 
-/// A member played by the test: its own endpoint, holding `id`'s key.
-async fn endpoint(id: &Identity) -> Endpoint {
-    Endpoint::builder(presets::Minimal)
-        .secret_key(SecretKey::from_bytes(&id.signing.to_bytes()))
-        .bind()
-        .await
-        .unwrap()
-}
-
-struct Peer {
-    conn: Connection,
-    send: SendStream,
-    recv: RecvStream,
-}
-
 impl Peer {
-    /// Dials `env`'s daemon on the member ALPN and opens the connection's one stream.
-    async fn dial(ep: &Endpoint, env: &Env) -> Peer {
-        let conn = ep.connect(addr(env), ALPN).await.unwrap();
-        let (send, recv) = conn.open_bi().await.unwrap();
-        Peer { conn, send, recv }
-    }
-
-    async fn send(&mut self, f: &Frame) {
-        frames::write(&mut self.send, f).await.unwrap();
-    }
-
-    async fn hello(&mut self, heads: Vec<String>) {
-        let protocol = PROTOCOL;
-        self.send(&Frame::Hello { protocol, heads }).await;
-    }
-
-    /// The next frame other than a `presence` (each `hello` is also answered with one).
-    async fn recv(&mut self) -> Frame {
-        loop {
-            let f = tokio::time::timeout(Duration::from_secs(5), frames::read(&mut self.recv))
-                .await
-                .expect("a frame within 5 s")
-                .unwrap();
-            if !matches!(f, Frame::Presence { .. }) {
-                return f;
-            }
-        }
-    }
-
     /// The `roster` frames up to and including the one with `more: false`.
     async fn pages(&mut self) -> Vec<Frame> {
         let mut out = vec![];

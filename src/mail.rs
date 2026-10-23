@@ -373,6 +373,15 @@ pub fn waiting(store: &Store, to: &Key, now: u64) -> Result<Vec<Message>> {
     Ok(out)
 }
 
+/// The addresses with waiting mail, newest mail first.
+pub fn waiting_keys(store: &Store, now: u64) -> Result<Vec<String>> {
+    let mut stmt = store.conn().prepare(
+        "SELECT to_key FROM mailbox WHERE expires_at >= ?1 GROUP BY to_key ORDER BY MAX(id) DESC",
+    )?;
+    let keys = stmt.query_map([now as i64], |r| r.get(0))?;
+    Ok(keys.collect::<rusqlite::Result<_>>()?)
+}
+
 fn take_where(store: &Store, to: &Key, only: Option<&str>, now: u64) -> Result<Vec<Message>> {
     let conn = store.conn();
     let tx = conn.unchecked_transaction()?;

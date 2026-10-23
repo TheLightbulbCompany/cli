@@ -70,92 +70,67 @@ fn cell(s: &str) -> String {
         .collect()
 }
 
-/// `who [--all]`: this computer's sessions; with `all`, then every teammate's (`directory`).
+/// `who`'s columns: header, then the `sessions` field it shows.
+const WHO: [(&str, &str); 6] = [
+    ("session", "key"),
+    ("agent", "provider"),
+    ("folder", "cwd"),
+    ("status", "status"),
+    ("tier", "tier"),
+    ("doing", "doing"),
+];
+/// `who --all`'s columns, from `directory` records (this computer's first).
+const WHO_ALL: [(&str, &str); 8] = [
+    ("session", "session_id"),
+    ("person", "person"),
+    ("computer", "computer"),
+    ("agent", "agent"),
+    ("folder", "cwd"),
+    ("status", "status"),
+    ("tier", "tier"),
+    ("doing", "doing"),
+];
+
+/// `who [--all]`: this computer's sessions; with `all`, every teammate's too (`directory`).
 pub fn who(as_json: bool, all: bool) -> Result<i32> {
     let mut conn = connect()?;
-    let sessions = ask(&mut conn, "sessions", json!({}))?["sessions"].clone();
-    let remote: Vec<Value> = if all {
-        let mine = format!("{}/", conn.member()?);
-        let dir = ask(&mut conn, "directory", json!({}))?["sessions"].clone();
-        dir.as_array()
-            .into_iter()
-            .flatten()
-            .filter(|s| {
-                !s["session_id"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .starts_with(&mine)
-            })
-            .cloned()
-            .collect()
+    let (op, columns) = if all {
+        ("directory", &WHO_ALL[..])
     } else {
-        vec![]
+        ("sessions", &WHO[..])
     };
+    let sessions = ask(&mut conn, op, json!({}))?["sessions"].clone();
     if as_json {
-        match all {
-            true => println!("{}", json!({ "sessions": sessions, "remote": remote })),
-            false => println!("{sessions}"),
-        }
+        println!("{sessions}");
         return Ok(0);
     }
-    let rows = |s: &Value, fields: &[&str]| -> Vec<String> {
-        let text = |f: &str| s[f].as_str().map(cell);
-        fields
-            .iter()
-            .map(|f| match *f {
-                "doing" => text("doing")
-                    .filter(|d| !d.is_empty())
-                    .or(text("title"))
-                    .unwrap_or_default(),
-                f => text(f).unwrap_or_default(),
-            })
-            .collect()
-    };
-    let local = ["key", "provider", "cwd", "status", "tier", "doing"];
-    let mut table = vec![["session", "agent", "folder", "status", "tier", "doing"]
-        .map(String::from)
-        .to_vec()];
-    table.extend(
-        sessions
-            .as_array()
-            .into_iter()
-            .flatten()
-            .map(|s| rows(s, &local)),
-    );
-    print_table(&table);
-    if !remote.is_empty() {
-        let fields = [
-            "session_id",
-            "person",
-            "computer",
-            "agent",
-            "repo",
-            "status",
-            "tier",
-            "doing",
-        ];
-        let mut table = vec![[
-            "session", "person", "computer", "agent", "repo", "status", "tier", "doing",
-        ]
-        .map(String::from)
-        .to_vec()];
-        table.extend(remote.iter().map(|s| rows(s, &fields)));
-        println!();
-        print_table(&table);
+    let mut rows = vec![columns
+        .iter()
+        .map(|(h, _)| h.to_string())
+        .collect::<Vec<_>>()];
+    for s in sessions.as_array().into_iter().flatten() {
+        let text = |f: &str| s[f].as_str().map(cell).filter(|t| !t.is_empty());
+        rows.push(
+            columns
+                .iter()
+                .map(|(_, f)| match *f {
+                    "doing" => text("doing").or(text("title")),
+                    f => text(f),
+                })
+                .map(Option::unwrap_or_default)
+                .collect(),
+        );
     }
-    Ok(0)
-}
-
-/// `rows` in columns two spaces apart, each as wide as its widest cell.
-fn print_table(rows: &[Vec<String>]) {
-    let n = rows.first().map_or(0, Vec::len);
-    let widths: Vec<usize> = (0..n)
+    let widths: Vec<usize> = (0..columns.len())
         .map(|i| rows.iter().map(|r| r[i].chars().count()).max().unwrap_or(0))
         .collect();
     for r in rows {
-        let line: Vec<String> = (0..n).map(|i| format!("{:<1$}", r[i], widths[i])).collect();
+        let line: Vec<String> = (0..columns.len())
+            .map(|i| format!("{:<1$}", r[i], widths[i]))
+            .collect();
         println!("{}", line.join("  ").trim_end());
     }
+    Ok(0)
 }
 
 /// Whether this invocation may be a session: the env names one, an agent is above us, or the

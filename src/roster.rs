@@ -133,6 +133,11 @@ pub struct Roster {
 }
 
 impl Roster {
+    /// `key`'s person: its member's `person_id`, else `key` itself.
+    pub fn person_of<'a>(&'a self, key: &'a str) -> &'a str {
+        self.members.get(key).map_or(key, |m| &m.person_id)
+    }
+
     pub fn founder(&self) -> Option<&Member> {
         self.members.values().find(|m| m.role == Role::Founder)
     }
