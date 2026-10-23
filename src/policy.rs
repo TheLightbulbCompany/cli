@@ -158,9 +158,15 @@ pub fn set_switch(store: &Store, on: bool, by: &str, now: i64) -> Result<()> {
     )
 }
 
-/// Writes `people[pid]` as `v`: a person no member of the roster is (yet).
+/// Writes `v` for a `pid` no member of the roster has (yet), in the table its kind will read:
+/// a `ws:<id>` in `cloud_of`, any other id in `people`.
 pub fn set_person(store: &Store, pid: &str, v: Verdict, by: &str, now: i64) -> Result<()> {
-    put(store, PEOPLE, pid, v.as_str(), by, now)
+    let scope = if pid.starts_with("ws:") {
+        CLOUD_OF
+    } else {
+        PEOPLE
+    };
+    put(store, scope, pid, v.as_str(), by, now)
 }
 
 fn put(store: &Store, scope: &str, pid: &str, value: &str, by: &str, now: i64) -> Result<()> {
@@ -230,7 +236,7 @@ mod tests {
         assert_eq!(d(&r, &aden), Verdict::Refuse);
         assert_eq!(d(&r, &other_ws), Verdict::Accept);
         // Each kind reads its own table only.
-        set_person(&s, "ws:w2", Verdict::Refuse, "local", 1).unwrap();
+        put(&s, PEOPLE, "ws:w2", "refuse", "local", 1).unwrap();
         assert_eq!(d(&r, &other_ws), Verdict::Accept);
         set_person(&s, "p-me", Verdict::Refuse, "local", 1).unwrap();
         assert_eq!(d(&r, &my_laptop), Verdict::Accept, "own person");
@@ -240,6 +246,22 @@ mod tests {
         set(&s, &r3, "me", &odd, Verdict::Refuse, "local", 1).unwrap();
         assert!(Policy::load(&s).unwrap().agents_send_without_asking);
         assert_eq!(d(&r3, &odd), Verdict::Refuse);
+    }
+
+    #[test]
+    fn an_unmatched_ws_id_is_a_cloud_of_entry() {
+        let (_d, s) = store();
+        set_person(&s, "ws:w3", Verdict::Refuse, "local", 1).unwrap();
+        set_person(&s, "p-later", Verdict::Accept, "local", 1).unwrap();
+        let p = Policy::load(&s).unwrap();
+        assert_eq!(p.cloud_of["ws:w3"], Verdict::Refuse);
+        assert!(!p.people.contains_key("ws:w3"));
+        assert_eq!(p.people["p-later"], Verdict::Accept);
+        // w3's member, admitted later, is refused, not held.
+        let me = member("me", "p-me", MemberKind::Computer, Some("w1"));
+        let w3 = member("w3", "ws:w3", MemberKind::Cloud, None);
+        let r = roster(&[&me, &w3]);
+        assert_eq!(decide(&s, &r, "me", &w3).unwrap(), Verdict::Refuse);
     }
 
     #[test]
