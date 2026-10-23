@@ -75,10 +75,11 @@ const V4: &str = "ALTER TABLE holds ADD COLUMN shown TEXT;";
 /// Which loop limit a `loop` refusal hit (`mail::HOPS`, `mail::RATE`), when known.
 const V5: &str = "ALTER TABLE receipts ADD COLUMN \"limit\" TEXT;";
 /// A session's repo and branch as its hook read them (the daemon never reads a session's
-/// folder), and the index a mailbox's reply-window query reads by.
+/// folder), its `who` handle, and the index a mailbox's reply-window query reads by.
 const V6: &str = "
 ALTER TABLE sessions ADD COLUMN repo TEXT;
 ALTER TABLE sessions ADD COLUMN branch TEXT;
+ALTER TABLE sessions ADD COLUMN handle TEXT;
 CREATE INDEX IF NOT EXISTS messages_to_sent ON messages (to_key, sent_at);
 ";
 
@@ -97,8 +98,8 @@ pub struct Session {
     pub executable: Option<String>,
     pub repo: Option<String>,
     pub branch: Option<String>,
-    /// `who`'s `<provider>-<n>`: the row's place among this provider's rows, ended ones too
-    /// (only `sessions` reads it; never written).
+    /// `who`'s `<provider>-<n>`, given when the row is first written and kept for its life
+    /// (`put_session` sets it; what a caller passes is ignored).
     pub handle: Option<String>,
 }
 
@@ -130,7 +131,7 @@ fn row_session(r: &rusqlite::Row) -> rusqlite::Result<Session> {
         executable: r.get("executable")?,
         repo: r.get("repo")?,
         branch: r.get("branch")?,
-        handle: r.get("handle").ok().flatten(),
+        handle: r.get("handle")?,
     })
 }
 
@@ -181,16 +182,22 @@ impl Store {
         &self.conn
     }
 
-    /// Writes `s` as a live row (an ended one is live again), in place: a row keeps its place
-    /// (`handle`).
+    /// Writes `s` as a live row (an ended one is live again). A new agent session's row gets the
+    /// handle `<provider>-<n>`, one past its provider's highest, which it then keeps.
+    /// ponytail: a number frees up again only when its row is purged (a day after it ended)
+    /// and it was the highest.
     pub fn put_session(&self, s: &Session) -> rusqlite::Result<()> {
         self.conn.execute(
             "INSERT INTO sessions (key, provider, conversation, pid, birth_micros, cwd, title, \
-             status, seen_at, executable, repo, branch) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
+             status, seen_at, executable, repo, branch, handle) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, \
+             CASE WHEN ?2 = '' THEN NULL ELSE ?2 || '-' || (SELECT 1 + coalesce(max( \
+             CAST(substr(handle, length(?2) + 2) AS INTEGER)), 0) FROM sessions \
+             WHERE provider = ?2) END) \
              ON CONFLICT(key) DO UPDATE SET provider = ?2, conversation = ?3, pid = ?4, \
              birth_micros = ?5, cwd = ?6, title = ?7, status = ?8, seen_at = ?9, \
-             executable = ?10, repo = ?11, branch = ?12, ended_at = NULL",
+             executable = ?10, repo = ?11, branch = ?12, ended_at = NULL, \
+             handle = coalesce(handle, excluded.handle)",
             params![
                 s.key,
                 s.provider,
@@ -222,11 +229,9 @@ impl Store {
 
     /// The rows that have not ended.
     pub fn sessions(&self) -> rusqlite::Result<Vec<Session>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT * FROM (SELECT rowid AS place, *, provider || '-' || \
-             row_number() OVER (PARTITION BY provider ORDER BY rowid) AS handle FROM sessions) \
-             WHERE ended_at IS NULL ORDER BY place",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT * FROM sessions WHERE ended_at IS NULL ORDER BY rowid")?;
         let rows = stmt.query_map([], row_session)?;
         rows.collect()
     }
@@ -712,7 +717,11 @@ mod tests {
             handle: None,
         };
         store.put_session(&session).unwrap();
-        assert_eq!(store.session("claude:abc").unwrap(), Some(session));
+        let handle = Some("claude-1".into());
+        assert_eq!(
+            store.session("claude:abc").unwrap(),
+            Some(Session { handle, ..session })
+        );
 
         let message = Message {
             id: "m1".into(),
@@ -848,6 +857,10 @@ mod tests {
             got,
             [h("a", "codex-1"), h("b", "claude-1"), h("d", "codex-3")]
         );
+        // An ended row still holds its number; a new one takes the next.
+        store.put_session(&row("e", "codex")).unwrap();
+        let e = store.session("e").unwrap().unwrap();
+        assert_eq!(e.handle.as_deref(), Some("codex-4"));
     }
 
     #[test]

@@ -59,7 +59,7 @@ pub struct AgentReport {
     pub trusted: bool,
 }
 
-type Configure = fn(&Ctx, &mut AgentReport) -> Result<()>;
+type Configure = fn(&Ctx, &mut AgentReport) -> Result<Owner>;
 
 /// What one run writes, and where.
 pub(crate) struct Ctx<'a> {
@@ -95,7 +95,8 @@ pub fn wired(home: &Path, agent: &str) -> bool {
     fs::read_to_string(home.join(file)).is_ok_and(|t| t.contains(&format!(" hook {agent} ")))
 }
 
-/// `agent`'s MCP server entries under `home`, `(name, command)` (reads, never writes).
+/// `agent`'s MCP server entries under `home`, `(name, command)`; `""` for an entry with no
+/// command (an http server), which is never ours (reads, never writes).
 fn servers(home: &Path, agent: &str) -> Vec<(String, String)> {
     let (file, key) = match agent {
         "claude" => (".claude.json", "mcpServers"),
@@ -108,19 +109,24 @@ fn servers(home: &Path, agent: &str) -> Vec<(String, String)> {
         let text = fs::read_to_string(home.join(file)).ok()?;
         Some(if file.ends_with(".toml") {
             let doc: toml_edit::DocumentMut = text.parse().ok()?;
-            let command = |v: &toml_edit::Item| Some(v.get("command")?.as_str()?.to_string());
+            let command = |v: &toml_edit::Item| {
+                v.get("command")
+                    .and_then(|c| c.as_str())
+                    .unwrap_or_default()
+                    .to_string()
+            };
             doc.get(key)?
                 .as_table_like()?
                 .iter()
-                .filter_map(|(k, v)| Some((k.to_string(), command(v)?)))
+                .map(|(k, v)| (k.to_string(), command(v)))
                 .collect()
         } else {
             let doc: Value = serde_json::from_str(&text).ok()?;
-            let command = |v: &Value| Some(v["command"].as_str()?.to_string());
+            let command = |v: &Value| v["command"].as_str().unwrap_or_default().to_string();
             doc[key]
                 .as_object()?
                 .iter()
-                .filter_map(|(k, v)| Some((k.clone(), command(v)?)))
+                .map(|(k, v)| (k.clone(), command(v)))
                 .collect()
         })
     };
@@ -212,7 +218,9 @@ pub fn run(home: &Path, executable: &Path, server: Option<&str>, remove: bool) -
             let why = "the server name takes letters, digits, - and _".into();
             State::Failed { why, hooks: false }
         } else if remove {
-            let ran = names.iter().try_for_each(|n| configure(&ctx(n), &mut r));
+            let ran = names
+                .iter()
+                .try_for_each(|n| configure(&ctx(n), &mut r).map(drop));
             match ran {
                 Ok(()) => State::Removed,
                 Err(e) => State::Failed {
@@ -221,7 +229,7 @@ pub fn run(home: &Path, executable: &Path, server: Option<&str>, remove: bool) -
                 },
             }
         } else {
-            // The first name that is free here, or ours already.
+            // The first name no entry has here, or ours has already.
             let taken = servers(home, name);
             let free = |n: &&&str| taken.iter().all(|(k, c)| k != **n || *c == exe);
             let pick = names.iter().find(free);
@@ -230,7 +238,8 @@ pub fn run(home: &Path, executable: &Path, server: Option<&str>, remove: bool) -
                     why: e.to_string(),
                     hooks: wired(home, name),
                 },
-                Ok(()) => match pick {
+                // What `configure` found decides, so a write that did not happen is not reported.
+                Ok(owner) => match pick.filter(|_| owner == Owner::Ours) {
                     None => State::HooksOnly("another program has the tool server name".into()),
                     Some(n) if *n == names[0] => State::Connected(n.to_string()),
                     Some(n) => State::ClashedTo(n.to_string()),

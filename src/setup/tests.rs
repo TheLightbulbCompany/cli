@@ -630,3 +630,27 @@ fn a_file_it_cannot_read_is_a_failure_not_a_name_clash() {
     assert!(line.starts_with("Cursor: not connected — "), "{line}");
     assert!(!line.contains("tool server name"), "{line}");
 }
+
+#[test]
+fn an_http_tool_server_under_the_name_counts_as_taken() {
+    let home = tempfile::tempdir().unwrap();
+    let h = home.path();
+    fs::create_dir(h.join(".claude")).unwrap();
+    let app = json!({"mcpServers": {"lightbulb": {"type": "http", "url": "https://x/mcp"}}});
+    put(h, ".claude.json", &app.to_string());
+    let r = run(h, Path::new(EXE), None, false);
+    assert_eq!(
+        agent(&r, "claude").state,
+        State::ClashedTo("lightbulb-connect".into())
+    );
+    let doc = json_at(h, ".claude.json");
+    assert_eq!(
+        doc["mcpServers"]["lightbulb"],
+        app["mcpServers"]["lightbulb"]
+    );
+    assert_eq!(doc["mcpServers"]["lightbulb-connect"]["command"], EXE);
+    // With the name given, it is hooks only, and says so.
+    put(h, ".claude.json", &app.to_string());
+    let r = run(h, Path::new(EXE), Some("lightbulb"), false);
+    assert!(matches!(agent(&r, "claude").state, State::HooksOnly(_)));
+}

@@ -269,7 +269,18 @@ pub fn who(as_json: bool, all: bool) -> Result<i32> {
         s[f].as_str().map(cell).filter(|t| !t.is_empty())
     }
     let columns: [(&str, Cell, bool); 7] = [
-        ("Name", |s| text(s, "handle").unwrap_or_default(), true),
+        // A handle, else (a teammate's session, or one not registered yet) the address `send`
+        // takes.
+        (
+            "Name",
+            |s| {
+                text(s, "handle")
+                    .or(text(s, "session_id"))
+                    .or(text(s, "key"))
+                    .unwrap_or_default()
+            },
+            true,
+        ),
         ("Person", |s| text(s, "person").unwrap_or_default(), false),
         (
             "Computer",

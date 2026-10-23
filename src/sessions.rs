@@ -227,8 +227,11 @@ pub fn scan_claude(home: &Path, member_short: &str) -> Vec<Session> {
     out
 }
 
-/// Registered rows plus Claude discoveries, deduplicated by key (a discovery wins:
-/// its status is fresher), `Gone` dropped, `title`/`doing` filled from the transcript.
+/// Registered rows plus Claude discoveries, deduplicated by key (a discovery wins for its
+/// status, which is fresher; the row for its folder, which its hook reported resolved, and its
+/// handle, repo and branch), `Gone` dropped, `title`/`doing` filled from the transcript. A
+/// session found only by discovery keeps Claude's own cwd as given (not resolved) and has no
+/// handle until its hook registers it.
 pub fn all(rows: &[store::Session], home: &Path, member_short: &str) -> Vec<Session> {
     let mut out: Vec<Session> = rows.iter().filter_map(|r| from_row(r, home)).collect();
     for found in scan_claude(home, member_short) {
@@ -236,6 +239,7 @@ pub fn all(rows: &[store::Session], home: &Path, member_short: &str) -> Vec<Sess
             Some(s) => {
                 *s = Session {
                     title: found.title.or(s.title.take()),
+                    cwd: std::mem::take(&mut s.cwd),
                     handle: s.handle.take(),
                     repo: s.repo.take(),
                     branch: s.branch.take(),
@@ -244,16 +248,6 @@ pub fn all(rows: &[store::Session], home: &Path, member_short: &str) -> Vec<Sess
             }
             None => out.push(found),
         }
-    }
-    // A session never registered has no row: numbered after the rows of its provider.
-    let n = |h: &str| h.rsplit_once('-')?.1.parse::<usize>().ok();
-    let mut next = (rows.iter().filter(|r| r.provider == "claude"))
-        .filter_map(|r| n(r.handle.as_deref()?))
-        .max()
-        .unwrap_or(0);
-    for s in out.iter_mut().filter(|s| s.handle.is_none()) {
-        next += 1;
-        s.handle = Some(format!("{}-{next}", s.provider));
     }
     out.retain(|s| s.status != Status::Gone);
     for s in &mut out {

@@ -25,7 +25,7 @@ pub struct TeamState {
     /// The replayed roster, replaced by every write (`net_ops`), never replayed per op.
     pub roster: roster::Roster,
     pub config: Config,
-    /// `config.folders_off`, each `presence::canonical`: what `register` and the presence
+    /// `config.folders_off`, as `folder` stored them (canonical): what `register` and the presence
     /// compare a session's folder with. Set with `config` (`set_config`).
     pub off: Vec<PathBuf>,
 }
@@ -41,12 +41,13 @@ impl TeamState {
     }
 }
 
-/// `config.folders_off`, each `presence::canonical`: `TeamState::set_config`'s `off`.
+/// `config.folders_off` as `folder` stored them (already canonical; lowercased again, a string
+/// change), so the daemon makes no filesystem call on them: `TeamState::set_config`'s `off`.
 pub fn canonical_off(config: &Config) -> Vec<PathBuf> {
     config
         .folders_off
         .iter()
-        .map(|o| crate::presence::canonical(o))
+        .map(|o| crate::presence::lower(o.clone()))
         .collect()
 }
 

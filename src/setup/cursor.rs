@@ -19,7 +19,7 @@ fn cursor_event(e: Event) -> &'static str {
     }
 }
 
-pub(super) fn configure(ctx: &Ctx, r: &mut AgentReport) -> Result<()> {
+pub(super) fn configure(ctx: &Ctx, r: &mut AgentReport) -> Result<Owner> {
     let dir = ctx.home.join(".cursor");
     let hooks = dir.join("hooks.json");
     edit_json(&hooks, !ctx.remove, r, |doc| {
@@ -52,13 +52,14 @@ pub(super) fn configure(ctx: &Ctx, r: &mut AgentReport) -> Result<()> {
         Ok(())
     })?;
     if owner == Owner::Foreign {
-        return Ok(());
+        return Ok(owner);
     }
     let rule = format!("Mcp({}:*)", ctx.server);
     edit_json(&dir.join("cli-config.json"), false, r, |doc| {
         set_json_rule(doc, "permissions", "allow", &rule, owner == Owner::Ours);
         Ok(())
-    })
+    })?;
+    Ok(owner)
 }
 
 /// Our entry in `hooks.<event>`: replaced in place or appended; removed when `None`.

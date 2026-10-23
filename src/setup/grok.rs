@@ -8,7 +8,7 @@ use crate::Result;
 use serde_json::json;
 use std::fs;
 
-pub(super) fn configure(ctx: &Ctx, r: &mut AgentReport) -> Result<()> {
+pub(super) fn configure(ctx: &Ctx, r: &mut AgentReport) -> Result<Owner> {
     let dir = ctx.home.join(".grok");
     // Grok loads every `*.json` in `hooks/`, so this file is ours alone: written whole,
     // deleted on remove, never backed up.
@@ -72,5 +72,6 @@ pub(super) fn configure(ctx: &Ctx, r: &mut AgentReport) -> Result<()> {
             allow.retain(|v| v.as_str() != Some(&rule));
         }
         Ok(())
-    })
+    })?;
+    Ok(owner)
 }

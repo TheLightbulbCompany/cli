@@ -2,13 +2,15 @@
 //! (`[hooks.state."<hooks.json>:<event>:<group>:0"]`; Codex skips an untrusted group
 //! silently), and `[mcp_servers.<name>]` in the same `config.toml`.
 
-use super::{edit_json, edit_toml, set_hook_group, set_toml_server, toml_table, AgentReport, Ctx};
+use super::{
+    edit_json, edit_toml, set_hook_group, set_toml_server, toml_table, AgentReport, Ctx, Owner,
+};
 use crate::hook::{Event, EVENTS};
 use crate::Result;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-pub(super) fn configure(ctx: &Ctx, r: &mut AgentReport) -> Result<()> {
+pub(super) fn configure(ctx: &Ctx, r: &mut AgentReport) -> Result<Owner> {
     let dir = ctx.home.join(".codex");
     let hooks = dir.join("hooks.json");
     // Trust key -> the hash to trust, or None to drop the key.
@@ -41,9 +43,10 @@ pub(super) fn configure(ctx: &Ctx, r: &mut AgentReport) -> Result<()> {
     r.notes.append(&mut shared);
     let config = dir.join("config.toml");
     let mut fresh = false;
+    let mut owner = Owner::Absent;
     edit_toml(&config, !ctx.remove, r, |doc| {
         let args = toml_edit::Array::from_iter(ctx.mcp_args());
-        set_toml_server(
+        owner = set_toml_server(
             ctx,
             doc,
             &[("command", ctx.exe.into()), ("args", args.into())],
@@ -76,7 +79,7 @@ pub(super) fn configure(ctx: &Ctx, r: &mut AgentReport) -> Result<()> {
         Ok(())
     })?;
     r.trusted |= fresh;
-    Ok(())
+    Ok(owner)
 }
 
 /// Codex's hook-trust hash: `{event_name, hooks: [hook]}` with keys sorted, compact JSON,

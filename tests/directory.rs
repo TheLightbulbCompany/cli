@@ -15,6 +15,19 @@ mod common;
 use common::{endpoint, out, presence_with, remote, seed_pair, sees, start_pair, until};
 use common::{Env, Peer, EXE};
 
+/// `p` as `folder` writes it to `folders_off`: resolved, lowercased on macOS.
+fn stored_off(p: &std::path::Path) -> String {
+    let r = lightbulb_connect::presence::resolved(p)
+        .to_str()
+        .unwrap()
+        .to_string();
+    if cfg!(target_os = "macos") {
+        r.to_lowercase()
+    } else {
+        r
+    }
+}
+
 /// This test process as a `provider` session `conversation` in `cwd`.
 fn register(e: &Env, provider: &str, conversation: &str, cwd: &str) -> Value {
     let pid = std::process::id();
@@ -120,7 +133,9 @@ async fn each_member_sees_the_whole_directory() {
     assert!(o.status.success(), "{}", common::err(&o));
     // By handle, ids only in `--json`.
     let text = out(&o);
-    assert!(!text.contains(&ka) && !text.contains(&kb2), "{text}");
+    // This computer's by handle; a teammate's by the address `send` takes.
+    assert!(!text.contains(&ka), "{text}");
+    assert!(text.lines().any(|l| l.starts_with(&kb2)), "{text}");
     let rows: Vec<&str> = text.lines().skip(1).collect();
     assert!(
         rows[0].contains("prasiddha") && rows[0].contains("mac"),
@@ -290,8 +305,8 @@ async fn off_folder_sessions_are_not_published() {
     for d in [&hidden, &open, &root.path().join("x")] {
         std::fs::create_dir_all(d).unwrap();
     }
-    // The off folder spelled through `..`, its sessions through a symlink, as their hook
-    // reports them: resolved (the daemon itself makes no filesystem call on a cwd).
+    // The off folder as `folder` stores it, its sessions as their hook reports them: both
+    // resolved (the daemon itself makes no filesystem call on either).
     std::os::unix::fs::symlink(&secret, root.path().join("alias")).unwrap();
     let off = root.path().join("x/../secret");
     a.daemon(false, "", &[]);
@@ -321,7 +336,7 @@ async fn off_folder_sessions_are_not_published() {
         assert_eq!(r["ended"], true, "{r}");
     }
     // The folder is turned off after its sessions registered (`reload`); a new one is ignored.
-    let config = format!("lan = false\nfolders_off = [{:?}]\n", off.to_str().unwrap());
+    let config = format!("lan = false\nfolders_off = [{:?}]\n", stored_off(&off));
     std::fs::write(a.state.path().join("config.toml"), config).unwrap();
     assert_eq!(a.ask(json!({"id": 1, "op": "reload"}))["ok"], true);
     assert_eq!(register(&a, "codex", "h3", &hidden)["ignored"], true);
@@ -346,4 +361,40 @@ async fn off_folder_sessions_are_not_published() {
     assert_eq!((known, kept), (vec![o2.clone()], vec![o2]));
     // Locally the off-folder session is still listed.
     assert_eq!(directory(&a, None).len(), 2);
+}
+
+/// A Claude session its hook registered under an off folder, which Claude's own file names
+/// through a symlink: the hook's resolved folder wins over the discovery's, so it is hidden.
+#[test]
+fn a_discovered_claude_session_keeps_its_hooks_folder() {
+    let (a, b) = common::pair(&[]);
+    let root = tempfile::tempdir().unwrap();
+    let secret = root.path().join("secret");
+    std::fs::create_dir_all(secret.join("proj")).unwrap();
+    let link = root.path().join("via-link");
+    std::os::unix::fs::symlink(&secret, &link).unwrap();
+    let me = std::process::id();
+    let birth = os::process(me).unwrap().birth_micros;
+    let claude = a.home.path().join(".claude/sessions");
+    std::fs::create_dir_all(&claude).unwrap();
+    let raw = link.join("proj");
+    std::fs::write(
+        claude.join(format!("{me}.json")),
+        json!({"pid": me, "sessionId": "s1", "cwd": raw, "startedAt": birth / 1000,
+            "status": "idle"})
+        .to_string(),
+    )
+    .unwrap();
+    let resolved = lightbulb_connect::presence::resolved(&raw);
+    let r = register(&a, "claude", "s1", resolved.to_str().unwrap());
+    let key = r["key"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{r}"))
+        .to_string();
+    until(15, "B sees the session", || sees(&b, &key));
+    let config = std::fs::read_to_string(a.state.path().join("config.toml")).unwrap();
+    let config = format!("{config}folders_off = [{:?}]\n", stored_off(&secret));
+    std::fs::write(a.state.path().join("config.toml"), config).unwrap();
+    assert_eq!(a.ask(json!({"id": 1, "op": "reload"}))["ok"], true);
+    until(15, "B no longer sees it", || !sees(&b, &key));
 }

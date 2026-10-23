@@ -1,12 +1,12 @@
 //! Claude Code: hooks in `~/.claude/settings.json`, the user-scope MCP server in
 //! `~/.claude.json`.
 
-use super::{edit_json, set_hook_group, set_json_server, AgentReport, Ctx};
+use super::{edit_json, set_hook_group, set_json_server, AgentReport, Ctx, Owner};
 use crate::hook::{Event, EVENTS};
 use crate::Result;
 use serde_json::json;
 
-pub(super) fn configure(ctx: &Ctx, r: &mut AgentReport) -> Result<()> {
+pub(super) fn configure(ctx: &Ctx, r: &mut AgentReport) -> Result<Owner> {
     let mut notes = vec![];
     edit_json(
         &ctx.home.join(".claude/settings.json"),
@@ -29,9 +29,11 @@ pub(super) fn configure(ctx: &Ctx, r: &mut AgentReport) -> Result<()> {
     )?;
     r.notes.append(&mut notes);
     let config = ctx.home.join(".claude.json");
+    let mut owner = Owner::Absent;
     edit_json(&config, !ctx.remove, r, |doc| {
         let entry = json!({"command": ctx.exe, "args": ctx.mcp_args()});
-        set_json_server(ctx, doc, "mcpServers", entry)?;
+        owner = set_json_server(ctx, doc, "mcpServers", entry)?;
         Ok(())
-    })
+    })?;
+    Ok(owner)
 }

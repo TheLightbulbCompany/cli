@@ -113,7 +113,7 @@ pub(crate) fn hidden(off: &[PathBuf], cwd: &str) -> bool {
 }
 
 /// `p` lowercased on macOS, whose volumes ignore case.
-fn lower(p: PathBuf) -> PathBuf {
+pub(crate) fn lower(p: PathBuf) -> PathBuf {
     if cfg!(target_os = "macos") {
         PathBuf::from(p.to_string_lossy().to_lowercase())
     } else {
