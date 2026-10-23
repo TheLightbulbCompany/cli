@@ -75,8 +75,8 @@ pub struct Daemon {
     pub dialog_answers: Mutex<Option<dialog::Answers>>,
     /// The join requests waiting for their person's answer (`admission`).
     pub admissions: crate::admission::Waiting,
-    /// The join requests forwarded to another computer of their person (`admission`).
-    pub forwards: crate::admission::Forwards,
+    /// Poked on every roster install (`net_ops::install`): waiters look again.
+    pub roster_changed: Notify,
     /// Held while a `team.join` runs: one at a time.
     pub joining: tokio::sync::Mutex<()>,
     /// Poked on a local session change: the presence sender (`presence::run`) looks again.
@@ -215,7 +215,7 @@ pub async fn run(dir: &Path) -> Result<()> {
         dialogs,
         dialog_answers: Mutex::new(Some(answers)),
         admissions: Mutex::default(),
-        forwards: Mutex::default(),
+        roster_changed: Notify::new(),
         joining: tokio::sync::Mutex::new(()),
         presence: Notify::new(),
         built: Mutex::default(),

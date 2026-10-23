@@ -347,6 +347,7 @@ pub fn install(
     new.lapse(super::ipc::now() as i64);
     team.roster = new;
     daemon.peers.changed.notify_one();
+    daemon.roster_changed.notify_waiters();
     Ok(())
 }
 

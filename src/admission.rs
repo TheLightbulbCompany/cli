@@ -75,21 +75,26 @@ fn words(v: Verdict) -> (&'static str, &'static str) {
     }
 }
 
-/// The requests this computer forwarded to another computer of their person, by candidate:
-/// that computer's key and the waiting connection task.
-pub type Forwards = Mutex<HashMap<String, (String, oneshot::Sender<Verdict>)>>;
-
-/// A request waiting for its person, and the connection task to tell.
-pub struct Pending {
-    req: Request,
-    tx: oneshot::Sender<Verdict>,
+/// A request waiting for an answer, and the connection task to tell.
+pub enum Pending {
+    /// Its person's, here (the dialog or `team.admit`).
+    Local {
+        req: Box<Request>,
+        tx: oneshot::Sender<Verdict>,
+    },
+    /// Forwarded to `to`, a computer of the candidate's person (`forward`): its decision.
+    Forwarded {
+        to: String,
+        candidate: String,
+        tx: oneshot::Sender<Verdict>,
+    },
 }
 
 /// The waiting requests by row id (`J<id>`). First answer wins: whoever takes the entry.
 pub type Waiting = Mutex<HashMap<i64, Pending>>;
 
 #[derive(Clone)]
-struct Request {
+pub struct Request {
     ticket: Ticket,
     proof: String,
     candidate: String,
@@ -300,7 +305,19 @@ fn open(d: &Daemon, req: &Request) -> Result<(i64, Option<Verdict>), &'static st
     let ask = req.ticket.mode != "open"
         || req.kind == "cloud"
         || same_person(&team.roster, req, now).is_some();
-    let row = Join {
+    let n = store.put_join(&row(req, now)).map_err(fail)?;
+    eprintln!("join: J{n} open for {}", net::short(&req.candidate));
+    if ask {
+        return Ok((n, None));
+    }
+    let v = try_admit(d, &mut team, &store, n, req, once, now);
+    close(&store, n, v);
+    Ok((n, Some(v)))
+}
+
+/// `req`'s `join_requests` row, made at `now`.
+fn row(req: &Request, now: i64) -> Join {
+    Join {
         id: 0,
         ticket_id: req.ticket.ticket_id.clone(),
         inviter: req.ticket.inviter.clone(),
@@ -309,15 +326,7 @@ fn open(d: &Daemon, req: &Request) -> Result<(i64, Option<Verdict>), &'static st
         computer: req.computer.clone(),
         kind: req.kind.clone(),
         created_at: now,
-    };
-    let n = store.put_join(&row).map_err(fail)?;
-    eprintln!("join: J{n} open for {}", net::short(&req.candidate));
-    if ask {
-        return Ok((n, None));
     }
-    let v = try_admit(d, &mut team, &store, n, req, once, now);
-    close(&store, n, v);
-    Ok((n, Some(v)))
 }
 
 /// Whether this computer may admit `req` into `r` now: the ticket and its live link, the
@@ -446,43 +455,71 @@ fn admit(d: &Daemon, n: i64, req: &Request) -> Verdict {
 /// Shows request `n` to the person and waits for an answer (dialog or `team.admit`), the
 /// candidate to hang up (`gone`), or the wait to run out (`not_answered`); `None` when the
 /// candidate is gone.
-async fn wait(d: &Daemon, gone: impl Future<Output = ()>, n: i64, req: Request) -> Option<Verdict> {
-    let (tx, mut rx) = oneshot::channel();
+async fn wait(d: &Daemon, gone: impl Future, n: i64, req: Request) -> Option<Verdict> {
+    let (tx, rx) = oneshot::channel();
     let text = prompt(&d.team.lock().unwrap().roster, &req, ipc::now() as i64);
     // Before the dialog: a headless one answers at once.
-    d.admissions.lock().unwrap().insert(n, Pending { req, tx });
-    let id = format!("J{n}");
+    d.admissions.lock().unwrap().insert(
+        n,
+        Pending::Local {
+            req: Box::new(req),
+            tx,
+        },
+    );
     let buttons = ["Decline", "Allow"];
-    d.dialogs
-        .show(&id, dialog::args("Lightbulb Connect", &text, &buttons));
+    d.dialogs.show(
+        &format!("J{n}"),
+        dialog::args("Lightbulb Connect", &text, &buttons),
+    );
+    answered(d, n, rx, gone, d.peers.knobs().join_wait).await
+}
+
+/// Request `n`'s answer on `rx`, unless the candidate hangs up (`gone`, then `None`) or `wait`
+/// passes (`not_answered`): a request given up on leaves `admissions` (its dialog withdrawn,
+/// its open row `expired`) unless an answer took it first, whose verdict is then on the way.
+async fn answered(
+    d: &Daemon,
+    n: i64,
+    mut rx: oneshot::Receiver<Verdict>,
+    gone: impl Future,
+    wait: Duration,
+) -> Option<Verdict> {
     let gone = tokio::select! {
         v = &mut rx => return v.ok(),
         _ = gone => true,
-        _ = tokio::time::sleep(d.peers.knobs().join_wait) => false,
+        _ = tokio::time::sleep(wait) => false,
     };
-    // Gave up, unless an answer took it first: then its verdict is on the way.
     if d.admissions.lock().unwrap().remove(&n).is_none() {
         return rx.await.ok();
     }
-    d.dialogs.withdraw(&id);
+    d.dialogs.withdraw(&format!("J{n}"));
     let _ = d.store.lock().unwrap().close_join(n, "expired");
     eprintln!("join: J{n} expired");
     (!gone).then_some(Err(NOT_ANSWERED))
 }
 
 /// The person's answer to request `n`, from the dialog or `team.admit`: its name and verdict,
-/// or `None` when it is not waiting (answered, or its candidate gone).
+/// or `None` when it is not waiting here (answered, its candidate gone, or forwarded).
 fn answer(d: &Daemon, n: i64, allow: bool) -> Option<(String, Verdict)> {
-    let p = d.admissions.lock().unwrap().remove(&n)?;
+    let (req, tx) = {
+        let mut waiting = d.admissions.lock().unwrap();
+        match waiting.remove(&n)? {
+            Pending::Local { req, tx } => (req, tx),
+            forwarded => {
+                waiting.insert(n, forwarded);
+                return None;
+            }
+        }
+    };
     d.dialogs.withdraw(&format!("J{n}"));
     let v = if allow {
-        admit(d, n, &p.req)
+        admit(d, n, &req)
     } else {
         close(&d.store.lock().unwrap(), n, Err(DECLINED));
         Err(DECLINED)
     };
-    let _ = p.tx.send(v);
-    Some((p.req.name, v))
+    let _ = tx.send(v);
+    Some((req.name, v))
 }
 
 /// Sends the signed decision (after an allow, the whole roster), then waits for the candidate
@@ -518,8 +555,9 @@ async fn tell(
 
 /// A person's new computer, asking this computer: hands the candidate's own signed request to
 /// that person's first online computer (replay order) and waits for its decision, as `wait`
-/// does for the person here; after an allow, until its `admit` has synced here. `None` when
-/// the candidate is gone; `your_computer_offline` when none of the person's is online.
+/// does for the person here (its row closed `forwarded`: the person here does not answer it);
+/// after an allow, until its `admit` has synced here. `None` when the candidate is gone;
+/// `your_computer_offline` when none of the person's is online.
 async fn forward(d: &Daemon, conn: &Connection, raw: Frame, req: &Request) -> Option<Verdict> {
     let now = ipc::now() as i64;
     let to = {
@@ -535,42 +573,48 @@ async fn forward(d: &Daemon, conn: &Connection, raw: Frame, req: &Request) -> Op
         eprintln!("join: {cand}'s person has no computer online");
         return Some(Err(YOUR_COMPUTER_OFFLINE));
     };
+    let n = {
+        let store = d.store.lock().unwrap();
+        let n = store.put_join(&row(req, now)).ok()?;
+        let _ = store.close_join(n, "forwarded");
+        n
+    };
     let (tx, rx) = oneshot::channel();
-    let pending = (to.clone(), tx);
-    d.forwards
-        .lock()
-        .unwrap()
-        .insert(req.candidate.clone(), pending);
+    let candidate = req.candidate.clone();
+    let pending = Pending::Forwarded {
+        to: to.clone(),
+        candidate,
+        tx,
+    };
+    d.admissions.lock().unwrap().insert(n, pending);
     if d.peers.send(&to, raw).is_err() {
-        d.forwards.lock().unwrap().remove(&req.candidate);
+        d.admissions.lock().unwrap().remove(&n);
         return Some(Err(YOUR_COMPUTER_OFFLINE));
     }
-    eprintln!("join: {cand} forwarded to {}", net::short(&to));
+    eprintln!("join: J{n} ({cand}) forwarded to {}", net::short(&to));
     // That computer gives up at its wait; we a step later.
-    let v = tokio::select! {
-        v = rx => v.ok(),
-        _ = conn.closed() => None,
-        _ = tokio::time::sleep(d.peers.knobs().join_wait + STEP) => Some(Err(NOT_ANSWERED)),
-    };
-    d.forwards.lock().unwrap().remove(&req.candidate);
-    let v = v?;
-    let deadline = tokio::time::Instant::now() + STEP;
-    while v.is_ok()
-        && !d
-            .team
-            .lock()
-            .unwrap()
-            .roster
-            .members
-            .contains_key(&req.candidate)
-    {
-        if tokio::time::Instant::now() > deadline {
-            eprintln!("join: {cand}'s admit did not arrive");
-            return Some(Err(INTERNAL));
+    let wait = d.peers.knobs().join_wait + STEP;
+    let v = answered(d, n, rx, conn.closed(), wait).await?;
+    let synced = async {
+        loop {
+            let changed = d.roster_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if is_member(d, &req.candidate) {
+                return;
+            }
+            changed.await;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    if v.is_ok() && tokio::time::timeout(STEP, synced).await.is_err() {
+        eprintln!("join: {cand}'s admit did not arrive");
+        return Some(Err(INTERNAL));
     }
     Some(v)
+}
+
+fn is_member(d: &Daemon, key: &str) -> bool {
+    d.team.lock().unwrap().roster.members.contains_key(key)
 }
 
 /// A join frame member `from` sent: a `join_request` it forwarded (a new computer of this
@@ -588,7 +632,7 @@ pub async fn from_member(d: Arc<Daemon>, from: String, f: Frame) {
                 Err(FORWARD) => Some(Err(net_ops::NOT_ADMIN)),
                 Err(r) => Some(Err(r)),
                 Ok((_, Some(v))) => Some(v),
-                Ok((n, None)) => wait(&d, std::future::pending(), n, req.clone()).await,
+                Ok((n, None)) => wait(&d, std::future::pending::<()>(), n, req.clone()).await,
             };
             let Some(v) = verdict else { return };
             let decision = Frame::JoinDecision {
@@ -606,11 +650,14 @@ pub async fn from_member(d: Arc<Daemon>, from: String, f: Frame) {
             ref reason,
             ..
         } if signed_by(&from, &f) => {
-            let mut fw = d.forwards.lock().unwrap();
-            if fw.get(candidate).is_none_or(|(to, _)| *to != from) {
+            let mut waiting = d.admissions.lock().unwrap();
+            let ours = |p: &Pending| matches!(p, Pending::Forwarded { to, candidate: c, .. } if *to == from && c == candidate);
+            let Some(n) = waiting.iter().find(|(_, p)| ours(p)).map(|(n, _)| *n) else {
                 return;
-            }
-            let (_, tx) = fw.remove(candidate).expect("present");
+            };
+            let Some(Pending::Forwarded { tx, .. }) = waiting.remove(&n) else {
+                return;
+            };
             let v = match verdict.as_str() {
                 "allow" => Ok(()),
                 "decline" => Err(DECLINED),
