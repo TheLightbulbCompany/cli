@@ -1,5 +1,5 @@
 [package]
-name = "lightbulb-connect"
+name = "lightbulb"
 version = "0.2.2"
 edition = "2021"
 rust-version = "1.91" # iroh 1.4

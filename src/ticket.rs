@@ -119,13 +119,10 @@ pub fn encode(t: &Ticket) -> String {
     BASE64URL_NOPAD.encode(&canonical(&value(t)))
 }
 
-/// A ticket from the bare ticket, the join line (the command), its app link, or the old web
-/// link (`https://thelightbulb.company/j/#<ticket>`, alone or in its `Join …:` line).
+/// A ticket from the bare ticket, the join line (the command) or its `lightbulb://join/` link.
 pub fn decode(s: &str) -> Result<Ticket> {
     let s = s.trim();
-    let bare = if let Some((_, t)) = s.split_once("/j/#") {
-        t
-    } else if let Some((_, t)) = s.split_once(" join '") {
+    let bare = if let Some((_, t)) = s.split_once(" join '") {
         t.split('\'').next().unwrap_or_default()
     } else {
         s.strip_prefix(APP).unwrap_or(s)
@@ -228,10 +225,8 @@ mod tests {
     fn ticket_round_trips_through_every_link_form() {
         let (_, x, r, t) = team("ask", false);
         let bare = encode(&t);
-        let web = format!("https://thelightbulb.company/j/#{bare}");
-        let old_line = format!("Join Lightbulb Connect: {web}");
         assert_eq!(line(&t), format!("lightbulb join '{bare}' --name NAME"));
-        for s in [bare.clone(), line(&t), web, old_line, app_link(&bare)] {
+        for s in [bare.clone(), line(&t), app_link(&bare)] {
             assert_eq!(decode(&s).unwrap(), t);
         }
         verify(&t, &r).unwrap();
@@ -239,7 +234,7 @@ mod tests {
         assert_eq!(t.members.len(), 2);
         assert!(t.ticket_id.starts_with(&format!("{}.", x.short)));
         assert_eq!(t.expires_at, 100 + 7 * 86_400);
-        assert!(decode("Join Lightbulb Connect: nonsense").is_err());
+        assert!(decode(&format!("https://thelightbulb.company/j/#{bare}")).is_err());
         // A once ticket carries the secret; its link only the hash.
         let (_, _, r, t) = team("ask", true);
         assert_eq!(r.links[&t.ticket_id].secret, hash(&t.secret));

@@ -4,12 +4,12 @@
 
 use iroh::endpoint::{RecvStream, SendStream};
 use iroh::Endpoint;
-use lightbulb_connect::admission::signed;
-use lightbulb_connect::daemon::net_ops;
-use lightbulb_connect::identity::Identity;
-use lightbulb_connect::net::frames::{self, Frame};
-use lightbulb_connect::roster::{self, Entry};
-use lightbulb_connect::streams;
+use lightbulb::admission::signed;
+use lightbulb::daemon::net_ops;
+use lightbulb::identity::Identity;
+use lightbulb::net::frames::{self, Frame};
+use lightbulb::roster::{self, Entry};
+use lightbulb::streams;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;

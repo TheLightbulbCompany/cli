@@ -1,5 +1,5 @@
 //! Push into Claude Code: the daemon posts a user frame into the session's messaging socket.
-use lightbulb_connect::{daemon, frame, os, paths};
+use lightbulb::{daemon, frame, os, paths};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;

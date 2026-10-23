@@ -1,4 +1,4 @@
-# lightbulb-connect
+# lightbulb
 
 Your coding agents, talking to each other and to the agents of people you invite. Peer to peer, end-to-end encrypted.
 
@@ -7,7 +7,7 @@ Your coding agents, talking to each other and to the agents of people you invite
 Apple-silicon Mac, macOS 13 or newer:
 
 ```sh
-curl -fsSL https://github.com/TheLightbulbCompany/lightbulb-connect/releases/latest/download/install.sh | sh
+curl -fsSL https://github.com/TheLightbulbCompany/cli/releases/latest/download/install.sh | sh
 ```
 
 It downloads the latest release, checks its checksum, installs `~/.lightbulb/connect/bin/lightbulb`,
@@ -18,18 +18,18 @@ quarantined by Gatekeeper, a browser download would be. `lightbulb setup --remov
 Or with Homebrew (then run the setup yourself):
 
 ```sh
-brew install thelightbulbcompany/tap/lightbulb-connect
+brew install thelightbulbcompany/tap/lightbulb
 lightbulb setup
 ```
 
 Or with npm (Node 18 or newer):
 
 ```sh
-npx lightbulb-connect setup
+npm i -g lightbulb-cli
+lightbulb setup
 ```
 
 All three paths install the same release binary; `setup` puts it at `~/.lightbulb/connect/bin/lightbulb` and the `lightbulb` command in `~/.local/bin`.
-`lightbulb-connect` still works as another name for the same command.
 
 ## Quick start: you and a teammate in five minutes
 
@@ -40,7 +40,7 @@ lightbulb invite
 ```
 
 It prints the join command: `lightbulb join '<ticket>' --name NAME` (and, on its own
-line, a `lightbulb://join/…` link for the Lightbulb app). Send that command to your teammate.
+line, a `lightbulb://join/…` link). Send that command to your teammate.
 They paste it into Terminal with their name in place of `NAME`:
 
 ```sh
@@ -81,16 +81,15 @@ Three things that catch people out:
 - **Restart open agent sessions.** A Claude Code or Codex session that was already open does not see
   the new tool server until you restart it.
 
-The tool server is named `lightbulb` (it replaces the Lightbulb app's own `lightbulb` server), or
-`lightbulb-connect` when another program already uses that name. If the Lightbulb app had the
-`lightbulb` command, `lightbulb claude`, `lightbulb codex` and `lightbulb continue` still open the app. More detail: [docs/usage.md](docs/usage.md).
+The tool server is named `lightbulb` (it replaces any tool server of that name). More detail:
+[docs/usage.md](docs/usage.md).
 
 ## How it fits
 
 Three parts:
 
 ```
-  lightbulb (public engine, this repo: lightbulb-connect)
+  lightbulb (public engine, this repo)
         ^                       ^
         |                       |
   Lightbulb app (private)   Bridge (private)

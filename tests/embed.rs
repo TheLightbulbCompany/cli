@@ -4,13 +4,13 @@
 mod common;
 
 use common::{call, dialog, endpoint, identity, now_s, ulid, until, Env, Peer};
-use lightbulb_connect::embed::Instance;
-use lightbulb_connect::identity::{key_bytes, Identity};
-use lightbulb_connect::net::frames::Frame;
-use lightbulb_connect::net::ALPN;
-use lightbulb_connect::policy;
-use lightbulb_connect::roster::{self, Entry, Kind};
-use lightbulb_connect::store::Store;
+use lightbulb::embed::Instance;
+use lightbulb::identity::{key_bytes, Identity};
+use lightbulb::net::frames::Frame;
+use lightbulb::net::ALPN;
+use lightbulb::policy;
+use lightbulb::roster::{self, Entry, Kind};
+use lightbulb::store::Store;
 use serde_json::{json, Value};
 use std::path::Path;
 use std::time::Duration;
@@ -28,7 +28,7 @@ async fn try_start(
     home: &Path,
     envs: &[&Env],
     snapshot: Option<&Path>,
-) -> lightbulb_connect::Result<Instance> {
+) -> lightbulb::Result<Instance> {
     common::instance(
         home,
         envs,

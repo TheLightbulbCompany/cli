@@ -9,12 +9,12 @@
 mod common;
 
 use common::{admit, call, count, identity, now_s, online, person_proof, played, until, Env, Peer};
-use lightbulb_connect::embed::Instance;
-use lightbulb_connect::identity::Identity;
-use lightbulb_connect::net::frames::{self, Frame};
-use lightbulb_connect::policy::{self, Verdict};
-use lightbulb_connect::roster::{self, Entry, Kind};
-use lightbulb_connect::store::Store;
+use lightbulb::embed::Instance;
+use lightbulb::identity::Identity;
+use lightbulb::net::frames::{self, Frame};
+use lightbulb::policy::{self, Verdict};
+use lightbulb::roster::{self, Entry, Kind};
+use lightbulb::store::Store;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};

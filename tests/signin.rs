@@ -7,8 +7,8 @@ use common::issuer::{computer_proof, workspace_proof};
 use common::{
     call, computer, dialog, err, invite, members, out, peers, person, seed_pair, until, Env, EXE,
 };
-use lightbulb_connect::daemon::ipc;
-use lightbulb_connect::embed::Instance;
+use lightbulb::daemon::ipc;
+use lightbulb::embed::Instance;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, TcpListener};
@@ -158,10 +158,10 @@ fn signin_writes_a_merge_and_renews_before_expiry() {
         "{start}"
     );
     let sig = start["sig"].as_str().unwrap();
-    assert!(lightbulb_connect::identity::verify(&me, &start, sig));
+    assert!(lightbulb::identity::verify(&me, &start, sig));
     let mut forged = start.clone();
     forged["member_key"] = json!(common::identity().key);
-    assert!(!lightbulb_connect::identity::verify(&me, &forged, sig));
+    assert!(!lightbulb::identity::verify(&me, &forged, sig));
     // A proof 21 hours old is renewed on the timer, signed by this computer over {proof, at}.
     // (Another computer: the older proof would not replace this one's newer one.)
     let e = Env::new();
@@ -184,7 +184,7 @@ fn signin_writes_a_merge_and_renews_before_expiry() {
     assert_eq!(path, "/connect/proof/refresh");
     assert_eq!(body["proof"], json!(old));
     let sig = body["sig"].as_str().unwrap();
-    assert!(lightbulb_connect::identity::verify(&me, body, sig));
+    assert!(lightbulb::identity::verify(&me, body, sig));
     assert_eq!(identity_of(&e)["person_id"], "user_1");
 }
 
@@ -222,7 +222,7 @@ fn an_agent_cannot_sign_this_computer_in() {
     // The daemon takes this test process for an agent.
     let e = Env::new();
     let me = std::process::id();
-    let birth = lightbulb_connect::os::process(me).unwrap().birth_micros;
+    let birth = lightbulb::os::process(me).unwrap().birth_micros;
     let pin = ("LIGHTBULB_CONNECT_HOOK_CALLER", format!("{me}:{birth}"));
     e.daemon(false, "", &[pin]);
     let token = computer_proof(

@@ -339,7 +339,7 @@ The one note: `no such folder: …` is the only error that is not a capitalised 
 
 The teammate follows this on Mac B (a different macOS account and person, release build, the same Wi-Fi as A).
 
-1. Run the install line: `curl -fsSL https://github.com/TheLightbulbCompany/lightbulb-connect/releases/latest/download/install.sh | sh`. It installs `~/.lightbulb/connect/bin/lightbulb`, runs `setup` (one line per agent and `Lightbulb Connect is on.`) and starts the background service.
+1. Run the install line: `curl -fsSL https://github.com/TheLightbulbCompany/cli/releases/latest/download/install.sh | sh`. It installs `~/.lightbulb/connect/bin/lightbulb`, runs `setup` (one line per agent and `Lightbulb is on.`) and starts the background service.
 2. Run `lightbulb doctor`, which must show `Relay                default` and end with `All good.` (If `~/.local/bin` is not on PATH, use the full path.)
 3. Quit and restart Claude Code and Codex. An open session does not load the new tool server. The tool server is named **`lightbulb`**.
 4. In a plain Terminal (not inside an agent), paste the command A's `invite` printed (`lightbulb join '<ticket>' --name NAME`), with your name in place of `NAME`. Wait for `Connected as <you> (<your computer>) …`. A clicks Allow, or runs `lightbulb approve J<n>`.

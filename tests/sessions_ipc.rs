@@ -1,4 +1,4 @@
-use lightbulb_connect::{daemon, os, paths};
+use lightbulb::{daemon, os, paths};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};

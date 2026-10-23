@@ -20,7 +20,7 @@ if (fs.existsSync(bin)) {
   run();
 } else {
   install().then(run, (err) => {
-    console.error(err.plain ? err.message : `Could not install Lightbulb Connect: ${err.message}`);
+    console.error(err.plain ? err.message : `Could not install Lightbulb: ${err.message}`);
     process.exit(1);
   });
 }

@@ -3,7 +3,7 @@
 //! an agent. That override is compiled out of release builds, so `cargo test --release`
 //! fails the pinned tests here; run them in a debug build.
 
-use lightbulb_connect::{os, paths};
+use lightbulb::{os, paths};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;

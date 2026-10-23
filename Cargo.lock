@@ -1870,7 +1870,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "lightbulb-connect"
+name = "lightbulb"
 version = "0.2.2"
 dependencies = [
  "clap",

@@ -10,12 +10,12 @@ use common::{
 };
 use iroh::endpoint::{presets, Connection, RecvStream, SendStream};
 use iroh::{Endpoint, SecretKey};
-use lightbulb_connect::admission;
-use lightbulb_connect::identity::Identity;
-use lightbulb_connect::net::frames::{self, Frame};
-use lightbulb_connect::net::JOIN_ALPN;
-use lightbulb_connect::roster;
-use lightbulb_connect::ticket::{self, Ticket};
+use lightbulb::admission;
+use lightbulb::identity::Identity;
+use lightbulb::net::frames::{self, Frame};
+use lightbulb::net::JOIN_ALPN;
+use lightbulb::roster;
+use lightbulb::ticket::{self, Ticket};
 use serde_json::{json, Value};
 use std::time::Duration;
 
@@ -487,7 +487,7 @@ fn team_join_is_person_only() {
     let t = invite(&a, "reusable");
     // B's daemon takes this test process for an agent.
     let me = std::process::id();
-    let birth = lightbulb_connect::os::process(me).unwrap().birth_micros;
+    let birth = lightbulb::os::process(me).unwrap().birth_micros;
     let pin = ("LIGHTBULB_CONNECT_HOOK_CALLER", format!("{me}:{birth}"));
     b.daemon(false, "", &[peers(&[&a]), pin]);
     let r = b.ask(json!({"id": 1, "op": "team.join", "ticket": t, "name": "bob"}));
@@ -565,7 +565,7 @@ async fn an_unprintable_name_is_refused_as_bad_name() {
     assert_eq!(o.status.code(), Some(1));
     assert_eq!(
         err(&o),
-        "That name has characters Lightbulb Connect cannot show. Use letters, numbers, spaces and punctuation.\n"
+        "That name has characters Lightbulb cannot show. Use letters, numbers, spaces and punctuation.\n"
     );
 }
 
@@ -593,7 +593,7 @@ async fn the_ticket_addresses_alone_reach_the_inviter() {
 
 #[test]
 fn bad_ticket_addresses_are_refused() {
-    use lightbulb_connect::net::parse_addrs;
+    use lightbulb::net::parse_addrs;
     let ok = |v: &[&str]| parse_addrs(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
     assert!(ok(&["192.168.0.2:4000", "[fe80::1]:4000"]).is_some());
     assert!(ok(&["169.254.1.1:9"]).is_some(), "link-local stays");
@@ -692,9 +692,4 @@ fn join_takes_the_bare_ticket() {
 #[test]
 fn join_takes_the_app_link() {
     joins_with(|t| format!("lightbulb://join/{t}"));
-}
-
-#[test]
-fn join_takes_the_old_web_link() {
-    joins_with(|t| format!("https://thelightbulb.company/j/#{t}"));
 }

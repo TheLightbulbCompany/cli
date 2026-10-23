@@ -1,8 +1,8 @@
 mod common;
 
 use common::{person, script, Env};
-use lightbulb_connect::daemon::ipc;
-use lightbulb_connect::dialog::{self, Queue};
+use lightbulb::daemon::ipc;
+use lightbulb::dialog::{self, Queue};
 use serde_json::json;
 use std::time::Duration;
 
@@ -49,7 +49,7 @@ fn ui_claim_is_person_only() {
     let env = Env::new();
     // The daemon takes this test process for an agent.
     let me = std::process::id();
-    let birth = lightbulb_connect::os::process(me).unwrap().birth_micros;
+    let birth = lightbulb::os::process(me).unwrap().birth_micros;
     env.daemon(
         false,
         "",

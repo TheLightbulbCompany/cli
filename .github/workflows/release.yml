@@ -15,15 +15,14 @@ jobs:
       # signing + notarytool), so Gatekeeper will quarantine a browser download.
       - name: Package
         run: |
-          # The asset keeps its name; the binary in it is `lightbulb`.
-          tar -czf lightbulb-connect-macos-arm64.tar.gz -C target/release lightbulb
-          shasum -a 256 lightbulb-connect-macos-arm64.tar.gz > lightbulb-connect-macos-arm64.tar.gz.sha256
+          tar -czf lightbulb-macos-arm64.tar.gz -C target/release lightbulb
+          shasum -a 256 lightbulb-macos-arm64.tar.gz > lightbulb-macos-arm64.tar.gz.sha256
       - name: Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes \
-            lightbulb-connect-macos-arm64.tar.gz lightbulb-connect-macos-arm64.tar.gz.sha256 install.sh
+            lightbulb-macos-arm64.tar.gz lightbulb-macos-arm64.tar.gz.sha256 install.sh
 
   # npm and Homebrew follow the release. Each job skips (green, with a log line) when its
   # secret is not set: secrets cannot appear in `if:`, so the token goes through env.
@@ -69,22 +68,22 @@ jobs:
         run: |
           set -eu
           VERSION="${GITHUB_REF_NAME#v}"
-          ASSET=lightbulb-connect-macos-arm64.tar.gz
+          ASSET=lightbulb-macos-arm64.tar.gz
           URL="https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/$ASSET"
           gh release download "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" -p "$ASSET.sha256"
           SHA="$(cut -d' ' -f1 "$ASSET.sha256")"
           echo "$SHA" | grep -Eq '^[0-9a-f]{64}$'
           git clone "https://x-access-token:$HOMEBREW_TAP_TOKEN@github.com/TheLightbulbCompany/homebrew-tap.git" tap
           cd tap
-          F=Formula/lightbulb-connect.rb
+          F=Formula/lightbulb.rb
           sed -i -E \
             -e "s|^(  url )\".*\"|\1\"$URL\"|" \
             -e "s|^(  sha256 )\"[0-9a-f]*\"|\1\"$SHA\"|" \
-            -e "s|\"lightbulb(-connect)? [0-9]+\.[0-9]+\.[0-9]+\"|\"lightbulb $VERSION\"|" \
+            -e "s|\"lightbulb [0-9]+\.[0-9]+\.[0-9]+\"|\"lightbulb $VERSION\"|" \
             "$F"
           git diff
           if git diff --quiet; then echo "Formula already at $VERSION"; exit 0; fi
           git config user.name "github-actions[bot]"
           git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
-          git commit -am "lightbulb-connect $VERSION"
+          git commit -am "lightbulb $VERSION"
           git push origin HEAD

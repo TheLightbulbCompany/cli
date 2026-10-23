@@ -1,4 +1,4 @@
-use lightbulb_connect::{daemon, paths};
+use lightbulb::{daemon, paths};
 use serde_json::{json, Value};
 use std::path::Path;
 use std::time::Duration;
@@ -61,8 +61,8 @@ async fn ipc_answers_ping_and_rejects_unknown_op() {
     assert_eq!(status["sessions"], 0);
     assert_eq!(status["member_key_short"].as_str().unwrap().len(), 12);
     // The team id is the solo network's genesis hash.
-    let store = lightbulb_connect::store::Store::open(&dir.path().join("state.db")).unwrap();
-    let entries = lightbulb_connect::roster::entries(&store).unwrap();
+    let store = lightbulb::store::Store::open(&dir.path().join("state.db")).unwrap();
+    let entries = lightbulb::roster::entries(&store).unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(status["team"]["id"], entries[0].hash());
 

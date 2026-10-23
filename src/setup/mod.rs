@@ -5,9 +5,9 @@
 //! `--remove` takes out only entries whose command names our executable, and restores
 //! nothing from the backups (they are the person's safety net).
 //!
-//! An MCP entry under our server name whose command is not our executable is foreign: it is
-//! left alone and reported, and no allow rule is written for it. Our allow rule exists only
-//! while the MCP entry is ours.
+//! Installing writes our MCP entry under our server name, replacing whatever entry has that
+//! name. Removing takes it out only when its command is our executable. Our allow rule exists
+//! only while the MCP entry is ours.
 //!
 //! A vendor config file that is missing is created, but only when that agent's home
 //! directory exists (the agent reads it from there); Cursor's `cli-config.json` is the
@@ -38,8 +38,6 @@ pub enum State {
     NotInstalled,
     /// Hooks and tools, the tools under this name.
     Connected(String),
-    /// Hooks and tools, the tools under this name because the first was another program's.
-    ClashedTo(String),
     /// Hooks but no tools, for this reason.
     HooksOnly(String),
     /// Wiring it failed (a file it could not read or write); whether its hooks are in.
@@ -69,11 +67,8 @@ pub(crate) struct Ctx<'a> {
     pub remove: bool,
 }
 
-/// The MCP server name when `--server-name` is not given, and the one taken instead when an
-/// agent has another program's server under it. The Lightbulb app's own session server
-/// (`<app> session-mcp`, `is_app_server`) under it is replaced, not worked around.
+/// The MCP server name when `--server-name` is not given.
 pub const DEFAULT_SERVER: &str = "lightbulb";
-pub const OTHER_SERVER: &str = "lightbulb-connect";
 
 /// Whether `name` can name the MCP server: it lands in TOML keys and allow rules.
 pub fn valid_server_name(name: &str) -> bool {
@@ -90,22 +85,15 @@ pub fn wired(home: &Path, agent: &str) -> bool {
         "claude" => ".claude/settings.json",
         "codex" => ".codex/hooks.json",
         "cursor" => ".cursor/hooks.json",
-        "grok" => ".grok/hooks/lightbulb-connect.json",
+        "grok" => ".grok/hooks/lightbulb.json",
         _ => return false,
     };
     fs::read_to_string(home.join(file)).is_ok_and(|t| t.contains(&format!(" hook {agent} ")))
 }
 
-/// Whether an MCP entry's `args` are the Lightbulb app's session server's (`["session-mcp"]`,
-/// as the app itself checks): the one entry setup replaces under the name it wants.
-fn is_app_server<'a>(args: impl IntoIterator<Item = Option<&'a str>>) -> bool {
-    let args: Vec<_> = args.into_iter().collect();
-    args == [Some("session-mcp")]
-}
-
-/// `agent`'s MCP server entries under `home`, `(name, command, the app's server)`; `""` for an
-/// entry with no command (an http server), which is never ours (reads, never writes).
-fn servers(home: &Path, agent: &str) -> Vec<(String, String, bool)> {
+/// `agent`'s MCP server entries under `home`, `(name, command)`; `""` for an entry with no
+/// command (an http server), which is never ours (reads, never writes).
+fn servers(home: &Path, agent: &str) -> Vec<(String, String)> {
     let (file, key) = match agent {
         "claude" => (".claude.json", "mcpServers"),
         "codex" => (".codex/config.toml", "mcp_servers"),
@@ -113,7 +101,7 @@ fn servers(home: &Path, agent: &str) -> Vec<(String, String, bool)> {
         "grok" => (".grok/config.toml", "mcp_servers"),
         _ => return vec![],
     };
-    let read = || -> Option<Vec<(String, String, bool)>> {
+    let read = || -> Option<Vec<(String, String)>> {
         let text = fs::read_to_string(home.join(file)).ok()?;
         Some(if file.ends_with(".toml") {
             let doc: toml_edit::DocumentMut = text.parse().ok()?;
@@ -126,7 +114,7 @@ fn servers(home: &Path, agent: &str) -> Vec<(String, String, bool)> {
             doc.get(key)?
                 .as_table_like()?
                 .iter()
-                .map(|(k, v)| (k.to_string(), command(v), toml_app_server(v)))
+                .map(|(k, v)| (k.to_string(), command(v)))
                 .collect()
         } else {
             let doc: Value = serde_json::from_str(&text).ok()?;
@@ -134,38 +122,21 @@ fn servers(home: &Path, agent: &str) -> Vec<(String, String, bool)> {
             doc[key]
                 .as_object()?
                 .iter()
-                .map(|(k, v)| (k.clone(), command(v), json_app_server(v)))
+                .map(|(k, v)| (k.clone(), command(v)))
                 .collect()
         })
     };
     read().unwrap_or_default()
 }
 
-fn json_app_server(v: &Value) -> bool {
-    v["args"]
-        .as_array()
-        .is_some_and(|a| is_app_server(a.iter().map(Value::as_str)))
-}
-
-fn toml_app_server(v: &toml_edit::Item) -> bool {
-    v.get("args")
-        .and_then(toml_edit::Item::as_array)
-        .is_some_and(|a| is_app_server(a.iter().map(toml_edit::Value::as_str)))
-}
-
-/// The name of `agent`'s MCP entry under `home` that runs this program (a `lightbulb` or
-/// `lightbulb-connect` binary that is not the app's server), if any (what `doctor` checks;
-/// reads, never writes).
+/// The name of `agent`'s MCP entry under `home` that runs a `lightbulb` binary, if any (what
+/// `doctor` checks; reads, never writes).
 pub fn tools(home: &Path, agent: &str) -> Option<String> {
-    let ours = |c: &str| {
-        Path::new(c)
-            .file_name()
-            .is_some_and(|f| f == "lightbulb" || f == "lightbulb-connect")
-    };
+    let ours = |c: &str| Path::new(c).file_name().is_some_and(|f| f == "lightbulb");
     servers(home, agent)
         .into_iter()
-        .find(|(_, c, app)| ours(c) && !app)
-        .map(|(k, ..)| k)
+        .find(|(_, c)| ours(c))
+        .map(|(k, _)| k)
 }
 
 /// `agent`'s state as its files under `home` are (`doctor`).
@@ -195,7 +166,7 @@ pub fn summary(connected: &[&str], cmd: &str) -> String {
     };
     let first = connected.first().copied().unwrap_or("Claude Code");
     format!(
-        "Lightbulb Connect is on.\n  Connected: {list}\n\nTry it: open {first} in any folder and ask \"list my other sessions\".\nAdd your other computer or a teammate: {cmd} invite\nCheck everything: {cmd} doctor"
+        "Lightbulb is on.\n  Connected: {list}\n\nTry it: open {first} in any folder and ask \"list my other sessions\".\nAdd your other computer or a teammate: {cmd} invite\nCheck everything: {cmd} doctor"
     )
 }
 
@@ -207,14 +178,11 @@ pub const AGENTS: [(&str, &str); 4] = [
     ("grok", ".grok"),
 ];
 
-/// Wires (or, `remove`, unwires) every installed agent. `server`: the MCP entry's name; `None`
-/// installs under `DEFAULT_SERVER`, or `OTHER_SERVER` where the default is another program's
-/// (found by reading the agent's MCP config first), and removes ours under either.
-/// ponytail: an agent wired under `OTHER_SERVER` keeps that entry when the default frees up
-/// later and a new run adds ours under the default too; clean up when that is seen.
+/// Wires (or, `remove`, unwires) every installed agent. `server`: the MCP entry's name
+/// (`None`: `DEFAULT_SERVER`).
 pub fn run(home: &Path, executable: &Path, server: Option<&str>, remove: bool) -> Report {
     let exe = executable.to_string_lossy();
-    let names = server.map_or(vec![DEFAULT_SERVER, OTHER_SERVER], |s| vec![s]);
+    let server = server.unwrap_or(DEFAULT_SERVER);
     let configures: [Configure; 4] = [
         claude::configure,
         codex::configure,
@@ -227,7 +195,7 @@ pub fn run(home: &Path, executable: &Path, server: Option<&str>, remove: bool) -
             name,
             ..Default::default()
         };
-        let ctx = |server| Ctx {
+        let ctx = Ctx {
             home,
             exe: &exe,
             server,
@@ -235,40 +203,17 @@ pub fn run(home: &Path, executable: &Path, server: Option<&str>, remove: bool) -
         };
         r.state = if !home.join(dir).is_dir() {
             State::NotInstalled
-        } else if !names.iter().all(|n| valid_server_name(n)) {
+        } else if !valid_server_name(server) {
             let why = "the server name takes letters, digits, - and _".into();
             State::Failed { why, hooks: false }
-        } else if remove {
-            let ran = names
-                .iter()
-                .try_for_each(|n| configure(&ctx(n), &mut r).map(drop));
-            match ran {
-                Ok(()) => State::Removed,
-                Err(e) => State::Failed {
-                    why: e.to_string(),
-                    hooks: wired(home, name),
-                },
-            }
         } else {
-            // The first name no entry has here, or ours has already.
-            let taken = servers(home, name);
-            let free = |n: &&&str| {
-                taken
-                    .iter()
-                    .all(|(k, c, app)| k != **n || *c == exe || *app)
-            };
-            let pick = names.iter().find(free);
-            match configure(&ctx(pick.unwrap_or(&names[0])), &mut r) {
+            match configure(&ctx, &mut r) {
                 Err(e) => State::Failed {
                     why: e.to_string(),
                     hooks: wired(home, name),
                 },
-                // What `configure` found decides, so a write that did not happen is not reported.
-                Ok(owner) => match pick.filter(|_| owner == Owner::Ours) {
-                    None => State::HooksOnly("another program has the tool server name".into()),
-                    Some(n) if *n == names[0] => State::Connected(n.to_string()),
-                    Some(n) => State::ClashedTo(n.to_string()),
-                },
+                Ok(_) if remove => State::Removed,
+                Ok(_) => State::Connected(server.to_string()),
             }
         };
         report.agents.push(r);
@@ -284,7 +229,7 @@ impl AgentReport {
 
     /// Whether it ended with hooks and tools.
     pub fn connected(&self) -> bool {
-        matches!(self.state, State::Connected(_) | State::ClashedTo(_))
+        matches!(self.state, State::Connected(_))
     }
 
     /// One line for the person: connected or not, and why.
@@ -292,11 +237,10 @@ impl AgentReport {
         let who = self.product();
         let mut line = match &self.state {
             State::NotInstalled => format!("{who}: not installed"),
-            State::Connected(t) if t == DEFAULT_SERVER => format!("{who}: connected (hooks + tools)"),
+            State::Connected(t) if t == DEFAULT_SERVER => {
+                format!("{who}: connected (hooks + tools)")
+            }
             State::Connected(t) => format!("{who}: connected (hooks + tools as \"{t}\")"),
-            State::ClashedTo(t) => format!(
-                "{who}: connected (hooks + tools as \"{t}\" — another \"{DEFAULT_SERVER}\" tool server is already installed)"
-            ),
             State::HooksOnly(why) | State::Failed { why, hooks: true } => {
                 format!("{who}: hooks added, but not its tools — {why}")
             }
@@ -316,9 +260,6 @@ impl AgentReport {
     pub fn fix(&self, cmd: &str) -> Option<String> {
         let who = self.product();
         match self.state {
-            State::HooksOnly(_) => Some(format!(
-                "{who} has hooks but no tools: another program has the tool server name. Run: {cmd} setup --server-name <a free name>"
-            )),
             State::Failed { .. } => Some(format!(
                 "{who} is not connected: fix the file named above, then run {cmd} setup again."
             )),
@@ -330,7 +271,7 @@ impl AgentReport {
     pub fn short(&self) -> &'static str {
         match self.state {
             State::NotInstalled => "not installed",
-            State::Connected(_) | State::ClashedTo(_) => "connected",
+            State::Connected(_) => "connected",
             State::HooksOnly(_) => "hooks only — tools missing (run setup)",
             State::Failed { .. } | State::Removed => "not connected",
         }
@@ -368,13 +309,13 @@ impl Ctx<'_> {
         format!("'{}'", self.exe.replace('\'', "'\\''"))
     }
 
-    /// The owner of a server entry, given its command (`None`: the entry has none) and whether
-    /// it is the Lightbulb app's server, which installing replaces (removing leaves it).
-    pub fn owner(&self, exists: bool, command: Option<&str>, app: bool) -> Owner {
+    /// The owner of a server entry, given its command (`None`: the entry has none). Installing
+    /// replaces any entry under our name, so only removing sees one as foreign.
+    pub fn owner(&self, exists: bool, command: Option<&str>) -> Owner {
         match (exists, command) {
             (false, _) => Owner::Absent,
             (true, Some(c)) if c == self.exe => Owner::Ours,
-            _ if app && !self.remove => Owner::Absent,
+            _ if !self.remove => Owner::Absent,
             _ => Owner::Foreign,
         }
     }
@@ -583,7 +524,7 @@ pub(crate) fn set_hook_group(
     Ok(index)
 }
 
-/// Puts `entry` under `doc[key][server]` or, removing, deletes it; a foreign entry is left.
+/// Puts `entry` under `doc[key][server]` or, removing, deletes ours; a foreign one is left.
 pub(crate) fn set_json_server(
     ctx: &Ctx,
     doc: &mut Value,
@@ -594,11 +535,7 @@ pub(crate) fn set_json_server(
         return Err(format!("`{key}` is not an object").into());
     }
     let current = &doc[key][ctx.server];
-    let owner = ctx.owner(
-        !current.is_null(),
-        current["command"].as_str(),
-        json_app_server(current),
-    );
+    let owner = ctx.owner(!current.is_null(), current["command"].as_str());
     match owner {
         Owner::Foreign => return Ok(Owner::Foreign),
         Owner::Ours if ctx.remove => {
@@ -640,8 +577,8 @@ pub(crate) fn set_json_rule(doc: &mut Value, a: &str, b: &str, rule: &str, prese
     }
 }
 
-/// `[mcp_servers.<server>]` in a TOML config: `fields` written, or, removing, the table
-/// deleted; a foreign one is left.
+/// `[mcp_servers.<server>]` in a TOML config: `fields` written (replacing whatever table is
+/// there), or, removing, ours deleted; a foreign one is left.
 pub(crate) fn set_toml_server(
     ctx: &Ctx,
     doc: &mut toml_edit::DocumentMut,
@@ -649,19 +586,17 @@ pub(crate) fn set_toml_server(
 ) -> Result<Owner> {
     use toml_edit::Item;
     let current = doc.get("mcp_servers").and_then(|s| s.get(ctx.server));
-    let app = current.is_some_and(toml_app_server);
     let owner = ctx.owner(
         current.is_some(),
         current
             .and_then(|t| t.get("command"))
             .and_then(Item::as_str),
-        app,
     );
-    if app && owner == Owner::Absent {
-        // None of the app's keys (env, timeouts) stay under ours.
+    if current.is_some() && owner == Owner::Absent {
+        // None of the replaced entry's keys (env, timeouts) stay under ours.
         doc["mcp_servers"]
             .as_table_like_mut()
-            .expect("has the app's")
+            .expect("has the entry")
             .remove(ctx.server);
     }
     match owner {

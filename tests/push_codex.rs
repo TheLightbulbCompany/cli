@@ -1,6 +1,6 @@
 //! Push into Codex: a thread served by Codex's app-server daemon gets
 //! `<daemon codex> queue --thread <id> --message <framed>`; any other Codex thread is never pushed.
-use lightbulb_connect::{daemon, frame, os, paths};
+use lightbulb::{daemon, frame, os, paths};
 use serde_json::{json, Value};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};

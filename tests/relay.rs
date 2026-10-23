@@ -3,8 +3,8 @@
 //! list; and a team's own relay, which replaces ours.
 
 use iroh_relay::server::{RelayConfig, Server, ServerConfig};
-use lightbulb_connect::config::Config;
-use lightbulb_connect::relay;
+use lightbulb::config::Config;
+use lightbulb::relay;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{Ipv4Addr, TcpListener};
@@ -247,7 +247,7 @@ async fn team_relay_from_meta_replaces_ours() {
     // A has none: it fetches ours from its issuer and verifies it. A's daemon takes this test
     // process for an agent (a person's requests come through `person`).
     let me = std::process::id();
-    let birth = lightbulb_connect::os::process(me).unwrap().birth_micros;
+    let birth = lightbulb::os::process(me).unwrap().birth_micros;
     let pin = ("LIGHTBULB_CONNECT_HOOK_CALLER", format!("{me}:{birth}"));
     a.daemon(
         false,
@@ -273,7 +273,7 @@ async fn team_relay_from_meta_replaces_ours() {
     // In effect at once: `relay.get` and a ticket minted right away.
     assert_eq!(got(&a)["source"], "config");
     let t = a.ask(json!({"id": 1, "op": "team.invite"}));
-    let ticket = lightbulb_connect::ticket::decode(t["ticket"].as_str().unwrap()).unwrap();
+    let ticket = lightbulb::ticket::decode(t["ticket"].as_str().unwrap()).unwrap();
     assert_eq!(ticket.relay_hint, canon(&team_relay));
     until(10, "B adopts the team's relay", || {
         got(&b)["source"] == "team"
@@ -284,7 +284,7 @@ async fn team_relay_from_meta_replaces_ours() {
     });
     // A teammate's ticket carries the relay in effect.
     let t = b.ask(json!({"id": 1, "op": "team.invite"}));
-    let ticket = lightbulb_connect::ticket::decode(t["ticket"].as_str().unwrap()).unwrap();
+    let ticket = lightbulb::ticket::decode(t["ticket"].as_str().unwrap()).unwrap();
     assert_eq!(ticket.relay_hint, canon(&team_relay));
     assert_eq!(b_hits.load(Ordering::SeqCst), 0, "B contacted our issuer");
     // `--local`: the founder's own relay only; the team keeps its relay.
@@ -299,8 +299,7 @@ async fn team_relay_from_meta_replaces_ours() {
     assert_eq!(got(&b)["urls"], json!([canon(&team_relay)]));
 
     // With a team relay, even a stale cache contacts nothing of ours.
-    let roster =
-        lightbulb_connect::roster::replay(&lightbulb_connect::roster::entries(&b.store()).unwrap());
+    let roster = lightbulb::roster::replay(&lightbulb::roster::entries(&b.store()).unwrap());
     let stale = tempfile::tempdir().unwrap();
     let keys = [kp.pk.to_base64()];
     let mut s = relay::State::load(stale.path(), &keys);
@@ -370,7 +369,7 @@ async fn a_joiner_reaches_the_inviter_through_the_relay_hint_alone() {
     let r = a.ask(json!({"id": 1, "op": "team.invite"}));
     let t = r["ticket"].as_str().unwrap().to_string();
     assert_eq!(
-        lightbulb_connect::ticket::decode(&t).unwrap().relay_hint,
+        lightbulb::ticket::decode(&t).unwrap().relay_hint,
         canon(&url)
     );
     c.daemon(false, "", &[relay_only()]);
@@ -414,7 +413,7 @@ fn issuer_missing(missing: fn(&str) -> bool) -> String {
 
 /// The hint a ticket carries with `list` in effect.
 fn hint(list: relay::List) -> String {
-    let p = lightbulb_connect::net::Peers::default();
+    let p = lightbulb::net::Peers::default();
     *p.relays.lock().unwrap() = list;
     p.relay_hint()
 }

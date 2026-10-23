@@ -9,12 +9,12 @@
 mod common;
 
 use common::{admit, call, count, endpoint, now_s, person, person_proof, played, until, Env, Peer};
-use lightbulb_connect::admission;
-use lightbulb_connect::embed::Instance;
-use lightbulb_connect::identity::Identity;
-use lightbulb_connect::net::frames::Frame;
-use lightbulb_connect::roster::{self, Entry, Kind};
-use lightbulb_connect::store::Store;
+use lightbulb::admission;
+use lightbulb::embed::Instance;
+use lightbulb::identity::Identity;
+use lightbulb::net::frames::Frame;
+use lightbulb::roster::{self, Entry, Kind};
+use lightbulb::store::Store;
 use serde_json::{json, Value};
 use std::time::Duration;
 use tokio::sync::broadcast::Receiver;
@@ -337,11 +337,7 @@ async fn workspace_allow_once_delivers_and_writes_no_policy() {
     );
     let v = serde_json::to_value(&n).unwrap();
     let sig = v["sig"].as_str().unwrap().to_string();
-    assert!(lightbulb_connect::identity::verify(
-        &w.b.identity().key,
-        &v,
-        &sig
-    ));
+    assert!(lightbulb::identity::verify(&w.b.identity().key, &v, &sig));
     let d = decision(&w.w1_id(), &w.b, "H1", "once", Q);
     m.send(&d).await;
     assert_eq!(decision_ack(&mut m, &d).await, "applied");
@@ -661,7 +657,7 @@ async fn hold_notice_and_decision_round_trip_on_an_instance() {
     let r = event(&mut rx, "decision_result").await;
     assert_eq!(r["result"], "not_open");
     // A permission hold rides the same path; Claude reads `hold_closed` by the bridge.
-    let me = lightbulb_connect::os::process(std::process::id()).unwrap();
+    let me = lightbulb::os::process(std::process::id()).unwrap();
     let r = w.b.ask(
         json!({"id": 1, "op": "register", "session": {"provider": "claude",
         "conversation": "c1", "pid": me.pid, "birth_micros": me.birth_micros, "cwd": "/tmp"}}),
@@ -761,7 +757,7 @@ fn notice_from(who: &Identity, computer: &str, for_person: &str) -> Frame {
 async fn dial(addr: &iroh::EndpointAddr, who: &Identity) -> (Peer, iroh::Endpoint) {
     let ep = endpoint(who).await;
     let conn = ep
-        .connect(addr.clone(), lightbulb_connect::net::ALPN)
+        .connect(addr.clone(), lightbulb::net::ALPN)
         .await
         .unwrap();
     let (send, recv) = conn.open_bi().await.unwrap();
@@ -778,7 +774,7 @@ async fn the_instance_drops_notices_not_from_its_own_persons_computers() {
     let port = call(&i, "status", json!({})).await["port"]
         .as_u64()
         .unwrap();
-    let key = lightbulb_connect::identity::key_bytes(&w.w1_id().key).unwrap();
+    let key = lightbulb::identity::key_bytes(&w.w1_id().key).unwrap();
     let addr = iroh::EndpointAddr::new(iroh::PublicKey::from_bytes(&key).unwrap())
         .with_ip_addr(format!("127.0.0.1:{port}").parse().unwrap());
 
