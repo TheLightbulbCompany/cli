@@ -243,6 +243,8 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
                     // Why our relay list was refused (or could not be fetched), when it was.
                     "relay_error": relay_error,
                     "port": daemon.peers.port.get(),
+                    // Local discovery: "on", "off" (`config.lan`) or "blocked" (macOS).
+                    "lan": daemon.peers.lan_status(),
                     "needs_update": needs_update,
                     "claim_live": daemon.claim_live(now() as i64),
                     "dropped": dropped(daemon),

@@ -324,3 +324,24 @@ async fn older_protocol_is_reported_not_served() {
     let next = tokio::time::timeout(Duration::from_secs(2), frames::read(&mut p.recv)).await;
     assert!(next.is_err(), "a frame after hello: {next:?}");
 }
+
+/// No `LIGHTBULB_CONNECT_PEERS` and no relay, `lan = true` (the default): two daemons on
+/// one computer find each other as two release builds do. This test cannot use mDNS: macOS
+/// refuses the multicast of an unsigned test binary (`EHOSTUNREACH`, Local Network), so it
+/// proves the loopback path (`net::local`, the same `Peers::addr` every dial and join uses),
+/// and that the daemon reports a refused mDNS instead of hiding it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_members_on_one_computer_find_each_other() {
+    let (a, b) = (Env::new(), Env::new());
+    seed_pair(&a, &b);
+    b.daemon(true, "", &[]);
+    a.daemon(true, "", &[]);
+    let connected = json!({"online": 1, "direct": 1, "total": 1});
+    until(15, "both online with no PEERS", || {
+        a.status()["peers"] == connected && b.status()["peers"] == connected
+    });
+    let lan = a.status()["lan"].as_str().unwrap().to_string();
+    assert!(lan == "on" || lan == "blocked", "{lan}");
+    let log = std::fs::read_to_string(a.state.path().join("daemon.log")).unwrap();
+    assert_eq!(lan == "blocked", log.contains("Local Network"), "{log}");
+}

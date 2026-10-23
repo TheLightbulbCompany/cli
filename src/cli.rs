@@ -1288,6 +1288,11 @@ pub fn doctor() -> Result<i32> {
         .and_then(|mut c| c.call("ping", json!({})))
         .is_ok_and(|r| r["ok"] == true);
     row("Background service", up, "running", "not running", &setup);
+    let lan = Conn::open().and_then(|mut c| c.call("status", json!({})));
+    if lan.is_ok_and(|r| r["lan"] == "blocked") {
+        let fix = "Allow lightbulb-connect in System Settings > Privacy & Security > Local Network";
+        row("Local network", false, "", "blocked by macOS", fix);
+    }
     if cfg!(target_os = "macos") {
         let loaded = if use_launchctl() {
             launchctl(&[

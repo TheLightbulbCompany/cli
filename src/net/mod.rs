@@ -1,6 +1,7 @@
 //! The member transport: a QUIC endpoint (iroh) whose key is this computer's member key, one
 //! connection per member pair carrying one stream of `Frame`s, the membership gate, and delta
-//! roster sync. Peers are found on the local network (mDNS, `config.lan`) and through the
+//! roster sync. Peers are found on the local network (mDNS, `config.lan`), this user's other
+//! daemons on this computer over loopback (`local`, also `config.lan`), and through the
 //! relays in effect (`relay`), which also carry a connection when no direct path exists
 //! (ciphertext only: QUIC is end to end between the two member keys).
 //!
@@ -28,6 +29,7 @@ use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMode, RelayUrl, SecretKey, Wa
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, Notify};
@@ -167,6 +169,10 @@ pub struct Peers {
     pub relay_state: Mutex<relay::State>,
     /// Poked by `relays_changed`: the relay loop brings the endpoint to the list.
     pub relay_changed: Notify,
+    /// `config.lan` at start.
+    pub lan: OnceLock<bool>,
+    /// The last mDNS probe was refused (`lan_refused`).
+    lan_blocked: AtomicBool,
 }
 
 /// A connection's outgoing frames, each with whoever waits to hear it was written.
@@ -196,12 +202,17 @@ impl Peers {
         self.knobs.get_or_init(Knobs::read)
     }
 
-    /// Where to dial member `key`: its key, the knob's addresses for it, and every relay in
+    /// Where to dial member `key`: its key, the knob's addresses for it, its loopback address
+    /// when it runs on this computer (`local`), and every relay in
     /// effect (iroh tries them all, and upgrades to a direct path where it can).
     pub fn addr(&self, key: &str) -> Option<EndpointAddr> {
         let id = PublicKey::from_bytes(&identity::key_bytes(key)?).ok()?;
-        let addrs = self.knobs().peers.get(key).into_iter().flatten();
-        let a = addrs.fold(EndpointAddr::new(id), |a, s| a.with_ip_addr(*s));
+        let here = self.lan.get() == Some(&true);
+        let here = here.then(|| local::addr(key)).flatten();
+        let addrs = self.knobs().peers.get(key).into_iter().flatten().copied();
+        let a = addrs
+            .chain(here)
+            .fold(EndpointAddr::new(id), |a, s| a.with_ip_addr(s));
         let relays = self.relays.lock().unwrap().urls.clone();
         Some(relays.into_iter().fold(a, |a, u| a.with_relay_url(u)))
     }
@@ -226,6 +237,22 @@ impl Peers {
     }
 
     /// The first relay in effect, for a ticket's `relay_hint` (`""` when none).
+    /// `"off"` (`config.lan = false`), `"blocked"` (macOS refuses our mDNS: no Local Network
+    /// permission) or `"on"`. While blocked each call probes again, so an Allow shows at once.
+    pub fn lan_status(&self) -> &'static str {
+        if !self.lan.get().copied().unwrap_or(false) {
+            return "off";
+        }
+        if self.lan_blocked.load(Ordering::Relaxed) {
+            self.lan_blocked.store(lan_refused(), Ordering::Relaxed);
+        }
+        if self.lan_blocked.load(Ordering::Relaxed) {
+            "blocked"
+        } else {
+            "on"
+        }
+    }
+
     pub fn relay_hint(&self) -> String {
         let l = self.relays.lock().unwrap();
         l.urls.first().map(|u| u.to_string()).unwrap_or_default()
@@ -443,6 +470,17 @@ impl Net {
         let endpoint = b.bind().await?;
         let port = endpoint.bound_sockets().first().map_or(0, |a| a.port());
         let _ = daemon.peers.port.set(port);
+        let _ = daemon.peers.lan.set(lan);
+        if lan {
+            local::publish(&daemon.identity.key, port);
+            if lan_refused() {
+                daemon.peers.lan_blocked.store(true, Ordering::Relaxed);
+                eprintln!(
+                    "net: macOS refuses this program the local network, so computers on it cannot find this one. \
+                     Allow lightbulb-connect in System Settings > Privacy & Security > Local Network."
+                );
+            }
+        }
         let _ = daemon.peers.endpoint.set(endpoint.clone());
         daemon.peers.knobs();
         let net = Net(Arc::new(Inner {
@@ -521,6 +559,9 @@ impl Net {
     }
 
     pub async fn close(&self) {
+        if self.0.daemon.peers.lan.get() == Some(&true) {
+            local::withdraw(&self.0.daemon.identity.key);
+        }
         self.0.endpoint.close().await;
     }
 
@@ -1113,4 +1154,52 @@ fn log_relays(l: &relay::List) {
 
 pub(crate) fn short(key: &str) -> &str {
     key.get(..12).unwrap_or(key)
+}
+
+/// Whether an mDNS send is refused with `EHOSTUNREACH`: what macOS answers every multicast
+/// of a program without the Local Network permission. iroh's mDNS lookup only logs that (at
+/// `tracing` level, which this daemon does not print), so without this the daemon is deaf to
+/// the LAN and says nothing. A 12-byte mDNS header with no questions: nobody answers it.
+fn lan_refused() -> bool {
+    let Ok(s) = std::net::UdpSocket::bind("0.0.0.0:0") else {
+        return false;
+    };
+    let r = s.send_to(&[0; 12], "224.0.0.251:5353");
+    r.is_err_and(|e| e.raw_os_error() == Some(libc::EHOSTUNREACH))
+}
+
+/// This user's daemons on this computer, found over loopback: each writes
+/// `<dir>/<member key>` = `127.0.0.1:<port>` at start and removes it at close. Loopback needs
+/// no Local Network permission and no multicast, so two daemons on one Mac connect even when
+/// mDNS cannot. A wrong or stale address costs one failed path, nothing more: iroh checks the
+/// member key on every connection.
+mod local {
+    use std::net::SocketAddr;
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    use std::path::PathBuf;
+
+    /// `/tmp/lightbulb-connect-<uid>`, if it is ours (mode 0700).
+    fn dir() -> Option<PathBuf> {
+        let uid = unsafe { libc::getuid() };
+        let d = PathBuf::from(format!("/tmp/lightbulb-connect-{uid}"));
+        let _ = std::fs::DirBuilder::new().mode(0o700).create(&d);
+        let m = std::fs::symlink_metadata(&d).ok()?;
+        (m.is_dir() && m.uid() == uid && m.mode() & 0o077 == 0).then_some(d)
+    }
+
+    pub fn publish(key: &str, port: u16) {
+        if let Some(d) = dir() {
+            let _ = std::fs::write(d.join(key), format!("127.0.0.1:{port}"));
+        }
+    }
+
+    pub fn withdraw(key: &str) {
+        if let Some(d) = dir() {
+            let _ = std::fs::remove_file(d.join(key));
+        }
+    }
+
+    pub fn addr(key: &str) -> Option<SocketAddr> {
+        std::fs::read_to_string(dir()?.join(key)).ok()?.parse().ok()
+    }
 }
