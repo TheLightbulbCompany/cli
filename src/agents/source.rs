@@ -69,6 +69,7 @@ mod tests {
             handle: None,
             repo: None,
             branch: None,
+            hidden: false,
         }
     }
 

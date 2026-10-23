@@ -209,6 +209,8 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
         "cloud.sessions.set" => super::net_ops::cloud_sessions_set(id, body, daemon).await,
         "app.send" | "app.inbox" | "app.receipt" => crate::app_send::op(id, op, body, daemon).await,
         "status" => {
+            // Before the team lock: `live_sessions` takes it.
+            let sessions = live_count(daemon);
             let t = daemon.team.lock().unwrap();
             let me = &daemon.identity.key;
             let members = &t.roster.members;
@@ -233,7 +235,7 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
                     "protocol": ours,
                     "member_key_short": daemon.identity.short,
                     "team": { "id": t.roster.team_id, "name": t.roster.team_name },
-                    "sessions": live_count(daemon),
+                    "sessions": sessions,
                     "peers": { "online": online, "direct": direct, "total": total },
                     "relay": relay,
                     // Why our relay list was refused (or could not be fetched), when it was.
@@ -543,15 +545,22 @@ fn put_row(daemon: &Daemon, store: &store::Store, row: &store::Session) -> crate
 }
 
 /// Registered and discovered sessions, `gone` ones left out (their rows stay until `end`).
-/// A session whose last push failed reads `next_step`: its mail waits for the next step.
+/// A session whose last push failed reads `next_step`: its mail waits for the next step. One
+/// under a hidden folder, or marked by a register a hidden folder refused, reads `hidden`.
 pub(crate) fn live_sessions(daemon: &Daemon) -> Vec<sessions::Session> {
-    let rows = daemon.store.lock().unwrap().sessions().unwrap_or_default();
+    let (rows, marked) = {
+        let store = daemon.store.lock().unwrap();
+        let rows = store.sessions().unwrap_or_default();
+        (rows, store.hidden_keys().unwrap_or_default())
+    };
+    let off = daemon.team.lock().unwrap().off.clone();
     let mut all = sessions::all(&rows, &daemon.claude_home, &daemon.identity.short);
     let failed = daemon.push_failed.lock().unwrap();
     for s in &mut all {
         if s.tier == sessions::Tier::Push && failed.contains(&s.key.0) {
             s.tier = sessions::Tier::NextStep;
         }
+        s.hidden = marked.contains(&s.key.0) || presence::hidden(&off, &s.cwd);
     }
     all
 }

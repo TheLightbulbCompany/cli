@@ -111,6 +111,10 @@ pub struct Session {
     pub repo: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    /// Computed at read time (`ipc::live_sessions`): kept from teammates (its folder is
+    /// hidden, or its register was refused for one). Local listings show it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hidden: bool,
 }
 
 /// Alive means the pid exists AND was born at `birth_micros`; a reused pid is not the session.
@@ -147,6 +151,7 @@ fn from_row(r: &store::Session, home: &Path) -> Option<Session> {
         handle: r.handle.clone(),
         repo: r.repo.clone(),
         branch: r.branch.clone(),
+        hidden: false,
         provider,
         conversation,
         pid,
@@ -222,6 +227,7 @@ pub fn scan_claude(home: &Path, member_short: &str) -> Vec<Session> {
             handle: None,
             repo: None,
             branch: None,
+            hidden: false,
         });
     }
     out

@@ -359,8 +359,18 @@ async fn off_folder_sessions_are_not_published() {
     assert_eq!(sessions[0].folder, "open");
     let o2 = format!("{sa}/codex:o2");
     assert_eq!((known, kept), (vec![o2.clone()], vec![o2]));
-    // Locally the off-folder session is still listed.
-    assert_eq!(directory(&a, None).len(), 2);
+    // Locally the off-folder session is still listed, marked hidden.
+    let local = directory(&a, None);
+    assert_eq!(local.len(), 2);
+    let flag = |c: &str| {
+        let id = format!("{sa}/codex:{c}");
+        local
+            .iter()
+            .find(|s| s["session_id"] == id.as_str())
+            .unwrap()["hidden"]
+            .clone()
+    };
+    assert_eq!((flag("h2"), flag("o1")), (json!(true), Value::Null));
 }
 
 /// A Claude session its hook registered under an off folder, which Claude's own file names
@@ -448,12 +458,27 @@ fn a_session_refused_under_an_off_folder_is_not_discovered_either() {
         let d = b.ask(json!({"id": 1, "op": "directory"})).to_string();
         !d.contains(&key) && !d.contains("secret plan")
     });
-    let mine = a.ask(json!({"id": 1, "op": "sessions"})).to_string();
-    assert!(mine.contains(&key), "this computer still lists it: {mine}");
+    let mine = a.ask(json!({"id": 1, "op": "sessions"}));
+    assert!(
+        mine.to_string().contains(&key),
+        "this computer still lists it: {mine}"
+    );
+    let listed = |r: &Value| {
+        r["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["key"] == key.as_str())
+            .unwrap()["hidden"]
+            .clone()
+    };
+    assert_eq!(listed(&mine), true, "{mine}");
     set(false);
     assert_eq!(
         register(&a, "claude", "s2", resolved.to_str().unwrap())["ok"],
         true
     );
     until(2, "B sees it again", || sees(&b, &key));
+    let mine = a.ask(json!({"id": 1, "op": "sessions"}));
+    assert_eq!(listed(&mine), Value::Null, "{mine}");
 }

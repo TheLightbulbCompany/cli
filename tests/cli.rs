@@ -813,6 +813,17 @@ fn folder_off_hides_sessions_after_reload() {
     let config = std::fs::read_to_string(a.state.path().join("config.toml")).unwrap();
     assert!(config.contains("folders_off"), "{config}");
     common::until(15, "B no longer sees it", || !common::sees(&b, &s1));
+    // This computer still lists it, saying it is hidden.
+    let o = a.run(&["who"]);
+    assert!(out(&o).contains("hidden from teammates"), "{}", out(&o));
+    let o = a.run(&["who", "--json"]);
+    let listed: Value = serde_json::from_str(&out(&o)).unwrap();
+    let s = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["key"] == s1.as_str());
+    assert_eq!(s.unwrap()["hidden"], true, "{listed}");
     // A new session under the folder is not registered at all.
     let sub = proj.path().join("sub");
     std::fs::create_dir(&sub).unwrap();
@@ -824,6 +835,8 @@ fn folder_off_hides_sessions_after_reload() {
     let o = a.person(&["folder", &dir, "on"]);
     assert!(o.status.success(), "{}{}", out(&o), err(&o));
     common::until(15, "B sees it again", || common::sees(&b, &s1));
+    let o = a.run(&["who"]);
+    assert!(!out(&o).contains("hidden from teammates"), "{}", out(&o));
 
     // A relative path is the folder under the shell's own; a missing one is refused.
     let o = a

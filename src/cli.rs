@@ -315,7 +315,12 @@ pub fn who(as_json: bool, all: bool) -> Result<i32> {
                     Some("next_step") => "at its next step",
                     _ => "when it checks",
                 };
-                format!("{status}, gets messages {gets}")
+                let hidden = if s["hidden"] == true {
+                    ", hidden from teammates"
+                } else {
+                    ""
+                };
+                format!("{status}, gets messages {gets}{hidden}")
             },
             true,
         ),

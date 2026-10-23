@@ -155,6 +155,8 @@ fn build(d: &Daemon, seq: u64) -> Frame {
     let (rows, ended, waiting) = {
         let store = d.store.lock().unwrap();
         let since = now.saturating_sub(DAY) as i64;
+        let live_keys = live.iter().map(|s| s.key.0.as_str()).collect();
+        let _ = store.prune_hidden(since, &live_keys);
         (
             store.sessions().unwrap_or_default(),
             store.ended_since(since).unwrap_or_default(),
@@ -171,11 +173,11 @@ fn build(d: &Daemon, seq: u64) -> Frame {
     candidates.sort_by_key(|(_, at, _)| std::cmp::Reverse(*at));
     // A session whose register a hidden folder refused has no row, but Claude's own file may
     // still name it (its folder spelled another way): its mark keeps that discovery from
-    // teammates too. The mark is cleared only by its next register, so after `folder on` it
-    // stays hidden until its next hook event; and a discovery that never registered is
-    // matched by Claude's cwd as given.
-    let marked = d.store.lock().unwrap().hidden_keys().unwrap_or_default();
-    live.retain(|s| publishable(&s.cwd) && !marked.contains(&s.key.0));
+    // teammates too (`hidden`). The mark is cleared by its next register, so after `folder
+    // on` it stays hidden until its next hook event, or pruned a day after its last renewal
+    // once no live session carries it; a discovery that never registered is matched by
+    // Claude's cwd as given.
+    live.retain(|s| !s.hidden);
     live.sort_by_key(|s| std::cmp::Reverse(s.birth_micros));
     live.truncate(MAX);
     let live_keys: HashSet<&str> = live.iter().map(|s| s.key.0.as_str()).collect();
@@ -464,16 +466,16 @@ fn record(m: &Member, me: &str, s: &Remote, cwd: &str, verified: bool, online: b
 /// full path), repo, branch, what it is doing or its title, any case.
 pub fn directory(d: &Daemon, query: Option<&str>) -> Value {
     // This computer's, with their folders; an instance's are the sessions it declared.
-    let local: Vec<(Remote, String, Option<String>)> = match &d.cloud {
+    let local: Vec<(Remote, String, Option<String>, bool)> = match &d.cloud {
         Some(c) => c
             .declared()
             .sessions
             .iter()
-            .map(|r| (r.clone(), String::new(), None))
+            .map(|r| (r.clone(), String::new(), None, false))
             .collect(),
         None => ipc::live_sessions(d)
             .iter()
-            .map(|s| (remote(s, false), s.cwd.clone(), s.handle.clone()))
+            .map(|s| (remote(s, false), s.cwd.clone(), s.handle.clone(), s.hidden))
             .collect(),
     };
     let remote_ones = stored(d);
@@ -512,11 +514,14 @@ pub fn directory(d: &Daemon, query: Option<&str>) -> Value {
     };
     let key = &d.identity.key;
     let mut out = vec![];
-    for (r, cwd, handle) in &local {
+    for (r, cwd, handle, hidden) in &local {
         if hit(&own, r, cwd) {
             let mut v = record(&own, &me, r, cwd, true, true);
             // `who --all`'s name for it (the MCP server leaves it out).
             v["handle"] = handle.clone().into();
+            if *hidden {
+                v["hidden"] = true.into();
+            }
             out.push(v);
         }
     }

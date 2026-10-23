@@ -234,7 +234,7 @@ impl Store {
     }
 
     /// Marks `key` as registered under a hidden folder at `now` (`hidden`), or no longer;
-    /// whether the mark changed. A mark not renewed for a day goes with `ended_since`'s purge.
+    /// whether the mark changed. A mark not renewed for a day goes with `prune_hidden`, unless its session is live.
     pub fn set_hidden(&self, key: &str, hidden: bool, now: i64) -> rusqlite::Result<bool> {
         let was = self
             .conn
@@ -255,6 +255,27 @@ impl Store {
                 .execute("DELETE FROM hidden_sessions WHERE key = ?1", [key])?;
         }
         Ok(was != hidden)
+    }
+
+    /// Deletes the hidden marks last renewed before `since` but those of `live` sessions: a
+    /// live one stays hidden however long it idles without a hook event.
+    pub fn prune_hidden(
+        &self,
+        since: i64,
+        live: &std::collections::HashSet<&str>,
+    ) -> rusqlite::Result<()> {
+        let old: Vec<String> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT key FROM hidden_sessions WHERE updated_at < ?1")?;
+            let rows = stmt.query_map([since], |r| r.get(0))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        for k in old.iter().filter(|k| !live.contains(k.as_str())) {
+            self.conn
+                .execute("DELETE FROM hidden_sessions WHERE key = ?1", [k])?;
+        }
+        Ok(())
     }
 
     /// The keys `set_hidden` marked.
@@ -300,13 +321,10 @@ impl Store {
         )? > 0)
     }
 
-    /// The rows that ended at `since` or later, `(key, ended_at, cwd)`; deletes older ends and
-    /// hidden marks last renewed before `since`.
+    /// The rows that ended at `since` or later, `(key, ended_at, cwd)`; deletes older ends.
     pub fn ended_since(&self, since: i64) -> rusqlite::Result<Vec<(String, i64, String)>> {
         self.conn
             .execute("DELETE FROM sessions WHERE ended_at < ?1", [since])?;
-        self.conn
-            .execute("DELETE FROM hidden_sessions WHERE updated_at < ?1", [since])?;
         let mut stmt = self
             .conn
             .prepare("SELECT key, ended_at, cwd FROM sessions WHERE ended_at IS NOT NULL")?;
@@ -932,11 +950,15 @@ mod tests {
     fn a_hidden_mark_says_when_it_changed_and_goes_a_day_after_its_last_renewal() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("state.db")).unwrap();
+        let none = std::collections::HashSet::new();
         assert!(store.set_hidden("k", true, 10).unwrap());
         assert!(!store.set_hidden("k", true, 20).unwrap());
-        store.ended_since(20).unwrap();
+        store.prune_hidden(20, &none).unwrap();
         assert!(store.hidden_keys().unwrap().contains("k"));
-        store.ended_since(21).unwrap();
+        // A live session's mark stays however old.
+        store.prune_hidden(21, &["k"].into()).unwrap();
+        assert!(store.hidden_keys().unwrap().contains("k"));
+        store.prune_hidden(21, &none).unwrap();
         assert!(store.hidden_keys().unwrap().is_empty());
         assert!(!store.set_hidden("k", false, 30).unwrap());
     }
