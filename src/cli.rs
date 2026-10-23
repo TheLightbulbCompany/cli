@@ -319,7 +319,8 @@ pub fn receipt(request_id: &str, from: Option<String>) -> Result<i32> {
 /// `folder <path> on|off`: whether the sessions under `path` are shown to teammates
 /// (`folders_off` in `config.toml`, canonical as presence compares them), then `reload`.
 /// A folder that does not exist cannot be turned off; one turned off before it went away can
-/// still be turned on.
+/// still be turned on (`presence::canonical` resolves it through its existing parent). `on` for
+/// a folder that was not off says so and exits 1.
 pub fn folder(path: &str, on: bool) -> Result<i32> {
     let dir = paths::state_dir();
     let full = std::env::current_dir()?.join(crate::config::expand_home(path));
@@ -329,7 +330,12 @@ pub fn folder(path: &str, on: bool) -> Result<i32> {
     }
     let p = crate::presence::canonical(&full);
     let mut off = crate::config::Config::load(&dir)?.folders_off;
+    let before = off.len();
     off.retain(|o| crate::presence::canonical(o) != p);
+    if on && off.len() == before {
+        eprintln!("{path} was not hidden");
+        return Ok(1);
+    }
     if !on {
         off.push(p);
     }

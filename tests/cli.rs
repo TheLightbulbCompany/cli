@@ -517,4 +517,25 @@ fn folder_off_hides_sessions_after_reload() {
     assert!(o.status.success(), "{}{}", out(&o), err(&o));
     let config = std::fs::read_to_string(a.state.path().join("config.toml")).unwrap();
     assert!(!config.to_lowercase().contains(&want), "{config}");
+    let o = a
+        .cmd(&["folder", "sub", "on"])
+        .current_dir(proj.path())
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(1));
+    assert!(err(&o).contains("sub was not hidden"), "{}", err(&o));
+
+    // Through a symlinked parent, turned off, then deleted: `on` still finds and removes it.
+    let link = proj.path().join("link");
+    std::os::unix::fs::symlink(proj.path(), &link).unwrap();
+    let gone = link.join("gone");
+    std::fs::create_dir(proj.path().join("gone")).unwrap();
+    let gone = gone.to_str().unwrap();
+    let o = a.run(&["folder", gone, "off"]);
+    assert!(o.status.success(), "{}{}", out(&o), err(&o));
+    std::fs::remove_dir(proj.path().join("gone")).unwrap();
+    let o = a.run(&["folder", gone, "on"]);
+    assert!(o.status.success(), "{}{}", out(&o), err(&o));
+    let config = std::fs::read_to_string(a.state.path().join("config.toml")).unwrap();
+    assert!(!config.to_lowercase().contains("/gone"), "{config}");
 }

@@ -103,9 +103,16 @@ pub(crate) fn hidden(off: &[PathBuf], cwd: &str) -> bool {
     }
 }
 
-/// `p` resolved (symlinks, `..`), else as given; lowercased on macOS, whose volumes ignore case.
+/// `p` resolved (symlinks, `..`); a path that does not exist (a deleted folder) is its nearest
+/// existing parent resolved, then the rest as given. Lowercased on macOS, whose volumes ignore case.
 pub(crate) fn canonical(p: &Path) -> PathBuf {
-    let p = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let p = p
+        .ancestors()
+        .find_map(|a| {
+            let rest = p.strip_prefix(a).ok()?;
+            Some(std::fs::canonicalize(a).ok()?.join(rest))
+        })
+        .unwrap_or_else(|| p.to_path_buf());
     if cfg!(target_os = "macos") {
         PathBuf::from(p.to_string_lossy().to_lowercase())
     } else {
