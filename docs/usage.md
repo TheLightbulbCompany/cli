@@ -34,8 +34,8 @@ Run `lightbulb-connect <command> --help` for the options of each one.
 | `setup --remove` | Take out only what `setup` wrote. Backups are left as they are. |
 | `doctor` | Check the service, the local network, the state folder and each agent, and say how to fix what is not right. |
 | `who` | List the sessions on this computer. `who --all` adds your teammates' sessions. |
-| `invite` | Print the line that adds your other computer or a teammate. `--once`: one join, valid 24 hours. `--new`: replace the link; the old one stops working. |
-| `join '<link>'` | Join the team the link is for. `--name <name>` sets the name you go by (default: your user name). The computer must be on its own first. |
+| `invite` | Print the join command that adds your other computer or a teammate (`lightbulb-connect join '<ticket>' --name <their name>`), and a `lightbulb://join/…` link for the app. `--once`: one join, valid 24 hours. `--new`: replace the invite; the old one stops working. |
+| `join '<ticket>'` | Join the team the invite is for. Takes the ticket, the whole `lightbulb://join/…` link, or an old `https://thelightbulb.company/j/#…` link. `--name <name>` sets the name you go by (default: your user name). The computer must be on its own first. |
 | `approve J1` / `approve H1` | Allow a join request (`J`) or a held message (`H`). |
 | `decline J1` / `decline H1` | Decline one. |
 | `held` | The join requests and messages waiting for your Allow. |
@@ -45,9 +45,9 @@ Run `lightbulb-connect <command> --help` for the options of each one.
 | `policy` | Who may message your sessions without asking. `policy <person> accept\|hold\|refuse` sets it. |
 | `team` | The team and its computers. |
 | `admin <name>` | Make a member an admin (founder only). `--founder` makes them the founder in your place. |
-| `remove <name>` | Remove a member (founder and admins). The invite link is replaced. |
+| `remove <name>` | Remove a member (founder and admins). The invite is replaced. |
 | `leave` | Leave the team. This computer is on its own network again. |
-| `relay [<url>]` | Show the relays this computer uses, or set one. From the founder or an admin it sets the team's relay; `--local` sets only this computer's; `--clear` clears yours. |
+| `relay [<url>]` | Show the relays this computer uses, or set one. With nothing set it uses the iroh project's public relays (`default`). From the founder or an admin it sets the team's relay; `--local` sets only this computer's; `--clear` clears yours and goes back to the default. Relays carry encrypted bytes only. |
 | `folder <path> on\|off` | Show or hide the sessions under a folder from your teammates. |
 | `version` | Print the version. |
 
