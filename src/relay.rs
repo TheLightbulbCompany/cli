@@ -35,7 +35,7 @@ pub const MAX_RELAYS: usize = 8;
 /// A cached list younger than this is used without asking the issuer.
 const FRESH: Duration = Duration::from_secs(86_400);
 /// A failed fetch is tried again after this.
-const RETRY: Duration = Duration::from_secs(3_600);
+pub const RETRY: Duration = Duration::from_secs(3_600);
 /// The most a relay list (or its signature) may be.
 const MAX_BYTES: u64 = 64 * 1024;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);

@@ -447,12 +447,23 @@ impl Net {
     /// every relay), so this only changes which relays there are.
     async fn relay_loop(self) {
         let d = &self.0.daemon;
-        let mut tick = tokio::time::interval(RELAY_FETCH);
         // What the endpoint has.
         let mut applied = d.peers.relays.lock().unwrap().urls.clone();
+        let mut first = true;
         loop {
+            // A retry is due an hour after the last attempt, whatever started that attempt (a
+            // poke too); with none pending, the hourly look at the cache's age.
+            let now = std::time::Instant::now();
+            let last = d.peers.relay_state.lock().unwrap().last_fetch_at;
+            let due = last.map(|t| t + relay::RETRY).filter(|t| *t > now);
+            let wake = match (first, due) {
+                (true, _) => now,
+                (_, Some(t)) => t,
+                _ => now + RELAY_FETCH,
+            };
+            first = false;
             tokio::select! {
-                _ = tick.tick() => {}
+                _ = tokio::time::sleep_until(wake.into()) => {}
                 _ = d.peers.relay_changed.notified() => {}
                 _ = self.0.endpoint.closed() => return,
             }

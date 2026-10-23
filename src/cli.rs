@@ -630,7 +630,10 @@ pub fn relay(set: Option<String>, local: bool) -> Result<i32> {
         };
         match url.as_str() {
             "" => println!("Relay cleared for {who}."),
-            u => println!("Relay for {who}: {u}"),
+            u => {
+                let canonical = crate::relay::parse(u).map_or(u.to_string(), |r| r.to_string());
+                println!("Relay for {who}: {canonical}")
+            }
         }
         return Ok(0);
     }

@@ -341,6 +341,12 @@ pub fn install(
     team.roster = new;
     daemon.peers.changed.notify_one();
     if relay_changed {
+        // Logged once per value: an install changes it once.
+        if let Some(v) = team.roster.relay.as_deref() {
+            if !v.trim().is_empty() && crate::relay::parse(v).is_none() {
+                eprintln!("relay: ignored the team's {v:?} (not an https relay URL)");
+            }
+        }
         daemon.peers.relays_changed(team);
     }
     Ok(())
