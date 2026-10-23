@@ -79,9 +79,16 @@ pub fn my_person(d: &Daemon, r: &Roster) -> String {
     r.person_of(&d.identity.key).to_string()
 }
 
-/// `s` as published: `folder` is `cwd`'s last part, or all of it with `share_paths`.
-fn remote(s: &Session, share_paths: bool) -> Remote {
-    let (repo, branch) = crate::mcp::git(&s.cwd);
+/// `s` as published: `folder` is `cwd`'s last part, or all of it with `share_paths`; repo and
+/// branch as its hook reported them (never read here: see `Daemon::git`).
+fn remote(d: &Daemon, s: &Session, share_paths: bool) -> Remote {
+    let (repo, branch) = d
+        .git
+        .lock()
+        .unwrap()
+        .get(&s.key.0)
+        .cloned()
+        .unwrap_or_default();
     let folder = if share_paths {
         s.cwd.clone()
     } else {
@@ -179,7 +186,7 @@ fn build(d: &Daemon, seq: u64) -> Frame {
     Frame::Presence {
         member: d.identity.key.clone(),
         seq,
-        sessions: live.iter().map(|s| remote(s, share)).collect(),
+        sessions: live.iter().map(|s| remote(d, s, share)).collect(),
         known,
         kept,
     }
@@ -444,7 +451,7 @@ pub fn directory(d: &Daemon, query: Option<&str>) -> Value {
     let key = &d.identity.key;
     let mut out = vec![];
     for s in &local {
-        let r = remote(s, false);
+        let r = remote(d, s, false);
         if hit(&own, &r, &s.cwd) {
             out.push(record(&own, &me, &r, &s.cwd, true, true));
         }
@@ -454,6 +461,11 @@ pub fn directory(d: &Daemon, query: Option<&str>) -> Value {
         for r in l.sessions.iter().filter(|r| hit(m, r, "")) {
             out.push(record(m, &me, r, "", verified, up));
         }
+    }
+    // `who --all`'s handles (the MCP server leaves them out).
+    for r in &mut out {
+        let (id, agent) = (r["session_id"].as_str(), r["agent"].as_str());
+        r["handle"] = ipc::handle_of(d, id.unwrap_or_default(), agent.unwrap_or_default()).into();
     }
     json!({ "sessions": out })
 }

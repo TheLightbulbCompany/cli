@@ -52,7 +52,6 @@ pub(super) fn configure(ctx: &Ctx, r: &mut AgentReport) -> Result<()> {
         Ok(())
     })?;
     if owner == Owner::Foreign {
-        r.notes.push(ctx.foreign_note(&mcp));
         return Ok(());
     }
     let rule = format!("Mcp({}:*)", ctx.server);

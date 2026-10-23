@@ -118,11 +118,20 @@ async fn each_member_sees_the_whole_directory() {
     assert_eq!(bob.unwrap()["online"], true, "{members}");
     let o = a.detached(&[EXE, "who", "--all"], "");
     assert!(o.status.success(), "{}", common::err(&o));
+    // By handle, ids only in `--json`.
     let text = out(&o);
-    let (local, remote) = (text.find(&ka).unwrap(), text.find(&kb2).unwrap());
-    assert!(local < remote, "{text}");
-    let line = text.lines().find(|l| l.contains(&kb2)).unwrap();
-    assert!(line.contains("bob") && line.contains("mbp"), "{text}");
+    assert!(!text.contains(&ka) && !text.contains(&kb2), "{text}");
+    let rows: Vec<&str> = text.lines().skip(1).collect();
+    assert!(
+        rows[0].contains("prasiddha") && rows[0].contains("mac"),
+        "{text}"
+    );
+    assert!(
+        rows[1..]
+            .iter()
+            .any(|l| l.contains("bob") && l.contains("mbp")),
+        "{text}"
+    );
 }
 
 /// `id` played over its own endpoint: dialed into `env` and past its `hello` (at `head`).

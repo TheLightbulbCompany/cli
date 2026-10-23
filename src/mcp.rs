@@ -197,7 +197,7 @@ fn git_in(cwd: &Path) -> Option<(Option<String>, Option<String>)> {
 
 /// Receipt `r` with its `note`, when it has one.
 fn with_note(mut r: Value) -> Value {
-    if let Some(n) = mail::receipt_note(&r, None) {
+    if let Some(n) = mail::receipt_note(&r) {
         r["note"] = n.into();
     }
     r
@@ -273,6 +273,10 @@ impl Server {
         };
         for r in &mut found {
             r["is_this_session"] = (r["session_id"] == call.from.0.as_str()).into();
+            // `who`'s, for people.
+            if let Some(o) = r.as_object_mut() {
+                o.remove("handle");
+            }
         }
         let total = found.len();
         let sessions: Vec<Value> = found.into_iter().take(a.limit as usize).collect();
@@ -408,7 +412,7 @@ impl ServerHandler for Server {
     }
 }
 
-const INSTRUCTIONS: &str = "These tools message the other coding sessions (Claude Code, Codex, Cursor, Grok CLI) on this computer and your teammates' computers. Call find_sessions to see them, then send_message to one by its session_id. Every send_message needs a request_id: a new [A-Za-z0-9._-]{1,128} string, reused only to retry that same send. Messages delivered to you show a requestId; pass it as reply_to to answer one.";
+const INSTRUCTIONS: &str = "These tools message the other coding sessions (Claude Code, Codex, Cursor, Grok CLI). Use these tools for sessions on this computer and on teammates' computers. Call find_sessions to see them, then send_message to one by its session_id. Every send_message needs a request_id: a new [A-Za-z0-9._-]{1,128} string, reused only to retry that same send. Messages delivered to you show a requestId; pass it as reply_to to answer one.";
 
 #[cfg(test)]
 mod tests {

@@ -33,7 +33,7 @@ fn toml_at(home: &Path, rel: &str) -> toml_edit::DocumentMut {
 }
 
 fn setup(home: &Path, remove: bool) -> Report {
-    run(home, Path::new(EXE), "lightbulb", remove)
+    run(home, Path::new(EXE), Some("lightbulb"), remove)
 }
 
 fn agent<'a>(r: &'a Report, name: &str) -> &'a AgentReport {
@@ -344,10 +344,7 @@ fn a_foreign_lightbulb_mcp_entry_is_left_alone_and_gets_no_allow_rule() {
         if !remove {
             assert!(get(h, ".codex/config.toml").starts_with(&app_toml));
             for name in ["claude", "codex", "cursor", "grok"] {
-                assert!(
-                    agent(&r, name).notes.iter().any(|n| n.contains("not ours")),
-                    "{name}"
-                );
+                assert!(agent(&r, name).hooks_only(), "{name}");
             }
         }
     }
@@ -370,7 +367,7 @@ fn setup_touches_only_installed_agents() {
     for missing in [".claude", ".claude.json", ".codex", ".cursor"] {
         assert!(!h.join(missing).exists(), "{missing}");
     }
-    assert_eq!(agent(&r, "claude").line(), "claude: not installed");
+    assert_eq!(agent(&r, "claude").line(), "Claude Code: not installed");
 }
 
 #[test]
@@ -380,6 +377,7 @@ fn hook_command_quotes_the_executable() {
         exe: "/opt/it's/lightbulb-connect",
         server: "lightbulb",
         remove: false,
+        foreign: std::cell::Cell::new(false),
     };
     let c = ctx.hook_command("grok", "stop");
     assert_eq!(c, r"'/opt/it'\''s/lightbulb-connect' hook grok stop");
@@ -470,7 +468,7 @@ fn a_bad_server_name_writes_nothing() {
     let home = tempfile::tempdir().unwrap();
     let h = home.path();
     fs::create_dir(h.join(".claude")).unwrap();
-    let r = run(h, Path::new(EXE), "a:b", false);
+    let r = run(h, Path::new(EXE), Some("a:b"), false);
     assert!(agent(&r, "claude").wrote.is_empty());
     assert!(agent(&r, "claude").notes[0].contains("server name"));
     assert!(!h.join(".claude.json").exists());
@@ -483,7 +481,7 @@ fn a_non_default_server_name_is_passed_to_mcp() {
     for dir in [".claude", ".codex", ".cursor", ".grok"] {
         fs::create_dir(h.join(dir)).unwrap();
     }
-    run(h, Path::new(EXE), "lightbulb-connect", false);
+    run(h, Path::new(EXE), Some("lightbulb-connect"), false);
     let args = json!(["mcp", "--server-name", "lightbulb-connect"]);
     assert_eq!(
         json_at(h, ".claude.json")["mcpServers"]["lightbulb-connect"]["args"],
@@ -510,10 +508,15 @@ fn codex_says_it_trusted_the_hooks() {
     let home = tempfile::tempdir().unwrap();
     fs::create_dir(home.path().join(".codex")).unwrap();
     let r = setup(home.path(), false);
-    assert!(agent(&r, "codex")
-        .line()
-        .contains("Codex hooks trusted on your behalf"));
-    assert!(agent(&setup(home.path(), false), "codex").notes.is_empty());
+    assert_eq!(
+        agent(&r, "codex").line(),
+        "Codex: connected (hooks + tools). Its hook prompt was answered for you."
+    );
+    // Said once: a second run has nothing new to trust.
+    assert_eq!(
+        agent(&setup(home.path(), false), "codex").line(),
+        "Codex: connected (hooks + tools)"
+    );
 }
 
 #[test]
@@ -549,9 +552,55 @@ fn remove_takes_out_a_plan_a_era_install() {
     // legacy (Plan A install)
     put(h, ".grok/hooks/lightbulb-network.json", "{}");
     let old = Path::new("/opt/lb/bin/lightbulb-network");
-    run(h, old, "lightbulb", false);
-    let r = run(h, old, "lightbulb", true);
+    run(h, old, Some("lightbulb"), false);
+    let r = run(h, old, Some("lightbulb"), true);
     assert!(!h.join(".grok/hooks/lightbulb-network.json").exists());
     assert!(!agent(&r, "grok").wrote.is_empty());
     assert!(toml_at(h, ".grok/config.toml").get("mcp_servers").is_none());
+}
+
+#[test]
+fn auto_naming_takes_lightbulb_connect_where_lightbulb_is_taken() {
+    let home = tempfile::tempdir().unwrap();
+    let h = home.path();
+    fs::create_dir(h.join(".claude")).unwrap();
+    fs::create_dir(h.join(".grok")).unwrap();
+    let app = json!({"mcpServers": {"lightbulb": {"command": APP}}});
+    put(h, ".claude.json", &app.to_string());
+    let r = run(h, Path::new(EXE), None, false);
+    let claude = agent(&r, "claude");
+    assert_eq!(
+        (claude.tools.as_deref(), claude.clashed),
+        (Some("lightbulb-connect"), true)
+    );
+    assert_eq!(
+        json_at(h, ".claude.json")["mcpServers"]["lightbulb"],
+        app["mcpServers"]["lightbulb"]
+    );
+    assert_eq!(agent(&r, "grok").tools.as_deref(), Some("lightbulb"));
+    assert_eq!(tools(h, "claude").as_deref(), Some("lightbulb-connect"));
+    assert_eq!(tools(h, "grok").as_deref(), Some("lightbulb"));
+    // Removing takes ours out under both names, and leaves the app's.
+    run(h, Path::new(EXE), None, true);
+    assert_eq!(json_at(h, ".claude.json"), app);
+    assert_eq!((tools(h, "claude"), tools(h, "grok")), (None, None));
+}
+
+#[test]
+fn the_closing_words_name_what_is_connected_and_the_command_to_type() {
+    assert_eq!(
+        summary(
+            &["Claude Code", "Codex", "Cursor", "Grok CLI"],
+            "lightbulb-connect"
+        ),
+        "Lightbulb Connect is on.
+  Connected: Claude Code, Codex, Cursor, Grok CLI
+  macOS may ask to let lightbulb-connect read your Desktop folder: click Allow
+  (it reads only each project's .git name and branch).
+
+Try it: open Claude Code in any folder and ask \"list my other sessions\".
+Add your other computer or a teammate: lightbulb-connect invite
+Check everything: lightbulb-connect doctor"
+    );
+    assert!(summary(&["Codex"], "lightbulb").contains("open Codex in any folder"));
 }

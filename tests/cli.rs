@@ -50,20 +50,159 @@ impl Env {
 }
 
 #[test]
-fn who_lists_a_registered_session() {
+fn who_lists_a_registered_session_by_its_handle() {
     let e = Env::new();
+    let none = out(&e.run(&["who"]));
+    assert_eq!(
+        none.trim(),
+        "No sessions yet. Open Claude Code, Codex, Cursor or Grok and they appear here."
+    );
     let key = e.session();
     let table = out(&e.run(&["who"]));
     let header = table.lines().next().unwrap();
     let cols: Vec<&str> = header.split_whitespace().collect();
-    assert_eq!(
-        cols,
-        ["session", "agent", "folder", "status", "tier", "doing"]
-    );
-    let row = table.lines().find(|l| l.starts_with(&key)).unwrap();
-    assert!(row.contains("codex") && row.contains("/tmp/proj") && row.contains("fix the thing"));
+    assert_eq!(cols, ["Name", "Agent", "Folder", "Status", "Doing"]);
+    let row = table.lines().find(|l| l.starts_with("codex-1 ")).unwrap();
+    assert!(row.contains("Codex") && row.contains("/tmp/proj") && row.contains("fix the thing"));
+    assert!(row.contains("gets messages at its next step"), "{row}");
+    assert!(!table.contains(&key), "{table}");
     let json: Value = serde_json::from_str(&out(&e.run(&["who", "--json"]))).unwrap();
     assert_eq!(json[0]["key"], key.as_str());
+    assert_eq!(json[0]["handle"], "codex-1");
+}
+
+#[test]
+fn send_takes_a_handle_and_a_member_name() {
+    let e = Env::new();
+    let key = e.session();
+    let o = e.person(&["send", "codex-1", "by handle"]);
+    assert!(o.status.success(), "{}", err(&o));
+    let m = e.ask(json!({"id": 1, "op": "inbox", "key": key}));
+    assert_eq!(m["messages"][0]["text"], "by handle", "{m}");
+    // `<member name>/<name>`: this computer's own member, by its name.
+    let t = e.ask(json!({"id": 1, "op": "team.get"}));
+    let name = t["members"][0]["name"].as_str().unwrap().to_string();
+    let o = e.person(&["send", &format!("{name}/inbox"), "by name"]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(
+        out(&o).trim(),
+        "Sent. Waiting in the \"inbox\" mailbox until someone reads it."
+    );
+    let m = e.inbox(&format!("{}/inbox", e.short()));
+    assert_eq!(m[0]["text"], "by name");
+    let o = e.person(&["send", "nobody/inbox", "x"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(
+        err(&o).trim(),
+        format!("No teammate called \"nobody\". Teammates: {name} (see lightbulb-connect team).")
+    );
+}
+
+#[test]
+fn errors_are_sentences() {
+    let e = Env::new();
+    e.session();
+    let o = e.person(&["policy", "someone", "maybe"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(err(&o).trim(), "policy takes accept, hold or refuse.");
+    let o = e.person(&["policy"]);
+    assert_eq!(
+        out(&o).lines().next(),
+        Some("Agents may message teammates without asking you: no."),
+        "{}",
+        err(&o)
+    );
+    let o = e.run(&["receipt", "NOPE"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(
+        err(&o).trim(),
+        "No message NOPE was sent from this terminal."
+    );
+    assert!(!err(&o).contains("Error"));
+}
+
+#[test]
+fn help_hides_the_agent_plumbing() {
+    let e = Env::new();
+    let help = out(&e.run(&["--help"]));
+    assert!(
+        help.contains("Getting started:") && help.contains("Everyday:"),
+        "{help}"
+    );
+    for hidden in ["hook", "mcp", "daemon"] {
+        assert!(
+            !help
+                .lines()
+                .any(|l| l.trim_start().starts_with(&format!("{hidden} "))),
+            "{help}"
+        );
+    }
+    // Still accepted.
+    assert!(e.run(&["daemon", "--help"]).status.success());
+}
+
+#[test]
+fn directory_shows_the_hooks_repo_and_never_reads_the_folder() {
+    let e = Env::new();
+    assert!(e.run(&["who"]).status.success());
+    // On disk the folder says another branch: the daemon must not look.
+    let proj = tempfile::tempdir().unwrap();
+    let git = proj.path().join(".git");
+    std::fs::create_dir(&git).unwrap();
+    std::fs::write(git.join("HEAD"), "ref: refs/heads/on-disk\n").unwrap();
+    let p = os::process(std::process::id()).unwrap();
+    let r = e.ask(
+        json!({"id": 1, "op": "register", "session": {"provider": "codex",
+        "conversation": "g1", "pid": p.pid, "birth_micros": p.birth_micros,
+        "cwd": proj.path(), "repo": "engine", "branch": "from-hook"}}),
+    );
+    assert!(r["key"].is_string(), "{r}");
+    let start = std::time::Instant::now();
+    let d = e.ask(json!({"id": 1, "op": "directory"}));
+    assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    let s = &d["sessions"][0];
+    assert_eq!(
+        (&s["repo"], &s["branch"]),
+        (&json!("engine"), &json!("from-hook")),
+        "{d}"
+    );
+}
+
+#[test]
+fn the_hook_reports_the_folders_repo_and_branch() {
+    let e = Env::new();
+    assert!(e.run(&["who"]).status.success());
+    let proj = tempfile::tempdir().unwrap();
+    let git = proj.path().join(".git");
+    std::fs::create_dir(&git).unwrap();
+    std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    std::fs::write(
+        git.join("config"),
+        "[remote \"origin\"]\n\turl = git@github.com:acme/engine.git\n",
+    )
+    .unwrap();
+    let p = os::process(std::process::id()).unwrap();
+    let payload =
+        json!({"session_id": "h1", "cwd": proj.path(), "hook_event_name": "SessionStart"});
+    let mut c = e.cmd(&["hook", "codex", "session-start"]);
+    let mut child = c
+        .env(
+            "LIGHTBULB_CONNECT_HOOK_CALLER",
+            format!("{}:{}", p.pid, p.birth_micros),
+        )
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    use std::io::Write;
+    write!(child.stdin.take().unwrap(), "{payload}").unwrap();
+    assert!(child.wait().unwrap().success());
+    let d = e.ask(json!({"id": 1, "op": "directory"}));
+    let s = &d["sessions"][0];
+    assert_eq!(
+        (&s["repo"], &s["branch"]),
+        (&json!("engine"), &json!("main")),
+        "{d}"
+    );
 }
 
 #[test]
@@ -72,7 +211,10 @@ fn send_from_terminal_to_a_session_prints_stored() {
     let key = e.session();
     let o = e.person(&["send", &key, "hello", "there", "--request-id", "r1"]);
     assert!(o.status.success(), "{}", err(&o));
-    assert_eq!(out(&o).trim(), "stored r1");
+    assert_eq!(
+        out(&o).trim(),
+        "Sent. The session sees it at its next step."
+    );
     // The sender was this terminal's name address, and the text kept its spaces.
     let r = e.ask(json!({"id": 1, "op": "receipt", "from": format!("{}/terminal", e.short()), "request_id": "r1"}));
     assert_eq!(r["receipt"]["state"], "stored");
@@ -82,7 +224,10 @@ fn send_from_terminal_to_a_session_prints_stored() {
     let o = e.person(&["send", "*", "all hands"]);
     let text = out(&o);
     assert_eq!(text.lines().count(), 1, "{text}{}", err(&o));
-    assert!(text.starts_with("stored ") && text.trim_end().ends_with(&key));
+    assert!(
+        text.starts_with("Sent. ") && text.trim_end().ends_with("(codex-1)"),
+        "{text}"
+    );
 }
 
 #[test]
@@ -134,13 +279,22 @@ fn receipt_prints_the_state() {
         .status
         .success());
     let o = e.run(&["receipt", "rc1"]);
+    assert_eq!(
+        out(&o).trim(),
+        "Sent. The session sees it at its next step."
+    );
+    let o = e.run(&["receipt", "rc1", "--json"]);
     let r: Value = serde_json::from_str(&out(&o)).unwrap();
     assert_eq!(
         (r["request_id"].as_str(), r["state"].as_str()),
         (Some("rc1"), Some("stored"))
     );
     let none = e.run(&["receipt", "nope"]);
-    assert!(!none.status.success() && err(&none).contains("no receipt"));
+    assert!(!none.status.success());
+    assert_eq!(
+        err(&none).trim(),
+        "No message nope was sent from this terminal."
+    );
 }
 
 #[test]
@@ -169,7 +323,12 @@ fn send_to_a_bare_name_reaches_listen() {
     let e = Env::new();
     e.session();
     let o = e.person(&["send", "carol", "bare hello", "--request-id", "b1"]);
-    assert_eq!(out(&o).trim(), "stored b1", "{}", err(&o));
+    assert_eq!(
+        out(&o).trim(),
+        "Sent. Waiting in the \"carol\" mailbox until someone reads it.",
+        "{}",
+        err(&o)
+    );
     let o = e.run(&["listen", "--as", "carol", "--once"]);
     assert!(out(&o).contains("bare hello"), "{}", err(&o));
 }
@@ -186,9 +345,12 @@ fn listen_once_prints_a_framed_message() {
     let o = e.run(&["listen", "--as", "ann", "--once"]);
     assert!(o.status.success(), "{}", err(&o));
     let text = out(&o);
-    // The framed text carries the request id and the body, not the raw JSON.
-    assert!(text.contains("first") && text.contains("q1"), "{text}");
-    assert!(!text.contains("\"text\""));
+    // Who it is from and the body, then how to answer; not the agents' frame or the JSON.
+    let short = e.short();
+    assert_eq!(
+        text,
+        format!("From You, at the terminal: first\nReply: lightbulb-connect send {short}/terminal \"…\" --reply-to q1\n")
+    );
     assert!(!e
         .run(&["listen", "--as", "no spaces", "--once"])
         .status
@@ -196,32 +358,43 @@ fn listen_once_prints_a_framed_message() {
 }
 
 #[test]
-fn an_unknown_subcommand_forwards_or_explains() {
+fn only_the_apps_own_commands_forward_and_the_rest_are_unknown() {
     let e = Env::new();
+    let unknown = |o: &Output, sub: &str| {
+        assert_eq!(o.status.code(), Some(2));
+        assert_eq!(
+            err(o).trim(),
+            format!("Unknown command: {sub}. Run lightbulb-connect --help.")
+        );
+        assert!(out(o).is_empty(), "{}", out(o));
+    };
     let missing = e
         .cmd(&["claude", "--resume"])
         .env("LIGHTBULB_CONNECT_DESKTOP", "/nonexistent/app")
         .output()
         .unwrap();
-    assert_eq!(missing.status.code(), Some(2));
-    assert!(err(&missing).contains("needs the Lightbulb app: thelightbulb.company/download"));
+    unknown(&missing, "claude");
 
     let app = e.home.path().join("fake-app");
     std::fs::write(&app, "#!/bin/sh\necho \"forwarded: $@\"\n").unwrap();
     std::fs::set_permissions(&app, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-    for sub in ["claude", "share", "frobnicate"] {
-        let o = e
-            .cmd(&[sub, "a", "--b"])
+    let run = |sub: &str| {
+        e.cmd(&[sub, "a", "--b"])
             .env("LIGHTBULB_CONNECT_DESKTOP", &app)
             .output()
-            .unwrap();
+            .unwrap()
+    };
+    // As the app reads its own CLI: `cli` first.
+    for sub in ["claude", "codex", "share"] {
+        let o = run(sub);
         assert_eq!(
             out(&o).trim(),
-            format!("forwarded: {sub} a --b"),
+            format!("forwarded: cli {sub} a --b"),
             "{}",
             err(&o)
         );
     }
+    unknown(&run("relay"), "relay");
 }
 
 #[test]
@@ -233,7 +406,17 @@ fn daemon_install_writes_the_plist_and_alias_without_touching_a_foreign_file() {
 
     let o = e.run(&["daemon", "--install"]);
     assert!(o.status.success(), "{}", err(&o));
-    assert!(out(&o).contains("not ours; left alone"), "{}", out(&o));
+    assert!(
+        out(&o).contains("Command: lightbulb-connect (\"lightbulb\" belongs to another program)"),
+        "{}",
+        out(&o)
+    );
+    assert_eq!(
+        std::fs::read_link(bin.join("lightbulb-connect")).unwrap(),
+        e.home
+            .path()
+            .join(".lightbulb/connect/bin/lightbulb-connect")
+    );
     // Under NO_LAUNCHCTL the line records the sequence a real run performs.
     assert!(out(&o).contains("would run: bootout gui/"), "{}", out(&o));
     assert!(out(&o).contains("; bootstrap gui/") && out(&o).contains("; kickstart -k gui/"));
@@ -271,7 +454,7 @@ fn daemon_install_writes_the_plist_and_alias_without_touching_a_foreign_file() {
     // A symlink pointing elsewhere is foreign too.
     std::fs::remove_file(bin.join("lightbulb")).unwrap();
     std::os::unix::fs::symlink("/usr/bin/true", bin.join("lightbulb")).unwrap();
-    assert!(out(&e.run(&["daemon", "--install"])).contains("not ours"));
+    assert!(out(&e.run(&["daemon", "--install"])).contains("belongs to another program"));
     assert_eq!(
         std::fs::read_link(bin.join("lightbulb")).unwrap().to_str(),
         Some("/usr/bin/true")
@@ -288,23 +471,45 @@ fn daemon_install_writes_the_plist_and_alias_without_touching_a_foreign_file() {
 }
 
 #[test]
-fn doctor_reports_what_is_missing() {
+fn doctor_reports_what_is_missing_and_the_fix() {
     // Nothing is installed in the temp home: doctor reports it and exits 1.
     let e = Env::new();
     let d = e.run(&["doctor"]);
     assert_eq!(d.status.code(), Some(1));
-    assert!(out(&d).contains("alias: missing") && out(&d).contains("daemon: missing"));
+    let text = out(&d);
+    assert!(text.contains("Background service   not running"), "{text}");
+    assert_eq!(
+        text.lines().last(),
+        Some("Run: lightbulb-connect setup"),
+        "{text}"
+    );
 }
 
 #[test]
-fn doctor_reports_a_foreign_alias_as_not_ours_not_missing() {
+fn doctor_checks_tools_too_and_names_the_command_to_type() {
     let e = Env::new();
+    std::fs::create_dir(e.home.path().join(".codex")).unwrap();
+    assert!(e.run(&["setup"]).status.success());
+    // The tools entry goes missing; the hooks stay.
+    std::fs::write(e.home.path().join(".codex/config.toml"), "").unwrap();
     let bin = e.home.path().join(".local/bin");
-    std::fs::create_dir_all(&bin).unwrap();
-    std::os::unix::fs::symlink("/usr/bin/true", bin.join("lightbulb")).unwrap();
-    let d = out(&e.run(&["doctor"]));
-    assert!(d.contains("alias: not ours (left alone)"), "{d}");
-    assert!(!d.contains("alias: missing"), "{d}");
+    std::fs::remove_file(bin.join("lightbulb")).unwrap();
+    std::os::unix::fs::symlink(
+        "/Applications/Lightbulb.app/Contents/MacOS/lightbulb-desktop",
+        bin.join("lightbulb"),
+    )
+    .unwrap();
+    let d = e.run(&["doctor"]);
+    let text = out(&d);
+    assert!(
+        text.contains("Codex                hooks only — tools missing (run setup)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Command name         \"lightbulb\" belongs to the Lightbulb app; type \"lightbulb-connect\""),
+        "{text}"
+    );
+    assert_eq!(d.status.code(), Some(1));
 }
 
 #[test]
@@ -347,6 +552,11 @@ fn send_from_an_agent_shell_sends_as_its_session_or_refuses() {
         .output()
         .unwrap();
     assert!(o.status.success(), "{}", err(&o));
+    assert!(
+        out(&o).starts_with("Sent as this Codex session.\n"),
+        "{}",
+        out(&o)
+    );
     let m = e.ask(json!({"id": 1, "op": "inbox", "key": format!("{}/bob", e.short())}));
     assert_eq!(m["messages"][0]["from"], key.as_str(), "{m}");
     assert!(m["messages"][0]["framed"]
@@ -443,13 +653,66 @@ fn setup_remove_also_stops_the_daemon_and_removes_the_job() {
     assert!(e.run(&["setup"]).status.success());
     let plist = h.join("Library/LaunchAgents/company.thelightbulb.connect.plist");
     assert!(plist.exists());
+    // A Plan A daemon still running on its old socket is told to stop.
+    let old = h.join(".lightbulb/network");
+    std::fs::create_dir_all(&old).unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(old.join("sock")).unwrap();
+    let told = std::thread::spawn(move || {
+        let (s, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(s).read_line(&mut line).unwrap();
+        line
+    });
     let o = e.run(&["setup", "--remove"]);
     assert!(o.status.success(), "{}", err(&o));
     assert!(!plist.exists());
+    assert!(told.join().unwrap().contains("\"op\":\"shutdown\""));
     assert!(
-        out(&o).contains("daemon stopped and launchd job removed"),
+        out(&o).contains("Lightbulb Connect is off. Your settings and messages are kept in"),
         "{}",
         out(&o)
+    );
+}
+
+#[test]
+fn setup_takes_another_name_when_lightbulb_is_taken_and_says_so() {
+    let e = Env::new();
+    let h = e.home.path();
+    std::fs::create_dir(h.join(".claude")).unwrap();
+    let app = json!({"mcpServers": {"lightbulb": {"command": "/Applications/Lightbulb.app/Contents/MacOS/lightbulb-desktop", "args": ["session-mcp"]}}});
+    std::fs::write(h.join(".claude.json"), app.to_string()).unwrap();
+    let o = e.run(&["setup"]);
+    assert!(o.status.success(), "{}{}", out(&o), err(&o));
+    let text = out(&o);
+    assert!(
+        text.contains("Claude Code: connected (hooks + tools as \"lightbulb-connect\" — another \"lightbulb\" tool server is already installed)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Lightbulb Connect is on.\n  Connected: Claude Code\n"),
+        "{text}"
+    );
+    let mcp: Value =
+        serde_json::from_str(&std::fs::read_to_string(h.join(".claude.json")).unwrap()).unwrap();
+    assert_eq!(
+        mcp["mcpServers"]["lightbulb"],
+        app["mcpServers"]["lightbulb"]
+    );
+    assert_eq!(
+        mcp["mcpServers"]["lightbulb-connect"]["args"],
+        json!(["mcp", "--server-name", "lightbulb-connect"])
+    );
+
+    // Both names taken: hooks only, and setup says why and fails.
+    let mut both = app.clone();
+    both["mcpServers"]["lightbulb-connect"] = json!({"command": "/usr/bin/true"});
+    std::fs::write(h.join(".claude.json"), both.to_string()).unwrap();
+    let o = e.run(&["setup"]);
+    assert_eq!(o.status.code(), Some(1), "{}", out(&o));
+    assert!(
+        err(&o).contains("Claude Code has hooks but no tools"),
+        "{}",
+        err(&o)
     );
 }
 
@@ -471,8 +734,9 @@ fn folder_off_hides_sessions_after_reload() {
     let o = b.person(&["send", &s1, "hello"]);
     let line = out(&o);
     assert!(
-        line.contains(" stored on mac (tier next_step)")
-            && line.contains("). Receipt: lightbulb-connect receipt "),
+        line.starts_with(
+            "Sent. Stored on mac for the session's next step. Check: lightbulb-connect receipt "
+        ),
         "{line}{}",
         err(&o)
     );

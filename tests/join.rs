@@ -142,6 +142,14 @@ fn ask_ticket_admits_only_after_allow() {
         until(10, "J1 is listed", || requests(&a).len() == 1);
         let r = &requests(&a)[0];
         assert_eq!(r["id"], "J1");
+        // `held` lists it with the command that answers it.
+        let o = a.detached(&[EXE, "held"], "");
+        assert_eq!(
+            out(&o),
+            "J1  bob (mbp) wants to join — lightbulb-connect approve J1\n",
+            "{}",
+            err(&o)
+        );
         assert_eq!(r["candidate"], b.identity().key);
         assert_eq!((&r["name"], &r["computer"]), (&json!("bob"), &json!("mbp")));
         assert_eq!((members(&a).len(), members(&b).len()), (1, 1));
@@ -151,10 +159,15 @@ fn ask_ticket_admits_only_after_allow() {
         assert!(o.status.success(), "{}", err(&o));
         assert_eq!(
             out(&o),
-            "Waiting for an admin to allow this...\nConnected as bob (mbp). Team \"prasiddha\": 2 computers online.\n"
+            "Asking whoever sent the link to allow this computer… (they get a prompt; this waits up to 10 minutes)\n\
+             Connected as bob (mbp). Team \"prasiddha\": 2 computers online.\n\
+             Your agents here can now see and message the team's agents. Try: lightbulb-connect who --all\n\
+             Until both computers sign in, your other computer counts as another person and its first message needs your Allow.\n"
         );
     });
     converged(&a, &b, 2);
+    let o = a.detached(&[EXE, "held"], "");
+    assert_eq!(out(&o), "No messages are waiting for your Allow.\n");
     // A second answer finds nothing open.
     let o = a.detached(&[EXE, "decline", "J1"], "");
     assert!(!o.status.success());

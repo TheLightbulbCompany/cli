@@ -2,9 +2,7 @@
 //! (`[hooks.state."<hooks.json>:<event>:<group>:0"]`; Codex skips an untrusted group
 //! silently), and `[mcp_servers.<name>]` in the same `config.toml`.
 
-use super::{
-    edit_json, edit_toml, set_hook_group, set_toml_server, toml_table, AgentReport, Ctx, Owner,
-};
+use super::{edit_json, edit_toml, set_hook_group, set_toml_server, toml_table, AgentReport, Ctx};
 use crate::hook::{Event, EVENTS};
 use crate::Result;
 use serde_json::json;
@@ -42,10 +40,10 @@ pub(super) fn configure(ctx: &Ctx, r: &mut AgentReport) -> Result<()> {
     })?;
     r.notes.append(&mut shared);
     let config = dir.join("config.toml");
-    let mut owner = Owner::Absent;
+    let mut fresh = false;
     edit_toml(&config, !ctx.remove, r, |doc| {
         let args = toml_edit::Array::from_iter(ctx.mcp_args());
-        owner = set_toml_server(
+        set_toml_server(
             ctx,
             doc,
             &[("command", ctx.exe.into()), ("args", args.into())],
@@ -58,7 +56,11 @@ pub(super) fn configure(ctx: &Ctx, r: &mut AgentReport) -> Result<()> {
                         "state",
                         true,
                     )?;
-                    toml_table(state, key, false)?["trusted_hash"] = toml_edit::value(hash);
+                    let t = toml_table(state, key, false)?;
+                    if t.get("trusted_hash").and_then(toml_edit::Item::as_str) != Some(hash) {
+                        t["trusted_hash"] = toml_edit::value(hash);
+                        fresh = true;
+                    }
                 }
                 None => {
                     if let Some(state) = doc
@@ -73,13 +75,7 @@ pub(super) fn configure(ctx: &Ctx, r: &mut AgentReport) -> Result<()> {
         }
         Ok(())
     })?;
-    if owner == Owner::Foreign {
-        r.notes.push(ctx.foreign_note(&config));
-    }
-    if !ctx.remove && !trust.is_empty() && r.wrote.contains(&config) {
-        r.notes
-            .push("Codex hooks trusted on your behalf (Codex would otherwise ask once)".into());
-    }
+    r.trusted |= fresh;
     Ok(())
 }
 

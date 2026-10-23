@@ -41,9 +41,18 @@ pub fn legacy_canonical(home: &Path) -> PathBuf {
     home.join(".lightbulb/network/bin/lightbulb-network")
 }
 
-/// legacy (Plan A install): stops and removes the old launchd job and deletes the old binary.
+/// legacy (Plan A install): stops the old daemon (its socket, then its launchd job) and
+/// removes the job and the old binary.
 pub fn legacy_uninstall(home: &Path) -> Result<()> {
     if cfg!(target_os = "macos") {
+        // A bootout alone leaves a daemon whose job is already gone running.
+        if let Ok(mut s) =
+            std::os::unix::net::UnixStream::connect(home.join(".lightbulb/network/sock"))
+        {
+            let _ = s.set_read_timeout(Some(Duration::from_secs(1)));
+            let _ = writeln!(s, r#"{{"id":1,"op":"shutdown"}}"#);
+            let _ = std::io::Read::read(&mut s, &mut [0; 64]);
+        }
         if use_launchctl() {
             let target = format!("gui/{}/{LEGACY_LABEL}", unsafe { libc::getuid() });
             launchctl(&["bootout", &target]);
@@ -72,20 +81,105 @@ fn connect() -> Result<Conn> {
     Conn::open()
 }
 
-/// `ask` that turns a refusal into an error.
+/// `ask` that turns a refusal into an error: a sentence (`refusal`).
 fn ask(conn: &mut Conn, op: &str, body: Value) -> Result<Value> {
     let r = conn.call(op, body)?;
     if r["ok"] == true {
         Ok(r)
     } else {
-        Err(format!(
-            "{op}: {}",
-            r["reason"]
-                .as_str()
-                .or(r["error"].as_str())
-                .unwrap_or("failed")
-        )
-        .into())
+        Err(refusal(&r).into())
+    }
+}
+
+/// A daemon refusal `r` as a sentence for the person.
+fn refusal(r: &Value) -> String {
+    let code = r["reason"].as_str().or(r["error"].as_str());
+    match code.unwrap_or("failed") {
+        "not_member" => "This computer is not in the network.".into(),
+        "not_a_person" => "Run this from your own terminal, not from an agent.".into(),
+        "not_admin" => "Only the founder and admins can do that.".into(),
+        "name_taken" => "That name is taken by your other computer's session.".into(),
+        c => format!(
+            "Lightbulb Connect could not do that ({}).",
+            c.replace('_', " ")
+        ),
+    }
+}
+
+/// The command name that runs this program here: `lightbulb` when that link is ours, else
+/// `lightbulb-connect` (the Lightbulb app may own `lightbulb`).
+pub fn command() -> &'static str {
+    let ours = home().is_ok_and(|h| {
+        fs::read_link(h.join(".local/bin/lightbulb")).is_ok_and(|t| t == canonical(&h))
+    });
+    if ours {
+        "lightbulb"
+    } else {
+        "lightbulb-connect"
+    }
+}
+
+/// `addr` as the daemon takes it: a `who` handle (`codex-1`) as its session id, and
+/// `<member name>/<rest>` as `<member>/<rest>`; an id or a bare name as given.
+fn address(conn: &mut Conn, addr: &str) -> Result<String> {
+    let Some((m, rest)) = addr.split_once('/') else {
+        let handle = addr
+            .rsplit_once('-')
+            .is_some_and(|(_, n)| n.parse::<u32>().is_ok());
+        if handle {
+            let all = ask(conn, "directory", json!({}))?["sessions"].clone();
+            let hit = all
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|s| s["handle"] == addr);
+            if let Some(id) = hit.and_then(|s| s["session_id"].as_str()) {
+                return Ok(id.into());
+            }
+        }
+        return Ok(addr.into());
+    };
+    let team = ask(conn, "team.get", json!({}))?;
+    let members = team["members"].as_array().cloned().unwrap_or_default();
+    let field = |v: &Value, k: &str| v[k].as_str().unwrap_or_default().to_string();
+    if members.iter().any(|v| v["short"] == m) {
+        return Ok(addr.into());
+    }
+    let named: Vec<&Value> = members
+        .iter()
+        .filter(|v| field(v, "name").eq_ignore_ascii_case(m))
+        .collect();
+    match named[..] {
+        [one] => Ok(format!("{}/{rest}", field(one, "short"))),
+        [] => {
+            let names: Vec<String> = members.iter().map(|v| cell(&field(v, "name"))).collect();
+            Err(format!(
+                "No teammate called \"{}\". Teammates: {} (see {} team).",
+                cell(m),
+                names.join(", "),
+                command()
+            )
+            .into())
+        }
+        _ => {
+            let ids: Vec<String> = named
+                .iter()
+                .map(|v| {
+                    format!(
+                        "{} on {}: {}/{rest}",
+                        cell(m),
+                        cell(&field(v, "computer")),
+                        field(v, "short")
+                    )
+                })
+                .collect();
+            Err(format!(
+                "More than one teammate is called \"{}\". Use one of: {}",
+                cell(m),
+                ids.join("; ")
+            )
+            .into())
+        }
     }
 }
 
@@ -98,68 +192,67 @@ fn cell(s: &str) -> String {
         .collect()
 }
 
-/// `who`'s columns: header, then the `sessions` field it shows.
-const WHO: [(&str, &str); 6] = [
-    ("session", "key"),
-    ("agent", "provider"),
-    ("folder", "cwd"),
-    ("status", "status"),
-    ("tier", "tier"),
-    ("doing", "doing"),
-];
-/// `who --all`'s columns, from `directory` records (this computer's first).
-const WHO_ALL: [(&str, &str); 8] = [
-    ("session", "session_id"),
-    ("person", "person"),
-    ("computer", "computer"),
-    ("agent", "agent"),
-    ("folder", "cwd"),
-    ("status", "status"),
-    ("tier", "tier"),
-    ("doing", "doing"),
-];
+/// `rows` (the first the header) as aligned columns.
+fn table(rows: &[Vec<String>]) {
+    let n = rows.first().map_or(0, Vec::len);
+    let widths: Vec<usize> = (0..n)
+        .map(|i| rows.iter().map(|r| r[i].chars().count()).max().unwrap_or(0))
+        .collect();
+    for r in rows {
+        let line: Vec<String> = (0..n).map(|i| format!("{:<1$}", r[i], widths[i])).collect();
+        println!("{}", line.join("  ").trim_end());
+    }
+}
 
-/// `who [--all]`: this computer's sessions; with `all`, every teammate's too (`directory`).
+/// `who [--all]`: this computer's sessions by handle; with `all`, every teammate's too
+/// (`directory`). Ids only with `--json`.
 pub fn who(as_json: bool, all: bool) -> Result<i32> {
     let mut conn = connect()?;
-    let (op, columns) = if all {
-        ("directory", &WHO_ALL[..])
-    } else {
-        ("sessions", &WHO[..])
-    };
+    let op = if all { "directory" } else { "sessions" };
     let sessions = ask(&mut conn, op, json!({}))?["sessions"].clone();
     if as_json {
         println!("{sessions}");
         return Ok(0);
     }
-    let mut rows = vec![columns
-        .iter()
-        .map(|(h, _)| h.to_string())
-        .collect::<Vec<_>>()];
-    for s in sessions.as_array().into_iter().flatten() {
+    let list = sessions.as_array().cloned().unwrap_or_default();
+    if list.is_empty() {
+        println!("No sessions yet. Open Claude Code, Codex, Cursor or Grok and they appear here.");
+        return Ok(0);
+    }
+    let header: &[&str] = if all {
+        &[
+            "Name", "Person", "Computer", "Agent", "Folder", "Status", "Doing",
+        ]
+    } else {
+        &["Name", "Agent", "Folder", "Status", "Doing"]
+    };
+    let mut rows = vec![header.iter().map(|h| h.to_string()).collect::<Vec<_>>()];
+    for s in &list {
         let text = |f: &str| s[f].as_str().map(cell).filter(|t| !t.is_empty());
-        rows.push(
-            columns
-                .iter()
-                .map(|(_, f)| match *f {
-                    "doing" => text("doing").or(text("title")),
-                    // A teammate's session has no folder here: its repo instead.
-                    "cwd" => text("cwd").or(text("repo")),
-                    f => text(f),
-                })
-                .map(Option::unwrap_or_default)
-                .collect(),
-        );
+        let agent = text("agent").or(text("provider")).unwrap_or_default();
+        let gets = match s["tier"].as_str() {
+            Some("push") => "instantly",
+            Some("next_step") => "at its next step",
+            _ => "when it checks",
+        };
+        let status = match s["status"].as_str() {
+            Some("live") => "busy",
+            _ => "idle",
+        };
+        let mut row = vec![text("handle").unwrap_or_default()];
+        if all {
+            row.extend([text("person"), text("computer")].map(Option::unwrap_or_default));
+        }
+        row.extend([
+            crate::frame::agent_name(&agent),
+            // A teammate's session has no folder here: its repo instead.
+            text("cwd").or(text("repo")).unwrap_or_default(),
+            format!("{status}, gets messages {gets}"),
+            text("doing").or(text("title")).unwrap_or_default(),
+        ]);
+        rows.push(row);
     }
-    let widths: Vec<usize> = (0..columns.len())
-        .map(|i| rows.iter().map(|r| r[i].chars().count()).max().unwrap_or(0))
-        .collect();
-    for r in rows {
-        let line: Vec<String> = (0..columns.len())
-            .map(|i| format!("{:<1$}", r[i], widths[i]))
-            .collect();
-        println!("{}", line.join("  ").trim_end());
-    }
+    table(&rows);
     Ok(0)
 }
 
@@ -196,35 +289,51 @@ pub fn send(
     }
     let mut conn = connect()?;
     let short = conn.member()?;
+    let from = match from {
+        Some(f) => Some(address(&mut conn, &f)?),
+        None => None,
+    };
+    let target = &address(&mut conn, target)?;
     let from = if identity {
         // An agent's shell speaks as its own session, never as the terminal or another one.
-        calling_session(&mut conn)
+        let own = calling_session(&mut conn)
             .filter(|own| from.as_ref().is_none_or(|f| f == own))
-            .ok_or("send from an agent's shell must name --from <session_id>, your own session")?
+            .ok_or("send from an agent's shell must name --from <session_id>, your own session")?;
+        let provider = own.split_once('/').and_then(|(_, r)| r.split_once(':'));
+        let agent = crate::frame::agent_name(provider.map_or("", |(p, _)| p));
+        println!("Sent as this {agent} session.");
+        own
     } else {
         from.unwrap_or_else(|| format!("{short}/terminal"))
     };
     let rid = request_id.unwrap_or_else(|| ulid::Ulid::generate().to_string());
-    let targets: Vec<(String, String)> = if group {
+    // (address, its handle, request id)
+    let targets: Vec<(String, String, String)> = if group {
         let sessions = ask(&mut conn, "sessions", json!({}))?["sessions"].clone();
         let prefix = target.trim_end_matches('*');
         sessions
             .as_array()
             .into_iter()
             .flatten()
-            .filter_map(|s| s["key"].as_str())
-            .filter(|k| target == "*" || k.starts_with(prefix))
+            .filter(|s| {
+                s["key"]
+                    .as_str()
+                    .is_some_and(|k| target == "*" || k.starts_with(prefix))
+            })
             .enumerate()
-            .map(|(i, k)| (k.to_string(), format!("{rid}.{}", i + 1)))
+            .map(|(i, s)| {
+                let at = |f: &str| s[f].as_str().unwrap_or_default().to_string();
+                (at("key"), at("handle"), format!("{rid}.{}", i + 1))
+            })
             .collect()
     } else {
-        vec![(target.to_string(), rid)]
+        vec![(target.to_string(), String::new(), rid)]
     };
     if targets.is_empty() {
-        return Err("no live sessions match".into());
+        return Err("No live session matches.".into());
     }
     let mut code = 0;
-    for (to, rid) in targets {
+    for (to, handle, rid) in targets {
         let r = ask(
             &mut conn,
             "send",
@@ -232,24 +341,77 @@ pub fn send(
                 "reply_to": reply_to, "wait": true }),
         )?;
         let receipt = &r["receipt"];
-        let state = receipt["state"].as_str().unwrap_or("unknown");
-        if state == "refused" {
+        if receipt["state"] == "refused" {
             code = 1;
         }
-        let line = crate::mail::receipt_note(receipt, Some(&rid)).unwrap_or_else(|| {
-            let mut line = match receipt["reason"].as_str() {
-                Some(reason) if state == "refused" => format!("refused: {reason}"),
-                _ => state.to_string(),
-            };
-            line.push_str(&format!(" {rid}"));
-            if group {
-                line.push_str(&format!(" {to}"));
-            }
-            line
-        });
-        println!("{line}");
+        let line = said(receipt, Some(&to), &rid);
+        if group {
+            println!("{line} ({})", cell(&handle));
+        } else {
+            println!("{line}");
+        }
     }
     Ok(code)
+}
+
+/// What receipt `r` of message `rid` (to `to`, when known) means, as a sentence for the person
+/// who sent it.
+fn said(r: &Value, to: Option<&str>, rid: &str) -> String {
+    let at = |f: &str| r[f].as_str().map(cell).unwrap_or_default();
+    let (person, computer) = (at("person"), at("where"));
+    let remote = r["person"].is_string();
+    let check = format!(" Check: {} receipt {rid}", command());
+    let name = to.map(|t| t.split_once('/').map_or(t, |(_, n)| n));
+    match at("state").as_str() {
+        "refused" if at("reason") == "loop" => {
+            format!(
+                "Not sent: {}.",
+                crate::mail::receipt_note(r).unwrap_or_default()
+            )
+        }
+        "refused" => format!(
+            "Not sent: {}.",
+            match at("reason").as_str() {
+                "policy" => "they do not take messages from you".to_string(),
+                "declined" => "they declined it".into(),
+                "not_member" => "that computer is not in your team".into(),
+                "request_id_reused" => "that request id was used for another message".into(),
+                "unsupported" => "their computer cannot take it".into(),
+                other => other.replace('_', " "),
+            }
+        ),
+        "held" => format!("Sent. {person} has to allow it first (they see a prompt).{check}"),
+        "queued" if remote => {
+            let until = crate::date::local_time(r["until"].as_i64().unwrap_or_default());
+            let why = if r["online"] == true {
+                "has not confirmed it yet"
+            } else {
+                "is offline"
+            };
+            format!("Not delivered yet: {computer} {why}. Lightbulb Connect keeps trying until {until}.{check}")
+        }
+        "queued" => format!("Not delivered yet.{check}"),
+        "stored" if remote => {
+            format!("Sent. Stored on {computer} for the session's next step.{check}")
+        }
+        "stored" if computer == "recipient" => "Sent. The session sees it at its next step.".into(),
+        "stored" => match name {
+            Some(n) if !n.contains(':') => {
+                format!(
+                    "Sent. Waiting in the \"{}\" mailbox until someone reads it.",
+                    cell(n)
+                )
+            }
+            Some(_) => "Sent. It waits until that session is back.".into(),
+            None => "Sent. It waits until it is read.".into(),
+        },
+        "delivered" if remote => format!("Delivered to {person} on {computer}."),
+        "delivered" => "Delivered.".into(),
+        "read" if remote => format!("Read by {person} on {computer}."),
+        "read" => "Read.".into(),
+        "expired" => "Not delivered: the other computer could not be reached for 24 hours.".into(),
+        other => format!("Sent ({other})."),
+    }
 }
 
 pub fn listen(name: &str, once: bool) -> Result<i32> {
@@ -282,7 +444,19 @@ fn listen_on(key: &str, once: bool) -> Result<()> {
         let r = ask(&mut conn, "inbox", json!({ "key": key, "wait_secs": 60 }))?;
         let messages = r["messages"].as_array().cloned().unwrap_or_default();
         for m in &messages {
-            println!("{}", m["framed"].as_str().unwrap_or_default());
+            let at = |f: &str| m[f].as_str().unwrap_or_default();
+            // A teammate's text, printed to a terminal: line breaks kept, nothing it would act on.
+            let text: String = at("text")
+                .chars()
+                .filter(|c| *c == '\n' || crate::label::printable(*c))
+                .collect();
+            println!("From {}: {text}", cell(at("label")));
+            println!(
+                "Reply: {} send {} \"…\" --reply-to {}",
+                command(),
+                cell(at("from")),
+                cell(at("request_id"))
+            );
         }
         if once && !messages.is_empty() {
             return Ok(());
@@ -290,20 +464,28 @@ fn listen_on(key: &str, once: bool) -> Result<()> {
     }
 }
 
-pub fn receipt(request_id: &str, from: Option<String>) -> Result<i32> {
+/// `receipt <id> [--from <addr>] [--json]`: what became of a message, as a sentence (`said`).
+pub fn receipt(request_id: &str, from: Option<String>, as_json: bool) -> Result<i32> {
     let mut conn = connect()?;
-    let from = match from {
-        Some(f) => f,
-        None => format!("{}/terminal", conn.member()?),
+    let (from, whence) = match from {
+        Some(f) => (address(&mut conn, &f)?, cell(&f)),
+        None => (
+            format!("{}/terminal", conn.member()?),
+            "this terminal".into(),
+        ),
     };
     let r = conn.call("receipt", json!({ "from": from, "request_id": request_id }))?;
     if r["ok"] == true {
-        println!("{}", r["receipt"]);
+        if as_json {
+            println!("{}", r["receipt"]);
+        } else {
+            println!("{}", said(&r["receipt"], None, request_id));
+        }
         Ok(0)
     } else if r["error"] == "not_found" {
-        Err(format!("no receipt for {request_id} from {from}").into())
+        Err(format!("No message {} was sent from {whence}.", cell(request_id)).into())
     } else {
-        Err(format!("receipt: {r}").into())
+        Err(refusal(&r).into())
     }
 }
 
@@ -352,15 +534,12 @@ pub fn folder(path: &str, on: bool) -> Result<i32> {
 
 // ---- team -------------------------------------------------------------------------------
 
-/// Prints the text `texts` maps `r`'s error code to (`not_member`'s shared text, else
-/// `"{verb}: {code}"`, for any other code);
-/// returns the exit code 1.
-fn refuse(r: &Value, texts: &[(&str, String)], verb: &str) -> Result<i32> {
+/// Prints the text `texts` maps `r`'s error code to (else `refusal`'s); returns the exit code 1.
+fn refuse(r: &Value, texts: &[(&str, String)]) -> Result<i32> {
     let code = r["error"].as_str().unwrap_or_default();
     match texts.iter().find(|(c, _)| *c == code) {
         Some((_, text)) => eprintln!("{text}"),
-        None if code == "not_member" => eprintln!("This computer is not in the network."),
-        None => eprintln!("{verb}: {code}"),
+        None => eprintln!("{}", refusal(r)),
     }
     Ok(1)
 }
@@ -374,9 +553,13 @@ pub fn invite(mode: Invite) -> Result<i32> {
     let r = connect()?.call("team.invite", json!({ "mode": mode }))?;
     if r["ok"] != true {
         let text = "Only the founder and admins can make an open link.".to_string();
-        return refuse(&r, &[("not_admin", text)], "invite");
+        return refuse(&r, &[("not_admin", text)]);
     }
     let line = r["line"].as_str().unwrap_or_default();
+    println!(
+        "Send this link to the person (or paste it on your other computer): {} join '<link>'",
+        command()
+    );
     match mode {
         Invite::Once => {
             let at = crate::date::utc(r["expires_at"].as_i64().unwrap_or_default());
@@ -401,7 +584,7 @@ pub fn join(link: &str, name: Option<String>, kind: &str, proof: Option<String>)
     let name = name.unwrap_or_else(daemon::user_name);
     let mut conn = connect()?;
     if crate::ticket::decode(link).is_ok_and(|t| t.mode == "ask") {
-        println!("Waiting for an admin to allow this...");
+        println!("Asking whoever sent the link to allow this computer… (they get a prompt; this waits up to 10 minutes)");
     }
     conn.wait_up_to(Duration::from_secs(660))?;
     let r = ask(
@@ -418,12 +601,17 @@ pub fn join(link: &str, name: Option<String>, kind: &str, proof: Option<String>)
                 .to_string();
             let n = r["online"].as_u64().unwrap_or(1);
             println!("Connected as {name} ({computer}). Team \"{team}\": {n} computers online.");
+            println!(
+                "Your agents here can now see and message the team's agents. Try: {} who --all",
+                command()
+            );
+            println!("Until both computers sign in, your other computer counts as another person and its first message needs your Allow.");
             return Ok(0);
         }
         (Some("waiting"), _) => "No one has answered yet. Run the same command again to keep asking.".to_string(),
-        (_, Some(admission::ALREADY_IN_TEAM)) => format!("You are in \"{team}\". Leave it first: lightbulb-connect leave"),
+        (_, Some(admission::ALREADY_IN_TEAM)) => format!("You are in \"{team}\". Leave it first: {} leave", command()),
         (_, Some(admission::NAME_TAKEN)) => format!(
-            "The name \"{name}\" is already used in this network. Try: lightbulb-connect join '{link}' --name {name}-2"
+            "The name \"{name}\" is already used in this network. Try: {} join '{link}' --name {name}-2", command()
         ),
         (_, Some(admission::UNREACHABLE)) => "No one from this network is online right now. Ask them to open their laptop, then run the same command again. Your key is ready; nothing was lost.".to_string(),
         (_, Some(admission::DECLINED)) => "Your request to join was declined.".to_string(),
@@ -431,7 +619,10 @@ pub fn join(link: &str, name: Option<String>, kind: &str, proof: Option<String>)
         (_, Some(admission::YOUR_COMPUTER_OFFLINE)) => "Open your other computer, then run the same command again.".to_string(),
         (_, Some(admission::BAD_TICKET)) => "This invite link does not work. Ask for a new one.".to_string(),
         (_, Some(admission::EXPIRED_TICKET)) => "This invite link has expired. Ask for a new one.".to_string(),
-        (_, reason) => format!("join: {}", reason.unwrap_or("refused")),
+        (_, reason) => format!(
+            "The team refused this computer ({}).",
+            reason.unwrap_or("refused").replace('_', " ")
+        ),
     };
     eprintln!("{text}");
     Ok(1)
@@ -516,7 +707,10 @@ pub fn signin() -> Result<i32> {
     // `proof::parse` let only plain text in.
     let name = r["name"].as_str().unwrap_or_default();
     if r["solo"] == true {
-        println!("Signed in as {name}. To join your network, paste its join line: lightbulb-connect join '<link>'");
+        println!(
+            "Signed in as {name}. To join your network, paste its join line: {} join '<link>'",
+            command()
+        );
     } else {
         println!("Signed in as {name}.");
     }
@@ -553,7 +747,7 @@ pub fn answer(request: &str, allow: bool, always: bool) -> Result<i32> {
             (ipc::BAD_REQUEST, always_text.into()),
         ];
         let texts = &texts[..if held { 3 } else { 2 }];
-        return refuse(&r, texts, if allow { "approve" } else { "decline" });
+        return refuse(&r, texts);
     }
     if held {
         println!("{} {request}.", if allow { "Allowed" } else { "Declined" });
@@ -574,18 +768,46 @@ pub fn answer(request: &str, allow: bool, always: bool) -> Result<i32> {
     Ok(0)
 }
 
-/// `held`: the held messages, one per line.
+/// `held`: the join requests and held messages waiting for an Allow, one per line with the
+/// command that allows it; "not verified" is explained once.
 pub fn held() -> Result<i32> {
-    let r = ask(&mut connect()?, "holds", json!({}))?;
-    for h in r["holds"].as_array().into_iter().flatten() {
-        let f = |k: &str| h[k].as_str().map(cell).unwrap_or_default();
-        println!(
-            "{}  {} -> {}  \"{}\"",
-            f("id"),
-            f("label"),
-            f("target_session"),
-            f("preview")
-        );
+    let mut conn = connect()?;
+    let joins = ask(&mut conn, "team.join_requests", json!({}))?;
+    let holds = ask(&mut conn, "holds", json!({}))?;
+    let cmd = command();
+    let f = |v: &Value, k: &str| v[k].as_str().map(cell).unwrap_or_default();
+    let mut lines: Vec<String> = joins["requests"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|j| {
+            let id = f(j, "id");
+            let (name, computer) = (f(j, "name"), f(j, "computer"));
+            format!("{id}  {name} ({computer}) wants to join — {cmd} approve {id}")
+        })
+        .collect();
+    for h in holds["holds"].as_array().into_iter().flatten() {
+        let id = f(h, "id");
+        let (who, to, text) = (f(h, "label"), f(h, "target_session"), f(h, "preview"));
+        lines.push(format!(
+            "{id}  {who} -> {to}  \"{text}\" — {cmd} approve {id}"
+        ));
+    }
+    if lines.is_empty() {
+        println!("No messages are waiting for your Allow.");
+    }
+    let mut explained = false;
+    for line in lines {
+        let unverified = " (not verified)";
+        if !explained && line.contains(unverified) {
+            explained = true;
+            println!(
+                "{}",
+                line.replacen(unverified, " (not verified — they have not signed in)", 1)
+            );
+        } else {
+            println!("{line}");
+        }
     }
     Ok(0)
 }
@@ -593,6 +815,12 @@ pub fn held() -> Result<i32> {
 /// `policy [<person> accept|hold|refuse]`: lists the policy (rows the bridge set marked so),
 /// or sets `<person>` (a `ws:<id>` workspace in `cloud_of`, anyone else in `people`).
 pub fn policy(person: Option<String>, value: Option<String>) -> Result<i32> {
+    if value
+        .as_deref()
+        .is_some_and(|v| !["accept", "hold", "refuse"].contains(&v))
+    {
+        return Err("policy takes accept, hold or refuse.".into());
+    }
     let mut conn = connect()?;
     let p = match (person, value) {
         (Some(pid), Some(v)) => ask(
@@ -602,42 +830,73 @@ pub fn policy(person: Option<String>, value: Option<String>) -> Result<i32> {
         )?,
         (None, None) => ask(&mut conn, "policy.get", json!({}))?,
         _ => {
-            eprintln!("Usage: lightbulb-connect policy [<person> accept|hold|refuse]");
+            let cmd = command();
+            eprintln!("Usage: {cmd} policy [<person> accept|hold|refuse]\n  <person> is a person id as {cmd} policy lists it (ws:<id> for a workspace's agents).\n  Example: {cmd} policy ws:acme accept");
             return Ok(2);
         }
     };
     let by = |key: String| match p["set_by"][&key].as_str() {
-        Some("bridge") => "  (set_by: bridge)",
+        Some("bridge") => " (set by the Lightbulb app)",
         _ => "",
     };
-    let on = p["agents_send_without_asking"] == true;
+    let on = if p["agents_send_without_asking"] == true {
+        "yes"
+    } else {
+        "no"
+    };
     println!(
-        "agents_send_without_asking: {on}{}",
+        "Agents may message teammates without asking you: {on}.{}",
         by(crate::policy::SWITCH.into())
     );
     for scope in ["people", "cloud_of"] {
         for (pid, v) in p[scope].as_object().into_iter().flatten() {
-            let v = v.as_str().unwrap_or_default();
-            println!("{scope} {}: {v}{}", cell(pid), by(format!("{scope}:{pid}")));
+            let v = match v.as_str() {
+                Some("accept") => "accepted",
+                Some("hold") => "held for your Allow",
+                Some("refuse") => "refused",
+                _ => "unknown",
+            };
+            println!(
+                "Messages from {}: {v}.{}",
+                cell(pid),
+                by(format!("{scope}:{pid}"))
+            );
         }
     }
     Ok(0)
 }
 
-/// `team`: the team's name and members.
+/// `team`: the team's name and members, this computer first as `You`; a member's address only
+/// where its name is shared (what `send` then needs).
 pub fn team() -> Result<i32> {
-    let t = ask(&mut connect()?, "team.get", json!({}))?;
-    println!("{}", t["name"].as_str().unwrap_or_default());
-    for m in t["members"].as_array().into_iter().flatten() {
+    let mut conn = connect()?;
+    let me = conn.member()?;
+    let t = ask(&mut conn, "team.get", json!({}))?;
+    let mut members = t["members"].as_array().cloned().unwrap_or_default();
+    members.sort_by_key(|m| m["short"] != me.as_str());
+    let n = members.len();
+    let s = if n == 1 { "" } else { "s" };
+    println!(
+        "Team \"{}\" — {n} computer{s}",
+        cell(t["name"].as_str().unwrap_or_default())
+    );
+    for m in &members {
         let f = |k: &str| m[k].as_str().map(cell).unwrap_or_default();
-        println!(
-            "  {}  {}  {}  {}",
-            f("name"),
-            f("computer"),
-            f("role"),
-            f("short")
-        );
+        let name = f("name");
+        let mut line = if m["short"] == me.as_str() {
+            format!("  You ({name}) · {} · {}", f("computer"), f("role"))
+        } else {
+            format!("  {name} · {} · {}", f("computer"), f("role"))
+        };
+        if m["online"] == false {
+            line.push_str(" · offline");
+        }
+        if members.iter().filter(|o| o["name"] == m["name"]).count() > 1 {
+            line.push_str(&format!(" · address: {}", f("short")));
+        }
+        println!("{line}");
     }
+    println!("Invite someone: {} invite", command());
     Ok(0)
 }
 
@@ -652,7 +911,7 @@ pub fn admin(name: &str, founder: bool) -> Result<i32> {
             ),
             ("not_found", format!("No member called {name}.")),
         ];
-        return refuse(&r, &texts, "admin");
+        return refuse(&r, &texts);
     }
     let n = r["name"].as_str().unwrap_or(name);
     if founder {
@@ -675,7 +934,7 @@ pub fn remove(name: &str) -> Result<i32> {
             ),
             ("not_found", format!("No member called {name}.")),
         ];
-        return refuse(&r, &texts, "remove");
+        return refuse(&r, &texts);
     }
     let n = r["name"].as_str().unwrap_or(name);
     let line = r["line"].as_str().unwrap_or_default();
@@ -702,8 +961,11 @@ pub fn leave() -> Result<i32> {
     }
     let r = conn.call("team.leave", json!({}))?;
     if r["ok"] != true {
-        let text = "You are the founder. Name a new founder first: lightbulb-connect admin <name> --founder";
-        return refuse(&r, &[("founder_must_transfer", text.to_string())], "leave");
+        let text = format!(
+            "You are the founder. Name a new founder first: {} admin <name> --founder",
+            command()
+        );
+        return refuse(&r, &[("founder_must_transfer", text)]);
     }
     println!("Left \"{name}\". This computer is on its own network again.");
     if r["told"] == false {
@@ -712,22 +974,34 @@ pub fn leave() -> Result<i32> {
     Ok(0)
 }
 
-/// Hands an unowned subcommand to the Lightbulb app's binary (replacing this process), or says
-/// what is needed.
+/// The Lightbulb app's own CLI verbs that this program does not own: `forward` hands them on.
+const APP_VERBS: [&str; 3] = ["claude", "codex", "share"];
+
+/// Hands one of the app's verbs to the Lightbulb app's binary as its CLI (`cli` first, as the
+/// app reads it), replacing this process; anything else, or no app, is an unknown command.
 pub fn forward(args: Vec<OsString>) -> Result<i32> {
     let app = std::env::var_os(DESKTOP_ENV).map_or_else(|| PathBuf::from(DESKTOP), PathBuf::from);
-    if !app.exists() {
-        eprintln!("needs the Lightbulb app: thelightbulb.company/download");
+    let verb = args
+        .first()
+        .map(|a| a.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if !APP_VERBS.contains(&verb.as_str()) || !app.exists() {
+        eprintln!(
+            "Unknown command: {}. Run {} --help.",
+            cell(&verb),
+            command()
+        );
         return Ok(2);
     }
-    Err(Command::new(app).args(args).exec().into())
+    Err(Command::new(app).arg("cli").args(args).exec().into())
 }
 
 // ---- alias and launchd ------------------------------------------------------------------
 
 /// Puts this executable at the canonical path (unless it is already there with the same
-/// bytes) and the `~/.local/bin/lightbulb` symlink at that. Returns what happened, one line.
-/// A regular file or a foreign symlink at the alias path is left alone and reported.
+/// bytes), the `~/.local/bin/lightbulb-connect` symlink at that, and `~/.local/bin/lightbulb`
+/// when that name is free. Returns the command name to type, one line. A regular file or a
+/// foreign symlink at either path is left alone.
 pub fn install_alias(home: &Path, exe: &Path) -> Result<String> {
     let canon = canonical(home);
     if exe != canon {
@@ -744,19 +1018,27 @@ pub fn install_alias(home: &Path, exe: &Path) -> Result<String> {
             fs::rename(&tmp, &canon)?;
         }
     }
-    let link = home.join(".local/bin/lightbulb");
-    match fs::symlink_metadata(&link) {
-        Ok(m) if m.is_symlink() && fs::read_link(&link)? == canon => {
-            Ok(format!("alias: {} (unchanged)", link.display()))
+    let full = link(&home.join(".local/bin/lightbulb-connect"), &canon)?;
+    Ok(match (link(&home.join(".local/bin/lightbulb"), &canon)?, full) {
+        (true, _) => "Command: lightbulb (or lightbulb-connect)".into(),
+        (false, true) => {
+            "Command: lightbulb-connect (\"lightbulb\" belongs to another program)".into()
         }
-        Ok(_) => Ok(format!(
-            "alias: {} exists and is not ours; left alone",
-            link.display()
-        )),
+        (false, false) => format!(
+            "Command: {} (lightbulb and lightbulb-connect in ~/.local/bin belong to other programs)",
+            canon.display()
+        ),
+    })
+}
+
+/// Makes `path` a symlink to `canon` unless something else is there; whether it is ours.
+fn link(path: &Path, canon: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(m) => Ok(m.is_symlink() && fs::read_link(path)? == canon),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir_all(link.parent().unwrap())?;
-            symlink(&canon, &link)?;
-            Ok(format!("alias: {} -> {}", link.display(), canon.display()))
+            fs::create_dir_all(path.parent().unwrap())?;
+            symlink(canon, path)?;
+            Ok(true)
         }
         Err(e) => Err(e.into()),
     }
@@ -844,12 +1126,15 @@ pub fn install_job(home: &Path, exe: &Path) -> Result<i32> {
             || launchctl(&["load", "-w", &file])
             || launchctl(&["kickstart", "-k", &service]);
         if !up {
-            println!("launchd: could not load {}", path.display());
+            println!(
+                "Background service: could not start it ({}).",
+                path.display()
+            );
             return Ok(1);
         }
-        println!("launchd: {LABEL}");
+        println!("Background service: running (starts at login).");
     } else {
-        println!("launchd: {LABEL} (launchctl skipped; would run: {sequence})");
+        println!("Background service: launchctl skipped (would run: {sequence})");
     }
     Ok(0)
 }
@@ -872,48 +1157,37 @@ pub fn daemon_uninstall() -> Result<i32> {
     if let Ok(mut conn) = Conn::open() {
         let _ = conn.call("shutdown", json!({}));
     }
-    println!("daemon stopped and launchd job removed; state kept");
+    let state = paths::state_path();
+    let shown = home()
+        .ok()
+        .and_then(|h| state.strip_prefix(h).ok().map(|p| Path::new("~").join(p)))
+        .unwrap_or(state);
+    println!(
+        "Lightbulb Connect is off. Your settings and messages are kept in {}.",
+        shown.display()
+    );
     Ok(0)
 }
 
 // ---- doctor -----------------------------------------------------------------------------
 
+/// `doctor`: one line per check, then `All good.` or the command that fixes the first that
+/// failed. (Whether macOS let it read a folder is not something it can ask.)
 pub fn doctor() -> Result<i32> {
     let home = home()?;
-    let mut missing = false;
-    let mut line = |name: &str, ok: bool| {
-        missing |= !ok;
-        println!("{name}: {}", if ok { "ok" } else { "missing" });
+    let cmd = command();
+    let setup = format!("Run: {cmd} setup");
+    // (check, what it found, the fix when it failed)
+    let mut rows: Vec<(String, String, Option<String>)> = vec![];
+    let up = Conn::open()
+        .and_then(|mut c| c.call("ping", json!({})))
+        .is_ok_and(|r| r["ok"] == true);
+    let (state, fix) = if up {
+        ("running", None)
+    } else {
+        ("not running", Some(setup.clone()))
     };
-    line(
-        "daemon",
-        Conn::open()
-            .and_then(|mut c| c.call("ping", json!({})))
-            .is_ok_and(|r| r["ok"] == true),
-    );
-    let mode = |p: &Path| fs::metadata(p).map(|m| m.permissions().mode() & 0o777).ok();
-    let dir = paths::state_path();
-    line("state dir", mode(&dir) == Some(0o700));
-    line("socket", mode(&dir.join(paths::SOCKET)) == Some(0o600));
-    for (agent, dot) in [
-        ("claude", ".claude"),
-        ("codex", ".codex"),
-        ("cursor", ".cursor"),
-        ("grok", ".grok"),
-    ] {
-        if home.join(dot).is_dir() {
-            line(agent, setup::wired(&home, agent));
-        } else {
-            println!("{agent}: not installed");
-        }
-    }
-    let alias = home.join(".local/bin/lightbulb");
-    match fs::read_link(&alias) {
-        Ok(t) if t == canonical(&home) => line("alias", true),
-        // Someone else's file or link at our alias path is theirs, not a gap in ours.
-        _ if alias.symlink_metadata().is_ok() => println!("alias: not ours (left alone)"),
-        _ => line("alias", false),
-    }
+    rows.push(("Background service".into(), state.into(), fix));
     if cfg!(target_os = "macos") {
         let loaded = if use_launchctl() {
             launchctl(&[
@@ -923,9 +1197,178 @@ pub fn doctor() -> Result<i32> {
         } else {
             plist_path(&home).exists()
         };
-        line("launchd", loaded);
+        let (state, fix) = if loaded {
+            ("yes", None)
+        } else {
+            ("no", Some(setup.clone()))
+        };
+        rows.push(("Starts at login".into(), state.into(), fix));
     }
-    Ok(i32::from(missing))
+    let mode = |p: &Path| fs::metadata(p).map(|m| m.permissions().mode() & 0o777).ok();
+    let dir = paths::state_path();
+    let socket = dir.join(paths::SOCKET);
+    let private = mode(&dir) == Some(0o700) && (!socket.exists() || mode(&socket) == Some(0o600));
+    if dir.exists() {
+        let (state, fix) = if private {
+            ("private", None)
+        } else {
+            (
+                "readable by others",
+                Some(format!("Run: chmod 700 {}", dir.display())),
+            )
+        };
+        rows.push(("State folder".into(), state.into(), fix));
+    }
+    for (agent, dot) in [
+        ("claude", ".claude"),
+        ("codex", ".codex"),
+        ("cursor", ".cursor"),
+        ("grok", ".grok"),
+    ] {
+        let state = match (
+            home.join(dot).is_dir(),
+            setup::wired(&home, agent),
+            setup::tools(&home, agent),
+        ) {
+            (false, ..) => Ok("not installed"),
+            (_, true, Some(_)) => Ok("connected"),
+            (_, true, None) => Err("hooks only — tools missing (run setup)"),
+            (_, false, _) => Err("not connected"),
+        };
+        let name = crate::frame::agent_name(agent);
+        match state {
+            Ok(s) => rows.push((name, s.into(), None)),
+            Err(s) => rows.push((name, s.into(), Some(setup.clone()))),
+        }
+    }
+    let ours = |p: &Path| fs::read_link(p).is_ok_and(|t| t == canonical(&home));
+    let (short, full) = (
+        home.join(".local/bin/lightbulb"),
+        home.join(".local/bin/lightbulb-connect"),
+    );
+    let owner = match fs::read_link(&short) {
+        Ok(t) if t.to_string_lossy().contains("Lightbulb.app") => "the Lightbulb app",
+        _ => "another program",
+    };
+    let (state, fix) = if ours(&short) {
+        ("\"lightbulb\"".to_string(), None)
+    } else if ours(&full) && short.symlink_metadata().is_ok() {
+        (
+            format!("\"lightbulb\" belongs to {owner}; type \"lightbulb-connect\""),
+            None,
+        )
+    } else if ours(&full) {
+        ("\"lightbulb-connect\"".to_string(), None)
+    } else {
+        ("not installed".to_string(), Some(setup.clone()))
+    };
+    rows.push(("Command name".into(), state, fix));
+    // legacy (Plan A install): its daemon on its old socket.
+    if std::os::unix::net::UnixStream::connect(home.join(".lightbulb/network/sock")).is_ok() {
+        let fix = format!("Run: {cmd} setup --remove, then {cmd} setup");
+        rows.push(("Old version".into(), "still running".into(), Some(fix)));
+    }
+    for (name, state, _) in &rows {
+        println!("{name:<20} {state}");
+    }
+    match rows.into_iter().find_map(|(.., fix)| fix) {
+        Some(fix) => {
+            println!("{fix}");
+            Ok(1)
+        }
+        None => {
+            println!("All good.");
+            Ok(0)
+        }
+    }
+}
+
+/// `setup [--remove]`: wires the installed agents to the canonical binary (or `executable`)
+/// and starts the background service; prints one line per agent, then what to try next. Exits
+/// 1 when an agent ends with hooks but no tools. `--remove` is the off switch: our entries,
+/// the old version's, the job and the running service go.
+pub fn setup(
+    remove: bool,
+    executable: Option<PathBuf>,
+    server: Option<String>,
+    verbose: bool,
+) -> Result<i32> {
+    if server
+        .as_deref()
+        .is_some_and(|s| !setup::valid_server_name(s))
+    {
+        return Err("--server-name takes letters, digits, - and _.".into());
+    }
+    if let Some(e) = executable.as_ref().filter(|e| !remove && !e.exists()) {
+        return Err(format!("--executable {} does not exist.", e.display()).into());
+    }
+    let home = home()?;
+    if !remove {
+        install_running(&home)?;
+    }
+    // Wired to the canonical copy, never to wherever this binary was built.
+    let executable = executable.unwrap_or_else(|| canonical(&home));
+    let report = setup::run(&home, &executable, server.as_deref(), remove);
+    let files = |a: &setup::AgentReport| {
+        if verbose {
+            for f in &a.wrote {
+                println!("  wrote {}", f.display());
+            }
+        }
+    };
+    if remove {
+        // legacy (Plan A install): its hook and MCP entries name the old binary.
+        let old = setup::run(&home, &legacy_canonical(&home), server.as_deref(), true);
+        for a in report
+            .agents
+            .iter()
+            .chain(&old.agents)
+            .filter(|a| !a.wrote.is_empty())
+        {
+            println!("{}: removed", a.product());
+            files(a);
+        }
+        legacy_uninstall(&home)?;
+        return if cfg!(target_os = "macos") {
+            daemon_uninstall()
+        } else {
+            Ok(0)
+        };
+    }
+    for a in &report.agents {
+        println!("{}", a.line());
+        files(a);
+    }
+    if cfg!(target_os = "macos") {
+        let code = install_job(&home, &executable)?;
+        if code != 0 {
+            return Ok(code);
+        }
+    }
+    let short: Vec<String> = report
+        .agents
+        .iter()
+        .filter(|a| a.hooks_only())
+        .map(|a| a.product())
+        .collect();
+    if !short.is_empty() {
+        let has = if short.len() == 1 { "has" } else { "have" };
+        eprintln!(
+            "{} {has} hooks but no tools: another program has the tool server name. Run: {} setup --server-name <a free name>",
+            short.join(", "),
+            command()
+        );
+        return Ok(1);
+    }
+    let connected: Vec<String> = report
+        .agents
+        .iter()
+        .filter(|a| a.tools.is_some())
+        .map(|a| a.product())
+        .collect();
+    let connected: Vec<&str> = connected.iter().map(String::as_str).collect();
+    println!("\n{}", setup::summary(&connected, command()));
+    Ok(0)
 }
 
 #[cfg(test)]

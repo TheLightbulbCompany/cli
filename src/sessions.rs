@@ -103,6 +103,9 @@ pub struct Session {
     /// that serves the thread. `tier` is `push` exactly when this is set.
     #[serde(skip)]
     pub push_via: Option<PathBuf>,
+    /// The short name `who` shows and `send` takes (`codex-1`), set by the daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle: Option<String>,
 }
 
 /// Alive means the pid exists AND was born at `birth_micros`; a reused pid is not the session.
@@ -136,6 +139,7 @@ fn from_row(r: &store::Session, home: &Path) -> Option<Session> {
             Tier::NextStep
         },
         push_via,
+        handle: None,
         provider,
         conversation,
         pid,
@@ -208,6 +212,7 @@ pub fn scan_claude(home: &Path, member_short: &str) -> Vec<Session> {
                 Tier::NextStep
             },
             push_via: socket,
+            handle: None,
         });
     }
     out

@@ -171,15 +171,22 @@ pub fn workspace_prompt(c: &Proof) -> String {
     )
 }
 
-/// What the person is asked about `req`: plain text (`check` let only that in).
-fn prompt(r: &Roster, req: &Request) -> String {
-    match req.verified() {
+/// What the person is asked about request `n` (`req`): plain text (`check` let only that in),
+/// and the command that answers it too.
+fn prompt(r: &Roster, req: &Request, n: i64) -> String {
+    let ask = match req.verified() {
         Some(c) if c.kind == ProofKind::Workspace => workspace_prompt(c),
         _ if same_person(r, req).is_some() => {
             format!("Your new Mac {} wants to join. Allow?", req.computer)
         }
-        _ => format!("{} wants to join your network", req.name),
-    }
+        _ => join_text(&req.name, &req.computer),
+    };
+    format!("{ask}\nOr run: {} approve J{n}", crate::cli::command())
+}
+
+/// The join dialog's words for a candidate called `name` on computer `computer`.
+fn join_text(name: &str, computer: &str) -> String {
+    format!("{name} (computer \"{computer}\") wants to join your team using your invite link. Allow only if you sent them the link.")
 }
 
 /// What a `join_request` proves it holds: hex sha256(secret ‖ candidate).
@@ -461,7 +468,7 @@ fn admit(d: &Daemon, n: i64, req: &Request) -> Verdict {
 /// candidate is gone.
 async fn wait(d: &Daemon, gone: impl Future, n: i64, req: Request) -> Option<Verdict> {
     let (tx, rx) = oneshot::channel();
-    let text = prompt(&d.team.lock().unwrap().roster, &req);
+    let text = prompt(&d.team.lock().unwrap().roster, &req, n);
     // Before the dialog: a headless one answers at once.
     d.admissions.lock().unwrap().insert(
         n,
@@ -959,6 +966,14 @@ fn take_roster(d: &Daemon, entries: &[Entry], team_id: &str) -> crate::Result<bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_join_dialog_says_who_from_where_and_how_they_got_in() {
+        assert_eq!(
+            join_text("demo2", "demo-laptop"),
+            "demo2 (computer \"demo-laptop\") wants to join your team using your invite link. Allow only if you sent them the link."
+        );
+    }
 
     #[test]
     fn a_forwarded_decision_answers_its_own_request_the_oldest_first() {

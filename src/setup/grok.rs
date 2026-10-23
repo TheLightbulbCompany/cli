@@ -72,9 +72,5 @@ pub(super) fn configure(ctx: &Ctx, r: &mut AgentReport) -> Result<()> {
             allow.retain(|v| v.as_str() != Some(&rule));
         }
         Ok(())
-    })?;
-    if owner == Owner::Foreign {
-        r.notes.push(ctx.foreign_note(&config));
-    }
-    Ok(())
+    })
 }

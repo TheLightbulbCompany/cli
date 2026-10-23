@@ -211,7 +211,7 @@ async fn handle(
             _ => Response::err(id, BAD_REQUEST),
         },
         "inbox" => inbox(id, &req.body, daemon, peer).await,
-        // Reads every session's transcript and git files: off the async threads.
+        // Reads every session's transcript (never its folder): off the async threads.
         "directory" => {
             let (d, q) = (daemon.clone(), req.body["query"].as_str().map(String::from));
             match tokio::task::spawn_blocking(move || presence::directory(&d, q.as_deref())).await {
@@ -340,13 +340,16 @@ struct Register {
     title: Option<String>,
     status: Option<String>,
     executable: Option<String>,
+    repo: Option<String>,
+    branch: Option<String>,
 }
 
-/// `register {session: {provider, conversation, pid, birth_micros, cwd, title?, status?, executable?}, caller?}`
+/// `register {session: {provider, conversation, pid, birth_micros, cwd, title?, status?, executable?, repo?, branch?}, caller?}`
 /// upserts by key; the daemon supplies the member prefix. A `cwd` under `folders_off` is
 /// answered `{key, ignored: true}` and nothing is written. A key whose row names another
 /// live process is refused (`bad_request`, reason `owned_by_live_process`). `status` is `idle` (default) or
-/// `busy` (stored as live); `conversation` is `[A-Za-z0-9._-]{1,128}`.
+/// `busy` (stored as live); `conversation` is `[A-Za-z0-9._-]{1,128}`. `repo` and `branch` are
+/// what the hook read from `cwd`'s `.git` (it has the folder access the person gave the agent).
 fn register(id: u64, body: &Value, daemon: &Daemon) -> Response {
     let Ok(r) = serde_json::from_value::<Register>(body["session"].clone()) else {
         return Response::err(id, BAD_REQUEST);
@@ -387,6 +390,17 @@ fn register(id: u64, body: &Value, daemon: &Daemon) -> Response {
         Ok(_) => {}
         Err(_) => return Response::err(id, INTERNAL),
     }
+    let git = (r.repo, r.branch);
+    if daemon
+        .git
+        .lock()
+        .unwrap()
+        .insert(key.0.clone(), git.clone())
+        != Some(git)
+    {
+        daemon.presence.notify_one();
+    }
+    handle_of(daemon, &key.0, &r.provider);
     let row = store::Session {
         key: key.0.clone(),
         provider: r.provider,
@@ -439,8 +453,27 @@ pub(crate) fn live_sessions(daemon: &Daemon) -> Vec<sessions::Session> {
         if s.tier == sessions::Tier::Push && failed.contains(&s.key.0) {
             s.tier = sessions::Tier::NextStep;
         }
+        s.handle = Some(handle_of(daemon, &s.key.0, &s.provider));
     }
     all
+}
+
+/// Session `key`'s `who` handle: `<agent>-<n>`, numbered per agent in the order this daemon
+/// life first sees each session; the same for its whole life.
+pub(crate) fn handle_of(daemon: &Daemon, key: &str, agent: &str) -> String {
+    let mut handles = daemon.handles.lock().unwrap();
+    if let Some(h) = handles.get(key) {
+        return h.clone();
+    }
+    let mut base: String = agent.chars().filter(char::is_ascii_alphanumeric).collect();
+    base.make_ascii_lowercase();
+    if base.is_empty() {
+        base = "agent".into();
+    }
+    let taken = |h: &&String| h.rsplit_once('-').is_some_and(|(b, _)| b == base);
+    let h = format!("{base}-{}", handles.values().filter(taken).count() + 1);
+    handles.insert(key.into(), h.clone());
+    h
 }
 
 fn live_count(daemon: &Daemon) -> usize {

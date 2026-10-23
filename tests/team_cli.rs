@@ -76,23 +76,31 @@ impl Env {
 
 const LINE: &str = "Join Lightbulb Connect: https://thelightbulb.company/j/#";
 
+/// What `invite` printed after its first line (which says what to do with the link).
+fn printed_link(o: &std::process::Output) -> String {
+    let text = out(o);
+    let (first, rest) = text.split_once('\n').unwrap_or_else(|| panic!("{text}"));
+    assert!(first.starts_with("Send this link to the person"), "{text}");
+    rest.to_string()
+}
+
 #[test]
 fn invite_reprints_the_same_link_until_new() {
     let e = Env::new();
-    let first = out(&e.run(&["invite"]));
+    let first = printed_link(&e.run(&["invite"]));
     assert!(first.starts_with(LINE), "{first}");
-    assert_eq!(out(&e.run(&["invite"])), first);
-    let new = out(&e.run(&["invite", "--new"]));
+    assert_eq!(printed_link(&e.run(&["invite"])), first);
+    let new = printed_link(&e.run(&["invite", "--new"]));
     let line = new
         .strip_prefix("Old link stopped working. New link: ")
         .unwrap_or_else(|| panic!("{new}"));
     assert!(line.starts_with(LINE) && line != first, "{new}");
-    assert_eq!(out(&e.run(&["invite"])), line);
-    let once = out(&e.run(&["invite", "--once"]));
+    assert_eq!(printed_link(&e.run(&["invite"])), line);
+    let once = printed_link(&e.run(&["invite", "--once"]));
     assert!(once.starts_with("One-time invite, expires "), "{once}");
     assert!(once.contains(&format!(" UTC: {LINE}")), "{once}");
     // The once link leaves the reusable one alone.
-    assert_eq!(out(&e.run(&["invite"])), line);
+    assert_eq!(printed_link(&e.run(&["invite"])), line);
 }
 
 #[test]
@@ -107,7 +115,15 @@ fn non_admin_remove_prints_exact_text() {
         "Only the founder and admins can remove computers. Ask aden."
     );
     let team = out(&e.run(&["team"]));
-    assert!(team.contains("acme") && team.contains("aden"), "{team}");
+    assert!(
+        team.starts_with("Team \"acme\" — 2 computers\n  You ("),
+        "{team}"
+    );
+    assert!(team.contains("  aden · "), "{team}");
+    assert!(
+        team.ends_with("Invite someone: lightbulb-connect invite\n"),
+        "{team}"
+    );
     assert_eq!(e.entries().len(), 2, "no genesis over a joined team");
     // An open link is for the founder and admins.
     let r = common::person(&e, json!({"id": 1, "op": "team.invite", "mode": "open"}));
@@ -155,7 +171,7 @@ fn restart_keeps_the_team_and_writes_no_second_genesis() {
 #[test]
 fn leave_locally_recreates_a_solo_network() {
     let e = Env::new();
-    let link = out(&e.run(&["invite"]));
+    let link = printed_link(&e.run(&["invite"]));
     let id = e.team_id();
     let no = e.detached(&[EXE, "leave"], "n\n");
     assert!(no.status.success());
@@ -175,7 +191,7 @@ fn leave_locally_recreates_a_solo_network() {
         .query_row("SELECT count(*) FROM team_link", [], |r| r.get(0))
         .unwrap();
     assert_eq!(links, 0);
-    let fresh = out(&e.run(&["invite"]));
+    let fresh = printed_link(&e.run(&["invite"]));
     assert!(fresh.starts_with(LINE) && fresh != link);
 }
 
@@ -195,7 +211,7 @@ fn founder_admin_remove_and_leave_texts() {
         out(&e.run(&["admin", "ADEN"])),
         "aden can now remove members.\n"
     );
-    let old = out(&e.run(&["invite"]));
+    let old = printed_link(&e.run(&["invite"]));
     let o = out(&e.run(&["remove", "aden"]));
     let line = o
         .strip_prefix(
@@ -203,7 +219,7 @@ fn founder_admin_remove_and_leave_texts() {
         )
         .unwrap_or_else(|| panic!("{o}"));
     assert!(line.starts_with(LINE) && line != old, "{o}");
-    assert_eq!(out(&e.run(&["invite"])), line);
+    assert_eq!(printed_link(&e.run(&["invite"])), line);
     assert!(!out(&e.run(&["team"])).contains("aden"));
 }
 

@@ -130,15 +130,12 @@ pub struct Receipt {
     pub at: Option<i64>,
 }
 
-/// What receipt `r` (as `send` and `receipt` answer it) means in words, when it needs them: mail
-/// on a teammate's computer, or a `loop` refusal. With `rid` it is the terminal's line: the id
-/// first where the receipt may still change, and a stored line naming the session's tier and
-/// the `receipt` command.
-pub fn receipt_note(r: &Value, rid: Option<&str>) -> Option<String> {
+/// What receipt `r` (as `send_message` and `message_receipt` answer it) means in words, when it
+/// needs them: mail on a teammate's computer, or a `loop` refusal. (The CLI says its own.)
+pub fn receipt_note(r: &Value) -> Option<String> {
     let at = |f: &str| r[f].as_str().unwrap_or_default();
     let (computer, person) = (at("where"), at("person"));
     let remote = r["person"].is_string();
-    let id = rid.map(|i| format!("{i} ")).unwrap_or_default();
     Some(match at("state") {
         "refused" if at("reason") == "loop" => match at("limit") {
             RATE => format!("loop limit: {LOOP_LIMIT} messages in 10 minutes to this session"),
@@ -152,18 +149,12 @@ pub fn receipt_note(r: &Value, rid: Option<&str>) -> Option<String> {
             } else {
                 "is offline"
             };
-            format!("{id}queued: {computer} {why}. Will retry until {until}.")
+            format!("queued: {computer} {why}. Will retry until {until}.")
         }
-        "stored" if remote => match rid {
-            Some(i) => format!(
-                "{i} stored on {computer} (tier {}). Receipt: lightbulb-connect receipt {i}",
-                r["tier"].as_str().unwrap_or("unknown")
-            ),
-            None => format!(
-                "stored on {computer}. It may be held for {person} to approve; you will see the receipt change."
-            ),
-        },
-        "held" if remote => format!("{id}held: waiting for {person} to approve"),
+        "stored" if remote => format!(
+            "stored on {computer}. It may be held for {person} to approve; you will see the receipt change."
+        ),
+        "held" if remote => format!("held: waiting for {person} to approve"),
         _ => return None,
     })
 }
@@ -902,11 +893,8 @@ mod tests {
     #[test]
     fn notes_name_the_loop_limit_or_say_a_limit() {
         let r = |limit: Option<&str>| {
-            receipt_note(
-                &serde_json::json!({"state": "refused", "reason": "loop", "limit": limit}),
-                None,
-            )
-            .unwrap()
+            receipt_note(&serde_json::json!({"state": "refused", "reason": "loop", "limit": limit}))
+                .unwrap()
         };
         assert_eq!(
             r(Some("hops")),
@@ -918,17 +906,11 @@ mod tests {
         );
         assert_eq!(r(None), "paused by a loop limit");
         assert_eq!(
-            receipt_note(
-                &serde_json::json!({"state": "refused", "reason": "policy"}),
-                None
-            ),
+            receipt_note(&serde_json::json!({"state": "refused", "reason": "policy"})),
             None
         );
         assert_eq!(
-            receipt_note(
-                &serde_json::json!({"state": "stored", "where": "recipient"}),
-                None
-            ),
+            receipt_note(&serde_json::json!({"state": "stored", "where": "recipient"})),
             None
         );
     }
