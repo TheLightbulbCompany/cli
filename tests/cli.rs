@@ -104,7 +104,7 @@ fn errors_are_sentences() {
     e.session();
     let o = e.person(&["policy", "someone", "maybe"]);
     assert_eq!(o.status.code(), Some(1));
-    assert_eq!(err(&o).trim(), "policy takes accept, hold or refuse.");
+    assert_eq!(err(&o).trim(), "Policy takes accept, hold or refuse.");
     let o = e.person(&["policy"]);
     assert_eq!(
         out(&o).lines().next(),

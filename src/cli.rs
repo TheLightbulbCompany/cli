@@ -437,7 +437,7 @@ pub fn send(
         if receipt["state"] == "refused" {
             code = 1;
         }
-        let line = said(receipt, Some(&to), &rid);
+        let line = said(receipt, Some(&to), &rid, true);
         if group {
             println!("{line} ({})", cell(&handle));
         } else {
@@ -448,11 +448,12 @@ pub fn send(
 }
 
 /// What receipt `r` of message `rid` (to `to`, when known) means, for the person who sent it.
-fn said(r: &Value, to: Option<&str>, rid: &str) -> String {
+fn said(r: &Value, to: Option<&str>, rid: &str, check: bool) -> String {
     let p = crate::mail::ForPerson {
         to,
         rid,
         cmd: command(),
+        check,
     };
     crate::mail::receipt_note(r, Some(&p)).unwrap_or_default()
 }
@@ -520,7 +521,7 @@ pub fn receipt(request_id: &str, from: Option<String>, as_json: bool) -> Result<
         if as_json {
             println!("{}", r["receipt"]);
         } else {
-            println!("{}", said(&r["receipt"], None, request_id));
+            println!("{}", said(&r["receipt"], None, request_id, false));
         }
         Ok(0)
     } else if r["error"] == "not_found" {
@@ -624,9 +625,19 @@ pub fn invite(mode: Invite) -> Result<i32> {
 pub fn join(link: &str, name: Option<String>, kind: &str, proof: Option<String>) -> Result<i32> {
     let name = name.unwrap_or_else(daemon::user_name);
     let mut conn = connect()?;
-    if crate::ticket::decode(link).is_ok_and(|t| t.mode == "ask") {
-        println!("Asking whoever sent the link to allow this computer… (they get a prompt; this waits up to 10 minutes)");
-    }
+    // Said once a member took the ticket and is asking its person (`join_asking`), never
+    // before a ticket it refuses at once.
+    let mut asking = Conn::open()?;
+    asking.call("subscribe", json!({}))?;
+    asking.wait_up_to(Duration::from_secs(660))?;
+    std::thread::spawn(move || {
+        while let Ok(e) = asking.next_line() {
+            if e["event"] == "join_asking" {
+                println!("Asking whoever sent the link to allow this computer… (they get a prompt; this waits up to 10 minutes)");
+                return;
+            }
+        }
+    });
     conn.wait_up_to(Duration::from_secs(660))?;
     let r = ask(
         &mut conn,
@@ -782,7 +793,12 @@ pub fn answer(request: &str, allow: bool, always: bool) -> Result<i32> {
         let texts = [
             (
                 admission::NOT_OPEN,
-                format!("{request} was already {gone}."),
+                match r["answered_in"].as_str() {
+                    Some("dialog") => format!("{request} was already answered in the dialog."),
+                    Some("phone") => format!("{request} was already answered from your phone."),
+                    Some(_) => format!("{request} was already answered at the command line."),
+                    None => format!("{request} was already {gone}."),
+                },
             ),
             (ipc::NOT_FOUND, format!("No {what} {request}.")),
             (ipc::BAD_REQUEST, always_text.into()),
@@ -860,7 +876,7 @@ pub fn policy(person: Option<String>, value: Option<String>) -> Result<i32> {
         .as_deref()
         .is_some_and(|v| !["accept", "hold", "refuse", "forget"].contains(&v))
     {
-        return Err("policy takes accept, hold or refuse.".into());
+        return Err("Policy takes accept, hold or refuse.".into());
     }
     let mut conn = connect()?;
     let mut team = None;
@@ -1110,10 +1126,17 @@ pub fn remove(name: &str) -> Result<i32> {
 /// service keeps running.
 pub fn leave() -> Result<i32> {
     let mut conn = connect()?;
-    let name = ask(&mut conn, "team.get", json!({}))?["name"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
+    let me = conn.member()?;
+    let t = ask(&mut conn, "team.get", json!({}))?;
+    let name = t["name"].as_str().unwrap_or_default().to_string();
+    // Alone after a removal: there is nothing to leave. (A computer alone by choice may still
+    // leave, which starts its network afresh and voids its links.)
+    let members = t["members"].as_array().cloned().unwrap_or_default();
+    let alone = members.len() == 1 && members[0]["short"] == me.as_str();
+    if alone && !t["removed"].is_null() {
+        println!("This computer is not in a team with anyone; it is on its own network already.");
+        return Ok(0);
+    }
     print!(
         "Leave \"{name}\"? Your computer stops connecting. Mail already stored here stays. [y/N] "
     );

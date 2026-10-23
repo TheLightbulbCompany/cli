@@ -476,6 +476,7 @@ pub fn install(
         }
     }
     team.roster = new;
+    daemon.peers.prune_known(&daemon.dir, &team.roster);
     daemon.peers.changed.notify_one();
     if relay_changed {
         // Logged once per value: an install changes it once.

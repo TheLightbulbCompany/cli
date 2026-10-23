@@ -179,6 +179,32 @@ pub struct Peers {
 
 /// Where `Peers::known` is kept, in the state dir.
 const ADDRS: &str = "addrs.json";
+/// The one rule for whose addresses are kept: the roster's members.
+fn kept_key(roster: &Roster, key: &str) -> bool {
+    roster.members.contains_key(key)
+}
+
+/// Writes `known` to `dir`'s `ADDRS`, mode 0600 (its folder is 0700; a file an older build
+/// wrote 0644 is narrowed too).
+fn save_known(dir: &std::path::Path, known: &HashMap<String, Vec<SocketAddr>>) {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let Ok(b) = serde_json::to_vec(known) else {
+        return;
+    };
+    let path = dir.join(ADDRS);
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path);
+    if let Ok(mut f) = f {
+        let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
+        let _ = f.write_all(&b);
+    }
+}
+
 /// The most direct addresses taken from a peer or a ticket.
 pub const MAX_ADDRS: usize = 8;
 
@@ -305,23 +331,31 @@ impl Peers {
     }
 
     /// `key` told its direct addresses `addrs` (already checked, `parse_addrs`): kept for its
-    /// dials, and in `dir`'s `ADDRS` when they changed. The one rule for what is kept: the
-    /// members of `roster` and `key` itself (a join's inviter is not a member yet), so the
-    /// file holds no stale keys after its next save.
+    /// dials, and saved when they changed. `key` itself is kept although not a member yet (a
+    /// join's inviter); every other key by `kept_key`.
     pub fn learn(&self, dir: &std::path::Path, key: &str, addrs: Vec<SocketAddr>, roster: &Roster) {
         let mut known = self.known.lock().unwrap();
         if addrs.is_empty() || known.get(key) == Some(&addrs) {
             return;
         }
-        known.retain(|k, _| roster.members.contains_key(k));
         known.insert(key.to_string(), addrs);
-        if let Ok(b) = serde_json::to_vec(&*known) {
-            let _ = std::fs::write(dir.join(ADDRS), b);
+        known.retain(|k, _| k == key || kept_key(roster, k));
+        save_known(dir, &known);
+    }
+
+    /// Drops (and saves the file without) every key `kept_key` refuses: after an install that
+    /// took a member out, and at start.
+    pub fn prune_known(&self, dir: &std::path::Path, roster: &Roster) {
+        let mut known = self.known.lock().unwrap();
+        let before = known.len();
+        known.retain(|k, _| kept_key(roster, k));
+        if known.len() != before {
+            save_known(dir, &known);
         }
     }
 
-    /// Loads `ADDRS` from `dir` (as `learn` last saved it), keeping the entries that check.
-    fn load_known(&self, dir: &std::path::Path) {
+    /// Loads `ADDRS` from `dir`, keeping the entries that check, then `prune_known`.
+    fn load_known(&self, dir: &std::path::Path, roster: &Roster) {
         let read: HashMap<String, Vec<String>> = std::fs::read(dir.join(ADDRS))
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
@@ -330,6 +364,7 @@ impl Peers {
             .into_iter()
             .filter_map(|(k, v)| Some((k, parse_addrs(&v)?)));
         *self.known.lock().unwrap() = ok.collect();
+        self.prune_known(dir, roster);
     }
 
     /// `status.relay` and `status.relay_error`: `none` without relays, `ok` while a home relay
@@ -514,7 +549,9 @@ impl Net {
     /// mDNS when `config.lan`) and starts accepting, dialing every active member, and keeping
     /// the relay list.
     pub async fn start(daemon: Arc<Daemon>) -> Result<Net> {
-        daemon.peers.load_known(&daemon.dir);
+        daemon
+            .peers
+            .load_known(&daemon.dir, &daemon.team.lock().unwrap().roster);
         let state = relay::State::load(&daemon.dir, &daemon.peers.knobs().relay_keys);
         *daemon.peers.relay_state.lock().unwrap() = state;
         let lan = {

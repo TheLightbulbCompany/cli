@@ -186,9 +186,14 @@ async fn second_answer_is_not_open() {
     assert_eq!(answer(&a, &h, "decline", None)["ok"], true);
     let r = answer(&a, &h, "allow", None);
     assert_eq!(
-        (&r["ok"], &r["error"]),
-        (&json!(false), &json!("not_open")),
+        (&r["ok"], &r["error"], &r["answered_in"]),
+        (&json!(false), &json!("not_open"), &json!("cli")),
         "{r}"
+    );
+    let log = std::fs::read_to_string(a.state.path().join("daemon.log")).unwrap();
+    assert!(
+        log.contains(&format!("hold {h}: decline (from the cli)")),
+        "{log}"
     );
     let r = answer(&a, "H99", "allow", None);
     assert_eq!(r["error"], "not_found");

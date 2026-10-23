@@ -79,6 +79,10 @@ pub struct Daemon {
     pub dialog_answers: Mutex<Option<dialog::Answers>>,
     /// The join requests waiting for their person's answer (`admission`).
     pub admissions: crate::admission::Waiting,
+    /// Which surface answered each join request and hold (`J<n>`/`H<n>` -> `dialog`/`cli`),
+    /// for the log and for `approve`'s "already answered" (in memory: what a person asks
+    /// right after).
+    pub answered_by: Mutex<HashMap<String, &'static str>>,
     /// Poked on every roster install (`net_ops::install`): waiters look again.
     pub roster_changed: Notify,
     /// Held while a `team.join` runs: one at a time.

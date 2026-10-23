@@ -137,6 +137,8 @@ fn ask_ticket_admits_only_after_allow() {
         "The name \"prasiddha\" is already used in this network. Try: lightbulb-connect join '{t}' --name prasiddha-2\n"
     );
     assert_eq!(err(&o), taken);
+    // Refused at once: it never said it was asking anyone.
+    assert_eq!(out(&o), "");
     std::thread::scope(|s| {
         let joining = s.spawn(|| b.detached(&[EXE, "join", &t, "--name", "bob"], ""));
         until(10, "J1 is listed", || requests(&a).len() == 1);
@@ -153,6 +155,8 @@ fn ask_ticket_admits_only_after_allow() {
         assert_eq!(r["candidate"], b.identity().key);
         assert_eq!((&r["name"], &r["computer"]), (&json!("bob"), &json!("mbp")));
         assert_eq!((members(&a).len(), members(&b).len()), (1, 1));
+        // Past the second after which the joiner says it is asking.
+        std::thread::sleep(Duration::from_millis(1_500));
         let o = a.detached(&[EXE, "approve", "J1"], "");
         assert!(o.status.success(), "{}", err(&o));
         let o = joining.join().unwrap();
@@ -171,7 +175,9 @@ fn ask_ticket_admits_only_after_allow() {
     // A second answer finds nothing open.
     let o = a.detached(&[EXE, "decline", "J1"], "");
     assert!(!o.status.success());
-    assert_eq!(err(&o), "J1 was already answered or withdrawn.\n");
+    assert_eq!(err(&o), "J1 was already answered at the command line.\n");
+    let log = std::fs::read_to_string(a.state.path().join("daemon.log")).unwrap();
+    assert!(log.contains("join: J1 answered from the cli"), "{log}");
     let o = a.detached(&[EXE, "approve", "J9"], "");
     assert!(!o.status.success());
     assert_eq!(err(&o), "No join request J9.\n");

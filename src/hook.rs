@@ -254,6 +254,15 @@ impl Conn {
             .to_string())
     }
 
+    /// The next line the daemon sends (an event, on a subscribed connection).
+    pub(crate) fn next_line(&mut self) -> Result<Value> {
+        let mut line = String::new();
+        if self.stream.read_line(&mut line)? == 0 {
+            return Err("the background service closed the connection".into());
+        }
+        Ok(serde_json::from_str(&line)?)
+    }
+
     pub(crate) fn call(&mut self, op: &str, mut body: Value) -> Result<Value> {
         body["id"] = self.next.into();
         body["op"] = op.into();
