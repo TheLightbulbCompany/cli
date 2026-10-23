@@ -606,12 +606,16 @@ pub fn policy(person: Option<String>, value: Option<String>) -> Result<i32> {
         }
     };
     // A row the bridge set is a relayed Allow: `Allowed <name> from your phone`.
-    let team = ask(&mut conn, "team.get", json!({}))?;
+    // The members' names only when some row is the bridge's.
+    let bridge = (p["set_by"].as_object().into_iter().flatten()).any(|(_, v)| v == "bridge");
+    let team = if bridge {
+        ask(&mut conn, "team.get", json!({}))?
+    } else {
+        Value::Null
+    };
     let name_of = |pid: &str| {
-        let ms = team["members"].as_array().into_iter().flatten();
-        let named = ms
-            .filter(|m| m["person_id"] == pid)
-            .find_map(|m| m["name"].as_str());
+        let mut ms = team["members"].as_array().into_iter().flatten();
+        let named = ms.find_map(|m| (m["person_id"] == pid).then(|| m["name"].as_str())?);
         cell(named.unwrap_or(pid))
     };
     let by = |key: String, who: Option<&str>| match p["set_by"][&key].as_str() {

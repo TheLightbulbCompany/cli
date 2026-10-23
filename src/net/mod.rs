@@ -985,17 +985,13 @@ fn flush(d: &Daemon, all: bool, expire: bool) -> Result<()> {
         }
         holds::expire_here(d, &store, now as i64)?;
     }
-    let due = outbox::due(&store, &online, if all { u64::MAX } else { now })?;
-    for (member, f) in due {
-        let Frame::Envelope { id, .. } = &f else {
-            continue;
-        };
-        let id = id.clone();
+    let since = now.saturating_sub(mail::HELD_S);
+    let due = outbox::due(&store, &online, if all { u64::MAX } else { now }, since)?;
+    for (id, member, f) in due {
         if d.peers.send(&member, f).is_ok() {
             outbox::sent(&store, &id, now)?;
         }
     }
-    crate::decision::flush(d, &store, &online, all, now)?;
     for (member, f) in outbox::receipts(&store)? {
         let Frame::Receipt { id, state, .. } = &f else {
             continue;

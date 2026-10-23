@@ -48,6 +48,15 @@ pub enum Kind {
     Permission,
 }
 
+impl Kind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Kind::Message => "message",
+            Kind::Permission => "permission",
+        }
+    }
+}
+
 /// A permission hold lasts this long unanswered.
 pub const PERMISSION_S: i64 = 600;
 /// A hold whose target session has been gone this long expires (`session_ended`).

@@ -249,8 +249,8 @@ pub async fn read(recv: &mut (impl AsyncRead + Unpin)) -> Result<Frame> {
 /// names a state past `queued`, with a known reason exactly when it is `refused`, and a `limit`
 /// only on a `loop` refusal (that it is bound to this member is `outbox::acked`'s check). A
 /// `join_request` or `join_decision` comes from a computer member. A `share_grant` passes
-/// `streams::grant_ok`. A `hold_notice` comes from a computer member, with no preview; a
-/// `decision` from a cloud member (`decision` checks the rest). An `ack` of a notice or a
+/// `streams::grant_ok`. A `hold_notice` passes `decision::notice_ok`; a `decision` comes from
+/// a cloud member (`decision::accept` checks the rest). An `ack` of a notice or a
 /// decision (`decision::is_control` ids) carries `decision::ack_ok`'s states and reasons only, and a
 /// `receipt` never names one. A `stream` never rides the control stream. `Err` names the
 /// check.
@@ -277,10 +277,7 @@ pub fn from_peer_ok(
             "state",
         ),
         Frame::Receipt { id, .. } if crate::decision::is_control(id) => Err("state"),
-        Frame::HoldNotice { preview, .. } => check(
-            peer.kind == MemberKind::Computer && preview.is_empty(),
-            "hold_notice",
-        ),
+        Frame::HoldNotice { .. } => check(crate::decision::notice_ok(f, peer), "hold_notice"),
         Frame::Decision { .. } => check(peer.kind == MemberKind::Cloud, "decision"),
         Frame::Ack {
             state,

@@ -842,7 +842,19 @@ async fn a_refusal_reaches_decision_result() {
         (Some("H1"), Some("refused"), Some("scope"))
     );
     assert_eq!(hold_state(&w.b, "H1"), "open");
-    // Answered: no longer pending.
+    // Refused, the hold still open: still pending, for the person to tap again.
+    let pending = call(&i, "holds.pending", json!({})).await["notices"].clone();
+    assert_eq!(pending[0]["hold_id"], "H1", "{pending}");
+    // Applied: no longer pending.
+    let r = call(
+        &i,
+        "decision.send",
+        json!({"hold_id": "H1", "holding_member": w.b.identity().key, "verdict": "allow",
+            "scope": "once", "decided_by": Q}),
+    )
+    .await;
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(event(&mut rx, "decision_result").await["result"], "applied");
     assert_eq!(
         call(&i, "holds.pending", json!({})).await["notices"],
         json!([])

@@ -196,6 +196,17 @@ impl Roster {
             .find(|m| m.kind == MemberKind::Cloud && m.person_id == ws && m.workspace.is_some())
     }
 
+    /// Member `key`, if it is a computer of `me`'s workspace (both proofs in force) and of
+    /// person `person`.
+    pub fn workspace_computer(&self, me: &str, key: &str, person: &str) -> Option<&Member> {
+        let ws = self.members.get(me)?.workspace.as_ref()?;
+        self.members.get(key).filter(|m| {
+            m.kind == MemberKind::Computer
+                && m.workspace.as_ref() == Some(ws)
+                && m.person_id == person
+        })
+    }
+
     /// Person `person`'s computer members, first admitted first.
     pub fn computers_of(&self, person: &str) -> Vec<&Member> {
         let mut ms: Vec<&Member> = (self.members.values())
