@@ -105,9 +105,9 @@ pub struct Cloud {
     declared: Mutex<Declared>,
     /// The last `Declared::version` the presence sender (`presence::run`) handed on.
     pub sent: tokio::sync::watch::Sender<u64>,
-    /// The `app_*` requests out (`app_send`), by envelope id: the computer asked, and where
-    /// its answer goes.
-    pub apps: Mutex<HashMap<String, (String, tokio::sync::oneshot::Sender<Value>)>>,
+    /// The `app_*` requests out (`app_send`), by envelope id: the computer asked, the answer
+    /// kind expected, and where the answer goes.
+    pub apps: Mutex<HashMap<String, crate::app_send::Waiter>>,
 }
 
 /// The sessions an instance declared (`cloud.sessions.set`), as published; each set is a new

@@ -11,12 +11,13 @@ mod common;
 use common::{admit, call, endpoint, identity, now_s, person_proof, until, Env, Peer};
 use lightbulb_connect::embed::Instance;
 use lightbulb_connect::identity::{key_bytes, Identity};
-use lightbulb_connect::net::frames::Frame;
+use lightbulb_connect::net::frames::{self, Frame};
 use lightbulb_connect::net::ALPN;
 use lightbulb_connect::policy::{self, Verdict};
 use lightbulb_connect::roster::{self, Entry, Kind};
 use lightbulb_connect::store::Store;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -44,6 +45,11 @@ fn person(who: &Identity, pid: &str, name: &str, computer: &str, ws: &str) -> Va
 }
 
 fn world() -> World {
+    world_at(now_s())
+}
+
+/// `world`, the workspace members' proofs issued at `iat` (two days back: lapsed).
+fn world_at(iat: i64) -> World {
     let (a, a2, b, c) = (Env::new(), Env::new(), Env::new(), Env::new());
     let w1 = tempfile::tempdir().unwrap();
     let iw1 = Identity::load_or_create(w1.path()).unwrap();
@@ -72,7 +78,7 @@ fn world() -> World {
     let e3 = admit(&ia, &e2, &ic, "rae", person(&ic, R, "Rae", "mbc", "W2"));
     let ws = |who: &Identity, id: &str, name: &str| {
         json!({"kind": "cloud", "person_id": format!("ws:{id}"),
-            "proof": common::ws_proof(who, id, name)})
+            "proof": common::issuer::workspace_proof(&who.key, id, name, &[], iat)})
     };
     let e4 = admit(&ia, &e3, &iw1, NAME, ws(&iw1, "W1", NAME));
     let e5 = admit(&ia, &e4, &iw2, "Other Co", ws(&iw2, "W2", "Other Co"));
@@ -303,29 +309,277 @@ async fn second_computer_is_tried_when_the_first_does_not_answer() {
     w.run(&[&w.a2]);
     let i = w.instance(&[&w.a2, &w.b]).await;
     // A, played by the test: connected, newest presence, answers nothing.
-    let ia = w.a.identity();
-    let port = ok(&i, "status", json!({})).await["port"].as_u64().unwrap();
-    let key = iroh::PublicKey::from_bytes(&key_bytes(&w.w1_identity().key).unwrap()).unwrap();
-    let addr =
-        iroh::EndpointAddr::new(key).with_ip_addr(format!("127.0.0.1:{port}").parse().unwrap());
-    let ep = endpoint(&ia).await;
-    let conn = ep.connect(addr, ALPN).await.unwrap();
-    let (send, recv) = conn.open_bi().await.unwrap();
-    let mut pa = Peer { conn, send, recv };
-    pa.hello(vec![]).await;
-    let seq = common::now_s() as u64 * 1000 + 3_600_000;
-    pa.send(&common::presence_with(&ia.key, seq, vec![])).await;
-    online(&i, 3).await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (mut pa, _ep) = as_newest_computer(&i, &w.a.identity(), 3).await;
     let q = w.q();
     let t = Instant::now();
     let r = ok(&i, "app.send", send_body("claude", &q, "r1")).await;
-    assert!(t.elapsed() >= Duration::from_secs(10), "{:?}", t.elapsed());
+    assert!(t.elapsed() >= Duration::from_secs(13), "{:?}", t.elapsed());
     assert_eq!(r["computer"], "mac2", "{r}");
-    let asked = app_answer(&mut pa).await.expect("A was asked first");
-    assert_eq!(asked.0, "app_send");
+    // Asked to send, then whether it did.
+    for kind in ["app_send", "app_receipt_query"] {
+        let asked = app_answer(&mut pa).await.expect("A was asked first");
+        assert_eq!(asked.0, kind);
+    }
     let m = w.b.take_one(&q);
     assert_eq!(m["from"], format!("{}/claude-app", w.a2.short()));
+    i.shutdown().await;
+}
+
+/// `who` played by the test as a computer of `i`'s, with the newest presence, once `i` has
+/// `online` members online.
+async fn as_newest_computer(i: &Instance, who: &Identity, online_n: u64) -> (Peer, iroh::Endpoint) {
+    let me = ok(i, "identity.get", json!({})).await;
+    let port = ok(i, "status", json!({})).await["port"].as_u64().unwrap();
+    let key = me["member_key"].as_str().unwrap();
+    let key = iroh::PublicKey::from_bytes(&key_bytes(key).unwrap()).unwrap();
+    let addr =
+        iroh::EndpointAddr::new(key).with_ip_addr(format!("127.0.0.1:{port}").parse().unwrap());
+    let ep = endpoint(who).await;
+    let conn = ep.connect(addr, ALPN).await.unwrap();
+    let (send, recv) = conn.open_bi().await.unwrap();
+    let mut p = Peer { conn, send, recv };
+    p.hello(vec![]).await;
+    let seq = now_s() as u64 * 1000 + 3_600_000;
+    p.send(&common::presence_with(&who.key, seq, vec![])).await;
+    online(i, online_n).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    (p, ep)
+}
+
+/// Plays computer `who` (prefix `short`) on `p` in the background: each `app_*` request is
+/// answered with `answer(kind, body)` as `(kind, body)`, or not at all.
+fn answering(
+    mut p: Peer,
+    short: String,
+    answer: impl Fn(&str, &Value) -> Option<(&'static str, Value)> + Send + 'static,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Ok(f) = frames::read(&mut p.recv).await {
+            let Frame::Envelope {
+                id,
+                kind,
+                from,
+                body,
+                ..
+            } = f
+            else {
+                continue;
+            };
+            let body: Value = serde_json::from_str(&body).unwrap();
+            if let Some((k, v)) = answer(&kind, &body) {
+                let mut a = app_frame(k, &format!("{short}/claude-app"), &from, v);
+                if let Frame::Envelope { reply_to, .. } = &mut a {
+                    *reply_to = Some(id);
+                }
+                frames::write(&mut p.send, &a).await.unwrap();
+            }
+        }
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_silent_computer_that_sent_is_not_resent() {
+    let w = world();
+    w.run(&[&w.a2]);
+    let i = w.instance(&[&w.a2, &w.b]).await;
+    let (pa, _ep) = as_newest_computer(&i, &w.a.identity(), 3).await;
+    // A sent (its answer was lost): asked again, it has the receipt.
+    let _a = answering(pa, w.a.short(), |kind, b| {
+        (kind == "app_receipt_query").then(|| {
+            (
+                "app_receipt",
+                json!({"app": "claude", "request_id": b["request_id"],
+                "id": common::ulid(), "state": "stored", "thread": common::ulid()}),
+            )
+        })
+    });
+    let r = ok(&i, "app.send", send_body("claude", &w.q(), "r1")).await;
+    assert_eq!(
+        (r["computer"].as_str(), r["state"].as_str()),
+        (Some("mac"), Some("stored")),
+        "{r}"
+    );
+    assert!(w.b.inbox(&w.q()).is_empty(), "A2 sent it again");
+    i.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn inbox_skips_a_computer_that_answers_an_error() {
+    let w = world();
+    w.run(&[&w.a2]);
+    let i = w.instance(&[&w.a2, &w.b]).await;
+    let q = w.q();
+    let to_a2 = format!("{}/claude-app", w.a2.short());
+    w.b.send(&q, &to_a2, "for a2", "q1", None);
+    until(10, "stored on A2", || w.b.state(&q, "q1") == "stored");
+    let (pa, _ep) = as_newest_computer(&i, &w.a.identity(), 3).await;
+    // A answers every inbox with an error, a send with an unknown code, and the wrong kind
+    // to a receipt query.
+    let _a = answering(pa, w.a.short(), |kind, b| match kind {
+        "app_inbox" => Some((
+            "app_inbox_result",
+            json!({"app": "claude", "error": "bad_request"}),
+        )),
+        "app_send" => Some((
+            "app_receipt",
+            json!({"app": "claude",
+            "request_id": b["request_id"], "error": "weird\ncode"}),
+        )),
+        _ => Some(("app_inbox_result", json!({"app": "claude", "records": []}))),
+    });
+    let inbox = ok(&i, "app.inbox", json!({"for_person": P, "app": "claude"})).await;
+    let recs = inbox["records"].as_array().unwrap();
+    assert_eq!(recs.len(), 1, "{inbox}");
+    assert_eq!(
+        (recs[0]["text"].as_str(), inbox["more"].as_bool()),
+        (Some("for a2"), Some(false))
+    );
+    let r = call(&i, "app.send", send_body("claude", &q, "r1")).await;
+    assert_eq!(r["error"], "internal", "{r}");
+    // A wrong-kind answer is no answer: A2 says it has none of it.
+    let ask = json!({"for_person": P, "app": "claude", "request_id": "r9"});
+    assert_eq!(call(&i, "app.receipt", ask).await["error"], "not_found");
+    i.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn inbox_answers_are_bounded_and_marked_read_after_the_write() {
+    let w = world();
+    w.run(&[&w.a]);
+    let i = w.instance(&[&w.a, &w.b]).await;
+    let q = w.q();
+    let app = format!("{}/claude-app", w.a.short());
+    let big = "x".repeat(60_000);
+    for n in 0..12 {
+        let text = format!("{n:02}{big}");
+        w.b.send(&q, &app, &text, &format!("q{n}"), None);
+    }
+    until(10, "all stored on A", || {
+        (0..12).all(|n| w.b.state(&q, &format!("q{n}")) == "stored")
+    });
+    let inbox = json!({"for_person": P, "app": "claude"});
+    let mut got = vec![];
+    let mut rounds = 0;
+    loop {
+        let r = ok(&i, "app.inbox", inbox.clone()).await;
+        let recs = r["records"].as_array().unwrap();
+        assert!(
+            !recs.is_empty() && recs.len() < 12,
+            "{} records",
+            recs.len()
+        );
+        got.extend(
+            recs.iter()
+                .map(|m| m["text"].as_str().unwrap()[..2].to_string()),
+        );
+        rounds += 1;
+        if r["more"] == false {
+            break;
+        }
+        assert!(rounds < 12);
+    }
+    got.sort();
+    let want: Vec<String> = (0..12).map(|n| format!("{n:02}")).collect();
+    assert_eq!(got, want);
+    // Each read once it went out, and A stayed connected throughout.
+    until(10, "all read", || {
+        (0..12).all(|n| w.b.state(&q, &format!("q{n}")) == "read")
+    });
+    assert_eq!(ok(&i, "status", json!({})).await["peers"]["online"], 2);
+    let r = ok(&i, "app.inbox", inbox).await;
+    assert!(r["records"].as_array().unwrap().is_empty(), "{r}");
+    i.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lapsed_workspace_member_has_no_authority() {
+    let w = world_at(now_s() - 2 * 86_400);
+    w.run(&[&w.a]);
+    let iw1 = w.w1_identity();
+    let (mut p, _ep) = played(&iw1, &w.a).await;
+    let from = format!("{}/claude-app", iw1.short);
+    let to = format!("{}/claude-app", w.a.short());
+    p.send(&app_frame(
+        "app_send",
+        &from,
+        &to,
+        send_body("claude", &w.q(), "x1"),
+    ))
+    .await;
+    assert_eq!(app_answer(&mut p).await, None);
+    assert!(w.b.inbox(&w.q()).is_empty());
+    let g = common::person(
+        &w.a,
+        json!({"id": 1, "op": "share.grant", "session": common::session(&w.a, "a1"),
+            "viewer": iw1.key, "input": true, "expires_at": now_s() + 600}),
+    );
+    assert_eq!(g["error"], "unsupported", "{g}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn app_envelope_from_outside_the_members_prefix_is_dropped() {
+    let w = world();
+    w.run(&[&w.a]);
+    let iw1 = w.w1_identity();
+    let (mut p, _ep) = played(&iw1, &w.a).await;
+    let to = format!("{}/claude-app", w.a.short());
+    for from in [format!("{}/claude-app", w.b.short()), "nobody".to_string()] {
+        p.send(&app_frame(
+            "app_send",
+            &from,
+            &to,
+            send_body("claude", &w.q(), "x1"),
+        ))
+        .await;
+        assert_eq!(app_answer(&mut p).await, None, "{from}");
+    }
+    assert!(w.a.status()["dropped"]["app"].as_u64() >= Some(2));
+    assert!(w.b.inbox(&w.q()).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_teammate_who_has_not_allowed_p_holds_ps_claude() {
+    let w = world();
+    policy::set_person(&w.b.store(), P, Verdict::Hold, "local", 2).unwrap();
+    w.run(&[&w.a]);
+    let i = w.instance(&[&w.a, &w.b]).await;
+    let r = ok(&i, "app.send", send_body("claude", &w.q(), "r1")).await;
+    assert_eq!(r["state"], "held", "{r}");
+    assert_eq!(count(&db(&w.b), "SELECT COUNT(*) FROM holds"), 1);
+    assert!(w.b.inbox(&w.q()).is_empty());
+    i.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_limit_is_the_persons_across_both_computers() {
+    let w = world();
+    w.run(&[&w.a, &w.a2]);
+    let i = w.instance(&[&w.a, &w.a2, &w.b]).await;
+    let q = w.q();
+    let mut by: HashMap<String, usize> = HashMap::new();
+    for n in 0..12 {
+        let r = ok(&i, "app.send", send_body("claude", &q, &format!("r{n}"))).await;
+        assert_eq!(r["state"], "stored", "{n}: {r}");
+        *by.entry(r["computer"].as_str().unwrap().into())
+            .or_default() += 1;
+    }
+    // A computer that sent all twelve is stopped: the 13th goes through one under its own
+    // count, and Q's computer counts the person.
+    if let Some((full, _)) = by.iter().find(|(_, n)| **n == 12) {
+        let e = if full == "mac" { &w.a } else { &w.a2 };
+        e.ask(json!({"id": 1, "op": "shutdown"}));
+        online(&i, 2).await;
+    }
+    let r = ok(&i, "app.send", send_body("claude", &q, "r12")).await;
+    assert_eq!(
+        (
+            r["state"].as_str(),
+            r["reason"].as_str(),
+            r["limit"].as_str()
+        ),
+        (Some("refused"), Some("loop"), Some("rate")),
+        "{r}"
+    );
     i.shutdown().await;
 }
 

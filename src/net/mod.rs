@@ -155,6 +155,8 @@ pub struct Peers {
     pub disconnected: Notify,
     /// Woken (`notify_waiters`) whenever a member answers for mail sent it (`outbox::acked`).
     pub acked: Notify,
+    /// Envelopes whose sender waits to hear they were written (`send_written`), by id.
+    written: Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>,
     /// The endpoint's UDP port.
     pub port: OnceLock<u16>,
     /// The endpoint, for the candidate side of a join.
@@ -300,6 +302,42 @@ impl Peers {
             Some(true) => Ok(()),
             Some(false) => Err("connection closed".into()),
             None => Err("not connected".into()),
+        }
+    }
+
+    /// `send` envelope `f`, and hear once it was written to the stream (`app_send`: mail is
+    /// marked read only then). `None` when it could not be queued. The caller drops the entry
+    /// (`unwritten`) if it gives up waiting.
+    pub(crate) fn send_written(
+        &self,
+        member: &str,
+        f: Frame,
+    ) -> Option<tokio::sync::oneshot::Receiver<()>> {
+        let Frame::Envelope { id, .. } = &f else {
+            return None;
+        };
+        let (id, (tx, rx)) = (id.clone(), tokio::sync::oneshot::channel());
+        self.written.lock().unwrap().insert(id.clone(), tx);
+        if self.send(member, f).is_err() {
+            self.unwritten(&id);
+            return None;
+        }
+        Some(rx)
+    }
+
+    /// Forgets `send_written`'s waiter for envelope `id`.
+    pub(crate) fn unwritten(&self, id: &str) {
+        self.written.lock().unwrap().remove(id);
+    }
+
+    /// Frame `f` was written: its `send_written` waiter hears it.
+    fn wrote(&self, f: &Frame) {
+        if let Frame::Envelope { id, kind, .. } = f {
+            if crate::app_send::is_app(kind) {
+                if let Some(tx) = self.written.lock().unwrap().remove(id) {
+                    let _ = tx.send(());
+                }
+            }
         }
     }
 
@@ -695,6 +733,7 @@ impl Net {
                     if frames::write(&mut send, &f).await.is_err() {
                         return;
                     }
+                    d.peers.wrote(&f);
                 }
             };
             let reader = async {

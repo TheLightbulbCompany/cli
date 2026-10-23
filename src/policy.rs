@@ -257,7 +257,8 @@ mod tests {
         let me = member("me", "p-me", MemberKind::Computer, Some("w1"));
         let my_laptop = member("lap", "p-me", MemberKind::Computer, None);
         let aden = member("aden", "p-aden", MemberKind::Computer, None);
-        let my_ws = member("ws1", "ws:w1", MemberKind::Cloud, None);
+        // A workspace member in force names its workspace (`Roster::my_workspace_member`).
+        let my_ws = member("ws1", "ws:w1", MemberKind::Cloud, Some("w1"));
         let other_ws = member("ws2", "ws:w2", MemberKind::Cloud, None);
         let r = roster(&[&me, &my_laptop, &aden, &my_ws, &other_ws]);
         let d = |r: &Roster, from: &Member| decide(&s, r, "me", from).unwrap();
@@ -310,7 +311,7 @@ mod tests {
         let me = member("me", "p-me", MemberKind::Computer, Some("w1"));
         let p1 = member("p1", "p1", MemberKind::Computer, None);
         let w = member("w", "ws:w", MemberKind::Cloud, None);
-        let mine = member("w1", "ws:w1", MemberKind::Cloud, None);
+        let mine = member("w1", "ws:w1", MemberKind::Cloud, Some("w1"));
         let r = roster(&[&me, &p1, &w, &mine]);
         set(&s, &r, "me", &p1, Verdict::Accept, "local", 1).unwrap();
         set(&s, &r, "me", &w, Verdict::Hold, "bridge", 1).unwrap();

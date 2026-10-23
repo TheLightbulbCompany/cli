@@ -1,6 +1,7 @@
 //! The engine's HTTP calls (the issuer's sign-in and our signed relay list): one policy.
 //! https only in release builds (debug: the tests' loopback servers), no redirects, one 10 s
-//! deadline for the whole call (connect, send, answer), answers at most 64 KiB. Blocking: callers run off the async threads.
+//! deadline for the whole call (connect, send, answer), answers at most 64 KiB. Blocking:
+//! callers run off the async threads.
 
 use crate::Result;
 use serde_json::Value;

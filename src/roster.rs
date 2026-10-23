@@ -186,12 +186,14 @@ impl Roster {
         }
     }
 
-    /// My workspace's member: the cloud member whose `person_id` is `ws:<me.workspace>`.
+    /// My workspace's member: the cloud member whose `person_id` is `ws:<me.workspace>`, while
+    /// its own proof is in force (a lapsed one has no authority: app sends, input grants,
+    /// `agents_send_without_asking`).
     pub fn my_workspace_member(&self, me: &Member) -> Option<&Member> {
         let ws = format!("ws:{}", me.workspace.as_ref()?);
         self.members
             .values()
-            .find(|m| m.kind == MemberKind::Cloud && m.person_id == ws)
+            .find(|m| m.kind == MemberKind::Cloud && m.person_id == ws && m.workspace.is_some())
     }
 
     /// Person `person`'s computer members, first admitted first.
