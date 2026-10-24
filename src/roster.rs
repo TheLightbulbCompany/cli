@@ -410,6 +410,8 @@ fn pass(
     // Links by `ticket_id`, each with the hash of its entry.
     let mut links: BTreeMap<String, (String, Link)> = BTreeMap::new();
     let mut used_once: BTreeSet<String> = BTreeSet::new();
+    // Whether the genesis is a workspace instance's own (`solo_genesis`'s `cloud`).
+    let mut cloud_founder = false;
     while let Some((_, h)) = ready.pop_first() {
         for c in children.get(h.as_str()).into_iter().flatten() {
             let n = waiting.get_mut(c).expect("a child is an entry");
@@ -425,6 +427,7 @@ fn pass(
                 r.team_id = h.clone();
                 r.team_name = e.text("team_name").to_string();
                 r.created_at = e.at;
+                cloud_founder = e.body["cloud"] == true;
                 r.members
                     .insert(e.signer.clone(), new_member(e, Role::Founder, claims));
             }
@@ -457,6 +460,11 @@ fn pass(
         }
         let computer = signer.kind == MemberKind::Computer;
         let founder = signer.role == Role::Founder;
+        // A workspace's cloud member, the one engine that knows a person's real id: the
+        // instance that founded this network as one, or a cloud member with its workspace
+        // proof. Only its `person` links vouch for a person.
+        let cloud_member = (founder && cloud_founder)
+            || (signer.kind == MemberKind::Cloud && signer.workspace.is_some());
         match e.kind {
             // A cloud (bridge) member never admits.
             Kind::Admit if computer => {
@@ -500,9 +508,10 @@ fn pass(
                     && r.members
                         .values()
                         .any(|m| m.kind == MemberKind::Cloud && m.person_id == e.text("person_id"));
-                // The signer of a `person` link admitting through it vouches for the person it
-                // minted the link for (the backend handed that link to exactly that person).
-                let vouched = link.is_some_and(|(_, l)| l.mode == "person" && l.signer == e.signer);
+                // A cloud member admitting through its own `person` link vouches for the person
+                // it minted the link for (the backend handed that link to exactly that person).
+                let vouched = cloud_member
+                    && link.is_some_and(|(_, l)| l.mode == "person" && l.signer == e.signer);
                 if authorised && !taken && !collides && role_ok && own_person(e, claims, vouched) {
                     r.members
                         .insert(target, new_member(e, Role::Member, claims));
@@ -549,10 +558,11 @@ fn pass(
                     r.members.remove(&target);
                 }
             }
-            // Only a computer member mints links, under its own `<short>.` prefix, and a
-            // `ticket_id` names one link ever.
+            // Only a computer member mints links (a `person` one only a cloud member), under its
+            // own `<short>.` prefix, and a `ticket_id` names one link ever.
             Kind::Link
                 if computer
+                    && (e.text("mode") != "person" || cloud_member)
                     && e.text("ticket_id")
                         .strip_prefix(signer.short.as_str())
                         .is_some_and(|rest| rest.len() > 1 && rest.starts_with('.')) =>
@@ -1129,6 +1139,45 @@ mod tests {
         }
         assert_eq!(s.members, d.members);
         assert_eq!(s.links, d.links);
+    }
+
+    #[test]
+    fn only_a_cloud_members_person_link_vouches_for_a_person() {
+        let (w, x, v, k) = (id(), id(), id(), id());
+        let person_link = |by: &Identity, parent: &Entry| {
+            let body = json!({"ticket_id": tid(by, "p"), "secret": "s", "mode": "person",
+                "once": true, "expires_at": 99});
+            op(by, parent, Kind::Link, body)
+        };
+        let as_user_v = |by: &Identity, parent: &Entry, who: &Identity| {
+            let mut b = admit_body(&who.key, &who.short);
+            b["ticket_id"] = json!(tid(by, "p"));
+            b["person_id"] = json!("user_v");
+            op(by, parent, Kind::Admit, b)
+        };
+        let log = |g: Entry| {
+            let ax = admit(&w, &g, &x.key, "x");
+            let wl = person_link(&w, &ax);
+            let av = as_user_v(&w, &wl, &v);
+            // X, a computer member, mints its own person link and admits K as V's person.
+            let xl = person_link(&x, &av);
+            let ak = as_user_v(&x, &xl, &k);
+            replay(&[g, ax, wl, av, xl, ak])
+        };
+        let r = log(crate::daemon::net_ops::solo_genesis(
+            &w,
+            Some("Acme"),
+            "Acme",
+            1,
+        ));
+        assert_eq!(r.members[&v.key].person_id, "user_v");
+        assert!(!r.members.contains_key(&k.key));
+        assert_ne!(r.person_of(&k.key), r.person_of(&v.key));
+        assert!(!r.links.contains_key(&tid(&x, "p")));
+        // A computer's network (no `cloud` genesis): its founder vouches for no one either.
+        let r = log(genesis(&w));
+        assert!(!r.members.contains_key(&v.key));
+        assert!(!r.members.contains_key(&k.key));
     }
 
     #[test]

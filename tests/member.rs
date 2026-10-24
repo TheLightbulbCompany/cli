@@ -597,41 +597,49 @@ async fn ask_and_open_links_still_refuse_on_an_instance() {
     assert_eq!(r["error"], "unsupported", "{r}");
 }
 
-/// Any member may sign a `person` link into the roster: only the member's own admits with no
-/// Allow.
+/// A computer member's `person` link is no link: only a cloud member's vouches for a person.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_teammates_person_link_still_waits_for_an_allow() {
+async fn a_teammates_person_link_is_refused() {
     use lightbulb::ticket;
     let dir = tempfile::tempdir().unwrap();
+    // The member founds its network (a `cloud` genesis); then X, admitted by it, signs its own
+    // person link into the roster.
+    let (child, token, sock) = member(dir.path(), friday());
+    ok(&sock, &token, "stop", json!({}));
+    exits_zero(child);
     let home = dir.path().join("home");
-    std::fs::create_dir_all(&home).unwrap();
     let w = Identity::load_or_create(&home).unwrap();
     let x = identity();
-    let g = lightbulb::daemon::net_ops::genesis(&w, NAME, NAME, NAME, 1);
-    let ax = common::admit(&w, &g, &x, "x", json!({}));
-    let before = roster::replay(&[g.clone(), ax.clone()]);
+    let store = Store::open(&home.join("state.db")).unwrap();
+    let entries = roster::entries(&store).unwrap();
+    let ax = common::admit(&w, &entries[0], &x, "x", json!({}));
+    let before = roster::replay(&[entries[0].clone(), ax.clone()]);
     let hints = (String::new(), vec![]);
     let (t, hashed) = ticket::mint(&x, &before, "person", true, common::now_s(), hints);
     let t = ticket::for_person(&x, t, "user_x");
     let body = ticket::link_body(&t, hashed.as_deref());
     let link = Entry::signed(&x, vec![ax.hash()], Kind::Link, body, 3);
-    let store = Store::open(&home.join("state.db")).unwrap();
-    for e in [&g, &ax, &link] {
+    for e in [&ax, &link] {
         roster::accept(&store, e, 10).unwrap();
     }
     drop(store);
     let (child, token, sock) = member(dir.path(), friday());
-    let mac = identity();
-    let (s, tok, tk) = (sock.clone(), token.clone(), t.clone());
-    let joining = tokio::spawn(async move { join(&s, &tok, &tk, &mac, None).await });
-    until(10, "the request waits for an Allow", || {
-        ok(&sock, &token, "team.join_requests", json!({}))["requests"]
+    let members = ok(&sock, &token, "team.get", json!({}))["members"].clone();
+    assert!(
+        members
             .as_array()
-            .is_some_and(|r| r.len() == 1)
-    });
+            .unwrap()
+            .iter()
+            .any(|m| m["key"] == x.key),
+        "{members}"
+    );
+    let (verdict, reason) = join(&sock, &token, &t, &identity(), None).await;
+    assert_eq!(
+        (verdict.as_str(), reason.as_deref()),
+        ("refused", Some("bad_ticket"))
+    );
     let policy = ok(&sock, &token, "policy.get", json!({}));
     assert_eq!(policy["people"], json!({}), "{policy}");
-    joining.abort();
     ok(&sock, &token, "stop", json!({}));
     exits_zero(child);
 }

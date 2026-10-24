@@ -390,12 +390,16 @@ pub fn genesis(me: &Identity, name: &str, computer: &str, team_name: &str, at: i
 
 /// This engine's solo network: a computer's (`genesis`, as its person), or a workspace
 /// member's (`cloud`: the workspace's name, member and team alike). An instance founds it as a
-/// plain member of its own key: a `cloud` member needs a workspace proof, which only `team.join`
-/// brings (`roster::own_person`).
+/// plain member of its own key (a `cloud` member needs a workspace proof, which only
+/// `team.join` brings), marked `cloud` so its `person` links vouch (`roster::pass`).
 pub(crate) fn solo_genesis(me: &Identity, cloud: Option<&str>, computer: &str, at: i64) -> Entry {
     let user = super::user_name();
     let name = cloud.unwrap_or(&user);
-    genesis(me, name, computer, name, at)
+    let mut body = genesis(me, name, computer, name, at).body;
+    if cloud.is_some() {
+        body["cloud"] = true.into();
+    }
+    Entry::signed(me, vec![], Kind::Admit, body, at)
 }
 
 /// Whether `path` is absolute and names nothing in (or of) state dir `dir`: a snapshot never
