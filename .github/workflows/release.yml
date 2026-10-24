@@ -8,7 +8,7 @@ jobs:
   macos-arm64:
     runs-on: macos-latest # Apple silicon (arm64)
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release
       # Not signed or notarized yet: that is a later step (Developer ID
@@ -38,9 +38,9 @@ jobs:
       - if: env.NPM_TOKEN == ''
         run: echo "NPM_TOKEN not set; skipping npm publish"
       - if: env.NPM_TOKEN != ''
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - if: env.NPM_TOKEN != ''
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 20
           registry-url: https://registry.npmjs.org

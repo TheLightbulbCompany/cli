@@ -40,7 +40,7 @@ impl Identity {
                 // Write then rename, so a crash never leaves a truncated key.
                 // We hold the lock, so a leftover .tmp is ours to replace.
                 let tmp = dir.join("identity.key.tmp");
-                let key = SigningKey::generate(&mut rand::rngs::OsRng);
+                let key = SigningKey::generate(&mut rand::rand_core::UnwrapErr(rand::rngs::SysRng));
                 crate::setup::create_with(&tmp, &key.to_bytes(), 0o600)?;
                 fs::rename(&tmp, &path)?;
                 key
