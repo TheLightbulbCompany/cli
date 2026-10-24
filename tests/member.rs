@@ -520,6 +520,26 @@ async fn a_person_link_is_single_use() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_computer_joined_by_a_person_link_without_a_proof_is_that_person() {
+    // A real Mac or WSL box has no person proof (the sign-in flow is gone); the person link the
+    // backend minted for them is the proof. Found on 2026-10-25 by the first real member: the
+    // CI runner's first message to the CEO was held although it had joined by that person's link.
+    let dir = tempfile::tempdir().unwrap();
+    let (child, token, sock) = member(dir.path(), friday());
+    let r = person_invite(&sock, &token, "user_x", "Prasiddha");
+    let t = ticket_of(r["result"]["line"].as_str().unwrap());
+    let mac = identity();
+    assert_eq!(join(&sock, &token, &t, &mac, None).await.0, "allow");
+    let policy = ok(&sock, &token, "policy.get", json!({}));
+    assert_eq!(policy["people"]["user_x"], "accept", "{policy}");
+    let (mut p, _ep) = dial(&sock, &token, &mac).await;
+    let to = format!("{}/friday", short(&sock, &token));
+    assert_eq!(send(&mut p, &mac, &to, "hi friday").await.1, "stored");
+    ok(&sock, &token, "stop", json!({}));
+    exits_zero(child);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_invited_persons_first_message_to_friday_is_not_held() {
     let dir = tempfile::tempdir().unwrap();
     let (child, token, sock) = member(dir.path(), friday());
