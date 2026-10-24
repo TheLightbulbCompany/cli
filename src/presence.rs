@@ -519,9 +519,14 @@ pub fn directory(d: &Daemon, query: Option<&str>) -> Value {
     let key = &d.identity.key;
     let mut out = vec![];
     for (r, cwd, handle, hidden) in &local {
-        if hit(&own, r, cwd) {
+        // `who`'s name for it (`claude-5`) finds it too: people pass it on to their agents.
+        let named = |q: &String| {
+            handle
+                .as_deref()
+                .is_some_and(|h| h.to_lowercase().contains(q))
+        };
+        if hit(&own, r, cwd) || q.as_ref().is_some_and(named) {
             let mut v = record(&own, &me, r, cwd, true, true);
-            // `who --all`'s name for it (the MCP server leaves it out).
             v["handle"] = handle.clone().into();
             if *hidden {
                 v["hidden"] = true.into();
