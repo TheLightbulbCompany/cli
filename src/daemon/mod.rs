@@ -258,6 +258,7 @@ pub async fn run(dir: &Path) -> Result<()> {
     // Briefly wider than 0600 after bind; the 0700 state dir closes that window.
     fs::set_permissions(&sock, Permissions::from_mode(0o600))?;
     tokio::spawn(crate::admission::route(daemon.clone()));
+    cli::refresh_setup(dir);
     tokio::spawn(auto_update(daemon.clone(), dir.to_path_buf()));
     // SIGTERM (launchd's stop) and SIGINT end it like a `shutdown` op: the socket and the
     // loopback address file (`net::local`) are removed on the way out.

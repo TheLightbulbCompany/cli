@@ -1163,6 +1163,36 @@ fn latest_tag(base: Option<&str>) -> Result<String> {
         .ok_or_else(|| "Could not learn the latest version; nothing changed.".into())
 }
 
+/// The Developer ID team every release is signed by.
+const TEAM_ID: &str = "WZX4U3C22Y";
+
+/// Whether `codesign -dv` output names our team.
+fn signed_by_us(dv: &str) -> bool {
+    dv.lines()
+        .any(|l| l.trim() == format!("TeamIdentifier={TEAM_ID}"))
+}
+
+/// Refuses a binary that is not validly signed by our team; the old binary is untouched.
+#[cfg(target_os = "macos")]
+fn verify_signature(bin: &Path) -> Result<()> {
+    let bad = || "The download is not signed by Lightbulb; nothing changed.";
+    let ok = Command::new("codesign")
+        .args(["--verify", "--strict"])
+        .arg(bin)
+        .output()
+        .is_ok_and(|o| o.status.success());
+    let dv = Command::new("codesign")
+        .arg("-dv")
+        .arg(bin)
+        .output()
+        .map_err(|_| bad())?;
+    if ok && signed_by_us(&String::from_utf8_lossy(&dv.stderr)) {
+        Ok(())
+    } else {
+        Err(bad().into())
+    }
+}
+
 /// Downloads release `tag` from `base`, checks its tarball against the release's `.sha256`, and
 /// only then makes it the canonical binary (`install_alias`). `Ok(false)`: the checksum did not
 /// match and nothing changed. Shared by `update` and the daemon's daily check.
@@ -1198,6 +1228,11 @@ fn install_release(home: &Path, base: &str, tag: &str) -> Result<bool> {
                 format!("The {tag} download holds no lightbulb binary; nothing changed.").into(),
             );
         }
+        // "(tests)" debug builds only: a stub binary has no signature.
+        #[cfg(target_os = "macos")]
+        if test_env("LIGHTBULB_ALLOW_UNSIGNED").is_none() {
+            verify_signature(&new)?;
+        }
         install_alias(home, &new)?;
         Ok(true)
     })();
@@ -1222,6 +1257,38 @@ fn should_auto_update(current: &str, latest: &str, last: Option<&str>) -> bool {
     match (parse_version(current), parse_version(latest)) {
         (Some(c), Some(l)) => l > c && last.and_then(parse_version) != Some(l),
         _ => false,
+    }
+}
+
+/// The version whose `setup` last ran, in the state dir.
+const SETUP_VERSION: &str = "setup-version";
+
+/// Whether `setup` must run again: the binary is not the version that last ran it.
+fn setup_due(last: Option<&str>, current: &str) -> bool {
+    last.map(str::trim) != Some(current)
+}
+
+/// At a daemon's start on the real install: after a version change (an auto-update), runs the
+/// canonical binary's `setup` once so hooks, MCP entries and the skill follow it. The marker is
+/// written first, so a failing setup is not retried on every start.
+pub fn refresh_setup(dir: &Path) {
+    if std::env::var_os(paths::HOME_ENV).is_some() {
+        return;
+    }
+    let last = fs::read_to_string(dir.join(SETUP_VERSION)).ok();
+    let Ok(home) = home() else { return };
+    if !setup_due(last.as_deref(), VERSION) || fs::write(dir.join(SETUP_VERSION), VERSION).is_err()
+    {
+        return;
+    }
+    let child = Command::new(canonical(&home))
+        .arg("setup")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    if let Ok(mut c) = child {
+        std::thread::spawn(move || c.wait());
     }
 }
 
@@ -1255,7 +1322,7 @@ pub fn auto_update(dir: &Path) -> Result<bool> {
         return Err("checksum mismatch; nothing changed".into());
     }
     eprintln!("auto-update: installed {tag}; restarting");
-    fs::write(dir.join(AUTO_UPDATE_LAST), &tag)?;
+    let _ = fs::write(dir.join(AUTO_UPDATE_LAST), &tag);
     Ok(true)
 }
 
@@ -1712,6 +1779,7 @@ pub fn setup(
         .collect();
     let connected: Vec<&str> = connected.iter().map(String::as_str).collect();
     println!("\n{}", setup::summary(&connected, command()));
+    let _ = fs::write(paths::state_path().join(SETUP_VERSION), VERSION);
     Ok(0)
 }
 
@@ -1730,6 +1798,25 @@ mod tests {
             "installed last time"
         );
         assert!(go("0.3.2", "v0.3.4", Some("v0.3.3")));
+    }
+
+    #[test]
+    fn the_signature_must_name_our_team() {
+        assert!(super::signed_by_us(
+            "Identifier=x\nTeamIdentifier=WZX4U3C22Y\n"
+        ));
+        assert!(!super::signed_by_us("TeamIdentifier=ABCDE12345\n"));
+        assert!(!super::signed_by_us(
+            "TeamIdentifier=not set\nAuthority=x\n"
+        ));
+        assert!(!super::signed_by_us(""));
+    }
+
+    #[test]
+    fn setup_reruns_after_a_version_change() {
+        assert!(super::setup_due(None, "0.3.3"));
+        assert!(super::setup_due(Some("0.3.2\n"), "0.3.3"));
+        assert!(!super::setup_due(Some("0.3.3\n"), "0.3.3"));
     }
 
     #[test]
