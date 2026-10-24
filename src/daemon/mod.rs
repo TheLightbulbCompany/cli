@@ -110,12 +110,6 @@ pub struct Cloud {
     declared: Mutex<Declared>,
     /// The last `Declared::version` the presence sender (`presence::run`) handed on.
     pub sent: tokio::sync::watch::Sender<u64>,
-    /// The `app_*` requests out (`app_send`), by envelope id: the computer asked, the answer
-    /// kind expected, and where the answer goes.
-    pub apps: Mutex<HashMap<String, crate::app_send::Waiter>>,
-    /// The hold notices received and not yet answered (`decision`), by `(holding member, hold
-    /// id)`: their `hold_notice` events.
-    pub notices: Mutex<HashMap<(String, String), serde_json::Value>>,
 }
 
 /// The sessions an instance declared (`cloud.sessions.set`), as published; each set is a new
@@ -133,8 +127,6 @@ impl Cloud {
             name,
             declared: Mutex::default(),
             sent: tokio::sync::watch::Sender::new(0),
-            apps: Mutex::default(),
-            notices: Mutex::default(),
         }
     }
 

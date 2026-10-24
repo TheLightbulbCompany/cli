@@ -29,16 +29,11 @@ pub fn enqueue(store: &Store, p: Prepared, to: &Member) -> Result<Receipt> {
 }
 
 /// The frames to send at `now` to the `online` members, `(row id, member, frame)`: envelopes
-/// still `queued`, hold notices and decisions created after `since` (`decision`), all due.
-pub fn due(
-    store: &Store,
-    online: &[String],
-    now: u64,
-    since: u64,
-) -> Result<Vec<(String, String, Frame)>> {
+/// still `queued`, all due.
+pub fn due(store: &Store, online: &[String], now: u64) -> Result<Vec<(String, String, Frame)>> {
     let now = i64::try_from(now).unwrap_or(i64::MAX);
     let mut out = vec![];
-    for (id, member, frame) in store.outbox_due(online, now, since as i64)? {
+    for (id, member, frame) in store.outbox_due(online, now)? {
         out.push((id, member, serde_json::from_str(&frame)?));
     }
     Ok(out)
@@ -169,7 +164,7 @@ mod tests {
     }
 
     fn due_n(s: &Store, now: u64) -> usize {
-        due(s, &["b".into()], now, 0).unwrap().len()
+        due(s, &["b".into()], now).unwrap().len()
     }
 
     #[test]
@@ -179,7 +174,7 @@ mod tests {
         let id = queue(&s, 100);
         assert_eq!(due_n(&s, 100), 1);
         assert!(
-            due(&s, &["c".into()], 100, 0).unwrap().is_empty(),
+            due(&s, &["c".into()], 100).unwrap().is_empty(),
             "only for the online"
         );
         sent(&s, &id, 100).unwrap();

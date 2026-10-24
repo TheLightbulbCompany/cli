@@ -632,4 +632,145 @@ async fn a_cloud_member_mints_no_person_link() {
     assert_eq!(r["error"], "unsupported", "{r}");
     ok(&sock, &token, "stop", json!({}));
     exits_zero(child);
+
+/// The doorbell (E4): the member founds its own network and publishes `wake` from its
+/// sessions file; computer A ("mac"), admitted to it, dials it with a fake `curl` first on its
+/// PATH that keeps its argv and stdin under `dir/curl`. Returns A (running), the member, its
+/// token and socket, and the wake token.
+fn doorbell(dir: &Path) -> (common::Env, Child, String, std::path::PathBuf, String) {
+    let home = dir.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let w = Identity::load_or_create(&home).unwrap();
+    let a = common::Env::new();
+    let g = lightbulb::daemon::net_ops::genesis(&w, NAME, NAME, NAME, 1);
+    let aa = common::admit(
+        &w,
+        &g,
+        &a.identity(),
+        "prasiddha",
+        json!({"computer": "mac"}),
+    );
+    for s in [Store::open(&home.join("state.db")).unwrap(), a.store()] {
+        for e in [&g, &aa] {
+            roster::accept(&s, e, 10).unwrap();
+        }
+    }
+    let wake_token = format!("org_1.{}", common::ulid());
+    let wake = json!({"url": "http://127.0.0.1:9/api/v1/network/wake", "token": wake_token});
+    let file = json!({"workspace": NAME, "sessions": friday(), "wake": wake});
+    let (child, token, sock) = common::member_with(dir, file);
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(dir.join("curl")).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    let rec = dir.join("curl").display().to_string();
+    let fake = common::script(
+        &bin,
+        &format!(
+            "n=$(ls '{rec}' | wc -l | tr -d ' ')\n\
+             printf '%s\\n' \"$@\" > '{rec}/'$n.args\n\
+             cat > '{rec}/'$n.stdin"
+        ),
+    );
+    std::fs::rename(fake, bin.join("curl")).unwrap();
+    let key = ok(&sock, &token, "identity.get", json!({}))["member_key"].clone();
+    let port = ok(&sock, &token, "status", json!({}))["port"].clone();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let peers = format!("{}@127.0.0.1:{port}", key.as_str().unwrap());
+    a.daemon(
+        false,
+        "",
+        &[("LIGHTBULB_CONNECT_PEERS", peers), ("PATH", path)],
+    );
+    common::until(10, "A is online", || {
+        ok(&sock, &token, "status", json!({}))["peers"]["online"] == 1
+    });
+    (a, child, token, sock, wake_token)
+}
+
+/// The curl calls made so far: each one's argv lines.
+fn rings(dir: &Path) -> Vec<Vec<String>> {
+    let mut calls: Vec<_> = std::fs::read_dir(dir.join("curl"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|x| x == "args"))
+        .collect();
+    calls.sort();
+    let lines = |p: &Path| {
+        std::fs::read_to_string(p)
+            .unwrap()
+            .lines()
+            .map(String::from)
+            .collect()
+    };
+    calls.iter().map(|p| lines(p)).collect()
+}
+
+/// The member stopped, and a message for its Friday due on A: until A rang once. Returns
+/// Friday's address.
+fn rang(dir: &Path, a: &common::Env, child: Child, token: &str, sock: &Path) -> String {
+    let to = format!("{}/friday", short(sock, token));
+    let from = common::session(a, "c1");
+    // Up: it reaches the member over the connection (held there: A is no one it knows), no
+    // doorbell.
+    a.send(&from, &to, "while up", "r1", None);
+    common::until(10, "on the member", || a.state(&from, "r1") == "held");
+    ok(sock, token, "stop", json!({}));
+    exits_zero(child);
+    assert!(rings(dir).is_empty(), "rang while the member was up");
+    a.send(&from, &to, "while parked", "r2", None);
+    common::until(90, "A rings the doorbell", || !rings(dir).is_empty());
+    to
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_computer_rings_the_doorbell_only_after_a_failed_dial() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, child, token, sock, _) = doorbell(dir.path());
+    let to = rang(dir.path(), &a, child, &token, &sock);
+    let calls = rings(dir.path());
+    assert_eq!(
+        calls[0],
+        [
+            "-fsS",
+            "-m",
+            "10",
+            "-X",
+            "POST",
+            "-K",
+            "-",
+            "http://127.0.0.1:9/api/v1/network/wake"
+        ]
+    );
+    // Backoff: more mail due rings no second time soon.
+    a.send(&common::session(&a, "c1"), &to, "still parked", "r3", None);
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(rings(dir.path()).len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_doorbell_token_is_absent_from_logs() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, child, token, sock, wake) = doorbell(dir.path());
+    rang(dir.path(), &a, child, &token, &sock);
+    // On curl's stdin, as a config line: never on its command line.
+    let stdin = std::fs::read_to_string(dir.path().join("curl/0.stdin")).unwrap();
+    assert_eq!(
+        stdin,
+        format!("header = \"Authorization: Bearer {wake}\"\n")
+    );
+    assert!(rings(dir.path())[0].iter().all(|l| !l.contains(&wake)));
+    for log in [
+        dir.path().join("member.log"),
+        a.state.path().join("daemon.log"),
+    ] {
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert!(!text.contains(&wake), "{log:?}: {text}");
+        assert!(!text.contains("org_1."), "{log:?}");
+    }
+    assert!(
+        std::fs::read_to_string(a.state.path().join("daemon.log"))
+            .unwrap()
+            .contains("doorbell"),
+        "the ring is logged"
+    );
 }

@@ -14,12 +14,12 @@ pub fn printable(c: char) -> bool {
 }
 
 /// `from`'s label for the reader at member `viewer` (its person is `Roster::person_of`):
-/// `Your Codex`, `You, at the terminal`, `Your desk mailbox`, `Your Claude` (a hosted app's
-/// `<app>-app` session, `app_send`) for the reader's own person;
+/// `Your Codex`, `You, at the terminal`, `Your desk mailbox` for the reader's own person;
 /// `aden's Codex`, `aden, at the terminal`, `aden's desk mailbox` for another's, `✓ Aden
 /// Smith's Codex` when that member's proof is in force (its name);
 /// ` (not verified)` after a member with no proof other than the reader's own computer;
-/// `<Agent> · <workspace name>` for a session of a workspace member in force (`render_as`);
+/// `<Agent> · <workspace name>` for a session of a workspace member in force (`render_as`),
+/// or a hosted app's declared title, `ChatGPT via Aden` (`via`);
 /// `an unknown member (not verified)` for a prefix the roster does not hold.
 pub fn render(roster: &Roster, viewer: &str, from: &str) -> String {
     render_as(roster, viewer, from, None)
@@ -36,6 +36,9 @@ pub fn render_as(roster: &Roster, viewer: &str, from: &str, declared: Option<&st
     if let Some(p) = ws.filter(|_| m.kind == MemberKind::Cloud) {
         let rest = split_addr(from).map_or(from, |(_, r)| r);
         let named = p.agents.iter().find(|a| a.eq_ignore_ascii_case(rest));
+        if let Some(title) = declared.filter(|t| via(rest, t)) {
+            return shown(title, 64, "an app");
+        }
         let agent = declared.or(named.map(String::as_str)).unwrap_or(rest);
         let space = p.workspace.as_ref().map_or("", |w| w.name.as_str());
         // The agent may be the presence's, so it is cut; the proof's text is (`proof::parse`).
@@ -56,11 +59,7 @@ pub fn render_as(roster: &Roster, viewer: &str, from: &str, declared: Option<&st
     };
     let label = match Sender::of(prefix, from) {
         Sender::Terminal => format!("{who}, at the terminal"),
-        // A hosted app's session on the person's own computer (`app_send`).
-        Sender::Name(n) => match crate::app_send::app_of(n) {
-            Some(app) => format!("{possessive} {}", crate::app_send::app_name(app)),
-            None => format!("{possessive} {n} mailbox"),
-        },
+        Sender::Name(n) => format!("{possessive} {n} mailbox"),
         Sender::Agent(p) => format!("{possessive} {}", agent_name(p)),
     };
     if verified(m, viewer) {
@@ -68,6 +67,16 @@ pub fn render_as(roster: &Roster, viewer: &str, from: &str, declared: Option<&st
     } else {
         format!("{label} (not verified)")
     }
+}
+
+/// Whether `title` is a hosted app's, `<App> via <Person>`, declared for workspace session
+/// `name` (`app_send`'s `{app}-{person}`, `app` the title's `App` in lower case).
+pub fn via(name: &str, title: &str) -> bool {
+    title.split_once(" via ").is_some_and(|(app, who)| {
+        !app.is_empty()
+            && !who.trim().is_empty()
+            && name.starts_with(&format!("{}-", app.to_ascii_lowercase()))
+    })
 }
 
 /// Whether member `m` reads as verified to the computer `own` (its key): it has a proof, or it is
@@ -185,20 +194,10 @@ mod tests {
         );
         assert_eq!(render(&r, &a_pid, "cshort/desk"), "Your desk mailbox");
         assert_eq!(render(&r, &a_pid, "cshort/grok:x"), "Your Grok CLI");
-        // A hosted app's session on a person's own computer.
-        assert_eq!(render(&r, &a_pid, "ashort/claude-app"), "Your Claude");
-        assert_eq!(render(&r, &a_pid, "cshort/muse-app"), "Your Muse");
+        // The retired `<app>-app` session is a plain name.
         assert_eq!(
-            render(&r, &a_pid, "bshort/chatgpt-app"),
-            "aden's ChatGPT (not verified)"
-        );
-        assert_eq!(
-            render(&r, &a_pid, "dshort/zed-app"),
-            "✓ EveLightbulb 's zed"
-        );
-        assert_eq!(
-            render(&r, &a_pid, "bshort/Zed-app"),
-            "aden's Zed-app mailbox (not verified)"
+            render(&r, &a_pid, "ashort/claude-app"),
+            "Your claude-app mailbox"
         );
         assert_eq!(
             render(&r, &a_pid, "zshort/codex:1"),
@@ -237,6 +236,17 @@ mod tests {
         assert_eq!(
             shown,
             format!("Friday{} · The Lightbulb Company", "x".repeat(26))
+        );
+        // A hosted app's declared title, as it is; not one for another name or app.
+        let app = |name: &str, t: &str| render_as(&r, &a_pid, &format!("wshort/{name}"), Some(t));
+        assert_eq!(app("chatgpt-u1", "ChatGPT via Aden"), "ChatGPT via Aden");
+        assert_eq!(
+            app("claude-u1", "ChatGPT via Aden"),
+            "ChatGPT via Aden · The Lightbulb Company"
+        );
+        assert_eq!(
+            app("chatgpt-u1", "ChatGPT via "),
+            "ChatGPT via  · The Lightbulb Company"
         );
         // Lapsed: an unverified member's mailbox.
         r.members.get_mut("wkey").unwrap().proof = None;

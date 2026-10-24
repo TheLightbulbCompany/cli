@@ -143,9 +143,43 @@ pub struct Roster {
     pub heads: Vec<String>,
     pub links: BTreeMap<String, Link>,
     pub relay: Option<String>,
+    /// The founder's doorbell (a parked workspace member's), from its latest `meta` with one.
+    pub wake: Option<Wake>,
     parents: BTreeMap<String, Vec<String>>,
     /// Every replayed entry with its hash, parents first.
     log: Vec<(String, Entry)>,
+}
+
+/// Where a computer rings a parked founder awake (`net`'s doorbell): `POST url` with
+/// `Authorization: Bearer <token>`. The URL carries no secret; the token is never logged
+/// (`Debug` hides it).
+#[derive(Clone, PartialEq)]
+pub struct Wake {
+    pub url: String,
+    pub token: String,
+}
+
+impl std::fmt::Debug for Wake {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Wake({})", self.url)
+    }
+}
+
+impl Wake {
+    /// A `meta` body's `wake`: an http(s) URL of printable ASCII with no space or quote, and a
+    /// token of `[A-Za-z0-9._-]` (it is written into curl's config, never a command line).
+    pub fn parse(v: &Value) -> Option<Wake> {
+        let (url, token) = (v["url"].as_str()?, v["token"].as_str()?);
+        let url_ok = (url.starts_with("https://") || url.starts_with("http://"))
+            && url.len() <= 2048
+            && url
+                .bytes()
+                .all(|b| b.is_ascii_graphic() && !b"\"'\\".contains(&b));
+        (url_ok && crate::sessions::word(token, 512)).then(|| Wake {
+            url: url.into(),
+            token: token.into(),
+        })
+    }
 }
 
 impl Roster {
@@ -537,6 +571,9 @@ fn pass(
                     if let Some(relay) = e.body["relay"].as_str() {
                         r.relay = Some(relay.to_string());
                     }
+                }
+                if let Some(w) = Wake::parse(&e.body["wake"]).filter(|_| founder) {
+                    r.wake = Some(w);
                 }
             }
             Kind::Admit | Kind::Link | Kind::Admin | Kind::Transfer => {}

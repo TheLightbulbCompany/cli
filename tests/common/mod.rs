@@ -613,8 +613,18 @@ pub fn member(
     dir: &std::path::Path,
     sessions: Value,
 ) -> (std::process::Child, String, std::path::PathBuf) {
+    member_with(
+        dir,
+        json!({"workspace": "The Lightbulb Company", "sessions": sessions}),
+    )
+}
+
+/// `member` with `body` (`{workspace, sessions, wake?}`) as its sessions file.
+pub fn member_with(
+    dir: &std::path::Path,
+    body: Value,
+) -> (std::process::Child, String, std::path::PathBuf) {
     let file = dir.join("sessions.json");
-    let body = json!({"workspace": "The Lightbulb Company", "sessions": sessions});
     std::fs::write(&file, body.to_string()).unwrap();
     let sock = dir.join("sock");
     let log = std::fs::File::create(dir.join("member.log")).unwrap();

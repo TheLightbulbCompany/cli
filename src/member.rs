@@ -66,6 +66,7 @@ pub async fn run(opts: MemberOpts, token: String) -> Result<()> {
         },
     )
     .await?;
+    instance.publish_wake(&file["wake"])?;
     let instance = Arc::new(instance);
     let _ = std::fs::remove_file(&opts.socket);
     // Created 0600, never wider for a moment: the umask is the process's, put back at once.
@@ -127,7 +128,9 @@ async fn connection(stream: UnixStream, i: Arc<Instance>, token: Arc<String>, st
                 if buf.len() > MAX_LINE {
                     (json!({"id": 0, "ok": false, "error": "unauthorized"}), Then::Close)
                 } else if !matches!(n, Ok(n) if n > 0) || buf.last() != Some(&b'\n') {
-                    return; // closed (or an error), with no whole line left
+                    // Closed (or an error), with no whole line left: the bridge ends every
+                    // line with `\n`, so a last one without it is dropped.
+                    return;
                 } else {
                     let line = String::from_utf8(std::mem::take(&mut buf)).unwrap_or_default();
                     answer(&line, &i, &token, &mut events).await

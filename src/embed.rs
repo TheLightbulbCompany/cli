@@ -243,9 +243,8 @@ impl Instance {
     /// op is refused (`bad_request`, reason `not_a_person`) but `team.join` as the workspace's
     /// cloud member (with its proof) and `team.leave`: the caller is the bridge, acting for a
     /// workspace admin who confirmed in the app. `inbox {session}` takes a declared session's
-    /// mail as Task 10's records, read. `app.send`, `app.inbox` and `app.receipt` carry a
-    /// hosted app's call to its person's own computer (`app_send`); `decision.send` carries a
-    /// person's tap on a hold notice back to the holding computer (`decision`).
+    /// mail as Task 10's records, read. `app.send`, `app.inbox` and `app.receipt` send and read
+    /// as a hosted app's declared session `{app}-{person}` (`app_send`).
     pub async fn call(&self, req: Value) -> Value {
         json!(self.respond(req).await)
     }
@@ -260,10 +259,45 @@ impl Instance {
     }
 
     /// Every event a socket subscriber gets (`message`, `held`, `hold_closed`,
-    /// `receipt_changed`, `member_removed`, `stream_*`, …), and an instance's own
-    /// (`hold_notice`, `decision_result`: `decision`), from now on.
+    /// `receipt_changed`, `member_removed`, `stream_*`, …), from now on.
     pub fn events(&self) -> broadcast::Receiver<Value> {
         self.daemon.events.subscribe()
+    }
+
+    /// `wake` (the sessions file's, `member`) signed into the roster as a founder's `meta` when
+    /// it differs from the roster's: a computer that cannot dial this member rings it there.
+    /// Nothing when it is absent; skipped and logged (never the token) when it is malformed or
+    /// this member is not the founder (only the founder's counts).
+    pub(crate) fn publish_wake(&self, wake: &Value) -> Result<()> {
+        if wake.is_null() {
+            return Ok(());
+        }
+        let Some(w) = roster::Wake::parse(wake) else {
+            eprintln!("wake: not a valid {{url, token}}; not published");
+            return Ok(());
+        };
+        let d = &self.daemon;
+        let mut team = d.team.lock().unwrap();
+        let me = team.roster.members.get(&d.identity.key).map(|m| m.role);
+        if me != Some(roster::Role::Founder) {
+            eprintln!("wake: this member is not its network's founder; not published");
+            return Ok(());
+        }
+        if team.roster.wake.as_ref() == Some(&w) {
+            return Ok(());
+        }
+        let store = d.store.lock().unwrap();
+        let body = json!({"wake": {"url": w.url, "token": w.token}});
+        net_ops::write(
+            d,
+            &mut team,
+            &store,
+            roster::Kind::Meta,
+            body,
+            ipc::now() as i64,
+        )?;
+        eprintln!("wake: published");
+        Ok(())
     }
 
     /// Closes the endpoint and waits (up to 5 s) for the instance's tasks to end with it, then

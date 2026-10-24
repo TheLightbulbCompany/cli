@@ -210,8 +210,6 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
         "inbox.ack" if instance => crate::embed::ack(id, body, daemon),
         "cloud.sessions.set" => super::net_ops::cloud_sessions_set(id, body, daemon).await,
         "app.send" | "app.inbox" | "app.receipt" => crate::app_send::op(id, op, body, daemon).await,
-        "decision.send" => crate::decision::op(id, body, daemon),
-        "holds.pending" => crate::decision::pending(id, daemon),
         "status" => {
             // Before the team lock: `live_sessions` takes it.
             let sessions = live_count(daemon);
