@@ -412,11 +412,23 @@ pub fn err(o: &Output) -> String {
 }
 
 /// An executable `/bin/sh` script `dir/osascript` running `body` (a fake `osascript`).
+// Written by a child `sh`, not by this process: on Linux a parallel test's fork inherits any
+// write fd we hold until it execs, and exec of a file open for writing fails (ETXTBSY).
 pub fn script(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
-    use std::os::unix::fs::PermissionsExt;
+    use std::io::Write;
     let p = dir.join("osascript");
-    std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
-    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut sh = std::process::Command::new("/bin/sh")
+        .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+        .arg(&p)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = sh.stdin.take().unwrap();
+    stdin
+        .write_all(format!("#!/bin/sh\n{body}\n").as_bytes())
+        .unwrap();
+    drop(stdin);
+    assert!(sh.wait().unwrap().success());
     p
 }
 

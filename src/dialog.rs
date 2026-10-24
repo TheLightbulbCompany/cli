@@ -87,7 +87,9 @@ struct State {
 }
 
 impl Queue {
-    /// Starts the queue's task; `program` is `osascript` (tests pass a fake).
+    /// Starts the queue's task; `program` is `osascript` (tests pass a fake). An empty program
+    /// (off macOS, `net::Knobs`) shows nothing, as `headless`: holds are answered with
+    /// `lightbulb approve` or `decline`.
     pub fn new(program: PathBuf) -> (Queue, Answers) {
         let (answers, rx) = mpsc::unbounded_channel();
         let inner = Arc::new(Inner {
@@ -186,6 +188,7 @@ async fn run(inner: Arc<Inner>) {
         };
         let answer = match inner.knob.get() {
             Some(k) => k.clone(),
+            None if inner.program.as_os_str().is_empty() => None,
             None => {
                 let child = Command::new(&inner.program)
                     .args(&args)

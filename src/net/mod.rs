@@ -64,7 +64,8 @@ pub struct Knobs {
     /// How long a join request waits for its person (600 s), or
     /// `LIGHTBULB_CONNECT_DEBUG_JOIN_WAIT_S`.
     pub join_wait: Duration,
-    /// The program dialogs run: `/usr/bin/osascript`, or `LIGHTBULB_CONNECT_DEBUG_OSASCRIPT`.
+    /// The program dialogs run: `/usr/bin/osascript` (none off macOS), or
+    /// `LIGHTBULB_CONNECT_DEBUG_OSASCRIPT`.
     pub osascript: PathBuf,
     /// `LIGHTBULB_CONNECT_DEBUG_DROP_ACKS=1`: every `ack` that arrives is dropped.
     drop_acks: bool,
@@ -77,7 +78,12 @@ pub struct Knobs {
     no_default_relays: bool,
 }
 
-const OSASCRIPT: &str = "/usr/bin/osascript";
+/// Off macOS there is no dialog program: an empty one answers nothing (`dialog::Queue`).
+const OSASCRIPT: &str = if cfg!(target_os = "macos") {
+    "/usr/bin/osascript"
+} else {
+    ""
+};
 
 impl Knobs {
     #[cfg(debug_assertions)]

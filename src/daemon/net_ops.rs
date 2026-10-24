@@ -810,7 +810,7 @@ fn no_agent(
     walk.all(|step| step.is_ok_and(|(_, agent)| !agent))
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod tests {
     use super::*;
     use std::io::{BufRead, BufReader};
@@ -875,6 +875,36 @@ mod tests {
         assert!(!person_walk(child, None));
         kill(child);
         claude.wait().unwrap();
+    }
+
+    /// A same-uid process that made itself non-dumpable hides its `exe`: the walk through it
+    /// fails closed (not a person), never falls back to the name it chose.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_hidden_same_uid_process_is_not_a_person() {
+        let (mut hidden, pid) = child_of(
+            &std::env::current_exe().unwrap(),
+            &[
+                "--exact",
+                "daemon::net_ops::tests::nondumpable_sleep",
+                "--ignored",
+                "--nocapture",
+            ],
+        );
+        assert!(os::process(pid).is_err());
+        assert!(!no_agent(caller::ancestors_pinned(pid, None)));
+        kill(pid);
+        hidden.wait().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "a helper the test above runs: non-dumpable, prints its pid, sleeps"]
+    fn nondumpable_sleep() {
+        // SAFETY: a plain prctl on this process.
+        assert_eq!(unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) }, 0);
+        println!("{}", std::process::id());
+        std::thread::sleep(std::time::Duration::from_secs(30));
     }
 
     #[test]

@@ -3,6 +3,7 @@
 mod common;
 
 use common::{Env, EXE};
+use lightbulb::cli::ASSET;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -21,25 +22,19 @@ fn release(dir: &Path, tag: &str, sum: Option<&str>) {
     .unwrap();
     fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
     let ok = |c: &mut Command| assert!(c.current_dir(dir).status().unwrap().success());
-    ok(Command::new("tar").args([
-        "-czf",
-        "lightbulb-macos-arm64.tar.gz",
-        "-C",
-        "stage",
-        "lightbulb",
-    ]));
+    ok(Command::new("tar").args(["-czf", ASSET, "-C", "stage", "lightbulb"]));
     let sha = Command::new("shasum")
-        .args(["-a", "256", "lightbulb-macos-arm64.tar.gz"])
+        .args(["-a", "256", ASSET])
         .current_dir(dir)
         .output()
         .unwrap()
         .stdout;
     let sha = String::from_utf8(sha).unwrap();
     let sha = match sum {
-        Some(s) => format!("{s}  lightbulb-macos-arm64.tar.gz\n"),
+        Some(s) => format!("{s}  {ASSET}\n"),
         None => sha,
     };
-    fs::write(dir.join("lightbulb-macos-arm64.tar.gz.sha256"), sha).unwrap();
+    fs::write(dir.join(format!("{ASSET}.sha256")), sha).unwrap();
     fs::write(dir.join("latest"), format!("{tag}\n")).unwrap();
 }
 

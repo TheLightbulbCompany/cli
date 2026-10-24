@@ -381,6 +381,21 @@ fn an_unknown_command_is_named() {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn daemon_install_is_macos_only() {
+    let e = Env::new();
+    for flag in ["--install", "--uninstall"] {
+        let o = e.run(&["daemon", flag]);
+        assert_eq!(o.status.code(), Some(2));
+        assert_eq!(
+            err(&o).trim(),
+            "Lightbulb's background service is macOS-only; run lightbulb daemon."
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
 #[test]
 fn daemon_install_writes_the_plist_and_alias_without_touching_a_foreign_file() {
     let e = Env::new();
@@ -855,6 +870,7 @@ fn the_daemon_starts_from_the_canonical_binary() {
 
 /// `daemon --install` (and so `setup`) stops the daemon that runs now, and waits for it to
 /// let go of the lock, before it loads the job: a daemon launchd did not start would hold it.
+#[cfg(target_os = "macos")]
 #[test]
 fn install_stops_the_running_daemon_first() {
     let e = Env::new();
@@ -884,6 +900,7 @@ fn install_stops_the_running_daemon_first() {
 
 /// A daemon that holds the lock and does not let go (here this test, holding it) is
 /// reported by the pid in the file, and no job is installed behind it.
+#[cfg(target_os = "macos")]
 #[test]
 fn install_refuses_while_the_old_daemon_will_not_stop() {
     let e = Env::new();
@@ -906,6 +923,7 @@ fn install_refuses_while_the_old_daemon_will_not_stop() {
 
 /// A pid left in the file by a daemon long gone, now some live process that holds no lock,
 /// is no daemon: the install goes ahead at once.
+#[cfg(target_os = "macos")]
 #[test]
 fn install_ignores_a_stale_pid_of_a_live_process() {
     let e = Env::new();
@@ -974,6 +992,7 @@ fn policy_refuses_your_own_person_and_forgets_an_old_row() {
 /// loaded, KeepAlive would restart the stopped daemon, which would retake the lock. A
 /// `launchctl` shim on PATH records each call and whether the daemon's socket still answered
 /// then; the first call must be the bootout, made while the old daemon still runs.
+#[cfg(target_os = "macos")]
 #[test]
 fn install_boots_the_job_out_before_it_stops_the_daemon() {
     use std::os::unix::fs::PermissionsExt;
