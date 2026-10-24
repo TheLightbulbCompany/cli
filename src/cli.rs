@@ -1452,7 +1452,16 @@ pub fn doctor() -> Result<i32> {
     let mut conn = Conn::open().ok();
     let mut call = |op: &str| conn.as_mut().and_then(|c| c.call(op, json!({})).ok());
     let up = call("ping").is_some_and(|r| r["ok"] == true);
-    row("Background service", up, "running", "not running", &setup);
+    // A daemon refuses to start under a mismatched key (`embed::KEY_MISMATCH`): name that,
+    // not setup, which cannot fix it.
+    let dir = paths::state_path();
+    let mismatch = !up && crate::embed::key_mismatch(&dir).unwrap_or(false);
+    let fix = if mismatch {
+        crate::embed::KEY_MISMATCH
+    } else {
+        &setup
+    };
+    row("Background service", up, "running", "not running", fix);
     if let Some(l) = up.then(|| call("relay.get")).flatten() {
         let first = l["urls"][0].as_str().map(cell).unwrap_or_default();
         let state = match l["source"].as_str().unwrap_or("none") {
@@ -1479,7 +1488,6 @@ pub fn doctor() -> Result<i32> {
         row("Starts at login", loaded, "yes", "no", &setup);
     }
     let mode = |p: &Path| fs::metadata(p).map(|m| m.permissions().mode() & 0o777).ok();
-    let dir = paths::state_path();
     let socket = dir.join(paths::SOCKET);
     if dir.exists() {
         let private =
