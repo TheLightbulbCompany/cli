@@ -26,9 +26,9 @@ recorded as `local`.
 lightbulb invite
 ```
 
-It prints the join command, `lightbulb join '<ticket>' --name NAME`, and on its own line a
-`lightbulb://join/…` link. Send either to the person. They replace `NAME` with the name they
-go by.
+It prints a four-word code (`lightbulb join <code>`, good for 10 minutes while your computer
+is on), a link, and the full join line, `lightbulb join '<ticket>'`. Send any of them to the
+person.
 
 | Command | The invite you get |
 |---|---|

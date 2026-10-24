@@ -175,6 +175,9 @@ pub enum Frame {
         computer: String,
         kind: String,
         proof: Option<String>,
+        /// The ticket came from an invite code: the inviter always asks its person.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        via_code: bool,
         sig: String,
     },
     JoinDecision {

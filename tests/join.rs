@@ -133,9 +133,7 @@ fn ask_ticket_admits_only_after_allow() {
     // `$USER` is A's name too.
     let o = b.detached(&[EXE, "join", &t], "");
     assert!(!o.status.success());
-    let taken = format!(
-        "The name \"prasiddha\" is already used in this network. Try: lightbulb join '{t}' --name prasiddha-2\n"
-    );
+    let taken = "The name \"prasiddha\" is already used in this network. Run the same command again with: --name prasiddha-2\n";
     assert_eq!(err(&o), taken);
     // Refused at once: it never said it was asking anyone.
     assert_eq!(out(&o), "");

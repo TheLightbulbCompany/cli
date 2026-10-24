@@ -1,16 +1,15 @@
 //! The invite code: four words that stand for a whole ticket. The inviter's daemon binds a
 //! second iroh endpoint whose secret key is derived from the code and, over a dedicated ALPN,
 //! hands the ticket to the first caller; the joiner derives the same public key and dials it.
-//! Single use: the listener ends after one hand-off, after `MAX_BAD` bad callers, or when the
-//! ticket expires. Nothing listens when no code invite is live, and the code is never logged.
+//! Single use: the listener ends after one hand-off, after `MAX_BAD` bad callers, after
+//! `LIFE_S` (10 minutes) or when the ticket expires. Nothing listens when no code invite is live, and the code is never logged.
 
 use crate::daemon::Daemon;
 use crate::net;
-use hkdf::Hkdf;
+use argon2::{Algorithm, Argon2, Params, Version};
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey};
 use serde_json::Value;
-use sha2::Sha256;
 use std::time::Duration;
 
 pub const ALPN: &[u8] = b"lightbulb/code/1";
@@ -24,6 +23,13 @@ const MAX_LIVE: usize = 8;
 const STEP: Duration = Duration::from_secs(10);
 /// How long a joiner tries to reach the inviter.
 const FETCH: Duration = Duration::from_secs(15);
+/// A code lives this long, or until its ticket expires if that comes first.
+pub const LIFE_S: i64 = 600;
+/// Argon2id memory (KiB), passes and lanes: a guess costs 64 MiB and about a second, so a relay
+/// operator who sees the endpoint key cannot afford to search the ~41-bit space for the secret.
+/// Debug builds (the tests) use 1 MiB.
+pub const MEM_KIB: u32 = if cfg!(debug_assertions) { 1024 } else { 65536 };
+const PASSES: u32 = 3;
 /// The ticket's size cap on the wire.
 const MAX_TICKET: usize = 8192;
 
@@ -70,13 +76,23 @@ pub fn normalize(s: &str) -> Option<String> {
     (parts.len() == 4 && parts.iter().all(|p| words().any(|w| w == *p))).then(|| parts.join("-"))
 }
 
-/// The endpoint key a normalized `code` stands for.
+/// The endpoint key a normalized `code` stands for: Argon2id over the code, salted with a fixed
+/// context string. Slow on purpose (see `MEM_KIB`): call it off the async threads.
 pub fn secret(code: &str) -> SecretKey {
+    let params = Params::new(MEM_KIB, PASSES, 1, Some(32)).expect("fixed Argon2 parameters");
     let mut okm = [0u8; 32];
-    Hkdf::<Sha256>::new(None, code.as_bytes())
-        .expand(INFO, &mut okm)
-        .expect("32 bytes is a valid HKDF-SHA256 length");
+    Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+        .hash_password_into(code.as_bytes(), INFO, &mut okm)
+        .expect("Argon2 with a 32-byte output and a long enough salt");
     SecretKey::from_bytes(&okm)
+}
+
+/// `secret` on a blocking thread.
+async fn secret_async(code: &str) -> Option<SecretKey> {
+    let code = code.to_string();
+    tokio::task::spawn_blocking(move || secret(&code))
+        .await
+        .ok()
 }
 
 /// Adds `code` to a successful `team.invite` answer `body` and serves its ticket: nothing
@@ -90,10 +106,14 @@ pub async fn offer(d: &Daemon, body: &mut Value) {
     if d.cloud.is_some() {
         return;
     }
+    let now = crate::daemon::ipc::now() as i64;
     let code = generate();
+    let Some(key) = secret_async(&code).await else {
+        return;
+    };
     let urls = d.peers.relays.lock().unwrap().urls.clone();
     let mut b = Endpoint::builder(presets::Minimal)
-        .secret_key(secret(&code))
+        .secret_key(key)
         .alpns(vec![ALPN.to_vec()])
         .relay_mode(RelayMode::Custom(
             urls.into_iter().map(net::relay_config).collect(),
@@ -105,7 +125,7 @@ pub async fn offer(d: &Daemon, body: &mut Value) {
         eprintln!("invite: the code could not be served");
         return;
     };
-    let task = tokio::spawn(serve(ep, ticket.to_string(), expires_at));
+    let task = tokio::spawn(serve(ep, ticket.to_string(), expires_at.min(now + LIFE_S)));
     let mut live = d.codes.lock().unwrap();
     live.retain(|t| !t.is_finished());
     if live.len() >= MAX_LIVE {
@@ -113,6 +133,7 @@ pub async fn offer(d: &Daemon, body: &mut Value) {
     }
     live.push(task);
     body["code"] = code.into();
+    body["code_secs"] = (expires_at.min(now + LIFE_S) - now).into();
 }
 
 /// Hands `ticket` to the first caller that asks for it, then closes; also closes after
@@ -162,11 +183,10 @@ async fn hand_off(incoming: iroh::endpoint::Incoming, ticket: &str) -> bool {
 /// or used code, or an inviter that is off.
 pub async fn fetch(d: &Daemon, ep: &Endpoint, code: &str) -> Option<String> {
     let urls = d.peers.relays.lock().unwrap().urls.clone();
+    let key = secret_async(code).await?;
     let addr = urls
         .into_iter()
-        .fold(EndpointAddr::new(secret(code).public()), |a, u| {
-            a.with_relay_url(u)
-        });
+        .fold(EndpointAddr::new(key.public()), |a, u| a.with_relay_url(u));
     let run = async {
         let conn = ep.connect(addr, ALPN).await.ok()?;
         let (mut send, mut recv) = conn.open_bi().await.ok()?;
@@ -204,6 +224,19 @@ mod tests {
         assert_eq!(secret(&c).public(), secret(&c).public());
         let other = (0..).map(|_| generate()).find(|o| *o != c).unwrap();
         assert_ne!(secret(&c).public(), secret(&other).public());
+    }
+
+    #[test]
+    fn the_derivation_is_deterministic_and_per_code() {
+        let (a, b) = ("alpha-bravo-charlie-delta", "alpha-bravo-charlie-echo");
+        assert_eq!(secret(a).public(), secret(a).public());
+        assert_ne!(secret(a).public(), secret(b).public());
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn release_derivation_is_64_mib() {
+        assert_eq!(MEM_KIB, 65536);
     }
 
     #[test]

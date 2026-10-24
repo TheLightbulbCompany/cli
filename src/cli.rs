@@ -545,7 +545,11 @@ pub fn invite(mode: Invite) -> Result<i32> {
         Via::Link
     };
     if let Some(code) = r["code"].as_str() {
-        println!("Tell them to run:  {} join {code}", command());
+        println!(
+            "Tell them to run:  {} join {code}   (the code works for {} minutes)",
+            command(),
+            (r["code_secs"].as_i64().unwrap_or(600) + 59) / 60
+        );
     }
     println!(
         "Or send this link:  {}",
@@ -572,7 +576,6 @@ pub fn join(link: &str, name: Option<String>, kind: &str, proof: Option<String>)
     // once the daemon rang a parked workspace's doorbell (`join_waking`); never before a
     // ticket it refuses at once, nor for an open link (it asks no one).
     let ticket = crate::ticket::decode(link).ok();
-    let has_wake = ticket.as_ref().is_some_and(|t| t.wake.is_some());
     if code.is_some() || ticket.is_some_and(|t| t.mode == "ask" || t.wake.is_some()) {
         let mut asking = Conn::open()?;
         asking.call("subscribe", json!({}))?;
@@ -594,6 +597,8 @@ pub fn join(link: &str, name: Option<String>, kind: &str, proof: Option<String>)
     };
     let r = ask(&mut conn, "team.join", body)?;
     let team = r["team"].as_str().unwrap_or_default();
+    // The ticket named a workspace (for a code, the daemon saw the ticket, not this process).
+    let has_wake = r["wake"] == true;
     let text = match (r["state"].as_str(), r["reason"].as_str()) {
         (Some("admitted"), _) => {
             let computer = ask(&mut conn, "identity.get", json!({}))?["computer"]
@@ -611,12 +616,8 @@ pub fn join(link: &str, name: Option<String>, kind: &str, proof: Option<String>)
         }
         (Some("waiting"), _) => "No one has answered yet. Run the same command again to keep asking.".to_string(),
         (_, Some(admission::ALREADY_IN_TEAM)) => format!("You are in \"{team}\". Leave it first: {} leave", command()),
-        // A code is never repeated in a message: the person adds the name to what they ran.
-        (_, Some(admission::NAME_TAKEN)) if code.is_some() => format!(
-            "The name \"{name}\" is already used in this network. Run the same command again with: --name {name}-2"
-        ),
         (_, Some(admission::NAME_TAKEN)) => format!(
-            "The name \"{name}\" is already used in this network. Try: {} join '{link}' --name {name}-2", command()
+            "The name \"{name}\" is already used in this network. Run the same command again with: --name {name}-2"
         ),
         (_, Some(admission::NO_CODE)) => "That code did not work. Check the words. Ask them to open their computer, or send the full line instead. A code works once.".to_string(),
         (_, Some(admission::UNREACHABLE)) if has_wake => "Your workspace did not answer. Run the same command again in a minute. Your key is ready; nothing was lost.".to_string(),

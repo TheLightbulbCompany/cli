@@ -54,9 +54,9 @@ Both of you run the install line above, and both of you add the PATH line if set
 lightbulb invite
 ```
 
-It prints the join command: `lightbulb join '<ticket>' --name NAME` (and, on its own
-line, a `lightbulb://join/…` link). Send that command to your teammate.
-They paste it into Terminal with their name in place of `NAME`:
+It prints a four-word code (`lightbulb join <code>`, good for 10 minutes while your computer
+is on), a link, and the full join line (`lightbulb join '<ticket>'`). Send one to your
+teammate. They paste it into Terminal; `--name sam` sets the name they go by:
 
 ```sh
 lightbulb join '<ticket>' --name sam

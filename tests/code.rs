@@ -122,3 +122,21 @@ async fn five_bad_callers_close_the_listener() {
     }
     assert_eq!(served, 5, "exactly five bad callers are answered");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_code_for_an_open_link_still_asks_the_inviter() {
+    let (_server, url) = relay_server().await;
+    let a = Env::new();
+    a.daemon(
+        false,
+        &format!("{}relay = \"{url}\"\n", computer("mac")),
+        &[dialog("Decline"), relay_only()],
+    );
+    let r = person(&a, json!({"id": 1, "op": "team.invite", "mode": "open"}));
+    let code = r["code"].as_str().expect("a code").to_string();
+    let r = join(&joiner(&url, "mbp"), &code);
+    assert_eq!(
+        r["reason"], "declined",
+        "an open link admits at once, a code asks: {r}"
+    );
+}

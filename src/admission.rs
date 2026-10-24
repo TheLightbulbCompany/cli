@@ -112,6 +112,8 @@ pub struct Request {
     name: String,
     computer: String,
     kind: String,
+    /// The ticket came from an invite code (`Frame::JoinRequest::via_code`).
+    via_code: bool,
     /// The candidate's sign-in proof (`kind=workspace` for a cloud member), verified once when
     /// the request came in: `Err` when it does not verify.
     claims: Option<Result<Proof, ()>>,
@@ -129,6 +131,7 @@ impl Request {
             computer,
             kind,
             proof,
+            via_code,
             ..
         } = f
         else {
@@ -142,6 +145,7 @@ impl Request {
             name: name.clone(),
             computer: computer.clone(),
             kind: kind.clone(),
+            via_code: *via_code,
             claims: (proof.as_deref()).map(|t| proof::verify(t, candidate, now).map_err(|_| ())),
         })
     }
@@ -210,6 +214,19 @@ pub fn request(
     kind: &str,
     token: Option<&str>,
 ) -> Frame {
+    request_via(id, t, name, computer, kind, token, false)
+}
+
+/// `request`, for a ticket that came from an invite code when `via_code`.
+fn request_via(
+    id: &Identity,
+    t: &Ticket,
+    name: &str,
+    computer: &str,
+    kind: &str,
+    token: Option<&str>,
+    via_code: bool,
+) -> Frame {
     signed(
         id,
         Frame::JoinRequest {
@@ -220,6 +237,7 @@ pub fn request(
             computer: computer.into(),
             kind: kind.into(),
             proof: token.map(Into::into),
+            via_code,
             sig: String::new(),
         },
     )
@@ -318,6 +336,7 @@ fn open(d: &Daemon, req: &Request) -> Result<(i64, Option<Verdict>), &'static st
     // sign a non-`open` link, so its word admits no one here.
     let ask = !own_person_link(d, req)
         && (req.ticket.mode != "open"
+            || req.via_code
             || req.kind == "cloud"
             || same_person(&team.roster, req).is_some());
     let n = store.put_join(&row(req, now)).map_err(fail)?;
@@ -932,7 +951,16 @@ pub async fn join(id: u64, body: &Value, d: &Arc<Daemon>) -> Response {
         let own = t.roster.members.get(me).and_then(|m| m.proof.as_ref());
         own.map(|p| p.token.clone())
     });
-    let req = request(&d.identity, &t, &name, &computer, kind, token.as_deref());
+    let via_code = code_in.is_some();
+    let req = request_via(
+        &d.identity,
+        &t,
+        &name,
+        &computer,
+        kind,
+        token.as_deref(),
+        via_code,
+    );
     // The last listed member's refusal, when every reachable one refused.
     let mut last = None;
     // The inviter's addresses on the ticket: what reaches it with no relay and no mDNS, kept
@@ -1019,7 +1047,10 @@ pub async fn join(id: u64, body: &Value, d: &Arc<Daemon>) -> Response {
             _ => break,
         }
     }
-    done("refused", Some(last.unwrap_or(UNREACHABLE)), "", 0)
+    // `wake`: the ticket named a workspace, whose doorbell was rung (the CLI says so).
+    let mut r = done("refused", Some(last.unwrap_or(UNREACHABLE)), "", 0);
+    r.body["wake"] = t.wake.is_some().into();
+    r
 }
 
 /// One member's answer to `req` on `conn`.
