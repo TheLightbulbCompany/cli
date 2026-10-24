@@ -166,7 +166,7 @@ sides, and whether the session's folder is hidden (`lightbulb folder <path> on`)
 |---|---|---|
 | `This invite link does not work. Ask for a new one.` | The line was cut or changed when pasted; or the invite was ended by `invite --new` (which ends every earlier invite of that computer, open and one-time ones too), ended by a `remove`, or was a one-time invite already used. | Ask for a fresh line (`lightbulb invite`), and paste it whole, in single quotes. |
 | `This invite link has expired. Ask for a new one.` | One-time invites last 24 hours, others 7 days. | Ask for a fresh line. |
-| `No one from this network is online right now. …` | Neither the inviter nor the founder or admins listed on it are reachable. | Ask them to open their laptop, then run the same command again. |
+| `No one from this network is online right now. …` | None of the members listed on it are reachable. | Ask them to open their laptop, then run the same command again. |
 | `No one has answered yet. Run the same command again to keep asking.` | The person did not click Allow in 10 minutes. | Run it again, and tell them to look for the dialog or run `lightbulb held`. |
 | `The name "sam" is already used in this network. …` | Another member has that name. | Use the name it suggests, or another `--name`. |
 | `You are in "<team>". Leave it first: lightbulb leave` | This computer is already in a team. | `lightbulb leave`, then join. |

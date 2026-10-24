@@ -912,6 +912,9 @@ pub fn team() -> Result<i32> {
         if m["online"] == false {
             line.push_str(" · offline");
         }
+        if m["by"].is_string() {
+            line.push_str(&format!(" · admitted by {}", f("by")));
+        }
         if members.iter().filter(|o| o["name"] == m["name"]).count() > 1 {
             line.push_str(&format!(" · address: {}", f("short")));
         }

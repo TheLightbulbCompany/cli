@@ -606,6 +606,12 @@ async fn an_agent_may_approve_a_join_and_the_answer_names_it() {
     assert_eq!(r["state"], "admitted", "{r}");
     assert_eq!(r["by"], format!("{}/claude-1", a.short()), "{r}");
     assert_eq!(members(&a).len(), 2);
+    // The signed `admit` carries the approver.
+    let entries = roster::entries(&a.store()).unwrap();
+    assert!(
+        entries.iter().any(|e| e.body["by"] == r["by"]),
+        "{entries:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

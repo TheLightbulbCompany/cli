@@ -143,10 +143,26 @@ pub struct ForPerson<'a> {
     pub check: bool,
 }
 
+/// A receipt's reason when a person or agent allowed the held message: `approved by <who>`.
+pub const APPROVED: &str = "approved by ";
+
 /// What receipt `r` means in words. With `person`, the sentence for the person who sent it at
 /// a terminal (always one). Without, the note an agent's `send_message` and `message_receipt`
 /// carry, only for mail on a teammate's computer or a `loop` refusal.
 pub fn receipt_note(r: &Value, person: Option<&ForPerson>) -> Option<String> {
+    let text = receipt_text(r, person)?;
+    Some(
+        match r["reason"].as_str().and_then(|w| w.strip_prefix(APPROVED)) {
+            Some(who) if person.is_some() => format!(
+                "{text} Approved by {}.",
+                crate::label::plain(who, usize::MAX)
+            ),
+            _ => text,
+        },
+    )
+}
+
+fn receipt_text(r: &Value, person: Option<&ForPerson>) -> Option<String> {
     let at = |f: &str| r[f].as_str().unwrap_or_default();
     // A teammate's words, printed to a terminal: one line, nothing it would act on.
     let shown = |f: &str| crate::label::plain(&at(f).replace(['\n', '\t'], " "), usize::MAX);
@@ -215,9 +231,6 @@ pub fn receipt_note(r: &Value, person: Option<&ForPerson>) -> Option<String> {
             )
         }
         "queued" => format!("Not delivered yet.{check}"),
-        "stored" if at("reason").starts_with("approved by ") => {
-            format!("Sent. {}.{check}", shown("reason").replacen('a', "A", 1))
-        }
         "stored" if remote => match mailbox {
             Some(n) => format!(
                 "Sent. Stored on {computer} in the \"{}\" mailbox.{check}",
@@ -287,15 +300,20 @@ pub(crate) fn advance(
 ) -> Result<bool> {
     let old = conn
         .query_row(
-            "SELECT state FROM receipts WHERE from_key = ?1 AND request_id = ?2",
+            "SELECT state, reason FROM receipts WHERE from_key = ?1 AND request_id = ?2",
             [from, request_id],
-            |r| r.get::<_, String>(0),
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
         )
         .optional()?;
-    let moves = match old {
-        Some(o) => state.later_than(State::parse(&o)?),
+    let moves = match &old {
+        Some((o, _)) => state.later_than(State::parse(o)?),
         None => true,
     };
+    // Who approved a held message stays on the receipt as it moves on.
+    let kept = old
+        .and_then(|(_, r)| r)
+        .filter(|r| reason.is_none() && r.starts_with(APPROVED));
+    let reason = reason.or(kept.as_deref());
     if moves {
         if state == State::Read {
             // `updated_at` stays the delivery time: the hops trigger window runs on it.
@@ -1642,6 +1660,7 @@ mod tests {
             admitted_at: 0,
             proof: None,
             workspace: None,
+            by: None,
         };
         let mine = Member {
             key: "mkey".into(),
@@ -1843,9 +1862,28 @@ mod tests {
             note(serde_json::json!({"state": "expired", "reason": "not_allowed"})),
             "Nobody answered the Allow for 7 days; the message expired."
         );
+        // The approval stays on the receipt as it moves to delivered.
+        let dir = tempfile::tempdir().unwrap();
+        let s = crate::store::Store::open(&dir.path().join("state.db")).unwrap();
+        advance(
+            s.conn(),
+            "f",
+            "r",
+            State::Stored,
+            Some("approved by m/claude-1"),
+            None,
+            1,
+        )
+        .unwrap();
+        advance(s.conn(), "f", "r", State::Delivered, None, None, 2).unwrap();
+        let kept: Option<String> = s
+            .conn()
+            .query_row("SELECT reason FROM receipts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kept.as_deref(), Some("approved by m/claude-1"));
         assert_eq!(
             note(serde_json::json!({"state": "stored", "reason": "approved by m/claude-1"})),
-            "Sent. Approved by m/claude-1."
+            "Sent. It waits until that session is back. Approved by m/claude-1."
         );
     }
 }

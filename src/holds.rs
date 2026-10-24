@@ -368,7 +368,7 @@ pub fn answer(
         if allow {
             store.put_mailbox(&m.to_key, &m.id, now, mail::expires_for(&m.to_key, now))?;
             // Past a person at the terminal, say who allowed it (`receipt_note`).
-            let said = by.contains('/').then(|| format!("approved by {by}"));
+            let said = (by != "local").then(|| format!("{}{by}", mail::APPROVED));
             mail::advance(
                 store.conn(),
                 f,
@@ -564,10 +564,14 @@ pub fn op(id: u64, op: &str, body: &Value, d: &Arc<Daemon>, caller: Caller) -> R
     // An agent may answer a hold (the answer records its session); nothing else here.
     let mut agent = None;
     if op != "policy.get" && !instance && !caller.is_person() {
-        if op != "hold.answer" {
+        // Only a resolved agent session may answer; an unresolved caller is refused.
+        let actor = (op == "hold.answer")
+            .then(|| caller.actor(&d.store.lock().unwrap()))
+            .flatten();
+        let Some(actor) = actor else {
             return refused(id, "not_a_person");
-        }
-        agent = Some(caller.session(d));
+        };
+        agent = Some(actor);
     }
     match run(id, op, body, d, instance, agent.as_deref()) {
         Ok(r) => r,

@@ -29,8 +29,9 @@ pub enum Kind {
     Leave,
     Link,
     Meta,
-    /// A kind this build does not know (the retired `admin`/`transfer`): parsed so the frame
-    /// survives, never verifies (its signature covered the old name), so it is refused.
+    /// Any kind this build does not know (the retired `admin`/`transfer`). It parses, so a frame
+    /// or a stored row never fails to load, but it re-serialises as "other" and so never
+    /// verifies: `accept` refuses it, and `replay` applies nothing for it.
     #[serde(other)]
     Other,
 }
@@ -106,6 +107,10 @@ pub struct Member {
     /// `proof`'s `workspace.id`: the workspace the person is signed into (the workspace
     /// member's own); `None` with no proof in force. The admit body's `workspace` is ignored.
     pub workspace: Option<String>,
+    /// Who approved this member's join, from the `admit` body (`local` is left out): an agent
+    /// session, `<member>/<handle>`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub by: Option<String>,
 }
 
 impl Member {
@@ -431,8 +436,7 @@ fn pass(
                 }
                 let via_link = || {
                     link.is_some_and(|(lh, l)| {
-                        l.signer == e.signer
-                            && anc[h.as_str()].contains(lh)
+                        anc[h.as_str()].contains(lh)
                             && !retired(&links, anc, lh, l, |n| anc[h.as_str()].contains(n))
                             // Every removal the link does not descend from ends it; an
                             // admission it already knew of stands.
@@ -448,10 +452,8 @@ fn pass(
                 // Another computer of a signed-in person: admitted by one of that person's.
                 let same = (!cloud && claims.is_some()).then(|| e.text("person_id"));
                 let same_person = same.is_some_and(|p| signer.person_id == p);
-                // A member admits directly, or through its own live link; only the founder also
-                // decides on another member's link.
-                let authorised =
-                    founder || e.text("ticket_id").is_empty() || via_link() || same_person;
+                // Any member admits directly, or through any live link.
+                let authorised = e.text("ticket_id").is_empty() || via_link() || same_person;
                 let collides = r.collides(e.text("name"), &target, same).is_some();
                 let role_ok = matches!(
                     e.body.get("role").and_then(Value::as_str),
@@ -645,6 +647,7 @@ fn new_member(e: &Entry, role: Role, claims: Option<&Proof>) -> Member {
         admitted_at: e.at,
         proof: None,
         workspace: None,
+        by: e.body["by"].as_str().map(String::from),
         key,
     };
     if let Some(p) = claims {
@@ -980,7 +983,8 @@ mod tests {
         let g = genesis(&f);
         let ab = admit(&f, &g, &b.key, "b");
         let old = member(&f, &ab, Kind::Other, &b.key);
-        let r = replay(&[g, ab, old]);
+        let child = op(&f, &old, Kind::Meta, json!({"team_name": "kid"}));
+        let r = replay(&[g, ab, old, child]);
         assert_eq!(r.members[&b.key].role, Role::Member);
         assert_eq!(r.members[&f.key].role, Role::Founder);
         let wire: Entry = serde_json::from_value(json!({"v": 1, "parents": [], "kind": "transfer",
@@ -1083,8 +1087,8 @@ mod tests {
 
     #[test]
     fn duplicate_ticket_id_link_is_dropped() {
-        // Z reuses X's `ticket_id` for a once-link and admits a puppet through it: Z's link is
-        // dropped, so the puppet is too, and X's link still admits.
+        // Z reuses X's `ticket_id` for a once-link: Z's link is dropped and X's stays, still
+        // reusable. Any member admits through a live link, so Z's admission through it stands.
         let (f, x, z, p, c) = (id(), id(), id(), id(), id());
         let g = genesis(&f);
         let ax = admit(&f, &g, &x.key, "x");
@@ -1095,7 +1099,7 @@ mod tests {
         let zp = admit_via(&z, &lz, &p.key, "p", &t);
         let xc = admit_via(&x, &zp, &c.key, "c", &t);
         let r = replay(&[g, ax, az, lx, lz, zp, xc]);
-        assert!(!r.members.contains_key(&p.key));
+        assert!(r.members.contains_key(&p.key));
         assert!(r.members.contains_key(&c.key));
         assert_eq!(r.links[&t].signer, x.key);
         assert!(!r.links[&t].once);
@@ -1389,7 +1393,7 @@ mod tests {
     }
 
     #[test]
-    fn inviter_may_admit_through_its_own_link_only() {
+    fn any_member_admits_through_any_live_link_until_a_removal_ends_it() {
         let (f, x, y, c, d, e) = (id(), id(), id(), id(), id(), id());
         let g = genesis(&f);
         let ax = admit(&f, &g, &x.key, "x");
@@ -1409,7 +1413,7 @@ mod tests {
         log.extend([ry, xe]);
         let r = replay(&log);
         assert!(r.members.contains_key(&c.key));
-        assert!(!r.members.contains_key(&d.key));
+        assert!(r.members.contains_key(&d.key));
         assert!(!r.members.contains_key(&y.key));
         assert!(!r.members.contains_key(&e.key));
         assert!(r.links.is_empty());

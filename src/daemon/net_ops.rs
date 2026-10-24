@@ -82,14 +82,24 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, caller: Caller) 
             return Response::err(id, UNSUPPORTED);
         }
         let gate = gate(op);
-        // Governance and open links need a person at the socket, before any authority check.
+        // Removal needs a person at the socket, before any authority check; an invite, a join
+        // and an answer also take a resolved agent session (`Caller::actor`).
         if gate.person_only && !caller.is_person() {
             return refused(id, "not_a_person");
         }
+        if op == "team.invite"
+            && caller != Caller::Instance
+            && caller.actor(&daemon.store.lock().unwrap()).is_none()
+        {
+            return refused(id, "not_a_person");
+        }
         match op {
-            "team.admit" if caller == Caller::Instance => return refused(id, "not_a_person"),
             "team.admit" => {
-                let by = (!caller.is_person()).then(|| caller.session(daemon));
+                let actor = caller.actor(&daemon.store.lock().unwrap());
+                let Some(actor) = actor else {
+                    return refused(id, "not_a_person");
+                };
+                let by = Some(actor).filter(|a| a != "local");
                 return crate::admission::admit_op(id, body, daemon, by);
             }
             "team.join_requests" => return crate::admission::requests_op(id, daemon),
@@ -790,24 +800,27 @@ pub async fn cloud_sessions_set(id: u64, body: &Value, daemon: &Daemon) -> Respo
     }
 }
 
+/// The session of the agent above `peer_pid`, as `<member>/<handle>`.
+/// `agent` before it registers one. `None` when no agent is above `peer_pid`.
+pub fn agent_session(store: &Store, peer_pid: u32) -> Option<String> {
+    let (agent, _) = caller::ancestors_from(peer_pid)
+        .filter_map(Result::ok)
+        .find(|(_, is_agent)| *is_agent)?;
+    let rows = store.sessions().ok()?;
+    let found = rows.into_iter().find(|s| {
+        s.pid == Some(agent.pid.into()) && s.birth_micros == i64::try_from(agent.birth_micros).ok()
+    });
+    Some(found.map_or("agent".into(), |s| {
+        s.handle.map_or(s.key.clone(), |h| {
+            format!("{}/{h}", s.key.split('/').next().unwrap_or_default())
+        })
+    }))
+}
+
 /// Whether a person, not an agent, is at the other end of the socket: no process from
 /// `peer_pid` up to pid 1 is an agent. Fails closed: a lookup that fails is no person.
 /// In debug builds, the process `CALLER_ENV` names counts as an agent.
 // ponytail: same-uid ceiling as `caller::walked_to_a_person` (a detached agent passes).
-/// The session of the agent above `peer_pid`, as `<member>/<handle>`.
-pub fn agent_session(d: &Daemon, peer_pid: u32) -> Option<String> {
-    let (agent, _) = caller::ancestors_from(peer_pid)
-        .filter_map(Result::ok)
-        .find(|(_, is_agent)| *is_agent)?;
-    let rows = d.store.lock().unwrap().sessions().ok()?;
-    let s = rows.into_iter().find(|s| {
-        s.pid == Some(agent.pid.into()) && s.birth_micros == i64::try_from(agent.birth_micros).ok()
-    })?;
-    Some(s.handle.map_or(s.key.clone(), |h| {
-        format!("{}/{h}", s.key.split('/').next().unwrap_or_default())
-    }))
-}
-
 pub fn person_only(peer_pid: u32) -> bool {
     no_agent(caller::ancestors_from(peer_pid))
 }
@@ -840,6 +853,20 @@ mod tests {
     fn kill(pid: u32) {
         // SAFETY: a plain signal to a pid this test started.
         unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    }
+
+    #[test]
+    fn an_unresolved_caller_is_nobody() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("state.db")).unwrap();
+        assert_eq!(super::super::ipc::Caller::Socket(None).actor(&store), None);
+        assert_eq!(super::super::ipc::Caller::Instance.actor(&store), None);
+        assert_eq!(
+            super::super::ipc::Caller::Socket(Some(1))
+                .actor(&store)
+                .as_deref(),
+            Some("local")
+        );
     }
 
     #[test]

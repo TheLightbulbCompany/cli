@@ -22,7 +22,7 @@ affects computers that can only reach each other through one.
    relays (`*.relay.n0.iroh.link`, run by the iroh project). Run `lightbulb relay` to see which
    relay is in use, and ask a teammate on another network whether they reach the team. For a
    team relay, ask whoever runs it.
-2. Switch the team to a relay that works. The founder or an admin runs:
+2. Switch the team to a relay that works. Any member runs:
 
    ```sh
    lightbulb relay https://relay.example.com
@@ -36,7 +36,7 @@ affects computers that can only reach each other through one.
    lightbulb relay https://relay.example.com --local
    ```
 
-4. When the outage is over, go back with `lightbulb relay --clear` (founder or admin: for the
+4. When the outage is over, go back with `lightbulb relay --clear` (for the
    team too; with `--local`: this computer only). With nothing set, the default relays are used.
 
 Nothing is lost during an outage. Messages wait on the sender's computer and are retried for
@@ -49,8 +49,7 @@ Nothing is lost during an outage. Messages wait on the sender's computer and are
 Someone with `~/.lightbulb/connect/identity.key` can act as this computer in your team. Replace
 the key:
 
-1. Take the old key out of the team: `lightbulb leave`. If you are the founder, first make
-   someone else the founder (`lightbulb admin <name> --founder`).
+1. Take the old key out of the team: `lightbulb leave`. 
 2. Stop the service: close your agent sessions, then `lightbulb setup --remove`.
 3. Delete the key and the state that belongs to it:
 
@@ -63,12 +62,12 @@ the key:
 4. Start again: `lightbulb setup`. The service makes a new key.
 5. Ask a teammate for a new invite (`lightbulb invite`) and `join` again.
 
-If the computer itself is lost or you cannot run `leave` on it, the founder or an admin removes
+If the computer itself is lost or you cannot run `leave` on it, another member removes
 it: `lightbulb remove <name>`. Then join from the new computer with a new invite.
 
 ### A team member is no longer trusted
 
-The founder or an admin runs:
+Any other member runs:
 
 ```sh
 lightbulb remove <name>
@@ -87,13 +86,13 @@ asking.
 It **cannot**: read messages, see sessions, or act as a member without being admitted.
 
 It shows: the team's id, the inviter's network addresses, and the public keys of up to six
-members (the inviter, the founder, the admins).
+members (the inviter and the founder).
 
 To end it:
 
 - A normal reusable invite: the inviter runs `lightbulb invite --new`. That ends their reusable
   invite only.
-- An `--open` invite: `invite --new` is not enough. The founder or an admin removes any member
+- An `--open` invite: `invite --new` is not enough. Any member removes another member
   (that ends every live invite), or you wait out its 7 days.
 - A one-time invite: it ends when it is used, or after 24 hours. A `remove` ends it too.
 

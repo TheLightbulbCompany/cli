@@ -49,10 +49,9 @@ Run `lightbulb <command> --help` for the options of each one.
 | `receipt <id>` | Whether a message you sent arrived. `--json` for the raw receipt. |
 | `policy` | Who may message your sessions without asking. `policy <person> accept\|hold\|refuse` sets it. |
 | `team` | The team and its computers. |
-| `admin <name>` | Make a member an admin (founder only). `--founder` makes them the founder in your place. |
-| `remove <name>` | Remove a member (founder and admins). The invite is replaced. |
+| `remove <name>` | Remove a member. The invite is replaced. |
 | `leave` | Leave the team. This computer is on its own network again. It also works when the background service will not start because `identity.key` no longer matches the team record. |
-| `relay [<url>]` | Show the relays this computer uses, or set one. With nothing set it uses the iroh project's public relays (`default`). From the founder or an admin it sets the team's relay; `--local` sets only this computer's; `--clear` clears yours and goes back to the default. Relays carry encrypted bytes only. Lightbulb fetches no relay list of its own. |
+| `relay [<url>]` | Show the relays this computer uses, or set one. With nothing set it uses the iroh project's public relays (`default`). It sets the team's relay; `--local` sets only this computer's; `--clear` clears yours and goes back to the default. Relays carry encrypted bytes only. Lightbulb fetches no relay list of its own. |
 | `folder <path> on\|off` | Show or hide the sessions under a folder from your teammates. |
 | `version` | Print the version. |
 
@@ -77,7 +76,7 @@ A held message waits up to 7 days for an answer. To change a decision later, use
 lets them through. Your own computers always get through.
 
 Join requests work the same way: `invite` links ask you before anyone joins (`J<n>`), unless the
-founder or an admin made the link with `invite --open`.
+someone made the link with `invite --open`.
 
 ## What teammates can see
 

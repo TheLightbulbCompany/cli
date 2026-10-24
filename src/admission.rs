@@ -13,7 +13,7 @@ use crate::net::frames::{self, Frame};
 use crate::net::{self, JOIN_ALPN};
 use crate::policy;
 use crate::proof::{self, Proof, ProofKind};
-use crate::roster::{self, Collision, Entry, Kind, MemberKind, Role, Roster};
+use crate::roster::{self, Collision, Entry, Kind, MemberKind, Roster};
 use crate::store::{Join, Store};
 use crate::ticket::{self, Ticket};
 use data_encoding::HEXLOWER;
@@ -323,7 +323,7 @@ fn open(d: &Daemon, req: &Request) -> Result<(i64, Option<Verdict>), &'static st
     if ask {
         return Ok((n, None));
     }
-    let v = try_admit(d, &mut team, &store, n, req, once, now);
+    let v = try_admit(d, &mut team, &store, n, req, once, None, now);
     close(&store, n, v);
     Ok((n, Some(v)))
 }
@@ -423,9 +423,7 @@ fn check(
             _ => Err(FORWARD),
         };
     }
-    let authorised = mine.is_some_and(|m| {
-        m.kind == MemberKind::Computer && (m.role == Role::Founder || link.signer == me)
-    });
+    let authorised = mine.is_some_and(|m| m.kind == MemberKind::Computer);
     if !authorised {
         return Err(net_ops::NOT_ADMIN);
     }
@@ -443,6 +441,7 @@ pub fn fits(s: &str) -> bool {
 
 /// Writes request `n`'s checked `admit`; for a `once` link, marks it used here; for a `person`
 /// link of ours, accepts its person.
+#[allow(clippy::too_many_arguments)]
 fn try_admit(
     d: &Daemon,
     team: &mut TeamState,
@@ -450,11 +449,16 @@ fn try_admit(
     n: i64,
     req: &Request,
     once: bool,
+    by: Option<&str>,
     now: i64,
 ) -> Verdict {
     let mut body = json!({"member": req.candidate, "name": req.name, "computer": req.computer,
         "person_id": req.candidate, "kind": req.kind, "role": "member",
         "ticket_id": req.ticket.ticket_id});
+    // The agent session that approved it, in the signed record.
+    if let Some(by) = by {
+        body["by"] = by.into();
+    }
     // `check` took it: the person (or `ws:<id>`) it names, and a workspace's own name.
     if let Some(c) = req.verified() {
         if let Some(w) = c.workspace.as_ref().filter(|_| req.kind == "cloud") {
@@ -499,12 +503,12 @@ fn close(store: &Store, n: i64, v: Verdict) {
 }
 
 /// The person allowed request `n`: checked again (the roster may have moved), then admitted.
-fn admit(d: &Daemon, n: i64, req: &Request) -> Verdict {
+fn admit(d: &Daemon, n: i64, req: &Request, by: Option<&str>) -> Verdict {
     let mut team = d.team.lock().unwrap();
     let store = d.store.lock().unwrap();
     let now = ipc::now() as i64;
     let v = check(&team.roster, &store, req, &d.identity.key, now)
-        .and_then(|once| try_admit(d, &mut team, &store, n, req, once, now));
+        .and_then(|once| try_admit(d, &mut team, &store, n, req, once, by, now));
     close(&store, n, v);
     v
 }
@@ -556,7 +560,13 @@ async fn answered(
 /// The person's answer to request `n`, from `surface` (`dialog`, or `cli` for `team.admit`):
 /// its name and verdict, or `None` when it is not waiting here (answered, its candidate gone,
 /// or forwarded).
-fn answer(d: &Daemon, n: i64, allow: bool, surface: &'static str) -> Option<(String, Verdict)> {
+fn answer(
+    d: &Daemon,
+    n: i64,
+    allow: bool,
+    surface: &'static str,
+    by: Option<&str>,
+) -> Option<(String, Verdict)> {
     let (req, tx) = {
         let mut waiting = d.admissions.lock().unwrap();
         match waiting.remove(&n)? {
@@ -574,7 +584,7 @@ fn answer(d: &Daemon, n: i64, allow: bool, surface: &'static str) -> Option<(Str
         .insert(format!("J{n}"), surface);
     eprintln!("join: J{n} answered from the {surface}");
     let v = if allow {
-        admit(d, n, &req)
+        admit(d, n, &req, by)
     } else {
         close(&d.store.lock().unwrap(), n, Err(DECLINED));
         Err(DECLINED)
@@ -774,7 +784,7 @@ pub async fn route(d: Arc<Daemon>) {
     while let Some((id, button)) = answers.recv().await {
         let Some(b) = button else { continue };
         if let Some(n) = dialog::number(&id, 'J') {
-            answer(&d, n, b == "Allow", "dialog");
+            answer(&d, n, b == "Allow", "dialog", None);
         } else if let Some(n) = dialog::number(&id, 'H') {
             crate::holds::on_dialog(&d, n, &b);
         } else {
@@ -815,7 +825,7 @@ pub fn admit_op(id: u64, body: &Value, d: &Daemon, by: Option<String>) -> Respon
     else {
         return Response::err(id, BAD_REQUEST);
     };
-    match answer(d, n, allow, "cli") {
+    match answer(d, n, allow, "cli", by.as_deref()) {
         Some((name, v)) => {
             if let Some(by) = &by {
                 eprintln!("join: J{n} answered by {by}");

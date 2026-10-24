@@ -255,6 +255,7 @@ mod tests {
             admitted_at: 0,
             proof: None,
             workspace: ws.map(Into::into),
+            by: None,
         }
     }
 

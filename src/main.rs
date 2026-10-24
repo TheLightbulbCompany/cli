@@ -169,7 +169,8 @@ enum Command {
         #[arg(value_parser = ["on", "off"])]
         state: String,
     },
-    /// The relays this computer uses (with a URL, sets yours and the team's too). Relays carry encrypted traffic only, when no direct path exists.
+    /// The relays this computer uses (with a URL, sets yours and the team's too). Relays
+    /// carry encrypted traffic only, when no direct path exists.
     Relay {
         url: Option<String>,
         /// Clear the relay you set.
