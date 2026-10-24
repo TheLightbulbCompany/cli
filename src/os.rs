@@ -300,16 +300,10 @@ mod tests {
         );
         #[cfg(target_os = "linux")]
         {
+            // Not root, `/proc/1/exe` is refused and the name comes from `comm`: whatever pid 1
+            // is (systemd, init, or a container's tini or sh), it resolves to a name.
             let init = process(1).unwrap().executable;
             assert!(!init.as_os_str().is_empty());
-            // Not root: `/proc/1/exe` is refused and the name comes from `comm`.
-            // SAFETY: getuid takes no arguments and cannot fail.
-            if unsafe { libc::getuid() } != 0 {
-                assert!(
-                    ["systemd", "init"].contains(&init.to_str().unwrap()),
-                    "{init:?}"
-                );
-            }
         }
     }
 

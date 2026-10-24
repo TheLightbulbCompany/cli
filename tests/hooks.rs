@@ -507,7 +507,10 @@ fn a_claude_hook_fired_by_cursor_registers_nothing() {
     let app = tempfile::tempdir().unwrap();
     let exe = app.path().join("Cursor.app/Contents/MacOS/Cursor");
     std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
-    std::fs::copy("/bin/sleep", &exe).unwrap();
+    // Copied by a child `cp`, not by this process: on Linux a parallel test's fork inherits any
+    // write fd we hold until it execs, and exec of a file open for writing fails (ETXTBSY).
+    let cp = Command::new("/bin/cp").arg("/bin/sleep").arg(&exe).status();
+    assert!(cp.unwrap().success());
     let mut cursor = Command::new(&exe).arg("30").spawn().unwrap();
     let p = os::process(cursor.id()).unwrap();
     let err = claude_start_as(&net, &p);
