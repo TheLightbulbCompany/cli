@@ -444,7 +444,7 @@ fn daemon_install_writes_the_plist_and_alias_without_touching_a_foreign_file() {
     // A symlink pointing elsewhere is replaced.
     std::fs::remove_file(bin.join("lightbulb")).unwrap();
     std::os::unix::fs::symlink("/usr/bin/true", bin.join("lightbulb")).unwrap();
-    assert!(out(&e.run(&["daemon", "--install"])).starts_with("Command: lightbulb\n"));
+    assert!(out(&e.run(&["daemon", "--install"])).starts_with("Command: lightbulb"));
     assert_eq!(std::fs::read_link(bin.join("lightbulb")).unwrap(), canon);
 
     let o = e.run(&["daemon", "--uninstall"]);
@@ -1053,7 +1053,7 @@ fn the_command_is_lightbulb() {
     let o = e.run(&["setup"]);
     assert!(o.status.success(), "{}", err(&o));
     let text = out(&o);
-    assert!(text.starts_with("Command: lightbulb\n"), "{text}");
+    assert!(text.starts_with("Command: lightbulb"), "{text}");
     assert!(
         text.contains("Add your other computer or a teammate: lightbulb invite\n"),
         "{text}"
@@ -1061,4 +1061,34 @@ fn the_command_is_lightbulb() {
     let canon = h.join(".lightbulb/connect/bin/lightbulb");
     assert!(canon.is_file());
     assert_eq!(std::fs::read_link(bin.join("lightbulb")).unwrap(), canon);
+}
+
+/// A fresh Mac: `~/.local/bin` is not on PATH, so setup adds it to the zsh profile once (a
+/// second run adds nothing) and says so, instead of asking the person to edit the file.
+#[cfg(target_os = "macos")]
+#[test]
+fn daemon_install_adds_local_bin_to_the_zsh_profile_once() {
+    let e = Env::new();
+    let run = || {
+        e.cmd(&["daemon", "--install"])
+            .env("SHELL", "/bin/zsh")
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .unwrap()
+    };
+    let o = run();
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(
+        out(&o).contains("added ~/.local/bin to your PATH in ~/.zshrc; open a new terminal"),
+        "{}",
+        out(&o)
+    );
+    let zshrc = e.home.path().join(".zshrc");
+    let once = std::fs::read_to_string(&zshrc).unwrap();
+    assert_eq!(
+        once,
+        "\n# Added by Lightbulb\nexport PATH=\"$HOME/.local/bin:$PATH\"\n"
+    );
+    assert!(run().status.success());
+    assert_eq!(std::fs::read_to_string(&zshrc).unwrap(), once);
 }

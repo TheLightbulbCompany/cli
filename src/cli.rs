@@ -1266,17 +1266,66 @@ pub fn update(version: Option<String>) -> Result<i32> {
     .into())
 }
 
-/// `Command: lightbulb`, plus the PATH line when `~/.local/bin` is not on this shell's PATH
-/// (a fresh Mac: the curl install lands there, and nothing else puts it on PATH).
+/// `Command: lightbulb`. When `~/.local/bin` is not on this shell's PATH (a fresh Mac: the curl
+/// install lands there and nothing else puts it on PATH), the PATH line is added to the login
+/// shell's profile once, in a marked block, and the person is told to open a new terminal.
 fn command_lines(home: &Path) -> String {
     let bin = home.join(".local/bin");
     let on_path =
         std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d == bin));
     if on_path {
-        "Command: lightbulb".into()
-    } else {
-        "Command: lightbulb\nAdd this line to your shell profile (~/.zshrc), then open a new terminal: export PATH=\"$HOME/.local/bin:$PATH\"".into()
+        return "Command: lightbulb".into();
     }
+    let profile = shell_profile(home);
+    let shown = format!(
+        "~/{}",
+        profile.strip_prefix(home).unwrap_or(&profile).display()
+    );
+    match add_to_path(&profile) {
+        Ok(()) => format!(
+            "Command: lightbulb (added ~/.local/bin to your PATH in {shown}; open a new terminal, or run {} now)",
+            canonical(home).display()
+        ),
+        Err(_) => format!(
+            "Command: lightbulb\nAdd this line to {shown}, then open a new terminal: {PATH_LINE}"
+        ),
+    }
+}
+
+const PATH_LINE: &str = "export PATH=\"$HOME/.local/bin:$PATH\"";
+const PATH_MARK: &str = "# Added by Lightbulb";
+
+/// The login shell's profile: `~/.zshrc` for zsh (the Mac default), `~/.bash_profile` on a Mac
+/// and `~/.bashrc` on Linux for bash, else `~/.profile`.
+fn shell_profile(home: &Path) -> PathBuf {
+    let shell = std::env::var("SHELL").unwrap_or_default();
+    let name = match shell.rsplit('/').next().unwrap_or_default() {
+        "zsh" => ".zshrc",
+        "bash" if cfg!(target_os = "macos") => ".bash_profile",
+        "bash" => ".bashrc",
+        _ => ".profile",
+    };
+    home.join(name)
+}
+
+/// Appends the marked PATH block to `profile` unless it already mentions `.local/bin`.
+fn add_to_path(profile: &Path) -> Result<()> {
+    let had = fs::read_to_string(profile).unwrap_or_default();
+    if had.contains(PATH_MARK) || had.contains(".local/bin") {
+        return Ok(());
+    }
+    let sep = if had.is_empty() || had.ends_with('\n') {
+        ""
+    } else {
+        "\n"
+    };
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(profile)?;
+    use std::io::Write;
+    write!(f, "{sep}\n{PATH_MARK}\n{PATH_LINE}\n")?;
+    Ok(())
 }
 
 /// Makes `path` a symlink to `target`, replacing whatever is there (atomically: a link made
