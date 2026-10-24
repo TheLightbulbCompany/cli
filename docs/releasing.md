@@ -27,7 +27,7 @@ after the release assets exist (the workflow's `needs:` does this).
 ## Rollback
 
 - curl: pin a tag with the install line:
-  `LIGHTBULB_VERSION=v0.2.2 curl -fsSL https://github.com/TheLightbulbCompany/cli/releases/latest/download/install.sh | sh`.
+  `curl -fsSL https://github.com/TheLightbulbCompany/cli/releases/latest/download/install.sh | LIGHTBULB_VERSION=v0.2.2 sh`.
   From 0.2.2 on, `lightbulb update --version v0.2.2` does the same.
 - brew users: the formula tracks latest; there is no versioned formula.
 - npm: `npm i -g lightbulb-cli@0.2.2`, then `lightbulb setup`.

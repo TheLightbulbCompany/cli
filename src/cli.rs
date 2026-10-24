@@ -1234,7 +1234,7 @@ pub fn update(version: Option<String>) -> Result<i32> {
         return Ok(2);
     };
     if want < FIRST_UPDATABLE {
-        eprintln!("Versions before 0.2.2 cannot be installed with update (they used a different layout). Use the install line with LIGHTBULB_VERSION.");
+        eprintln!("Versions before 0.2.2 cannot be installed.");
         return Ok(2);
     }
     if parse_version(VERSION) == Some(want) {

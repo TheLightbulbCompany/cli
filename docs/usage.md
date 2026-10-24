@@ -35,7 +35,7 @@ Run `lightbulb <command> --help` for the options of each one.
 | Command | What it does |
 |---|---|
 | `setup` | Connect Claude Code, Codex, Cursor and Grok CLI here and start the background service. |
-| `update` | Install the latest release over this one and restart the background service. `--version v0.2.3` installs that release instead (0.2.2 or later; for older ones, use the install line with `LIGHTBULB_VERSION`). |
+| `update` | Install the latest release over this one and restart the background service. `--version v0.2.3` installs that release instead (0.2.2 or later). |
 | `setup --remove` | Take out only what `setup` wrote. Backups are left as they are. |
 | `doctor` | Check the service, the local network, the state folder and each agent, and say how to fix what is not right. |
 | `who` | List the sessions on this computer. `who --all` adds your teammates' sessions. |

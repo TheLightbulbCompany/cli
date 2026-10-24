@@ -8,6 +8,7 @@ set -eu
 REPO="TheLightbulbCompany/cli"
 ASSET="lightbulb-macos-arm64.tar.gz"
 if [ -n "${LIGHTBULB_VERSION:-}" ]; then
+  case "$LIGHTBULB_VERSION" in v*) ;; *) LIGHTBULB_VERSION="v$LIGHTBULB_VERSION" ;; esac
   BASE="https://github.com/$REPO/releases/download/$LIGHTBULB_VERSION"
 else
   BASE="https://github.com/$REPO/releases/latest/download"

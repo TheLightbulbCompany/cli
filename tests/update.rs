@@ -111,7 +111,7 @@ fn versions_before_0_2_2_are_refused() {
     assert_eq!(o.status.code(), Some(2));
     assert_eq!(
         text(&o.stderr).trim(),
-        "Versions before 0.2.2 cannot be installed with update (they used a different layout). Use the install line with LIGHTBULB_VERSION."
+        "Versions before 0.2.2 cannot be installed."
     );
     assert!(!canonical(&env).exists());
 }

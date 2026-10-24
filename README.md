@@ -16,7 +16,7 @@ Run the same line again to upgrade. Builds are not yet signed with a Developer I
 quarantined by Gatekeeper, a browser download would be. `lightbulb setup --remove` takes everything out.
 
 `lightbulb update` keeps you current. To pin or roll back to a release:
-`LIGHTBULB_VERSION=v0.2.2 curl -fsSL https://github.com/TheLightbulbCompany/cli/releases/latest/download/install.sh | sh`.
+`curl -fsSL https://github.com/TheLightbulbCompany/cli/releases/latest/download/install.sh | LIGHTBULB_VERSION=v0.2.2 sh`.
 
 Or with Homebrew (then run the setup yourself):
 
