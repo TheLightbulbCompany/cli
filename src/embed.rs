@@ -304,36 +304,54 @@ pub(crate) fn take_read(d: &Daemon, key: &Key) -> Result<Vec<Value>> {
         .collect())
 }
 
-/// `inbox.peek {}` -> `{sessions: [{session, records}]}`: what waits for each declared name, as
-/// Task 10's records (`ipc::INBOX_RECORD`), left waiting: `inbox.ack` moves each on.
+/// `inbox.peek {}` -> `{sessions: [{session, records}]}`: what waits for each declared name and
+/// what was delivered but not yet read, as Task 10's records (`ipc::INBOX_RECORD`) with
+/// `stage` (`delivered`, then `waiting`, each oldest first), all left as they are: `inbox.ack`
+/// moves each on. A record lists until it is read, so a turn that died is handed out again.
 pub(crate) fn peek(id: u64, d: &Daemon) -> Response {
-    let prefix = format!("{}/", d.identity.short);
-    let waiting = || -> Result<Vec<(String, Vec<store::Message>)>> {
+    let short = &d.identity.short;
+    type Group = (String, Vec<(store::Message, &'static str)>);
+    let listed = || -> Result<Vec<Group>> {
         let store = d.store.lock().unwrap();
         let now = ipc::now();
-        let mut out = vec![];
-        for key in mail::waiting_keys(&store, now)? {
-            let Some(name) = key
-                .strip_prefix(&prefix)
-                .filter(|n| sessions::valid_name(n))
-            else {
-                continue;
+        let mut out: Vec<Group> = vec![];
+        let mut push = |m: store::Message, stage| {
+            let name = m.to_key.split_once('/').map(|(_, n)| n.to_string());
+            let Some(name) = name.filter(|n| sessions::valid_name(n)) else {
+                return;
             };
-            out.push((
-                name.to_string(),
-                mail::waiting(&store, &Key(key.clone()), now)?,
-            ));
+            match out.iter_mut().find(|(n, _)| *n == name) {
+                Some((_, ms)) => ms.push((m, stage)),
+                None => out.push((name, vec![(m, stage)])),
+            }
+        };
+        for m in mail::delivered_unread(&store, short)? {
+            push(m, "delivered");
+        }
+        for key in mail::waiting_keys(&store, now)? {
+            if key.starts_with(&format!("{short}/")) {
+                for m in mail::waiting(&store, &Key(key), now)? {
+                    push(m, "waiting");
+                }
+            }
         }
         Ok(out)
     };
-    let Ok(waiting) = waiting() else {
+    let Ok(listed) = listed() else {
         return Response::err(id, INTERNAL);
     };
     // After the store lock: `records` takes the team's.
-    let sessions: Vec<Value> = waiting
-        .iter()
-        .map(|(name, m)| {
-            let records: Vec<Value> = ipc::records(d, m).iter().map(ipc::inbox_record).collect();
+    let sessions: Vec<Value> = listed
+        .into_iter()
+        .map(|(name, ms)| {
+            let (ms, stages): (Vec<_>, Vec<_>) = ms.into_iter().unzip();
+            let records: Vec<Value> = (ipc::records(d, &ms).iter().zip(stages))
+                .map(|(r, stage)| {
+                    let mut r = ipc::inbox_record(r);
+                    r["stage"] = stage.into();
+                    r
+                })
+                .collect();
             json!({ "session": name, "records": records })
         })
         .collect();
@@ -341,8 +359,9 @@ pub(crate) fn peek(id: u64, d: &Daemon) -> Response {
 }
 
 /// `inbox.ack {session, record, stage}` -> `{}`: `delivered` takes record `record` (an id from
-/// `inbox.peek`) from session `session`'s mailbox; `read` marks it read and drops its text.
-/// `not_found` for a record that is not (or no longer) there; `bad_request` for another stage.
+/// `inbox.peek`) from session `session`'s mailbox (again: `{}`); `read` takes it if it still
+/// waits, marks it read and drops its text. `not_found` for a record that was never session
+/// `session`'s; `bad_request` for another stage.
 pub(crate) fn ack(id: u64, body: &Value, d: &Daemon) -> Response {
     let (Some(name), Some(record), Some(stage)) = (
         body["session"].as_str().filter(|n| sessions::valid_name(n)),
@@ -356,11 +375,13 @@ pub(crate) fn ack(id: u64, body: &Value, d: &Daemon) -> Response {
     let key = Key(format!("{}/{name}", d.identity.short));
     let found = || -> Result<bool> {
         let store = d.store.lock().unwrap();
-        if stage == "delivered" {
-            return Ok(mail::take_one(&store, &key, record, ipc::now())?.is_some());
-        }
+        // Taken from the mailbox if it still waits; a record delivered before is as it was.
+        mail::take_one(&store, &key, record, ipc::now())?;
         if store.message(record)?.is_none_or(|m| m.to_key != key.0) {
             return Ok(false);
+        }
+        if stage == "delivered" {
+            return Ok(true);
         }
         mail::mark_read(&store, record)?;
         mail::forget(&store)?;

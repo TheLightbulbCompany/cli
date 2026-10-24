@@ -226,8 +226,10 @@ async fn peek_lists_without_taking_and_ack_moves_the_receipt() {
     let mut keys: Vec<&String> = rec.as_object().unwrap().keys().collect();
     keys.sort();
     let mut want = lightbulb::daemon::ipc::INBOX_RECORD.to_vec();
+    want.push("stage");
     want.sort();
     assert_eq!(keys, want);
+    assert_eq!(rec["stage"], "waiting");
 
     let ack = |record: &str, stage: &str| {
         line(
@@ -246,11 +248,30 @@ async fn peek_lists_without_taking_and_ack_moves_the_receipt() {
         json!({"id": 7, "ok": true, "result": {}})
     );
     assert_eq!(receipt(&mut pa, &id).await, "delivered");
+    // Delivered, not read (a turn that died): still listed, and a second ack is the same.
     let after = ok(&sock, &token, "inbox.peek", json!({}));
-    assert_eq!(after["sessions"], json!([]), "{after}");
+    let listed = &after["sessions"][0]["records"];
+    assert_eq!(listed.as_array().map(Vec::len), Some(1), "{after}");
+    assert_eq!(
+        (listed[0]["id"].as_str(), listed[0]["stage"].as_str()),
+        (Some(id.as_str()), Some("delivered"))
+    );
+    assert_eq!(ack(&id, "delivered")["result"], json!({}));
 
     assert_eq!(ack(&id, "read")["ok"], true);
     assert_eq!(receipt(&mut pa, &id).await, "read");
+    let after = ok(&sock, &token, "inbox.peek", json!({}));
+    assert_eq!(after["sessions"], json!([]), "{after}");
+    // `read` on a record still waiting takes it too.
+    let (id2, _) = send(&mut pa, &a, &to, "second").await;
+    assert_eq!(ack(&id2, "read")["ok"], true);
+    // Its receipt reaches `read` (a `delivered` may come first or be folded into it).
+    pa.recv_where(
+        |f| matches!(f, Frame::Receipt { id, state, .. } if *id == id2 && state == "read"),
+    )
+    .await;
+    let after = ok(&sock, &token, "inbox.peek", json!({}));
+    assert_eq!(after["sessions"], json!([]), "{after}");
     let db = dir.path().join("home/state.db");
     let sql = format!("SELECT COUNT(*) FROM messages WHERE id = '{id}' AND body IS NULL");
     until(10, "the text is forgotten", || {

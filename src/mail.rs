@@ -900,6 +900,26 @@ pub fn waiting(store: &Store, to: &Key, now: u64) -> Result<Vec<Message>> {
     Ok(out)
 }
 
+/// The messages to member `short`'s names (`<short>/<name>`) that were delivered and are not
+/// yet read, oldest first: taken from the mailbox, their text kept until `mark_read`.
+pub fn delivered_unread(store: &Store, short: &str) -> Result<Vec<Message>> {
+    let mut stmt = store.conn().prepare(
+        "SELECT m.id FROM messages m JOIN receipts r \
+         ON r.from_key = m.from_key AND r.request_id = m.request_id \
+         WHERE r.state = 'delivered' AND m.body IS NOT NULL AND substr(m.to_key, 1, ?2) = ?1 \
+         AND NOT EXISTS (SELECT 1 FROM mailbox b WHERE b.message_id = m.id) ORDER BY m.rowid",
+    )?;
+    let prefix = format!("{short}/");
+    let ids = stmt.query_map(params![prefix, prefix.len() as i64], |r| {
+        r.get::<_, String>(0)
+    })?;
+    let mut out = vec![];
+    for id in ids {
+        out.extend(store.message(&id?)?);
+    }
+    Ok(out)
+}
+
 /// The addresses with waiting mail, newest mail first.
 pub fn waiting_keys(store: &Store, now: u64) -> Result<Vec<String>> {
     let mut stmt = store.conn().prepare(
