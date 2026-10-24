@@ -116,9 +116,10 @@ How long things last:
 | A one-time invite / a reusable or open invite | 24 hours / 7 days |
 | Answered join requests | kept 30 days |
 
-Message text is kept in `state.db` after delivery; nothing deletes it. `leave` and
-`setup --remove` keep it too. To erase this computer's key and messages, run
-`lightbulb setup --remove`, then delete `~/.lightbulb/connect/` and the command link
+A message's text is deleted from `state.db` once nothing waits on it (read, refused or
+expired); its row stays for receipts, loop limits and request-id replay. Messages to your own
+terminal keep their text. `leave` and `setup --remove` keep what is left. To erase this
+computer's key and messages, run `lightbulb setup --remove`, then delete `~/.lightbulb/connect/` and the command link
 `~/.local/bin/lightbulb`:
 
 ```sh
