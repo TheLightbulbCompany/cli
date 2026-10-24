@@ -219,7 +219,7 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
             let total = members.keys().filter(|k| *k != me).count();
             let ours = daemon.peers.knobs().protocol;
             let (online, direct, outdated) = daemon.peers.status();
-            let (relay, relay_error) = daemon.peers.relay_status();
+            let relay = daemon.peers.relay_status();
             // `<computer> needs an update (protocol <theirs>, yours <ours>)`
             let needs_update: Vec<String> = outdated
                 .into_iter()
@@ -240,8 +240,6 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
                     "sessions": sessions,
                     "peers": { "online": online, "direct": direct, "total": total },
                     "relay": relay,
-                    // Why our relay list was refused (or could not be fetched), when it was.
-                    "relay_error": relay_error,
                     "port": daemon.peers.port.get(),
                     // Local discovery: "on", "off" (`config.lan`) or "blocked" (macOS).
                     "lan": daemon.peers.lan_status(),

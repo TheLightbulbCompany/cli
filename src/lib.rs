@@ -12,7 +12,6 @@ pub mod embed;
 pub mod frame;
 pub mod holds;
 pub mod hook;
-pub mod http;
 pub mod identity;
 pub mod label;
 pub mod mail;

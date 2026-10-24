@@ -1,26 +1,21 @@
 //! Sign-in proofs: a compact EdDSA JWS from the Lightbulb issuer naming a person (or, for the
 //! workspace member, a workspace) and the computer key it was issued to. Verified offline
 //! against the compiled-in issuer keys; they live only in the roster (`merge`, `proof`, an
-//! `admit`'s `proof`). Also the issuer's HTTP calls (`post`) and the daemon's renewal (`tick`).
+//! `admit`'s `proof`). Nothing here calls the issuer: sign-in and renewal return with real
+//! issuer keys at the key ceremony.
 
 use crate::daemon::{ipc, net_ops, Daemon};
-use crate::http;
 use crate::roster::{Kind, MemberKind};
 use crate::Result;
 use data_encoding::BASE64URL_NOPAD;
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::sync::Arc;
 
 /// A token past this is refused unread (its `admit` must fit a roster entry).
 pub const MAX_TOKEN: usize = 4096;
 /// A proof lives at most this long.
 const MAX_LIFE_S: i64 = 86_400;
-/// A proof this old is renewed.
-pub const RENEW_AT_S: i64 = 20 * 3600;
-/// A failed renewal is tried again after this.
-const RETRY_S: i64 = 3600;
 /// How far ahead of our clock an issuer may stamp `iat` (clock skew).
 const IAT_SKEW_S: i64 = 300;
 
@@ -179,47 +174,10 @@ pub fn verify(token: &str, member_key: &str, now: i64) -> Result<Proof> {
     Ok(c)
 }
 
-/// `{issuer}/<path>`.
-pub fn route(issuer: &str, path: &str) -> String {
-    format!("{}/{path}", issuer.trim_end_matches('/'))
-}
-
 /// On the daemon's 60 s timer: drops expired proofs from the cached roster (their badge and
-/// workspace), and once this computer's own proof is `RENEW_AT_S` old asks the issuer for a
-/// new one (off the async threads), writing it as a `proof` entry; a failure tries again
-/// hourly. `retry_at`: no call before it (a renewal's new `iat` ends the calls).
-pub fn tick(d: &Arc<Daemon>, retry_at: &mut i64) {
-    let now = ipc::now() as i64;
-    let (token, issuer) = {
-        let mut team = d.team.lock().unwrap();
-        team.roster.lapse(now);
-        let own = team.roster.members.get(&d.identity.key);
-        let Some(p) = own.and_then(|m| m.proof.as_ref()) else {
-            return;
-        };
-        if now < p.iat + RENEW_AT_S || now < *retry_at {
-            return;
-        }
-        (p.token.clone(), team.config.issuer.clone())
-    };
-    // No second call while this one runs, nor for an hour after a failure.
-    *retry_at = now + RETRY_S;
-    let d = d.clone();
-    tokio::task::spawn_blocking(move || {
-        if let Err(e) = renew(&d, &token, &issuer, now) {
-            eprintln!("proof: renewal failed, retrying in an hour: {e}");
-        }
-    });
-}
-
-/// One renewal: `proof/refresh` (`{proof, at, sig}`, signed by this computer's key over
-/// `{proof, at}`), its answer recorded (`record` verifies it).
-fn renew(d: &Daemon, token: &str, issuer: &str, now: i64) -> Result<()> {
-    let body = d.identity.signed(json!({"proof": token, "at": now}));
-    let (status, v) = http::post_json(&route(issuer, "proof/refresh"), &body)?;
-    let new = v["proof"].as_str().filter(|_| status == 200);
-    record(d, new.ok_or_else(|| format!("issuer answered {status}"))?)?;
-    Ok(())
+/// workspace).
+pub fn tick(d: &Daemon) {
+    d.team.lock().unwrap().roster.lapse(ipc::now() as i64);
 }
 
 /// `record`'s refusal of a proof for another person than this computer's.

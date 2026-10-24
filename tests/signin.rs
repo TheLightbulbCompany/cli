@@ -1,5 +1,5 @@
-//! Sign-in proofs: the device flow against a loopback test issuer, renewal, a person's second
-//! computer admitted by their first, and the workspace member admitted with a workspace proof.
+//! Sign-in proofs: `signin` refuses (no issuer keys yet), a person's second computer admitted
+//! by their first, and the workspace member admitted with a workspace proof.
 
 mod common;
 
@@ -10,84 +10,7 @@ use common::{
 use lightbulb::daemon::ipc;
 use lightbulb::embed::Instance;
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{Ipv4Addr, TcpListener};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
-
-/// What the test issuer was asked: `(path, body)`.
-type Asked = Arc<Mutex<Vec<(String, Value)>>>;
-
-/// A plain HTTP/1.1 issuer on the loopback: `device/start` (code `D1`, interval 0),
-/// `device/token` (pending once, then a computer proof for the started key as `user_1`
-/// "Prasiddha"), `proof/refresh` (the old proof's claims, issued now). Its `issuer` URL.
-fn issuer() -> (String, Asked) {
-    let l = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let url = format!("http://{}/connect", l.local_addr().unwrap());
-    let asked: Asked = Arc::default();
-    let log = asked.clone();
-    std::thread::spawn(move || {
-        let mut key = String::new();
-        let mut polls = 0;
-        for s in l.incoming().flatten() {
-            let mut r = BufReader::new(&s);
-            let mut line = String::new();
-            r.read_line(&mut line).unwrap_or_default();
-            let mut len = 0;
-            loop {
-                let mut h = String::new();
-                if r.read_line(&mut h).unwrap_or(0) <= 2 {
-                    break;
-                }
-                if let Some(v) = h.to_lowercase().strip_prefix("content-length:") {
-                    len = v.trim().parse().unwrap_or(0);
-                }
-            }
-            let mut body = vec![0; len];
-            r.read_exact(&mut body).unwrap_or_default();
-            let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-            let path = line.split(' ').nth(1).unwrap_or_default().to_string();
-            // Our signed relay list is fetched from the issuer too (`relay`): not the sign-in's.
-            if !path.contains("/relays.json") {
-                log.lock().unwrap().push((path.clone(), body.clone()));
-            }
-            let proof = |k: &str| computer_proof(k, "user_1", "Prasiddha", None, ipc::now() as i64);
-            let (status, answer) = if path.ends_with("/device/start") {
-                key = body["member_key"].as_str().unwrap_or_default().into();
-                let a = json!({"device_code": "D1", "user_code": "ABCD-EFGH",
-                    "verification_uri_complete": "https://example.invalid/d?c=ABCD", "interval": 0});
-                ("200 OK", a)
-            } else if path.ends_with("/device/token") {
-                polls += 1;
-                match polls {
-                    1 => ("200 OK", json!({"pending": true})),
-                    2 => ("200 OK", json!({"proof": proof(&key)})),
-                    _ => ("410 Gone", json!({})),
-                }
-            } else if path.ends_with("/proof/refresh") {
-                // The same claims, issued now.
-                let old = body["proof"].as_str().unwrap_or_default();
-                let payload = old.split('.').nth(1).unwrap_or_default();
-                let bytes = data_encoding::BASE64URL_NOPAD.decode(payload.as_bytes());
-                let mut c: Value =
-                    serde_json::from_slice(&bytes.unwrap_or_default()).unwrap_or_default();
-                c["iat"] = json!(ipc::now() as i64);
-                c["exp"] = json!(ipc::now() as i64 + 86_400);
-                ("200 OK", json!({"proof": common::issuer::mint(&c)}))
-            } else {
-                ("404 Not Found", json!({}))
-            };
-            let a = answer.to_string();
-            let mut s = &s;
-            let _ = write!(
-                s,
-                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{a}",
-                a.len()
-            );
-        }
-    });
-    (url, asked)
-}
 
 fn identity_of(e: &Env) -> Value {
     e.ask(json!({"id": 1, "op": "identity.get"}))
@@ -125,67 +48,18 @@ fn member<'a>(ms: &'a [Value], key: &str) -> &'a Value {
 }
 
 #[test]
-fn signin_writes_a_merge_and_renews_before_expiry() {
-    let (url, asked) = issuer();
+fn signin_says_verified_names_are_not_available_yet() {
     let e = Env::new();
-    // The 60 s timer, every second.
-    let fast = ("LIGHTBULB_CONNECT_DEBUG_OUTBOX_S", "1".to_string());
-    e.daemon(
-        false,
-        &format!("issuer = \"{url}\"\n"),
-        std::slice::from_ref(&fast),
-    );
-    let me = e.identity().key;
+    e.daemon(false, "", &[]);
     let o = e.detached(&[EXE, "signin"], "");
-    assert!(o.status.success(), "{}{}", out(&o), err(&o));
-    assert_eq!(
-        out(&o),
-        "Confirm the code ABCD-EFGH in your browser: https://example.invalid/d?c=ABCD\n\
-         Signed in as Prasiddha. To join your network, run the line your inviter sent: lightbulb join '<ticket>' --name <your name>\n"
-    );
+    assert_eq!(o.status.code(), Some(2));
+    assert_eq!(err(&o), "Verified names are not available yet.\n");
     let id = identity_of(&e);
-    assert_eq!(
-        (&id["person_id"], &id["verified"], &id["name"]),
-        (&json!("user_1"), &json!(true), &json!("Prasiddha")),
-        "{id}"
-    );
-    // `device/start` is signed by this computer's key over {member_key, computer, at}.
-    let (path, start) = asked.lock().unwrap()[0].clone();
-    assert_eq!(path, "/connect/device/start");
-    assert_eq!(start["member_key"], me);
-    assert!(
-        (start["at"].as_i64().unwrap() - ipc::now() as i64).abs() < 60,
-        "{start}"
-    );
-    let sig = start["sig"].as_str().unwrap();
-    assert!(lightbulb::identity::verify(&me, &start, sig));
-    let mut forged = start.clone();
-    forged["member_key"] = json!(common::identity().key);
-    assert!(!lightbulb::identity::verify(&me, &forged, sig));
-    // A proof 21 hours old is renewed on the timer, signed by this computer over {proof, at}.
-    // (Another computer: the older proof would not replace this one's newer one.)
-    let e = Env::new();
-    e.daemon(false, &format!("issuer = \"{url}\"\n"), &[fast]);
-    let me = e.identity().key;
-    let old = computer_proof(
-        &me,
-        "user_1",
-        "Prasiddha",
-        None,
-        ipc::now() as i64 - 21 * 3600,
-    );
-    let r = person(&e, json!({"id": 1, "op": "identity.proof", "proof": old}));
-    assert_eq!(r["ok"], true, "{r}");
-    until(10, "renewed", || {
-        identity_of(&e)["expires_at"].as_i64().unwrap() > ipc::now() as i64 + 23 * 3600
-    });
-    let asked = asked.lock().unwrap();
-    let (path, body) = asked.iter().find(|(p, _)| p.ends_with("refresh")).unwrap();
-    assert_eq!(path, "/connect/proof/refresh");
-    assert_eq!(body["proof"], json!(old));
-    let sig = body["sig"].as_str().unwrap();
-    assert!(lightbulb::identity::verify(&me, body, sig));
-    assert_eq!(identity_of(&e)["person_id"], "user_1");
+    assert_eq!(id["verified"], false, "{id}");
+    // Hidden from the top-level help.
+    let o = e.detached(&[EXE, "--help"], "");
+    assert!(!out(&o).contains("signin"), "{}", out(&o));
+    assert!(out(&o).contains("\n  relay     "), "{}", out(&o));
 }
 
 #[test]
@@ -359,26 +233,6 @@ async fn workspace_member_joins_with_a_workspace_proof() {
             &json!("W1")
         )
     );
-    w.shutdown().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn workspace_member_renews_its_workspace_proof() {
-    let (url, _asked) = issuer();
-    let (f, _dir, t) = founder();
-    let home = tempfile::tempdir().unwrap();
-    let fast = ("LIGHTBULB_CONNECT_DEBUG_OUTBOX_S", "1".to_string());
-    let (w, wk) = workspace(home.path(), &f, &url, &[fast]).await;
-    let old = workspace_proof(&wk, "W1", WS, &["Friday"], ipc::now() as i64 - 21 * 3600);
-    let r = join_cloud(&w, &t, &old).await;
-    assert_eq!(r["state"], "admitted", "{r}");
-    until(10, "renewed on F", || {
-        let ms = members(&f);
-        let m = member(&ms, &wk);
-        m["proof"]["iat"].as_i64().unwrap() > ipc::now() as i64 - 60
-            && m["proof"]["kind"] == "workspace"
-    });
-    assert_eq!(member(&members(&f), &wk)["person_id"], "ws:W1");
     w.shutdown().await;
 }
 

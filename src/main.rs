@@ -17,7 +17,6 @@ Getting started:
   doctor    Check that everything is connected, and say how to fix what is not
   invite    Print the join line that adds your other computer or a teammate
   join      Join the team a join line is for: join '<ticket>'
-  signin    Sign in to Lightbulb, so teammates see your verified name
   update    Install the latest release (or --version vX.Y.Z) and restart the background service
 
 Everyday:
@@ -36,6 +35,7 @@ Team:
   leave     Leave the team
   policy    Who may message your sessions without asking
   folder    Show or hide the sessions in a folder from your teammates: folder <path> on|off
+  relay     The relays used when no direct path exists; relay <url> sets yours
 
 Run lightbulb <command> --help for its options; lightbulb --version for the version.
 ";
@@ -144,7 +144,8 @@ enum Command {
         #[arg(long, hide = true)]
         proof: Option<String>,
     },
-    /// Sign in to Lightbulb in your browser, so teammates see your verified name.
+    /// Verified names are not available yet (they come with the issuer's real keys).
+    #[command(hide = true)]
     Signin,
     /// Install the latest release (or `--version`) over this one, then run its `setup`.
     Update {

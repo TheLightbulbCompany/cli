@@ -166,7 +166,7 @@ fn ask_ticket_admits_only_after_allow() {
             "Asking whoever sent the link to allow this computer… (they get a prompt; this waits up to 10 minutes)\n\
              Connected as bob (mbp). Team \"prasiddha\": 2 computers online.\n\
              Your agents here can now see and message the team's agents. Try: lightbulb who --all\n\
-             Until both computers sign in, your other computer counts as another person and its first message needs your Allow.\n"
+             Until verified names arrive, your other computer counts as another person and its first message needs your Allow.\n"
         );
     });
     converged(&a, &b, 2);

@@ -143,8 +143,8 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, caller: Caller) 
                 }),
             )
         }
-        // `relay.get {}` -> `{urls, source, error}`: the relays in effect and where they came
-        // from (`config`, `team`, `lightbulb` or `none`); the snapshot `status` reads too.
+        // `relay.get {}` -> `{urls, source}`: the relays in effect and where they came
+        // from (`config`, `team`, `default` or `none`); the snapshot `status` reads too.
         "relay.get" => Response::ok(id, json!(*daemon.peers.relays.lock().unwrap())),
         "relay.set" => relay_set(id, body, daemon, caller),
         // An agent fed a hostile sign-in must not move this computer into another person.
