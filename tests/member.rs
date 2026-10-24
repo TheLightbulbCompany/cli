@@ -632,6 +632,7 @@ async fn a_cloud_member_mints_no_person_link() {
     assert_eq!(r["error"], "unsupported", "{r}");
     ok(&sock, &token, "stop", json!({}));
     exits_zero(child);
+}
 
 /// The doorbell (E4): the member founds its own network and publishes `wake` from its
 /// sessions file; computer A ("mac"), admitted to it, dials it with a fake `curl` first on its
