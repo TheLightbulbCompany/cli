@@ -349,7 +349,11 @@ async fn a_skewed_peer_clock_sets_no_deadline_here() {
     let sent = common::count(&db, "SELECT sent_at FROM messages");
     let expires = common::count(&db, "SELECT expires_at FROM mailbox");
     assert!((t0..=secs()).contains(&sent), "{sent} vs {t0}");
-    assert_eq!(expires, sent + 86_400);
+    // Held: the expiry is stamped at Allow (holds.rs), `sent_at` at arrival — up to a second apart.
+    assert!(
+        (sent + 86_400..=sent + 86_400 + 5).contains(&expires),
+        "{expires} vs {sent}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
