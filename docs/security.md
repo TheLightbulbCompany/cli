@@ -30,6 +30,13 @@ not expired.
 In a flat network any computer member can mint a one-time link and so add a cloud member
 that is not verified (shown "(not verified)"). Accepted: members are trusted.
 
+A member's person id (which person's computer it is) is its own key unless something vouches
+for another: a verified sign-in proof, or a workspace's cloud member admitting a computer
+through the one-time person link it made for that person. Only a cloud member's person link
+counts (the workspace instance that founded its network, or a cloud member with its workspace
+proof); one signed by any other member is dropped, so no member can admit a key as someone
+else's computer.
+
 ### Invite codes
 
 `lightbulb invite` also prints a four-word code (EFF short wordlist, about 41 bits). The code
@@ -37,7 +44,9 @@ is a convenience; the full line or link is the strongest path. While the inviter
 runs, a second endpoint whose key is derived from the code (Argon2id, 64 MiB, 3 passes, so
 each guess is costly) serves the full invite once. It closes after the first hand-off, after 5
 bad callers, after 10 minutes, or when the invite expires, and nothing listens when no code
-invite is live. A join by code always needs the inviter's Allow, even for an open link. The
+invite is live. The code never serves the printed invite: it serves a fresh one-time invite
+made for it alone, which asks the inviter, so a join by code always needs the inviter's Allow,
+even when the printed link is open or reusable. The
 code is never logged, but it appears in shell history and `ps` on the joiner's computer; it
 is dead once used or after 10 minutes. 5 junk connections can close a live code (denial of
 service only; fall back to the full line).
@@ -157,14 +166,20 @@ conversations, only the messages sent to them. Hide a folder with `lightbulb fol
 
 ## Telemetry and network requests
 
-Lightbulb sends anonymous usage counts (see "Usage counts" in the README; off with `lightbulb telemetry off`). It sends no crash reports and no message content.
+Lightbulb sends anonymous usage counts (see "Usage counts" in the README; off with `lightbulb telemetry off`, or `DO_NOT_TRACK=1` / `LIGHTBULB_NO_TELEMETRY=1`, which always win). It sends no crash reports and no message content. The first `setup` sends one `cli_installed` event before it prints the opt-out notice; set one of those variables before installing to send nothing at all.
 
 Apart from those counts, the engine makes no network call to Lightbulb: no relay list, no sign-in. It talks
 only to your teammates' computers and, when no direct path exists, to the relays (the iroh
 project's public relays unless you or your team set one).
 
-The install script, `npm install` and `lightbulb update` (when you run it) download the release
-from GitHub.
+The install script, `npm install`, `lightbulb update` and the daemon's daily update check
+download the release from GitHub. An update checks the tarball's SHA-256 against the `.sha256`
+file of the same GitHub release: that proves the download is intact, with the same trust as
+the install script (whoever controls the release controls both). On macOS an update also
+requires the new binary to be signed with Lightbulb's Developer ID (team `WZX4U3C22Y`); on
+Linux the checksum is the only check. An update never edits your shell profile: only `setup`
+run by you at a terminal adds `~/.local/bin` to your PATH, and never through a symlinked
+profile.
 
 ## Reporting a vulnerability
 
