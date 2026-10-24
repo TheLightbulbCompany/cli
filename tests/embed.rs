@@ -212,8 +212,11 @@ async fn person_only_ops_are_refused_in_process() {
     for (op, body) in [
         ("team.remove", json!({"member": x})),
         ("team.admin", json!({"member": x})),
-        ("hold.answer", json!({"hold": "H1", "verdict": "allow"})),
-        ("hold.get", json!({"hold": "H1"})),
+        // `holds`, `hold.get` and `hold.answer` (with `decided_by`) are the bridge's.
+        (
+            "hold.file",
+            json!({"kind": "permission", "session": "x", "prompt": "p"}),
+        ),
         ("policy.set", json!({"person_id": x, "value": "accept"})),
         ("share.grant", json!({"session": "x", "to": x})),
     ] {

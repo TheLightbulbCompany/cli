@@ -161,9 +161,9 @@ impl Caller {
     }
 }
 
-/// What an instance does not do: it mints no link, its settings are its `EmbedOpts`, it asks
-/// no one (`ui.claim`), and it stops by `Instance::shutdown`.
-const NOT_ON_AN_INSTANCE: [&str; 4] = ["team.invite", "reload", "ui.claim", "shutdown"];
+/// What an instance does not do: it mints no link but a person one (`net_ops`), its settings
+/// are its `EmbedOpts`, it asks no one (`ui.claim`), and it stops by `Instance::shutdown`.
+const NOT_ON_AN_INSTANCE: [&str; 3] = ["reload", "ui.claim", "shutdown"];
 
 /// The fields of an `inbox` record an agent (MCP `check_inbox`) or an instance's caller is
 /// handed.

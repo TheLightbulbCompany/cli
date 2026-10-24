@@ -11,6 +11,7 @@ use crate::dialog;
 use crate::identity::{self, Identity};
 use crate::net::frames::{self, Frame};
 use crate::net::{self, JOIN_ALPN};
+use crate::policy;
 use crate::proof::{self, Proof, ProofKind};
 use crate::roster::{self, Collision, Entry, Kind, MemberKind, Role, Roster};
 use crate::store::{Join, Store};
@@ -308,10 +309,13 @@ fn open(d: &Daemon, req: &Request) -> Result<(i64, Option<Verdict>), &'static st
     if all >= LIMITS.0 || by_inviter >= LIMITS.1 || by_candidate >= LIMITS.2 {
         return Err(TOO_MANY);
     }
-    // A cloud candidate, and a person's new computer, always wait for an Allow.
-    let ask = req.ticket.mode != "open"
-        || req.kind == "cloud"
-        || same_person(&team.roster, req).is_some();
+    // A cloud candidate, and a person's new computer, always wait for an Allow; a `person`
+    // link of ours (a computer, `check`) never does. Another member's waits: any member may
+    // sign a non-`open` link, so its word admits no one here.
+    let ask = !own_person_link(d, req)
+        && (req.ticket.mode != "open"
+            || req.kind == "cloud"
+            || same_person(&team.roster, req).is_some());
     let n = store.put_join(&row(req, now)).map_err(fail)?;
     eprintln!("join: J{n} open for {}", net::short(&req.candidate));
     if ask {
@@ -320,6 +324,11 @@ fn open(d: &Daemon, req: &Request) -> Result<(i64, Option<Verdict>), &'static st
     let v = try_admit(d, &mut team, &store, n, req, once, now);
     close(&store, n, v);
     Ok((n, Some(v)))
+}
+
+/// Whether `req` comes with a `person` link this computer signed (`check` proved its link).
+fn own_person_link(d: &Daemon, req: &Request) -> bool {
+    req.ticket.mode == "person" && req.ticket.inviter == d.identity.key
 }
 
 /// `req`'s `join_requests` row, made at `now`.
@@ -365,6 +374,11 @@ fn check(
         "cloud" => true,
         _ => return Err(UNSUPPORTED),
     };
+    // A `person` link is for a person's computer.
+    let person_link = link.mode == "person";
+    if person_link && cloud {
+        return Err(UNSUPPORTED);
+    }
     // Decided from the proof, never from what the request says of itself; one that expired
     // while its dialog waited is not in force at the Allow.
     let c = match &req.claims {
@@ -400,7 +414,8 @@ fn check(
         None => {}
     }
     let mine = r.members.get(me);
-    if let Some(p) = same {
+    // Our `person` link is our word for the computer: no other computer of theirs asks.
+    if let Some(p) = same.filter(|_| !(person_link && link.signer == me)) {
         return match mine {
             Some(m) if m.kind == MemberKind::Computer && m.person_id == p => Ok(link.once),
             _ => Err(FORWARD),
@@ -424,7 +439,8 @@ pub fn fits(s: &str) -> bool {
         && s.chars().all(crate::label::printable)
 }
 
-/// Writes request `n`'s checked `admit`; for a `once` link, marks it used here.
+/// Writes request `n`'s checked `admit`; for a `once` link, marks it used here; for a `person`
+/// link of ours, accepts its person.
 fn try_admit(
     d: &Daemon,
     team: &mut TeamState,
@@ -454,6 +470,13 @@ fn try_admit(
     }
     if once {
         let _ = store.use_link(&req.ticket.ticket_id, &req.candidate);
+    }
+    // Our `person` link's person is accepted here from now on (`policy::decide`).
+    let person = req.ticket.person.as_deref();
+    if let Some(p) = person.filter(|_| own_person_link(d, req)) {
+        if let Err(e) = policy::set_person(store, p, policy::Verdict::Accept, "bridge", now) {
+            eprintln!("join: J{n}: {e}");
+        }
     }
     Ok(())
 }

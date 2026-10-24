@@ -545,13 +545,19 @@ pub fn on_dialog(d: &Arc<Daemon>, n: i64, button: &str) {
     }
 }
 
+/// An instance's word for a hold id it does not have (a computer's is `not_found`).
+pub const HOLD_NOT_FOUND: &str = "hold_not_found";
+
 /// The hold and policy ops: `holds`, `hold.get`, `hold.answer`, `hold.file`, `policy.get`,
-/// `policy.set` (all but `policy.get` person-only: previews are a teammate's text).
+/// `policy.set` (all but `policy.get` person-only: previews are a teammate's text). An
+/// instance's caller (the bridge, for the workspace's people) may run `holds`, `hold.get` and
+/// `hold.answer`, the last with `decided_by`, the person who answered.
 pub fn op(id: u64, op: &str, body: &Value, d: &Arc<Daemon>, caller: Caller) -> Response {
-    if op != "policy.get" && !caller.is_person() {
+    let instance = caller == Caller::Instance && matches!(op, "holds" | "hold.get" | "hold.answer");
+    if op != "policy.get" && !instance && !caller.is_person() {
         return refused(id, "not_a_person");
     }
-    match run(id, op, body, d) {
+    match run(id, op, body, d, instance) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("{op}: {e}");
@@ -560,8 +566,9 @@ pub fn op(id: u64, op: &str, body: &Value, d: &Arc<Daemon>, caller: Caller) -> R
     }
 }
 
-fn run(id: u64, op: &str, body: &Value, d: &Arc<Daemon>) -> Result<Response> {
+fn run(id: u64, op: &str, body: &Value, d: &Arc<Daemon>, instance: bool) -> Result<Response> {
     let me = &d.identity.key;
+    let missing = if instance { HOLD_NOT_FOUND } else { NOT_FOUND };
     let hold_id = body["hold"].as_str().and_then(|s| dialog::number(s, 'H'));
     Ok(match op {
         // `holds {}` -> `{holds: [{id, kind, target_session, from, label, verified, preview,
@@ -589,7 +596,7 @@ fn run(id: u64, op: &str, body: &Value, d: &Arc<Daemon>) -> Result<Response> {
             let team = d.team.lock().unwrap();
             let store = d.store.lock().unwrap();
             let Some(h) = hold_id.map(|n| get(&store, n)).transpose()?.flatten() else {
-                return Ok(Response::err(id, NOT_FOUND));
+                return Ok(Response::err(id, missing));
             };
             let birth = store
                 .session(&h.target_session)?
@@ -605,8 +612,14 @@ fn run(id: u64, op: &str, body: &Value, d: &Arc<Daemon>) -> Result<Response> {
             )
         }
         // `hold.answer {hold, verdict: allow|decline, scope?}` -> `{id, verdict, scope}`;
-        // `scope` is a `Scope` word or `always`.
+        // `scope` is a `Scope` word or `always`. On an instance also `decided_by`, recorded as
+        // the answer's `by` (a computer's is `local`).
         "hold.answer" => {
+            let (by, surface) = match body["decided_by"].as_str() {
+                _ if !instance => ("local", "cli"),
+                Some(p) if !p.is_empty() => (p, "bridge"),
+                _ => return Ok(Response::err(id, BAD_REQUEST)),
+            };
             let allow = match body["verdict"].as_str() {
                 Some(ALLOW) => true,
                 Some(DECLINE) => false,
@@ -618,13 +631,14 @@ fn run(id: u64, op: &str, body: &Value, d: &Arc<Daemon>) -> Result<Response> {
                 _ => return Ok(Response::err(id, BAD_REQUEST)),
             };
             let Some(n) = hold_id else {
-                return Ok(Response::err(id, NOT_FOUND));
+                return Ok(Response::err(id, missing));
             };
-            match answer_here(d, n, allow, scope, "local", "cli")? {
+            match answer_here(d, n, allow, scope, by, surface)? {
                 Ok(c) => Response::ok(
                     id,
                     json!({"id": c.hold.name(), "verdict": c.verdict(), "scope": c.scope}),
                 ),
+                Err(NOT_FOUND) => Response::err(id, missing),
                 Err(code) => {
                     let by = d.answered_by.lock().unwrap().get(&format!("H{n}")).copied();
                     Response::err_with(id, code, json!({ "answered_in": by }))

@@ -407,3 +407,208 @@ async fn a_delivered_record_left_unread_past_its_ttl_expires() {
     ok(&sock, &token, "stop", json!({}));
     exits_zero(child);
 }
+
+// ---- person invites (E8) ----------------------------------------------------------------
+
+/// `team.invite {mode: "person", for, name}` on the member: its answer.
+fn person_invite(sock: &Path, token: &str, person: &str, name: &str) -> Value {
+    let body = json!({"mode": "person", "for": person, "name": name});
+    line(sock, token, "team.invite", body)
+}
+
+/// The ticket inside a join line.
+fn ticket_of(join_line: &str) -> lightbulb::ticket::Ticket {
+    lightbulb::ticket::decode(join_line.split('\'').nth(1).unwrap()).unwrap()
+}
+
+/// `who` asks the member behind `sock` to join with `t`, signed in with `proof` if any: the
+/// decision's verdict and reason.
+async fn join(
+    sock: &Path,
+    token: &str,
+    t: &lightbulb::ticket::Ticket,
+    who: &Identity,
+    proof: Option<&str>,
+) -> (String, Option<String>) {
+    let key = ok(sock, token, "identity.get", json!({}))["member_key"].clone();
+    let port = ok(sock, token, "status", json!({}))["port"]
+        .as_u64()
+        .unwrap();
+    let key = iroh::PublicKey::from_bytes(
+        &lightbulb::identity::key_bytes(key.as_str().unwrap()).unwrap(),
+    )
+    .unwrap();
+    let addr =
+        iroh::EndpointAddr::new(key).with_ip_addr(format!("127.0.0.1:{port}").parse().unwrap());
+    let ep = common::endpoint(who).await;
+    let conn = ep.connect(addr, lightbulb::net::JOIN_ALPN).await.unwrap();
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    let req = lightbulb::admission::request(who, t, "prasiddha", "mbp", "computer", proof);
+    lightbulb::net::frames::write(&mut send, &req)
+        .await
+        .unwrap();
+    let f = tokio::time::timeout(
+        Duration::from_secs(10),
+        lightbulb::net::frames::read(&mut recv),
+    )
+    .await
+    .expect("a decision within 10 s")
+    .unwrap();
+    conn.close(VarInt::from_u32(0), b"");
+    match f {
+        Frame::JoinDecision {
+            verdict, reason, ..
+        } => (verdict, reason),
+        f => panic!("{f:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_person_link_admits_a_mac_without_an_allow() {
+    let dir = tempfile::tempdir().unwrap();
+    let (child, token, sock) = member(dir.path(), friday());
+    for bad in ["O'Brien", "a\nb", "tab\there"] {
+        let r = person_invite(&sock, &token, "user_x", bad);
+        assert_eq!(r["error"], "bad_request", "{bad:?}: {r}");
+    }
+    let r = line(
+        &sock,
+        &token,
+        "team.invite",
+        json!({"mode": "person", "name": "P"}),
+    );
+    assert_eq!(r["error"], "bad_request", "no `for`: {r}");
+    let r = person_invite(&sock, &token, "user_x", "Prasiddha");
+    let inv = &r["result"];
+    let join_line = inv["line"].as_str().unwrap();
+    let encoded = join_line.split('\'').nth(1).unwrap();
+    assert_eq!(
+        join_line,
+        format!("lightbulb join '{encoded}' --name 'Prasiddha'")
+    );
+    let expires = inv["expires_at"].as_i64().unwrap();
+    assert!((expires - common::now_s() - 86_400).abs() <= 5, "{inv}");
+    let t = ticket_of(join_line);
+    assert_eq!(t.person.as_deref(), Some("user_x"));
+    let mac = identity();
+    assert_eq!(join(&sock, &token, &t, &mac, None).await.0, "allow");
+    let members = ok(&sock, &token, "team.get", json!({}))["members"].clone();
+    assert!(
+        members
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["key"] == mac.key),
+        "{members}"
+    );
+    // No J row waited for an Allow.
+    let requests = ok(&sock, &token, "team.join_requests", json!({}));
+    assert_eq!(requests["requests"], json!([]), "{requests}");
+    let db = dir.path().join("home/state.db");
+    let sql = "SELECT COUNT(*) FROM join_requests WHERE state = 'admitted'";
+    assert_eq!(common::count(&db, sql), 1);
+    ok(&sock, &token, "stop", json!({}));
+    exits_zero(child);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_person_link_is_single_use() {
+    let dir = tempfile::tempdir().unwrap();
+    let (child, token, sock) = member(dir.path(), friday());
+    let r = person_invite(&sock, &token, "user_x", "Prasiddha");
+    let t = ticket_of(r["result"]["line"].as_str().unwrap());
+    assert_eq!(join(&sock, &token, &t, &identity(), None).await.0, "allow");
+    let (verdict, reason) = join(&sock, &token, &t, &identity(), None).await;
+    assert_eq!(
+        (verdict.as_str(), reason.as_deref()),
+        ("refused", Some("bad_ticket"))
+    );
+    ok(&sock, &token, "stop", json!({}));
+    exits_zero(child);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_invited_persons_first_message_to_friday_is_not_held() {
+    let dir = tempfile::tempdir().unwrap();
+    let (child, token, sock) = member(dir.path(), friday());
+    let r = person_invite(&sock, &token, "user_x", "Prasiddha");
+    let t = ticket_of(r["result"]["line"].as_str().unwrap());
+    // The person's Mac, signed in as that Clerk user.
+    let mac = identity();
+    let proof = common::person_proof(&mac, "user_x", "Prasiddha", None);
+    assert_eq!(join(&sock, &token, &t, &mac, Some(&proof)).await.0, "allow");
+    let policy = ok(&sock, &token, "policy.get", json!({}));
+    assert_eq!(policy["people"]["user_x"], "accept", "{policy}");
+    let (mut p, _ep) = dial(&sock, &token, &mac).await;
+    let to = format!("{}/friday", short(&sock, &token));
+    assert_eq!(send(&mut p, &mac, &to, "hi friday").await.1, "stored");
+    ok(&sock, &token, "stop", json!({}));
+    exits_zero(child);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ask_and_open_links_still_refuse_on_an_instance() {
+    let dir = tempfile::tempdir().unwrap();
+    let (child, token, sock) = member(dir.path(), friday());
+    let invite = |mode: Value| line(&sock, &token, "team.invite", json!({ "mode": mode }));
+    // `ask` is no `team.invite` mode: every link is an ask link but `open` and `person`.
+    assert_eq!(invite(json!("ask"))["error"], "bad_request");
+    for mode in [
+        Value::Null,
+        json!("open"),
+        json!("reusable"),
+        json!("once"),
+        json!("new"),
+    ] {
+        assert_eq!(invite(mode.clone())["error"], "unsupported", "{mode}");
+    }
+    ok(&sock, &token, "stop", json!({}));
+    exits_zero(child);
+    // A person link is the member's alone: a computer refuses it.
+    let a = common::Env::new();
+    a.daemon(false, "", &[]);
+    let r = common::person(
+        &a,
+        json!({"id": 1, "op": "team.invite", "mode": "person", "for": "u", "name": "P"}),
+    );
+    assert_eq!(r["error"], "unsupported", "{r}");
+}
+
+/// Any member may sign a `person` link into the roster: only the member's own admits with no
+/// Allow.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_teammates_person_link_still_waits_for_an_allow() {
+    use lightbulb::ticket;
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let w = Identity::load_or_create(&home).unwrap();
+    let x = identity();
+    let g = lightbulb::daemon::net_ops::genesis(&w, NAME, NAME, NAME, 1);
+    let ax = common::admit(&w, &g, &x, "x", json!({}));
+    let before = roster::replay(&[g.clone(), ax.clone()]);
+    let hints = (String::new(), vec![]);
+    let (t, hashed) = ticket::mint(&x, &before, "person", true, common::now_s(), hints);
+    let t = ticket::for_person(&x, t, "user_x");
+    let body = ticket::link_body(&t, hashed.as_deref());
+    let link = Entry::signed(&x, vec![ax.hash()], Kind::Link, body, 3);
+    let store = Store::open(&home.join("state.db")).unwrap();
+    for e in [&g, &ax, &link] {
+        roster::accept(&store, e, 10).unwrap();
+    }
+    drop(store);
+    let (child, token, sock) = member(dir.path(), friday());
+    let mac = identity();
+    let (s, tok, tk) = (sock.clone(), token.clone(), t.clone());
+    let joining = tokio::spawn(async move { join(&s, &tok, &tk, &mac, None).await });
+    until(10, "the request waits for an Allow", || {
+        ok(&sock, &token, "team.join_requests", json!({}))["requests"]
+            .as_array()
+            .is_some_and(|r| r.len() == 1)
+    });
+    let policy = ok(&sock, &token, "policy.get", json!({}));
+    assert_eq!(policy["people"], json!({}), "{policy}");
+    joining.abort();
+    ok(&sock, &token, "stop", json!({}));
+    exits_zero(child);
+}

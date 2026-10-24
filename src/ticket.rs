@@ -24,7 +24,7 @@ pub struct Ticket {
     pub ticket_id: String,
     pub team_id: String,
     pub secret: String,
-    /// `ask` or `open`.
+    /// `ask`, `open` or `person` (a member's link for one person's computer).
     pub mode: String,
     pub inviter: String,
     pub relay_hint: String,
@@ -34,6 +34,10 @@ pub struct Ticket {
     pub addrs: Vec<String>,
     pub members: Vec<String>,
     pub expires_at: i64,
+    /// A `person` link's person (their sign-in id): the member accepts their messages once
+    /// the link admits their computer. Absent from other tickets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub person: Option<String>,
     pub sig: String,
 }
 
@@ -99,8 +103,16 @@ pub fn sign(
         addrs,
         members,
         expires_at,
+        person: None,
         sig: String::new(),
     };
+    t.sig = id.sign(&value(&t));
+    t
+}
+
+/// `t` for `person`, signed again by `id`.
+pub fn for_person(id: &Identity, mut t: Ticket, person: &str) -> Ticket {
+    t.person = Some(person.into());
     t.sig = id.sign(&value(&t));
     t
 }
@@ -169,6 +181,11 @@ pub fn line(t: &Ticket) -> String {
 /// The join line for an `encode`d ticket: the command the person runs.
 pub fn join_line(encoded: &str) -> String {
     format!("{COMMAND}{encoded}{NAME}")
+}
+
+/// A `person` link's join line, `name` filled in (the caller keeps `'` out of it).
+pub fn person_line(encoded: &str, name: &str) -> String {
+    format!("{COMMAND}{encoded}' --name '{name}'")
 }
 
 /// The link the Lightbulb app opens, for an `encode`d ticket.
