@@ -88,7 +88,7 @@ pub fn sign(
     expires_at: i64,
     (relay_hint, addrs): (String, Vec<String>),
 ) -> Ticket {
-    // The inviter first, then the founder and admins, by key.
+    // The inviter first, then the founder, by key.
     let mut members = vec![id.key.clone()];
     for m in roster.members.values().filter(|m| m.role != Role::Member) {
         if !members.contains(&m.key) {

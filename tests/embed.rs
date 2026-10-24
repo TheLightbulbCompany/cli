@@ -211,7 +211,6 @@ async fn person_only_ops_are_refused_in_process() {
     let x = identity().key;
     for (op, body) in [
         ("team.remove", json!({"member": x})),
-        ("team.admin", json!({"member": x})),
         // `holds`, `hold.get` and `hold.answer` (with `decided_by`) are the bridge's.
         (
             "hold.file",

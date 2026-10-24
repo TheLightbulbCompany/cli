@@ -424,7 +424,7 @@ fn check(
         };
     }
     let authorised = mine.is_some_and(|m| {
-        m.kind == MemberKind::Computer && (m.role != Role::Member || (link.signer == me && !cloud))
+        m.kind == MemberKind::Computer && (m.role == Role::Founder || link.signer == me)
     });
     if !authorised {
         return Err(net_ops::NOT_ADMIN);

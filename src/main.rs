@@ -30,7 +30,6 @@ Everyday:
 
 Team:
   team      The team and its computers
-  admin     Make a member an admin (or with --founder, the founder)
   remove    Remove a member
   leave     Leave the team
   policy    Who may message your sessions without asking
@@ -113,19 +112,13 @@ enum Command {
         /// An invite for one join, valid 24 hours.
         #[arg(long, conflicts_with = "open")]
         once: bool,
-        /// An invite whose joins need no Allow (founder and admins).
+        /// An invite whose joins need no Allow.
         #[arg(long)]
         open: bool,
     },
     /// Show the team and its members.
     Team,
-    /// Make a member an admin (founder only), or with --founder the founder in your place.
-    Admin {
-        name: String,
-        #[arg(long)]
-        founder: bool,
-    },
-    /// Remove a member (founder and admins); the invite is replaced.
+    /// Remove a member; the invite is replaced.
     Remove { name: String },
     /// Leave the team; this computer is on its own network again.
     Leave,
@@ -176,14 +169,13 @@ enum Command {
         #[arg(value_parser = ["on", "off"])]
         state: String,
     },
-    /// The relays this computer uses (with a URL, sets yours; from the founder or an admin,
-    /// the team's too). Relays carry encrypted traffic only, when no direct path exists.
+    /// The relays this computer uses (with a URL, sets yours and the team's too). Relays carry encrypted traffic only, when no direct path exists.
     Relay {
         url: Option<String>,
         /// Clear the relay you set.
         #[arg(long, conflicts_with = "url")]
         clear: bool,
-        /// Only this computer, not the team (founder and admins set the team's by default).
+        /// Only this computer, not the team (otherwise the team's too).
         #[arg(long)]
         local: bool,
     },
@@ -304,7 +296,6 @@ fn run() -> lightbulb::Result<()> {
             _ => Invite::Reusable,
         })?),
         Command::Team => exit(cli::team()?),
-        Command::Admin { name, founder } => exit(cli::admin(&name, founder)?),
         Command::Remove { name } => exit(cli::remove(&name)?),
         Command::Leave => exit(cli::leave()?),
         Command::Join {

@@ -16,9 +16,7 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 pub const NOT_ADMIN: &str = "not_admin";
-pub const NOT_FOUNDER: &str = "not_founder";
 pub const NOT_MEMBER: &str = "not_member";
-pub const FOUNDER_MUST_TRANSFER: &str = "founder_must_transfer";
 
 /// `team.invite`'s `mode`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,30 +49,23 @@ impl Invite {
     }
 }
 
-/// Who may run a team op: a person at the socket (not an agent), and at least `min_role`
-/// (`None`: anyone, even a computer the team removed).
+/// Who may run a team op: a person at the socket (not an agent) when `person_only`, and a
+/// member of the network when `member` (else even a computer the team removed).
 struct Gate {
     person_only: bool,
-    min_role: Option<Role>,
+    member: bool,
 }
 
 fn gate(op: &str, invite: Invite) -> Gate {
-    let (person_only, min_role) = match op {
-        "team.remove" => (true, Some(Role::Admin)),
-        "team.admin" => (true, Some(Role::Founder)),
-        "team.admit" => (true, None),
-        "team.invite" if invite == Invite::Open => (true, Some(Role::Admin)),
-        "team.invite" => (false, Some(Role::Member)),
-        _ => (false, None),
-    };
     Gate {
-        person_only,
-        min_role,
+        person_only: matches!(op, "team.remove" | "team.admit")
+            || (op == "team.invite" && invite == Invite::Open),
+        member: matches!(op, "team.remove" | "team.invite"),
     }
 }
 
 pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, caller: Caller) -> Response {
-    // Retired: a cloud member is removed by an admin like any member.
+    // Retired: a cloud member is removed like any member.
     if op == "team.unlink" {
         return Response::err(id, UNSUPPORTED);
     }
@@ -110,7 +101,7 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, caller: Caller) 
             store: &store,
             now: super::ipc::now() as i64,
         };
-        return match ops.run(op, body, invite, gate.min_role) {
+        return match ops.run(op, body, invite, gate.member) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("{op}: {e}");
@@ -235,7 +226,7 @@ pub fn reload(daemon: &Daemon) -> crate::Result<()> {
 }
 
 /// `relay.set {url, local}` -> `{team}`: writes `config.toml: relay` (an empty or missing
-/// `url` clears it); from the founder or an admin, unless `local`, also the roster's
+/// `url` clears it); from a member, unless `local`, also the roster's
 /// `meta {relay}`, so the whole team adopts it (`team: true`). In effect before the answer.
 /// A person only: it moves where this computer's traffic goes.
 fn relay_set(id: u64, body: &Value, daemon: &Daemon, caller: Caller) -> Response {
@@ -249,8 +240,8 @@ fn relay_set(id: u64, body: &Value, daemon: &Daemon, caller: Caller) -> Response
     let mut team = daemon.team.lock().unwrap();
     let store = daemon.store.lock().unwrap();
     let me = &daemon.identity.key;
-    let role = team.roster.members.get(me).map(|m| m.role);
-    let elevated = role >= Some(Role::Admin) && body["local"] != true;
+    let member = team.roster.members.contains_key(me);
+    let elevated = member && body["local"] != true;
     match set_relay(daemon, &mut team, &store, url, elevated) {
         Ok(()) => {
             daemon.peers.relays_changed(&team);
@@ -287,8 +278,7 @@ const TELL_WAIT: Duration = Duration::from_secs(5);
 /// `team.leave {}` -> `{name, told}`: writes this computer's `leave` entry and sends it to the
 /// online members, waiting up to 5 s for one to take it (it then drops the connection, as to
 /// any computer no longer a member); `told` is false when none did. Then it forgets the team
-/// and starts this computer's solo network. A founder with other computers in the team and
-/// no admin must transfer first. `person`: a person asked (an embedded instance's caller
+/// and starts this computer's solo network. `person`: a person asked (an embedded instance's caller
 /// counts as one: the bridge acts for a workspace admin who confirmed in the app).
 pub async fn leave(id: u64, daemon: &Daemon, person: bool) -> Response {
     if !person {
@@ -300,15 +290,6 @@ pub async fn leave(id: u64, daemon: &Daemon, person: bool) -> Response {
         let store = daemon.store.lock().unwrap();
         let r = &team.roster;
         let role = r.members.get(&me).map(|m| m.role);
-        // Cloud members (a person's bridge) do not keep the founder in.
-        let others = r
-            .members
-            .values()
-            .any(|m| m.key != me && m.kind == MemberKind::Computer);
-        let admin = r.members.values().any(|m| m.role == Role::Admin);
-        if role == Some(Role::Founder) && others && !admin {
-            return Response::err(id, FOUNDER_MUST_TRANSFER);
-        }
         // Alone (or already removed), there is no one to tell.
         let tell = role.is_some() && !r.is_solo(&me);
         let (name, root_at) = (r.team_name.clone(), r.created_at);
@@ -586,29 +567,15 @@ impl TeamOps<'_> {
         op: &str,
         body: &Value,
         invite: Invite,
-        min_role: Option<Role>,
+        member: bool,
     ) -> crate::Result<Response> {
         let id = self.id;
         let identity = &self.daemon.identity;
         let me_key = identity.key.clone();
         let r = &self.team.roster;
-        // `None` once this computer is no longer in the roster (removed by someone else).
-        let role = r.members.get(&me_key).map(|m| m.role);
-        // Membership first: a computer the team no longer holds is `not_member` for any op
-        // with a minimum role.
-        if min_role.is_some() && role.is_none() {
+        // Membership first: a computer the team no longer holds is `not_member`.
+        if member && !r.members.contains_key(&me_key) {
             return Ok(Response::err(id, NOT_MEMBER));
-        }
-        if role < min_role {
-            return Ok(match min_role {
-                Some(Role::Founder) => Response::err(id, NOT_FOUNDER),
-                Some(Role::Admin) => Response::err_with(
-                    id,
-                    NOT_ADMIN,
-                    json!({"founder": r.founder().map(|m| &m.name)}),
-                ),
-                _ => Response::err(id, NOT_MEMBER),
-            });
         }
         let target = || {
             let who = body["member"].as_str()?;
@@ -702,31 +669,13 @@ impl TeamOps<'_> {
                         "ticket": s, "expires_at": t.expires_at, "replaced": replaced}),
                 )
             }
-            // `team.admin {member, founder}` -> `{member, name}`: an admin, or (`founder`) the
-            // founder in our place.
-            "team.admin" => {
-                let Some(t) = target() else {
-                    return Ok(Response::err(id, NOT_FOUND));
-                };
-                // A cloud member never governs.
-                if t.key == me_key || t.kind == MemberKind::Cloud {
-                    return Ok(Response::err(id, BAD_REQUEST));
-                }
-                let kind = if body["founder"] == true {
-                    Kind::Transfer
-                } else {
-                    Kind::Admin
-                };
-                self.write(kind, json!({"member": t.key}))?;
-                Response::ok(id, json!({"member": t.key, "name": t.name}))
-            }
             // `team.remove {member}` -> `{name, line}`: the removal ends every live link, so a
             // new one follows it.
             "team.remove" => {
                 let Some(t) = target() else {
                     return Ok(Response::err(id, NOT_FOUND));
                 };
-                if t.key == me_key || t.role == Role::Founder {
+                if t.key == me_key || (t.role == Role::Founder && t.kind == MemberKind::Cloud) {
                     return Ok(Response::err(id, BAD_REQUEST));
                 }
                 self.write(Kind::Remove, json!({"member": t.key}))?;

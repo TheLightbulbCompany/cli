@@ -120,16 +120,10 @@ fn invite_reprints_the_same_link_until_new() {
 }
 
 #[test]
-fn non_admin_remove_prints_exact_text() {
+fn a_plain_member_opens_links_and_removes_the_founder() {
     // A team founded elsewhere by aden, which admitted this computer as a plain member.
     let e = Env::new();
     e.seed(true);
-    let o = e.run(&["remove", "aden"]);
-    assert_eq!(o.status.code(), Some(1));
-    assert_eq!(
-        err(&o).trim(),
-        "Only the founder and admins can remove computers. Ask aden."
-    );
     let team = out(&e.run(&["team"]));
     assert!(
         team.starts_with("Team \"acme\" — 2 computers\n  You ("),
@@ -141,22 +135,21 @@ fn non_admin_remove_prints_exact_text() {
         "{team}"
     );
     assert_eq!(e.entries().len(), 2, "no genesis over a joined team");
-    // An open link is for the founder and admins.
+    // Every network is flat: any member makes an open link and removes another member.
     let r = common::person(&e, json!({"id": 1, "op": "team.invite", "mode": "open"}));
-    assert_eq!(r["error"], "not_admin", "{r}");
-    assert_eq!(e.entries().len(), 2);
+    assert_eq!(r["ok"], true, "{r}");
+    let o = e.run(&["remove", "aden"]);
+    assert!(o.status.success(), "{}", err(&o));
 }
 
 #[test]
-fn remove_admin_and_leave_from_an_agent_shell_are_refused() {
+fn remove_and_leave_from_an_agent_shell_are_refused() {
     let e = Env::pinned();
     e.seed(false);
     assert!(e.run(&["team"]).status.success()); // starts the pinned daemon
     let before = e.entries();
     for req in [
         json!({"op": "team.remove", "member": "aden"}),
-        json!({"op": "team.admin", "member": "aden", "founder": false}),
-        json!({"op": "team.admin", "member": "aden", "founder": true}),
         json!({"op": "team.leave"}),
         json!({"op": "team.invite", "mode": "open"}),
     ] {
@@ -212,21 +205,10 @@ fn leave_locally_recreates_a_solo_network() {
 }
 
 #[test]
-fn founder_admin_remove_and_leave_texts() {
+fn remove_text() {
     // This computer founded "acme" and admitted aden.
     let e = Env::new();
     e.seed(false);
-
-    let o = e.detached(&[EXE, "leave"], "y\n");
-    assert_eq!(o.status.code(), Some(1));
-    assert_eq!(
-        err(&o).trim(),
-        "You are the founder. Name a new founder first: lightbulb admin <name> --founder"
-    );
-    assert_eq!(
-        out(&e.run(&["admin", "ADEN"])),
-        "aden can now remove members.\n"
-    );
     let old = printed_link(&e.run(&["invite"]));
     let o = out(&e.run(&["remove", "aden"]));
     let line = o
@@ -263,9 +245,6 @@ fn founder_whose_only_other_member_is_cloud_can_leave() {
         10,
     )
     .unwrap();
-    // A cloud member can be neither admin nor founder.
-    let o = e.run(&["admin", "bridge"]);
-    assert_eq!(o.status.code(), Some(1), "{}", out(&o));
     let o = e.detached(&[EXE, "leave"], "y\n");
     assert!(o.status.success(), "{}", err(&o));
     assert_eq!(e.entries().len(), 1);

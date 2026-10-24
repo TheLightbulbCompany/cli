@@ -67,7 +67,6 @@ fn refusal(r: &Value) -> String {
     match code.unwrap_or("failed") {
         "not_member" => "This computer is not in the network.".into(),
         "not_a_person" => "Run this from your own terminal, not from an agent.".into(),
-        "not_admin" => "Only the founder and admins can do that.".into(),
         "name_taken" => "That name is taken by your other computer's session.".into(),
         c => format!("Lightbulb could not do that ({}).", c.replace('_', " ")),
     }
@@ -523,8 +522,7 @@ pub fn invite(mode: Invite) -> Result<i32> {
     }
     let r = connect()?.call("team.invite", json!({ "mode": mode }))?;
     if r["ok"] != true {
-        let text = "Only the founder and admins can make an open link.".to_string();
-        return refuse(&r, &[("not_admin", text)]);
+        return refuse(&r, &[]);
     }
     let line = r["line"].as_str().unwrap_or_default();
     match mode {
@@ -924,40 +922,11 @@ pub fn team() -> Result<i32> {
     Ok(0)
 }
 
-/// `admin <name> [--founder]`.
-pub fn admin(name: &str, founder: bool) -> Result<i32> {
-    let r = connect()?.call("team.admin", json!({ "member": name, "founder": founder }))?;
-    if r["ok"] != true {
-        let texts = [
-            (
-                "not_founder",
-                "Only the founder can make admins.".to_string(),
-            ),
-            ("not_found", format!("No member called {name}.")),
-        ];
-        return refuse(&r, &texts);
-    }
-    let n = r["name"].as_str().unwrap_or(name);
-    if founder {
-        println!("{n} is now the founder.");
-    } else {
-        println!("{n} can now remove members.");
-    }
-    Ok(0)
-}
-
 /// `remove <name>`.
 pub fn remove(name: &str) -> Result<i32> {
     let r = connect()?.call("team.remove", json!({ "member": name }))?;
     if r["ok"] != true {
-        let ask = r["founder"].as_str().unwrap_or("the founder");
-        let texts = [
-            (
-                "not_admin",
-                format!("Only the founder and admins can remove computers. Ask {ask}."),
-            ),
-            ("not_found", format!("No member called {name}.")),
-        ];
+        let texts = [("not_found", format!("No member called {name}."))];
         return refuse(&r, &texts);
     }
     let n = r["name"].as_str().unwrap_or(name);
@@ -1031,11 +1000,7 @@ pub fn leave() -> Result<i32> {
     }
     let r = conn.call("team.leave", json!({}))?;
     if r["ok"] != true {
-        let text = format!(
-            "You are the founder. Name a new founder first: {} admin <name> --founder",
-            command()
-        );
-        return refuse(&r, &[("founder_must_transfer", text)]);
+        return refuse(&r, &[]);
     }
     println!("Left \"{name}\". This computer is on its own network again.");
     if r["told"] == false {
@@ -1045,7 +1010,7 @@ pub fn leave() -> Result<i32> {
 }
 
 /// `relay [<url> | --clear] [--local]`: sets this computer's relay to `set` (`""` clears it),
-/// and from the founder or an admin the team's unless `local`; alone, prints the relays in
+/// and the team's unless `local`; alone, prints the relays in
 /// effect and where they come from.
 pub fn relay(set: Option<String>, local: bool) -> Result<i32> {
     let mut conn = connect()?;
