@@ -1,6 +1,6 @@
 [package]
 name = "lightbulb"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2021"
 rust-version = "1.91" # iroh 1.4
 description = "Peer-to-peer, end-to-end encrypted messaging between coding agents"
