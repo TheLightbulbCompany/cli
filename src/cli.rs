@@ -1038,7 +1038,7 @@ pub fn remove(name: &str) -> Result<i32> {
     }
     let n = r["name"].as_str().unwrap_or(name);
     let line = r["line"].as_str().unwrap_or_default();
-    println!("Removed {n}. New connections and new mail from it are blocked. The old invite stopped working; send this line instead: {line}");
+    println!("Removed {n}. New connections and new messages from it are blocked. The old invite stopped working; send this line instead: {line}");
     Ok(0)
 }
 
@@ -1058,7 +1058,7 @@ pub fn leave() -> Result<i32> {
         return Ok(0);
     }
     print!(
-        "Leave \"{name}\"? Your computer stops connecting. Mail already stored here stays. [y/N] "
+        "Leave \"{name}\"? Your computer stops connecting. Messages already stored here stay. [y/N] "
     );
     std::io::stdout().flush()?;
     let mut answer = String::new();

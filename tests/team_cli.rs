@@ -194,7 +194,7 @@ fn leave_locally_recreates_a_solo_network() {
     assert!(o.status.success(), "{}", err(&o));
     assert_eq!(
         out(&o),
-        "Leave \"prasiddha\"? Your computer stops connecting. Mail already stored here stays. [y/N] \
+        "Leave \"prasiddha\"? Your computer stops connecting. Messages already stored here stay. [y/N] \
          Left \"prasiddha\". This computer is on its own network again.\n"
     );
     assert_ne!(e.team_id(), id);
@@ -228,7 +228,7 @@ fn founder_admin_remove_and_leave_texts() {
     let o = out(&e.run(&["remove", "aden"]));
     let line = o
         .strip_prefix(
-            "Removed aden. New connections and new mail from it are blocked. The old invite stopped working; send this line instead: ",
+            "Removed aden. New connections and new messages from it are blocked. The old invite stopped working; send this line instead: ",
         )
         .unwrap_or_else(|| panic!("{o}"))
         .trim_end();
