@@ -215,6 +215,44 @@ fn forged_open_mode_is_refused() {
     assert_eq!((members(&a).len(), members(&b).len()), (1, 1));
 }
 
+/// A link's expiry is the inviter's own stamp, compared with the inviter's own clock when the
+/// request arrives: the joiner's clock is never read, so a joiner whose clock runs behind
+/// cannot use a link the inviter's clock says is over.
+#[test]
+fn an_expired_link_is_refused_by_the_inviters_clock() {
+    let (a, b) = (Env::new(), Env::new());
+    let ia = a.identity();
+    let now = common::now_s();
+    let g = lightbulb::daemon::net_ops::genesis(&ia, "prasiddha", "mac", "acme", now - 120);
+    let store = a.store();
+    roster::accept(&store, &g, now).unwrap();
+    let r = roster::replay(&roster::entries(&store).unwrap());
+    let id = format!("{}.{}", ia.short, common::ulid());
+    let t = ticket::sign(
+        &ia,
+        &r,
+        id,
+        "s3cret".into(),
+        "open",
+        now - 60,
+        (String::new(), vec![]),
+    );
+    let link = ticket::link_body(&t, None);
+    let entry = roster::Entry::signed(&ia, vec![g.hash()], roster::Kind::Link, link, now - 90);
+    roster::accept(&store, &entry, now).unwrap();
+    store
+        .put_link(&t.ticket_id, &t.secret, None, "open", t.expires_at)
+        .unwrap();
+    drop(store);
+    a.daemon(false, &computer("mac"), &[dialog("Allow")]);
+    b.daemon(false, &computer("mbp"), &[peers(&[&a])]);
+    refused(
+        &join(&b, &ticket::encode(&t), "carol", "computer"),
+        "expired_ticket",
+    );
+    assert_eq!(members(&a).len(), 1);
+}
+
 #[test]
 fn once_ticket_admits_once() {
     let (f, x, c1, c2) = (Env::new(), Env::new(), Env::new(), Env::new());

@@ -175,6 +175,29 @@ async fn relay_down_keeps_mail_queued() {
     assert_eq!(b.take_one(&sb)["text"], "later");
 }
 
+/// The relay going down takes nothing from two computers that also reach each other
+/// directly (one network): they stay online, and a message sent after the outage is stored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relay_down_leaves_the_direct_path_working() {
+    let (server, url) = relay_server(0).await;
+    let (a, b) = (Env::new(), Env::new());
+    seed_pair(&a, &b);
+    let cfg = format!("relay = \"{url}\"\n");
+    b.daemon(false, &cfg, &[]);
+    a.daemon(false, &cfg, &[peers(&[&b])]);
+    until(30, "A's relay is up", || a.status()["relay"] == "ok");
+    until(30, "a direct link", || a.status()["peers"]["direct"] == 1);
+
+    server.shutdown().await.unwrap();
+    until(30, "A sees the relay down", || {
+        a.status()["relay"] == "unreachable"
+    });
+    assert!(online(&a) && online(&b));
+    let (sa, sb) = (session(&a, "a1"), session(&b, "b1"));
+    a.send(&sa, &sb, "same network", "r1", None);
+    assert_eq!(b.take_one(&sb)["text"], "same network");
+}
+
 #[test]
 fn unsigned_or_partial_relay_list_is_refused() {
     let kp = minisign::KeyPair::generate_unencrypted_keypair().unwrap();

@@ -101,6 +101,23 @@ impl Net {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/hooks")
             .join(format!("{fixture}.json"));
+        let out = self.hook_raw(agent, event, &std::fs::read(path).unwrap(), pin);
+        assert!(
+            out.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    /// The hook with `stdin` as its payload; it must exit 0, whatever it was given.
+    fn hook_raw(
+        &self,
+        agent: &str,
+        event: &str,
+        stdin: &[u8],
+        pin: Option<&os::Process>,
+    ) -> std::process::Output {
         let mut cmd = Command::new(EXE);
         if let Some(p) = pin {
             cmd.env(
@@ -117,20 +134,10 @@ impl Net {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(&std::fs::read(path).unwrap())
-            .unwrap();
+        child.stdin.take().unwrap().write_all(stdin).unwrap();
         let out = child.wait_with_output().unwrap();
         assert!(out.status.success(), "a hook must always exit 0");
-        assert!(
-            out.stderr.is_empty(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        String::from_utf8(out.stdout).unwrap()
+        out
     }
 }
 
@@ -162,6 +169,50 @@ fn stop_hook_hands_waiting_mail_to_grok_as_block_decision() {
     assert_eq!(out, json!({"decision": "block", "reason": frame_of("r1")}));
     assert_eq!(net.receipt("r1"), "delivered");
     assert_eq!(net.session(&key).unwrap()["status"], "idle");
+}
+
+/// An agent that changes its hook format: whatever arrives on stdin that no agent's shape
+/// names a conversation in (not JSON, another type, renamed fields, an event name we do not
+/// know), the hook, run as that very agent, exits 0, prints nothing for the agent, registers
+/// and ends no session, and leaves the waiting message waiting.
+#[test]
+fn an_unknown_hook_payload_exits_0_and_changes_nothing() {
+    let net = Net::new();
+    net.hook("claude", "session-start", "claude-session-start");
+    let conv = "00000000-0000-4000-8000-0000000000c1";
+    let key = net.key("claude", conv);
+    net.send(&key, "body r1", "r1");
+    let me = os::process(std::process::id()).unwrap();
+    let unknown_event = json!({"hook_event_name": "SomethingNew", "session_id": conv});
+    let renamed = json!({"sessionUuid": conv, "event": "Stop", "schema": 2});
+    let wrong_types =
+        json!({"session_id": 5, "conversation_id": [conv], "sessionId": {"id": conv}});
+    let payloads = [
+        String::new(),
+        "not json".into(),
+        "null".into(),
+        "[1,2]".into(),
+        "{}".into(),
+        renamed.to_string(),
+        wrong_types.to_string(),
+    ];
+    for agent in ["claude", "codex", "cursor", "grok"] {
+        // Cursor also reads `session_id`: an unknown event name is only unknown to the two
+        // agents that name the event in the payload.
+        let extra = ["claude", "codex"]
+            .contains(&agent)
+            .then(|| unknown_event.to_string());
+        for event in lightbulb::hook::EVENTS {
+            for stdin in payloads.iter().chain(extra.as_ref()) {
+                let out = net.hook_raw(agent, event.arg(), stdin.as_bytes(), Some(&me));
+                assert!(out.stdout.is_empty(), "{agent} {} {stdin}", event.arg());
+            }
+        }
+    }
+    let sessions = net.call(json!({"id": 1, "op": "sessions"}))["sessions"].clone();
+    assert_eq!(sessions.as_array().map(Vec::len), Some(1), "{sessions}");
+    assert!(net.session(&key).is_some());
+    assert_eq!(net.receipt("r1"), "stored");
 }
 
 #[test]

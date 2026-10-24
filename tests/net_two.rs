@@ -183,6 +183,33 @@ async fn child_and_parent_in_separate_frames_converge() {
     assert_eq!(roster::entries(&b.store()).unwrap().len(), 4);
 }
 
+/// A member's connection is authenticated, but each roster entry it relays carries its own
+/// signature: one whose body was changed after signing, or whose `signer` names a member that
+/// did not sign it, is refused and never stored; the untouched entry is applied.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tampered_or_misattributed_roster_entries_are_refused() {
+    let (a, b) = (Env::new(), Env::new());
+    let [_, admit] = seed_pair(&a, &b);
+    let good = chain(&a.identity(), &admit, 1, 0, "good").remove(0);
+    b.daemon(false, "", &[]);
+
+    let ep = endpoint(&a.identity()).await;
+    let mut p = synced(&ep, &b, &admit).await;
+    let mut tampered = good.clone();
+    tampered.body["note"] = json!("forged");
+    let stranger = Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
+    let mut misattributed = chain(&stranger, &admit, 1, 0, "x").remove(0);
+    misattributed.signer = a.identity().key;
+    p.send(&roster_frame(vec![tampered, misattributed])).await;
+    p.send(&roster_frame(vec![good.clone()])).await;
+    until(2, "B applies the good entry", || {
+        heads(b.heads()) == vec![good.hash()]
+    });
+    assert_eq!(roster::entries(&b.store()).unwrap().len(), 3);
+    let log = std::fs::read_to_string(b.state.path().join("daemon.log")).unwrap();
+    assert_eq!(log.matches("refused a roster entry").count(), 2, "{log}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn waiting_entries_are_dropped_on_close() {
     let (a, b) = (Env::new(), Env::new());
