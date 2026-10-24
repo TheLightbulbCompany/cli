@@ -18,6 +18,7 @@ Getting started:
   invite    Print the join line that adds your other computer or a teammate
   join      Join the team a join line is for: join '<ticket>'
   signin    Sign in to Lightbulb, so teammates see your verified name
+  update    Install the latest release (or --version vX.Y.Z) and restart the background service
 
 Everyday:
   who       List the sessions here (who --all: your teammates' too)
@@ -145,6 +146,12 @@ enum Command {
     },
     /// Sign in to Lightbulb in your browser, so teammates see your verified name.
     Signin,
+    /// Install the latest release (or `--version`) over this one, then run its `setup`.
+    Update {
+        /// The release to install, like v0.2.2 (default: the latest).
+        #[arg(long)]
+        version: Option<String>,
+    },
     /// Allow a join request (`J<n>`) or a held message (`H<n>`).
     Approve {
         request: String,
@@ -285,6 +292,7 @@ fn run() -> lightbulb::Result<()> {
             proof,
         } => exit(cli::join(&link, name, &kind, proof)?),
         Command::Signin => exit(cli::signin()?),
+        Command::Update { version } => exit(cli::update(version)?),
         Command::Approve { request, always } => exit(cli::answer(&request, true, always)?),
         Command::Decline { request } => exit(cli::answer(&request, false, false)?),
         Command::Held => exit(cli::held()?),

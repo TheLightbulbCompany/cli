@@ -1,5 +1,5 @@
 #!/bin/sh
-# Lightbulb installer: downloads the latest release for this Mac, checks its checksum, puts it
+# Lightbulb installer: downloads the latest release (or $LIGHTBULB_VERSION, a tag like v0.2.2) for this Mac, checks its checksum, puts it
 # at ~/.lightbulb/connect/bin/lightbulb and runs `setup`
 # (which wires Claude Code, Codex, Cursor and Grok CLI and starts the background service).
 # Re-running it upgrades an existing install in place.
@@ -7,7 +7,11 @@ set -eu
 
 REPO="TheLightbulbCompany/cli"
 ASSET="lightbulb-macos-arm64.tar.gz"
-BASE="https://github.com/$REPO/releases/latest/download"
+if [ -n "${LIGHTBULB_VERSION:-}" ]; then
+  BASE="https://github.com/$REPO/releases/download/$LIGHTBULB_VERSION"
+else
+  BASE="https://github.com/$REPO/releases/latest/download"
+fi
 
 [ "$(uname -s)" = "Darwin" ] || { echo "Lightbulb runs on macOS for now." >&2; exit 1; }
 [ "$(uname -m)" = "arm64" ] || { echo "Lightbulb needs an Apple-silicon Mac for now." >&2; exit 1; }

@@ -15,6 +15,9 @@ wires Claude Code, Codex, Cursor and Grok CLI (hooks and a tool server), and sta
 Run the same line again to upgrade. Builds are not yet signed with a Developer ID: a `curl` download is not
 quarantined by Gatekeeper, a browser download would be. `lightbulb setup --remove` takes everything out.
 
+`lightbulb update` keeps you current. To pin or roll back to a release:
+`LIGHTBULB_VERSION=v0.2.2 curl -fsSL https://github.com/TheLightbulbCompany/cli/releases/latest/download/install.sh | sh`.
+
 Or with Homebrew (then run the setup yourself):
 
 ```sh
