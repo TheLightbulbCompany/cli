@@ -33,7 +33,7 @@ fn toml_at(home: &Path, rel: &str) -> toml_edit::DocumentMut {
 }
 
 fn setup(home: &Path, remove: bool) -> Report {
-    run(home, Path::new(EXE), Some("lightbulb"), remove)
+    run(home, Path::new(EXE), None, remove)
 }
 
 fn agent<'a>(r: &'a Report, name: &str) -> &'a AgentReport {
@@ -93,7 +93,7 @@ fn setup_writes_claude_hooks_and_mcp_and_backs_up_once() {
     assert_eq!(s["hooks"]["Stop"].as_array().unwrap().len(), 3);
     let c = json_at(h, ".claude.json");
     assert_eq!(
-        c["mcpServers"]["lightbulb"],
+        c["mcpServers"]["lightbulb-network"],
         json!({"command": EXE, "args": ["mcp"]})
     );
     assert_eq!(c["mcpServers"]["other"], json!({"command": "x"}));
@@ -147,7 +147,7 @@ fn setup_writes_codex_hooks_and_mcp_and_backs_up_once() {
             Some(codex::trust_hash(&label, &command, timeout, false).as_str())
         );
     }
-    let server = &toml["mcp_servers"]["lightbulb"];
+    let server = &toml["mcp_servers"]["lightbulb-network"];
     assert_eq!(server["command"].as_str(), Some(EXE));
     assert_eq!(
         server["args"]
@@ -200,13 +200,13 @@ fn setup_writes_cursor_hooks_and_mcp_and_backs_up_once() {
     }
     let m = json_at(h, ".cursor/mcp.json");
     assert_eq!(
-        m["mcpServers"]["lightbulb"],
+        m["mcpServers"]["lightbulb-network"],
         json!({"type": "stdio", "command": EXE, "args": ["mcp"]})
     );
     assert_eq!(m["mcpServers"]["filesystem"], json!({"command": "npx"}));
     assert_eq!(
         json_at(h, ".cursor/cli-config.json")["permissions"]["allow"],
-        json!(["Shell(ls)", "Mcp(lightbulb:*)"])
+        json!(["Shell(ls)", "Mcp(lightbulb-network:*)"])
     );
 
     assert!(agent(&setup(h, false), "cursor").wrote.is_empty());
@@ -249,7 +249,7 @@ fn setup_writes_grok_hooks_and_mcp_and_backs_up_once() {
         assert_eq!(hooks["hooks"][event], json!([ours]), "{event}");
     }
     let toml = toml_at(h, ".grok/config.toml");
-    let server = &toml["mcp_servers"]["lightbulb"];
+    let server = &toml["mcp_servers"]["lightbulb-network"];
     assert_eq!(server["command"].as_str(), Some(EXE));
     assert_eq!(server["enabled"].as_bool(), Some(true));
     let allow: Vec<_> = toml["permission"]["allow"]
@@ -258,7 +258,7 @@ fn setup_writes_grok_hooks_and_mcp_and_backs_up_once() {
         .iter()
         .map(|v| v.as_str().unwrap().to_string())
         .collect();
-    assert_eq!(allow, ["Bash(ls)", "MCPTool(lightbulb__*)"]);
+    assert_eq!(allow, ["Bash(ls)", "MCPTool(lightbulb-network__*)"]);
     assert_eq!(toml["cli"]["installer"].as_str(), Some("npm"));
 
     assert!(agent(&setup(h, false), "grok").wrote.is_empty());
@@ -324,9 +324,9 @@ fn remove_takes_only_our_entries() {
 fn any_lightbulb_mcp_entry_is_replaced_by_ours_and_a_foreign_one_survives_remove() {
     let home = tempfile::tempdir().unwrap();
     let h = home.path();
-    let other = json!({"mcpServers": {"lightbulb": {"command": APP, "args": ["serve"], "env": {"A": "1"}}}});
+    let other = json!({"mcpServers": {"lightbulb-network": {"command": APP, "args": ["serve"], "env": {"A": "1"}}}});
     let other_toml = format!(
-        "[mcp_servers.lightbulb]\ncommand = \"{APP}\"\nargs = [\"serve\"]\nstartup_timeout_sec = 30\n"
+        "[mcp_servers.lightbulb-network]\ncommand = \"{APP}\"\nargs = [\"serve\"]\nstartup_timeout_sec = 30\n"
     );
     let put_all = || {
         put(h, ".claude.json", &other.to_string());
@@ -340,20 +340,24 @@ fn any_lightbulb_mcp_entry_is_replaced_by_ours_and_a_foreign_one_survives_remove
     for name in ["claude", "codex", "cursor", "grok"] {
         assert_eq!(
             agent(&r, name).state,
-            State::Connected("lightbulb".into()),
+            State::Connected("lightbulb-network".into()),
             "{name}"
         );
-        assert_eq!(tools(h, name).as_deref(), Some("lightbulb"), "{name}");
+        assert_eq!(
+            tools(h, name).as_deref(),
+            Some("lightbulb-network"),
+            "{name}"
+        );
     }
     for rel in [".claude.json", ".cursor/mcp.json"] {
-        let server = &json_at(h, rel)["mcpServers"]["lightbulb"];
+        let server = &json_at(h, rel)["mcpServers"]["lightbulb-network"];
         assert_eq!(server["command"], EXE, "{rel}");
         assert_eq!(server["args"], json!(["mcp"]), "{rel}");
         assert!(server.get("env").is_none(), "{rel}");
     }
     for rel in [".codex/config.toml", ".grok/config.toml"] {
         let doc = toml_at(h, rel);
-        let server = &doc["mcp_servers"]["lightbulb"];
+        let server = &doc["mcp_servers"]["lightbulb-network"];
         assert_eq!(server["command"].as_str(), Some(EXE), "{rel}");
         assert!(server.get("startup_timeout_sec").is_none(), "{rel}");
     }
@@ -391,7 +395,7 @@ fn hook_command_quotes_the_executable() {
     let ctx = Ctx {
         home: Path::new("/"),
         exe: "/opt/it's/lightbulb",
-        server: "lightbulb",
+        server: "lightbulb-network",
         remove: false,
     };
     let c = ctx.hook_command("grok", "stop");
@@ -592,15 +596,16 @@ fn an_http_tool_server_under_the_name_is_replaced() {
     let home = tempfile::tempdir().unwrap();
     let h = home.path();
     fs::create_dir(h.join(".claude")).unwrap();
-    let other = json!({"mcpServers": {"lightbulb": {"type": "http", "url": "https://x/mcp"}}});
+    let other =
+        json!({"mcpServers": {"lightbulb-network": {"type": "http", "url": "https://x/mcp"}}});
     put(h, ".claude.json", &other.to_string());
     let r = run(h, Path::new(EXE), None, false);
     assert_eq!(
         agent(&r, "claude").state,
-        State::Connected("lightbulb".into())
+        State::Connected("lightbulb-network".into())
     );
     assert_eq!(
-        json_at(h, ".claude.json")["mcpServers"]["lightbulb"],
+        json_at(h, ".claude.json")["mcpServers"]["lightbulb-network"],
         json!({"command": EXE, "args": ["mcp"]})
     );
 }
@@ -625,4 +630,46 @@ fn the_skill_is_installed_for_claude_and_codex_and_removed_with_setup() {
     assert!(!h.join(".claude/skills/lightbulb-network").exists());
     assert!(!h.join(".codex/skills/lightbulb-network").exists());
     assert_eq!(get(h, ".claude/skills/other/SKILL.md"), "mine");
+}
+
+#[test]
+fn our_old_lightbulb_entry_moves_to_the_new_name_and_the_apps_stays() {
+    let home = tempfile::tempdir().unwrap();
+    let h = home.path();
+    fs::create_dir(h.join(".claude")).unwrap();
+    // Ours under the old name, beside nothing; then the desktop app's under the old name.
+    for old_cmd in [EXE, APP] {
+        put(
+            h,
+            ".claude.json",
+            &json!({"mcpServers": {"lightbulb": {"command": old_cmd, "args": ["x"]}}}).to_string(),
+        );
+        put(
+            h,
+            ".codex/config.toml",
+            &format!("[mcp_servers.lightbulb]\ncommand = \"{old_cmd}\"\nargs = [\"x\"]\n"),
+        );
+        run(h, Path::new(EXE), None, false);
+        let claude = json_at(h, ".claude.json");
+        let codex = toml_at(h, ".codex/config.toml");
+        assert_eq!(claude["mcpServers"]["lightbulb-network"]["command"], EXE);
+        assert_eq!(
+            codex["mcp_servers"]["lightbulb-network"]["command"].as_str(),
+            Some(EXE)
+        );
+        let kept = old_cmd == APP;
+        assert_eq!(
+            !claude["mcpServers"]["lightbulb"].is_null(),
+            kept,
+            "{old_cmd}"
+        );
+        assert_eq!(
+            codex["mcp_servers"].get("lightbulb").is_some(),
+            kept,
+            "{old_cmd}"
+        );
+        if kept {
+            assert_eq!(claude["mcpServers"]["lightbulb"]["command"], APP);
+        }
+    }
 }

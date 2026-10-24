@@ -67,8 +67,14 @@ pub(crate) struct Ctx<'a> {
     pub remove: bool,
 }
 
-/// The MCP server name when `--server-name` is not given.
-pub const DEFAULT_SERVER: &str = "lightbulb";
+/// The MCP server name when `--server-name` is not given. Not `lightbulb`: the Lightbulb
+/// desktop app registers its own server under that name, and two owners of one name keep
+/// replacing each other.
+pub const DEFAULT_SERVER: &str = "lightbulb-network";
+
+/// The name this engine used before `DEFAULT_SERVER`: setup removes an entry under it only when
+/// it runs this executable (the app's own `lightbulb` stays).
+const OLD_SERVER: &str = "lightbulb";
 
 /// Whether `name` can name the MCP server: it lands in TOML keys and allow rules.
 pub fn valid_server_name(name: &str) -> bool {
@@ -560,6 +566,14 @@ pub(crate) fn set_json_server(
     if !(doc[key].is_null() || doc[key].is_object()) {
         return Err(format!("`{key}` is not an object").into());
     }
+    let old = &doc[key][OLD_SERVER];
+    if ctx.server != OLD_SERVER && ctx.owner(!old.is_null(), old["command"].as_str()) == Owner::Ours
+    {
+        doc[key]
+            .as_object_mut()
+            .expect("holds our old entry")
+            .remove(OLD_SERVER);
+    }
     let current = &doc[key][ctx.server];
     let owner = ctx.owner(!current.is_null(), current["command"].as_str());
     match owner {
@@ -611,6 +625,14 @@ pub(crate) fn set_toml_server(
     fields: &[(&str, toml_edit::Value)],
 ) -> Result<Owner> {
     use toml_edit::Item;
+    let old = doc.get("mcp_servers").and_then(|s| s.get(OLD_SERVER));
+    let old_cmd = old.and_then(|t| t.get("command")).and_then(Item::as_str);
+    if ctx.server != OLD_SERVER && ctx.owner(old.is_some(), old_cmd) == Owner::Ours {
+        doc["mcp_servers"]
+            .as_table_like_mut()
+            .expect("holds our old entry")
+            .remove(OLD_SERVER);
+    }
     let current = doc.get("mcp_servers").and_then(|s| s.get(ctx.server));
     let owner = ctx.owner(
         current.is_some(),

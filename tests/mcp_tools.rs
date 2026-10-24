@@ -107,7 +107,7 @@ impl Net {
         );
         assert_eq!(
             init["result"]["serverInfo"]["name"],
-            name.unwrap_or("lightbulb"),
+            name.unwrap_or("lightbulb-network"),
             "{init}"
         );
         m.write(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
