@@ -1566,6 +1566,7 @@ pub fn doctor() -> Result<i32> {
         named.err().unwrap_or_default(),
         &setup,
     );
+    crate::telemetry::sync_env_optout(&dir);
     let counts = if crate::telemetry::active(&dir) {
         "on"
     } else {

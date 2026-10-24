@@ -129,42 +129,56 @@ pub fn build(event: &Event, install_id: &str) -> Value {
     json!({"api_key": KEY, "batch": [{"event": name, "distinct_id": install_id, "properties": p}]})
 }
 
-/// Whether to send. `env` reads an environment variable; `debug` is "this is a debug build".
-pub fn enabled(env: impl Fn(&str) -> Option<String>, config_on: bool, debug: bool) -> bool {
-    let set = |k: &str| env(k).is_some_and(|v| !v.is_empty() && v != "0");
-    !(set("DO_NOT_TRACK") || set("LIGHTBULB_NO_TELEMETRY") || !config_on || (debug && !set(FORCE)))
+/// Whether to send: the config allows it, and this is not a debug build or a test state
+/// folder (`LIGHTBULB_CONNECT_HOME`) unless `force` (`LIGHTBULB_TELEMETRY_FORCE`).
+pub fn enabled(config_on: bool, quiet_build: bool, force: bool) -> bool {
+    config_on && (!quiet_build || force)
 }
 
-/// Why it is off, for `telemetry status`; `None` when on.
-fn off_reason(dir: &Path) -> Option<&'static str> {
-    let env = |k: &str| std::env::var(k).ok();
-    let set = |k: &str| env(k).is_some_and(|v| !v.is_empty() && v != "0");
-    let config_on = Config::load(dir).is_ok_and(|c| c.telemetry);
-    if set("DO_NOT_TRACK") {
-        Some("DO_NOT_TRACK is set")
-    } else if set("LIGHTBULB_NO_TELEMETRY") {
-        Some("LIGHTBULB_NO_TELEMETRY is set")
-    } else if !config_on {
-        Some("turned off in config")
-    } else if !enabled(env, config_on, cfg!(debug_assertions)) {
-        Some("debug build")
-    } else {
-        None
-    }
+fn env_set(k: &str) -> bool {
+    std::env::var(k).is_ok_and(|v| !v.is_empty() && v != "0")
 }
 
+fn env_off() -> Option<&'static str> {
+    ["DO_NOT_TRACK", "LIGHTBULB_NO_TELEMETRY"]
+        .into_iter()
+        .find(|k| env_set(k))
+}
+
+/// The daemon's gate: the config only (an opt-out in a shell's environment never reaches a
+/// launchd/systemd daemon, so a CLI command saves it to the config: `sync_env_optout`).
 pub fn active(dir: &Path) -> bool {
-    off_reason(dir).is_none()
+    let config_on = Config::load(dir).is_ok_and(|c| c.telemetry);
+    let quiet = cfg!(debug_assertions) || std::env::var_os(crate::paths::HOME_ENV).is_some();
+    enabled(config_on, quiet, env_set(FORCE))
+}
+
+/// Saves an environment opt-out as `telemetry = false`, once. Whether it did.
+fn sync_env_optout_if(dir: &Path, opted_out: bool) -> bool {
+    let on = Config::load(dir).is_ok_and(|c| c.telemetry);
+    opted_out && on && Config::set(dir, "telemetry", "false").is_ok()
+}
+
+/// What every CLI command that sends (or reports) runs first.
+pub fn sync_env_optout(dir: &Path) -> bool {
+    sync_env_optout_if(dir, env_off().is_some())
 }
 
 /// `telemetry [on|off]`: sets the config, then says where it stands.
 pub fn command(dir: &Path, state: Option<&str>) -> Result<i32> {
+    let saved = sync_env_optout(dir);
     if let Some(s) = state {
         Config::set(dir, "telemetry", if s == "on" { "true" } else { "false" })?;
     }
-    match off_reason(dir) {
-        None => println!("Usage counts  on"),
-        Some(why) => println!("Usage counts  off ({why})"),
+    let config_on = Config::load(dir).is_ok_and(|c| c.telemetry);
+    match (config_on, env_off(), active(dir)) {
+        (_, Some(k), _) => {
+            let note = if saved { "; saved to config" } else { "" };
+            println!("Usage counts  off ({k} is set{note})")
+        }
+        (false, ..) => println!("Usage counts  off (turned off in config)"),
+        (true, _, false) => println!("Usage counts  off (debug build)"),
+        _ => println!("Usage counts  on"),
     }
     Ok(0)
 }
@@ -205,6 +219,12 @@ fn write_private(path: &Path, text: &str) -> Result<()> {
 
 /// Sends `event` if usage counts are on. Never waits, never fails the caller.
 pub fn send(dir: &Path, event: Event) {
+    sync_env_optout(dir);
+    send_if_active(dir, event);
+}
+
+/// `send` on the config's word alone (the daemon).
+fn send_if_active(dir: &Path, event: Event) {
     if active(dir) {
         if let Ok(id) = install_id(dir) {
             post(&build(&event, &id));
@@ -242,6 +262,10 @@ fn post(body: &Value) {
 /// Called by `setup`: records the version this computer runs. The first run sends
 /// `cli_installed` and returns true (print `NOTICE`); a changed version sends `cli_updated`.
 pub fn on_setup(dir: &Path) -> bool {
+    sync_env_optout(dir);
+    if !active(dir) {
+        return false; // nothing recorded, so a later opt-in still counts as the first run
+    }
     let path = dir.join(VERSION_FILE);
     let last = fs::read_to_string(&path).ok().map(|s| s.trim().to_string());
     if last.as_deref() == Some(VERSION) {
@@ -249,18 +273,17 @@ pub fn on_setup(dir: &Path) -> bool {
     }
     let _ = write_private(&path, VERSION);
     let first = last.is_none();
-    let event = match last {
-        None => Event::Installed,
-        Some(from) => Event::Updated {
-            from,
-            to: VERSION.into(),
+    send_if_active(
+        dir,
+        match last {
+            None => Event::Installed,
+            Some(from) => Event::Updated {
+                from,
+                to: VERSION.into(),
+            },
         },
-    };
-    let on = active(dir);
-    if on {
-        send(dir, event);
-    }
-    on && first
+    );
+    first
 }
 
 /// Whether the daily summary is due: never sent, or a day ago.
@@ -318,17 +341,23 @@ fn daily_counts(d: &Daemon, since: i64) -> Daily {
 pub async fn run_daily(d: Arc<Daemon>) {
     tokio::time::sleep(Duration::from_secs(300)).await;
     loop {
-        let now = crate::daemon::ipc::now();
-        let stamp = d.dir.join(DAILY_FILE);
-        let last = fs::read_to_string(&stamp)
-            .ok()
-            .and_then(|s| s.trim().parse().ok());
-        if due(last, now) && active(&d.dir) {
-            let _ = write_private(&stamp, &now.to_string());
-            let counts = daily_counts(&d, now.saturating_sub(DAY) as i64);
-            send(&d.dir, Event::Daily(counts));
-        }
+        let d2 = d.clone();
+        let _ = tokio::task::spawn_blocking(move || daily_once(&d2)).await;
         tokio::time::sleep(Duration::from_secs(3600)).await;
+    }
+}
+
+/// One tick: counts and sends when a day has passed and the config allows. Blocking work.
+fn daily_once(d: &Daemon) {
+    let now = crate::daemon::ipc::now();
+    let stamp = d.dir.join(DAILY_FILE);
+    let last = fs::read_to_string(&stamp)
+        .ok()
+        .and_then(|s| s.trim().parse().ok());
+    if due(last, now) && active(&d.dir) {
+        let _ = write_private(&stamp, &now.to_string());
+        let counts = daily_counts(d, now.saturating_sub(DAY) as i64);
+        send_if_active(&d.dir, Event::Daily(counts));
     }
 }
 
@@ -403,23 +432,26 @@ mod tests {
     }
 
     #[test]
-    fn off_switches_stop_sending() {
-        let none = |_: &str| None;
-        let with =
-            |k: &'static str, v: &'static str| move |q: &str| (q == k).then(|| v.to_string());
-        // Release build, defaults: on.
-        assert!(enabled(none, true, false));
-        assert!(!enabled(with("DO_NOT_TRACK", "1"), true, false));
-        assert!(!enabled(with("LIGHTBULB_NO_TELEMETRY", "1"), true, false));
-        assert!(!enabled(none, false, false));
-        // Debug build: off unless forced, and the switches still win over the force.
-        assert!(!enabled(none, true, true));
-        assert!(enabled(with(FORCE, "1"), true, true));
-        assert!(!enabled(
-            |k| (k == FORCE || k == "DO_NOT_TRACK").then(|| "1".into()),
-            true,
-            true
-        ));
+    fn the_gate_reads_config_and_build() {
+        assert!(enabled(true, false, false));
+        assert!(!enabled(false, false, true), "config off beats force");
+        assert!(!enabled(true, true, false), "debug or test folder: off");
+        assert!(enabled(true, true, true));
+    }
+
+    #[test]
+    fn an_env_opt_out_is_saved_to_config_and_gates_the_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        assert!(Config::load(d).unwrap().telemetry);
+        assert!(!sync_env_optout_if(d, false));
+        assert!(Config::load(d).unwrap().telemetry);
+        assert!(sync_env_optout_if(d, true));
+        assert!(!Config::load(d).unwrap().telemetry);
+        assert!(!sync_env_optout_if(d, true), "once");
+        // The daemon's gate sees it without the environment.
+        assert!(!active(d));
+        assert!(!enabled(Config::load(d).unwrap().telemetry, false, true));
     }
 
     #[test]

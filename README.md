@@ -164,6 +164,6 @@ Lightbulb sends anonymous usage counts so the project can see adoption. Each eve
 - `invite_created` (`via`).
 - `cli_daily`, at most once a day: messages sent and received, holds opened and allowed, computers on the network, and which agents (claude, codex, cursor, grok) are connected.
 
-The only identifier is a random ID made on first use and kept in the state folder (`install-id`); it is not derived from your key or computer name. Never sent: message text, names, person ids, keys, tickets, codes, folder paths, team ids. Sending runs in the background with a 3 second limit and failures are dropped.
+The only identifier is a random ID made on first use and kept in the state folder (`install-id`); it is not derived from your key or computer name. Never sent: message text, names, person ids, keys, tickets, codes, folder paths, team ids. Sending runs in the background with a 3 second limit and failures are dropped. PostHog sees your IP address (HTTPS reveals it) but is told to discard it (geoip disabled).
 
-Turn it off with any of: `lightbulb telemetry off` (`on` turns it back on, `status` shows it), `telemetry = false` in `config.toml`, or `LIGHTBULB_NO_TELEMETRY=1` or `DO_NOT_TRACK=1` in the environment. `lightbulb doctor` shows `Usage counts  on|off`.
+Turn it off with any of: `lightbulb telemetry off` (`on` turns it back on, `status` shows it), `telemetry = false` in `config.toml`, or `LIGHTBULB_NO_TELEMETRY=1` or `DO_NOT_TRACK=1` in the environment (the next `lightbulb` command saves it as `telemetry = false`, because the background service does not see your shell's environment). `lightbulb doctor` shows `Usage counts  on|off`.
