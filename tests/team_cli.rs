@@ -273,7 +273,8 @@ fn founder_whose_only_other_member_is_cloud_can_leave() {
 
 #[test]
 fn a_computer_outside_the_roster_is_told_so() {
-    // A team aden founded that never admitted this computer.
+    // A team aden founded that never admitted this computer: its key is not the record's, so
+    // the daemon will not start (as after a replaced identity.key).
     let e = Env::new();
     let aden = Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
     let g = net_ops::genesis(&aden, "aden", "mac", "acme", 1);
@@ -281,7 +282,7 @@ fn a_computer_outside_the_roster_is_told_so() {
     roster::accept(&store, &g, 10).unwrap();
     let o = e.run(&["remove", "aden"]);
     assert_eq!(o.status.code(), Some(1));
-    assert_eq!(err(&o).trim(), "This computer is not in the network.");
+    assert_eq!(err(&o).trim(), lightbulb::embed::KEY_MISMATCH);
 }
 
 #[test]
