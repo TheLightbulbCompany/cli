@@ -76,6 +76,27 @@ pub async fn start(home: &Path, opts: EmbedOpts) -> Result<Instance> {
     })
 }
 
+/// `boot`'s refusal when `identity.key` was replaced (or lost) under a kept `state.db`: the
+/// team record is signed for the old key, which nothing here can sign as any more.
+pub const KEY_MISMATCH: &str = "identity.key does not match this computer's team record. Run lightbulb leave, then join again with a new invite.";
+
+/// Whether `dir`'s roster has no member for `identity`: `identity.key` is not the key the
+/// team record was made for.
+fn mismatched(identity: &Identity, roster: &roster::Roster) -> bool {
+    !roster.members.contains_key(&identity.key)
+}
+
+/// `mismatched` for `dir` as it is on disk (`false` with no `identity.key` or no roster),
+/// for a caller that does not hold the lock: nothing is written.
+pub fn key_mismatch(dir: &Path) -> Result<bool> {
+    if !dir.join("identity.key").exists() || !dir.join("state.db").exists() {
+        return Ok(false);
+    }
+    let entries = roster::entries(&Store::open(&dir.join("state.db"))?)?;
+    Ok(!entries.is_empty()
+        && mismatched(&Identity::load_or_create(dir)?, &roster::replay(&entries)))
+}
+
 /// The start path the daemon and an instance share, under `dir`'s lock (the caller's):
 /// identity, store, the solo genesis on first start, the team, the transport and the presence
 /// sender. A `cloud` instance (its workspace's name, and the home lock it keeps) has no
@@ -97,6 +118,9 @@ pub(crate) async fn boot(
         entries.push(g);
     }
     let mut roster = roster::replay(&entries);
+    if mismatched(&identity, &roster) {
+        return Err(KEY_MISMATCH.into());
+    }
     roster.lapse(now);
     let mut team = TeamState {
         roster,

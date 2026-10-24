@@ -129,6 +129,8 @@ pub struct Link {
     pub once: bool,
     pub expires_at: i64,
     pub signer: String,
+    /// `invite --new`'s link: it ends every earlier link of its signer, any mode, once ones too.
+    pub ends_all: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -522,6 +524,7 @@ fn pass(
                             once: e.body["once"].as_bool().unwrap_or(false),
                             expires_at: e.body["expires_at"].as_i64().unwrap_or(0),
                             signer: e.signer.clone(),
+                            ends_all: e.body["ends_all"] == true,
                         };
                         (h.clone(), link)
                     });
@@ -552,8 +555,9 @@ fn pass(
     (r, applied)
 }
 
-/// Whether reusable link `l` (entry `lh`) is ended by a newer reusable link of its signer in
-/// the same mode: one descended from it that `seen` holds. Once links never end or are ended.
+/// Whether link `l` (entry `lh`) is ended by a newer link of its signer that `seen` holds (one
+/// descended from it): a reusable one in the same mode ends a reusable one; an `ends_all` one
+/// ends every link. Otherwise once links never end or are ended.
 fn retired(
     links: &BTreeMap<String, (String, Link)>,
     anc: &BTreeMap<&str, HashSet<String>>,
@@ -561,14 +565,12 @@ fn retired(
     l: &Link,
     seen: impl Fn(&str) -> bool,
 ) -> bool {
-    !l.once
-        && links.values().any(|(nh, n)| {
-            !n.once
-                && n.signer == l.signer
-                && n.mode == l.mode
-                && anc[nh.as_str()].contains(lh)
-                && seen(nh)
-        })
+    links.values().any(|(nh, n)| {
+        n.signer == l.signer
+            && (n.ends_all || (!l.once && !n.once && n.mode == l.mode))
+            && anc[nh.as_str()].contains(lh)
+            && seen(nh)
+    })
 }
 
 /// Removes `target` (never the founder) by removal `h`; whether it was removed.

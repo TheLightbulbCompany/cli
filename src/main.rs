@@ -107,7 +107,7 @@ enum Command {
     Doctor,
     /// Print this computer's join line (the reusable invite, unless a flag says otherwise).
     Invite {
-        /// Replace the reusable invite; the old one stops working.
+        /// A new invite; every earlier one from this computer (open ones too) stops working.
         #[arg(long, conflicts_with_all = ["once", "open"])]
         new: bool,
         /// An invite for one join, valid 24 hours.

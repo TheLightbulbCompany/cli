@@ -106,7 +106,10 @@ fn invite_reprints_the_same_link_until_new() {
     assert!(first.starts_with(LINE), "{first}");
     assert_eq!(printed_link(&e.run(&["invite"])), first);
     let (notice, line) = invite_parts(&e.run(&["invite", "--new"]));
-    assert_eq!(notice, "The old invite stopped working.\n");
+    assert_eq!(
+        notice,
+        "Every earlier invite from this computer stopped working.\n"
+    );
     assert!(line != first, "{line}");
     assert_eq!(printed_link(&e.run(&["invite"])), line);
     let (once, _) = invite_parts(&e.run(&["invite", "--once"]));
@@ -328,4 +331,32 @@ fn policy_takes_a_teammates_name_and_lists_names() {
         json!({"id": 1, "op": "policy.set", "person_id": "aden", "value": "hold"}),
     );
     assert_eq!(r["error"], "not_found", "{r}");
+}
+
+#[test]
+fn a_replaced_identity_key_refuses_to_start_until_leave() {
+    let (a, b) = (Env::new(), Env::new());
+    common::seed_pair(&a, &b);
+    // A new identity.key under the kept state.db: the team record is for the old one.
+    std::fs::remove_file(a.state.path().join("identity.key")).unwrap();
+    let line = "identity.key does not match this computer's team record. Run lightbulb leave, then join again with a new invite.\n";
+    let run = |args: &[&str]| {
+        let mut c = a.base_cmd(std::process::Command::new(EXE));
+        c.args(args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap()
+    };
+    let o = run(&["daemon"]);
+    assert_eq!((o.status.code(), err(&o)), (Some(1), line.to_string()));
+    // Any command says why, not just that the daemon did not start.
+    let o = run(&["team"]);
+    assert_eq!((o.status.code(), err(&o)), (Some(1), line.to_string()));
+    // `leave` works without the daemon; then this computer starts on its own network.
+    let o = a.detached(&[EXE, "leave"], "y\n");
+    assert!(o.status.success(), "{}{}", out(&o), err(&o));
+    assert!(out(&o).ends_with("Left \"acme\". This computer is on its own network again.\n"));
+    a.daemon(false, "", &[]);
+    let t = a.ask(json!({"id": 1, "op": "team.get"}));
+    assert_eq!(t["members"].as_array().unwrap().len(), 1, "{t}");
 }

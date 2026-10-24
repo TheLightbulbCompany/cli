@@ -45,7 +45,13 @@ pub(crate) fn plist_path(home: &Path) -> PathBuf {
 
 /// Starts the daemon if needed, then opens a connection to it.
 fn connect() -> Result<Conn> {
-    daemon::ensure_running()?;
+    if let Err(e) = daemon::ensure_running() {
+        // The daemon refuses a replaced identity.key: say why, not just that it did not start.
+        if crate::embed::key_mismatch(&paths::state_dir()).unwrap_or(false) {
+            return Err(crate::embed::KEY_MISMATCH.into());
+        }
+        return Err(e);
+    }
     Conn::open()
 }
 
@@ -535,7 +541,9 @@ pub fn invite(mode: Invite) -> Result<i32> {
                 "Anyone with this line joins without asking. Use it only with people you trust."
             );
         }
-        _ if r["replaced"] == true => println!("The old invite stopped working."),
+        _ if r["replaced"] == true => {
+            println!("Every earlier invite from this computer stopped working.")
+        }
         _ => {}
     }
     println!("Send this line to the person (or paste it on your other computer):");
@@ -957,9 +965,34 @@ pub fn remove(name: &str) -> Result<i32> {
     Ok(0)
 }
 
+/// `leave` when `identity.key` no longer matches the team record (the daemon will not start):
+/// after a yes, the team record goes from `state.db`, as a removal would leave it; the next
+/// start makes this computer its own network with its new key. Nothing can be signed for the
+/// team, so it is not told.
+fn leave_unsigned(dir: &std::path::Path) -> Result<i32> {
+    let _lock = daemon::lock_dir(dir, false)?;
+    let store = crate::store::Store::open(&dir.join("state.db"))?;
+    let name = crate::roster::replay(&crate::roster::entries(&store)?).team_name;
+    print!("Leave \"{name}\"? This computer's key changed, so the team cannot be told. Messages already stored here stay. [y/N] ");
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    if !matches!(answer.trim(), "y" | "Y" | "yes") {
+        return Ok(0);
+    }
+    crate::outbox::refuse_all(&store, daemon::ipc::now(), "not_member")?;
+    store.clear_roster()?;
+    println!("Left \"{name}\". This computer is on its own network again.");
+    Ok(0)
+}
+
 /// `leave`: after a yes, this computer leaves its team and is on its own network again. The
 /// service keeps running.
 pub fn leave() -> Result<i32> {
+    let dir = paths::state_dir();
+    if crate::embed::key_mismatch(&dir)? {
+        return leave_unsigned(&dir);
+    }
     let mut conn = connect()?;
     let me = conn.member()?;
     let t = ask(&mut conn, "team.get", json!({}))?;

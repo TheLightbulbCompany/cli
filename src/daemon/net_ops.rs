@@ -27,7 +27,7 @@ pub enum Invite {
     /// This member's live link, minted when it has none.
     #[default]
     Reusable,
-    /// A new link in place of the live one.
+    /// A new link in place of the live one, ending every earlier link of this computer.
     New,
     /// A link for one join.
     Once,
@@ -659,13 +659,17 @@ impl TeamOps<'_> {
                             && l.expires_at > self.now
                     })
                     .cloned();
-                let replaced = invite == Invite::New && live.is_some();
+                let replaced = invite == Invite::New
+                    && r.links
+                        .values()
+                        .any(|l| l.signer == me_key && l.expires_at > self.now);
                 let t = match live {
                     Some(l) if invite != Invite::New => {
                         let hint = self.daemon.peers.hints();
                         ticket::sign(identity, r, l.ticket_id, l.secret, mode, l.expires_at, hint)
                     }
-                    _ => self.new_link(mode, invite.once())?,
+                    // `--new` ends every earlier link of this computer, `open` and once ones too.
+                    _ => self.new_link(mode, invite.once(), invite == Invite::New)?,
                 };
                 let s = ticket::encode(&t);
                 Response::ok(
@@ -702,7 +706,7 @@ impl TeamOps<'_> {
                     return Ok(Response::err(id, BAD_REQUEST));
                 }
                 self.write(Kind::Remove, json!({"member": t.key}))?;
-                let link = self.new_link("ask", false)?;
+                let link = self.new_link("ask", false, false)?;
                 Response::ok(id, json!({"name": t.name, "line": ticket::line(&link)}))
             }
             _ => Response::err(id, UNKNOWN_OP),
@@ -714,8 +718,13 @@ impl TeamOps<'_> {
     }
 
     /// Mints a link of `mode` off the cached roster (signed into the roster, recorded in
-    /// `team_link`): its ticket.
-    fn new_link(&mut self, mode: &str, once: bool) -> crate::Result<ticket::Ticket> {
+    /// `team_link`; with `ends_all`, ending every earlier link of ours): its ticket.
+    fn new_link(
+        &mut self,
+        mode: &str,
+        once: bool,
+        ends_all: bool,
+    ) -> crate::Result<ticket::Ticket> {
         let (t, hashed) = ticket::mint(
             &self.daemon.identity,
             &self.team.roster,
@@ -724,7 +733,11 @@ impl TeamOps<'_> {
             self.now,
             self.daemon.peers.hints(),
         );
-        self.write(Kind::Link, ticket::link_body(&t, hashed.as_deref()))?;
+        let mut body = ticket::link_body(&t, hashed.as_deref());
+        if ends_all {
+            body["ends_all"] = true.into();
+        }
+        self.write(Kind::Link, body)?;
         self.store.put_link(
             &t.ticket_id,
             &t.secret,

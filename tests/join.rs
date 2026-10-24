@@ -733,3 +733,18 @@ fn join_takes_the_bare_ticket() {
 fn join_takes_the_app_link() {
     joins_with(|t| format!("lightbulb://join/{t}"));
 }
+
+#[test]
+fn invite_new_ends_every_earlier_invite_open_ones_too() {
+    let (a, c) = (Env::new(), Env::new());
+    a.daemon(false, &computer("mac"), &[dialog("Allow")]);
+    let (open, once) = (invite_open(&a), invite(&a, "once"));
+    let r = a.ask(json!({"id": 1, "op": "team.invite", "mode": "new"}));
+    assert_eq!(r["replaced"], true, "{r}");
+    let new = r["ticket"].as_str().unwrap().to_string();
+    c.daemon(false, &computer("mbp"), &[peers(&[&a])]);
+    refused(&join(&c, &open, "carol", "computer"), "bad_ticket");
+    refused(&join(&c, &once, "carol", "computer"), "bad_ticket");
+    assert_eq!(members(&a).len(), 1);
+    assert_eq!(join(&c, &new, "carol", "computer")["state"], "admitted");
+}
