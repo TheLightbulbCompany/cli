@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use lightbulb::daemon::net_ops::Invite;
-use lightbulb::{cli, daemon, hook, mcp, paths, setup};
+use lightbulb::{cli, daemon, hook, mcp, member, paths, setup};
 use std::ffi::OsString;
 use std::io::{Read, Write};
 
@@ -194,6 +194,27 @@ enum Command {
     /// Always exits 0; errors go to stderr.
     #[command(hide = true)]
     Hook { agent: String, event: String },
+    /// Run the engine as a cloud workspace's sidecar, driven over `--socket` by the Lightbulb
+    /// bridge; the socket's token is the first line of stdin.
+    #[command(hide = true)]
+    Member {
+        /// The instance's state dir.
+        #[arg(long)]
+        home: std::path::PathBuf,
+        /// Where the final copy of state.db goes at stop (outside --home).
+        #[arg(long)]
+        snapshot: std::path::PathBuf,
+        #[arg(long)]
+        socket: std::path::PathBuf,
+        /// The workspace's display name.
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        relay: Option<String>,
+        /// The sessions file: {"workspace", "sessions": [{"name", "agent", "title"?}]}.
+        #[arg(long)]
+        sessions: std::path::PathBuf,
+    },
     /// Run the stdio MCP server an agent talks to (find_sessions, send_message, ...).
     #[command(hide = true)]
     Mcp {
@@ -311,6 +332,29 @@ fn run() -> lightbulb::Result<()> {
             exit(2)
         }
         Command::Mcp { server_name } => mcp::run(server_name)?,
+        Command::Member {
+            home,
+            snapshot,
+            socket,
+            name,
+            relay,
+            sessions,
+        } => {
+            let mut token = String::new();
+            std::io::stdin().read_line(&mut token)?;
+            let token = token.trim_end_matches(['\n', '\r']).to_string();
+            let opts = member::MemberOpts {
+                home,
+                snapshot,
+                socket,
+                name,
+                relay,
+                sessions,
+            };
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(member::run(opts, token))?;
+            rt.shutdown_timeout(std::time::Duration::from_secs(1));
+        }
         Command::Setup {
             remove,
             executable,

@@ -4,12 +4,12 @@
 //! raises no dialog; otherwise it is the daemon: `boot` is the one start path both share.
 
 use crate::config::Config;
-use crate::daemon::ipc::{Caller, Request, Response, BAD_REQUEST, INTERNAL};
+use crate::daemon::ipc::{Caller, Request, Response, BAD_REQUEST, INTERNAL, NOT_FOUND};
 use crate::daemon::{ipc, net_ops, Cloud, Daemon, TeamState};
 use crate::identity::Identity;
 use crate::roster::{self, MemberKind};
 use crate::sessions::{self, Key};
-use crate::store::Store;
+use crate::store::{self, Store};
 use crate::{dialog, mail, net, presence, Result};
 use iroh::RelayUrl;
 use serde_json::{json, Value};
@@ -27,6 +27,9 @@ pub struct EmbedOpts {
     pub snapshot: Option<PathBuf>,
     /// The workspace's display name: the name it joins as, and its solo network's.
     pub name: String,
+    /// The sessions declared before the transport starts (`cloud.sessions.set`'s list), so mail
+    /// for them that arrives right after start is kept, not refused as unadvertised.
+    pub sessions: Vec<Value>,
 }
 
 /// A running instance. Dropping it without `shutdown` closes its endpoint all the same (no
@@ -64,7 +67,7 @@ pub async fn start(home: &Path, opts: EmbedOpts) -> Result<Instance> {
         lan: false,
         ..Config::load(home)?
     };
-    let (daemon, net) = boot(home, config, Some((opts.name, lock))).await?;
+    let (daemon, net) = boot(home, config, Some((opts.name, lock, opts.sessions))).await?;
     Ok(Instance {
         daemon,
         net,
@@ -105,17 +108,47 @@ pub fn key_mismatch(dir: &Path) -> Result<bool> {
     ))
 }
 
+/// The sessions of `list` that `cloud.sessions.set` would take, one by one: a name that is not
+/// valid (or is there twice) is skipped and logged, and only the first `presence::MAX` are
+/// kept, so one bad entry does not keep the whole workspace off the network.
+fn declarable(short: &str, list: &[Value]) -> Vec<net::frames::Remote> {
+    let mut kept: Vec<net::frames::Remote> = vec![];
+    for s in list {
+        match net_ops::remotes(short, std::slice::from_ref(s)) {
+            Some(r) if !kept.iter().any(|k| k.session_id == r[0].session_id) => kept.extend(r),
+            _ => eprintln!(
+                "sessions: skipped {} (not a valid session, or declared twice)",
+                s["name"]
+            ),
+        }
+    }
+    if kept.len() > presence::MAX {
+        eprintln!(
+            "sessions: kept the first {} of {}",
+            presence::MAX,
+            kept.len()
+        );
+        kept.truncate(presence::MAX);
+    }
+    kept
+}
+
 /// The start path the daemon and an instance share, under `dir`'s lock (the caller's):
 /// identity, store, the solo genesis on first start, the team, the transport and the presence
-/// sender. A `cloud` instance (its workspace's name, and the home lock it keeps) has no
-/// dialogs and declares its sessions; a computer's are its agents' (`claude_home`).
+/// sender. A `cloud` instance (its workspace's name, the home lock it keeps and the sessions it
+/// declares from the start) has no dialogs; a computer's sessions are its agents'
+/// (`claude_home`).
 pub(crate) async fn boot(
     dir: &Path,
     config: Config,
-    cloud: Option<(String, std::fs::File)>,
+    cloud: Option<(String, std::fs::File, Vec<Value>)>,
 ) -> Result<(Arc<Daemon>, net::Net)> {
-    let (cloud, home_lock) = cloud.unzip();
+    let (cloud, home_lock, declared) = match cloud {
+        Some((name, lock, sessions)) => (Some(name), Some(lock), sessions),
+        None => (None, None, vec![]),
+    };
     let identity = Identity::load_or_create(dir)?;
+    let declared = declarable(&identity.short, &declared);
     let store = Store::open(&dir.join("state.db"))?;
     let now = ipc::now() as i64;
     // The solo network's genesis, written once: a computer that has a roster keeps it.
@@ -189,7 +222,13 @@ pub(crate) async fn boot(
         built: Mutex::default(),
         latest: Mutex::new(latest),
         streams: Default::default(),
-        cloud: cloud.map(Cloud::new),
+        cloud: cloud.map(|name| {
+            let c = Cloud::new(name);
+            if !declared.is_empty() {
+                c.set(declared);
+            }
+            c
+        }),
         home_lock,
     });
     // No join connection outlives a restart: its open requests are over.
@@ -208,11 +247,16 @@ impl Instance {
     /// hosted app's call to its person's own computer (`app_send`); `decision.send` carries a
     /// person's tap on a hold notice back to the holding computer (`decision`).
     pub async fn call(&self, req: Value) -> Value {
+        json!(self.respond(req).await)
+    }
+
+    /// `call`'s answer as a `Response`, its body apart (`member` nests it as `result`).
+    pub(crate) async fn respond(&self, req: Value) -> Response {
         let id = req["id"].as_u64().unwrap_or(0);
-        json!(match serde_json::from_value::<Request>(req) {
+        match serde_json::from_value::<Request>(req) {
             Ok(r) => ipc::op(id, &r.op, &r.body, &self.daemon, Caller::Instance).await,
             Err(_) => Response::err(id, BAD_REQUEST),
-        })
+        }
     }
 
     /// Every event a socket subscriber gets (`message`, `held`, `hold_closed`,
@@ -282,4 +326,99 @@ pub(crate) fn take_read(d: &Daemon, key: &Key) -> Result<Vec<Value>> {
         .iter()
         .map(ipc::inbox_record)
         .collect())
+}
+
+/// `inbox.peek {}` -> `{sessions: [{session, records}]}`: what waits for each declared name and
+/// what was delivered but not yet read, as Task 10's records (`ipc::INBOX_RECORD`) with
+/// `stage` (`delivered`, then `waiting`, each oldest first), all left as they are: `inbox.ack`
+/// moves each on. A record lists until it is read, so a turn that died is handed out again.
+pub(crate) fn peek(id: u64, d: &Daemon) -> Response {
+    let short = &d.identity.short;
+    type Group = (String, Vec<(store::Message, &'static str)>);
+    let listed = || -> Result<Vec<Group>> {
+        let store = d.store.lock().unwrap();
+        let now = ipc::now();
+        let mut out: Vec<Group> = vec![];
+        let mut push = |m: store::Message, stage| {
+            // Declared sessions only: mail for an agent since removed stays with the engine.
+            let declared = d.cloud.as_ref().is_some_and(|c| c.declares(&m.to_key));
+            let name = m.to_key.split_once('/').map(|(_, n)| n.to_string());
+            let Some(name) = name.filter(|_| declared) else {
+                return;
+            };
+            match out.iter_mut().find(|(n, _)| *n == name) {
+                Some((_, ms)) => ms.push((m, stage)),
+                None => out.push((name, vec![(m, stage)])),
+            }
+        };
+        for m in mail::delivered_unread(&store, short, now)? {
+            push(m, "delivered");
+        }
+        for key in mail::waiting_keys(&store, now)? {
+            if key.starts_with(&format!("{short}/")) {
+                for m in mail::waiting(&store, &Key(key), now)? {
+                    push(m, "waiting");
+                }
+            }
+        }
+        Ok(out)
+    };
+    let Ok(listed) = listed() else {
+        return Response::err(id, INTERNAL);
+    };
+    // After the store lock: `records` takes the team's.
+    let sessions: Vec<Value> = listed
+        .into_iter()
+        .map(|(name, ms)| {
+            let (ms, stages): (Vec<_>, Vec<_>) = ms.into_iter().unzip();
+            let records: Vec<Value> = (ipc::records(d, &ms).iter().zip(stages))
+                .map(|(r, stage)| {
+                    let mut r = ipc::inbox_record(r);
+                    r["stage"] = stage.into();
+                    r
+                })
+                .collect();
+            json!({ "session": name, "records": records })
+        })
+        .collect();
+    Response::ok(id, json!({ "sessions": sessions }))
+}
+
+/// `inbox.ack {session, record, stage}` -> `{}`: `delivered` takes record `record` (an id from
+/// `inbox.peek`) from session `session`'s mailbox (again: `{}`); `read` takes it if it still
+/// waits, marks it read and drops its text. `not_found` for a record that was never session
+/// `session`'s; `bad_request` for another stage.
+pub(crate) fn ack(id: u64, body: &Value, d: &Daemon) -> Response {
+    let (Some(name), Some(record), Some(stage)) = (
+        body["session"].as_str().filter(|n| sessions::valid_name(n)),
+        body["record"].as_str(),
+        body["stage"]
+            .as_str()
+            .filter(|s| ["delivered", "read"].contains(s)),
+    ) else {
+        return Response::err(id, BAD_REQUEST);
+    };
+    let key = Key(format!("{}/{name}", d.identity.short));
+    let found = || -> Result<bool> {
+        let store = d.store.lock().unwrap();
+        // Taken from the mailbox if it still waits; a record delivered before is as it was.
+        mail::take_one(&store, &key, record, ipc::now())?;
+        if store.message(record)?.is_none_or(|m| m.to_key != key.0) {
+            return Ok(false);
+        }
+        if stage == "delivered" {
+            return Ok(true);
+        }
+        mail::mark_read(&store, record)?;
+        mail::forget(&store)?;
+        Ok(true)
+    };
+    match found() {
+        Ok(true) => {
+            d.peers.outbox.notify_one();
+            Response::ok(id, json!({}))
+        }
+        Ok(false) => Response::err(id, NOT_FOUND),
+        Err(_) => Response::err(id, INTERNAL),
+    }
 }

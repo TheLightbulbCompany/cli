@@ -900,6 +900,59 @@ pub fn waiting(store: &Store, to: &Key, now: u64) -> Result<Vec<Message>> {
     Ok(out)
 }
 
+/// The messages to member `short`'s names (`<short>/<name>`) that were delivered and are not
+/// yet read, oldest first: taken from the mailbox, their text kept until `mark_read`. Only
+/// those delivered within `outbox::TTL_S` of `now`; `expire_delivered` ends the rest.
+pub fn delivered_unread(store: &Store, short: &str, now: u64) -> Result<Vec<Message>> {
+    let since = now.saturating_sub(crate::outbox::TTL_S) as i64;
+    let ids = delivered_ids(store, short, "r.updated_at >= ?3", since)?;
+    let mut out = vec![];
+    for id in ids {
+        out.extend(store.message(&id)?);
+    }
+    Ok(out)
+}
+
+/// Member `short`'s delivered-unread mail (`delivered_unread`) delivered more than
+/// `outbox::TTL_S` before `now` becomes `expired` (its text is `forget`'s then): a turn that
+/// never completes is not handed out for ever.
+pub fn expire_delivered(store: &Store, short: &str, now: u64) -> Result<()> {
+    let before = now.saturating_sub(crate::outbox::TTL_S) as i64;
+    let tx = store.conn().unchecked_transaction()?;
+    for id in delivered_ids(store, short, "r.updated_at < ?3", before)? {
+        if let Some(m) = store.message(&id)? {
+            advance(
+                &tx,
+                &m.from_key,
+                &m.request_id,
+                State::Expired,
+                None,
+                None,
+                now,
+            )?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// The ids of `delivered_unread`'s messages for which `bound` (on `r.updated_at`, the delivery
+/// time, against `?3` = `at`) holds, oldest first.
+fn delivered_ids(store: &Store, short: &str, bound: &str, at: i64) -> Result<Vec<String>> {
+    let mut stmt = store.conn().prepare(&format!(
+        "SELECT m.id FROM messages m JOIN receipts r \
+         ON r.from_key = m.from_key AND r.request_id = m.request_id \
+         WHERE r.state = 'delivered' AND m.body IS NOT NULL AND substr(m.to_key, 1, ?2) = ?1 \
+         AND {bound} AND NOT EXISTS (SELECT 1 FROM mailbox b WHERE b.message_id = m.id) \
+         ORDER BY m.rowid"
+    ))?;
+    let prefix = format!("{short}/");
+    let ids = stmt.query_map(params![prefix, prefix.len() as i64, at], |r| {
+        r.get::<_, String>(0)
+    })?;
+    Ok(ids.collect::<rusqlite::Result<_>>()?)
+}
+
 /// The addresses with waiting mail, newest mail first.
 pub fn waiting_keys(store: &Store, now: u64) -> Result<Vec<String>> {
     let mut stmt = store.conn().prepare(

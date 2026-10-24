@@ -288,6 +288,7 @@ pub async fn instance(
         relay: None,
         snapshot: snapshot.map(std::path::Path::to_path_buf),
         name: name.into(),
+        sessions: vec![],
     };
     let i = lightbulb::embed::start(home, opts).await;
     for (k, _) in &knobs {
@@ -319,7 +320,12 @@ pub async fn online(i: &lightbulb::embed::Instance, n: u64) {
 pub async fn dial_instance(i: &lightbulb::embed::Instance, who: &Identity) -> (Peer, Endpoint) {
     let key = call(i, "identity.get", json!({})).await["member_key"].clone();
     let port = call(i, "status", json!({})).await["port"].as_u64().unwrap();
-    let key = PublicKey::from_bytes(&identity::key_bytes(key.as_str().unwrap()).unwrap()).unwrap();
+    dial_at(key.as_str().unwrap(), port, who).await
+}
+
+/// `who` played by the test, dialing the member `key` listening on loopback `port`, `hello` sent.
+pub async fn dial_at(key: &str, port: u64, who: &Identity) -> (Peer, Endpoint) {
+    let key = PublicKey::from_bytes(&identity::key_bytes(key).unwrap()).unwrap();
     let addr = EndpointAddr::new(key).with_ip_addr(format!("127.0.0.1:{port}").parse().unwrap());
     let ep = endpoint(who).await;
     let conn = ep.connect(addr, ALPN).await.unwrap();
@@ -598,4 +604,56 @@ pub async fn played(who: &Identity, env: &Env) -> (Peer, Endpoint) {
 pub fn count(db: &std::path::Path, sql: &str) -> i64 {
     let c = rusqlite::Connection::open(db).unwrap();
     c.query_row(sql, [], |r| r.get(0)).unwrap()
+}
+
+/// `lightbulb member` on `dir/home`, declaring `sessions` (`dir/sessions.json`), its socket at
+/// `dir/sock` and its final snapshot at `dir/last.db`, started and answering: the child, its
+/// token and its socket. Its log is `dir/member.log`.
+pub fn member(
+    dir: &std::path::Path,
+    sessions: Value,
+) -> (std::process::Child, String, std::path::PathBuf) {
+    let file = dir.join("sessions.json");
+    let body = json!({"workspace": "The Lightbulb Company", "sessions": sessions});
+    std::fs::write(&file, body.to_string()).unwrap();
+    let sock = dir.join("sock");
+    let log = std::fs::File::create(dir.join("member.log")).unwrap();
+    let token = ulid();
+    let mut child = Command::new(EXE)
+        .arg("member")
+        .arg("--home")
+        .arg(dir.join("home"))
+        .arg("--snapshot")
+        .arg(dir.join("last.db"))
+        .arg("--socket")
+        .arg(&sock)
+        .args(["--name", "The Lightbulb Company", "--sessions"])
+        .arg(&file)
+        .env("HOME", dir)
+        .env("LIGHTBULB_CONNECT_DEBUG_NO_DEFAULT_RELAYS", "1")
+        .env_remove("LIGHTBULB_CONNECT_PEERS")
+        .stdin(Stdio::piped())
+        .stdout(log.try_clone().unwrap())
+        .stderr(log)
+        .spawn()
+        .unwrap();
+    writeln!(child.stdin.take().unwrap(), "{token}").unwrap();
+    until(10, "the member answers", || {
+        assert!(child.try_wait().unwrap().is_none(), "the member exited");
+        UnixStream::connect(&sock).is_ok() && line(&sock, &token, "ping", json!({}))["ok"] == true
+    });
+    (child, token, sock)
+}
+
+/// One line to a member's socket, `{token, id, op, ...body}`, on a fresh connection: its answer.
+pub fn line(sock: &std::path::Path, token: &str, op: &str, body: Value) -> Value {
+    let mut req = body;
+    req["token"] = token.into();
+    req["id"] = 7.into();
+    req["op"] = op.into();
+    let mut s = UnixStream::connect(sock).unwrap();
+    writeln!(s, "{req}").unwrap();
+    let mut answer = String::new();
+    BufReader::new(s).read_line(&mut answer).unwrap();
+    serde_json::from_str(&answer).unwrap_or_else(|_| panic!("{op}: {answer:?}"))
 }
