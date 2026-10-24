@@ -375,6 +375,15 @@ fn find_sessions_marks_is_this_session() {
         b["person_verified"], true,
         "this computer, as its label says"
     );
+    // `who`'s name for each, and a query by it finds just that one.
+    let name = b["name"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no name in {b}"))
+        .to_string();
+    assert!(name.starts_with("codex-"), "{name}");
+    let by_name = m.tool("find_sessions", json!({"query": name})).json();
+    assert_eq!(by_name["total"], 1, "{by_name}");
+    assert_eq!(by_name["sessions"][0]["session_id"], theirs.as_str());
     assert_eq!(b["online"], true);
     assert_eq!(b["can_send"], true);
     assert_eq!(b["needs_owner_ok"], false);

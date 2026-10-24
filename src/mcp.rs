@@ -273,9 +273,14 @@ impl Server {
         };
         for r in &mut found {
             r["is_this_session"] = (r["session_id"] == call.from.0.as_str()).into();
-            // `who`'s, for people.
+            // `who`'s name for a session on this computer (`claude-5`), as `name`.
             if let Some(o) = r.as_object_mut() {
-                o.remove("handle");
+                match o.remove("handle") {
+                    Some(Value::String(h)) if !h.is_empty() => {
+                        o.insert("name".into(), h.into());
+                    }
+                    _ => {}
+                }
             }
         }
         let total = found.len();
