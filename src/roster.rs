@@ -658,8 +658,13 @@ fn own_person(e: &Entry, claims: Option<&Proof>, vouched: bool) -> bool {
         Some(p) => p.sub == e.text("person_id") && (p.kind == ProofKind::Workspace) == cloud,
         // `vouched`: the signer of a `person` link admitting through it names the computer's
         // person — that link went to exactly that person, once (a Mac has no proof of its own).
-        // A workspace member without a proof is its own key's person, as a computer is.
-        None => e.text("person_id") == e.text("member") || (!cloud && vouched),
+        // A vouched id is an account id, never a key: the `cloud` marker is self-declared, and a
+        // key-form id is some unverified computer's own. A workspace member without a proof is
+        // its own key's person, as a computer is.
+        None => {
+            let p = e.text("person_id");
+            p == e.text("member") || (!cloud && vouched && !crate::identity::is_key(p))
+        }
     }
 }
 
@@ -1178,6 +1183,26 @@ mod tests {
         let r = log(genesis(&w));
         assert!(!r.members.contains_key(&v.key));
         assert!(!r.members.contains_key(&k.key));
+    }
+
+    #[test]
+    fn a_cloud_founder_vouches_account_ids_never_a_computers_key() {
+        let (w, x, k) = (id(), id(), id());
+        let g = crate::daemon::net_ops::solo_genesis(&w, Some("Acme"), "Acme", 1);
+        let ax = admit(&w, &g, &x.key, "x");
+        let body = json!({"ticket_id": tid(&w, "p"), "secret": "s", "mode": "person",
+            "once": true, "expires_at": 99});
+        let wl = op(&w, &ax, Kind::Link, body);
+        // The founder, marker and all, vouches K as X's own key-form id: in any case.
+        for forged in [x.key.clone(), x.key.to_uppercase()] {
+            let mut b = admit_body(&k.key, "k");
+            b["ticket_id"] = json!(tid(&w, "p"));
+            b["person_id"] = json!(forged);
+            let ak = op(&w, &wl, Kind::Admit, b);
+            let r = replay(&[g.clone(), ax.clone(), wl.clone(), ak]);
+            assert!(!r.members.contains_key(&k.key), "{forged}");
+            assert!(!r.same_person_computer(&x.key, &k.key));
+        }
     }
 
     #[test]

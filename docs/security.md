@@ -35,7 +35,11 @@ for another: a verified sign-in proof, or a workspace's cloud member admitting a
 through the one-time person link it made for that person. Only a cloud member's person link
 counts (the workspace instance that founded its network, or a cloud member with its workspace
 proof); one signed by any other member is dropped, so no member can admit a key as someone
-else's computer.
+else's computer. The founder's workspace marker is self-declared until issuer proofs ship, so a
+vouched id must be an account id (such as `user_…`) and never a member key: a hostile
+workspace-style network can only vouch account ids, which no plain computer has. A computer
+counts a message as its own person's only from itself or from a computer with the same
+account id.
 
 ### Invite codes
 
