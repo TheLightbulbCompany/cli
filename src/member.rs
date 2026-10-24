@@ -12,10 +12,9 @@ use crate::embed::{self, EmbedOpts, Instance};
 use crate::roster::MemberKind;
 use crate::Result;
 use serde_json::{json, Value};
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::broadcast::{error::RecvError, Receiver};
@@ -63,8 +62,13 @@ pub async fn run(opts: MemberOpts, token: String) -> Result<()> {
     .await?;
     let instance = Arc::new(instance);
     let _ = std::fs::remove_file(&opts.socket);
-    let listener = UnixListener::bind(&opts.socket)?;
-    std::fs::set_permissions(&opts.socket, std::fs::Permissions::from_mode(0o600))?;
+    // Created 0600, never wider for a moment: the umask is the process's, put back at once.
+    // SAFETY: umask takes a mode and cannot fail.
+    let umask = unsafe { libc::umask(0o177) };
+    let listener = UnixListener::bind(&opts.socket);
+    // SAFETY: as above.
+    unsafe { libc::umask(umask) };
+    let listener = listener?;
     let (token, stop) = (Arc::new(token), Arc::new(Notify::new()));
     let mut conns = JoinSet::new();
     loop {
@@ -89,6 +93,9 @@ pub async fn run(opts: MemberOpts, token: String) -> Result<()> {
     Ok(())
 }
 
+/// The longest line a connection reads (more is answered `unauthorized` and closed).
+const MAX_LINE: usize = 1 << 20;
+
 /// What a connection does after a line's answer.
 enum Then {
     Next,
@@ -98,13 +105,24 @@ enum Then {
 
 async fn connection(stream: UnixStream, i: Arc<Instance>, token: Arc<String>, stop: Arc<Notify>) {
     let (read, mut write) = stream.into_split();
-    let mut lines = BufReader::new(read).lines();
+    let mut read = BufReader::new(read);
+    // The line so far: `read_until` keeps what it read when the event branch wins the select.
+    let mut buf = Vec::new();
     let mut events: Option<Receiver<Value>> = None;
     loop {
         let (frame, then) = tokio::select! {
-            line = lines.next_line() => match line {
-                Ok(Some(line)) => answer(&line, &i, &token, &mut events).await,
-                _ => return,
+            n = async {
+                let room = (MAX_LINE + 1 - buf.len()) as u64;
+                (&mut read).take(room).read_until(b'\n', &mut buf).await
+            } => {
+                if buf.len() > MAX_LINE {
+                    (json!({"id": 0, "ok": false, "error": "unauthorized"}), Then::Close)
+                } else if !matches!(n, Ok(n) if n > 0) || buf.last() != Some(&b'\n') {
+                    return; // closed (or an error), with no whole line left
+                } else {
+                    let line = String::from_utf8(std::mem::take(&mut buf)).unwrap_or_default();
+                    answer(&line, &i, &token, &mut events).await
+                }
             },
             event = async { events.as_mut().unwrap().recv().await }, if events.is_some() => {
                 match event {

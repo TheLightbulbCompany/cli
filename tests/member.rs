@@ -7,6 +7,7 @@ use common::{identity, line, member, until, Peer};
 use iroh::endpoint::VarInt;
 use lightbulb::identity::Identity;
 use lightbulb::net::frames::Frame;
+use lightbulb::net::SUPERSEDED;
 use lightbulb::roster::{self, Entry, Kind};
 use lightbulb::store::Store;
 use serde_json::{json, Value};
@@ -150,7 +151,21 @@ fn a_line_without_the_token_is_refused_and_closed() {
         let mut more = String::new();
         assert_eq!(r.read_line(&mut more).unwrap_or(0), 0, "{more}");
     }
+    // A line longer than 1 MiB is not read to its end: refused and closed.
+    let mut s = UnixStream::connect(&sock).unwrap();
+    let long = format!(
+        "{{\"token\": \"{token}\", \"pad\": \"{}\"}}\n",
+        "x".repeat(2 << 20)
+    );
+    let _ = s.write_all(long.as_bytes()); // the member may close before it is all written
+    let mut answer = String::new();
+    BufReader::new(s).read_line(&mut answer).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&answer).unwrap()["error"],
+        "unauthorized"
+    );
     assert_eq!(ok(&sock, &token, "ping", json!({})), json!({}));
+    // SAFETY: kill takes a pid and a signal; the pid is our own live child's.
     unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
     exits_zero(child);
 }
@@ -173,6 +188,7 @@ fn status_answers_as_an_instance_and_shutdown_is_refused() {
     assert_eq!(r["error"], "unsupported", "{r}");
     // Still running: SIGTERM stops it, exit 0, with its snapshot.
     assert_eq!(ok(&sock, &token, "ping", json!({})), json!({}));
+    // SAFETY: kill takes a pid and a signal; the pid is our own live child's.
     unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
     exits_zero(child);
     assert!(dir.path().join("last.db").is_file());
@@ -182,13 +198,24 @@ fn status_answers_as_an_instance_and_shutdown_is_refused() {
 async fn an_early_message_to_a_declared_session_is_kept() {
     let dir = tempfile::tempdir().unwrap();
     let a = seed(dir.path());
-    let (child, token, sock) = member(dir.path(), friday());
+    // A bad name and a second friday are skipped: the member starts with friday declared.
+    let mut sessions = friday();
+    let list = sessions.as_array_mut().unwrap();
+    list.push(json!({"name": "Not a name!", "agent": "hermes"}));
+    list.push(json!({"name": "friday", "agent": "other"}));
+    let (child, token, sock) = member(dir.path(), sessions);
     // No `cloud.sessions.set`: the sessions file declared friday before the member started.
     let (mut pa, _ep) = dial(&sock, &token, &a).await;
     let to = format!("{}/friday", short(&sock, &token));
     assert_eq!(send(&mut pa, &a, &to, "early").await.1, "stored");
     let ghost = format!("{}/ghost", short(&sock, &token));
     assert_eq!(send(&mut pa, &a, &ghost, "nobody").await.1, "refused");
+    let peek = ok(&sock, &token, "inbox.peek", json!({}));
+    assert_eq!(peek["sessions"][0]["session"], "friday", "{peek}");
+    // Friday's agent was removed: its mail stays with the engine, off the peek.
+    ok(&sock, &token, "cloud.sessions.set", json!({"sessions": []}));
+    let peek = ok(&sock, &token, "inbox.peek", json!({}));
+    assert_eq!(peek["sessions"], json!([]), "{peek}");
     ok(&sock, &token, "stop", json!({}));
     exits_zero(child);
 }
@@ -295,6 +322,8 @@ async fn stop_writes_the_snapshot_outside_the_home() {
     );
 }
 
+// The test plays A's computer closing our link as SUPERSEDED, as it does when a second
+// connection from this member's key replaces it (accepted by ruling over dialing twice).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_second_connection_with_this_key_emits_superseded() {
     let dir = tempfile::tempdir().unwrap();
@@ -322,7 +351,7 @@ async fn a_second_connection_with_this_key_emits_superseded() {
     until(10, "A is online", || {
         ok(&sock, &token, "status", json!({}))["peers"]["online"] == 1
     });
-    pa.conn.close(VarInt::from_u32(2), b"superseded");
+    pa.conn.close(VarInt::from_u32(SUPERSEDED), b"superseded");
     let short = a.short.clone();
     let seen = tokio::task::spawn_blocking(move || loop {
         let mut l = String::new();
@@ -338,6 +367,43 @@ async fn a_second_connection_with_this_key_emits_superseded() {
     .unwrap()
     .expect("a superseded event");
     assert_eq!(seen["by_peer"], short.as_str(), "{seen}");
+    ok(&sock, &token, "stop", json!({}));
+    exits_zero(child);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delivered_record_left_unread_past_its_ttl_expires() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = seed(dir.path());
+    let (child, token, sock) = member(dir.path(), friday());
+    let (mut pa, _ep) = dial(&sock, &token, &a).await;
+    let to = format!("{}/friday", short(&sock, &token));
+    let (id, _) = send(&mut pa, &a, &to, "a turn that always fails").await;
+    let ack = json!({"session": "friday", "record": id, "stage": "delivered"});
+    ok(&sock, &token, "inbox.ack", ack);
+    ok(&sock, &token, "stop", json!({}));
+    exits_zero(child);
+    // Delivered more than `outbox::TTL_S` ago, never read.
+    let db = dir.path().join("home/state.db");
+    let c = rusqlite::Connection::open(&db).unwrap();
+    let old = format!("updated_at - {}", lightbulb::outbox::TTL_S + 10);
+    c.execute(
+        &format!("UPDATE receipts SET updated_at = {old} WHERE state = 'delivered'"),
+        [],
+    )
+    .unwrap();
+    drop(c);
+    let (child, token, sock) = member(dir.path(), friday());
+    let peek = ok(&sock, &token, "inbox.peek", json!({}));
+    assert_eq!(peek["sessions"], json!([]), "{peek}");
+    let sql = format!(
+        "SELECT COUNT(*) FROM receipts r JOIN messages m ON m.from_key = r.from_key \
+         AND m.request_id = r.request_id WHERE m.id = '{id}' AND r.state = 'expired' \
+         AND m.body IS NULL"
+    );
+    until(10, "the receipt reads expired", || {
+        common::count(&db, &sql) == 1
+    });
     ok(&sock, &token, "stop", json!({}));
     exits_zero(child);
 }

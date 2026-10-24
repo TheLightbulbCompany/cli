@@ -108,6 +108,31 @@ pub fn key_mismatch(dir: &Path) -> Result<bool> {
     ))
 }
 
+/// The sessions of `list` that `cloud.sessions.set` would take, one by one: a name that is not
+/// valid (or is there twice) is skipped and logged, and only the first `presence::MAX` are
+/// kept, so one bad entry does not keep the whole workspace off the network.
+fn declarable(short: &str, list: &[Value]) -> Vec<net::frames::Remote> {
+    let mut kept: Vec<net::frames::Remote> = vec![];
+    for s in list {
+        match net_ops::remotes(short, std::slice::from_ref(s)) {
+            Some(r) if !kept.iter().any(|k| k.session_id == r[0].session_id) => kept.extend(r),
+            _ => eprintln!(
+                "sessions: skipped {} (not a valid session, or declared twice)",
+                s["name"]
+            ),
+        }
+    }
+    if kept.len() > presence::MAX {
+        eprintln!(
+            "sessions: kept the first {} of {}",
+            presence::MAX,
+            kept.len()
+        );
+        kept.truncate(presence::MAX);
+    }
+    kept
+}
+
 /// The start path the daemon and an instance share, under `dir`'s lock (the caller's):
 /// identity, store, the solo genesis on first start, the team, the transport and the presence
 /// sender. A `cloud` instance (its workspace's name, the home lock it keeps and the sessions it
@@ -123,8 +148,7 @@ pub(crate) async fn boot(
         None => (None, None, vec![]),
     };
     let identity = Identity::load_or_create(dir)?;
-    let declared = net_ops::remotes(&identity.short, &declared)
-        .ok_or("the declared sessions are not valid")?;
+    let declared = declarable(&identity.short, &declared);
     let store = Store::open(&dir.join("state.db"))?;
     let now = ipc::now() as i64;
     // The solo network's genesis, written once: a computer that has a roster keeps it.
@@ -316,8 +340,10 @@ pub(crate) fn peek(id: u64, d: &Daemon) -> Response {
         let now = ipc::now();
         let mut out: Vec<Group> = vec![];
         let mut push = |m: store::Message, stage| {
+            // Declared sessions only: mail for an agent since removed stays with the engine.
+            let declared = d.cloud.as_ref().is_some_and(|c| c.declares(&m.to_key));
             let name = m.to_key.split_once('/').map(|(_, n)| n.to_string());
-            let Some(name) = name.filter(|n| sessions::valid_name(n)) else {
+            let Some(name) = name.filter(|_| declared) else {
                 return;
             };
             match out.iter_mut().find(|(n, _)| *n == name) {
@@ -325,7 +351,7 @@ pub(crate) fn peek(id: u64, d: &Daemon) -> Response {
                 None => out.push((name, vec![(m, stage)])),
             }
         };
-        for m in mail::delivered_unread(&store, short)? {
+        for m in mail::delivered_unread(&store, short, now)? {
             push(m, "delivered");
         }
         for key in mail::waiting_keys(&store, now)? {

@@ -47,7 +47,8 @@ const MAX_PENDING: usize = 10_000;
 const JOIN_WAIT: Duration = Duration::from_secs(600);
 
 const NOT_MEMBER: u32 = 1;
-const SUPERSEDED: u32 = 2;
+/// The close code of a link that another connection from the same member replaced.
+pub const SUPERSEDED: u32 = 2;
 
 /// The debug knobs, read once (`Peers::knobs`); release builds take the defaults.
 pub struct Knobs {
@@ -884,7 +885,8 @@ impl Net {
             }
         }
         // The peer took another connection from our key in this one's place: for a workspace's
-        // sidecar, another process holding its key (the bridge counts these).
+        // sidecar, another process holding its key (the bridge counts these). A computer
+        // daemon's event subscribers get it too, and ignore it like any event they do not know.
         if let Some(iroh::endpoint::ConnectionError::ApplicationClosed(c)) = conn.close_reason() {
             if c.error_code == VarInt::from_u32(SUPERSEDED) {
                 let e = serde_json::json!({ "event": "superseded", "by_peer": short(&key) });
@@ -1112,6 +1114,10 @@ fn flush(d: &Daemon, all: bool, expire: bool) -> Result<()> {
     let store = d.store.lock().unwrap();
     if expire {
         mail::expire(&store, now)?;
+        // An instance's delivered-unread mail (`inbox.peek` hands it out until it is read).
+        if d.cloud.is_some() {
+            mail::expire_delivered(&store, &d.identity.short, now)?;
+        }
         for id in outbox::expire(&store, now, d.peers.knobs().outbox_s)? {
             receipt_changed(d, &id, State::Expired.name(), Some("unreachable"));
         }
