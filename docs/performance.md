@@ -55,7 +55,7 @@ join takes about 0.1 s, and the full mesh connects about 0.1 s after the last jo
 results look wrong. First, a message arrives in about 7 ms and is taken in about 7 ms, but
 the sender reads `delivered` only about 1 s later. The cause is the 1 s poll in `flush_loop`
 (`src/net/mod.rs`, which already has a `ponytail:` note): it sends the `delivered` receipt
-back to the sender, and nothing wakes it. If `mail` woke that loop when a receipt is
+back to the sender, and nothing wakes it. If taking a message woke that loop when a receipt is
 queued, the round trip would drop to about 15 ms. Second, the median directory refresh is
 the 250 ms presence coalesce (`src/presence.rs`, `COALESCE`). But the p95 is 0.8 to 1 s in
 each run, and this is not explained. The directory from a few computers comes one or more

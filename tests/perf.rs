@@ -39,7 +39,11 @@ impl Drop for Team {
         while Instant::now() < deadline && pids.iter().any(|&p| unsafe { libc::kill(p, 0) } == 0) {
             std::thread::sleep(Duration::from_millis(50));
         }
-        for p in pids {
+        // Only the ones still alive: a pid that already exited may have been reused.
+        for p in pids
+            .into_iter()
+            .filter(|&p| unsafe { libc::kill(p, 0) } == 0)
+        {
             unsafe { libc::kill(p, libc::SIGKILL) };
         }
     }
