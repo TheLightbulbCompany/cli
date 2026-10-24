@@ -79,7 +79,7 @@ pub struct Knobs {
     /// How long the outbox keeps trying (`outbox::TTL_S`), or `LIGHTBULB_CONNECT_DEBUG_OUTBOX_S`.
     outbox_s: u64,
     /// `LIGHTBULB_CONNECT_DEBUG_RELAY_ONLY=1`: no direct (IP) transport, only the relays.
-    relay_only: bool,
+    pub(crate) relay_only: bool,
     /// `LIGHTBULB_CONNECT_DEBUG_NO_DEFAULT_RELAYS=1`: no public relays when nothing else is
     /// set (direct only), so a test never reaches the internet.
     no_default_relays: bool,
@@ -1424,7 +1424,7 @@ pub(crate) fn pages(entries: Vec<Entry>) -> Vec<Frame> {
 
 /// Relay `url`: iroh's own config for one of its public relays (QUIC address discovery on);
 /// any other without it (off in Phase 1: our relays serve HTTPS only).
-fn relay_config(url: RelayUrl) -> iroh::RelayConfig {
+pub(crate) fn relay_config(url: RelayUrl) -> iroh::RelayConfig {
     let public = iroh::defaults::prod::default_relay_map().get(&url);
     public.map_or_else(|| iroh::RelayConfig::new(url, None), |c| (*c).clone())
 }

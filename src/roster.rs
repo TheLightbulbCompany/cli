@@ -202,7 +202,8 @@ fn wake_host(rest: &str) -> bool {
 impl Wake {
     /// A `meta` body's `wake`: an https URL of printable ASCII with no space or quote, whose
     /// host is a public-looking DNS name (`wake_host`), and a token of `[A-Za-z0-9._-]` (it is
-    /// written into curl's config, never a command line).
+    /// written into curl's config, never a command line). A DNS name that resolves to a private
+    /// address is not filtered (accepted: only a member's own signed `meta` supplies it).
     pub fn parse(v: &Value) -> Option<Wake> {
         let (url, token) = (v["url"].as_str()?, v["token"].as_str()?);
         let url_ok = url.strip_prefix("https://").is_some_and(wake_host)

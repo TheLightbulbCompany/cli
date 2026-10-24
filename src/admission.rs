@@ -29,6 +29,8 @@ use tokio::sync::oneshot;
 pub const NOT_OPEN: &str = "not_open";
 pub const ALREADY_IN_TEAM: &str = "already_in_team";
 pub const BAD_TICKET: &str = "bad_ticket";
+/// A code that is no code, or that no inviter serves (wrong, used, or the inviter is off).
+pub const NO_CODE: &str = "no_code";
 pub const EXPIRED_TICKET: &str = "expired_ticket";
 pub const NAME_TAKEN: &str = "name_taken";
 pub const KEY_COLLISION: &str = "key_collision";
@@ -864,9 +866,10 @@ enum Outcome {
 /// team, online}`. Only a solo computer joins; it asks the ticket's members in order, one at a
 /// time, carrying `proof` (else this computer's own sign-in proof, if any).
 pub async fn join(id: u64, body: &Value, d: &Arc<Daemon>) -> Response {
-    let Some(link) = body["ticket"].as_str() else {
+    let (ticket_in, code_in) = (body["ticket"].as_str(), body["code"].as_str());
+    if ticket_in.is_some() == code_in.is_some() {
         return Response::err(id, BAD_REQUEST);
-    };
+    }
     let Ok(_joining) = d.joining.try_lock() else {
         return Response::err(id, BAD_REQUEST);
     };
@@ -900,11 +903,28 @@ pub async fn join(id: u64, body: &Value, d: &Arc<Daemon>) -> Response {
     if !fits(&name) || !fits(&computer) {
         return done("refused", Some(BAD_NAME), "", 0);
     }
-    let Ok(t) = ticket::decode(link) else {
-        return done("refused", Some(BAD_TICKET), "", 0);
-    };
     let Some(ep) = d.peers.endpoint.get() else {
         return Response::err(id, INTERNAL);
+    };
+    // A code stands for the ticket its inviter serves once; wrong, used and offline look the same.
+    let fetched;
+    let link = match (ticket_in, code_in) {
+        (Some(link), _) => link,
+        (_, Some(code)) => {
+            let ticket = match crate::code::normalize(code) {
+                Some(code) => crate::code::fetch(d, ep, &code).await,
+                None => None,
+            };
+            let Some(ticket) = ticket else {
+                return done("refused", Some(NO_CODE), "", 0);
+            };
+            fetched = ticket;
+            &fetched
+        }
+        _ => return Response::err(id, BAD_REQUEST),
+    };
+    let Ok(t) = ticket::decode(link) else {
+        return done("refused", Some(BAD_TICKET), "", 0);
     };
     // Its proof: the one given (the workspace member's), else this computer's sign-in.
     let token = body["proof"].as_str().map(String::from).or_else(|| {

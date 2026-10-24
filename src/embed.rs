@@ -234,6 +234,7 @@ pub(crate) async fn boot(
         answered_by: Mutex::default(),
         roster_changed: Default::default(),
         joining: tokio::sync::Mutex::new(()),
+        codes: Mutex::default(),
         presence: Default::default(),
         built: Mutex::default(),
         latest: Mutex::new(latest),

@@ -87,6 +87,8 @@ pub struct Daemon {
     pub roster_changed: Notify,
     /// Held while a `team.join` runs: one at a time.
     pub joining: tokio::sync::Mutex<()>,
+    /// The live invite-code listeners (`code`), at most a few.
+    pub codes: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     /// Poked on a local session change: the presence sender (`presence::run`) looks again.
     pub presence: Notify,
     /// The presence last built (`presence::run`), sent stamped after each `hello`.

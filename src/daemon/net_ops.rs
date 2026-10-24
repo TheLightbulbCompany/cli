@@ -674,6 +674,7 @@ impl TeamOps<'_> {
                 Response::ok(
                     id,
                     json!({"line": ticket::join_line(&s), "app_link": ticket::app_link(&s),
+                        "link": ticket::web_link(&s),
                         "ticket": s, "expires_at": t.expires_at, "replaced": replaced}),
                 )
             }
