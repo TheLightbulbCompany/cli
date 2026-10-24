@@ -81,6 +81,7 @@ impl Net {
     fn mcp_named(&self, as_: &os::Process, name: Option<&str>) -> Mcp {
         let mut child = Command::new(EXE)
             .arg("mcp")
+            .env("LIGHTBULB_CONNECT_DEBUG_NO_TELEMETRY", "1")
             .args(name.map(|n| ["--server-name", n]).into_iter().flatten())
             .env(paths::HOME_ENV, self.dir.path())
             .env("LIGHTBULB_CONNECT_CLAUDE_HOME", self.claude.path())

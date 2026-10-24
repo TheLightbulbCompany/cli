@@ -1140,7 +1140,9 @@ fn parse_version(v: &str) -> Option<(u64, u64, u64)> {
 /// `curl -fsSL url` (with `-I`: the headers only); its stdout, or an error naming the URL.
 fn curl(url: &str, head: bool) -> Result<Vec<u8>> {
     let mut c = Command::new("curl");
-    c.arg(if head { "-fsSI" } else { "-fsSL" }).arg(url);
+    c.arg("-q")
+        .arg(if head { "-fsSI" } else { "-fsSL" })
+        .arg(url);
     let out = c.output().map_err(|e| format!("curl: {e}"))?;
     if !out.status.success() {
         return Err(format!("Could not download {url}; nothing changed.").into());
