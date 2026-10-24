@@ -460,6 +460,14 @@ fn try_admit(
         }
         body["person_id"] = c.sub.clone().into();
         body["proof"] = c.token.clone().into();
+    } else if own_person_link(d, req) {
+        // A person link we minted IS the proof of who this computer belongs to: the backend
+        // handed it to exactly that person, once. Without this the PEOPLE accept row below is
+        // keyed by their id while the member's person_id would be the computer's own key, and
+        // their first message to a cloud agent would be held.
+        if let Some(p) = req.ticket.person.as_deref() {
+            body["person_id"] = p.into();
+        }
     }
     if let Err(e) = net_ops::write(d, team, store, Kind::Admit, body, now) {
         eprintln!("join: J{n}: {e}");

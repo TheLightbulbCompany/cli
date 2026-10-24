@@ -462,7 +462,10 @@ fn pass(
                         .any(|m| m.kind == MemberKind::Cloud && m.person_id == e.text("person_id"));
                 let kind_ok = (elevated || !cloud) && !taken;
                 let authorised = elevated || via_link() || same_person;
-                if authorised && kind_ok && !collides && role_ok && own_person(e, claims) {
+                // The signer of a `person` link admitting through it vouches for the person it
+                // minted the link for (the backend handed that link to exactly that person).
+                let vouched = link.is_some_and(|(_, l)| l.mode == "person" && l.signer == e.signer);
+                if authorised && kind_ok && !collides && role_ok && own_person(e, claims, vouched) {
                     r.members
                         .insert(target, new_member(e, Role::Member, claims));
                     if let Some((lh, _)) = link.filter(|(_, l)| l.once) {
@@ -633,11 +636,13 @@ fn take(
 /// An `admit` names the member's own key as its `person_id`, or the `sub` of its verified
 /// proof (the one way to claim another id); a cloud member's needs a `workspace` proof, a
 /// computer's a `computer` one when it has any.
-fn own_person(e: &Entry, claims: Option<&Proof>) -> bool {
+fn own_person(e: &Entry, claims: Option<&Proof>, vouched: bool) -> bool {
     let cloud = e.text("kind") == "cloud";
     match claims {
         Some(p) => p.sub == e.text("person_id") && (p.kind == ProofKind::Workspace) == cloud,
-        None => !cloud && e.text("person_id") == e.text("member"),
+        // `vouched`: the signer of a `person` link admitting through it names the computer's
+        // person — that link went to exactly that person, once (a Mac has no proof of its own).
+        None => !cloud && (e.text("person_id") == e.text("member") || vouched),
     }
 }
 
@@ -649,7 +654,7 @@ fn proven(e: &Entry) -> Option<Proof> {
 
 fn is_genesis(e: &Entry, claims: Option<&Proof>) -> bool {
     e.kind == Kind::Admit
-        && own_person(e, claims)
+        && own_person(e, claims, false)
         && e.text("role") == "founder"
         && e.text("member") == e.signer
         && e.signer.get(..12).is_some()
