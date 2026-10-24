@@ -1075,6 +1075,7 @@ fn daemon_install_adds_local_bin_to_the_zsh_profile_once() {
         e.cmd(&["daemon", "--install"])
             .env("SHELL", "/bin/zsh")
             .env("PATH", "/usr/bin:/bin")
+            .env("LIGHTBULB_CONNECT_DEBUG_TTY", "1")
             .output()
             .unwrap()
     };
@@ -1093,4 +1094,33 @@ fn daemon_install_adds_local_bin_to_the_zsh_profile_once() {
     );
     assert!(run().status.success());
     assert_eq!(std::fs::read_to_string(&zshrc).unwrap(), once);
+}
+
+/// No person at a terminal (an update, the daemon's setup refresh, a pipe): the profile is not
+/// touched, and setup says which line to add. Nor is a symlinked profile written through.
+#[cfg(target_os = "macos")]
+#[test]
+fn setup_off_a_terminal_or_on_a_symlinked_profile_leaves_the_profile_alone() {
+    let e = Env::new();
+    let run = |tty: bool| {
+        let mut c = e.cmd(&["daemon", "--install"]);
+        c.env("SHELL", "/bin/zsh").env("PATH", "/usr/bin:/bin");
+        if tty {
+            c.env("LIGHTBULB_CONNECT_DEBUG_TTY", "1");
+        }
+        c.output().unwrap()
+    };
+    let advice = "Add this line to ~/.zshrc, then open a new terminal: export PATH=";
+    let zshrc = e.home.path().join(".zshrc");
+    let o = run(false);
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(out(&o).contains(advice), "{}", out(&o));
+    assert!(!zshrc.exists());
+    let dotfiles = e.home.path().join("dotfiles-zshrc");
+    std::fs::write(&dotfiles, "# mine\n").unwrap();
+    std::os::unix::fs::symlink(&dotfiles, &zshrc).unwrap();
+    let o = run(true);
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(out(&o).contains(advice), "{}", out(&o));
+    assert_eq!(std::fs::read_to_string(&dotfiles).unwrap(), "# mine\n");
 }

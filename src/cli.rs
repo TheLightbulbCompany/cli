@@ -23,6 +23,8 @@ const NO_SERVICE: &str = "Lightbulb's background service is macOS-only; run ligh
 const NO_LAUNCHCTL: &str = "LIGHTBULB_CONNECT_NO_LAUNCHCTL";
 /// Names a session the invocation speaks as (nothing sets it yet).
 const SESSION_ENV: &str = "LIGHTBULB_CONNECT_SESSION";
+/// (tests) Treat stdout as a terminal: a person at it (`install_running`).
+const TTY_ENV: &str = "LIGHTBULB_CONNECT_DEBUG_TTY";
 
 /// A "(tests)" environment override: read in debug builds only, as `net::Knobs::read` does.
 fn test_env(name: &str) -> Option<std::ffi::OsString> {
@@ -1108,8 +1110,9 @@ fn relay_host(url: &str) -> String {
 
 /// Puts this executable at the canonical path (unless it is already there with the same
 /// bytes) and `~/.local/bin/lightbulb` at that, replacing any link there; a regular file there
-/// is left alone. Returns what to say.
-pub fn install_alias(home: &Path, exe: &Path) -> Result<String> {
+/// is left alone. Returns what to say; only a person's own run (`person`) edits their shell
+/// profile (`command_lines`).
+pub fn install_alias(home: &Path, exe: &Path, person: bool) -> Result<String> {
     let canon = canonical(home);
     if exe != canon {
         let same = fs::read(&canon)
@@ -1128,10 +1131,10 @@ pub fn install_alias(home: &Path, exe: &Path) -> Result<String> {
     let short = home.join(".local/bin/lightbulb");
     match short_link(home) {
         Link::File => Ok("~/.local/bin/lightbulb belongs to another program and was left alone; put ~/.lightbulb/connect/bin on your PATH to type lightbulb.".into()),
-        Link::Ours => Ok(command_lines(home)),
+        Link::Ours => Ok(command_lines(home, person)),
         _ => {
             relink(&short, &canon)?;
-            Ok(command_lines(home))
+            Ok(command_lines(home, person))
         }
     }
 }
@@ -1270,7 +1273,7 @@ fn install_release(home: &Path, base: &str, tag: &str) -> Result<bool> {
                 verify_signature(&new)?;
             }
         }
-        install_alias(home, &new)?;
+        install_alias(home, &new, false)?;
         Ok(true)
     })();
     let _ = fs::remove_dir_all(&dir);
@@ -1414,7 +1417,8 @@ pub fn update(version: Option<String>) -> Result<i32> {
 /// `Command: lightbulb`. When `~/.local/bin` is not on this shell's PATH (a fresh Mac: the curl
 /// install lands there and nothing else puts it on PATH), the PATH line is added to the login
 /// shell's profile once, in a marked block, and the person is told to open a new terminal.
-fn command_lines(home: &Path) -> String {
+/// Only on a `person`'s own run: an update or the daemon only says which line to add.
+fn command_lines(home: &Path, person: bool) -> String {
     let bin = home.join(".local/bin");
     let on_path =
         std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d == bin));
@@ -1426,14 +1430,15 @@ fn command_lines(home: &Path) -> String {
         "~/{}",
         profile.strip_prefix(home).unwrap_or(&profile).display()
     );
-    match add_to_path(&profile) {
-        Ok(()) => format!(
+    if person && add_to_path(&profile).is_ok() {
+        format!(
             "Command: lightbulb (added ~/.local/bin to your PATH in {shown}; open a new terminal, or run {} now)",
             canonical(home).display()
-        ),
-        Err(_) => format!(
+        )
+    } else {
+        format!(
             "Command: lightbulb\nAdd this line to {shown}, then open a new terminal: {PATH_LINE}"
-        ),
+        )
     }
 }
 
@@ -1453,8 +1458,12 @@ fn shell_profile(home: &Path) -> PathBuf {
     home.join(name)
 }
 
-/// Appends the marked PATH block to `profile` unless it already mentions `.local/bin`.
+/// Appends the marked PATH block to `profile` unless it already mentions `.local/bin`; never
+/// through a symlink (a dotfiles repo's file is the person's to edit).
 fn add_to_path(profile: &Path) -> Result<()> {
+    if fs::symlink_metadata(profile).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err("a symlinked profile".into());
+    }
     let had = fs::read_to_string(profile).unwrap_or_default();
     if had.contains(PATH_MARK) || had.contains(".local/bin") {
         return Ok(());
@@ -1527,10 +1536,13 @@ fn plist(exe: &Path, log: &Path) -> String {
     )
 }
 
-/// Puts the running binary at the canonical path and the alias at that, printing the line.
+/// Puts the running binary at the canonical path and the alias at that, printing the line; a
+/// person at a terminal may get the PATH line added to their profile.
 pub fn install_running(home: &Path) -> Result<()> {
+    use std::io::IsTerminal;
     let exe = std::env::current_exe()?.canonicalize()?;
-    println!("{}", install_alias(home, &exe)?);
+    let person = std::io::stdout().is_terminal() || test_env(TTY_ENV).is_some();
+    println!("{}", install_alias(home, &exe, person)?);
     Ok(())
 }
 
