@@ -153,7 +153,7 @@ pub struct Roster {
 /// Where a computer rings a parked founder awake (`net`'s doorbell): `POST url` with
 /// `Authorization: Bearer <token>`. The URL carries no secret; the token is never logged
 /// (`Debug` hides it).
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct Wake {
     pub url: String,
     pub token: String,

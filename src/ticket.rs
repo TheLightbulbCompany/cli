@@ -1,7 +1,7 @@
 //! Invite tickets: a signed, base64url JSON naming a roster `link`, carried in the join line.
 
 use crate::identity::{self, canonical, Identity};
-use crate::roster::{Role, Roster};
+use crate::roster::{Role, Roster, Wake};
 use crate::Result;
 use data_encoding::{BASE64URL_NOPAD, HEXLOWER};
 use serde::{Deserialize, Serialize};
@@ -38,6 +38,10 @@ pub struct Ticket {
     /// the link admits their computer. Absent from other tickets.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub person: Option<String>,
+    /// A workspace member's doorbell (its roster `wake`): a joiner that reaches no member rings
+    /// it and keeps dialing while the workspace wakes. Absent from a computer's tickets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake: Option<Wake>,
     pub sig: String,
 }
 
@@ -104,6 +108,7 @@ pub fn sign(
         members,
         expires_at,
         person: None,
+        wake: None,
         sig: String::new(),
     };
     t.sig = id.sign(&value(&t));
@@ -260,6 +265,26 @@ mod tests {
         let mut wrong = t;
         wrong.secret = "guess".into();
         assert!(verify(&wrong, &r).is_err());
+    }
+
+    #[test]
+    fn a_tickets_wake_is_covered_by_the_signature() {
+        let (_, x, r, t) = team("person", true);
+        let w = Wake {
+            url: "https://example.test/api/v1/network/wake".into(),
+            token: "org_1.abc".into(),
+        };
+        let mut added = t.clone();
+        added.wake = Some(w.clone());
+        assert!(
+            !signed_by_inviter(&added),
+            "an added wake breaks the signature"
+        );
+        let signed = for_person(&x, added, "user_1");
+        assert!(signed_by_inviter(&signed));
+        verify(&signed, &r).unwrap();
+        assert_eq!(decode(&encode(&signed)).unwrap().wake, Some(w));
+        assert_eq!(t.wake, None);
     }
 
     #[test]

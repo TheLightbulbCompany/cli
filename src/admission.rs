@@ -62,6 +62,8 @@ const REASONS: &[&str] = &[
 
 /// A dial, a first frame, a `roster` page, the goodbye: each gets this long.
 const STEP: Duration = Duration::from_secs(10);
+/// Between dial rounds while a rung workspace wakes.
+const WAKE_RETRY: Duration = Duration::from_secs(5);
 /// How long a member's silence on a join request means it is asking its person.
 const ASKING: Duration = Duration::from_secs(1);
 /// Open requests at once: per team, per inviter, per candidate.
@@ -908,49 +910,72 @@ pub async fn join(id: u64, body: &Value, d: &Arc<Daemon>) -> Response {
         d.peers
             .learn(&d.dir, &t.inviter, inviter_addrs.clone(), &team.roster);
     }
-    for m in t.members.iter().filter(|m| *m != me) {
-        let Some(mut addr) = d.peers.addr(m) else {
-            continue;
-        };
-        // The inviter's relay, before this computer knows its own list (an https one only).
-        if let Some(u) = crate::relay::parse(&t.relay_hint) {
-            addr = addr.with_relay_url(u);
-        }
-        let Ok(Ok(conn)) = tokio::time::timeout(STEP, ep.connect(addr, JOIN_ALPN)).await else {
-            eprintln!("join: dial {} failed", net::short(m));
-            continue;
-        };
-        let outcome = attempt(d, &conn, &req, m, &t).await;
-        conn.close(VarInt::from_u32(0), b"");
-        match outcome {
-            Outcome::Next(r) => last = r.or(last),
-            Outcome::Refused(NOT_ANSWERED) => return done("waiting", None, "", 0),
-            Outcome::Refused(r) => return done("refused", Some(r), "", 0),
-            Outcome::Admitted => {
-                eprintln!("join: admitted by {}", net::short(m));
-                // Kept again now the inviter is a member: a roster change while the request
-                // waited pruned what the ticket gave (the inviter was no member then), and
-                // with no relay and no mDNS it is the one way to reach the team.
-                {
-                    let team = d.team.lock().unwrap();
-                    d.peers
-                        .learn(&d.dir, &t.inviter, inviter_addrs.clone(), &team.roster);
-                }
-                d.peers.changed.notify_one();
-                // The dial loop connects to the team; give it a moment for the count.
-                let _ = tokio::time::timeout(Duration::from_secs(5), async {
-                    loop {
-                        let hello = d.peers.connected.notified();
-                        if !d.peers.online().is_empty() {
-                            return;
-                        }
-                        hello.await;
-                    }
-                })
-                .await;
-                let team = d.team.lock().unwrap().roster.team_name.clone();
-                return done("admitted", None, &team, d.peers.online().len() + 1);
+    // A workspace member's ticket carries its doorbell: when no member answers, ring it once
+    // and keep dialing while the workspace wakes (`join_waking`, for the CLI). The ticket is
+    // its inviter's (checked above); the wake is re-parsed so a ticket cannot hand curl
+    // anything `Wake::parse` refuses. A workspace member never rings.
+    let mut wake = t
+        .wake
+        .as_ref()
+        .filter(|_| d.cloud.is_none())
+        .and_then(|w| crate::roster::Wake::parse(&json!({"url": w.url, "token": w.token})));
+    let mut until: Option<tokio::time::Instant> = None;
+    loop {
+        for m in t.members.iter().filter(|m| *m != me) {
+            let Some(mut addr) = d.peers.addr(m) else {
+                continue;
+            };
+            // The inviter's relay, before this computer knows its own list (an https one only).
+            if let Some(u) = crate::relay::parse(&t.relay_hint) {
+                addr = addr.with_relay_url(u);
             }
+            let Ok(Ok(conn)) = tokio::time::timeout(STEP, ep.connect(addr, JOIN_ALPN)).await else {
+                eprintln!("join: dial {} failed", net::short(m));
+                continue;
+            };
+            let outcome = attempt(d, &conn, &req, m, &t).await;
+            conn.close(VarInt::from_u32(0), b"");
+            match outcome {
+                Outcome::Next(r) => last = r.or(last),
+                Outcome::Refused(NOT_ANSWERED) => return done("waiting", None, "", 0),
+                Outcome::Refused(r) => return done("refused", Some(r), "", 0),
+                Outcome::Admitted => {
+                    eprintln!("join: admitted by {}", net::short(m));
+                    // Kept again now the inviter is a member: a roster change while the request
+                    // waited pruned what the ticket gave (the inviter was no member then), and
+                    // with no relay and no mDNS it is the one way to reach the team.
+                    {
+                        let team = d.team.lock().unwrap();
+                        d.peers
+                            .learn(&d.dir, &t.inviter, inviter_addrs.clone(), &team.roster);
+                    }
+                    d.peers.changed.notify_one();
+                    // The dial loop connects to the team; give it a moment for the count.
+                    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+                        loop {
+                            let hello = d.peers.connected.notified();
+                            if !d.peers.online().is_empty() {
+                                return;
+                            }
+                            hello.await;
+                        }
+                    })
+                    .await;
+                    let team = d.team.lock().unwrap().roster.team_name.clone();
+                    return done("admitted", None, &team, d.peers.online().len() + 1);
+                }
+            }
+        }
+        if last.is_none() {
+            if let Some(w) = wake.take() {
+                let _ = d.events.send(json!({"event": "join_waking"}));
+                net::doorbell(w, net::short(&t.inviter).to_string()).await;
+                until = Some(tokio::time::Instant::now() + d.peers.knobs().wake_wait);
+            }
+        }
+        match until {
+            Some(u) if tokio::time::Instant::now() < u => tokio::time::sleep(WAKE_RETRY).await,
+            _ => break,
         }
     }
     done("refused", Some(last.unwrap_or(UNREACHABLE)), "", 0)

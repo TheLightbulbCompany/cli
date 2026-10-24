@@ -45,6 +45,9 @@ const REDIAL: Duration = Duration::from_secs(30);
 /// Entries one connection may hold waiting for their parents.
 const MAX_PENDING: usize = 10_000;
 const JOIN_WAIT: Duration = Duration::from_secs(600);
+/// How long a join keeps dialing after it rang a parked workspace's doorbell: the microVM's
+/// cold start (~55 s) plus the member's own start.
+const WAKE_WAIT: Duration = Duration::from_secs(150);
 
 const NOT_MEMBER: u32 = 1;
 /// The close code of a link that another connection from the same member replaced.
@@ -65,6 +68,9 @@ pub struct Knobs {
     /// How long a join request waits for its person (600 s), or
     /// `LIGHTBULB_CONNECT_DEBUG_JOIN_WAIT_S`.
     pub join_wait: Duration,
+    /// How long a join keeps dialing after ringing a workspace's doorbell (150 s), or
+    /// `LIGHTBULB_CONNECT_DEBUG_WAKE_WAIT_S`.
+    pub wake_wait: Duration,
     /// The program dialogs run: `/usr/bin/osascript` (none off macOS), or
     /// `LIGHTBULB_CONNECT_DEBUG_OSASCRIPT`.
     pub osascript: PathBuf,
@@ -113,6 +119,9 @@ impl Knobs {
             join_wait: var("LIGHTBULB_CONNECT_DEBUG_JOIN_WAIT_S")
                 .and_then(|v| v.parse().ok())
                 .map_or(JOIN_WAIT, Duration::from_secs),
+            wake_wait: var("LIGHTBULB_CONNECT_DEBUG_WAKE_WAIT_S")
+                .and_then(|v| v.parse().ok())
+                .map_or(WAKE_WAIT, Duration::from_secs),
             osascript: var("LIGHTBULB_CONNECT_DEBUG_OSASCRIPT")
                 .map_or(OSASCRIPT.into(), Into::into),
             drop_acks: var("LIGHTBULB_CONNECT_DEBUG_DROP_ACKS").is_some_and(|v| v == "1"),
@@ -133,6 +142,7 @@ impl Knobs {
             gate_pause: None,
             dialog: None,
             join_wait: JOIN_WAIT,
+            wake_wait: WAKE_WAIT,
             osascript: OSASCRIPT.into(),
             drop_acks: false,
             outbox_s: outbox::TTL_S,
@@ -1189,7 +1199,7 @@ fn flush(d: &Daemon, all: bool, expire: bool) -> Result<()> {
 /// Rings `who`'s doorbell: `curl -q -g --proto =http,https -fsS -m 10 -X POST -K - <url>`, the bearer token handed on
 /// stdin as a config line, never on a command line (`ps`) or in a log; curl's output is not
 /// kept (an error could quote what it read).
-async fn doorbell(w: roster::Wake, who: String) {
+pub(crate) async fn doorbell(w: roster::Wake, who: String) {
     use tokio::io::AsyncWriteExt;
     let mut c = tokio::process::Command::new("curl");
     // `-q` first: no `~/.curlrc` (a `trace` line there could write the header to a file);

@@ -655,7 +655,15 @@ impl TeamOps<'_> {
                 else {
                     return Ok(Response::err(id, BAD_REQUEST));
                 };
-                let t = self.new_link(invite.link_mode(), true, false)?;
+                let mut t = self.new_link(invite.link_mode(), true, false)?;
+                // A workspace member's line carries its doorbell: the person may paste it
+                // after the workspace parked, and the joiner has no roster to ring from.
+                t.wake = self
+                    .team
+                    .roster
+                    .wake
+                    .clone()
+                    .filter(|_| self.daemon.cloud.is_some());
                 let t = ticket::for_person(&self.daemon.identity, t, person);
                 let line = ticket::person_line(&ticket::encode(&t), name);
                 Response::ok(id, json!({"line": line, "expires_at": t.expires_at}))

@@ -555,17 +555,21 @@ pub fn invite(mode: Invite) -> Result<i32> {
 pub fn join(link: &str, name: Option<String>, kind: &str, proof: Option<String>) -> Result<i32> {
     let name = name.unwrap_or_else(daemon::user_name);
     let mut conn = connect()?;
-    // Said once a member took an `ask` ticket and is asking its person (`join_asking`), never
-    // before a ticket it refuses at once, nor for an open link (it asks no one).
-    if crate::ticket::decode(link).is_ok_and(|t| t.mode == "ask") {
+    // Said once a member took an `ask` ticket and is asking its person (`join_asking`), or
+    // once the daemon rang a parked workspace's doorbell (`join_waking`); never before a
+    // ticket it refuses at once, nor for an open link (it asks no one).
+    let ticket = crate::ticket::decode(link).ok();
+    let has_wake = ticket.as_ref().is_some_and(|t| t.wake.is_some());
+    if ticket.is_some_and(|t| t.mode == "ask" || t.wake.is_some()) {
         let mut asking = Conn::open()?;
         asking.call("subscribe", json!({}))?;
         asking.wait_up_to(Duration::from_secs(660))?;
         std::thread::spawn(move || {
             while let Ok(e) = asking.next_line() {
-                if e["event"] == "join_asking" {
-                    println!("Asking whoever sent the link to allow this computer… (they get a prompt; this waits up to 10 minutes)");
-                    return;
+                match e["event"].as_str() {
+                    Some("join_asking") => println!("Asking whoever sent the link to allow this computer… (they get a prompt; this waits up to 10 minutes)"),
+                    Some("join_waking") => println!("Waking your workspace… this takes about a minute."),
+                    _ => {}
                 }
             }
         });
@@ -597,6 +601,7 @@ pub fn join(link: &str, name: Option<String>, kind: &str, proof: Option<String>)
         (_, Some(admission::NAME_TAKEN)) => format!(
             "The name \"{name}\" is already used in this network. Try: {} join '{link}' --name {name}-2", command()
         ),
+        (_, Some(admission::UNREACHABLE)) if has_wake => "Your workspace did not answer. Run the same command again in a minute. Your key is ready; nothing was lost.".to_string(),
         (_, Some(admission::UNREACHABLE)) => "No one from this network is online right now. Ask them to open their laptop, then run the same command again. Your key is ready; nothing was lost.".to_string(),
         (_, Some(admission::DECLINED)) => "Your request to join was declined.".to_string(),
         (_, Some(admission::BAD_NAME)) => "That name has characters Lightbulb cannot show. Use letters, numbers, spaces and punctuation.".to_string(),
