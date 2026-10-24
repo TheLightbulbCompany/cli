@@ -7,6 +7,7 @@ use crate::daemon::net_ops::Invite;
 use crate::hook::{self, Conn};
 use crate::{admission, daemon, http, label, paths, proof, setup, Result};
 use serde_json::{json, Value};
+use sha2::Digest;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::{symlink, PermissionsExt};
@@ -1037,7 +1038,7 @@ pub fn remove(name: &str) -> Result<i32> {
     }
     let n = r["name"].as_str().unwrap_or(name);
     let line = r["line"].as_str().unwrap_or_default();
-    println!("Removed {n}. New connections and new mail from it are blocked. The old invite stopped working; send this line instead: {line}");
+    println!("Removed {n}. New connections and new messages from it are blocked. The old invite stopped working; send this line instead: {line}");
     Ok(0)
 }
 
@@ -1057,7 +1058,7 @@ pub fn leave() -> Result<i32> {
         return Ok(0);
     }
     print!(
-        "Leave \"{name}\"? Your computer stops connecting. Mail already stored here stays. [y/N] "
+        "Leave \"{name}\"? Your computer stops connecting. Messages already stored here stay. [y/N] "
     );
     std::io::stdout().flush()?;
     let mut answer = String::new();
@@ -1171,6 +1172,126 @@ pub fn install_alias(home: &Path, exe: &Path) -> Result<String> {
             Ok(command_lines(home))
         }
     }
+}
+
+/// The release this binary is: `Cargo.toml`'s version.
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+const RELEASES: &str = "https://github.com/TheLightbulbCompany/cli/releases";
+const ASSET: &str = "lightbulb-macos-arm64.tar.gz";
+/// The oldest release `update` can install: earlier ones shipped a differently named binary.
+const FIRST_UPDATABLE: (u64, u64, u64) = (0, 2, 2);
+/// "(tests)" A release folder (`file://…`) used in place of GitHub: it holds the asset, its
+/// `.sha256`, and `latest`, a file naming the latest tag (GitHub tells it by a redirect).
+const RELEASE_BASE: &str = "LIGHTBULB_RELEASE_BASE";
+
+fn parse_version(v: &str) -> Option<(u64, u64, u64)> {
+    let mut it = v.strip_prefix('v').unwrap_or(v).split('.').map(str::parse);
+    let ver = (it.next()?.ok()?, it.next()?.ok()?, it.next()?.ok()?);
+    it.next().is_none().then_some(ver)
+}
+
+/// `curl -fsSL url` (with `-I`: the headers only); its stdout, or an error naming the URL.
+fn curl(url: &str, head: bool) -> Result<Vec<u8>> {
+    let mut c = Command::new("curl");
+    c.arg(if head { "-fsSI" } else { "-fsSL" }).arg(url);
+    let out = c.output().map_err(|e| format!("curl: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("Could not download {url}; nothing changed.").into());
+    }
+    Ok(out.stdout)
+}
+
+/// The latest release's tag: the last part of the redirect GitHub answers `releases/latest` with.
+fn latest_tag(base: Option<&str>) -> Result<String> {
+    if let Some(base) = base {
+        return Ok(
+            String::from_utf8_lossy(&curl(&format!("{base}/latest"), false)?)
+                .trim()
+                .to_string(),
+        );
+    }
+    let head = String::from_utf8_lossy(&curl(&format!("{RELEASES}/latest"), true)?).into_owned();
+    head.lines()
+        .find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.eq_ignore_ascii_case("location")
+                .then(|| v.trim().rsplit('/').next().unwrap_or("").to_string())
+        })
+        .ok_or_else(|| "Could not learn the latest version; nothing changed.".into())
+}
+
+/// `update [--version vX.Y.Z]`: installs that release (default: the latest) over the canonical
+/// binary, then runs the new binary's `setup`, which moves the hooks, MCP entries and the
+/// background service to it.
+pub fn update(version: Option<String>) -> Result<i32> {
+    let base = test_env(RELEASE_BASE).map(|b| b.to_string_lossy().into_owned());
+    let tag = match version {
+        Some(v) => v,
+        None => latest_tag(base.as_deref())?,
+    };
+    let Some(want) = parse_version(&tag) else {
+        eprintln!("Not a version: {tag}. Use the form v0.2.2.");
+        return Ok(2);
+    };
+    if want < FIRST_UPDATABLE {
+        eprintln!("Versions before 0.2.2 cannot be installed.");
+        return Ok(2);
+    }
+    if parse_version(VERSION) == Some(want) {
+        println!("Already on {VERSION}.");
+        return Ok(0);
+    }
+    let tag = format!("v{}.{}.{}", want.0, want.1, want.2);
+    let base = base.unwrap_or_else(|| format!("{RELEASES}/download/{tag}"));
+    println!("Updating {VERSION} → {}…", &tag[1..]);
+
+    let home = home()?;
+    let canon = canonical(&home);
+    let bin = canon.parent().unwrap();
+    fs::create_dir_all(bin)?;
+    // Unpacked beside the canonical binary, so the final rename stays on one filesystem.
+    let dir = bin.join(format!(".update-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir)?;
+    let installed = (|| -> Result<bool> {
+        let sum = String::from_utf8_lossy(&curl(&format!("{base}/{ASSET}.sha256"), false)?)
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let tarball = curl(&format!("{base}/{ASSET}"), false)?;
+        if data_encoding::HEXLOWER.encode(&sha2::Sha256::digest(&tarball)) != sum {
+            return Ok(false);
+        }
+        fs::write(dir.join(ASSET), &tarball)?;
+        let ok = Command::new("tar")
+            .arg("-xzf")
+            .arg(dir.join(ASSET))
+            .arg("-C")
+            .arg(&dir)
+            .status()
+            .is_ok_and(|s| s.success());
+        let new = dir.join("lightbulb");
+        if !ok || !new.is_file() {
+            return Err(
+                format!("The {tag} download holds no lightbulb binary; nothing changed.").into(),
+            );
+        }
+        install_alias(&home, &new)?;
+        Ok(true)
+    })();
+    let _ = fs::remove_dir_all(&dir);
+    if !installed? {
+        eprintln!("Checksum mismatch; nothing changed.");
+        return Ok(1);
+    }
+    use std::os::unix::process::CommandExt;
+    Err(format!(
+        "{}: {}",
+        canon.display(),
+        Command::new(&canon).arg("setup").exec()
+    )
+    .into())
 }
 
 /// `Command: lightbulb`, plus the PATH line when `~/.local/bin` is not on this shell's PATH
