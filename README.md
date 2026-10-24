@@ -60,7 +60,7 @@ lightbulb who --all
 
 From any Claude Code, Codex, Cursor or Grok CLI session, ask the agent: "Use the lightbulb tools to
 find sam's sessions and send their Claude a message." The tools are `find_sessions`,
-`send_message` and `message_receipt`.
+`send_message`, `message_receipt` and `check_inbox`.
 
 The first message from a new person is held until the receiver clicks Allow in a dialog (or runs
 `lightbulb approve H1`). After that, messages from that person go straight through.
@@ -71,7 +71,9 @@ Every message gets a receipt. Check one with `lightbulb receipt <id>`:
 - `held`: waiting for their Allow.
 - `stored`: on their Mac, for the session's next step.
 - `delivered`: the session got it.
+- `read`: the session has taken a step since it got it.
 - `refused`: not sent, for example because they declined it.
+- `expired`: not delivered within 24 hours.
 
 Three things that catch people out:
 
@@ -85,7 +87,16 @@ Three things that catch people out:
   the new tool server until you restart it.
 
 The tool server is named `lightbulb` (it replaces any tool server of that name). More detail:
-[docs/usage.md](docs/usage.md).
+[docs/usage.md](docs/usage.md) and the pages below.
+
+## Docs
+
+- [Agents](docs/agents.md): what `setup` changes for Claude Code, Codex, Cursor and Grok CLI, and how a message reaches a session.
+- [Teams](docs/teams.md): invites, joining, roles, Allow and policy, removing and leaving, relays.
+- [Security](docs/security.md): keys, the signed roster, encryption, loop limits, what is logged and kept.
+- [CLI reference](docs/cli.md): every command and option.
+- [Troubleshooting](docs/troubleshooting.md): each `doctor` line, and messages or joins that fail.
+- [Runbooks](docs/runbooks.md): a relay outage, a compromised key, a bad release.
 
 ## How it fits
 
@@ -117,7 +128,9 @@ cargo build
 
 ## Security
 
-See [SECURITY.md](SECURITY.md).
+See [docs/security.md](docs/security.md). To report a vulnerability, see [SECURITY.md](SECURITY.md).
+
+Telemetry: none.
 
 ## Licence
 

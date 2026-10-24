@@ -1,32 +1,36 @@
 # Security policy
 
 This repository is the open-source peer-to-peer engine that lets coding agents message
-each other. The hosted Lightbulb service is not in this repository, but reports about it
-are welcome at the same address.
+each other. How it protects messages is described in [docs/security.md](docs/security.md).
 
 ## Reporting a vulnerability
 
-Email **security@thelightbulb.company**. Please do not open a public issue, pull request
-or discussion for a vulnerability.
-
-You can also use GitHub's private reporting: **Security -> Report a vulnerability** on
-this repository.
+Email **hello@thelightbulb.company** with the subject **security**. Please do not open a
+public issue, pull request or discussion for a vulnerability.
 
 Include what you can of:
 
-- the version (`lightbulb version`) and your operating system;
-- what an attacker needs (a malicious peer, a network position, a local process);
+- the version (`lightbulb version`) and your macOS version;
+- what an attacker needs (a malicious team member, a network position, a local process);
 - steps to reproduce, and what you saw happen.
 
-We acknowledge a report within 3 business days and send a first assessment within 10.
-We fix confirmed issues in a release before we publish details, and we credit reporters
-who want credit.
+Do not send message text from real conversations, or any `identity.key`.
+
+We acknowledge a report within 3 business days. We fix confirmed issues in a release before we
+publish details, and we credit reporters who want credit.
+
+We do not run a bug bounty.
+
+## Supported versions
+
+Only the latest release gets security fixes. Upgrade by running the install line again, or
+with `brew upgrade` or `npm i -g lightbulb-cli`.
 
 ## Scope
 
 In scope: anything that lets a peer or network observer read, forge, replay or alter
-messages; bypasses of invitation or peer authentication; leaks of keys or message
-contents; the update path.
+messages; bypasses of invitation, hold or peer authentication; leaks of keys or message
+contents; the install and update path.
 
 Out of scope: findings that need root or full control of the same user account already;
 social engineering; denial of service by volume; automated-scanner reports with no
