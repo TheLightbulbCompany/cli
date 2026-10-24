@@ -11,7 +11,7 @@ It prints one line per check, then `All good.` or the fix for the first check th
 
 ## The `doctor` lines
 
-### `Background service     not running`
+### `Background service   not running`
 
 The background service is not answering. Fix: `lightbulb setup`. It installs the service and
 starts it.
@@ -20,7 +20,7 @@ If `setup` then says `The old background service did not stop (pid N). Run: kill
 lightbulb setup again.`, an old copy is still running and holds the state folder. Do what it
 says.
 
-### `Starts at login        no`
+### `Starts at login      no`
 
 The login item (`~/Library/LaunchAgents/company.thelightbulb.connect.plist`) is not loaded, so
 the service will not start at login. Fix: `lightbulb setup`.
@@ -28,7 +28,7 @@ the service will not start at login. Fix: `lightbulb setup`.
 If `setup` prints `Background service: could not start it (…)`, macOS refused to load the job.
 Check that the file named there exists, then log out and in, and run `setup` again.
 
-### `Local network          blocked by macOS`
+### `Local network        blocked by macOS`
 
 macOS has not allowed lightbulb on the local network, so your other Macs on the same Wi-Fi
 cannot find this one. Fix: System Settings > Privacy & Security > Local Network, and turn on
@@ -37,7 +37,7 @@ lightbulb. macOS asks once; if you missed the question, the switch is there.
 Joins on the same Wi-Fi still work while it is blocked, because the invite carries your Mac's
 addresses. Computers on other networks connect through a relay and do not need it.
 
-### `State folder           readable by others`
+### `State folder         readable by others`
 
 `~/.lightbulb/connect` must be readable only by you (mode `700`, its socket `600`). Fix:
 `chmod 700 ~/.lightbulb/connect`. If the line stays red, the socket is too open: run
@@ -57,13 +57,13 @@ The line is named after the agent (`Claude Code`, `Codex`, `Cursor`, `Grok CLI`)
 
 After a fix, restart the agent's open sessions so they load the tool server.
 
-### `Command name           "lightbulb" is a link to another program (run setup)`
+### `Command name         "lightbulb" is a link to another program (run setup)`
 
 `~/.local/bin/lightbulb` points at a program that is not ours. Fix: `lightbulb setup` (or
 `~/.lightbulb/connect/bin/lightbulb setup` if the `lightbulb` command runs the other program).
 Setup replaces the link.
 
-`Command name   not installed` means there is no `~/.local/bin/lightbulb`; the fix is the same.
+`Command name         not installed` means there is no `~/.local/bin/lightbulb`; the fix is the same.
 
 If the line reads `~/.local/bin/lightbulb is another program's; put ~/.lightbulb/connect/bin on
 your PATH`, a real file (not a link) is there. Setup leaves it alone. Add
@@ -78,14 +78,31 @@ This line is never red. It shows the relay in use: `default` (the iroh project's
 
 ### `lightbulb: command not found` after the curl install
 
-The command is in `~/.local/bin`, which a new Mac does not have on its PATH. `setup` prints the
-line to add. Add it to `~/.zshrc`, then open a new terminal:
+The command is in `~/.local/bin`, which a new Mac does not have on its PATH. Right after the
+install, `setup` prints:
+`Add this line to your shell profile (~/.zshrc), then open a new terminal: export PATH="$HOME/.local/bin:$PATH"`.
+This applies to both of you: the person who invites and the teammate who joins. Add it to
+`~/.zshrc`, then open a new terminal:
 
 ```sh
-export PATH="$HOME/.local/bin:$PATH"
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
 ```
 
 Until then, run `~/.lightbulb/connect/bin/lightbulb`.
+
+### `lightbulb version` still shows the old version after an upgrade
+
+After `brew upgrade` or `npm i -g lightbulb-cli@latest`, run `lightbulb setup`, then
+`lightbulb version`. If the version did not change, your PATH found the old copy in
+`~/.local/bin` first, and that copy ran `setup`. Run setup from the package's own binary:
+
+```sh
+"$(brew --prefix)/bin/lightbulb" setup     # Homebrew
+"$(npm prefix -g)/bin/lightbulb" setup     # npm
+```
+
+The curl install line, and `lightbulb update` in a later release, always replace the copy in
+`~/.lightbulb/connect/bin`.
 
 ### `The background service did not answer in 10 s`
 
@@ -111,8 +128,8 @@ close your agent sessions, then run `setup --remove` again.
 
 `doctor` has no relay check. Signs that your computers cannot reach each other:
 `lightbulb team` shows them `· offline`, and receipts stay `queued`
-(`Not delivered yet: <computer> is offline.`). `~/.lightbulb/connect/daemon.log` has lines like
-`net: dial <key>: failed`. See the [relay outage runbook](runbooks.md#relay-outage).
+(`Not delivered yet: <computer> is offline.`). `~/.lightbulb/connect/daemon.log` has a line like
+`net: dial <key>: failed` (logged once, when a dial starts failing). See the [relay outage runbook](runbooks.md#relay-outage).
 
 `lightbulb relay` may print `Our relay list was refused: …`. That is about Lightbulb's optional
 signed relay list; the relays shown above it are still the ones in use.
@@ -127,7 +144,7 @@ call `message_receipt`. What the answer means:
 | `Not delivered yet: <computer> is offline. Lightbulb keeps trying until <time>.` | The other Mac is asleep or unreachable. | Wake it. Lightbulb retries for 24 hours. |
 | `… has not confirmed it yet` | It was sent; the other Mac has not answered. | Wait, or check the relay (above). |
 | `Sent. <person> has to allow it first (they see a prompt).` | Held: the receiver has not allowed you yet. | The receiver runs `lightbulb held`, then `approve H<n>`. |
-| `Sent. Stored on <computer> for the session's next step.` | On their Mac, waiting for the session. | The session reads it at its next step; an idle session when someone next types to it. See [agents](agents.md#how-a-message-reaches-a-session). |
+| `Sent. Stored on <computer>.` | On their Mac, waiting for the session. | The session reads it at its next step; an idle session when someone next types to it. See [agents](agents.md#how-a-message-reaches-a-session). |
 | `Delivered …` / `Read …` | The session got it. | Nothing. |
 | `Not sent: they declined it.` | The receiver clicked Decline. | Ask them. |
 | `Not sent: they do not take messages from you.` | Their policy refuses you. | They run `lightbulb policy <you> accept`. |

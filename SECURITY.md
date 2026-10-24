@@ -23,8 +23,11 @@ We do not run a bug bounty.
 
 ## Supported versions
 
-Only the latest release gets security fixes. Upgrade by running the install line again, or
-with `brew upgrade` or `npm i -g lightbulb-cli`.
+Only the latest release gets security fixes. Upgrade by running the install line again; it
+always replaces the installed copy. With Homebrew or npm, run `brew upgrade` or
+`npm i -g lightbulb-cli@latest`, then `lightbulb setup`, then check `lightbulb version`. If the
+version did not change, PATH found the old copy first: run setup from the package's own binary,
+`"$(brew --prefix)/bin/lightbulb" setup` or `"$(npm prefix -g)/bin/lightbulb" setup`.
 
 ## Scope
 

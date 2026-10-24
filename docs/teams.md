@@ -14,9 +14,11 @@ Every computer starts on its own: a team of one, with you as the founder. You gr
 | Admin | Made by the founder. | `remove` a member, make an open invite (`invite --open`), set the team's relay. |
 | Member | Everyone else. | Invite people, answer join requests that come in on their own invites, message, set their own policy and relay. |
 
-Only a person at a terminal can run `held`, `approve`, `decline`, `policy <person> <value>`,
-`remove`, `admin`, `invite --open`, `relay <url>`, `signin` and `leave`. If an agent runs them, they answer
-`Run this from your own terminal, not from an agent.`
+Only a person at a terminal can run `join`, `held`, `approve`, `decline`,
+`policy <person> <value>`, `remove`, `admin`, `invite --open`, `relay <url>`, `signin` and
+`leave`. If an agent runs them, most answer `Run this from your own terminal, not from an agent.`
+`invite --open` answers `invite --open is for people at a terminal`, and `signin` answers
+`Sign in from your own terminal, not from an agent.`
 
 ## Invite
 
@@ -32,7 +34,7 @@ go by.
 |---|---|
 | `invite` | Your reusable invite. It works for many joins, for 7 days. Running `invite` again prints the same one. |
 | `invite --once` | A new invite for one join, valid 24 hours. |
-| `invite --new` | A new reusable invite. Your old one stops working at once. |
+| `invite --new` | A new reusable invite. Your old reusable invite stops working at once. It does not end an open invite (`--open`) or a one-time invite; an open invite ends only with a `remove` or its 7-day expiry. A later release makes `invite --new` end every invite of this computer. |
 | `invite --open` | Founder and admins only. Anyone with it joins without an Allow. Valid 7 days. Use it only with people you trust. |
 
 The ticket is signed by your computer. It carries your team's id, a secret, your computer's
@@ -81,8 +83,9 @@ and lets that person's later messages through without asking. Decline refuses it
 receipt reads `Not sent: they declined it.` A held message waits up to 7 days. It expires
 sooner if the session it was for has been gone for 24 hours.
 
-Your own computers count as one person only after both sign in (see "Sign in" below). Until
-then, the first message from your other computer is held like anyone's.
+Without a sign-in, each computer counts as its own person. Sign-in (verified names) is not
+available in this release, so the first message from your other computer is held once, like
+anyone's. Allow it once and its later messages go through.
 
 ## Policy
 
@@ -96,7 +99,8 @@ lightbulb policy sam refuse     # refuse sam's messages
 ```
 
 The person is a teammate's name or their short address, as `lightbulb team` shows it. Anyone
-with no entry is held. Your own computers always get through. An Allow on a held message sets
+with no entry is held. Messages between sessions on this computer always get through; your other
+computers count as you only after both sign in, which is not available in this release. An Allow on a held message sets
 that person to `accept`.
 
 ## Remove

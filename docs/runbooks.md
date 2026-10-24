@@ -12,14 +12,16 @@ affects computers that can only reach each other through one.
 - `lightbulb team` shows teammates `· offline` while their Macs are on.
 - Receipts stay `queued`: `Not delivered yet: <computer> is offline.` or `… has not confirmed it
   yet`.
-- `~/.lightbulb/connect/daemon.log` shows `net: dial <key>: failed` again and again.
-- `lightbulb doctor` still reads `Background service  running`; it does not test relays.
+- `~/.lightbulb/connect/daemon.log` shows `net: dial <key>: failed` (logged once, when dials start failing).
+- `lightbulb doctor` still reads `Background service   running`; it does not test relays.
   `lightbulb relay` shows which relays are in use.
 
 **What to do**
 
-1. Check the relay's own status. For the default relays (`*.relay.n0.iroh.link`), that is the
-   iroh project (iroh.computer). For a team relay, ask whoever runs it.
+1. Check whether the relay is the problem. We know of no public status page for the default
+   relays (`*.relay.n0.iroh.link`, run by the iroh project). Run `lightbulb relay` to see which
+   relay is in use, and ask a teammate on another network whether they reach the team. For a
+   team relay, ask whoever runs it.
 2. Switch the team to a relay that works. The founder or an admin runs:
 
    ```sh
@@ -87,16 +89,24 @@ It **cannot**: read messages, see sessions, or act as a member without being adm
 It shows: the team's id, the inviter's network addresses, and the public keys of up to six
 members (the inviter, the founder, the admins).
 
-To end it: the inviter runs `lightbulb invite --new` (ends their reusable invite), or the
-founder or an admin removes any member, which ends every live invite. If an `--open` invite was
-used by someone you do not know, remove them: `lightbulb remove <name>`.
+To end it:
+
+- A normal reusable invite: the inviter runs `lightbulb invite --new`. That ends their reusable
+  invite only.
+- An `--open` invite: `invite --new` is not enough. The founder or an admin removes any member
+  (that ends every live invite), or you wait out its 7 days.
+- A one-time invite: it ends when it is used, or after 24 hours. A `remove` ends it too.
+
+A later release makes `invite --new` end every invite of this computer. If an `--open` invite
+was used by someone you do not know, remove them: `lightbulb remove <name>`.
 
 ## Bad release
 
 If a new release breaks something, go back to the previous one and pin it.
 
 **curl install** (`vX.Y.Z` is the release tag you want; the setting goes before `sh`, which runs
-the script)
+the script). This works only once the latest release's installer reads `LIGHTBULB_VERSION`
+(v0.2.3 or later). The v0.2.2 installer ignores it and installs the latest release.
 
 ```sh
 curl -fsSL https://github.com/TheLightbulbCompany/cli/releases/latest/download/install.sh | LIGHTBULB_VERSION=vX.Y.Z sh
@@ -106,13 +116,20 @@ curl -fsSL https://github.com/TheLightbulbCompany/cli/releases/latest/download/i
 
 ```sh
 npm i -g lightbulb-cli@X.Y.Z
-lightbulb setup
+"$(npm prefix -g)/bin/lightbulb" setup
+lightbulb version
 ```
 
-**Homebrew** always installs the latest release. To go back, use the curl or npm line above.
+Run `setup` from the npm package's own binary, as above. A plain `lightbulb setup` can find the
+old copy in `~/.local/bin` first; that copy then runs `setup` and nothing changes.
 
-`setup` (which the curl install runs) copies the binary to `~/.lightbulb/connect/bin/lightbulb`
-and restarts the service on it. Check with `lightbulb version` and `lightbulb doctor`. Your key,
-team and messages stay as they were.
+**Homebrew** always installs the latest release. To go back, use the curl or npm line above.
+After a `brew upgrade`, run `"$(brew --prefix)/bin/lightbulb" setup` for the same reason.
+
+`setup` copies the binary it runs from to `~/.lightbulb/connect/bin/lightbulb` and restarts the
+service on it. The curl install line (and `lightbulb update`, in a later release) always replaces
+that copy. Check with `lightbulb version`: if it does not show X.Y.Z, PATH found the old copy
+first; run setup from the package's binary as above. Then `lightbulb doctor`. Your key, team and
+messages stay as they were.
 
 Then tell us: open an issue with the output of `lightbulb version` and `lightbulb doctor`.

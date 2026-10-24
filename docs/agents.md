@@ -80,7 +80,7 @@ server. Then check with `lightbulb doctor`: each installed agent should read `co
 
 ## How a message reaches a session
 
-A message for a session waits in that session's mailbox on its own computer. It gets to the
+A message for a session waits on that session's own computer until the session takes it. It gets to the
 agent in one of three ways. `lightbulb who` shows which one applies, in the Status column.
 
 **Instantly** (`gets messages instantly`). Lightbulb writes the message into the session as a
@@ -93,7 +93,7 @@ new turn, at once. If the session is idle, this starts a turn. This works for:
   thread's next turn with that Codex's own `codex queue` command. Other Codex threads are not
   pushed to.
 
-If a push fails, the message stays in the mailbox. The session then reads
+If a push fails, the message keeps waiting. The session then reads
 `gets messages at its next step` until a push works again.
 
 **At its next step** (`gets messages at its next step`). A hook hands the waiting messages to
@@ -112,10 +112,10 @@ it when you next type to it (Claude Code, Codex) or when it next uses a tool (Cu
 **When it checks** (`gets messages when it checks`). The agent calls `check_inbox` itself.
 Any agent can do this, at any time.
 
-Whenever a session uses one of the four tools and messages are waiting for it, the tool's
-answer ends with `N unread message(s) for this session; they arrive at your next step.`
+When a session that is not pushed to uses one of the four tools and messages are waiting for
+it, the tool's answer ends with `N unread message(s) for this session; they arrive at your next step.`
 
-A message waits in a session's mailbox for 24 hours. A message not picked up by then expires.
+A message waits for its session for 24 hours. A message not picked up by then expires.
 
 ## What the agent and you see
 
@@ -128,9 +128,11 @@ Reply with send_message(reply_to="<id>") to answer this message.
 <the text>
 ```
 
-`<sender>` is the sender as your computer knows it: for example `Your Codex` for a session of
-your own, `sam's Claude Code (not verified)` for a teammate who has not signed in, or
-`sam, at the terminal` for a person who sent it with `lightbulb send`. If the text itself has a line that starts like a
+`<sender>` is the sender as your computer knows it: for example `Your Codex` for another
+session on this computer, `sam's Claude Code (not verified)` for a teammate, or
+`sam, at the terminal (not verified)` for a teammate who sent it with `lightbulb send`. In this
+release no one can sign in yet, so every other computer's label ends `(not verified)`, your own
+other computers included. If the text itself has a line that starts like a
 Lightbulb header, Lightbulb breaks it with an invisible character, so a sender cannot fake one.
 
 Where you see it depends on the agent. A pushed message appears in the session as its own turn.

@@ -58,7 +58,10 @@ Joins still work, because the invite carries the inviter's addresses.
 A message from someone you have not allowed does not reach your sessions. It is held until you
 answer it (Allow or Decline in a dialog, or `lightbulb approve H<n>` / `decline H<n>`).
 
-- Your own computers always get through.
+- Messages between sessions on this computer always get through.
+- Your other computers count as you only after both sign in. Sign-in (verified names) is not
+  available in this release, so each computer counts as its own person, and your other
+  computer's first message is held once, like anyone's.
 - A person with no policy entry is held.
 - Allow lets that person's later messages through (`policy <person> accept`).
 - `policy <person> hold` asks each time; `policy <person> refuse` refuses them.
@@ -101,6 +104,7 @@ is `0600`):
 | `state.db` | SQLite: the roster, sessions, messages, receipts, holds and their answers, policy. |
 | `daemon.log` | The log (see above). |
 | `addrs.json` | Teammates' last known network addresses. |
+| `relays.json`, `relays.json.minisig`, `relays.floor` | The signed relay list, its signature, and the newest list date seen (only while no relay is set). |
 | `sock`, `daemon.lock` | The service's socket and lock. |
 | `bin/lightbulb` | The program. |
 
@@ -109,14 +113,19 @@ How long things last:
 | What | How long |
 |---|---|
 | A message waiting for an offline computer | retried for 24 hours, then `expired` |
-| A message in a session's mailbox, not picked up | 24 hours, then `expired` |
+| A message waiting on the receiving computer for its session, not picked up | 24 hours, then `expired` |
 | A held message with no answer | 7 days (sooner if its session has been gone for 24 hours) |
 | A one-time invite / a reusable or open invite | 24 hours / 7 days |
 | Answered join requests | kept 30 days |
 
 Message text is kept in `state.db` after delivery; nothing deletes it. `leave` and
 `setup --remove` keep it too. To erase this computer's key and messages, run
-`lightbulb setup --remove`, then delete `~/.lightbulb/connect/`.
+`lightbulb setup --remove`, then delete `~/.lightbulb/connect/` and the command link
+`~/.local/bin/lightbulb`:
+
+```sh
+rm -rf ~/.lightbulb/connect ~/.local/bin/lightbulb
+```
 
 ## What teammates see
 

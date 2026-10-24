@@ -1,11 +1,17 @@
 # CLI reference
 
-Every command, with the options its `--help` lists (version 0.2.2). Run
-`lightbulb <command> --help` for the same text in your terminal.
+Every command, with the same options and arguments its `--help` lists (version 0.2.2). Each
+`Usage:` line and `--help` line is the binary's own text; the rest says the same in plain words.
+Run `lightbulb <command> --help` for the full text in your terminal. (`held`'s line is the one in
+the next release; 0.2.2 says only "The held messages waiting for your Allow", but lists join
+requests too.)
 
-Commands that decide for you (`held`, `approve`, `decline`, `policy <person> <value>`, `remove`,
-`admin`, `invite --open`, `relay <url>`, `signin`, `leave`) must be run by a person at a
-terminal, not by an agent.
+Commands that decide for you (`join`, `held`, `approve`, `decline`, `policy <person> <value>`,
+`remove`, `admin`, `invite --open`, `relay <url>`, `signin`, `leave`) must be run by a person at
+a terminal, not by an agent. Run from an agent, most answer
+`Run this from your own terminal, not from an agent.`; `invite --open` answers
+`invite --open is for people at a terminal`, and `signin` answers
+`Sign in from your own terminal, not from an agent.`
 
 ## Getting started
 
@@ -14,8 +20,10 @@ terminal, not by an agent.
 When you use it: once after installing, after an upgrade, or to turn Lightbulb off.
 
 ```
-lightbulb setup [--remove] [--executable <path>] [--server-name <name>] [--verbose]
+lightbulb setup [OPTIONS]
 ```
+
+`--help`: Wire the installed agents (Claude Code, Codex, Cursor, Grok CLI) to this engine: their hooks and MCP server entry. Each file is backed up once as `<file>.lightbulb-backup`.
 
 Connects Claude Code, Codex, Cursor and Grok CLI here (their hooks and the `lightbulb` tool
 server) and starts the background service. Each file is backed up once as
@@ -36,6 +44,8 @@ When you use it: when something does not work.
 lightbulb doctor
 ```
 
+`--help`: Check the daemon, state permissions, agent wiring, alias and launchd job.
+
 Checks the background service, the relay, the local network, the login item, the state folder,
 each agent and the `lightbulb` command, and prints the fix for the first thing that is wrong.
 Exits 1 when something is wrong. Every line: [troubleshooting](troubleshooting.md).
@@ -45,8 +55,10 @@ Exits 1 when something is wrong. Every line: [troubleshooting](troubleshooting.m
 When you use it: to add your other computer or a teammate.
 
 ```
-lightbulb invite [--new | --once | --open]
+lightbulb invite [OPTIONS]
 ```
+
+`--help`: Print this computer's join line (the reusable invite, unless a flag says otherwise).
 
 Prints this computer's join line (the reusable invite unless an option says otherwise).
 
@@ -61,8 +73,10 @@ Prints this computer's join line (the reusable invite unless an option says othe
 When you use it: on the new computer, with the line someone sent you.
 
 ```
-lightbulb join [--name <name>] <TICKET>
+lightbulb join [OPTIONS] <TICKET>
 ```
+
+`--help`: Join the network a join line is for (this computer must be on its own).
 
 Joins the team the line is for. This computer must be on its own.
 
@@ -80,6 +94,8 @@ see [teams](teams.md#sign-in).)
 lightbulb signin
 ```
 
+`--help`: Sign in to Lightbulb in your browser, so teammates see your verified name.
+
 Signs in to Lightbulb in your browser.
 
 ## Everyday
@@ -89,8 +105,10 @@ Signs in to Lightbulb in your browser.
 When you use it: to see which sessions are open, and how each gets messages.
 
 ```
-lightbulb who [--all] [--json]
+lightbulb who [OPTIONS]
 ```
+
+`--help`: List the coding sessions on this computer (with `--all`, then every teammate's).
 
 Lists the coding sessions on this computer: name (such as `codex-1`), agent, folder, status and
 what it is doing.
@@ -105,8 +123,10 @@ what it is doing.
 When you use it: to message a session from your terminal.
 
 ```
-lightbulb send [--from <session>] [--reply-to <id>] [--request-id <id>] <TARGET> <TEXT>...
+lightbulb send [OPTIONS] <TARGET> <TEXT>...
 ```
+
+`--help`: Send text to a session (`session_id`), a name address (`<member>/<name>`), or, from a person's terminal, a group (`*`, `<member>/*`).
 
 `<TARGET>` is a name from `who` (`codex-1`), a session id, a name address `<member>/<name>`
 (for example `sam/inbox`, where `sam` is a teammate's name), or `*` for every open session on
@@ -126,8 +146,10 @@ Group sends (`*`, `<member>/*`) are for people at a terminal only.
 When you use it: to read messages sent to a name, for example from a script.
 
 ```
-lightbulb listen --as <name> [--once]
+lightbulb listen [OPTIONS] --as <NAME>
 ```
+
+`--help`: Print messages addressed to the name `<member>/<name>` as they arrive (Ctrl-C to stop).
 
 Prints messages addressed to `<your member>/<name>` as they arrive, each with a `Reply:` line.
 Ctrl-C stops it. `<name>` takes letters, digits, `.`, `_` and `-` (1 to 64).
@@ -142,8 +164,10 @@ Ctrl-C stops it. `<name>` takes letters, digits, `.`, `_` and `-` (1 to 64).
 When you use it: to see whether a message arrived.
 
 ```
-lightbulb receipt [--from <address>] [--json] <REQUEST_ID>
+lightbulb receipt [OPTIONS] <REQUEST_ID>
 ```
+
+`--help`: Print the receipt of a message sent from this terminal (or `--from` another address).
 
 Prints the receipt of a message sent from this terminal. States: `queued`, `held`, `stored`,
 `delivered`, `read`, `refused`, `expired`.
@@ -161,6 +185,8 @@ When you use it: to see what waits for your Allow.
 lightbulb held
 ```
 
+`--help`: The join requests and held messages waiting for your Allow.
+
 Lists join requests (`J<n>`) and held messages (`H<n>`), each with the command that allows it.
 
 ### approve
@@ -168,13 +194,17 @@ Lists join requests (`J<n>`) and held messages (`H<n>`), each with the command t
 When you use it: to allow a join request or a held message.
 
 ```
-lightbulb approve [--always] <REQUEST>
+lightbulb approve [OPTIONS] <REQUEST>
 ```
 
+`--help`: Allow a join request (`J<n>`) or a held message (`H<n>`).
+
 `<REQUEST>` is `J<n>` or `H<n>` from `held`. Allowing a held message from a teammate's computer
-also lets that person's later messages through. `--always` does not apply to messages between
-computers; leave it off (it then answers `--always is only for messages from a cloud member's
-agents.`).
+also lets that person's later messages through.
+
+| Option | Meaning |
+|---|---|
+| `--always` | Only for messages from a cloud member's agents. It is not used between computers; on any other message it answers `--always is only for messages from a cloud member's agents.` |
 
 ### decline
 
@@ -183,6 +213,8 @@ When you use it: to refuse a join request or a held message.
 ```
 lightbulb decline <REQUEST>
 ```
+
+`--help`: Decline a join request (`J<n>`) or a held message (`H<n>`).
 
 ## Team
 
@@ -194,13 +226,17 @@ When you use it: to see the team, its computers, their roles, and who is offline
 lightbulb team
 ```
 
+`--help`: Show the team and its members.
+
 ### admin
 
 When you use it: as the founder, to make an admin or hand over the founder role.
 
 ```
-lightbulb admin [--founder] <NAME>
+lightbulb admin [OPTIONS] <NAME>
 ```
+
+`--help`: Make a member an admin (founder only), or with --founder the founder in your place.
 
 Founder only. With `--founder`, `<NAME>` becomes the founder and you become an admin.
 
@@ -211,6 +247,8 @@ When you use it: to take a computer out of the team.
 ```
 lightbulb remove <NAME>
 ```
+
+`--help`: Remove a member (founder and admins); the invite is replaced.
 
 Founder and admins. Every live invite in the team stops working; the answer has a new invite
 line.
@@ -223,6 +261,8 @@ When you use it: to take this computer out of its team.
 lightbulb leave
 ```
 
+`--help`: Leave the team; this computer is on its own network again.
+
 Asks `[y/N]` first. This computer is on its own network again.
 
 ### policy
@@ -230,8 +270,10 @@ Asks `[y/N]` first. This computer is on its own network again.
 When you use it: to choose who may message your sessions without asking.
 
 ```
-lightbulb policy [<PERSON> <accept|hold|refuse>]
+lightbulb policy [PERSON] [VALUE]
 ```
+
+`--help`: Who may message your sessions; with a person and a value, sets it.
 
 With no arguments, shows the policy. `<PERSON>` is a teammate's name or short address, as
 `team` shows it.
@@ -241,8 +283,10 @@ With no arguments, shows the policy. `<PERSON>` is a teammate's name or short ad
 When you use it: to hide a project's sessions from your teammates.
 
 ```
-lightbulb folder <PATH> <on|off>
+lightbulb folder <PATH> <STATE>
 ```
+
+`--help`: Show (`on`) or hide (`off`) the sessions under a folder from your teammates.
 
 `off` hides the sessions under `<PATH>` from teammates; `on` shows them again.
 
@@ -251,8 +295,10 @@ lightbulb folder <PATH> <on|off>
 When you use it: to see or change the relays (not listed in `lightbulb --help`).
 
 ```
-lightbulb relay [<URL>] [--clear] [--local]
+lightbulb relay [OPTIONS] [URL]
 ```
+
+`--help`: The relays this computer uses (with a URL, sets yours; from the founder or an admin, the team's too). Relays carry encrypted traffic only, when no direct path exists.
 
 With no arguments, shows the relays in use and where they come from. With a URL (`https://`
 only), sets yours; from the founder or an admin, the team's too. Relays carry encrypted traffic
@@ -269,6 +315,8 @@ only, when no direct path exists.
 lightbulb version
 lightbulb --version
 ```
+
+`--help`: Print the version.
 
 Prints the version, for example `lightbulb 0.2.2`.
 

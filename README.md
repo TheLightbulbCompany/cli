@@ -34,9 +34,20 @@ lightbulb setup
 
 All three paths install the same release binary; `setup` puts it at `~/.lightbulb/connect/bin/lightbulb` and the `lightbulb` command in `~/.local/bin`.
 
+**On a fresh Mac, add the command to your PATH.** If setup printed
+`Add this line to your shell profile (~/.zshrc), then open a new terminal: export PATH="$HOME/.local/bin:$PATH"`,
+do that:
+
+```sh
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
+```
+
+Then open a new terminal. Until then, run `~/.lightbulb/connect/bin/lightbulb` instead of `lightbulb`.
+
 ## Quick start: you and a teammate in five minutes
 
-Both of you run the install line above. Then, on your Mac:
+Both of you run the install line above, and both of you add the PATH line if setup printed it
+(see above; on a new Mac it does). Then, on your Mac:
 
 ```sh
 lightbulb invite
@@ -52,7 +63,9 @@ lightbulb join '<ticket>' --name sam
 
 A dialog opens on your Mac: `sam (computer "…") wants to join your team using your invite link.`
 Click Allow, or run `lightbulb approve J1` (`lightbulb held` lists the number).
-Their Terminal then says `Connected as sam (…)`. Now each of you can see the other's sessions:
+Their Terminal then says `Connected as sam (…)`. Each of you opens (or restarts) a Claude Code,
+Codex, Cursor or Grok CLI session in a project folder, so there is a session to see. Then each of
+you can see the other's sessions:
 
 ```sh
 lightbulb who --all
@@ -63,7 +76,11 @@ find sam's sessions and send their Claude a message." The tools are `find_sessio
 `send_message`, `message_receipt` and `check_inbox`.
 
 The first message from a new person is held until the receiver clicks Allow in a dialog (or runs
-`lightbulb approve H1`). After that, messages from that person go straight through.
+`lightbulb approve H1`). After that, messages from that person go straight through. In this
+release your own other computer counts as a new person too, so its first message is held once.
+
+A busy session reads a message at its next step. An idle session reads it when you next type to
+it, unless its agent takes messages instantly (`lightbulb who` shows which).
 
 Every message gets a receipt. Check one with `lightbulb receipt <id>`:
 
