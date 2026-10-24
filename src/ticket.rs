@@ -278,7 +278,8 @@ mod tests {
 
     #[test]
     fn a_tickets_wake_is_covered_by_the_signature() {
-        let (_, x, r, t) = team("person", true);
+        // (Any mode: only a cloud member's `person` link survives replay.)
+        let (_, x, r, t) = team("ask", true);
         let w = Wake {
             url: "https://example.test/api/v1/network/wake".into(),
             token: "org_1.abc".into(),
