@@ -1134,6 +1134,8 @@ fn parse_version(v: &str) -> Option<(u64, u64, u64)> {
 /// `curl -fsSL url` (with `-I`: the headers only); its stdout, or an error naming the URL.
 fn curl(url: &str, head: bool) -> Result<Vec<u8>> {
     let mut c = Command::new("curl");
+    // Bounded, so a stalled download cannot hang the daemon's daily check.
+    c.args(["--connect-timeout", "30", "--max-time", "600"]);
     c.arg(if head { "-fsSI" } else { "-fsSL" }).arg(url);
     let out = c.output().map_err(|e| format!("curl: {e}"))?;
     if !out.status.success() {
@@ -1161,33 +1163,11 @@ fn latest_tag(base: Option<&str>) -> Result<String> {
         .ok_or_else(|| "Could not learn the latest version; nothing changed.".into())
 }
 
-/// `update [--version vX.Y.Z]`: installs that release (default: the latest) over the canonical
-/// binary, then runs the new binary's `setup`, which moves the hooks, MCP entries and the
-/// background service to it.
-pub fn update(version: Option<String>) -> Result<i32> {
-    let base = test_env(RELEASE_BASE).map(|b| b.to_string_lossy().into_owned());
-    let tag = match version {
-        Some(v) => v,
-        None => latest_tag(base.as_deref())?,
-    };
-    let Some(want) = parse_version(&tag) else {
-        eprintln!("Not a version: {tag}. Use the form v0.2.2.");
-        return Ok(2);
-    };
-    if want < FIRST_UPDATABLE {
-        eprintln!("Versions before 0.2.2 cannot be installed.");
-        return Ok(2);
-    }
-    if parse_version(VERSION) == Some(want) {
-        println!("Already on {VERSION}.");
-        return Ok(0);
-    }
-    let tag = format!("v{}.{}.{}", want.0, want.1, want.2);
-    let base = base.unwrap_or_else(|| format!("{RELEASES}/download/{tag}"));
-    println!("Updating {VERSION} → {}…", &tag[1..]);
-
-    let home = home()?;
-    let canon = canonical(&home);
+/// Downloads release `tag` from `base`, checks its tarball against the release's `.sha256`, and
+/// only then makes it the canonical binary (`install_alias`). `Ok(false)`: the checksum did not
+/// match and nothing changed. Shared by `update` and the daemon's daily check.
+fn install_release(home: &Path, base: &str, tag: &str) -> Result<bool> {
+    let canon = canonical(home);
     let bin = canon.parent().unwrap();
     fs::create_dir_all(bin)?;
     // Unpacked beside the canonical binary, so the final rename stays on one filesystem.
@@ -1218,11 +1198,95 @@ pub fn update(version: Option<String>) -> Result<i32> {
                 format!("The {tag} download holds no lightbulb binary; nothing changed.").into(),
             );
         }
-        install_alias(&home, &new)?;
+        install_alias(home, &new)?;
         Ok(true)
     })();
     let _ = fs::remove_dir_all(&dir);
-    if !installed? {
+    installed
+}
+
+/// Set to `1` to turn the daemon's daily update off (with `auto_update = false` in config).
+const NO_AUTO_UPDATE: &str = "LIGHTBULB_NO_AUTO_UPDATE";
+/// The tag the last auto-update installed, in the state dir: a release that does not report the
+/// version it is tagged with is installed once, not on every restart.
+const AUTO_UPDATE_LAST: &str = "auto-update.last";
+
+/// Whether the daily update is on: the config setting, unless the environment turns it off.
+pub fn auto_update_on(config: &crate::config::Config) -> bool {
+    config.auto_update && std::env::var(NO_AUTO_UPDATE).as_deref() != Ok("1")
+}
+
+/// Whether `latest` is to be installed over `current`: strictly newer (never the same, never a
+/// downgrade, never something that is not a version) and not the one installed last time.
+fn should_auto_update(current: &str, latest: &str, last: Option<&str>) -> bool {
+    match (parse_version(current), parse_version(latest)) {
+        (Some(c), Some(l)) => l > c && last.and_then(parse_version) != Some(l),
+        _ => false,
+    }
+}
+
+/// The daemon's daily check: installs the latest release when it is newer than this binary, by
+/// the same checksum-verified path as `update`. `Ok(true)`: installed, the daemon should exit so
+/// its service manager starts the new binary. Only the real install is touched (not a
+/// side-by-side state dir, not a binary run from elsewhere); a Linux install has no service to
+/// restart, so it only says a release exists.
+pub fn auto_update(dir: &Path) -> Result<bool> {
+    let home = home()?;
+    let canon = canonical(&home);
+    if std::env::var_os(paths::HOME_ENV).is_some()
+        || std::env::current_exe()?.canonicalize()? != canon.canonicalize()?
+    {
+        return Ok(false);
+    }
+    let base = test_env(RELEASE_BASE).map(|b| b.to_string_lossy().into_owned());
+    let tag = latest_tag(base.as_deref())?;
+    let last = fs::read_to_string(dir.join(AUTO_UPDATE_LAST)).ok();
+    if !should_auto_update(VERSION, &tag, last.as_deref().map(str::trim)) {
+        return Ok(false);
+    }
+    let want = parse_version(&tag).ok_or("not a version")?;
+    let tag = format!("v{}.{}.{}", want.0, want.1, want.2);
+    if !cfg!(target_os = "macos") {
+        eprintln!("auto-update: {tag} is available; run: lightbulb update");
+        return Ok(false);
+    }
+    let base = base.unwrap_or_else(|| format!("{RELEASES}/download/{tag}"));
+    if !install_release(&home, &base, &tag)? {
+        return Err("checksum mismatch; nothing changed".into());
+    }
+    eprintln!("auto-update: installed {tag}; restarting");
+    fs::write(dir.join(AUTO_UPDATE_LAST), &tag)?;
+    Ok(true)
+}
+
+/// `update [--version vX.Y.Z]`: installs that release (default: the latest) over the canonical
+/// binary, then runs the new binary's `setup`, which moves the hooks, MCP entries and the
+/// background service to it.
+pub fn update(version: Option<String>) -> Result<i32> {
+    let base = test_env(RELEASE_BASE).map(|b| b.to_string_lossy().into_owned());
+    let tag = match version {
+        Some(v) => v,
+        None => latest_tag(base.as_deref())?,
+    };
+    let Some(want) = parse_version(&tag) else {
+        eprintln!("Not a version: {tag}. Use the form v0.2.2.");
+        return Ok(2);
+    };
+    if want < FIRST_UPDATABLE {
+        eprintln!("Versions before 0.2.2 cannot be installed.");
+        return Ok(2);
+    }
+    if parse_version(VERSION) == Some(want) {
+        println!("Already on {VERSION}.");
+        return Ok(0);
+    }
+    let tag = format!("v{}.{}.{}", want.0, want.1, want.2);
+    let base = base.unwrap_or_else(|| format!("{RELEASES}/download/{tag}"));
+    println!("Updating {VERSION} → {}…", &tag[1..]);
+
+    let home = home()?;
+    let canon = canonical(&home);
+    if !install_release(&home, &base, &tag)? {
         eprintln!("Checksum mismatch; nothing changed.");
         return Ok(1);
     }
@@ -1560,6 +1624,8 @@ pub fn doctor() -> Result<i32> {
         named.err().unwrap_or_default(),
         &setup,
     );
+    let on = crate::config::Config::load(&dir).is_ok_and(|c| auto_update_on(&c));
+    row("Auto-update", true, if on { "on" } else { "off" }, "", "");
     for (name, state, _) in &rows {
         println!("{name:<20} {state}");
     }
@@ -1651,6 +1717,30 @@ pub fn setup(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn auto_update_installs_only_a_strictly_newer_release_once() {
+        use super::should_auto_update as go;
+        assert!(go("0.3.2", "v0.3.3", None));
+        assert!(go("0.3.2", "v0.10.0", None), "versions compare as numbers");
+        assert!(!go("0.3.3", "v0.3.3", None), "same version");
+        assert!(!go("0.3.3", "v0.3.2", None), "never a downgrade");
+        assert!(!go("0.3.2", "latest", None) && !go("0.3.2", "v0.3.3; rm", None));
+        assert!(
+            !go("0.3.2", "v0.3.3", Some("v0.3.3")),
+            "installed last time"
+        );
+        assert!(go("0.3.2", "v0.3.4", Some("v0.3.3")));
+    }
+
+    #[test]
+    fn auto_update_is_off_by_config() {
+        let mut c = crate::config::Config::default();
+        std::env::remove_var(super::NO_AUTO_UPDATE);
+        assert!(super::auto_update_on(&c));
+        c.auto_update = false;
+        assert!(!super::auto_update_on(&c));
+    }
+
     #[test]
     fn a_title_with_control_characters_prints_as_plain_text() {
         let title = "fix\u{1b}[2J\u{1b}]8;;http://x\u{7}\tit\u{85}\u{2066}now\r\nok";

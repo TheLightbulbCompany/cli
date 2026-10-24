@@ -258,6 +258,7 @@ pub async fn run(dir: &Path) -> Result<()> {
     // Briefly wider than 0600 after bind; the 0700 state dir closes that window.
     fs::set_permissions(&sock, Permissions::from_mode(0o600))?;
     tokio::spawn(crate::admission::route(daemon.clone()));
+    tokio::spawn(auto_update(daemon.clone(), dir.to_path_buf()));
     // SIGTERM (launchd's stop) and SIGINT end it like a `shutdown` op: the socket and the
     // loopback address file (`net::local`) are removed on the way out.
     let d = daemon.clone();
@@ -279,6 +280,26 @@ pub async fn run(dir: &Path) -> Result<()> {
     net.close().await;
     let _ = fs::remove_file(&sock);
     Ok(()) // `lock` drops here, after the socket is gone.
+}
+
+/// Checks for a newer release ten minutes after the start and then daily (`cli::auto_update`).
+/// An installed one ends the daemon, and the service manager starts the new binary; a failed
+/// check logs one line and waits for the next day.
+async fn auto_update(daemon: Arc<Daemon>, dir: PathBuf) {
+    tokio::time::sleep(Duration::from_secs(600)).await;
+    loop {
+        let on = cli::auto_update_on(&daemon.team.lock().unwrap().config);
+        if on {
+            let dir = dir.clone();
+            match tokio::task::spawn_blocking(move || cli::auto_update(&dir)).await {
+                Ok(Ok(true)) => return daemon.shutdown.notify_one(),
+                Ok(Ok(false)) => {}
+                Ok(Err(e)) => eprintln!("auto-update: {e}"),
+                Err(_) => eprintln!("auto-update: the check failed"),
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(86_400)).await;
+    }
 }
 
 /// This person's name: `$USER`, else `me`.
