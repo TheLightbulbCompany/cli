@@ -33,19 +33,21 @@ pub enum Invite {
     Once,
     /// A link whose joins need no Allow (founder and admins).
     Open,
+    /// A once link for one person's computer, admitted with no Allow (an instance only).
+    Person,
 }
 
 impl Invite {
     fn link_mode(self) -> &'static str {
-        if self == Invite::Open {
-            "open"
-        } else {
-            "ask"
+        match self {
+            Invite::Open => "open",
+            Invite::Person => "person",
+            _ => "ask",
         }
     }
 
     fn once(self) -> bool {
-        self == Invite::Once
+        matches!(self, Invite::Once | Invite::Person)
     }
 }
 
@@ -85,6 +87,10 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, caller: Caller) 
         } else {
             Invite::default()
         };
+        // A person link is an instance's alone, and an instance mints no other link.
+        if op == "team.invite" && (invite == Invite::Person) != (caller == Caller::Instance) {
+            return Response::err(id, UNSUPPORTED);
+        }
         let gate = gate(op, invite);
         // Governance and open links need a person at the socket, before any authority check.
         if gate.person_only && !caller.is_person() {
@@ -633,6 +639,26 @@ impl TeamOps<'_> {
                     json!({"team_id": r.team_id, "name": r.team_name, "members": members,
                         "heads": r.heads, "removed": removed_notice(self.daemon)}),
                 )
+            }
+            // `team.invite {mode: "person", for, name}` -> `{line, expires_at}`: a once link
+            // for person `for`'s computer (24 h), its line with `name` filled in.
+            "team.invite" if invite == Invite::Person => {
+                // Only a computer member's links survive replay and pass `check`: a cloud
+                // member's line could only ever get `bad_ticket`.
+                if r.members.get(&me_key).map(|m| m.kind) != Some(MemberKind::Computer) {
+                    return Ok(Response::err(id, UNSUPPORTED));
+                }
+                // Joinable as is (`admission::fits`) and safe inside the line's quotes.
+                let quotable = |n: &&str| crate::admission::fits(n) && !n.contains('\'');
+                let person = body["for"].as_str().filter(|p| !p.is_empty());
+                let (Some(person), Some(name)) = (person, body["name"].as_str().filter(quotable))
+                else {
+                    return Ok(Response::err(id, BAD_REQUEST));
+                };
+                let t = self.new_link(invite.link_mode(), true, false)?;
+                let t = ticket::for_person(&self.daemon.identity, t, person);
+                let line = ticket::person_line(&ticket::encode(&t), name);
+                Response::ok(id, json!({"line": line, "expires_at": t.expires_at}))
             }
             // `team.invite {mode}` -> `{ticket, line, app_link, expires_at, replaced}`. `reusable`
             // (and `open`) reprint this member's live link of that mode, minting one if none.

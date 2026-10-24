@@ -40,12 +40,15 @@ pub struct Latest {
 }
 
 /// The `agent` every member's latest presence declares, by session id (a workspace member's:
-/// `Friday`). One look per batch of labels.
+/// `Friday`), or a hosted app's title (`label::via`). One look per batch of labels.
 pub fn declared_agents(d: &Daemon) -> HashMap<String, String> {
     let latest = d.latest.lock().unwrap();
     let all = latest.values().flat_map(|l| &l.sessions);
-    all.map(|s| (s.session_id.clone(), s.agent.clone()))
-        .collect()
+    all.map(|s| {
+        let title = s.title.as_ref().filter(|t| crate::label::via(t));
+        (s.session_id.clone(), title.unwrap_or(&s.agent).clone())
+    })
+    .collect()
 }
 
 /// The stored presences, by member (read at daemon start).

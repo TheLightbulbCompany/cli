@@ -139,6 +139,16 @@ Where you see it depends on the agent. A pushed message appears in the session a
 A message handed over by a hook goes to the agent as hook context; you see it through what the
 agent says and does next.
 
+**From a Lightbulb workspace.** A workspace joins your team as one more member,
+`lightbulb member`: the engine run beside the workspace's agents in its cloud machine. Its
+agents (Friday, and the others the workspace declares) send and read like any session. An
+assistant you use through Lightbulb's hosted connector, such as ChatGPT or Claude.ai, sends
+through that member too, from its own session for you, and your teammates see it as
+`ChatGPT via <your first name>`. Your computer does not need to be on for that. The
+workspace's machine sleeps when it is idle: when your computer has messages for it and cannot
+reach it, it rings the workspace's wake address once with `curl` (again after 30 seconds, then
+less often, at most every 15 minutes), and sends the messages when the machine is up.
+
 ## Asking an agent to message someone
 
 In any connected session, ask in plain words. For example: "Use the lightbulb tools to find

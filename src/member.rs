@@ -43,7 +43,13 @@ pub async fn run(opts: MemberOpts, token: String) -> Result<()> {
     // Before the start: a SIGTERM during it still stops cleanly once it is up.
     let mut term = signal(SignalKind::terminate())?;
     let file: Value = serde_json::from_slice(&std::fs::read(&opts.sessions)?)?;
-    let sessions = file["sessions"].as_array().cloned().unwrap_or_default();
+    let sessions = match file["sessions"].as_array() {
+        Some(l) => l.clone(),
+        None => {
+            eprintln!("member: no sessions list in the sessions file; no sessions declared");
+            vec![]
+        }
+    };
     let relay = opts
         .relay
         .as_deref()
@@ -60,9 +66,13 @@ pub async fn run(opts: MemberOpts, token: String) -> Result<()> {
         },
     )
     .await?;
+    instance.publish_wake(&file["wake"])?;
     let instance = Arc::new(instance);
     let _ = std::fs::remove_file(&opts.socket);
     // Created 0600, never wider for a moment: the umask is the process's, put back at once.
+    // ponytail: the umask is process-wide for those microseconds; a file another task makes
+    // in that window comes out 0600 (narrower, never wider), and nothing makes directories
+    // concurrently. A per-socket fchmod-before-listen would close it, if that ever matters.
     // SAFETY: umask takes a mode and cannot fail.
     let umask = unsafe { libc::umask(0o177) };
     let listener = UnixListener::bind(&opts.socket);
@@ -118,7 +128,9 @@ async fn connection(stream: UnixStream, i: Arc<Instance>, token: Arc<String>, st
                 if buf.len() > MAX_LINE {
                     (json!({"id": 0, "ok": false, "error": "unauthorized"}), Then::Close)
                 } else if !matches!(n, Ok(n) if n > 0) || buf.last() != Some(&b'\n') {
-                    return; // closed (or an error), with no whole line left
+                    // Closed (or an error), with no whole line left: the bridge ends every
+                    // line with `\n`, so a last one without it is dropped.
+                    return;
                 } else {
                     let line = String::from_utf8(std::mem::take(&mut buf)).unwrap_or_default();
                     answer(&line, &i, &token, &mut events).await

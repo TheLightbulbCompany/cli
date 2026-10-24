@@ -448,18 +448,6 @@ impl Peers {
         }
     }
 
-    /// `send` `f`, and hear once it was written to the stream (`app_send` marks mail read
-    /// only then); `None` when it could not be queued.
-    pub(crate) fn send_written(
-        &self,
-        member: &str,
-        f: Frame,
-    ) -> Option<tokio::sync::oneshot::Receiver<()>> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let queued = self.ok_link(member, |l| l.tx.send((f, Some(tx))).is_ok());
-        queued.unwrap_or(false).then_some(rx)
-    }
-
     /// Counts a dropped frame of `kind` (`status`'s `dropped`).
     pub(crate) fn dropped(&self, kind: &'static str) {
         *self.dropped.lock().unwrap().entry(kind).or_default() += 1;
@@ -548,6 +536,24 @@ struct Inner {
     endpoint: Endpoint,
     daemon: Arc<Daemon>,
     dials: Mutex<HashMap<String, DialState>>,
+    doorbell: Mutex<Doorbell>,
+}
+
+/// The founder's doorbell on this computer (`ring`): when the next ring may go, and the wait
+/// after the last; back to none once a connection to the founder is up.
+#[derive(Default)]
+struct Doorbell {
+    next: Option<std::time::Instant>,
+    wait: Duration,
+}
+
+/// The wait after a ring that followed a wait of `w`: 30 s, doubling to 15 min.
+fn doorbell_wait(w: Duration) -> Duration {
+    if w.is_zero() {
+        Duration::from_secs(30)
+    } else {
+        (w * 2).min(Duration::from_secs(900))
+    }
 }
 
 impl Net {
@@ -602,6 +608,7 @@ impl Net {
             endpoint,
             daemon,
             dials: Mutex::default(),
+            doorbell: Mutex::default(),
         }));
         tokio::spawn(net.clone().accept_loop());
         tokio::spawn(net.clone().keep_up());
@@ -791,9 +798,45 @@ impl Net {
         };
         match r {
             Some(conn) => self.serve(conn, key, true).await,
-            None if newly_failed => eprintln!("net: dial {}: failed", short(&key)),
-            None => {}
+            None => {
+                if newly_failed {
+                    eprintln!("net: dial {}: failed", short(&key));
+                }
+                self.ring(&key);
+            }
         }
+    }
+
+    /// After a failed dial of `key` (a parked workspace member): when it is the founder and
+    /// published a doorbell (`Roster::wake`), mail to it is due and the backoff allows
+    /// (`doorbell_wait`), one `curl` rings it in the background. A computer only.
+    fn ring(&self, key: &str) {
+        let d = &self.0.daemon;
+        if d.cloud.is_some() {
+            return;
+        }
+        let wake = {
+            let team = d.team.lock().unwrap();
+            let r = &team.roster;
+            match (r.founder(), &r.wake) {
+                (Some(f), Some(w)) if f.key == key => w.clone(),
+                _ => return,
+            }
+        };
+        let due = d.store.lock().unwrap().outbox_due(&[key.into()], i64::MAX);
+        if !due.is_ok_and(|v| !v.is_empty()) {
+            return;
+        }
+        {
+            let mut b = self.0.doorbell.lock().unwrap();
+            let now = std::time::Instant::now();
+            if b.next.is_some_and(|t| now < t) {
+                return;
+            }
+            b.wait = doorbell_wait(b.wait);
+            b.next = Some(now + b.wait);
+        }
+        tokio::spawn(doorbell(wake, short(key).to_string()));
     }
 
     /// One member connection, from the gate to its close.
@@ -842,6 +885,15 @@ impl Net {
         };
         if let Ok((mut send, mut recv)) = streams {
             eprintln!("net: connected {}", short(&key));
+            if d.team
+                .lock()
+                .unwrap()
+                .roster
+                .founder()
+                .is_some_and(|f| f.key == key)
+            {
+                *self.0.doorbell.lock().unwrap() = Doorbell::default();
+            }
             let writer = async {
                 while let Some((f, done)) = rx.recv().await {
                     if frames::write(&mut send, &f).await.is_err() {
@@ -917,7 +969,7 @@ impl Net {
         let mut synced = false;
         let mut hello_ok = false;
         let (mut presence, mut envelope, mut answer) = (None, None, None);
-        let (mut grant, mut join, mut relayed) = (None, None, None);
+        let (mut grant, mut join) = (None, None);
         if let Err(why) = frames::from_peer_ok(&f, peer, d) {
             d.peers.dropped(f.kind());
             eprintln!("net: dropped a {} frame from {short} ({why})", f.kind());
@@ -958,8 +1010,6 @@ impl Net {
             grant = Some(f);
         } else if matches!(f, Frame::JoinRequest { .. } | Frame::JoinDecision { .. }) {
             join = Some(f);
-        } else if matches!(f, Frame::HoldNotice { .. } | Frame::Decision { .. }) {
-            relayed = Some(f);
         } else if matches!(f, Frame::Ack { .. }) && d.peers.knobs().drop_acks {
             eprintln!("net: dropped an ack from {short} (debug)");
         } else if let Frame::Ack {
@@ -999,20 +1049,12 @@ impl Net {
         if let Some(env) = envelope.filter(|_| d.peers.speaks_ours(key, conn)) {
             receive(d, key, &env, tx);
         }
-        if let Some(f) = relayed.filter(|_| d.peers.speaks_ours(key, conn)) {
-            crate::decision::on_frame(d, key, &f, tx);
-        }
         if let Some(g) = grant.filter(|_| d.peers.speaks_ours(key, conn)) {
             if let Err(e) = crate::streams::store(&d.store.lock().unwrap(), &g, ipc::now() as i64) {
                 eprintln!("net: a share_grant from {short}: {e}");
             }
         }
-        if let Some((id, state, reason, _)) = answer
-            .as_ref()
-            .filter(|a| crate::decision::is_control(&a.0))
-        {
-            crate::decision::acked(d, key, id, state, reason.as_deref());
-        } else if let Some((id, state, reason, limit)) = answer {
+        if let Some((id, state, reason, limit)) = answer {
             let store = d.store.lock().unwrap();
             let state = State::parse(&state).expect("checked by from_peer_ok");
             let (reason, limit) = (reason.as_deref(), limit.as_deref());
@@ -1042,13 +1084,15 @@ impl Net {
 
 /// Member `key`'s envelope: checked and stored (`mail::receive`), answered with an `ack`.
 /// One whose `from` is not the member's own is dropped unanswered.
-/// The `app_*` kinds go to `app_send` instead: no mailbox, hold, hop count or `ack`.
+/// An `app_*` envelope (the retired relay of a hosted app's call) is dropped unanswered.
 fn receive(d: &Arc<Daemon>, key: &str, env: &Frame, tx: &Tx) {
     let Frame::Envelope { id, to, kind, .. } = env else {
         return;
     };
-    if crate::app_send::is_app(kind) {
-        return crate::app_send::on_envelope(d, key, env.clone());
+    if kind.starts_with("app_") {
+        d.peers.dropped("app");
+        // Not `id` or `kind`: the peer chose them.
+        return eprintln!("net: dropped an app envelope from {}", short(key));
     }
     let team = d.team.lock().unwrap();
     let Some(peer) = team.roster.members.get(key) else {
@@ -1124,8 +1168,7 @@ fn flush(d: &Daemon, all: bool, expire: bool) -> Result<()> {
         holds::expire_here(d, &store, now as i64)?;
         mail::forget(&store)?;
     }
-    let since = now.saturating_sub(mail::HELD_S);
-    let due = outbox::due(&store, &online, if all { u64::MAX } else { now }, since)?;
+    let due = outbox::due(&store, &online, if all { u64::MAX } else { now })?;
     for (id, member, f) in due {
         if d.peers.send(&member, f).is_ok() {
             outbox::sent(&store, &id, now)?;
@@ -1141,6 +1184,47 @@ fn flush(d: &Daemon, all: bool, expire: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Rings `who`'s doorbell: `curl -q -g --proto =http,https -fsS -m 10 -X POST -K - <url>`, the bearer token handed on
+/// stdin as a config line, never on a command line (`ps`) or in a log; curl's output is not
+/// kept (an error could quote what it read).
+async fn doorbell(w: roster::Wake, who: String) {
+    use tokio::io::AsyncWriteExt;
+    let mut c = tokio::process::Command::new("curl");
+    // `-q` first: no `~/.curlrc` (a `trace` line there could write the header to a file);
+    // `-g`: no URL globbing; http(s) only, no redirects followed.
+    c.args([
+        "-q",
+        "-g",
+        "--proto",
+        "=http,https",
+        "-fsS",
+        "-m",
+        "10",
+        "-X",
+        "POST",
+        "-K",
+        "-",
+    ])
+    .arg(&w.url)
+    .stdin(std::process::Stdio::piped())
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null())
+    .kill_on_drop(true);
+    let rang = async {
+        let mut child = c.spawn()?;
+        let mut stdin = child.stdin.take().expect("piped");
+        let header = format!("header = \"Authorization: Bearer {}\"\n", w.token);
+        stdin.write_all(header.as_bytes()).await?;
+        drop(stdin);
+        child.wait().await
+    };
+    match rang.await {
+        Ok(s) if s.success() => eprintln!("net: rang {who}'s doorbell"),
+        Ok(s) => eprintln!("net: {who}'s doorbell: curl {s}"),
+        Err(e) => eprintln!("net: {who}'s doorbell: {e}"),
+    }
 }
 
 /// Accepts the waiting entries whose parents are known, in order, until none is left that
@@ -1463,5 +1547,19 @@ mod local {
         // file is skipped (Linux follows when there is a Linux build).
         crate::os::process(pid).ok()?;
         addr.parse().ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_doorbell_backs_off_from_30_s_to_15_min() {
+        let mut w = std::time::Duration::ZERO;
+        let mut got = vec![];
+        for _ in 0..7 {
+            w = super::doorbell_wait(w);
+            got.push(w.as_secs());
+        }
+        assert_eq!(got, [30, 60, 120, 240, 480, 900, 900]);
     }
 }

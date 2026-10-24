@@ -703,3 +703,86 @@ async fn a_cloud_sender_gets_always_allow() {
         Some(Scope::CloudOf)
     );
 }
+
+// ---- holds on the member (E6) -----------------------------------------------------------
+
+/// A member home under `dir` whose engine founded "acme" and admitted stranger `b` ("bob",
+/// another person) before it starts.
+fn member_with_stranger(dir: &std::path::Path, b: &Identity) {
+    let home = dir.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let w = Identity::load_or_create(&home).unwrap();
+    let g = net_ops::genesis(&w, "The Lightbulb Company", "ws", "acme", 1);
+    let ab = common::admit(&w, &g, b, "bob", json!({}));
+    let store = Store::open(&home.join("state.db")).unwrap();
+    for e in [&g, &ab] {
+        roster::accept(&store, e, 10).unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_strangers_first_message_is_held_and_answered_with_decided_by() {
+    let dir = tempfile::tempdir().unwrap();
+    let b = common::identity();
+    member_with_stranger(dir.path(), &b);
+    let friday = json!([{"name": "friday", "agent": "hermes", "title": "Friday"}]);
+    let (mut child, token, sock) = common::member(dir.path(), friday);
+    let me = common::ok(&sock, &token, "identity.get", json!({}));
+    let port = common::ok(&sock, &token, "status", json!({}))["port"]
+        .as_u64()
+        .unwrap();
+    let (mut p, _ep) = common::dial_at(me["member_key"].as_str().unwrap(), port, &b).await;
+    let to = format!("{}/friday", me["member_key_short"].as_str().unwrap());
+    let id = ulid();
+    let from = format!("{}/codex:b1", b.short);
+    p.send(&envelope(&id, "r1", &from, &to, "hello friday"))
+        .await;
+    assert_eq!(p.ack(&id).await.0, "held");
+    let listed = common::ok(&sock, &token, "holds", json!({}));
+    let holds = listed["holds"].as_array().unwrap();
+    assert_eq!(holds.len(), 1, "{listed}");
+    assert_eq!(
+        (&holds[0]["id"], &holds[0]["target_session"]),
+        (&json!("H1"), &json!(to))
+    );
+    let got = common::ok(&sock, &token, "hold.get", json!({"hold": "H1"}));
+    assert_eq!(got["body"], "hello friday", "{got}");
+    for op in ["hold.get", "hold.answer"] {
+        let body = json!({"hold": "H9", "verdict": "allow", "decided_by": "user_x"});
+        let r = common::line(&sock, &token, op, body);
+        assert_eq!(r, json!({"id": 7, "ok": false, "error": "hold_not_found"}));
+    }
+    let body = json!({"hold": "H1", "verdict": "allow", "decided_by": "user_x"});
+    let r = common::ok(&sock, &token, "hold.answer", body);
+    assert_eq!((&r["id"], &r["verdict"]), (&json!("H1"), &json!("allow")));
+    p.recv_where(
+        |f| matches!(f, Frame::Receipt { id: i, state, .. } if *i == id && state == "stored"),
+    )
+    .await;
+    let db = dir.path().join("home/state.db");
+    let sql = "SELECT COUNT(*) FROM approvals WHERE hold_id = 1 AND \"by\" = 'user_x'";
+    assert_eq!(common::count(&db, sql), 1);
+    common::ok(&sock, &token, "stop", json!({}));
+    assert!(child.wait().unwrap().success());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hold_answer_on_an_instance_needs_decided_by() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut child, token, sock) = common::member(dir.path(), json!([]));
+    for decided_by in [Value::Null, json!(""), json!(3)] {
+        let body = json!({"hold": "H1", "verdict": "allow", "decided_by": decided_by});
+        let r = common::line(&sock, &token, "hold.answer", body);
+        assert_eq!(r["error"], "bad_request", "{decided_by}: {r}");
+    }
+    // Still person-only on an instance: what the bridge never asks.
+    let r = common::line(
+        &sock,
+        &token,
+        "policy.set",
+        json!({"person_id": "u", "value": "accept"}),
+    );
+    assert_eq!(r["reason"], "not_a_person", "{r}");
+    common::ok(&sock, &token, "stop", json!({}));
+    assert!(child.wait().unwrap().success());
+}

@@ -143,9 +143,43 @@ pub struct Roster {
     pub heads: Vec<String>,
     pub links: BTreeMap<String, Link>,
     pub relay: Option<String>,
+    /// The founder's doorbell (a parked workspace member's), from its latest `meta` with one.
+    pub wake: Option<Wake>,
     parents: BTreeMap<String, Vec<String>>,
     /// Every replayed entry with its hash, parents first.
     log: Vec<(String, Entry)>,
+}
+
+/// Where a computer rings a parked founder awake (`net`'s doorbell): `POST url` with
+/// `Authorization: Bearer <token>`. The URL carries no secret; the token is never logged
+/// (`Debug` hides it).
+#[derive(Clone, PartialEq)]
+pub struct Wake {
+    pub url: String,
+    pub token: String,
+}
+
+impl std::fmt::Debug for Wake {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Wake({})", self.url)
+    }
+}
+
+impl Wake {
+    /// A `meta` body's `wake`: an http(s) URL of printable ASCII with no space or quote, and a
+    /// token of `[A-Za-z0-9._-]` (it is written into curl's config, never a command line).
+    pub fn parse(v: &Value) -> Option<Wake> {
+        let (url, token) = (v["url"].as_str()?, v["token"].as_str()?);
+        let url_ok = (url.starts_with("https://") || url.starts_with("http://"))
+            && url.len() <= 2048
+            && url
+                .bytes()
+                .all(|b| b.is_ascii_graphic() && !b"\"'\\".contains(&b));
+        (url_ok && crate::sessions::word(token, 512)).then(|| Wake {
+            url: url.into(),
+            token: token.into(),
+        })
+    }
 }
 
 impl Roster {
@@ -488,6 +522,8 @@ fn pass(
                 let to = r.members.get_mut(&target);
                 if let Some(t) = to.filter(|t| t.kind == MemberKind::Computer) {
                     t.role = Role::Founder;
+                    // The old founder's doorbell is not the new one's.
+                    r.wake = None;
                     r.members.get_mut(&e.signer).expect("active").role = Role::Admin;
                     admins.push(e.signer.clone());
                 }
@@ -501,6 +537,7 @@ fn pass(
                             .find(|a| r.members.get(*a).is_some_and(|m| m.role == Role::Admin));
                         if let Some(a) = oldest.cloned() {
                             r.members.get_mut(&a).expect("active").role = Role::Founder;
+                            r.wake = None;
                         }
                     }
                 }
@@ -537,6 +574,9 @@ fn pass(
                     if let Some(relay) = e.body["relay"].as_str() {
                         r.relay = Some(relay.to_string());
                     }
+                }
+                if let Some(w) = Wake::parse(&e.body["wake"]).filter(|_| founder) {
+                    r.wake = Some(w);
                 }
             }
             Kind::Admit | Kind::Link | Kind::Admin | Kind::Transfer => {}
@@ -1181,6 +1221,60 @@ mod tests {
         assert!(!r.members.contains_key(&f.key));
         assert_eq!(r.members[&c.key].role, Role::Founder);
         assert_eq!(r.members[&b.key].role, Role::Admin);
+    }
+
+    #[test]
+    fn wake_parse_takes_http_s_and_a_plain_token_only() {
+        let w = |url: &str, token: &str| Wake::parse(&json!({"url": url, "token": token}));
+        let ok = w("https://example.test/api/v1/network/wake", "org_1.abc-D");
+        assert_eq!(
+            ok.map(|w| w.url),
+            Some("https://example.test/api/v1/network/wake".into())
+        );
+        for (url, token) in [
+            ("file:///etc/passwd", "t"),
+            ("https://example.test/a b", "t"),
+            ("https://example.test/\"x", "t"),
+            ("https://example.test/", "a\"b"),
+            ("https://example.test/", "a\nb"),
+            ("https://example.test/", ""),
+        ] {
+            assert!(w(url, token).is_none(), "{url} {token:?}");
+        }
+        assert!(w("https://example.test/", &"t".repeat(513)).is_none());
+        assert!(w("https://example.test/", &"t".repeat(512)).is_some());
+    }
+
+    #[test]
+    fn a_new_founder_clears_the_old_founders_wake() {
+        let (f, b) = (id(), id());
+        let g = genesis(&f);
+        let ab = admit(&f, &g, &b.key, "b");
+        let wake = json!({"wake": {"url": "https://example.test/w", "token": "o.s"}});
+        let m = op(&f, &ab, Kind::Meta, wake);
+        let r = replay(&[g.clone(), ab.clone(), m.clone()]);
+        assert_eq!(r.wake.map(|w| w.token), Some("o.s".into()));
+        // A non-founder's wake is not taken.
+        let mb = op(
+            &b,
+            &m,
+            Kind::Meta,
+            json!({"wake": {"url": "https://x.test/", "token": "b"}}),
+        );
+        assert_eq!(
+            replay(&[g.clone(), ab.clone(), m.clone(), mb])
+                .wake
+                .map(|w| w.token),
+            Some("o.s".into())
+        );
+        let t = member(&f, &m, Kind::Transfer, &b.key);
+        assert_eq!(replay(&[g.clone(), ab.clone(), m.clone(), t]).wake, None);
+        // The founder leaves: the oldest admin is promoted, and the wake goes with it.
+        let pb = member(&f, &m, Kind::Admin, &b.key);
+        let lf = member(&f, &pb, Kind::Leave, &f.key);
+        let r = replay(&[g, ab, m, pb, lf]);
+        assert_eq!(r.founder().map(|x| x.key.clone()), Some(b.key.clone()));
+        assert_eq!(r.wake, None);
     }
 
     #[test]

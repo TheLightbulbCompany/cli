@@ -161,9 +161,9 @@ impl Caller {
     }
 }
 
-/// What an instance does not do: it mints no link, its settings are its `EmbedOpts`, it asks
-/// no one (`ui.claim`), and it stops by `Instance::shutdown`.
-const NOT_ON_AN_INSTANCE: [&str; 4] = ["team.invite", "reload", "ui.claim", "shutdown"];
+/// What an instance does not do: it mints no link but a person one (`net_ops`), its settings
+/// are its `EmbedOpts`, it asks no one (`ui.claim`), and it stops by `Instance::shutdown`.
+const NOT_ON_AN_INSTANCE: [&str; 3] = ["reload", "ui.claim", "shutdown"];
 
 /// The fields of an `inbox` record an agent (MCP `check_inbox`) or an instance's caller is
 /// handed.
@@ -189,9 +189,6 @@ pub fn inbox_record(v: &Value) -> Value {
         .collect()
 }
 
-/// The fields of a receipt (`finish`) an app's answer carries (`app_send`).
-pub const RECEIPT_FIELDS: [&str; 5] = ["state", "reason", "limit", "thread", "tier"];
-
 /// One op, from `caller`: every person-only op refuses without a person.
 pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: Caller) -> Response {
     let instance = caller == Caller::Instance;
@@ -209,9 +206,9 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
         "inbox.peek" if instance => crate::embed::peek(id, daemon),
         "inbox.ack" if instance => crate::embed::ack(id, body, daemon),
         "cloud.sessions.set" => super::net_ops::cloud_sessions_set(id, body, daemon).await,
-        "app.send" | "app.inbox" | "app.receipt" => crate::app_send::op(id, op, body, daemon).await,
-        "decision.send" => crate::decision::op(id, body, daemon),
-        "holds.pending" => crate::decision::pending(id, daemon),
+        "app.send" | "app.inbox" | "app.receipt" if instance => {
+            crate::app_send::op(id, op, body, daemon).await
+        }
         "status" => {
             // Before the team lock: `live_sessions` takes it.
             let sessions = live_count(daemon);

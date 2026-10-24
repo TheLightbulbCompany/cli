@@ -696,14 +696,12 @@ impl Store {
         Ok(())
     }
 
-    /// The frames for `members` due at `now`: `(row id, member, frame)`. A message's while still
-    /// `queued`; a row that is no message (a hold notice or decision, `decision`) while
-    /// created after `since`.
+    /// The frames for `members` due at `now`, each message's while still `queued`: `(row id,
+    /// member, frame)`.
     pub fn outbox_due(
         &self,
         members: &[String],
         now: i64,
-        since: i64,
     ) -> rusqlite::Result<Vec<(String, String, String)>> {
         if members.is_empty() {
             return Ok(vec![]);
@@ -711,11 +709,10 @@ impl Store {
         let marks = vec!["?"; members.len()].join(", ");
         let mut stmt = self.conn.prepare(&format!(
             "SELECT o.message_id, o.to_member, o.frame FROM outbox o \
-             LEFT JOIN messages m ON m.id = o.message_id LEFT {MSG_RECEIPT} \
-             WHERE (r.state = 'queued' OR (m.id IS NULL AND o.created_at > ?)) \
-             AND o.next_at <= ? AND o.to_member IN ({marks})"
+             JOIN messages m ON m.id = o.message_id LEFT {MSG_RECEIPT} \
+             WHERE r.state = 'queued' AND o.next_at <= ? AND o.to_member IN ({marks})"
         ))?;
-        let args = [&since as &dyn rusqlite::ToSql, &now]
+        let args = [&now as &dyn rusqlite::ToSql]
             .into_iter()
             .chain(members.iter().map(|m| m as &dyn rusqlite::ToSql));
         let rows = stmt.query_map(rusqlite::params_from_iter(args), |r| {
