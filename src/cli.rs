@@ -2,6 +2,7 @@
 //! `daemon --install/--uninstall`, and the `lightbulb` alias.
 //! Each is a client of the daemon, like the hook.
 
+use crate::code::Via;
 use crate::daemon::ipc;
 use crate::daemon::net_ops::Invite;
 use crate::hook::{self, Conn};
@@ -541,10 +542,26 @@ pub fn invite(mode: Invite) -> Result<i32> {
         }
         _ => {}
     }
-    println!("Send this line to the person (or paste it on your other computer):");
+    // Code first (the easy way), then the link, then the full line.
+    // The form the invite leads with, for usage counts.
+    let _via = if r["code"].is_string() {
+        Via::Code
+    } else {
+        Via::Link
+    };
+    if let Some(code) = r["code"].as_str() {
+        println!(
+            "Tell them to run:  {} join {code}   (the code works for {} minutes)",
+            command(),
+            (r["code_secs"].as_i64().unwrap_or(600) + 59) / 60
+        );
+    }
+    println!(
+        "Or send this link:  {}",
+        r["link"].as_str().unwrap_or_default()
+    );
+    println!("If the code doesn't work, send this line (or paste it on your other computer):");
     println!("{line}");
-    println!("Replace NAME with the name they go by.");
-    println!("{}", r["app_link"].as_str().unwrap_or_default());
     Ok(0)
 }
 
@@ -552,14 +569,19 @@ pub fn invite(mode: Invite) -> Result<i32> {
 /// for its person to allow it. Hidden: `--kind cloud --proof <jws>`, a workspace member (the
 /// bridge joins in process; this is for tests and ops).
 pub fn join(link: &str, name: Option<String>, kind: &str, proof: Option<String>) -> Result<i32> {
+    // Which form the person was given; usage counts read it.
+    let (code, _via) = match crate::code::normalize(link) {
+        Some(c) => (Some(c), Via::Code),
+        None if link.trim().starts_with("https://") => (None, Via::Link),
+        None => (None, Via::Line),
+    };
     let name = name.unwrap_or_else(daemon::user_name);
     let mut conn = connect()?;
     // Said once a member took an `ask` ticket and is asking its person (`join_asking`), or
     // once the daemon rang a parked workspace's doorbell (`join_waking`); never before a
     // ticket it refuses at once, nor for an open link (it asks no one).
     let ticket = crate::ticket::decode(link).ok();
-    let has_wake = ticket.as_ref().is_some_and(|t| t.wake.is_some());
-    if ticket.is_some_and(|t| t.mode == "ask" || t.wake.is_some()) {
+    if code.is_some() || ticket.is_some_and(|t| t.mode == "ask" || t.wake.is_some()) {
         let mut asking = Conn::open()?;
         asking.call("subscribe", json!({}))?;
         asking.wait_up_to(Duration::from_secs(660))?;
@@ -574,12 +596,14 @@ pub fn join(link: &str, name: Option<String>, kind: &str, proof: Option<String>)
         });
     }
     conn.wait_up_to(Duration::from_secs(660))?;
-    let r = ask(
-        &mut conn,
-        "team.join",
-        json!({"ticket": link, "name": name, "kind": kind, "proof": proof}),
-    )?;
+    let body = match &code {
+        Some(c) => json!({"code": c, "name": name, "kind": kind, "proof": proof}),
+        None => json!({"ticket": link, "name": name, "kind": kind, "proof": proof}),
+    };
+    let r = ask(&mut conn, "team.join", body)?;
     let team = r["team"].as_str().unwrap_or_default();
+    // The ticket named a workspace (for a code, the daemon saw the ticket, not this process).
+    let has_wake = r["wake"] == true;
     let text = match (r["state"].as_str(), r["reason"].as_str()) {
         (Some("admitted"), _) => {
             let computer = ask(&mut conn, "identity.get", json!({}))?["computer"]
@@ -602,8 +626,9 @@ pub fn join(link: &str, name: Option<String>, kind: &str, proof: Option<String>)
         (Some("waiting"), _) => "No one has answered yet. Run the same command again to keep asking.".to_string(),
         (_, Some(admission::ALREADY_IN_TEAM)) => format!("You are in \"{team}\". Leave it first: {} leave", command()),
         (_, Some(admission::NAME_TAKEN)) => format!(
-            "The name \"{name}\" is already used in this network. Try: {} join '{link}' --name {name}-2", command()
+            "The name \"{name}\" is already used in this network. Run the same command again with: --name {name}-2"
         ),
+        (_, Some(admission::NO_CODE)) => "That code did not work. Check the words. Ask them to open their computer, or send the full line instead. A code works once.".to_string(),
         (_, Some(admission::UNREACHABLE)) if has_wake => "Your workspace did not answer. Run the same command again in a minute. Your key is ready; nothing was lost.".to_string(),
         (_, Some(admission::UNREACHABLE)) => "No one from this network is online right now. Ask them to open their laptop, then run the same command again. Your key is ready; nothing was lost.".to_string(),
         (_, Some(admission::DECLINED)) => "Your request to join was declined.".to_string(),

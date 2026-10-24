@@ -14,11 +14,12 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub const MAX_FRAME: usize = 1 << 20;
 
 /// The reasons a peer may give for `refused`.
-pub const REASONS: [&str; 6] = [
+pub const REASONS: [&str; 7] = [
     "loop",
     "policy",
     "declined",
     "not_member",
+    "not_a_member",
     "request_id_reused",
     "unsupported",
 ];
@@ -174,6 +175,9 @@ pub enum Frame {
         computer: String,
         kind: String,
         proof: Option<String>,
+        /// The ticket came from an invite code: the inviter always asks its person.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        via_code: bool,
         sig: String,
     },
     JoinDecision {

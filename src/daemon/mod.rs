@@ -87,6 +87,8 @@ pub struct Daemon {
     pub roster_changed: Notify,
     /// Held while a `team.join` runs: one at a time.
     pub joining: tokio::sync::Mutex<()>,
+    /// The live invite-code listeners (`code`), at most a few.
+    pub codes: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     /// Poked on a local session change: the presence sender (`presence::run`) looks again.
     pub presence: Notify,
     /// The presence last built (`presence::run`), sent stamped after each `hello`.
@@ -110,6 +112,8 @@ pub struct Cloud {
     declared: Mutex<Declared>,
     /// The last `Declared::version` the presence sender (`presence::run`) handed on.
     pub sent: tokio::sync::watch::Sender<u64>,
+    /// This member's own doorbell (the sessions file's `wake`), republished after a join.
+    pub wake: Mutex<Option<crate::roster::Wake>>,
 }
 
 /// The sessions an instance declared (`cloud.sessions.set`), as published; each set is a new
@@ -119,6 +123,8 @@ pub struct Declared {
     pub version: u64,
     pub sessions: Arc<Vec<net::frames::Remote>>,
     pub ids: Arc<HashSet<String>>,
+    /// The person ids whose computers may message these sessions; `None`: anyone the policy admits.
+    pub members: Option<Arc<HashSet<String>>>,
 }
 
 impl Cloud {
@@ -127,6 +133,7 @@ impl Cloud {
             name,
             declared: Mutex::default(),
             sent: tokio::sync::watch::Sender::new(0),
+            wake: Mutex::default(),
         }
     }
 
@@ -140,13 +147,14 @@ impl Cloud {
     }
 
     /// Makes `sessions` the declared list: its version.
-    pub fn set(&self, sessions: Vec<net::frames::Remote>) -> u64 {
+    pub fn set(&self, sessions: Vec<net::frames::Remote>, members: Option<HashSet<String>>) -> u64 {
         let mut d = self.declared.lock().unwrap();
         let ids = sessions.iter().map(|s| s.session_id.clone()).collect();
         *d = Declared {
             version: d.version + 1,
             sessions: Arc::new(sessions),
             ids: Arc::new(ids),
+            members: members.map(Arc::new),
         };
         d.version
     }

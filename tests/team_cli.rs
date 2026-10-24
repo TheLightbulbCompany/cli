@@ -75,23 +75,35 @@ impl Env {
 }
 
 const LINE: &str = "lightbulb join '";
-const HEADER: &str = "Send this line to the person (or paste it on your other computer):\n";
+const HEADER: &str =
+    "If the code doesn't work, send this line (or paste it on your other computer):\n";
 
-/// What `invite` printed before its header (a notice, or nothing), and the join command
-/// after it; the app link follows on its own line, for the same ticket.
+/// What `invite` printed before the code (a notice, or nothing), and the join command at the
+/// end; the code and the page link come between, for the same invite (at most 6 lines).
 fn invite_parts(o: &std::process::Output) -> (String, String) {
     let text = out(o);
-    let (notice, rest) = text.split_once(HEADER).unwrap_or_else(|| panic!("{text}"));
+    assert!(text.lines().count() <= 6, "{text}");
+    let (before, rest) = text.split_once(HEADER).unwrap_or_else(|| panic!("{text}"));
     let lines: Vec<&str> = rest.lines().collect();
-    let [line, "Replace NAME with the name they go by.", app] = lines[..] else {
-        panic!("{text}")
-    };
+    let [line] = lines[..] else { panic!("{text}") };
     let ticket = line
         .strip_prefix(LINE)
-        .and_then(|t| t.strip_suffix("' --name NAME"))
+        .and_then(|t| t.strip_suffix('\''))
         .unwrap_or_else(|| panic!("{text}"));
-    assert_eq!(app, format!("lightbulb://join/{ticket}"), "{text}");
-    (notice.to_string(), line.to_string())
+    let mut before: Vec<&str> = before.lines().collect();
+    let link = before.pop().unwrap_or_default();
+    assert_eq!(
+        link,
+        format!("Or send this link:  https://thelightbulb.company/j#{ticket}"),
+        "{text}"
+    );
+    let code = before.pop().unwrap_or_default();
+    assert!(
+        code.starts_with("Tell them to run:  ") && code.contains(" join "),
+        "{text}"
+    );
+    let notice = before.iter().map(|l| format!("{l}\n")).collect::<String>();
+    (notice, line.to_string())
 }
 
 /// The join command `invite` printed.

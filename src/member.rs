@@ -8,6 +8,7 @@
 //! `subscribe` streams `Instance::events` (`lag` when some were missed); `stop`, or SIGTERM,
 //! shuts the instance down (leaving its snapshot) and exits 0.
 
+use crate::daemon::net_ops;
 use crate::embed::{self, EmbedOpts, Instance};
 use crate::roster::MemberKind;
 use crate::Result;
@@ -30,8 +31,8 @@ pub struct MemberOpts {
     /// The workspace's display name.
     pub name: String,
     pub relay: Option<String>,
-    /// `{workspace, sessions: [{name, agent, title?, ...}], wake?}`: the sessions declared
-    /// before the transport starts.
+    /// `{workspace, sessions: [{name, agent, title?, ...}], wake?, members?}`: the sessions
+    /// declared before the transport starts; `members`, person ids, gate who may message them.
     pub sessions: PathBuf,
 }
 
@@ -50,6 +51,12 @@ pub async fn run(opts: MemberOpts, token: String) -> Result<()> {
             vec![]
         }
     };
+    let members = match file.get("members") {
+        None => None,
+        Some(v) => net_ops::members_of(v).map_err(|()| {
+            "the sessions file's members must be null or a list of person id strings"
+        })?,
+    };
     let relay = opts
         .relay
         .as_deref()
@@ -63,6 +70,7 @@ pub async fn run(opts: MemberOpts, token: String) -> Result<()> {
             snapshot: Some(opts.snapshot),
             name: opts.name,
             sessions,
+            members,
         },
     )
     .await?;

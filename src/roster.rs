@@ -149,8 +149,9 @@ pub struct Roster {
     pub heads: Vec<String>,
     pub links: BTreeMap<String, Link>,
     pub relay: Option<String>,
-    /// The founder's doorbell (a parked workspace member's), from its latest `meta` with one.
-    pub wake: Option<Wake>,
+    /// A parked workspace member's doorbell, by member key: its own latest `meta` with one
+    /// (the founder's, or a cloud member's; a computer's is not taken). Members only.
+    pub wakes: BTreeMap<String, Wake>,
     parents: BTreeMap<String, Vec<String>>,
     /// Every replayed entry with its hash, parents first.
     log: Vec<(String, Entry)>,
@@ -171,12 +172,41 @@ impl std::fmt::Debug for Wake {
     }
 }
 
+/// Whether `rest` (a URL after `https://`) names a DNS host: labels of letters, digits and
+/// hyphens, at least two, ending in an alphabetic label (so no IPv4 or other number form, and no
+/// IPv6 literal), not `localhost` or under it, with no userinfo; an optional port.
+fn wake_host(rest: &str) -> bool {
+    let auth = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let (host, port) = match auth.split_once(':') {
+        Some((h, p)) => (h, Some(p)),
+        None => (auth, None),
+    };
+    let label = |l: &str| {
+        (1..=63).contains(&l.len())
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+            && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    };
+    let labels: Vec<&str> = host.split('.').collect();
+    let tld = labels.last().copied().unwrap_or_default();
+    port.is_none_or(|p| (1..=5).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_digit()))
+        && host.len() <= 253
+        && labels.len() >= 2
+        && labels.iter().all(|l| label(l))
+        && tld.len() >= 2
+        && tld.bytes().all(|b| b.is_ascii_alphabetic())
+        && !host.eq_ignore_ascii_case("localhost")
+        && !tld.eq_ignore_ascii_case("localhost")
+}
+
 impl Wake {
-    /// A `meta` body's `wake`: an http(s) URL of printable ASCII with no space or quote, and a
-    /// token of `[A-Za-z0-9._-]` (it is written into curl's config, never a command line).
+    /// A `meta` body's `wake`: an https URL of printable ASCII with no space or quote, whose
+    /// host is a public-looking DNS name (`wake_host`), and a token of `[A-Za-z0-9._-]` (it is
+    /// written into curl's config, never a command line). A DNS name that resolves to a private
+    /// address is not filtered (accepted: only a member's own signed `meta` supplies it).
     pub fn parse(v: &Value) -> Option<Wake> {
         let (url, token) = (v["url"].as_str()?, v["token"].as_str()?);
-        let url_ok = (url.starts_with("https://") || url.starts_with("http://"))
+        let url_ok = url.strip_prefix("https://").is_some_and(wake_host)
             && url.len() <= 2048
             && url
                 .bytes()
@@ -454,6 +484,12 @@ fn pass(
                 let same_person = same.is_some_and(|p| signer.person_id == p);
                 // Any member admits directly, or through any live link.
                 let authorised = e.text("ticket_id").is_empty() || via_link() || same_person;
+                // A workspace with no proof is nobody's word but a person's Allow on a once
+                // link: a hostile member cannot mint unverified members for keys it holds.
+                let authorised = authorised
+                    && (!cloud
+                        || claims.is_some()
+                        || (via_link() && link.is_some_and(|(_, l)| l.once)));
                 let collides = r.collides(e.text("name"), &target, same).is_some();
                 let role_ok = matches!(
                     e.body.get("role").and_then(Value::as_str),
@@ -545,13 +581,15 @@ fn pass(
                         r.relay = Some(relay.to_string());
                     }
                 }
-                if let Some(w) = Wake::parse(&e.body["wake"]).filter(|_| founder) {
-                    r.wake = Some(w);
+                let own = founder || signer.kind == MemberKind::Cloud;
+                if let Some(w) = Wake::parse(&e.body["wake"]).filter(|_| own) {
+                    r.wakes.insert(e.signer.clone(), w);
                 }
             }
             Kind::Admit | Kind::Link | Kind::Other => {}
         }
     }
+    r.wakes.retain(|k, _| r.members.contains_key(k));
     // Live links: unused, not retired, and descended from every removal (a removal it did not
     // see ends it).
     for (lh, l) in links.values() {
@@ -610,7 +648,8 @@ fn own_person(e: &Entry, claims: Option<&Proof>, vouched: bool) -> bool {
         Some(p) => p.sub == e.text("person_id") && (p.kind == ProofKind::Workspace) == cloud,
         // `vouched`: the signer of a `person` link admitting through it names the computer's
         // person — that link went to exactly that person, once (a Mac has no proof of its own).
-        None => !cloud && (e.text("person_id") == e.text("member") || vouched),
+        // A workspace member without a proof is its own key's person, as a computer is.
+        None => e.text("person_id") == e.text("member") || (!cloud && vouched),
     }
 }
 
@@ -647,7 +686,10 @@ fn new_member(e: &Entry, role: Role, claims: Option<&Proof>) -> Member {
         admitted_at: e.at,
         proof: None,
         workspace: None,
-        by: e.body["by"].as_str().map(String::from),
+        // An approval names a session of the signer's own computer; any other is dropped.
+        by: (e.body["by"].as_str())
+            .filter(|b| b.split('/').next() == e.signer.get(..12))
+            .map(String::from),
         key,
     };
     if let Some(p) = claims {
@@ -959,6 +1001,29 @@ mod tests {
     }
 
     #[test]
+    fn a_proofless_cloud_admit_needs_a_once_link() {
+        let (f, k1, k2, k3) = (id(), id(), id(), id());
+        let g = genesis(&f);
+        let cloud = |parent: &Entry, who: &Identity, ticket: &str| {
+            let mut b = admit_body(&who.key, &who.short);
+            b["kind"] = json!("cloud");
+            b["ticket_id"] = json!(ticket);
+            op(&f, parent, Kind::Admit, b)
+        };
+        // Ticketless: dropped. A reusable link: dropped. A once link: stands.
+        let a1 = cloud(&g, &k1, "");
+        let (t2, t3) = (tid(&f, "reusable"), tid(&f, "once"));
+        let l2 = link_with(&f, &a1, &t2, false);
+        let a2 = cloud(&l2, &k2, &t2);
+        let l3 = link_with(&f, &a2, &t3, true);
+        let a3 = cloud(&l3, &k3, &t3);
+        let r = replay(&[g, a1, l2, a2, l3, a3]);
+        assert!(!r.members.contains_key(&k1.key));
+        assert!(!r.members.contains_key(&k2.key));
+        assert!(r.members.contains_key(&k3.key));
+    }
+
+    #[test]
     fn one_cloud_member_per_workspace_even_on_a_fork() {
         let (f, k1, k2) = (id(), id(), id());
         let g = genesis(&f);
@@ -1200,6 +1265,22 @@ mod tests {
             ok.map(|w| w.url),
             Some("https://example.test/api/v1/network/wake".into())
         );
+        for url in [
+            "http://example.test/w",
+            "https://127.0.0.1/w",
+            "https://[::1]/w",
+            "https://localhost/w",
+            "https://a.localhost/w",
+            "https://intranet/w",
+            "https://10.0.0.1:8443/w",
+            "https://example.test@evil.test.1/w",
+            "https://user@example.test/w",
+            "https://0x7f.1/w",
+            "https://example.test:/w",
+        ] {
+            assert!(w(url, "t").is_none(), "{url}");
+        }
+        assert!(w("https://wake.example.test:8443/w?x=1", "t").is_some());
         for (url, token) in [
             ("file:///etc/passwd", "t"),
             ("https://example.test/a b", "t"),
@@ -1215,7 +1296,7 @@ mod tests {
     }
 
     #[test]
-    fn only_the_founders_wake_is_taken() {
+    fn only_the_founders_or_a_cloud_members_wake_is_taken() {
         let (f, b) = (id(), id());
         let g = genesis(&f);
         let ab = admit(&f, &g, &b.key, "b");
@@ -1228,7 +1309,33 @@ mod tests {
             json!({"wake": {"url": "https://x.test/", "token": "b"}}),
         );
         let r = replay(&[g, ab, m, mb]);
-        assert_eq!(r.wake.map(|w| w.token), Some("o.s".into()));
+        assert_eq!(r.wakes.get(&f.key).map(|w| w.token.as_str()), Some("o.s"));
+        assert_eq!(r.wakes.get(&b.key), None);
+    }
+
+    #[test]
+    fn an_admit_keeps_by_only_for_a_session_of_its_signer() {
+        let (f, b, c, d) = (id(), id(), id(), id());
+        let mut e = genesis(&f);
+        let mut entries = vec![e.clone()];
+        for (who, by) in [
+            (&b, Some(format!("{}/codex-1", f.short))),
+            (&c, Some(format!("{}/codex-1", b.short))),
+            (&d, None),
+        ] {
+            let mut body = admit_body(&who.key, &who.short);
+            if let Some(by) = by {
+                body["by"] = json!(by);
+            }
+            e = op(&f, &e, Kind::Admit, body);
+            entries.push(e.clone());
+        }
+        let r = replay(&entries);
+        let got = |w: &Identity| r.members[&w.key].by.clone();
+        assert_eq!(got(&b), Some(format!("{}/codex-1", f.short)));
+        // Another member's session: the admission stands, the claim is dropped.
+        assert_eq!(got(&c), None);
+        assert_eq!(got(&d), None);
     }
 
     fn merge(by: &Identity, parent: &Entry, who: &Identity, pid: &str, proof: &str) -> Entry {

@@ -29,6 +29,8 @@ use tokio::sync::oneshot;
 pub const NOT_OPEN: &str = "not_open";
 pub const ALREADY_IN_TEAM: &str = "already_in_team";
 pub const BAD_TICKET: &str = "bad_ticket";
+/// A code that is no code, or that no inviter serves (wrong, used, or the inviter is off).
+pub const NO_CODE: &str = "no_code";
 pub const EXPIRED_TICKET: &str = "expired_ticket";
 pub const NAME_TAKEN: &str = "name_taken";
 pub const KEY_COLLISION: &str = "key_collision";
@@ -110,6 +112,8 @@ pub struct Request {
     name: String,
     computer: String,
     kind: String,
+    /// The ticket came from an invite code (`Frame::JoinRequest::via_code`).
+    via_code: bool,
     /// The candidate's sign-in proof (`kind=workspace` for a cloud member), verified once when
     /// the request came in: `Err` when it does not verify.
     claims: Option<Result<Proof, ()>>,
@@ -127,6 +131,7 @@ impl Request {
             computer,
             kind,
             proof,
+            via_code,
             ..
         } = f
         else {
@@ -140,6 +145,7 @@ impl Request {
             name: name.clone(),
             computer: computer.clone(),
             kind: kind.clone(),
+            via_code: *via_code,
             claims: (proof.as_deref()).map(|t| proof::verify(t, candidate, now).map_err(|_| ())),
         })
     }
@@ -208,6 +214,19 @@ pub fn request(
     kind: &str,
     token: Option<&str>,
 ) -> Frame {
+    request_via(id, t, name, computer, kind, token, false)
+}
+
+/// `request`, for a ticket that came from an invite code when `via_code`.
+fn request_via(
+    id: &Identity,
+    t: &Ticket,
+    name: &str,
+    computer: &str,
+    kind: &str,
+    token: Option<&str>,
+    via_code: bool,
+) -> Frame {
     signed(
         id,
         Frame::JoinRequest {
@@ -218,6 +237,7 @@ pub fn request(
             computer: computer.into(),
             kind: kind.into(),
             proof: token.map(Into::into),
+            via_code,
             sig: String::new(),
         },
     )
@@ -316,6 +336,7 @@ fn open(d: &Daemon, req: &Request) -> Result<(i64, Option<Verdict>), &'static st
     // sign a non-`open` link, so its word admits no one here.
     let ask = !own_person_link(d, req)
         && (req.ticket.mode != "open"
+            || req.via_code
             || req.kind == "cloud"
             || same_person(&team.roster, req).is_some());
     let n = store.put_join(&row(req, now)).map_err(fail)?;
@@ -348,8 +369,8 @@ fn row(req: &Request, now: i64) -> Join {
 }
 
 /// Whether this computer may admit `req` into `r` now: the ticket and its live link, the
-/// secret, the kind and its proof (a cloud member needs a `workspace` one, for a workspace with
-/// no member yet; a computer's, if any, must verify), a free name and prefix, and our authority: over that link, or (a person's
+/// secret, the kind and its proof (any must verify; a cloud member's is a `workspace` one, and
+/// optional), a free name and prefix, and our authority: over that link, or (a person's
 /// new computer) being that person's computer, else `FORWARD`. Whether the link is a once link.
 fn check(
     r: &Roster,
@@ -376,6 +397,10 @@ fn check(
         "cloud" => true,
         _ => return Err(UNSUPPORTED),
     };
+    // A workspace with no proof joins through a once link only (`roster`'s admit rule).
+    if cloud && req.claims.is_none() && !link.once {
+        return Err(UNSUPPORTED);
+    }
     // A `person` link is for a person's computer.
     let person_link = link.mode == "person";
     if person_link && cloud {
@@ -384,8 +409,7 @@ fn check(
     // Decided from the proof, never from what the request says of itself; one that expired
     // while its dialog waited is not in force at the Allow.
     let c = match &req.claims {
-        // A cloud candidate with no proof at all is not a workspace this engine knows.
-        None if cloud => return Err(UNSUPPORTED),
+        // No proof: a computer, or a workspace shown by its given name, "(not verified)".
         None => None,
         Some(Ok(c)) if now > c.exp => return Err(if cloud { UNSUPPORTED } else { BAD_REQUEST }),
         Some(Ok(c)) if (c.kind == ProofKind::Workspace) == cloud => Some(c),
@@ -861,9 +885,10 @@ enum Outcome {
 /// team, online}`. Only a solo computer joins; it asks the ticket's members in order, one at a
 /// time, carrying `proof` (else this computer's own sign-in proof, if any).
 pub async fn join(id: u64, body: &Value, d: &Arc<Daemon>) -> Response {
-    let Some(link) = body["ticket"].as_str() else {
+    let (ticket_in, code_in) = (body["ticket"].as_str(), body["code"].as_str());
+    if ticket_in.is_some() == code_in.is_some() {
         return Response::err(id, BAD_REQUEST);
-    };
+    }
     let Ok(_joining) = d.joining.try_lock() else {
         return Response::err(id, BAD_REQUEST);
     };
@@ -873,10 +898,9 @@ pub async fn join(id: u64, body: &Value, d: &Arc<Daemon>) -> Response {
         .trim()
         .to_string();
     let kind = body["kind"].as_str().unwrap_or("computer");
-    // Only an embedded instance joins as a workspace's member, only as that, and with its
-    // proof.
-    let unproven = kind == "cloud" && !body["proof"].is_string();
-    if (kind == "cloud") != d.cloud.is_some() || unproven {
+    // Only an embedded instance joins as a workspace's member, and only as that. Its proof is
+    // optional: without one it is shown "(not verified)", as any unproven member.
+    if (kind == "cloud") != d.cloud.is_some() {
         return Response::err(id, BAD_REQUEST);
     }
     let me = &d.identity.key;
@@ -898,11 +922,28 @@ pub async fn join(id: u64, body: &Value, d: &Arc<Daemon>) -> Response {
     if !fits(&name) || !fits(&computer) {
         return done("refused", Some(BAD_NAME), "", 0);
     }
-    let Ok(t) = ticket::decode(link) else {
-        return done("refused", Some(BAD_TICKET), "", 0);
-    };
     let Some(ep) = d.peers.endpoint.get() else {
         return Response::err(id, INTERNAL);
+    };
+    // A code stands for the ticket its inviter serves once; wrong, used and offline look the same.
+    let fetched;
+    let link = match (ticket_in, code_in) {
+        (Some(link), _) => link,
+        (_, Some(code)) => {
+            let ticket = match crate::code::normalize(code) {
+                Some(code) => crate::code::fetch(d, ep, &code).await,
+                None => None,
+            };
+            let Some(ticket) = ticket else {
+                return done("refused", Some(NO_CODE), "", 0);
+            };
+            fetched = ticket;
+            &fetched
+        }
+        _ => return Response::err(id, BAD_REQUEST),
+    };
+    let Ok(t) = ticket::decode(link) else {
+        return done("refused", Some(BAD_TICKET), "", 0);
     };
     // Its proof: the one given (the workspace member's), else this computer's sign-in.
     let token = body["proof"].as_str().map(String::from).or_else(|| {
@@ -910,7 +951,16 @@ pub async fn join(id: u64, body: &Value, d: &Arc<Daemon>) -> Response {
         let own = t.roster.members.get(me).and_then(|m| m.proof.as_ref());
         own.map(|p| p.token.clone())
     });
-    let req = request(&d.identity, &t, &name, &computer, kind, token.as_deref());
+    let via_code = code_in.is_some();
+    let req = request_via(
+        &d.identity,
+        &t,
+        &name,
+        &computer,
+        kind,
+        token.as_deref(),
+        via_code,
+    );
     // The last listed member's refusal, when every reachable one refused.
     let mut last = None;
     // The inviter's addresses on the ticket: what reaches it with no relay and no mDNS, kept
@@ -976,6 +1026,10 @@ pub async fn join(id: u64, body: &Value, d: &Arc<Daemon>) -> Response {
                         }
                     })
                     .await;
+                    // A workspace member's doorbell goes into the team it just joined.
+                    if let Err(e) = crate::embed::publish(d) {
+                        eprintln!("join: wake: {e}");
+                    }
                     let team = d.team.lock().unwrap().roster.team_name.clone();
                     return done("admitted", None, &team, d.peers.online().len() + 1);
                 }
@@ -993,7 +1047,10 @@ pub async fn join(id: u64, body: &Value, d: &Arc<Daemon>) -> Response {
             _ => break,
         }
     }
-    done("refused", Some(last.unwrap_or(UNREACHABLE)), "", 0)
+    // `wake`: the ticket named a workspace, whose doorbell was rung (the CLI says so).
+    let mut r = done("refused", Some(last.unwrap_or(UNREACHABLE)), "", 0);
+    r.body["wake"] = t.wake.is_some().into();
+    r
 }
 
 /// One member's answer to `req` on `conn`.

@@ -320,6 +320,7 @@ pub fn answer(
     allow: bool,
     scope: Option<&str>,
     by: &str,
+    members: Option<&std::collections::HashSet<String>>,
     now: i64,
 ) -> Result<std::result::Result<Closed, &'static str>> {
     let Some(h) = get(store, id)? else {
@@ -351,6 +352,12 @@ pub fn answer(
         Some(t) => t.clone(),
         None => dialog(store, roster, &me.key, &h)?.0,
     };
+    // A workspace's member gate (`mail::receive`) binds a hold filed before it changed: its
+    // sender, no longer a member, is refused, never delivered.
+    let gated = allow
+        && h.kind() == Kind::Message
+        && members.is_some_and(|m| !from.is_some_and(|f| m.contains(&f.person_id)));
+    let allow = allow && !gated;
     let c = Closed {
         hold: h,
         allow,
@@ -387,7 +394,7 @@ pub fn answer(
                 f,
                 rid,
                 State::Refused,
-                Some("declined"),
+                Some(if gated { "not_a_member" } else { "declined" }),
                 None,
                 at,
             )?;
@@ -515,7 +522,18 @@ fn answer_here(
         let team = d.team.lock().unwrap();
         let store = d.store.lock().unwrap();
         let now = ipc::now() as i64;
-        answer(&store, &team.roster, &d.identity, id, allow, scope, by, now)?
+        let members = d.cloud.as_ref().and_then(|c| c.declared().members);
+        answer(
+            &store,
+            &team.roster,
+            &d.identity,
+            id,
+            allow,
+            scope,
+            by,
+            members.as_deref(),
+            now,
+        )?
     };
     if let Ok(c) = &r {
         after(d, c, by, Some(surface));

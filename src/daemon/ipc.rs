@@ -352,6 +352,13 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
         "share.grant" | "stream.open" | "stream.send" | "stream.close" => {
             crate::streams::handle(id, op, body, daemon, caller).await
         }
+        "team.invite" => {
+            let mut r = super::net_ops::handle(id, op, body, daemon, caller);
+            if r.ok {
+                crate::code::offer(daemon, &mut r.body).await;
+            }
+            r
+        }
         op => super::net_ops::handle(id, op, body, daemon, caller),
     }
 }

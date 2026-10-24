@@ -27,6 +27,21 @@ Invites are signed by the computer that made them. A join is checked against the
 invite must still be live (not replaced, not ended by a removal, not a used one-time invite) and
 not expired.
 
+In a flat network any computer member can mint a one-time link and so add a cloud member
+that is not verified (shown "(not verified)"). Accepted: members are trusted.
+
+### Invite codes
+
+`lightbulb invite` also prints a four-word code (EFF short wordlist, about 41 bits). The code
+is a convenience; the full line or link is the strongest path. While the inviter's daemon
+runs, a second endpoint whose key is derived from the code (Argon2id, 64 MiB, 3 passes, so
+each guess is costly) serves the full invite once. It closes after the first hand-off, after 5
+bad callers, after 10 minutes, or when the invite expires, and nothing listens when no code
+invite is live. A join by code always needs the inviter's Allow, even for an open link. The
+code is never logged, but it appears in shell history and `ps` on the joiner's computer; it
+is dead once used or after 10 minutes. 5 junk connections can close a live code (denial of
+service only; fall back to the full line).
+
 ## Transport encryption
 
 Computers talk over QUIC, using the iroh library. Each connection is encrypted end to end

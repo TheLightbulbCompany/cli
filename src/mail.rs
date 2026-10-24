@@ -213,6 +213,7 @@ fn receipt_text(r: &Value, person: Option<&ForPerson>) -> Option<String> {
                 "policy" => "they do not take messages from you".to_string(),
                 "declined" => "they declined it".into(),
                 "not_member" => "that computer is not in your team".into(),
+                "not_a_member" => "that workspace only takes messages from its members".into(),
                 "request_id_reused" => "that request id was used for another message".into(),
                 "unsupported" => "their computer cannot take it".into(),
                 _ => shown("reason").replace('_', " "),
@@ -725,7 +726,9 @@ pub fn send(
 /// `policy`, or kept under a hold (`holds::hold`, `held`, in no mailbox), or stored for `to`
 /// with origin `net:<peer short>`, timed by its arrival (`now`). Held or stored, it is
 /// remembered in `seen_ids`. On a workspace member, `declared` are its sessions: new mail for
-/// any other is `policy` (after the resend checks, so a resend gets the state it has).
+/// any other is `policy` (after the resend checks, so a resend gets the state it has). With
+/// `members` (person ids), mail from a peer whose person is not in it is `not_a_member`: no hold.
+#[allow(clippy::too_many_arguments)]
 pub fn receive(
     store: &Store,
     env: &Frame,
@@ -733,6 +736,7 @@ pub fn receive(
     roster: &Roster,
     me: &str,
     declared: Option<&std::collections::HashSet<String>>,
+    members: Option<&std::collections::HashSet<String>>,
     now: u64,
 ) -> Result<Answer> {
     let Frame::Envelope {
@@ -797,6 +801,9 @@ pub fn receive(
     }
     if declared.is_some_and(|d| !d.contains(to)) {
         return refused("policy");
+    }
+    if members.is_some_and(|m| !m.contains(&peer.person_id)) {
+        return refused("not_a_member");
     }
     // An answer to (or in the thread of) a message this computer sent is at least one hop
     // past it, whatever `hops` the peer claims; only a person (`/terminal`, fenced by the
@@ -1698,7 +1705,7 @@ mod tests {
         allow_p(&s);
         for (i, to) in ["m/terminal", "m/codex:c"].iter().enumerate() {
             let (peer, roster, env) = peer_mail(to, &format!("r{i}"));
-            let got = receive(&s, &env, &peer, &roster, "m", None, 1000).unwrap();
+            let got = receive(&s, &env, &peer, &roster, "m", None, None, 1000).unwrap();
             let fresh = Answer {
                 fresh: true,
                 ..Answer::is(State::Stored)
@@ -1717,10 +1724,10 @@ mod tests {
         allow_p(&s);
         let (peer, roster, env) = peer_mail("m/codex:c", "r1");
         let again = || {
-            let r = receive(&s, &env, &peer, &roster, "m", None, 1001).unwrap();
+            let r = receive(&s, &env, &peer, &roster, "m", None, None, 1001).unwrap();
             (r.state, r.reason, r.fresh)
         };
-        receive(&s, &env, &peer, &roster, "m", None, 1000).unwrap();
+        receive(&s, &env, &peer, &roster, "m", None, None, 1000).unwrap();
         advance(
             s.conn(),
             "p/codex:a",

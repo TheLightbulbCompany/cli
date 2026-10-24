@@ -276,6 +276,50 @@ async fn undeclared_cloud_session_cannot_send() {
     i.shutdown().await;
 }
 
+/// A workspace joins with no proof: the person at computer A allows it, and it is a cloud member
+/// named for its workspace, its own key's person, with no verified workspace. A computer still
+/// cannot join as cloud (`tests/join.rs`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_workspace_joins_without_a_proof() {
+    let a = computer_a();
+    let home = tempfile::tempdir().unwrap();
+    let i = start(home.path(), &[&a], None).await;
+    // A reusable link does not take it: a workspace with no proof joins through a once link.
+    let t = a.ask(json!({"id": 1, "op": "team.invite"}));
+    let r = ok(
+        &i,
+        "team.join",
+        json!({"ticket": t["ticket"], "name": NAME, "kind": "cloud"}),
+    )
+    .await;
+    assert_eq!(r["state"], "refused", "{r}");
+    let t = a.ask(json!({"id": 1, "op": "team.invite", "mode": "once"}));
+    let r = ok(
+        &i,
+        "team.join",
+        json!({"ticket": t["ticket"], "name": NAME, "kind": "cloud"}),
+    )
+    .await;
+    assert_eq!(r["state"], "admitted", "{r}");
+    let me = ok(&i, "identity.get", json!({})).await;
+    let team = ok(&i, "team.get", json!({})).await;
+    let mine = (team["members"].as_array().unwrap().iter())
+        .find(|m| m["key"] == me["member_key"])
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        (
+            mine["kind"].as_str(),
+            mine["name"].as_str(),
+            mine["person_id"].as_str()
+        ),
+        (Some("cloud"), Some(NAME), me["member_key"].as_str()),
+        "{mine}"
+    );
+    assert!(mine["workspace"].is_null(), "{mine}");
+    i.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn workspace_instance_joins_and_leaves_in_process() {
     let a = computer_a();
@@ -290,14 +334,7 @@ async fn workspace_instance_joins_and_leaves_in_process() {
     )
     .await;
     assert_eq!(r["error"], "bad_request", "{r}");
-    // No proof, or one whose `sub` is not its workspace's: refused.
-    let r = call(
-        &i,
-        "team.join",
-        json!({"ticket": t["ticket"], "name": NAME, "kind": "cloud"}),
-    )
-    .await;
-    assert_eq!(r["error"], "bad_request", "{r}");
+    // A proof whose `sub` is not its workspace's: refused.
     let key = ok(&i, "identity.get", json!({})).await["member_key"].clone();
     let bad = common::issuer::mint(&json!({"iss": "test", "iat": now_s(), "exp": now_s() + 600,
         "sub": "ws:W2", "name": NAME, "computer": key, "kind": "workspace",

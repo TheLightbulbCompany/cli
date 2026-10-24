@@ -290,6 +290,7 @@ pub async fn instance(
         snapshot: snapshot.map(std::path::Path::to_path_buf),
         name: name.into(),
         sessions: vec![],
+        members: None,
     };
     let i = lightbulb::embed::start(home, opts).await;
     for (k, _) in &knobs {
