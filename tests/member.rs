@@ -467,7 +467,15 @@ async fn join(
 async fn a_person_link_admits_a_mac_without_an_allow() {
     let dir = tempfile::tempdir().unwrap();
     let (child, token, sock) = member(dir.path(), friday());
-    for bad in ["O'Brien", "a\nb", "tab\there"] {
+    let long = "x".repeat(65);
+    for bad in [
+        "O'Brien",
+        "a\nb",
+        "tab\there",
+        " lead",
+        "car\u{202e}ol",
+        &long,
+    ] {
         let r = person_invite(&sock, &token, "user_x", bad);
         assert_eq!(r["error"], "bad_request", "{bad:?}: {r}");
     }
@@ -609,6 +617,19 @@ async fn a_teammates_person_link_still_waits_for_an_allow() {
     let policy = ok(&sock, &token, "policy.get", json!({}));
     assert_eq!(policy["people"], json!({}), "{policy}");
     joining.abort();
+    ok(&sock, &token, "stop", json!({}));
+    exits_zero(child);
+}
+
+/// A member that is its workspace's cloud member in another's team signs no link that would
+/// survive the roster's replay: no person line from it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cloud_member_mints_no_person_link() {
+    let dir = tempfile::tempdir().unwrap();
+    seed(dir.path());
+    let (child, token, sock) = member(dir.path(), friday());
+    let r = person_invite(&sock, &token, "user_x", "Prasiddha");
+    assert_eq!(r["error"], "unsupported", "{r}");
     ok(&sock, &token, "stop", json!({}));
     exits_zero(child);
 }

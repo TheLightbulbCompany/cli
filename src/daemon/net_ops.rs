@@ -643,8 +643,13 @@ impl TeamOps<'_> {
             // `team.invite {mode: "person", for, name}` -> `{line, expires_at}`: a once link
             // for person `for`'s computer (24 h), its line with `name` filled in.
             "team.invite" if invite == Invite::Person => {
-                let quotable =
-                    |n: &&str| !n.is_empty() && !n.chars().any(|c| c == '\'' || c.is_control());
+                // Only a computer member's links survive replay and pass `check`: a cloud
+                // member's line could only ever get `bad_ticket`.
+                if r.members.get(&me_key).map(|m| m.kind) != Some(MemberKind::Computer) {
+                    return Ok(Response::err(id, UNSUPPORTED));
+                }
+                // Joinable as is (`admission::fits`) and safe inside the line's quotes.
+                let quotable = |n: &&str| crate::admission::fits(n) && !n.contains('\'');
                 let person = body["for"].as_str().filter(|p| !p.is_empty());
                 let (Some(person), Some(name)) = (person, body["name"].as_str().filter(quotable))
                 else {
