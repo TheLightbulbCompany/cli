@@ -112,8 +112,6 @@ pub struct Request {
     name: String,
     computer: String,
     kind: String,
-    /// The ticket came from an invite code (`Frame::JoinRequest::via_code`).
-    via_code: bool,
     /// The candidate's sign-in proof (`kind=workspace` for a cloud member), verified once when
     /// the request came in: `Err` when it does not verify.
     claims: Option<Result<Proof, ()>>,
@@ -131,7 +129,6 @@ impl Request {
             computer,
             kind,
             proof,
-            via_code,
             ..
         } = f
         else {
@@ -145,7 +142,6 @@ impl Request {
             name: name.clone(),
             computer: computer.clone(),
             kind: kind.clone(),
-            via_code: *via_code,
             claims: (proof.as_deref()).map(|t| proof::verify(t, candidate, now).map_err(|_| ())),
         })
     }
@@ -214,19 +210,6 @@ pub fn request(
     kind: &str,
     token: Option<&str>,
 ) -> Frame {
-    request_via(id, t, name, computer, kind, token, false)
-}
-
-/// `request`, for a ticket that came from an invite code when `via_code`.
-fn request_via(
-    id: &Identity,
-    t: &Ticket,
-    name: &str,
-    computer: &str,
-    kind: &str,
-    token: Option<&str>,
-    via_code: bool,
-) -> Frame {
     signed(
         id,
         Frame::JoinRequest {
@@ -237,7 +220,6 @@ fn request_via(
             computer: computer.into(),
             kind: kind.into(),
             proof: token.map(Into::into),
-            via_code,
             sig: String::new(),
         },
     )
@@ -333,10 +315,10 @@ fn open(d: &Daemon, req: &Request) -> Result<(i64, Option<Verdict>), &'static st
     }
     // A cloud candidate, and a person's new computer, always wait for an Allow; a `person`
     // link of ours (a computer, `check`) never does. Another member's waits: any member may
-    // sign a non-`open` link, so its word admits no one here.
+    // sign a non-`open` link, so its word admits no one here. (A code serves a once `ask`
+    // link of its own, `code::offer`.)
     let ask = !own_person_link(d, req)
         && (req.ticket.mode != "open"
-            || req.via_code
             || req.kind == "cloud"
             || same_person(&team.roster, req).is_some());
     let n = store.put_join(&row(req, now)).map_err(fail)?;
@@ -951,16 +933,7 @@ pub async fn join(id: u64, body: &Value, d: &Arc<Daemon>) -> Response {
         let own = t.roster.members.get(me).and_then(|m| m.proof.as_ref());
         own.map(|p| p.token.clone())
     });
-    let via_code = code_in.is_some();
-    let req = request_via(
-        &d.identity,
-        &t,
-        &name,
-        &computer,
-        kind,
-        token.as_deref(),
-        via_code,
-    );
+    let req = request(&d.identity, &t, &name, &computer, kind, token.as_deref());
     // The last listed member's refusal, when every reachable one refused.
     let mut last = None;
     // The inviter's addresses on the ticket: what reaches it with no relay and no mDNS, kept

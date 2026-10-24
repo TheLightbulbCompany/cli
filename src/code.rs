@@ -106,17 +106,22 @@ async fn secret_async(code: &str, window: i64) -> Option<SecretKey> {
         .ok()
 }
 
-/// Adds `code` to a successful `team.invite` answer `body` and serves its ticket: nothing
-/// when the invite has none (a person link), on a workspace member, or when no endpoint
-/// binds (the printed line still works).
+/// Adds `code` to a successful `team.invite` answer `body` and serves, for it, a fresh once
+/// `ask` link of its own (never the printed link, which may be reusable or `open`): nothing
+/// when the invite has none (a person link), on a workspace member, or when no link is minted
+/// or no endpoint binds (the printed line still works).
 pub async fn offer(d: &Daemon, body: &mut Value) {
-    let (Some(ticket), Some(expires_at)) = (body["ticket"].as_str(), body["expires_at"].as_i64())
-    else {
-        return;
-    };
-    if d.cloud.is_some() {
+    if body["ticket"].is_null() || d.cloud.is_some() {
         return;
     }
+    let t = match crate::daemon::net_ops::code_link(d) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("invite: no code link: {e}");
+            return;
+        }
+    };
+    let (ticket, expires_at) = (crate::ticket::encode(&t), t.expires_at);
     let now = crate::daemon::ipc::now() as i64;
     let code = generate();
     let Some(key) = secret_async(&code, window(now)).await else {
@@ -136,7 +141,7 @@ pub async fn offer(d: &Daemon, body: &mut Value) {
         eprintln!("invite: the code could not be served");
         return;
     };
-    let task = tokio::spawn(serve(ep, ticket.to_string(), expires_at.min(now + LIFE_S)));
+    let task = tokio::spawn(serve(ep, ticket, expires_at.min(now + LIFE_S)));
     let mut live = d.codes.lock().unwrap();
     live.retain(|t| !t.is_finished());
     if live.len() >= MAX_LIVE {

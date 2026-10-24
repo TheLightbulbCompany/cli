@@ -735,6 +735,20 @@ impl TeamOps<'_> {
     }
 }
 
+/// A fresh once `ask` link for an invite code to serve (`code::offer`): its ticket.
+pub(crate) fn code_link(daemon: &Daemon) -> crate::Result<ticket::Ticket> {
+    let mut team = daemon.team.lock().unwrap();
+    let store = daemon.store.lock().unwrap();
+    let mut ops = TeamOps {
+        id: 0,
+        daemon,
+        team: &mut team,
+        store: &store,
+        now: super::ipc::now() as i64,
+    };
+    ops.new_link("ask", true, false)
+}
+
 /// The published sessions of member `short` that `list` declares (`cloud.sessions.set`, the
 /// sessions file at start): each `{name, agent, title?}`, names valid and distinct, at most
 /// `presence::MAX`. `None` if any is not.
