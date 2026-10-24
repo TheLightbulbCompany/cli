@@ -306,6 +306,11 @@ pub fn ensure_running() -> Result<()> {
     if answers_ping(&sock) {
         return Ok(());
     }
+    // A daemon would refuse at boot (`embed::KEY_MISMATCH`): say so now, so a hook or the MCP
+    // server does not wait out a start that cannot happen.
+    if crate::embed::key_mismatch(&dir).unwrap_or(false) {
+        return Err(crate::embed::KEY_MISMATCH.into());
+    }
     let launchd = cfg!(target_os = "macos")
         && cli::use_launchctl()
         && std::env::var_os(paths::HOME_ENV).is_none()

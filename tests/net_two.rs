@@ -546,36 +546,3 @@ async fn loopback_file_is_kept_fresh() {
         std::fs::read_to_string(&file).is_ok_and(|t| t == text)
     });
 }
-
-/// send -> delivered over two daemons: A sends to a session on B, B's session takes it, A's
-/// receipt says `delivered`. 20 messages; prints the median. `cargo test --test net_two --
-/// --ignored --nocapture send_to_delivered`.
-#[test]
-#[ignore]
-fn send_to_delivered_median() {
-    let (a, b) = common::pair(&[]);
-    let mut ms = vec![];
-    for m in 0..20 {
-        // A pair of its own each time: under the loop limits (hops, 12 per 10 minutes).
-        let (from, to) = (
-            common::session(&a, &format!("s{m}")),
-            common::session(&b, &format!("r{m}")),
-        );
-        let rid = format!("m{m}");
-        let t = std::time::Instant::now();
-        a.send(&from, &to, "ping", &rid, None);
-        loop {
-            b.inbox(&to);
-            if a.state(&from, &rid) == "delivered" {
-                break;
-            }
-            assert!(t.elapsed() < Duration::from_secs(10), "{rid} not delivered");
-        }
-        ms.push(t.elapsed().as_secs_f64() * 1000.0);
-    }
-    ms.sort_by(f64::total_cmp);
-    println!(
-        "send -> delivered ms: median {:.1}, max {:.1}",
-        ms[10], ms[19]
-    );
-}

@@ -1,15 +1,12 @@
 //! Relay fallback: two computers that cannot reach each other directly talk through a relay
 //! (iroh's own relay server, run here over plain HTTP on the loopback); a team's own relay,
-//! which replaces the default; and nothing of ours is ever fetched.
+//! which replaces the default.
 
 use iroh_relay::server::{RelayConfig, Server, ServerConfig};
 use lightbulb::config::Config;
 use lightbulb::relay;
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader, Write};
 use std::net::{Ipv4Addr, TcpListener};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
 mod common;
@@ -33,28 +30,6 @@ fn relay_only() -> (&'static str, String) {
 /// `url` as the engine writes it (`RelayUrl`'s form: a trailing `/`).
 fn canon(url: &str) -> String {
     relay::parse(url).unwrap().to_string()
-}
-
-/// A loopback HTTP server that answers 404 to everything, counting the requests it gets: an
-/// `issuer` nothing may contact.
-fn counting_server() -> (String, Arc<AtomicUsize>) {
-    let l = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let url = format!("http://{}/connect", l.local_addr().unwrap());
-    let hits = Arc::new(AtomicUsize::new(0));
-    let h = hits.clone();
-    std::thread::spawn(move || {
-        for s in l.incoming().flatten() {
-            h.fetch_add(1, Ordering::SeqCst);
-            let mut r = BufReader::new(&s);
-            while r.read_line(&mut String::new()).is_ok_and(|n| n > 2) {}
-            let mut s = &s;
-            let _ = write!(
-                s,
-                "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
-            );
-        }
-    });
-    (url, hits)
 }
 
 fn online(e: &Env) -> bool {
@@ -153,17 +128,15 @@ async fn relay_down_leaves_the_direct_path_working() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn team_relay_from_meta_replaces_the_default() {
     let (_server, team_relay) = relay_server(0).await;
-    let (issuer, hits) = counting_server();
-    let iss = format!("issuer = \"{issuer}\"\n");
     let (a, b) = (Env::new(), Env::new());
     seed_pair(&a, &b);
-    b.daemon(false, &iss, &[]);
+    b.daemon(false, "", &[]);
     // A's daemon takes this test process for an agent (a person's requests come through
     // `person`).
     let me = std::process::id();
     let birth = lightbulb::os::process(me).unwrap().birth_micros;
     let pin = ("LIGHTBULB_CONNECT_HOOK_CALLER", format!("{me}:{birth}"));
-    a.daemon(false, &iss, &[peers(&[&b]), pin]);
+    a.daemon(false, "", &[peers(&[&b]), pin]);
     until(10, "both online", || online(&a) && online(&b));
     let got = |e: &Env| e.ask(json!({"id": 1, "op": "relay.get"}));
     // Nothing set (and the tests' knob keeps the public relays away): direct only.
@@ -214,7 +187,6 @@ async fn team_relay_from_meta_replaces_the_default() {
             vec![relay::parse(&team_relay).unwrap()]
         )
     );
-    assert_eq!(hits.load(Ordering::SeqCst), 0, "the issuer was contacted");
 
     // `relay` alone prints the list and its source.
     let o = a.detached(&[EXE, "relay"], "");
@@ -289,8 +261,7 @@ async fn relay_clear_returns_to_the_default() {
     let e = Env::new();
     // The default on: the knob that keeps the other tests off the internet is cleared.
     let on = ("LIGHTBULB_CONNECT_DEBUG_NO_DEFAULT_RELAYS", "0".to_string());
-    let (issuer, hits) = counting_server();
-    let config = format!("relay = \"{url}\"\nissuer = \"{issuer}\"\n");
+    let config = format!("relay = \"{url}\"\n");
     e.daemon(false, &config, &[on]);
     let o = e.detached(&[EXE, "relay"], "");
     assert_eq!(out(&o), format!("config  {}\n", canon(&url)));
@@ -312,8 +283,5 @@ async fn relay_clear_returns_to_the_default() {
         "{}",
         out(&o)
     );
-    // With no relay set the daemon calls home for nothing (there was once a daily list).
-    std::thread::sleep(Duration::from_secs(3));
-    assert_eq!(hits.load(Ordering::SeqCst), 0, "the issuer was contacted");
     e.ask(json!({"id": 1, "op": "shutdown"}));
 }

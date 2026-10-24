@@ -138,16 +138,9 @@ impl World {
 
     /// W1's instance, dialing B, and its events from the start, once B is online to it.
     async fn instance(&self, knobs: &[(&str, String)]) -> (Instance, Receiver<Value>) {
-        let i = common::instance(
-            self.w1.path(),
-            &[&self.b],
-            NAME,
-            "http://127.0.0.1:9/connect",
-            None,
-            knobs,
-        )
-        .await
-        .unwrap();
+        let i = common::instance(self.w1.path(), &[&self.b], NAME, None, knobs)
+            .await
+            .unwrap();
         let rx = i.events();
         online(&i).await;
         (i, rx)
@@ -849,16 +842,9 @@ async fn a_notice_no_one_heard_is_not_acked_and_stays_pending() {
     let w = world(Some("W1"));
     w.b.daemon(false, "", &[]);
     // No subscriber yet.
-    let i = common::instance(
-        w.w1.path(),
-        &[&w.b],
-        NAME,
-        "http://127.0.0.1:9/connect",
-        None,
-        &[],
-    )
-    .await
-    .unwrap();
+    let i = common::instance(w.w1.path(), &[&w.b], NAME, None, &[])
+        .await
+        .unwrap();
     online(&i).await;
     let (mut pa, _e) = played(&w.a, &w.b).await;
     w.held_from(&mut pa, &format!("{}/codex:a1", w.a.short), 1)

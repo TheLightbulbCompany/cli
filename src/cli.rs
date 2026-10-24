@@ -45,13 +45,7 @@ pub(crate) fn plist_path(home: &Path) -> PathBuf {
 
 /// Starts the daemon if needed, then opens a connection to it.
 fn connect() -> Result<Conn> {
-    if let Err(e) = daemon::ensure_running() {
-        // The daemon refuses a replaced identity.key: say why, not just that it did not start.
-        if crate::embed::key_mismatch(&paths::state_dir()).unwrap_or(false) {
-            return Err(crate::embed::KEY_MISMATCH.into());
-        }
-        return Err(e);
-    }
+    daemon::ensure_running()?;
     Conn::open()
 }
 
@@ -970,7 +964,21 @@ pub fn remove(name: &str) -> Result<i32> {
 /// start makes this computer its own network with its new key. Nothing can be signed for the
 /// team, so it is not told.
 fn leave_unsigned(dir: &std::path::Path) -> Result<i32> {
-    let _lock = daemon::lock_dir(dir, false)?;
+    // A start that is about to refuse (launchd's respawn) holds the lock a moment: wait it out.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let _lock =
+        loop {
+            match daemon::lock_dir(dir, false) {
+                Ok(l) => break l,
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(100))
+                }
+                Err(_) => return Err(
+                    "The background service holds the state folder. Stop it, then run leave again."
+                        .into(),
+                ),
+            }
+        };
     let store = crate::store::Store::open(&dir.join("state.db"))?;
     let name = crate::roster::replay(&crate::roster::entries(&store)?).team_name;
     print!("Leave \"{name}\"? This computer's key changed, so the team cannot be told. Messages already stored here stay. [y/N] ");

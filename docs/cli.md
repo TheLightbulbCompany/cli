@@ -7,11 +7,10 @@ the next release; 0.2.2 says only "The held messages waiting for your Allow", bu
 requests too.)
 
 Commands that decide for you (`join`, `held`, `approve`, `decline`, `policy <person> <value>`,
-`remove`, `admin`, `invite --open`, `relay <url>`, `signin`, `leave`) must be run by a person at
+`remove`, `admin`, `invite --open`, `relay <url>`, `leave`) must be run by a person at
 a terminal, not by an agent. Run from an agent, most answer
 `Run this from your own terminal, not from an agent.`; `invite --open` answers
-`invite --open is for people at a terminal`, and `signin` answers
-`Sign in from your own terminal, not from an agent.`
+`invite --open is for people at a terminal`.
 
 ## Getting started
 
@@ -60,11 +59,12 @@ lightbulb invite [OPTIONS]
 
 `--help`: Print this computer's join line (the reusable invite, unless a flag says otherwise).
 
-Prints this computer's join line (the reusable invite unless an option says otherwise).
+Prints this computer's join line (the reusable invite unless an option says otherwise). After
+`--new` it says `Every earlier invite from this computer stopped working.`
 
 | Option | Meaning |
 |---|---|
-| `--new` | Replace the reusable invite; the old one stops working. |
+| `--new` | A new invite; every earlier one from this computer (open ones too) stops working. |
 | `--once` | An invite for one join, valid 24 hours. |
 | `--open` | An invite whose joins need no Allow (founder and admins). |
 
@@ -84,19 +84,6 @@ Joins the team the line is for. This computer must be on its own.
 |---|---|
 | `<TICKET>` | The line your inviter sent: the long code after `join`, or the whole `lightbulb://join/…` link. |
 | `--name <name>` | The name you go by in the team. Default: your user name. |
-
-### signin
-
-When you use it: to show teammates your verified name. (In this release it cannot finish yet;
-see [teams](teams.md#sign-in).)
-
-```
-lightbulb signin
-```
-
-`--help`: Sign in to Lightbulb in your browser, so teammates see your verified name.
-
-Signs in to Lightbulb in your browser.
 
 ## Everyday
 
@@ -129,8 +116,9 @@ lightbulb send [OPTIONS] <TARGET> <TEXT>...
 `--help`: Send text to a session (`session_id`), a name address (`<member>/<name>`), or, from a person's terminal, a group (`*`, `<member>/*`).
 
 `<TARGET>` is a name from `who` (`codex-1`), a session id, a name address `<member>/<name>`
-(for example `sam/inbox`, where `sam` is a teammate's name), or `*` for every open session on
-this computer. The rest of the line is the text. It prints the receipt, for example
+(for example `sam/inbox`, where `sam` is a teammate's name), `*` for every open session on
+this computer, or `<member>/*` (for example `'sam/*'`) for each of that teammate's sessions as
+`who --all` lists them. The rest of the line is the text. It prints the receipt, for example
 `Sent. sam has to allow it first (they see a prompt). Check: lightbulb receipt <id>`.
 
 | Option | Meaning |
@@ -263,7 +251,8 @@ lightbulb leave
 
 `--help`: Leave the team; this computer is on its own network again.
 
-Asks `[y/N]` first. This computer is on its own network again.
+Asks `[y/N]` first. This computer is on its own network again. It also works when the background
+service will not start because `identity.key` no longer matches the team record.
 
 ### policy
 
@@ -292,7 +281,7 @@ lightbulb folder <PATH> <STATE>
 
 ### relay
 
-When you use it: to see or change the relays (not listed in `lightbulb --help`).
+When you use it: to see or change the relays.
 
 ```
 lightbulb relay [OPTIONS] [URL]

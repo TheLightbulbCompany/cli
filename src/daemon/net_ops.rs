@@ -148,17 +148,7 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, caller: Caller) 
         "relay.get" => Response::ok(id, json!(*daemon.peers.relays.lock().unwrap())),
         "relay.set" => relay_set(id, body, daemon, caller),
         // An agent fed a hostile sign-in must not move this computer into another person.
-        "identity.proof" | "identity.device_start" if !caller.is_person() => {
-            refused(id, "not_a_person")
-        }
-        // `identity.device_start {}` -> `{member_key, computer, at, sig}`: `device/start`'s
-        // body, `sig` by this computer's key over the rest (person-only).
-        "identity.device_start" => {
-            let computer = daemon.team.lock().unwrap().config.computer.clone();
-            let at = super::ipc::now() as i64;
-            let body = json!({"member_key": daemon.identity.key, "computer": computer, "at": at});
-            Response::ok(id, daemon.identity.signed(body))
-        }
+        "identity.proof" if !caller.is_person() => refused(id, "not_a_person"),
         // `identity.proof {proof}` -> `{name, person_id, solo}`: this computer's sign-in proof,
         // written to the roster (`proof::record`), person-only; `bad_request` when it does not
         // verify (reason `other_person` when it names another person than this computer's).

@@ -106,17 +106,12 @@ fn an_agent_cannot_sign_this_computer_in() {
         None,
         ipc::now() as i64,
     );
-    for op in [
-        json!({"id": 1, "op": "identity.proof", "proof": token}),
-        json!({"id": 1, "op": "identity.device_start"}),
-    ] {
-        let r = e.ask(op);
-        assert_eq!(
-            (&r["error"], &r["reason"]),
-            (&json!("bad_request"), &json!("not_a_person")),
-            "{r}"
-        );
-    }
+    let r = e.ask(json!({"id": 1, "op": "identity.proof", "proof": token}));
+    assert_eq!(
+        (&r["error"], &r["reason"]),
+        (&json!("bad_request"), &json!("not_a_person")),
+        "{r}"
+    );
     assert_eq!(identity_of(&e)["person_id"], e.identity().key);
 }
 
@@ -170,8 +165,6 @@ fn second_computer_of_same_person_is_admitted_by_the_first() {
 }
 
 const WS: &str = "The Lightbulb Company";
-/// A closed port's: no test reaches ours.
-const NO_ISSUER: &str = "http://127.0.0.1:9/connect";
 
 /// F founds a solo network whose dialogs `allowing` answers; its link. The workspace member is
 /// an embedded instance (only one joins as `cloud`).
@@ -183,16 +176,9 @@ fn founder() -> (Env, tempfile::TempDir, String) {
     (f, dir, t)
 }
 
-/// An instance of workspace `WS` on `home`, dialing `f`, with `issuer` and `knobs`.
-async fn workspace(
-    home: &Path,
-    f: &Env,
-    issuer: &str,
-    knobs: &[(&str, String)],
-) -> (Instance, String) {
-    let i = common::instance(home, &[f], WS, issuer, None, knobs)
-        .await
-        .unwrap();
+/// An instance of workspace `WS` on `home`, dialing `f`, with `knobs`.
+async fn workspace(home: &Path, f: &Env, knobs: &[(&str, String)]) -> (Instance, String) {
+    let i = common::instance(home, &[f], WS, None, knobs).await.unwrap();
     let me = call(&i, "identity.get", json!({})).await;
     let key = me["member_key"].as_str().unwrap().to_string();
     (i, key)
@@ -210,7 +196,7 @@ async fn join_cloud(i: &Instance, t: &str, proof: &str) -> Value {
 async fn workspace_member_joins_with_a_workspace_proof() {
     let (f, dir, t) = founder();
     let home = tempfile::tempdir().unwrap();
-    let (w, wk) = workspace(home.path(), &f, NO_ISSUER, &[]).await;
+    let (w, wk) = workspace(home.path(), &f, &[]).await;
     let agents = ["Friday", "Engineering"];
     let proof = workspace_proof(&wk, "W1", WS, &agents, ipc::now() as i64);
     let r = join_cloud(&w, &t, &proof).await;
@@ -242,10 +228,10 @@ async fn second_member_for_one_workspace_is_refused() {
     // Another name, so only the one-member-per-`sub` rule can refuse the second.
     let proof = |k: &str, name: &str| workspace_proof(k, "W1", name, &[], ipc::now() as i64);
     let (h1, h2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-    let (w, wk) = workspace(h1.path(), &f, NO_ISSUER, &[]).await;
+    let (w, wk) = workspace(h1.path(), &f, &[]).await;
     let r = join_cloud(&w, &t, &proof(&wk, WS)).await;
     assert_eq!(r["state"], "admitted", "{r}");
-    let (w2, wk2) = workspace(h2.path(), &f, NO_ISSUER, &[]).await;
+    let (w2, wk2) = workspace(h2.path(), &f, &[]).await;
     let r = join_cloud(&w2, &t, &proof(&wk2, "Lightbulb, renamed")).await;
     assert_eq!(
         (&r["state"], &r["reason"]),
@@ -260,7 +246,7 @@ async fn second_member_for_one_workspace_is_refused() {
 async fn computer_proof_cannot_join_as_cloud() {
     let (f, dir, t) = founder();
     let home = tempfile::tempdir().unwrap();
-    let (w, wk) = workspace(home.path(), &f, NO_ISSUER, &[]).await;
+    let (w, wk) = workspace(home.path(), &f, &[]).await;
     let ws = Some(("W1", "The Lightbulb Company"));
     let proof = computer_proof(&wk, "user_1", "Prasiddha", ws, ipc::now() as i64);
     let r = join_cloud(&w, &t, &proof).await;

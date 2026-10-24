@@ -93,7 +93,8 @@ text is deleted from `state.db` once nothing waits on it (read, refused or expir
 your own terminal keep theirs.
 
 The engine makes no network call to Lightbulb: no relay list, no sign-in, no telemetry. It talks
-only to your teammates' computers and, when no direct path exists, to the relays.
+only to your teammates' computers and, when no direct path exists, to the relays. (`update`,
+when you run it, downloads from this project's GitHub releases.)
 
 To hide sessions, run `lightbulb folder <path> off`. Sessions under that folder disappear
 from your teammates' `who --all` within a few seconds. `who` on your

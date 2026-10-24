@@ -113,16 +113,9 @@ impl World {
 
     /// W1's member, dialing `envs`, once all of them are online.
     async fn instance(&self, envs: &[&Env]) -> Instance {
-        let i = common::instance(
-            self.w1.path(),
-            envs,
-            NAME,
-            "http://127.0.0.1:9/connect",
-            None,
-            &[],
-        )
-        .await
-        .unwrap();
+        let i = common::instance(self.w1.path(), envs, NAME, None, &[])
+            .await
+            .unwrap();
         online(&i, envs.len() as u64).await;
         i
     }

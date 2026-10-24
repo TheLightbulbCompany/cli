@@ -72,15 +72,8 @@ impl Env {
 
     /// Starts `lightbulb daemon` on this state dir with `lan` (mDNS) and `config` as
     /// `config.toml`, and `env` set, and waits until it answers.
-    /// Unless `config` names an issuer, a closed port's: no test reaches ours (nor fetches our
-    /// relay list).
     pub fn daemon(&self, lan: bool, config: &str, env: &[(&str, String)]) {
-        let issuer = if config.contains("issuer") {
-            ""
-        } else {
-            "issuer = \"http://127.0.0.1:9/connect\"\n"
-        };
-        let config = format!("lan = {lan}\n{issuer}{config}");
+        let config = format!("lan = {lan}\n{config}");
         std::fs::write(self.state.path().join("config.toml"), config).unwrap();
         let log = std::fs::File::create(self.state.path().join("daemon.log")).unwrap();
         let mut c = self.base_cmd(Command::new(EXE));
@@ -272,14 +265,13 @@ pub fn ws_proof(who: &Identity, ws: &str, name: &str) -> String {
 /// one start at a time.
 static STARTING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// An embedded instance on `home`, workspace `name`, with issuer `issuer`, that dials `envs`
+/// An embedded instance on `home`, workspace `name`, that dials `envs`
 /// at their running daemons, leaving a final snapshot at `snapshot` on shutdown; `knobs` are
 /// set while it starts (its knobs are read then).
 pub async fn instance(
     home: &std::path::Path,
     envs: &[&Env],
     name: &str,
-    issuer: &str,
     snapshot: Option<&std::path::Path>,
     knobs: &[(&str, String)],
 ) -> lightbulb::Result<lightbulb::embed::Instance> {
@@ -294,7 +286,6 @@ pub async fn instance(
     let opts = lightbulb::embed::EmbedOpts {
         kind: roster::MemberKind::Cloud,
         relay: None,
-        issuer: issuer.into(),
         snapshot: snapshot.map(std::path::Path::to_path_buf),
         name: name.into(),
     };

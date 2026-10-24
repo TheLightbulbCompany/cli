@@ -239,7 +239,11 @@ pub fn receipt_note(r: &Value, person: Option<&ForPerson>) -> Option<String> {
         "delivered" => "Delivered.".into(),
         "read" if remote => format!("Read by {who} on {computer}."),
         "read" => "Read.".into(),
-        // The sender's outbox gave up (`unreachable`), or it waited unread in the mailbox.
+        // A hold nobody answered (`not_allowed`), the sender's outbox gave up (`unreachable`), or
+        // it waited unread in the mailbox (or its session ended while held).
+        "expired" if at("reason") == "not_allowed" => {
+            "Nobody answered the Allow for 7 days; the message expired.".into()
+        }
         "expired" if at("reason") == "unreachable" => {
             "Not delivered: the other computer could not be reached for 24 hours.".into()
         }
@@ -539,8 +543,8 @@ pub fn prepare(
         // Not persisted: a later message may make this reply_to known.
         (None, None) => return unstored("no_recipient"),
     };
-    if let Some((old_to, old_text)) = store.sent_as(&from.0, request_id)? {
-        if old_to != to.0 || old_text.is_some_and(|t| t != text) {
+    if let Some((old_to, same)) = store.sent_as(&from.0, request_id, text)? {
+        if old_to != to.0 || !same {
             // Not persisted: the original's receipt must stay as it was.
             return unstored("request_id_reused");
         }
@@ -757,8 +761,8 @@ pub fn receive(
             ..Answer::is(State::parse(&state)?)
         });
     }
-    if let Some((old_to, old_body)) = store.sent_as(from, request_id)? {
-        if old_to != *to || old_body.is_some_and(|b| b != *body) {
+    if let Some((old_to, same)) = store.sent_as(from, request_id, body)? {
+        if old_to != *to || !same {
             return refused("request_id_reused");
         }
         // The same message under another envelope id: where it is now.
@@ -975,17 +979,29 @@ pub fn mark_read(store: &Store, message_id: &str) -> Result<()> {
 
 /// Drops the text of every message nothing waits on any more: its receipt is final (`read`,
 /// `refused` or `expired`) and no mailbox or outbox row names it. The row stays (loop limits,
-/// threads and receipts read it); a person's own terminal mailbox keeps its text.
+/// threads and receipts read it) with the text's digest (`body_sha`, for a retry's compare);
+/// a person's own terminal mailbox keeps its text.
 // ponytail: a scan of the rows still holding text on the expiry timer; a trigger if it shows.
 pub fn forget(store: &Store) -> Result<()> {
-    store.conn().execute(
-        "UPDATE messages SET body = NULL WHERE body IS NOT NULL AND to_key NOT LIKE '%/terminal' \
+    let tx = store.conn().unchecked_transaction()?;
+    let done: Vec<(String, String)> = {
+        let mut stmt = tx.prepare(
+        "SELECT id, body FROM messages WHERE body IS NOT NULL AND to_key NOT LIKE '%/terminal' \
          AND EXISTS (SELECT 1 FROM receipts r WHERE r.from_key = messages.from_key \
              AND r.request_id = messages.request_id AND r.state IN ('read', 'refused', 'expired')) \
          AND NOT EXISTS (SELECT 1 FROM mailbox b WHERE b.message_id = messages.id) \
          AND NOT EXISTS (SELECT 1 FROM outbox o WHERE o.message_id = messages.id)",
-        [],
-    )?;
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for (id, body) in done {
+        tx.execute(
+            "UPDATE messages SET body = NULL, body_sha = ?2 WHERE id = ?1",
+            params![id, crate::store::body_sha(&body)],
+        )?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -1728,6 +1744,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r.state, State::Read);
+        // Another text under it is still a reused request id: compared by its digest.
+        let r = send(
+            &s,
+            &k("m/codex:a"),
+            Some(&k("m/codex:b")),
+            "ho",
+            "r1",
+            None,
+            4,
+        )
+        .unwrap();
+        assert_eq!(
+            (r.state, r.reason.as_deref()),
+            (State::Refused, Some("request_id_reused"))
+        );
         // The person's own terminal keeps its history, read or not.
         take(&s, &k("m/terminal"), 2).unwrap();
         advance(s.conn(), "m/codex:b", "r2", State::Read, None, None, 3).unwrap();
@@ -1751,6 +1782,10 @@ mod tests {
         assert_eq!(
             note(serde_json::json!({"state": "expired", "reason": "unreachable"})),
             "Not delivered: the other computer could not be reached for 24 hours."
+        );
+        assert_eq!(
+            note(serde_json::json!({"state": "expired", "reason": "not_allowed"})),
+            "Nobody answered the Allow for 7 days; the message expired."
         );
     }
 }

@@ -29,15 +29,7 @@ async fn try_start(
     envs: &[&Env],
     snapshot: Option<&Path>,
 ) -> lightbulb::Result<Instance> {
-    common::instance(
-        home,
-        envs,
-        NAME,
-        "http://127.0.0.1:9/connect",
-        snapshot,
-        &[],
-    )
-    .await
+    common::instance(home, envs, NAME, snapshot, &[]).await
 }
 
 async fn ok(i: &Instance, op: &str, body: Value) -> Value {

@@ -406,7 +406,7 @@ pub fn answer(
 
 /// Closes the open holds past their time at `now`: a message whose target session has been
 /// gone (ended, or with no row here) `GONE_S` (`expired`, reason `session_ended`) or that
-/// waited `mail::HELD_S` (`expired`); a permission prompt whose session is gone or that waited
+/// waited `mail::HELD_S` with no answer (`expired`, reason `not_allowed`); a permission prompt whose session is gone or that waited
 /// `PERMISSION_S`. Returns them.
 // ponytail: a session with no row (discovered only, never registered) counts as gone from
 // the hold's start; register it to keep its holds the full 7 days.
@@ -421,7 +421,10 @@ pub fn expire(store: &Store, now: i64) -> Result<Vec<Hold>> {
                 None,
             ),
             Kind::Message if ended => (true, Some("session_ended")),
-            Kind::Message => (h.created_at <= now - mail::HELD_S as i64, None),
+            Kind::Message => (
+                h.created_at <= now - mail::HELD_S as i64,
+                Some("not_allowed"),
+            ),
         };
         if !due {
             continue;
