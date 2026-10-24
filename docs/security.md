@@ -134,9 +134,9 @@ conversations, only the messages sent to them. Hide a folder with `lightbulb fol
 
 ## Telemetry and network requests
 
-Telemetry: none. Lightbulb sends no usage data, no crash reports and no analytics.
+Lightbulb sends anonymous usage counts (see "Usage counts" in the README; off with `lightbulb telemetry off`). It sends no crash reports and no message content.
 
-The engine makes no network call to Lightbulb: no relay list, no sign-in, no telemetry. It talks
+Apart from those counts, the engine makes no network call to Lightbulb: no relay list, no sign-in. It talks
 only to your teammates' computers and, when no direct path exists, to the relays (the iroh
 project's public relays unless you or your team set one).
 

@@ -163,6 +163,11 @@ enum Command {
         /// accept, hold or refuse.
         value: Option<String>,
     },
+    /// Anonymous usage counts: `on`, `off`, or (no argument) their state.
+    Telemetry {
+        #[arg(value_parser = ["on", "off", "status"])]
+        state: Option<String>,
+    },
     /// Show (`on`) or hide (`off`) the sessions under a folder from your teammates.
     Folder {
         path: String,
@@ -311,6 +316,10 @@ fn run() -> lightbulb::Result<()> {
         Command::Decline { request } => exit(cli::answer(&request, false, false)?),
         Command::Held => exit(cli::held()?),
         Command::Policy { person, value } => exit(cli::policy(person, value)?),
+        Command::Telemetry { state } => exit(lightbulb::telemetry::command(
+            &lightbulb::paths::state_dir(),
+            state.as_deref().filter(|s| *s != "status"),
+        )?),
         Command::Folder { path, state } => exit(cli::folder(&path, state == "on")?),
         Command::Relay { url, clear, local } => {
             exit(cli::relay(clear.then(String::new).or(url), local)?)

@@ -125,6 +125,7 @@ pub fn output(h: &Hook, text: &str) -> Value {
 
 /// Runs one hook; `Ok(Some(stdout))` when there is something for the agent.
 pub fn run(agent: &str, event: &str, stdin: &str) -> Result<Option<String>> {
+    crate::telemetry::sync_env_optout(&crate::paths::state_path());
     let Some(h) = normalize(agent, event, &serde_json::from_str(stdin)?) else {
         return Ok(None);
     };

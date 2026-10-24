@@ -260,6 +260,7 @@ pub async fn run(dir: &Path) -> Result<()> {
     tokio::spawn(crate::admission::route(daemon.clone()));
     cli::refresh_setup(dir);
     tokio::spawn(auto_update(daemon.clone(), dir.to_path_buf()));
+    tokio::spawn(crate::telemetry::run_daily(daemon.clone()));
     // SIGTERM (launchd's stop) and SIGINT end it like a `shutdown` op: the socket and the
     // loopback address file (`net::local`) are removed on the way out.
     let d = daemon.clone();
@@ -316,6 +317,7 @@ pub fn user_name() -> String {
 /// never a second owner; otherwise this binary spawns one.
 pub fn ensure_running() -> Result<()> {
     let dir = paths::state_dir();
+    crate::telemetry::sync_env_optout(&dir);
     let sock = dir.join(paths::SOCKET);
     if answers_ping(&sock) {
         return Ok(());

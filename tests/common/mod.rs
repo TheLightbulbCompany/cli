@@ -48,6 +48,7 @@ impl Env {
             .env("LIGHTBULB_CONNECT_CLAUDE_HOME", self.home.path())
             .env("LIGHTBULB_CONNECT_NO_LAUNCHCTL", "1")
             .env("LIGHTBULB_CONNECT_DEBUG_NO_DEFAULT_RELAYS", "1")
+            .env("LIGHTBULB_CONNECT_DEBUG_NO_TELEMETRY", "1")
             .env("HOME", self.home.path())
             .env("USER", "prasiddha");
         c
@@ -643,6 +644,7 @@ pub fn member_with(
         .arg(&file)
         .env("HOME", dir)
         .env("LIGHTBULB_CONNECT_DEBUG_NO_DEFAULT_RELAYS", "1")
+        .env("LIGHTBULB_CONNECT_DEBUG_NO_TELEMETRY", "1")
         .env_remove("LIGHTBULB_CONNECT_PEERS")
         .stdin(Stdio::piped())
         .stdout(log.try_clone().unwrap())
