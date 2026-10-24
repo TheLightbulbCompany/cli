@@ -1,0 +1,59 @@
+name: Bug report
+description: Something in lightbulb does not work as the docs say.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not report a vulnerability here. Email hello@thelightbulb.company with the subject "security" (see SECURITY.md).
+        Do not paste message text from real conversations, or `identity.key`.
+  - type: textarea
+    id: version
+    attributes:
+      label: lightbulb version
+      description: The output of `lightbulb version`.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: lightbulb doctor
+      description: The output of `lightbulb doctor`.
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: agent
+    attributes:
+      label: Agent and its version
+      description: Claude Code, Codex, Cursor or Grok CLI, and its version (for example the output of `claude --version`), or "none".
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps
+      description: What you ran or asked the agent, one step per line.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual
+      description: What happened instead, with any error text.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        The relevant lines of `~/.lightbulb/connect/daemon.log`. It never holds message text, but it does hold member key prefixes and session ids; remove any you do not want to share.
+      render: text

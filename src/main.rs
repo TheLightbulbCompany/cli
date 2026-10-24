@@ -161,7 +161,7 @@ enum Command {
     },
     /// Decline a join request (`J<n>`) or a held message (`H<n>`).
     Decline { request: String },
-    /// The held messages waiting for your Allow.
+    /// The join requests and held messages waiting for your Allow.
     Held,
     /// Who may message your sessions; with a person and a value, sets it.
     Policy {
