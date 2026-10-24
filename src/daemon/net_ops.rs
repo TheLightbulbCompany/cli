@@ -739,33 +739,22 @@ impl TeamOps<'_> {
     }
 }
 
-/// `cloud.sessions.set {sessions: [{name, agent, title?}]}` -> `{}` (an embedded instance only;
-/// `unsupported` on a computer): the workspace's agents, published as `<short>/<name>` with
-/// `agent` and `title` (at most `presence::MAX`, each name a `valid_name`, once). Answers once
-/// the presence sender (`presence::run`) has handed on the presence carrying them, so a `send`
-/// from a name just declared is never refused as unadvertised by a peer the envelope reaches
-/// first; `internal` if that takes over 5 s (the list stands, and goes out on the next send).
-pub async fn cloud_sessions_set(id: u64, body: &Value, daemon: &Daemon) -> Response {
-    let Some(cloud) = &daemon.cloud else {
-        return Response::err(id, UNSUPPORTED);
-    };
-    let Some(list) = body["sessions"]
-        .as_array()
-        .filter(|l| l.len() <= crate::presence::MAX)
-    else {
-        return Response::err(id, BAD_REQUEST);
-    };
+/// The published sessions of member `short` that `list` declares (`cloud.sessions.set`, the
+/// sessions file at start): each `{name, agent, title?}`, names valid and distinct, at most
+/// `presence::MAX`. `None` if any is not.
+pub(crate) fn remotes(short: &str, list: &[Value]) -> Option<Vec<crate::net::frames::Remote>> {
+    if list.len() > crate::presence::MAX {
+        return None;
+    }
     let mut names = HashSet::new();
     let mut out = vec![];
     for s in list {
-        let (Some(name), Some(agent)) = (s["name"].as_str(), s["agent"].as_str()) else {
-            return Response::err(id, BAD_REQUEST);
-        };
+        let (name, agent) = (s["name"].as_str()?, s["agent"].as_str()?);
         if !crate::sessions::valid_name(name) || !names.insert(name) {
-            return Response::err(id, BAD_REQUEST);
+            return None;
         }
         let r = crate::net::frames::Remote {
-            session_id: format!("{}/{name}", daemon.identity.short),
+            session_id: format!("{short}/{name}"),
             agent: agent.into(),
             repo: None,
             branch: None,
@@ -776,11 +765,30 @@ pub async fn cloud_sessions_set(id: u64, body: &Value, daemon: &Daemon) -> Respo
             title: s["title"].as_str().map(String::from),
         }
         .clamp();
-        if !r.valid(&daemon.identity.short, true) {
-            return Response::err(id, BAD_REQUEST);
+        if !r.valid(short, true) {
+            return None;
         }
         out.push(r);
     }
+    Some(out)
+}
+
+/// `cloud.sessions.set {sessions: [{name, agent, title?}]}` -> `{}` (an embedded instance only;
+/// `unsupported` on a computer): the workspace's agents, published as `<short>/<name>` with
+/// `agent` and `title` (at most `presence::MAX`, each name a `valid_name`, once). Answers once
+/// the presence sender (`presence::run`) has handed on the presence carrying them, so a `send`
+/// from a name just declared is never refused as unadvertised by a peer the envelope reaches
+/// first; `internal` if that takes over 5 s (the list stands, and goes out on the next send).
+pub async fn cloud_sessions_set(id: u64, body: &Value, daemon: &Daemon) -> Response {
+    let Some(cloud) = &daemon.cloud else {
+        return Response::err(id, UNSUPPORTED);
+    };
+    let Some(out) = body["sessions"]
+        .as_array()
+        .and_then(|l| remotes(&daemon.identity.short, l))
+    else {
+        return Response::err(id, BAD_REQUEST);
+    };
     let mut sent = cloud.sent.subscribe();
     let version = cloud.set(out);
     daemon.presence.notify_one();

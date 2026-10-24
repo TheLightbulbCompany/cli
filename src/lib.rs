@@ -16,6 +16,7 @@ pub mod identity;
 pub mod label;
 pub mod mail;
 pub mod mcp;
+pub mod member;
 pub mod net;
 pub mod os;
 pub mod outbox;

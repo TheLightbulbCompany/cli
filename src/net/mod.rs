@@ -883,6 +883,14 @@ impl Net {
                 _ = viewers => {}
             }
         }
+        // The peer took another connection from our key in this one's place: for a workspace's
+        // sidecar, another process holding its key (the bridge counts these).
+        if let Some(iroh::endpoint::ConnectionError::ApplicationClosed(c)) = conn.close_reason() {
+            if c.error_code == VarInt::from_u32(SUPERSEDED) {
+                let e = serde_json::json!({ "event": "superseded", "by_peer": short(&key) });
+                let _ = d.events.send(e);
+            }
+        }
         d.peers.forget(&key, &conn);
         crate::presence::seen(d, &key);
         conn.close(VarInt::from_u32(0), b"");
