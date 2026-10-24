@@ -178,9 +178,15 @@ pub(crate) async fn boot(
     if mismatched(&identity, &roster) {
         return Err(KEY_MISMATCH.into());
     }
+    // A workspace's network from before the `cloud` marker: its person links no longer vouch, so
+    // found it again, marked. Nobody ran those builds outside our own tests.
+    let unmarked = cloud.is_some()
+        && entries
+            .iter()
+            .any(|e| e.parents.is_empty() && e.signer == identity.key && e.body["cloud"] != true);
     // Known but no member: removed (a stop before `removed_here`'s new genesis, or a fork that
     // dropped us). On our own network again, as `removed_here` leaves it.
-    if !roster.members.contains_key(&identity.key) {
+    if unmarked || !roster.members.contains_key(&identity.key) {
         crate::outbox::refuse_all(&store, now as u64, "not_member")?;
         store.clear_roster()?;
         let at = now.max(roster.created_at + 1);

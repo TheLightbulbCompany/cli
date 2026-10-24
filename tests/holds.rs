@@ -762,7 +762,10 @@ fn member_with_stranger(dir: &std::path::Path, b: &Identity) {
     let home = dir.join("home");
     std::fs::create_dir_all(&home).unwrap();
     let w = Identity::load_or_create(&home).unwrap();
-    let g = net_ops::genesis(&w, "The Lightbulb Company", "ws", "acme", 1);
+    let g = common::workspace_genesis(
+        &w,
+        &net_ops::genesis(&w, "The Lightbulb Company", "ws", "acme", 1),
+    );
     let ab = common::admit(&w, &g, b, "bob", json!({}));
     let store = Store::open(&home.join("state.db")).unwrap();
     for e in [&g, &ab] {

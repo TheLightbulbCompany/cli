@@ -37,9 +37,13 @@ counts (the workspace instance that founded its network, or a cloud member with 
 proof); one signed by any other member is dropped, so no member can admit a key as someone
 else's computer. The founder's workspace marker is self-declared until issuer proofs ship, so a
 vouched id must be an account id (such as `user_…`) and never a member key: a hostile
-workspace-style network can only vouch account ids, which no plain computer has. A computer
-counts a message as its own person's only from itself or from a computer with the same
-account id.
+workspace-style network can only vouch account ids, never a plain computer's own key. A
+computer counts a message as its own person's only from itself or from a computer with the
+same account id. What is left until issuer proofs ship: anyone can run a workspace-style
+network (`lightbulb member`), and if you join one with a person line it gave you, it chooses
+your account id there and can vouch one of its own computers as that same id, so that
+computer's messages reach you without a prompt. Only join with a person line from a workspace
+you trust; an ordinary invite line or code never does this.
 
 ### Invite codes
 
@@ -181,9 +185,9 @@ download the release from GitHub. An update checks the tarball's SHA-256 against
 file of the same GitHub release: that proves the download is intact, with the same trust as
 the install script (whoever controls the release controls both). On macOS an update also
 requires the new binary to be signed with Lightbulb's Developer ID (team `WZX4U3C22Y`); on
-Linux the checksum is the only check. An update never edits your shell profile: only `setup`
-run by you at a terminal adds `~/.local/bin` to your PATH, and never through a symlinked
-profile.
+Linux the checksum is the only check. The background daily update never edits your shell
+profile. Only a command you run at a terminal (`setup`, or `update` there) adds `~/.local/bin`
+to your PATH, once, and never through a symlinked profile.
 
 ## Reporting a vulnerability
 

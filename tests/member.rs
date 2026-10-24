@@ -676,7 +676,10 @@ fn doorbell_of(
     let w = Identity::load_or_create(&home).unwrap();
     let a = common::Env::new();
     let entries: Vec<Entry> = if founder {
-        let g = lightbulb::daemon::net_ops::genesis(&w, NAME, NAME, NAME, 1);
+        let g = common::workspace_genesis(
+            &w,
+            &lightbulb::daemon::net_ops::genesis(&w, NAME, NAME, NAME, 1),
+        );
         let aa = common::admit(
             &w,
             &g,

@@ -663,3 +663,20 @@ async fn a_dropped_instance_shuts_down_before_its_home_is_free() {
     let r = try_start(home.path(), &[], Some(&inside)).await;
     assert!(r.err().is_some_and(|e| e.to_string().contains("snapshot")));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_workspace_network_from_before_the_marker_is_founded_again() {
+    let home = tempfile::tempdir().unwrap();
+    let w = Identity::load_or_create(home.path()).unwrap();
+    let old = genesis(&w, None); // the instance's own genesis, without `cloud`
+    let store = Store::open(&home.path().join("state.db")).unwrap();
+    roster::accept(&store, &old, 10).unwrap();
+    drop(store);
+    let i = start(home.path(), &[], None).await;
+    i.shutdown().await;
+    let entries = roster::entries(&Store::open(&home.path().join("state.db")).unwrap()).unwrap();
+    let roots: Vec<_> = entries.iter().filter(|e| e.parents.is_empty()).collect();
+    assert_eq!(roots.len(), 1, "only the new genesis is kept");
+    assert_eq!(roots[0].body["cloud"], true);
+    assert_ne!(roots[0].hash(), old.hash());
+}
