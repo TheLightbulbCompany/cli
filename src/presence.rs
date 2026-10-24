@@ -45,8 +45,7 @@ pub fn declared_agents(d: &Daemon) -> HashMap<String, String> {
     let latest = d.latest.lock().unwrap();
     let all = latest.values().flat_map(|l| &l.sessions);
     all.map(|s| {
-        let rest = crate::sessions::split_addr(&s.session_id).map_or("", |(_, r)| r);
-        let title = s.title.as_ref().filter(|t| crate::label::via(rest, t));
+        let title = s.title.as_ref().filter(|t| crate::label::via(t));
         (s.session_id.clone(), title.unwrap_or(&s.agent).clone())
     })
     .collect()

@@ -36,7 +36,7 @@ pub fn render_as(roster: &Roster, viewer: &str, from: &str, declared: Option<&st
     if let Some(p) = ws.filter(|_| m.kind == MemberKind::Cloud) {
         let rest = split_addr(from).map_or(from, |(_, r)| r);
         let named = p.agents.iter().find(|a| a.eq_ignore_ascii_case(rest));
-        if let Some(title) = declared.filter(|t| via(rest, t)) {
+        if let Some(title) = declared.filter(|t| via(t)) {
             return shown(title, 64, "an app");
         }
         let agent = declared.or(named.map(String::as_str)).unwrap_or(rest);
@@ -69,14 +69,12 @@ pub fn render_as(roster: &Roster, viewer: &str, from: &str, declared: Option<&st
     }
 }
 
-/// Whether `title` is a hosted app's, `<App> via <Person>`, declared for workspace session
-/// `name` (`app_send`'s `{app}-{person}`, `app` the title's `App` in lower case).
-pub fn via(name: &str, title: &str) -> bool {
-    title.split_once(" via ").is_some_and(|(app, who)| {
-        !app.is_empty()
-            && !who.trim().is_empty()
-            && name.starts_with(&format!("{}-", app.to_ascii_lowercase()))
-    })
+/// Whether a declared `title` is a hosted app's, `<App> via <Person>` (`app_send`): the
+/// declaring workspace member is its trust root, so it renders as it is.
+pub fn via(title: &str) -> bool {
+    title
+        .split_once(" via ")
+        .is_some_and(|(app, who)| !app.trim().is_empty() && !who.trim().is_empty())
 }
 
 /// Whether member `m` reads as verified to the computer `own` (its key): it has a proof, or it is
@@ -240,10 +238,7 @@ mod tests {
         // A hosted app's declared title, as it is; not one for another name or app.
         let app = |name: &str, t: &str| render_as(&r, &a_pid, &format!("wshort/{name}"), Some(t));
         assert_eq!(app("chatgpt-u1", "ChatGPT via Aden"), "ChatGPT via Aden");
-        assert_eq!(
-            app("claude-u1", "ChatGPT via Aden"),
-            "ChatGPT via Aden · The Lightbulb Company"
-        );
+        assert_eq!(app("claude-u1", "Claude.ai via Aden"), "Claude.ai via Aden");
         assert_eq!(
             app("chatgpt-u1", "ChatGPT via "),
             "ChatGPT via  · The Lightbulb Company"

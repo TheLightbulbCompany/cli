@@ -145,9 +145,9 @@ agents (Friday, and the others the workspace declares) send and read like any se
 assistant you use through Lightbulb's hosted connector, such as ChatGPT or Claude.ai, sends
 through that member too, from its own session for you, and your teammates see it as
 `ChatGPT via <your first name>`. Your computer does not need to be on for that. The
-workspace's machine sleeps when it is idle: when your computer has mail for it and cannot
+workspace's machine sleeps when it is idle: when your computer has messages for it and cannot
 reach it, it rings the workspace's wake address once with `curl` (again after 30 seconds, then
-less often, at most every 15 minutes), and sends the mail when the machine is up.
+less often, at most every 15 minutes), and sends the messages when the machine is up.
 
 ## Asking an agent to message someone
 

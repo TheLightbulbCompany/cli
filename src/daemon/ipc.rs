@@ -189,9 +189,6 @@ pub fn inbox_record(v: &Value) -> Value {
         .collect()
 }
 
-/// The fields of a receipt (`finish`) an app's answer carries (`app_send`).
-pub const RECEIPT_FIELDS: [&str; 5] = ["state", "reason", "limit", "thread", "tier"];
-
 /// One op, from `caller`: every person-only op refuses without a person.
 pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: Caller) -> Response {
     let instance = caller == Caller::Instance;
@@ -209,7 +206,9 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
         "inbox.peek" if instance => crate::embed::peek(id, daemon),
         "inbox.ack" if instance => crate::embed::ack(id, body, daemon),
         "cloud.sessions.set" => super::net_ops::cloud_sessions_set(id, body, daemon).await,
-        "app.send" | "app.inbox" | "app.receipt" => crate::app_send::op(id, op, body, daemon).await,
+        "app.send" | "app.inbox" | "app.receipt" if instance => {
+            crate::app_send::op(id, op, body, daemon).await
+        }
         "status" => {
             // Before the team lock: `live_sessions` takes it.
             let sessions = live_count(daemon);

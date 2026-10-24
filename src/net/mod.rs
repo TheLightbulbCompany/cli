@@ -1186,17 +1186,32 @@ fn flush(d: &Daemon, all: bool, expire: bool) -> Result<()> {
     Ok(())
 }
 
-/// Rings `who`'s doorbell: `curl -fsS -m 10 -X POST -K - <url>`, the bearer token handed on
+/// Rings `who`'s doorbell: `curl -q -g --proto =http,https -fsS -m 10 -X POST -K - <url>`, the bearer token handed on
 /// stdin as a config line, never on a command line (`ps`) or in a log; curl's output is not
 /// kept (an error could quote what it read).
 async fn doorbell(w: roster::Wake, who: String) {
     use tokio::io::AsyncWriteExt;
     let mut c = tokio::process::Command::new("curl");
-    c.args(["-fsS", "-m", "10", "-X", "POST", "-K", "-", &w.url])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true);
+    // `-q` first: no `~/.curlrc` (a `trace` line there could write the header to a file);
+    // `-g`: no URL globbing; http(s) only, no redirects followed.
+    c.args([
+        "-q",
+        "-g",
+        "--proto",
+        "=http,https",
+        "-fsS",
+        "-m",
+        "10",
+        "-X",
+        "POST",
+        "-K",
+        "-",
+    ])
+    .arg(&w.url)
+    .stdin(std::process::Stdio::piped())
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null())
+    .kill_on_drop(true);
     let rang = async {
         let mut child = c.spawn()?;
         let mut stdin = child.stdin.take().expect("piped");

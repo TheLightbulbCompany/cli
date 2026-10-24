@@ -731,6 +731,10 @@ async fn a_computer_rings_the_doorbell_only_after_a_failed_dial() {
     assert_eq!(
         calls[0],
         [
+            "-q",
+            "-g",
+            "--proto",
+            "=http,https",
             "-fsS",
             "-m",
             "10",
@@ -741,7 +745,7 @@ async fn a_computer_rings_the_doorbell_only_after_a_failed_dial() {
             "http://127.0.0.1:9/api/v1/network/wake"
         ]
     );
-    // Backoff: more mail due rings no second time soon.
+    // Backoff: more messages due ring no second time soon.
     a.send(&common::session(&a, "c1"), &to, "still parked", "r3", None);
     tokio::time::sleep(Duration::from_secs(5)).await;
     assert_eq!(rings(dir.path()).len(), 1);
