@@ -348,8 +348,8 @@ fn row(req: &Request, now: i64) -> Join {
 }
 
 /// Whether this computer may admit `req` into `r` now: the ticket and its live link, the
-/// secret, the kind and its proof (a cloud member needs a `workspace` one, for a workspace with
-/// no member yet; a computer's, if any, must verify), a free name and prefix, and our authority: over that link, or (a person's
+/// secret, the kind and its proof (any must verify; a cloud member's is a `workspace` one, and
+/// optional), a free name and prefix, and our authority: over that link, or (a person's
 /// new computer) being that person's computer, else `FORWARD`. Whether the link is a once link.
 fn check(
     r: &Roster,
@@ -384,8 +384,7 @@ fn check(
     // Decided from the proof, never from what the request says of itself; one that expired
     // while its dialog waited is not in force at the Allow.
     let c = match &req.claims {
-        // A cloud candidate with no proof at all is not a workspace this engine knows.
-        None if cloud => return Err(UNSUPPORTED),
+        // No proof: a computer, or a workspace shown by its given name, "(not verified)".
         None => None,
         Some(Ok(c)) if now > c.exp => return Err(if cloud { UNSUPPORTED } else { BAD_REQUEST }),
         Some(Ok(c)) if (c.kind == ProofKind::Workspace) == cloud => Some(c),
@@ -873,10 +872,9 @@ pub async fn join(id: u64, body: &Value, d: &Arc<Daemon>) -> Response {
         .trim()
         .to_string();
     let kind = body["kind"].as_str().unwrap_or("computer");
-    // Only an embedded instance joins as a workspace's member, only as that, and with its
-    // proof.
-    let unproven = kind == "cloud" && !body["proof"].is_string();
-    if (kind == "cloud") != d.cloud.is_some() || unproven {
+    // Only an embedded instance joins as a workspace's member, and only as that. Its proof is
+    // optional: without one it is shown "(not verified)", as any unproven member.
+    if (kind == "cloud") != d.cloud.is_some() {
         return Response::err(id, BAD_REQUEST);
     }
     let me = &d.identity.key;
@@ -976,6 +974,10 @@ pub async fn join(id: u64, body: &Value, d: &Arc<Daemon>) -> Response {
                         }
                     })
                     .await;
+                    // A workspace member's doorbell goes into the team it just joined.
+                    if let Err(e) = crate::embed::publish(d) {
+                        eprintln!("join: wake: {e}");
+                    }
                     let team = d.team.lock().unwrap().roster.team_name.clone();
                     return done("admitted", None, &team, d.peers.online().len() + 1);
                 }

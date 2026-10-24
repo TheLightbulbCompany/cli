@@ -638,12 +638,7 @@ impl TeamOps<'_> {
                 let mut t = self.new_link(invite.link_mode(), true, false)?;
                 // A workspace member's line carries its doorbell: the person may paste it
                 // after the workspace parked, and the joiner has no roster to ring from.
-                t.wake = self
-                    .team
-                    .roster
-                    .wake
-                    .clone()
-                    .filter(|_| self.daemon.cloud.is_some());
+                t.wake = self.team.roster.wakes.get(&me_key).cloned();
                 let t = ticket::for_person(&self.daemon.identity, t, person);
                 let line = ticket::person_line(&ticket::encode(&t), name);
                 Response::ok(id, json!({"line": line, "expires_at": t.expires_at}))
@@ -769,12 +764,27 @@ pub(crate) fn remotes(short: &str, list: &[Value]) -> Option<Vec<crate::net::fra
     Some(out)
 }
 
-/// `cloud.sessions.set {sessions: [{name, agent, title?}]}` -> `{}` (an embedded instance only;
+/// A sessions list's `members` (person ids): `None` when absent (no gate); anything but a list
+/// of strings gates everyone out, never no one.
+pub(crate) fn members_of(v: &Value) -> Option<HashSet<String>> {
+    match v {
+        Value::Null => None,
+        Value::Array(l) => Some(
+            l.iter()
+                .filter_map(|p| p.as_str().map(String::from))
+                .collect(),
+        ),
+        _ => Some(HashSet::new()),
+    }
+}
+
+/// `cloud.sessions.set {sessions: [{name, agent, title?}], members?}` -> `{}` (an embedded instance only;
 /// `unsupported` on a computer): the workspace's agents, published as `<short>/<name>` with
 /// `agent` and `title` (at most `presence::MAX`, each name a `valid_name`, once). Answers once
 /// the presence sender (`presence::run`) has handed on the presence carrying them, so a `send`
 /// from a name just declared is never refused as unadvertised by a peer the envelope reaches
 /// first; `internal` if that takes over 5 s (the list stands, and goes out on the next send).
+/// `members` replaces the sessions' member gate (`mail::receive`); absent, there is none.
 pub async fn cloud_sessions_set(id: u64, body: &Value, daemon: &Daemon) -> Response {
     let Some(cloud) = &daemon.cloud else {
         return Response::err(id, UNSUPPORTED);
@@ -786,7 +796,7 @@ pub async fn cloud_sessions_set(id: u64, body: &Value, daemon: &Daemon) -> Respo
         return Response::err(id, BAD_REQUEST);
     };
     let mut sent = cloud.sent.subscribe();
-    let version = cloud.set(out);
+    let version = cloud.set(out, members_of(&body["members"]));
     daemon.presence.notify_one();
     let handed = sent.wait_for(|v| *v >= version);
     let handed = matches!(

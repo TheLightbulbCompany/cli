@@ -63,8 +63,13 @@ async fn dial(sock: &Path, token: &str, who: &Identity) -> (Peer, iroh::Endpoint
     common::dial_at(key.as_str().unwrap(), port, who).await
 }
 
-/// `p` (member `who`) sends `text` to `to`: its envelope id and the member's ack state.
-async fn send(p: &mut Peer, who: &Identity, to: &str, text: &str) -> (String, String) {
+/// `p` (member `who`) sends `text` to `to`: its envelope id and the member's ack state and reason.
+async fn send_acked(
+    p: &mut Peer,
+    who: &Identity,
+    to: &str,
+    text: &str,
+) -> (String, String, Option<String>) {
     let id = common::ulid();
     p.send(&Frame::Envelope {
         id: id.clone(),
@@ -84,9 +89,15 @@ async fn send(p: &mut Peer, who: &Identity, to: &str, text: &str) -> (String, St
         .recv_where(|f| matches!(f, Frame::Ack { id: i, .. } if *i == id))
         .await
     {
-        Frame::Ack { state, .. } => (id, state),
+        Frame::Ack { state, reason, .. } => (id, state, reason),
         _ => unreachable!(),
     }
+}
+
+/// `send_acked` without the reason.
+async fn send(p: &mut Peer, who: &Identity, to: &str, text: &str) -> (String, String) {
+    let (id, state, _) = send_acked(p, who, to, text).await;
+    (id, state)
 }
 
 /// The receipt state `p` hears next for envelope `id`.
@@ -643,20 +654,42 @@ async fn a_cloud_member_mints_no_person_link() {
 /// PATH that keeps its argv and stdin under `dir/curl`. Returns A (running), the member, its
 /// token and socket, and the wake token.
 fn doorbell(dir: &Path) -> (common::Env, Child, String, std::path::PathBuf, String) {
+    doorbell_of(dir, true)
+}
+
+/// `doorbell`, the member its network's founder or, not, A's cloud member (admitted with no
+/// proof): either way its own `wake` is the one A rings.
+fn doorbell_of(
+    dir: &Path,
+    founder: bool,
+) -> (common::Env, Child, String, std::path::PathBuf, String) {
     let home = dir.join("home");
     std::fs::create_dir_all(&home).unwrap();
     let w = Identity::load_or_create(&home).unwrap();
     let a = common::Env::new();
-    let g = lightbulb::daemon::net_ops::genesis(&w, NAME, NAME, NAME, 1);
-    let aa = common::admit(
-        &w,
-        &g,
-        &a.identity(),
-        "prasiddha",
-        json!({"computer": "mac"}),
-    );
+    let entries = if founder {
+        let g = lightbulb::daemon::net_ops::genesis(&w, NAME, NAME, NAME, 1);
+        let aa = common::admit(
+            &w,
+            &g,
+            &a.identity(),
+            "prasiddha",
+            json!({"computer": "mac"}),
+        );
+        [g, aa]
+    } else {
+        let g = lightbulb::daemon::net_ops::genesis(&a.identity(), "prasiddha", "mac", "acme", 1);
+        let aw = common::admit(
+            &a.identity(),
+            &g,
+            &w,
+            NAME,
+            json!({"kind": "cloud", "person_id": w.key, "computer": NAME}),
+        );
+        [g, aw]
+    };
     for s in [Store::open(&home.join("state.db")).unwrap(), a.store()] {
-        for e in [&g, &aa] {
+        for e in &entries {
             roster::accept(&s, e, 10).unwrap();
         }
     }
@@ -756,6 +789,25 @@ async fn a_computer_rings_the_doorbell_only_after_a_failed_dial() {
     assert_eq!(rings(dir.path()).len(), 1);
 }
 
+/// A workspace member that is not its network's founder publishes its own doorbell, and a
+/// computer rings it after a failed dial (the founder case is the test above).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_computer_rings_a_non_founder_cloud_members_doorbell() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, child, token, sock, wake) = doorbell_of(dir.path(), false);
+    // Parked: a message for its Friday is due on A, and A rings the member's own doorbell.
+    let to = format!("{}/friday", short(&sock, &token));
+    ok(&sock, &token, "stop", json!({}));
+    exits_zero(child);
+    a.send(&common::session(&a, "c1"), &to, "while parked", "r1", None);
+    common::until(90, "A rings the doorbell", || !rings(dir.path()).is_empty());
+    let stdin = std::fs::read_to_string(dir.path().join("curl/0.stdin")).unwrap();
+    assert_eq!(
+        stdin,
+        format!("header = \"Authorization: Bearer {wake}\"\n")
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_doorbell_token_is_absent_from_logs() {
     let dir = tempfile::tempdir().unwrap();
@@ -842,4 +894,67 @@ async fn a_join_to_a_parked_member_rings_its_doorbell() {
         !text.contains(&wake),
         "the token never reaches the person's terminal"
     );
+}
+
+/// The sessions file's `members` gates who may message the member's sessions: a listed person
+/// is delivered, any other is `refused` `not_a_member` (not held, nothing in the mailbox), no
+/// field gates no one, and `cloud.sessions.set` replaces the list.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_members_list_gates_who_may_message_the_sessions() {
+    let person = |a: &Identity| format!("p-{}", a.short);
+    // Listed: delivered.
+    let dir = tempfile::tempdir().unwrap();
+    let a = seed(dir.path());
+    let file = json!({"workspace": NAME, "sessions": friday(), "members": [person(&a), "user_x"]});
+    let (child, token, sock) = common::member_with(dir.path(), file);
+    let (mut pa, _ep) = dial(&sock, &token, &a).await;
+    let to = format!("{}/friday", short(&sock, &token));
+    assert_eq!(send(&mut pa, &a, &to, "in").await.1, "stored");
+    // Reloaded without A: refused, and nothing more reaches the mailbox.
+    ok(
+        &sock,
+        &token,
+        "cloud.sessions.set",
+        json!({"sessions": friday(), "members": ["user_x"]}),
+    );
+    let (_, state, reason) = send_acked(&mut pa, &a, &to, "out").await;
+    assert_eq!(
+        (state.as_str(), reason.as_deref()),
+        ("refused", Some("not_a_member"))
+    );
+    let peek = ok(&sock, &token, "inbox.peek", json!({}));
+    assert_eq!(
+        peek["sessions"][0]["records"].as_array().unwrap().len(),
+        1,
+        "{peek}"
+    );
+    // Reloaded with no field: no gate.
+    ok(
+        &sock,
+        &token,
+        "cloud.sessions.set",
+        json!({"sessions": friday()}),
+    );
+    assert_eq!(send(&mut pa, &a, &to, "again").await.1, "stored");
+    ok(&sock, &token, "stop", json!({}));
+    exits_zero(child);
+
+    // Not listed from the start: refused.
+    let dir = tempfile::tempdir().unwrap();
+    let a = seed(dir.path());
+    let file = json!({"workspace": NAME, "sessions": friday(), "members": ["user_x"]});
+    let (child, token, sock) = common::member_with(dir.path(), file);
+    let (mut pa, _ep) = dial(&sock, &token, &a).await;
+    let to = format!("{}/friday", short(&sock, &token));
+    let (_, state, reason) = send_acked(&mut pa, &a, &to, "no").await;
+    assert_eq!(
+        (state.as_str(), reason.as_deref()),
+        ("refused", Some("not_a_member"))
+    );
+    assert_eq!(
+        ok(&sock, &token, "inbox.peek", json!({}))["sessions"],
+        json!([])
+    );
+    ok(&sock, &token, "stop", json!({}));
+    exits_zero(child);
 }

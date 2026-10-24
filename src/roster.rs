@@ -149,8 +149,9 @@ pub struct Roster {
     pub heads: Vec<String>,
     pub links: BTreeMap<String, Link>,
     pub relay: Option<String>,
-    /// The founder's doorbell (a parked workspace member's), from its latest `meta` with one.
-    pub wake: Option<Wake>,
+    /// A parked workspace member's doorbell, by member key: its own latest `meta` with one
+    /// (the founder's, or a cloud member's; a computer's is not taken). Members only.
+    pub wakes: BTreeMap<String, Wake>,
     parents: BTreeMap<String, Vec<String>>,
     /// Every replayed entry with its hash, parents first.
     log: Vec<(String, Entry)>,
@@ -545,13 +546,15 @@ fn pass(
                         r.relay = Some(relay.to_string());
                     }
                 }
-                if let Some(w) = Wake::parse(&e.body["wake"]).filter(|_| founder) {
-                    r.wake = Some(w);
+                let own = founder || signer.kind == MemberKind::Cloud;
+                if let Some(w) = Wake::parse(&e.body["wake"]).filter(|_| own) {
+                    r.wakes.insert(e.signer.clone(), w);
                 }
             }
             Kind::Admit | Kind::Link | Kind::Other => {}
         }
     }
+    r.wakes.retain(|k, _| r.members.contains_key(k));
     // Live links: unused, not retired, and descended from every removal (a removal it did not
     // see ends it).
     for (lh, l) in links.values() {
@@ -610,7 +613,8 @@ fn own_person(e: &Entry, claims: Option<&Proof>, vouched: bool) -> bool {
         Some(p) => p.sub == e.text("person_id") && (p.kind == ProofKind::Workspace) == cloud,
         // `vouched`: the signer of a `person` link admitting through it names the computer's
         // person — that link went to exactly that person, once (a Mac has no proof of its own).
-        None => !cloud && (e.text("person_id") == e.text("member") || vouched),
+        // A workspace member without a proof is its own key's person, as a computer is.
+        None => e.text("person_id") == e.text("member") || (!cloud && vouched),
     }
 }
 
@@ -647,7 +651,10 @@ fn new_member(e: &Entry, role: Role, claims: Option<&Proof>) -> Member {
         admitted_at: e.at,
         proof: None,
         workspace: None,
-        by: e.body["by"].as_str().map(String::from),
+        // An approval names a session of the signer's own computer; any other is dropped.
+        by: (e.body["by"].as_str())
+            .filter(|b| b.split('/').next() == e.signer.get(..12))
+            .map(String::from),
         key,
     };
     if let Some(p) = claims {
@@ -1215,7 +1222,7 @@ mod tests {
     }
 
     #[test]
-    fn only_the_founders_wake_is_taken() {
+    fn only_the_founders_or_a_cloud_members_wake_is_taken() {
         let (f, b) = (id(), id());
         let g = genesis(&f);
         let ab = admit(&f, &g, &b.key, "b");
@@ -1228,7 +1235,33 @@ mod tests {
             json!({"wake": {"url": "https://x.test/", "token": "b"}}),
         );
         let r = replay(&[g, ab, m, mb]);
-        assert_eq!(r.wake.map(|w| w.token), Some("o.s".into()));
+        assert_eq!(r.wakes.get(&f.key).map(|w| w.token.as_str()), Some("o.s"));
+        assert_eq!(r.wakes.get(&b.key), None);
+    }
+
+    #[test]
+    fn an_admit_keeps_by_only_for_a_session_of_its_signer() {
+        let (f, b, c, d) = (id(), id(), id(), id());
+        let mut e = genesis(&f);
+        let mut entries = vec![e.clone()];
+        for (who, by) in [
+            (&b, Some(format!("{}/codex-1", f.short))),
+            (&c, Some(format!("{}/codex-1", b.short))),
+            (&d, None),
+        ] {
+            let mut body = admit_body(&who.key, &who.short);
+            if let Some(by) = by {
+                body["by"] = json!(by);
+            }
+            e = op(&f, &e, Kind::Admit, body);
+            entries.push(e.clone());
+        }
+        let r = replay(&entries);
+        let got = |w: &Identity| r.members[&w.key].by.clone();
+        assert_eq!(got(&b), Some(format!("{}/codex-1", f.short)));
+        // Another member's session: the admission stands, the claim is dropped.
+        assert_eq!(got(&c), None);
+        assert_eq!(got(&d), None);
     }
 
     fn merge(by: &Identity, parent: &Entry, who: &Identity, pid: &str, proof: &str) -> Entry {

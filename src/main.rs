@@ -130,7 +130,7 @@ enum Command {
         /// The name you go by in the network (default: your user name).
         #[arg(long)]
         name: Option<String>,
-        /// `cloud`: join as a workspace member (tests and ops; needs `--proof`).
+        /// `cloud`: join as a workspace member (an embedded instance's; `--proof` is optional).
         #[arg(long, hide = true, default_value = "computer", value_parser = ["computer", "cloud"])]
         kind: String,
         /// The workspace member's `kind=workspace` proof.

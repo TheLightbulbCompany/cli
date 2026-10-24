@@ -30,6 +30,8 @@ pub struct EmbedOpts {
     /// The sessions declared before the transport starts (`cloud.sessions.set`'s list), so mail
     /// for them that arrives right after start is kept, not refused as unadvertised.
     pub sessions: Vec<Value>,
+    /// The person ids whose computers may message the sessions; `None`: no gate.
+    pub members: Option<std::collections::HashSet<String>>,
 }
 
 /// A running instance. Dropping it without `shutdown` closes its endpoint all the same (no
@@ -67,7 +69,12 @@ pub async fn start(home: &Path, opts: EmbedOpts) -> Result<Instance> {
         lan: false,
         ..Config::load(home)?
     };
-    let (daemon, net) = boot(home, config, Some((opts.name, lock, opts.sessions))).await?;
+    let (daemon, net) = boot(
+        home,
+        config,
+        Some((opts.name, lock, opts.sessions, opts.members)),
+    )
+    .await?;
     Ok(Instance {
         daemon,
         net,
@@ -133,6 +140,15 @@ fn declarable(short: &str, list: &[Value]) -> Vec<net::frames::Remote> {
     kept
 }
 
+/// An instance's start: its workspace's name, the home lock it keeps, the sessions it declares
+/// from the start and the person ids that may message them.
+pub(crate) type CloudStart = (
+    String,
+    std::fs::File,
+    Vec<Value>,
+    Option<std::collections::HashSet<String>>,
+);
+
 /// The start path the daemon and an instance share, under `dir`'s lock (the caller's):
 /// identity, store, the solo genesis on first start, the team, the transport and the presence
 /// sender. A `cloud` instance (its workspace's name, the home lock it keeps and the sessions it
@@ -141,11 +157,11 @@ fn declarable(short: &str, list: &[Value]) -> Vec<net::frames::Remote> {
 pub(crate) async fn boot(
     dir: &Path,
     config: Config,
-    cloud: Option<(String, std::fs::File, Vec<Value>)>,
+    cloud: Option<CloudStart>,
 ) -> Result<(Arc<Daemon>, net::Net)> {
-    let (cloud, home_lock, declared) = match cloud {
-        Some((name, lock, sessions)) => (Some(name), Some(lock), sessions),
-        None => (None, None, vec![]),
+    let (cloud, home_lock, declared, members) = match cloud {
+        Some((name, lock, sessions, members)) => (Some(name), Some(lock), sessions, members),
+        None => (None, None, vec![], None),
     };
     let identity = Identity::load_or_create(dir)?;
     let declared = declarable(&identity.short, &declared);
@@ -224,8 +240,8 @@ pub(crate) async fn boot(
         streams: Default::default(),
         cloud: cloud.map(|name| {
             let c = Cloud::new(name);
-            if !declared.is_empty() {
-                c.set(declared);
+            if !declared.is_empty() || members.is_some() {
+                c.set(declared, members);
             }
             c
         }),
@@ -241,7 +257,7 @@ pub(crate) async fn boot(
 impl Instance {
     /// One IPC op (`{id, op, ...}`, as on the socket), answered in process. Every person-only
     /// op is refused (`bad_request`, reason `not_a_person`) but `team.join` as the workspace's
-    /// cloud member (with its proof) and `team.leave`: the caller is the bridge, acting for a
+    /// cloud member (its proof optional) and `team.leave`: the caller is the bridge, acting for a
     /// workspace admin who confirmed in the app. `inbox {session}` takes a declared session's
     /// mail as Task 10's records, read. `app.send`, `app.inbox` and `app.receipt` send and read
     /// as a hosted app's declared session `{app}-{person}` (`app_send`).
@@ -264,10 +280,9 @@ impl Instance {
         self.daemon.events.subscribe()
     }
 
-    /// `wake` (the sessions file's, `member`) signed into the roster as a founder's `meta` when
-    /// it differs from the roster's: a computer that cannot dial this member rings it there.
-    /// Nothing when it is absent; skipped and logged (never the token) when it is malformed or
-    /// this member is not the founder (only the founder's counts).
+    /// `wake` (the sessions file's, `member`) is this member's own doorbell: signed into the
+    /// roster as its `meta` when it differs from the roster's (`publish`), and again after a
+    /// join. Nothing when it is absent; skipped and logged (never the token) when malformed.
     pub(crate) fn publish_wake(&self, wake: &Value) -> Result<()> {
         if wake.is_null() {
             return Ok(());
@@ -277,27 +292,10 @@ impl Instance {
             return Ok(());
         };
         let d = &self.daemon;
-        let mut team = d.team.lock().unwrap();
-        let me = team.roster.members.get(&d.identity.key).map(|m| m.role);
-        if me != Some(roster::Role::Founder) {
-            eprintln!("wake: this member is not its network's founder; not published");
-            return Ok(());
+        if let Some(c) = &d.cloud {
+            *c.wake.lock().unwrap() = Some(w);
         }
-        if team.roster.wake.as_ref() == Some(&w) {
-            return Ok(());
-        }
-        let store = d.store.lock().unwrap();
-        let body = json!({"wake": {"url": w.url, "token": w.token}});
-        net_ops::write(
-            d,
-            &mut team,
-            &store,
-            roster::Kind::Meta,
-            body,
-            ipc::now() as i64,
-        )?;
-        eprintln!("wake: published");
-        Ok(())
+        publish(d)
     }
 
     /// Closes the endpoint and waits (up to 5 s) for the instance's tasks to end with it, then
@@ -333,6 +331,39 @@ impl Drop for Instance {
             rt.spawn(async move { net.close().await });
         }
     }
+}
+
+/// Signs this member's doorbell (`Cloud::wake`) into its roster as a `meta` when the roster's
+/// differs. Only a founder's or a cloud member's counts (`roster::pass`); skipped otherwise.
+pub(crate) fn publish(d: &Daemon) -> Result<()> {
+    let Some(w) = d
+        .cloud
+        .as_ref()
+        .and_then(|c| c.wake.lock().unwrap().clone())
+    else {
+        return Ok(());
+    };
+    let mut team = d.team.lock().unwrap();
+    let me = team.roster.members.get(&d.identity.key);
+    if !me.is_some_and(|m| m.role == roster::Role::Founder || m.kind == MemberKind::Cloud) {
+        eprintln!("wake: this member cannot publish a doorbell; not published");
+        return Ok(());
+    }
+    if team.roster.wakes.get(&d.identity.key) == Some(&w) {
+        return Ok(());
+    }
+    let store = d.store.lock().unwrap();
+    let body = json!({"wake": {"url": w.url, "token": w.token}});
+    net_ops::write(
+        d,
+        &mut team,
+        &store,
+        roster::Kind::Meta,
+        body,
+        ipc::now() as i64,
+    )?;
+    eprintln!("wake: published");
+    Ok(())
 }
 
 /// `inbox {session}` -> `{messages}`: takes what waits for declared session `session` (a
