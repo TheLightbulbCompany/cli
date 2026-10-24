@@ -167,17 +167,18 @@ pub fn sync_env_optout(dir: &Path) -> bool {
     sync_env_optout_if(dir, env_off().is_some())
 }
 
-/// `telemetry [on|off]`: sets the config, then says where it stands.
+/// `telemetry [on|off]`: sets the config, then says where it stands. An environment opt-out
+/// keeps it off: `on` writes nothing then.
 pub fn command(dir: &Path, state: Option<&str>) -> Result<i32> {
     let saved = sync_env_optout(dir);
-    if let Some(s) = state {
+    if let Some(s) = state.filter(|s| *s != "on" || env_off().is_none()) {
         Config::set(dir, "telemetry", if s == "on" { "true" } else { "false" })?;
     }
     let config_on = Config::load(dir).is_ok_and(|c| c.telemetry);
     match (config_on, env_off(), active(dir)) {
         (_, Some(k), _) => {
             let note = if saved { "; saved to config" } else { "" };
-            println!("Usage counts  off ({k} is set{note})")
+            println!("Usage counts  off ({k} is set and keeps it off{note})")
         }
         (false, ..) => println!("Usage counts  off (turned off in config)"),
         (true, _, false) => println!("Usage counts  off (debug build)"),
@@ -223,7 +224,9 @@ fn write_private(path: &Path, text: &str) -> Result<()> {
 /// Sends `event` if usage counts are on. Never waits, never fails the caller.
 pub fn send(dir: &Path, event: Event) {
     sync_env_optout(dir);
-    send_if_active(dir, event);
+    if env_off().is_none() {
+        send_if_active(dir, event);
+    }
 }
 
 /// `send` on the config's word alone (the daemon).
@@ -267,7 +270,7 @@ fn post(body: &Value) {
 /// `cli_installed` and returns true (print `NOTICE`); a changed version sends `cli_updated`.
 pub fn on_setup(dir: &Path) -> bool {
     sync_env_optout(dir);
-    if !active(dir) {
+    if env_off().is_some() || !active(dir) {
         return false; // nothing recorded, so a later opt-in still counts as the first run
     }
     let path = dir.join(VERSION_FILE);

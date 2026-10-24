@@ -1065,6 +1065,34 @@ fn the_command_is_lightbulb() {
     assert_eq!(std::fs::read_link(bin.join("lightbulb")).unwrap(), canon);
 }
 
+/// `telemetry on` under an environment opt-out writes nothing and says the variable keeps it
+/// off.
+#[test]
+fn telemetry_on_under_do_not_track_stays_off() {
+    let e = Env::new();
+    let o = e
+        .cmd(&["telemetry", "on"])
+        .env("DO_NOT_TRACK", "1")
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(
+        out(&o).contains("DO_NOT_TRACK is set and keeps it off"),
+        "{}",
+        out(&o)
+    );
+    let o = e
+        .cmd(&["telemetry"])
+        .env_remove("DO_NOT_TRACK")
+        .output()
+        .unwrap();
+    assert!(
+        out(&o).contains("off (turned off in config)"),
+        "{}",
+        out(&o)
+    );
+}
+
 /// A fresh Mac: `~/.local/bin` is not on PATH, so setup adds it to the zsh profile once (a
 /// second run adds nothing) and says so, instead of asking the person to edit the file.
 #[cfg(target_os = "macos")]
