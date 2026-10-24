@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::{identity, line, member, until, Peer};
+use common::{identity, line, member, ok, until, Peer};
 use iroh::endpoint::VarInt;
 use lightbulb::identity::Identity;
 use lightbulb::net::frames::Frame;
@@ -52,17 +52,6 @@ fn seed(dir: &Path) -> Identity {
         roster::accept(&store, e, 10).unwrap();
     }
     a
-}
-
-/// The answer's `result` (the op must succeed).
-fn ok(sock: &Path, token: &str, op: &str, body: Value) -> Value {
-    let r = line(sock, token, op, body);
-    assert_eq!(
-        (r["ok"].clone(), r["id"].clone()),
-        (json!(true), json!(7)),
-        "{op}: {r}"
-    );
-    r["result"].clone()
 }
 
 /// `who` dialing the member behind `sock`: the connection, `hello` sent.
@@ -434,12 +423,7 @@ async fn join(
     let port = ok(sock, token, "status", json!({}))["port"]
         .as_u64()
         .unwrap();
-    let key = iroh::PublicKey::from_bytes(
-        &lightbulb::identity::key_bytes(key.as_str().unwrap()).unwrap(),
-    )
-    .unwrap();
-    let addr =
-        iroh::EndpointAddr::new(key).with_ip_addr(format!("127.0.0.1:{port}").parse().unwrap());
+    let addr = common::loopback(key.as_str().unwrap(), port);
     let ep = common::endpoint(who).await;
     let conn = ep.connect(addr, lightbulb::net::JOIN_ALPN).await.unwrap();
     let (mut send, mut recv) = conn.open_bi().await.unwrap();

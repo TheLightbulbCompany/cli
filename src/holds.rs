@@ -543,7 +543,7 @@ pub fn on_dialog(d: &Arc<Daemon>, n: i64, button: &str) {
 }
 
 /// An instance's word for a hold id it does not have (a computer's is `not_found`).
-pub const HOLD_NOT_FOUND: &str = "hold_not_found";
+const HOLD_NOT_FOUND: &str = "hold_not_found";
 
 /// The hold and policy ops: `holds`, `hold.get`, `hold.answer`, `hold.file`, `policy.get`,
 /// `policy.set` (all but `policy.get` person-only: previews are a teammate's text). An

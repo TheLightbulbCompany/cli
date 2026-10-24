@@ -325,10 +325,8 @@ pub async fn dial_instance(i: &lightbulb::embed::Instance, who: &Identity) -> (P
 
 /// `who` played by the test, dialing the member `key` listening on loopback `port`, `hello` sent.
 pub async fn dial_at(key: &str, port: u64, who: &Identity) -> (Peer, Endpoint) {
-    let key = PublicKey::from_bytes(&identity::key_bytes(key).unwrap()).unwrap();
-    let addr = EndpointAddr::new(key).with_ip_addr(format!("127.0.0.1:{port}").parse().unwrap());
     let ep = endpoint(who).await;
-    let conn = ep.connect(addr, ALPN).await.unwrap();
+    let conn = ep.connect(loopback(key, port), ALPN).await.unwrap();
     let (send, recv) = conn.open_bi().await.unwrap();
     let mut p = Peer { conn, send, recv };
     p.hello(vec![]).await;
@@ -485,8 +483,12 @@ pub fn identity() -> Identity {
 
 /// The running daemon of `env`, on the loopback.
 pub fn addr(env: &Env) -> EndpointAddr {
-    let key = PublicKey::from_bytes(&identity::key_bytes(&env.identity().key).unwrap()).unwrap();
-    let port = env.status()["port"].as_u64().unwrap();
+    loopback(&env.identity().key, env.status()["port"].as_u64().unwrap())
+}
+
+/// The member `key` listening on loopback `port`.
+pub fn loopback(key: &str, port: u64) -> EndpointAddr {
+    let key = PublicKey::from_bytes(&identity::key_bytes(key).unwrap()).unwrap();
     EndpointAddr::new(key).with_ip_addr(format!("127.0.0.1:{port}").parse().unwrap())
 }
 
@@ -653,6 +655,17 @@ pub fn member_with(
         UnixStream::connect(&sock).is_ok() && line(&sock, &token, "ping", json!({}))["ok"] == true
     });
     (child, token, sock)
+}
+
+/// A member socket op's `result` (the op must succeed).
+pub fn ok(sock: &std::path::Path, token: &str, op: &str, body: Value) -> Value {
+    let r = line(sock, token, op, body);
+    assert_eq!(
+        (r["ok"].clone(), r["id"].clone()),
+        (json!(true), json!(7)),
+        "{op}: {r}"
+    );
+    r["result"].clone()
 }
 
 /// One line to a member's socket, `{token, id, op, ...body}`, on a fresh connection: its answer.

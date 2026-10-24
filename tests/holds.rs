@@ -720,13 +720,6 @@ fn member_with_stranger(dir: &std::path::Path, b: &Identity) {
     }
 }
 
-/// The member's answer to `op` (the op must succeed): its `result`.
-fn on_member(sock: &std::path::Path, token: &str, op: &str, body: Value) -> Value {
-    let r = common::line(sock, token, op, body);
-    assert_eq!(r["ok"], true, "{op}: {r}");
-    r["result"].clone()
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_strangers_first_message_is_held_and_answered_with_decided_by() {
     let dir = tempfile::tempdir().unwrap();
@@ -734,8 +727,8 @@ async fn a_strangers_first_message_is_held_and_answered_with_decided_by() {
     member_with_stranger(dir.path(), &b);
     let friday = json!([{"name": "friday", "agent": "hermes", "title": "Friday"}]);
     let (mut child, token, sock) = common::member(dir.path(), friday);
-    let me = on_member(&sock, &token, "identity.get", json!({}));
-    let port = on_member(&sock, &token, "status", json!({}))["port"]
+    let me = common::ok(&sock, &token, "identity.get", json!({}));
+    let port = common::ok(&sock, &token, "status", json!({}))["port"]
         .as_u64()
         .unwrap();
     let (mut p, _ep) = common::dial_at(me["member_key"].as_str().unwrap(), port, &b).await;
@@ -745,14 +738,14 @@ async fn a_strangers_first_message_is_held_and_answered_with_decided_by() {
     p.send(&envelope(&id, "r1", &from, &to, "hello friday"))
         .await;
     assert_eq!(p.ack(&id).await.0, "held");
-    let listed = on_member(&sock, &token, "holds", json!({}));
+    let listed = common::ok(&sock, &token, "holds", json!({}));
     let holds = listed["holds"].as_array().unwrap();
     assert_eq!(holds.len(), 1, "{listed}");
     assert_eq!(
         (&holds[0]["id"], &holds[0]["target_session"]),
         (&json!("H1"), &json!(to))
     );
-    let got = on_member(&sock, &token, "hold.get", json!({"hold": "H1"}));
+    let got = common::ok(&sock, &token, "hold.get", json!({"hold": "H1"}));
     assert_eq!(got["body"], "hello friday", "{got}");
     for op in ["hold.get", "hold.answer"] {
         let body = json!({"hold": "H9", "verdict": "allow", "decided_by": "user_x"});
@@ -760,7 +753,7 @@ async fn a_strangers_first_message_is_held_and_answered_with_decided_by() {
         assert_eq!(r, json!({"id": 7, "ok": false, "error": "hold_not_found"}));
     }
     let body = json!({"hold": "H1", "verdict": "allow", "decided_by": "user_x"});
-    let r = on_member(&sock, &token, "hold.answer", body);
+    let r = common::ok(&sock, &token, "hold.answer", body);
     assert_eq!((&r["id"], &r["verdict"]), (&json!("H1"), &json!("allow")));
     p.recv_where(
         |f| matches!(f, Frame::Receipt { id: i, state, .. } if *i == id && state == "stored"),
@@ -769,7 +762,7 @@ async fn a_strangers_first_message_is_held_and_answered_with_decided_by() {
     let db = dir.path().join("home/state.db");
     let sql = "SELECT COUNT(*) FROM approvals WHERE hold_id = 1 AND \"by\" = 'user_x'";
     assert_eq!(common::count(&db, sql), 1);
-    on_member(&sock, &token, "stop", json!({}));
+    common::ok(&sock, &token, "stop", json!({}));
     assert!(child.wait().unwrap().success());
 }
 
@@ -790,6 +783,6 @@ async fn hold_answer_on_an_instance_needs_decided_by() {
         json!({"person_id": "u", "value": "accept"}),
     );
     assert_eq!(r["reason"], "not_a_person", "{r}");
-    on_member(&sock, &token, "stop", json!({}));
+    common::ok(&sock, &token, "stop", json!({}));
     assert!(child.wait().unwrap().success());
 }
