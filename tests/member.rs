@@ -783,3 +783,63 @@ async fn the_doorbell_token_is_absent_from_logs() {
         "the ring is logged"
     );
 }
+
+/// A workspace member's person line carries its doorbell, and a join that finds the member
+/// parked rings it, then says so instead of "open their laptop" (the computer that joins is new:
+/// it has no roster to ring from).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_join_to_a_parked_member_rings_its_doorbell() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_a, child, token, sock, wake) = doorbell(dir.path());
+    let r = person_invite(&sock, &token, "user_b", "B");
+    let line = r["result"]["line"].as_str().unwrap_or_default().to_string();
+    let t = ticket_of(&line);
+    assert_eq!(
+        t.wake.as_ref().map(|w| w.url.as_str()),
+        Some("http://127.0.0.1:9/api/v1/network/wake"),
+        "{r}"
+    );
+    let key = ok(&sock, &token, "identity.get", json!({}))["member_key"].clone();
+    let port = ok(&sock, &token, "status", json!({}))["port"].clone();
+    ok(&sock, &token, "stop", json!({}));
+    exits_zero(child);
+    assert!(rings(dir.path()).is_empty(), "rang before any join");
+    // B, a new computer with the fake curl first on its PATH, joins while the member is parked.
+    let b = common::Env::new();
+    let path = format!(
+        "{}:{}",
+        dir.path().join("bin").display(),
+        std::env::var("PATH").unwrap()
+    );
+    let peers = format!("{}@127.0.0.1:{port}", key.as_str().unwrap());
+    b.daemon(
+        false,
+        "",
+        &[
+            ("LIGHTBULB_CONNECT_PEERS", peers),
+            ("PATH", path),
+            ("LIGHTBULB_CONNECT_DEBUG_WAKE_WAIT_S", "0".into()),
+        ],
+    );
+    let ticket = line.split('\'').nth(1).unwrap();
+    let out = b.detached(&[common::EXE, "join", ticket, "--name", "B"], "");
+    let text = format!("{}{}", common::out(&out), common::err(&out));
+    assert!(text.contains("Waking your workspace"), "{text}");
+    assert!(text.contains("did not answer"), "{text}");
+    assert!(!text.contains("laptop"), "{text}");
+    let calls = rings(dir.path());
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert_eq!(
+        calls[0].last().map(String::as_str),
+        Some("http://127.0.0.1:9/api/v1/network/wake")
+    );
+    let stdin = std::fs::read_to_string(dir.path().join("curl/0.stdin")).unwrap();
+    assert_eq!(
+        stdin,
+        format!("header = \"Authorization: Bearer {wake}\"\n")
+    );
+    assert!(
+        !text.contains(&wake),
+        "the token never reaches the person's terminal"
+    );
+}
