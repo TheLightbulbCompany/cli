@@ -3,7 +3,7 @@ use std::path::Path;
 
 /// Migration `i` takes the db to `user_version` `i + 1`. Forward only; each one only adds
 /// tables or columns, and runs once (in the transaction that moves `user_version`).
-const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6];
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7];
 
 const V1: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
@@ -85,6 +85,15 @@ ALTER TABLE sessions ADD COLUMN handle TEXT;
 CREATE TABLE IF NOT EXISTS hidden_sessions (key TEXT PRIMARY KEY, updated_at INTEGER);
 CREATE INDEX IF NOT EXISTS messages_to_sent ON messages (to_key, sent_at);
 ";
+/// A message's text digest, kept when `mail::forget` drops the text, so a retry under the same
+/// request id still compares.
+const V7: &str = "ALTER TABLE messages ADD COLUMN body_sha TEXT;";
+
+/// The digest `messages.body_sha` keeps: hex sha256 of the text.
+pub fn body_sha(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    data_encoding::HEXLOWER.encode(&Sha256::digest(text.as_bytes()))
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Session {
@@ -149,7 +158,8 @@ pub(crate) fn row_message(r: &rusqlite::Row) -> rusqlite::Result<Message> {
         thread: r.get("thread")?,
         hops: r.get("hops")?,
         origin: r.get("origin")?,
-        body: r.get("body")?,
+        // `NULL` once `mail::forget` dropped it.
+        body: r.get::<_, Option<String>>("body")?.unwrap_or_default(),
         sent_at: r.get("sent_at")?,
     })
 }
@@ -377,7 +387,8 @@ impl Store {
 
     pub fn put_message(&self, m: &Message) -> rusqlite::Result<()> {
         self.conn.execute(
-            "INSERT INTO messages VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO messages (id, request_id, from_key, to_key, kind, thread, hops, origin, \
+             body, sent_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 m.id,
                 m.request_id,
@@ -548,17 +559,26 @@ pub struct Untold {
 
 /// Mail between members: the mailbox, what peers sent (`seen_ids`) and the outbox.
 impl Store {
-    /// `from`'s message `request_id` as stored: `(to, body)`.
+    /// `from`'s message `request_id` as stored: `(to, whether its text is `text`)`, the text
+    /// compared by its digest once `mail::forget` dropped it.
     pub fn sent_as(
         &self,
         from: &str,
         request_id: &str,
-    ) -> rusqlite::Result<Option<(String, String)>> {
+        text: &str,
+    ) -> rusqlite::Result<Option<(String, bool)>> {
         self.conn
             .query_row(
-                "SELECT to_key, body FROM messages WHERE from_key = ?1 AND request_id = ?2",
+                "SELECT to_key, body, body_sha FROM messages WHERE from_key = ?1 AND request_id = ?2",
                 [from, request_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| {
+                    let (body, sha): (Option<String>, Option<String>) = (r.get(1)?, r.get(2)?);
+                    let same = match body {
+                        Some(b) => b == text,
+                        None => sha.as_deref() == Some(body_sha(text).as_str()),
+                    };
+                    Ok((r.get(0)?, same))
+                },
             )
             .optional()
     }

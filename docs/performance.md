@@ -35,7 +35,7 @@ The test is `tests/perf.rs`. It is ignored by default, so `cargo test` does not 
 | join, invite to `admitted` (19 joins) | min 80 ms / median 130 ms / max 425 ms |
 | full mesh online after the last join | 107 ms |
 | directory refresh, new session on X until Y lists it (20 samples) | median 266 ms / p95 886 ms |
-| message, `send` on X until X's receipt reads `delivered` (100 messages) | median 960 ms / p95 1009 ms |
+| message, `send` on X until X's receipt reads `delivered` (100 messages) | median 8 ms / p95 9 ms (before the flush loop was woken: median 960 ms / p95 1009 ms) |
 | of which: `send` until X reads `stored` | median 7 ms / p95 17 ms |
 | of which: `send` until Y's session takes it | median 7 ms / p95 16 ms |
 | resident memory per daemon after the run | min 35.6 MB / median 36.0 MB / max 38.0 MB |
@@ -51,14 +51,14 @@ the receipt becomes `delivered`. The test polls every 2 ms.
 
 The charter's target is 50 sessions on 20 computers, and the test reaches it in about
 80 s on one laptop. The memory is flat: about 36 MB per daemon, with a spread of 2 MB. A
-join takes about 0.1 s, and the full mesh connects about 0.1 s after the last join. Two
-results look wrong. First, a message arrives in about 7 ms and is taken in about 7 ms, but
-the sender reads `delivered` only about 1 s later. The cause is the 1 s poll in `flush_loop`
-(`src/net/mod.rs`, which already has a `ponytail:` note): it sends the `delivered` receipt
-back to the sender, and nothing wakes it. If taking a message woke that loop when a receipt is
-queued, the round trip would drop to about 15 ms. Second, the median directory refresh is
+join takes about 0.1 s, and the full mesh connects about 0.1 s after the last join. A
+message arrives in about 7 ms and is taken in about 7 ms, and the sender reads `delivered`
+about 1 ms later: taking or reading a message wakes `flush_loop` (`src/net/mod.rs`), which
+sends the receipt at once. (Before that, the receipt waited for the loop's 1 s poll, and
+`delivered` took about 1 s; a later run measured median 8 ms / p95 9 ms with the wake.) One
+result looks wrong: the median directory refresh is
 the 250 ms presence coalesce (`src/presence.rs`, `COALESCE`). But the p95 is 0.8 to 1 s in
 each run, and this is not explained. The directory from a few computers comes one or more
 coalesce windows late. It is worth a look before the team gets bigger. All the numbers are
-from a debug build: a release build will be faster on CPU-bound steps, but the 1 s and
-250 ms timers stay the same.
+from a debug build: a release build will be faster on CPU-bound steps, but the 250 ms
+timer stays the same.

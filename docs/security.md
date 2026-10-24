@@ -59,9 +59,8 @@ A message from someone you have not allowed does not reach your sessions. It is 
 answer it (Allow or Decline in a dialog, or `lightbulb approve H<n>` / `decline H<n>`).
 
 - Messages between sessions on this computer always get through.
-- Your other computers count as you only after both sign in. Sign-in (verified names) is not
-  available in this release, so each computer counts as its own person, and your other
-  computer's first message is held once, like anyone's.
+- Verified names are not available yet, so each computer counts as its own person, and your
+  other computer's first message is held once, like anyone's.
 - A person with no policy entry is held.
 - Allow lets that person's later messages through (`policy <person> accept`).
 - `policy <person> hold` asks each time; `policy <person> refuse` refuses them.
@@ -101,10 +100,9 @@ is `0600`):
 |---|---|
 | `identity.key` | This computer's secret key. |
 | `config.toml` | Settings (computer name, relay, `lan`, hidden folders). |
-| `state.db` | SQLite: the roster, sessions, messages, receipts, holds and their answers, policy. |
+| `state.db` | SQLite: the roster, sessions, messages, receipts, holds and their answers, policy. A message's text is deleted once nothing waits on it (read, refused or expired); messages to your own terminal keep theirs. |
 | `daemon.log` | The log (see above). |
 | `addrs.json` | Teammates' last known network addresses. |
-| `relays.json`, `relays.json.minisig`, `relays.floor` | The signed relay list, its signature, and the newest list date seen (only while no relay is set). |
 | `sock`, `daemon.lock` | The service's socket and lock. |
 | `bin/lightbulb` | The program. |
 
@@ -138,17 +136,12 @@ conversations, only the messages sent to them. Hide a folder with `lightbulb fol
 
 Telemetry: none. Lightbulb sends no usage data, no crash reports and no analytics.
 
-It talks to your teammates' computers and to relays. Apart from that, it makes these requests to
-the Lightbulb server (`https://thelightbulb.company/connect`):
+The engine makes no network call to Lightbulb: no relay list, no sign-in, no telemetry. It talks
+only to your teammates' computers and, when no direct path exists, to the relays (the iroh
+project's public relays unless you or your team set one).
 
-- **The signed relay list:** while neither you nor your team has set a relay, the service asks
-  for `relays.json` and its signature at most once a day (once an hour after a failure). It sends
-  no data about you; the server sees your IP address. Setting a relay (`lightbulb relay <url>`)
-  stops it. A list is used only if it carries a valid signature.
-- **Sign-in:** `lightbulb signin`, when you run it, and then renewing that sign-in about once a
-  day.
-
-The install script and `npm install` download the release from GitHub.
+The install script, `npm install` and `lightbulb update` (when you run it) download the release
+from GitHub.
 
 ## Reporting a vulnerability
 

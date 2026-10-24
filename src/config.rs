@@ -19,9 +19,8 @@ enum Kind {
 }
 
 /// Every setting: the one list `load` and `set` read.
-const KEYS: [(&str, Kind); 7] = [
+const KEYS: [(&str, Kind); 6] = [
     ("computer", Kind::Str(|c| &mut c.computer)),
-    ("issuer", Kind::Str(|c| &mut c.issuer)),
     (
         "preview_to_workspace",
         Kind::Bool(|c| &mut c.preview_to_workspace),
@@ -39,7 +38,6 @@ fn kind(key: &str) -> Option<Kind> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub computer: String,
-    pub issuer: String,
     pub preview_to_workspace: bool,
     pub share_paths: bool,
     pub lan: bool,
@@ -51,7 +49,6 @@ impl Default for Config {
     fn default() -> Config {
         Config {
             computer: os::hostname(),
-            issuer: "https://thelightbulb.company/connect".into(),
             preview_to_workspace: false,
             share_paths: false,
             lan: true,
@@ -153,7 +150,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path();
         let c = Config::load(d).unwrap();
-        assert_eq!(c.issuer, "https://thelightbulb.company/connect");
         assert_eq!(c.computer, crate::os::hostname());
         assert!(!c.preview_to_workspace && !c.share_paths && c.lan);
         assert_eq!((c.relay, c.folders_off.len()), (None, 0));

@@ -106,7 +106,10 @@ fn invite_reprints_the_same_link_until_new() {
     assert!(first.starts_with(LINE), "{first}");
     assert_eq!(printed_link(&e.run(&["invite"])), first);
     let (notice, line) = invite_parts(&e.run(&["invite", "--new"]));
-    assert_eq!(notice, "The old invite stopped working.\n");
+    assert_eq!(
+        notice,
+        "Every earlier invite from this computer stopped working.\n"
+    );
     assert!(line != first, "{line}");
     assert_eq!(printed_link(&e.run(&["invite"])), line);
     let (once, _) = invite_parts(&e.run(&["invite", "--once"]));
@@ -270,7 +273,8 @@ fn founder_whose_only_other_member_is_cloud_can_leave() {
 
 #[test]
 fn a_computer_outside_the_roster_is_told_so() {
-    // A team aden founded that never admitted this computer.
+    // A team aden founded that never admitted this computer: its key is not the record's, so
+    // the daemon will not start (as after a replaced identity.key).
     let e = Env::new();
     let aden = Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
     let g = net_ops::genesis(&aden, "aden", "mac", "acme", 1);
@@ -278,7 +282,7 @@ fn a_computer_outside_the_roster_is_told_so() {
     roster::accept(&store, &g, 10).unwrap();
     let o = e.run(&["remove", "aden"]);
     assert_eq!(o.status.code(), Some(1));
-    assert_eq!(err(&o).trim(), "This computer is not in the network.");
+    assert_eq!(err(&o).trim(), lightbulb::embed::KEY_MISMATCH);
 }
 
 #[test]
@@ -328,4 +332,71 @@ fn policy_takes_a_teammates_name_and_lists_names() {
         json!({"id": 1, "op": "policy.set", "person_id": "aden", "value": "hold"}),
     );
     assert_eq!(r["error"], "not_found", "{r}");
+}
+
+#[test]
+fn a_replaced_identity_key_refuses_to_start_until_leave() {
+    let (a, b) = (Env::new(), Env::new());
+    common::seed_pair(&a, &b);
+    // A new identity.key under the kept state.db: the team record is for the old one.
+    std::fs::remove_file(a.state.path().join("identity.key")).unwrap();
+    let line = "identity.key does not match this computer's team record. Run lightbulb leave, then join again with a new invite.\n";
+    let run = |args: &[&str], stdin: &str| {
+        let mut c = a.base_cmd(std::process::Command::new(EXE));
+        c.args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = c.spawn().unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(stdin.as_bytes())
+            .unwrap();
+        let t = std::time::Instant::now();
+        let o = child.wait_with_output().unwrap();
+        (o, t.elapsed())
+    };
+    let (o, _) = run(&["daemon"], "");
+    assert_eq!((o.status.code(), err(&o)), (Some(1), line.to_string()));
+    // Any command says why at once, with no start to wait out.
+    let (o, took) = run(&["team"], "");
+    assert_eq!((o.status.code(), err(&o)), (Some(1), line.to_string()));
+    assert!(took < std::time::Duration::from_secs(1), "{took:?}");
+    // A hook (which always exits 0) does not stall its agent either.
+    let end = r#"{"session_id":"s1","hook_event_name":"SessionEnd","cwd":"/tmp"}"#;
+    let (o, took) = run(&["hook", "claude", "session-end"], end);
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(
+        err(&o).contains("identity.key does not match"),
+        "{}",
+        err(&o)
+    );
+    assert!(took < std::time::Duration::from_secs(1), "{took:?}");
+    // `leave` works without the daemon; then this computer starts on its own network.
+    let o = a.detached(&[EXE, "leave"], "y\n");
+    assert!(o.status.success(), "{}{}", out(&o), err(&o));
+    assert!(out(&o).ends_with("Left \"acme\". This computer is on its own network again.\n"));
+    a.daemon(false, "", &[]);
+    let t = a.ask(json!({"id": 1, "op": "team.get"}));
+    assert_eq!(t["members"].as_array().unwrap().len(), 1, "{t}");
+}
+
+#[test]
+fn a_removal_found_at_start_makes_a_solo_network_not_a_key_error() {
+    // B's store holds A's removal of B but never made B's own genesis (a stop in between).
+    let (a, b) = (Env::new(), Env::new());
+    let [_, admit] = common::seed_pair(&a, &b);
+    let gone = json!({"member": b.identity().key});
+    let r = Entry::signed(&a.identity(), vec![admit.hash()], Kind::Remove, gone, 3);
+    roster::accept(&b.store(), &r, 10).unwrap();
+    b.daemon(false, "", &[]);
+    let t = b.ask(json!({"id": 1, "op": "team.get"}));
+    let ms = t["members"].as_array().unwrap();
+    assert_eq!(
+        (ms.len(), &ms[0]["key"]),
+        (1, &json!(b.identity().key)),
+        "{t}"
+    );
 }

@@ -39,20 +39,20 @@ Run `lightbulb <command> --help` for the options of each one.
 | `setup --remove` | Take out only what `setup` wrote. Backups are left as they are. |
 | `doctor` | Check the service, the local network, the state folder and each agent, and say how to fix what is not right. |
 | `who` | List the sessions on this computer. `who --all` adds your teammates' sessions. |
-| `invite` | Print the join command that adds your other computer or a teammate (`lightbulb join '<ticket>' --name NAME`; replace `NAME` with the name they go by), and a `lightbulb://join/…` link. `--once`: one join, valid 24 hours. `--new`: replace the invite; the old one stops working. |
+| `invite` | Print the join command that adds your other computer or a teammate (`lightbulb join '<ticket>' --name NAME`; replace `NAME` with the name they go by), and a `lightbulb://join/…` link. `--once`: one join, valid 24 hours. `--new`: a new invite; every earlier one from this computer, `--open` and `--once` ones too, stops working. |
 | `join '<ticket>'` | Join the team the invite is for. Takes the ticket or the whole `lightbulb://join/…` link. `--name <name>` sets the name you go by (default: your user name). The computer must be on its own first. |
 | `approve J1` / `approve H1` | Allow a join request (`J`) or a held message (`H`). |
 | `decline J1` / `decline H1` | Decline one. |
 | `held` | The join requests and messages waiting for your Allow. |
-| `send <to> "<text>"` | Send a message from the terminal: `send codex-1 "hi"`, or to a teammate's name: `send sam/inbox "hi"`. |
+| `send <to> "<text>"` | Send a message from the terminal: `send codex-1 "hi"`, or to a teammate's name: `send sam/inbox "hi"`. From your own terminal, `send 'sam/*' "hi"` sends to each of sam's sessions (as `who --all` lists them), and `send '*' "hi"` to every session on this computer. |
 | `listen --as <name>` | Print the messages sent to a name on this computer. |
 | `receipt <id>` | Whether a message you sent arrived. `--json` for the raw receipt. |
 | `policy` | Who may message your sessions without asking. `policy <person> accept\|hold\|refuse` sets it. |
 | `team` | The team and its computers. |
 | `admin <name>` | Make a member an admin (founder only). `--founder` makes them the founder in your place. |
 | `remove <name>` | Remove a member (founder and admins). The invite is replaced. |
-| `leave` | Leave the team. This computer is on its own network again. |
-| `relay [<url>]` | Show the relays this computer uses, or set one. With nothing set it uses the iroh project's public relays (`default`). From the founder or an admin it sets the team's relay; `--local` sets only this computer's; `--clear` clears yours and goes back to the default. Relays carry encrypted bytes only. A ticket carries no relay unless a team or computer relay is set, so a team that uses our signed relay list should set it as the team relay too, so joiners reach it. |
+| `leave` | Leave the team. This computer is on its own network again. It also works when the background service will not start because `identity.key` no longer matches the team record. |
+| `relay [<url>]` | Show the relays this computer uses, or set one. With nothing set it uses the iroh project's public relays (`default`). From the founder or an admin it sets the team's relay; `--local` sets only this computer's; `--clear` clears yours and goes back to the default. Relays carry encrypted bytes only. Lightbulb fetches no relay list of its own. |
 | `folder <path> on\|off` | Show or hide the sessions under a folder from your teammates. |
 | `version` | Print the version. |
 
@@ -88,7 +88,13 @@ For each session on your computer, teammates see:
 - whether it is busy or idle, and a short title of what it is doing.
 
 They never see your messages, your files or your agents' conversations. Messages travel end to end
-encrypted between the two computers, and their text is not written to the log.
+encrypted between the two computers, and their text is not written to the log. A message's
+text is deleted from `state.db` once nothing waits on it (read, refused or expired); messages to
+your own terminal keep theirs.
+
+The engine makes no network call to Lightbulb: no relay list, no sign-in, no telemetry. It talks
+only to your teammates' computers and, when no direct path exists, to the relays. (`update`,
+when you run it, downloads from this project's GitHub releases.)
 
 To hide sessions, run `lightbulb folder <path> off`. Sessions under that folder disappear
 from your teammates' `who --all` within a few seconds. `who` on your
@@ -101,6 +107,15 @@ and its receipt reads `queued`:
 `Not delivered yet: <computer> is offline. Lightbulb keeps trying until <time>.`
 The sender keeps trying for 24 hours. When the other Mac comes back, the message arrives (held
 first, if the sender is new to it). After 24 hours an undelivered message expires.
+
+A message that reaches the other Mac but waits there unread for 24 hours (the session never came
+back) expires too. The sender's receipt then reads
+`<session> did not come back within 24 hours; the message expired.`
+
+If the service will not start and says
+`identity.key does not match this computer's team record. Run lightbulb leave, then join again with a new invite.`,
+the key was replaced while the messages were kept. Do what it says: `leave` works without the
+service, then ask a teammate for a new invite.
 
 `join` needs the inviter's Mac to be online. If it is not, `join` says so; run the same command
 again later.

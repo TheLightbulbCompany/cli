@@ -155,7 +155,11 @@ pub fn receipt_note(r: &Value, person: Option<&ForPerson>) -> Option<String> {
     let until = || crate::date::local_time(r["until"].as_i64().unwrap_or_default());
     let limit = || match at("limit") {
         RATE => format!("loop limit: {LOOP_LIMIT} messages in 10 minutes to this session"),
-        HOPS => format!("paused after {MAX_HOPS} agent replies; a person must speak"),
+        // A person's message is hop 0, so `MAX_HOPS - 1` agent replies get through.
+        HOPS => format!(
+            "paused after {} agent replies; a person must speak",
+            MAX_HOPS - 1
+        ),
         _ => "paused by a loop limit".into(),
     };
     let Some(p) = person else {
@@ -235,7 +239,18 @@ pub fn receipt_note(r: &Value, person: Option<&ForPerson>) -> Option<String> {
         "delivered" => "Delivered.".into(),
         "read" if remote => format!("Read by {who} on {computer}."),
         "read" => "Read.".into(),
-        "expired" => "Not delivered: the other computer could not be reached for 24 hours.".into(),
+        // A hold nobody answered (`not_allowed`), the sender's outbox gave up (`unreachable`), or
+        // it waited unread in the mailbox (or its session ended while held).
+        "expired" if at("reason") == "not_allowed" => {
+            "Nobody answered the Allow for 7 days; the message expired.".into()
+        }
+        "expired" if at("reason") == "unreachable" => {
+            "Not delivered: the other computer could not be reached for 24 hours.".into()
+        }
+        "expired" => format!(
+            "{} did not come back within 24 hours; the message expired.",
+            crate::label::plain(name.unwrap_or("The session"), usize::MAX)
+        ),
         other => format!("Sent ({}).", crate::label::plain(other, usize::MAX)),
     })
 }
@@ -528,8 +543,8 @@ pub fn prepare(
         // Not persisted: a later message may make this reply_to known.
         (None, None) => return unstored("no_recipient"),
     };
-    if let Some((old_to, old_text)) = store.sent_as(&from.0, request_id)? {
-        if old_to != to.0 || old_text != text {
+    if let Some((old_to, same)) = store.sent_as(&from.0, request_id, text)? {
+        if old_to != to.0 || !same {
             // Not persisted: the original's receipt must stay as it was.
             return unstored("request_id_reused");
         }
@@ -746,8 +761,8 @@ pub fn receive(
             ..Answer::is(State::parse(&state)?)
         });
     }
-    if let Some((old_to, old_body)) = store.sent_as(from, request_id)? {
-        if old_to != *to || old_body != *body {
+    if let Some((old_to, same)) = store.sent_as(from, request_id, body)? {
+        if old_to != *to || !same {
             return refused("request_id_reused");
         }
         // The same message under another envelope id: where it is now.
@@ -962,6 +977,34 @@ pub fn mark_read(store: &Store, message_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Drops the text of every message nothing waits on any more: its receipt is final (`read`,
+/// `refused` or `expired`) and no mailbox or outbox row names it. The row stays (loop limits,
+/// threads and receipts read it) with the text's digest (`body_sha`, for a retry's compare);
+/// a person's own terminal mailbox keeps its text.
+// ponytail: a scan of the rows still holding text on the expiry timer; a trigger if it shows.
+pub fn forget(store: &Store) -> Result<()> {
+    let tx = store.conn().unchecked_transaction()?;
+    let done: Vec<(String, String)> = {
+        let mut stmt = tx.prepare(
+        "SELECT id, body FROM messages WHERE body IS NOT NULL AND to_key NOT LIKE '%/terminal' \
+         AND EXISTS (SELECT 1 FROM receipts r WHERE r.from_key = messages.from_key \
+             AND r.request_id = messages.request_id AND r.state IN ('read', 'refused', 'expired')) \
+         AND NOT EXISTS (SELECT 1 FROM mailbox b WHERE b.message_id = messages.id) \
+         AND NOT EXISTS (SELECT 1 FROM outbox o WHERE o.message_id = messages.id)",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for (id, body) in done {
+        tx.execute(
+            "UPDATE messages SET body = NULL, body_sha = ?2 WHERE id = ?1",
+            params![id, crate::store::body_sha(&body)],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 /// Mail that waited past `HOLD_S` becomes `expired` and leaves the mailbox.
 pub fn expire(store: &Store, now: u64) -> Result<()> {
     let conn = store.conn();
@@ -996,7 +1039,7 @@ mod tests {
         };
         assert_eq!(
             r(Some("hops")),
-            "paused after 4 agent replies; a person must speak"
+            "paused after 3 agent replies; a person must speak"
         );
         assert_eq!(
             r(Some("rate")),
@@ -1651,5 +1694,98 @@ mod tests {
         let got = |f: &str| receipt(&s, &k(f), "req-1").unwrap().unwrap().state;
         assert_eq!((got("a"), got("b")), (State::Read, State::Delivered));
         assert!(receipt(&s, &k("c"), "req-1").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_read_message_loses_its_text_but_the_terminal_keeps_its_own() {
+        let (_d, s) = setup();
+        register(&s, "m/codex:b", true);
+        let body = |rid: &str| -> Option<String> {
+            let q = "SELECT body FROM messages WHERE request_id = ?1";
+            s.conn().query_row(q, [rid], |r| r.get(0)).unwrap()
+        };
+        send(
+            &s,
+            &k("m/codex:a"),
+            Some(&k("m/codex:b")),
+            "hi",
+            "r1",
+            None,
+            1,
+        )
+        .unwrap();
+        send(
+            &s,
+            &k("m/codex:b"),
+            Some(&k("m/terminal")),
+            "yo",
+            "r2",
+            None,
+            1,
+        )
+        .unwrap();
+        forget(&s).unwrap();
+        assert_eq!(body("r1").as_deref(), Some("hi"), "still waiting");
+        take(&s, &k("m/codex:b"), 2).unwrap();
+        forget(&s).unwrap();
+        assert_eq!(body("r1").as_deref(), Some("hi"), "delivered, not read yet");
+        mark_read_for(&s, &k("m/codex:b"), 3).unwrap();
+        forget(&s).unwrap();
+        assert_eq!(body("r1"), None);
+        // The row stays: a retry of the same request is still answered by its receipt.
+        let r = send(
+            &s,
+            &k("m/codex:a"),
+            Some(&k("m/codex:b")),
+            "hi",
+            "r1",
+            None,
+            4,
+        )
+        .unwrap();
+        assert_eq!(r.state, State::Read);
+        // Another text under it is still a reused request id: compared by its digest.
+        let r = send(
+            &s,
+            &k("m/codex:a"),
+            Some(&k("m/codex:b")),
+            "ho",
+            "r1",
+            None,
+            4,
+        )
+        .unwrap();
+        assert_eq!(
+            (r.state, r.reason.as_deref()),
+            (State::Refused, Some("request_id_reused"))
+        );
+        // The person's own terminal keeps its history, read or not.
+        take(&s, &k("m/terminal"), 2).unwrap();
+        advance(s.conn(), "m/codex:b", "r2", State::Read, None, None, 3).unwrap();
+        forget(&s).unwrap();
+        assert_eq!(body("r2").as_deref(), Some("yo"));
+    }
+
+    #[test]
+    fn an_expiry_says_who_did_not_come_back() {
+        let p = ForPerson {
+            to: Some("m/codex:b"),
+            rid: "r1",
+            cmd: "lightbulb",
+            check: false,
+        };
+        let note = |r: serde_json::Value| receipt_note(&r, Some(&p)).unwrap();
+        assert_eq!(
+            note(serde_json::json!({"state": "expired"})),
+            "codex:b did not come back within 24 hours; the message expired."
+        );
+        assert_eq!(
+            note(serde_json::json!({"state": "expired", "reason": "unreachable"})),
+            "Not delivered: the other computer could not be reached for 24 hours."
+        );
+        assert_eq!(
+            note(serde_json::json!({"state": "expired", "reason": "not_allowed"})),
+            "Nobody answered the Allow for 7 days; the message expired."
+        );
     }
 }

@@ -42,8 +42,6 @@ const PAGE_BYTES: usize = 512 * 1024;
 const PAGE_ENTRIES: usize = 500;
 /// Every member is redialed this often (through each relay too), within the 60 s cap.
 const REDIAL: Duration = Duration::from_secs(30);
-/// How often the relay loop asks whether a fetch of ours is due (`relay::State::fetch_if_due`).
-const RELAY_FETCH: Duration = Duration::from_secs(3_600);
 /// Entries one connection may hold waiting for their parents.
 const MAX_PENDING: usize = 10_000;
 const JOIN_WAIT: Duration = Duration::from_secs(600);
@@ -72,18 +70,11 @@ pub struct Knobs {
     drop_acks: bool,
     /// How long the outbox keeps trying (`outbox::TTL_S`), or `LIGHTBULB_CONNECT_DEBUG_OUTBOX_S`.
     outbox_s: u64,
-    /// The keys `relays.json` may be signed by: `relay::KEYS`, or
-    /// `LIGHTBULB_CONNECT_DEBUG_RELAY_KEYS=<minisign public key>,…`.
-    pub relay_keys: Vec<String>,
     /// `LIGHTBULB_CONNECT_DEBUG_RELAY_ONLY=1`: no direct (IP) transport, only the relays.
     relay_only: bool,
     /// `LIGHTBULB_CONNECT_DEBUG_NO_DEFAULT_RELAYS=1`: no public relays when nothing else is
     /// set (direct only), so a test never reaches the internet.
     no_default_relays: bool,
-}
-
-fn compiled_keys() -> Vec<String> {
-    relay::KEYS.iter().map(|k| k.to_string()).collect()
 }
 
 const OSASCRIPT: &str = "/usr/bin/osascript";
@@ -121,8 +112,6 @@ impl Knobs {
             outbox_s: var("LIGHTBULB_CONNECT_DEBUG_OUTBOX_S")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(outbox::TTL_S),
-            relay_keys: var("LIGHTBULB_CONNECT_DEBUG_RELAY_KEYS")
-                .map_or_else(compiled_keys, |v| v.split(',').map(String::from).collect()),
             relay_only: var("LIGHTBULB_CONNECT_DEBUG_RELAY_ONLY").is_some_and(|v| v == "1"),
             no_default_relays: var("LIGHTBULB_CONNECT_DEBUG_NO_DEFAULT_RELAYS")
                 .is_some_and(|v| v == "1"),
@@ -140,7 +129,6 @@ impl Knobs {
             osascript: OSASCRIPT.into(),
             drop_acks: false,
             outbox_s: outbox::TTL_S,
-            relay_keys: compiled_keys(),
             relay_only: false,
             no_default_relays: false,
         }
@@ -156,7 +144,8 @@ pub struct Peers {
     pub changed: Notify,
     /// Woken (`notify_waiters`) whenever a member says `hello` in our protocol.
     pub connected: Notify,
-    /// Poked when mail joins the outbox.
+    /// Poked when mail joins the outbox, or a receipt owed to a sender moves (a take, a read):
+    /// the flush loop sends it now.
     pub outbox: Notify,
     /// Woken (`notify_waiters`) whenever a member's connection ends.
     pub disconnected: Notify,
@@ -170,8 +159,6 @@ pub struct Peers {
     pub dropped: Mutex<std::collections::BTreeMap<&'static str, u64>>,
     /// The relays in effect (`relay::list`; the relay loop brings the endpoint after).
     pub relays: Mutex<relay::List>,
-    /// What is known of our list: loaded once at start, changed only by a fetch.
-    pub relay_state: Mutex<relay::State>,
     /// Poked by `relays_changed`: the relay loop brings the endpoint to the list.
     pub relay_changed: Notify,
     /// `config.lan` at start.
@@ -281,20 +268,13 @@ impl Peers {
     }
 
     /// The one entry for a relay change (start, `relay.set`, a roster install whose team relay
-    /// changed, a fetch): makes the list for `t` and our state the one in effect at once
+    /// changed): makes the list for `t` the one in effect at once
     /// (`relay.get`, tickets and dials read it), and pokes the relay loop for the endpoint.
     /// In memory only: no disk, no crypto.
     pub fn relays_changed(&self, t: &TeamState) {
-        let mut new = relay::list(
-            &t.config.relay,
-            &t.roster.relay,
-            &self.relay_state.lock().unwrap(),
-        );
+        let mut new = relay::list(&t.config.relay, &t.roster.relay);
         if new.source == relay::Source::Default && self.knobs().no_default_relays {
-            new = relay::List {
-                error: new.error,
-                ..relay::List::default()
-            };
+            new = relay::List::default();
         }
         let mut l = self.relays.lock().unwrap();
         if (&new.urls, new.source) != (&l.urls, l.source) {
@@ -383,18 +363,21 @@ impl Peers {
         self.prune_known(dir, roster);
     }
 
-    /// `status.relay` and `status.relay_error`: `none` without relays, `ok` while a home relay
-    /// is connected, else `unreachable`; and why our list was refused, while it is.
-    pub fn relay_status(&self) -> (&'static str, Option<String>) {
-        let l = self.relays.lock().unwrap();
-        if l.urls.is_empty() {
-            return ("none", l.error.clone());
+    /// `status.relay`: `none` without relays, `ok` while a home relay is connected, else
+    /// `unreachable`.
+    pub fn relay_status(&self) -> &'static str {
+        if self.relays.lock().unwrap().urls.is_empty() {
+            return "none";
         }
         let up = self
             .endpoint
             .get()
             .is_some_and(|e| e.home_relay_status().get().iter().any(|r| r.is_connected()));
-        (if up { "ok" } else { "unreachable" }, l.error.clone())
+        if up {
+            "ok"
+        } else {
+            "unreachable"
+        }
     }
 
     /// Members with a live connection that said `hello` in our protocol.
@@ -568,8 +551,6 @@ impl Net {
         daemon
             .peers
             .load_known(&daemon.dir, &daemon.team.lock().unwrap().roster);
-        let state = relay::State::load(&daemon.dir, &daemon.peers.knobs().relay_keys);
-        *daemon.peers.relay_state.lock().unwrap() = state;
         let lan = {
             let t = daemon.team.lock().unwrap();
             for v in [&t.config.relay, &t.roster.relay].into_iter().flatten() {
@@ -581,8 +562,8 @@ impl Net {
             t.config.lan
         };
         let secret = SecretKey::from_bytes(&daemon.identity.signing.to_bytes());
-        // Always a relay transport (an empty map is direct only), so a list that comes later
-        // can be added at runtime.
+        // Always a relay transport (an empty map is direct only), so a relay set later can be
+        // added at runtime.
         let urls = daemon.peers.relays.lock().unwrap().urls.clone();
         let map = urls.into_iter().map(relay_config);
         let mut b = Endpoint::builder(presets::Minimal)
@@ -623,51 +604,17 @@ impl Net {
     }
 
     /// Brings the endpoint's relays to the list in effect (`peers.relays`) whenever
-    /// `relays_changed` pokes, and tries the fetch of ours hourly (`relay::State::
-    /// fetch_if_due` decides) on a blocking thread, swapping the state in after. iroh keeps
-    /// the connection to its home relay up itself (and the dial loop redials members through
-    /// every relay), so this only changes which relays there are.
+    /// `relays_changed` pokes. iroh keeps the connection to its home relay up itself (and the
+    /// dial loop redials members through every relay), so this only changes which relays
+    /// there are.
     async fn relay_loop(self) {
         let d = &self.0.daemon;
         // What the endpoint has.
         let mut applied = d.peers.relays.lock().unwrap().urls.clone();
-        let mut first = true;
         loop {
-            // A retry is due an hour after the last attempt, whatever started that attempt (a
-            // poke too); with none pending, the hourly look at the cache's age.
-            let now = std::time::Instant::now();
-            let last = d.peers.relay_state.lock().unwrap().last_fetch_at;
-            let due = last.map(|t| t + relay::RETRY).filter(|t| *t > now);
-            let wake = match (first, due) {
-                (true, _) => now,
-                (_, Some(t)) => t,
-                _ => now + RELAY_FETCH,
-            };
-            first = false;
             tokio::select! {
-                _ = tokio::time::sleep_until(wake.into()) => {}
                 _ = d.peers.relay_changed.notified() => {}
                 _ = self.0.endpoint.closed() => return,
-            }
-            let (mut state, issuer, set) = {
-                let t = d.team.lock().unwrap();
-                let set = (t.config.relay.clone(), t.roster.relay.clone());
-                (
-                    d.peers.relay_state.lock().unwrap().clone(),
-                    t.config.issuer.clone(),
-                    set,
-                )
-            };
-            let d2 = d.clone();
-            let fetched = tokio::task::spawn_blocking(move || {
-                let keys = &d2.peers.knobs().relay_keys;
-                let f = state.fetch_if_due(&d2.dir, &issuer, (&set.0, &set.1), keys);
-                (f, state)
-            })
-            .await;
-            if let Ok((true, state)) = fetched {
-                *d.peers.relay_state.lock().unwrap() = state;
-                d.peers.relays_changed(&d.team.lock().unwrap());
             }
             let urls = d.peers.relays.lock().unwrap().urls.clone();
             if urls == applied {
@@ -745,16 +692,13 @@ impl Net {
     }
 
     /// Sends what members are owed: on each `hello` every queued envelope of an online member,
-    /// and every second the envelopes due (`outbox::due`'s per-row backoff) and the receipts
-    /// waiting; every 60 s (or the outbox knob, if shorter) expires what waited too long, here
-    /// and in the outbox, and lapses and renews sign-in proofs (`proof::tick`).
-    // ponytail: a 1 s poll (two small queries) picks up receipts that mail state changes queue;
-    // wake it from `mail` if that ever shows.
+    /// and on every `peers.outbox` poke (or each second) the envelopes due (`outbox::due`'s
+    /// per-row backoff) and the receipts waiting; every 60 s (or the outbox knob, if shorter) expires what waited too long, here
+    /// and in the outbox, and lapses sign-in proofs (`proof::tick`).
     async fn flush_loop(self) {
         let d = &self.0.daemon;
         let every = Duration::from_secs(d.peers.knobs().outbox_s.clamp(1, 60));
         let mut expired_at: Option<std::time::Instant> = None;
-        let mut renew_at = 0;
         loop {
             // Armed before the flush, so a `hello` during it is not missed.
             let connected = d.peers.connected.notified();
@@ -769,7 +713,7 @@ impl Net {
             let expire = expired_at.is_none_or(|t| t.elapsed() >= every);
             if expire {
                 expired_at = Some(std::time::Instant::now());
-                crate::proof::tick(d, &mut renew_at);
+                crate::proof::tick(d);
             }
             if let Err(e) = flush(d, all, expire) {
                 eprintln!("net: outbox: {e}");
@@ -1158,6 +1102,7 @@ fn flush(d: &Daemon, all: bool, expire: bool) -> Result<()> {
             receipt_changed(d, &id, State::Expired.name(), Some("unreachable"));
         }
         holds::expire_here(d, &store, now as i64)?;
+        mail::forget(&store)?;
     }
     let since = now.saturating_sub(mail::HELD_S);
     let due = outbox::due(&store, &online, if all { u64::MAX } else { now }, since)?;
@@ -1378,10 +1323,7 @@ fn relay_config(url: RelayUrl) -> iroh::RelayConfig {
 fn log_relays(l: &relay::List) {
     let source = serde_json::to_value(l.source).unwrap_or_default();
     let urls: Vec<String> = l.urls.iter().map(ToString::to_string).collect();
-    match &l.error {
-        Some(e) => eprintln!("relay: {source} {urls:?} ({e})"),
-        None => eprintln!("relay: {source} {urls:?}"),
-    }
+    eprintln!("relay: {source} {urls:?}");
 }
 
 pub(crate) fn short(key: &str) -> &str {

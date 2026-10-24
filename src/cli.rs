@@ -5,7 +5,7 @@
 use crate::daemon::ipc;
 use crate::daemon::net_ops::Invite;
 use crate::hook::{self, Conn};
-use crate::{admission, daemon, http, label, paths, proof, setup, Result};
+use crate::{admission, daemon, paths, setup, Result};
 use serde_json::{json, Value};
 use sha2::Digest;
 use std::fs;
@@ -321,21 +321,29 @@ pub fn send(
     let rid = request_id.unwrap_or_else(|| ulid::Ulid::generate().to_string());
     // (address, its handle, request id)
     let targets: Vec<(String, String, String)> = if group {
-        let sessions = ask(&mut conn, "sessions", json!({}))?["sessions"].clone();
+        // `*`: this computer's sessions; `<member>/*`: theirs as `who --all` sees them.
+        let op = if target == "*" {
+            "sessions"
+        } else {
+            "directory"
+        };
+        let sessions = ask(&mut conn, op, json!({}))?["sessions"].clone();
         let prefix = target.trim_end_matches('*');
         sessions
             .as_array()
             .into_iter()
             .flatten()
-            .filter(|s| {
-                s["key"]
-                    .as_str()
-                    .is_some_and(|k| target == "*" || k.starts_with(prefix))
+            .filter(|s| s["hidden"] != true)
+            .filter_map(|s| {
+                let key = s["key"].as_str().or(s["session_id"].as_str())?;
+                (target == "*" || key.starts_with(prefix)).then_some((key, s))
             })
             .enumerate()
-            .map(|(i, s)| {
-                let at = |f: &str| s[f].as_str().unwrap_or_default().to_string();
-                (at("key"), at("handle"), format!("{rid}.{}", i + 1))
+            .map(|(i, (key, s))| {
+                let handle = s["handle"].as_str().filter(|h| !h.is_empty());
+                let agent = || crate::frame::agent_name(s["agent"].as_str().unwrap_or_default());
+                let handle = handle.map_or_else(agent, String::from);
+                (key.to_string(), handle, format!("{rid}.{}", i + 1))
             })
             .collect()
     } else {
@@ -527,7 +535,9 @@ pub fn invite(mode: Invite) -> Result<i32> {
                 "Anyone with this line joins without asking. Use it only with people you trust."
             );
         }
-        _ if r["replaced"] == true => println!("The old invite stopped working."),
+        _ if r["replaced"] == true => {
+            println!("Every earlier invite from this computer stopped working.")
+        }
         _ => {}
     }
     println!("Send this line to the person (or paste it on your other computer):");
@@ -577,7 +587,7 @@ pub fn join(link: &str, name: Option<String>, kind: &str, proof: Option<String>)
                 "Your agents here can now see and message the team's agents. Try: {} who --all",
                 command()
             );
-            println!("Until both computers sign in, your other computer counts as another person and its first message needs your Allow.");
+            println!("Until verified names arrive, your other computer counts as another person and its first message needs your Allow.");
             return Ok(0);
         }
         (Some("waiting"), _) => "No one has answered yet. Run the same command again to keep asking.".to_string(),
@@ -600,93 +610,10 @@ pub fn join(link: &str, name: Option<String>, kind: &str, proof: Option<String>)
     Ok(1)
 }
 
-/// How long `signin` waits for the person to confirm in the browser.
-const SIGNIN_WAIT: Duration = Duration::from_secs(900);
-
-/// `signin`: the issuer's device flow for this computer's key (`device/start`, the browser,
-/// then `device/token` until it answers), the proof written to the roster (`identity.proof`).
+/// `signin`: verified names need the issuer's real keys (the key ceremony), so this refuses.
 pub fn signin() -> Result<i32> {
-    let issuer = crate::config::Config::load(&paths::state_dir())?.issuer;
-    let start = connect()?.call("identity.device_start", json!({}))?;
-    if start["ok"] != true {
-        match start["reason"].as_str().or(start["error"].as_str()) {
-            Some("not_a_person") => eprintln!("Sign in from your own terminal, not from an agent."),
-            reason => eprintln!("signin: {}", reason.unwrap_or("failed")),
-        }
-        return Ok(1);
-    }
-    let body = json!({"member_key": start["member_key"], "computer": start["computer"],
-        "at": start["at"], "sig": start["sig"]});
-    let post = |path: &str, body: &Value| http::post_json(&proof::route(&issuer, path), body);
-    let (status, s) = post("device/start", &body)?;
-    let (Some(code), Some(uri)) = (
-        s["device_code"].as_str(),
-        s["verification_uri_complete"].as_str(),
-    ) else {
-        eprintln!(
-            "Sign-in is not available right now (the issuer answered {status}). Try again later."
-        );
-        return Ok(1);
-    };
-    // The issuer's words, as plain text: `config.toml` (its URL) is the agent's to write.
-    let user_code = label::plain(s["user_code"].as_str().unwrap_or_default(), 32);
-    println!(
-        "Confirm the code {user_code} in your browser: {}",
-        label::plain(uri, 512)
-    );
-    // A person at a terminal gets the browser (an https page only; debug: the tests' http);
-    // a script reads the line above.
-    let web = uri.starts_with("https://") || (cfg!(debug_assertions) && uri.starts_with("http://"));
-    if web
-        && uri.chars().all(label::printable)
-        && std::io::IsTerminal::is_terminal(&std::io::stdout())
-    {
-        let _ = Command::new("open").arg(uri).status();
-    }
-    let every = Duration::from_secs(s["interval"].as_u64().unwrap_or(5).clamp(1, 60));
-    let deadline = std::time::Instant::now() + SIGNIN_WAIT;
-    let mut token = None;
-    while token.is_none() && std::time::Instant::now() < deadline {
-        let (status, t) = post("device/token", &json!({"device_code": code}))?;
-        match status {
-            200 if t["pending"] == true => std::thread::sleep(every),
-            // A proof, or (neither) nothing more to wait for.
-            200 => match t["proof"].as_str() {
-                Some(p) => token = Some(p.to_string()),
-                None => break,
-            },
-            410 => break,
-            _ => {
-                eprintln!("Sign-in failed (the issuer answered {status}). Try again later.");
-                return Ok(1);
-            }
-        }
-    }
-    let Some(token) = token else {
-        eprintln!("This sign-in code expired. Run the same command again.");
-        return Ok(1);
-    };
-    // A fresh connection: the first may have sat idle through the wait.
-    let r = connect()?.call("identity.proof", json!({ "proof": token }))?;
-    if r["reason"] == "other_person" {
-        eprintln!("This sign-in is for a different person than this computer already belongs to.");
-        return Ok(1);
-    }
-    if r["ok"] != true {
-        eprintln!("The issuer's answer did not verify for this computer. Try again later.");
-        return Ok(1);
-    }
-    // `proof::parse` let only plain text in.
-    let name = r["name"].as_str().unwrap_or_default();
-    if r["solo"] == true {
-        println!(
-            "Signed in as {name}. To join your network, run the line your inviter sent: {} join '<ticket>' --name <your name>",
-            command()
-        );
-    } else {
-        println!("Signed in as {name}.");
-    }
-    Ok(0)
+    eprintln!("Verified names are not available yet.");
+    Ok(2)
 }
 
 /// `approve <id> [--always]` / `decline <id>`: answers join request `J<n>` or held message
@@ -763,18 +690,8 @@ pub fn held() -> Result<i32> {
             format!("{id}  {name} ({computer}) wants to join — {cmd} approve {id}")
         })
         .collect();
-    // "not verified" explained at its first appearance only.
-    let mut explained = false;
     for h in holds["holds"].as_array().into_iter().flatten() {
-        let (id, mut who) = (f(h, "id"), f(h, "label"));
-        if h["verified"] == false && !explained {
-            explained = true;
-            who = who.replacen(
-                " (not verified)",
-                " (not verified — they have not signed in)",
-                1,
-            );
-        }
+        let (id, who) = (f(h, "id"), f(h, "label"));
         let (to, text) = (f(h, "target_session"), f(h, "preview"));
         lines.push(format!(
             "{id}  {who} -> {to}  \"{text}\" — {cmd} approve {id}"
@@ -1042,9 +959,48 @@ pub fn remove(name: &str) -> Result<i32> {
     Ok(0)
 }
 
+/// `leave` when `identity.key` no longer matches the team record (the daemon will not start):
+/// after a yes, the team record goes from `state.db`, as a removal would leave it; the next
+/// start makes this computer its own network with its new key. Nothing can be signed for the
+/// team, so it is not told.
+fn leave_unsigned(dir: &std::path::Path) -> Result<i32> {
+    // A start that is about to refuse (launchd's respawn) holds the lock a moment: wait it out.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let _lock =
+        loop {
+            match daemon::lock_dir(dir, false) {
+                Ok(l) => break l,
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(100))
+                }
+                Err(_) => return Err(
+                    "The background service holds the state folder. Stop it, then run leave again."
+                        .into(),
+                ),
+            }
+        };
+    let store = crate::store::Store::open(&dir.join("state.db"))?;
+    let name = crate::roster::replay(&crate::roster::entries(&store)?).team_name;
+    print!("Leave \"{name}\"? This computer's key changed, so the team cannot be told. Messages already stored here stay. [y/N] ");
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    if !matches!(answer.trim(), "y" | "Y" | "yes") {
+        return Ok(0);
+    }
+    crate::outbox::refuse_all(&store, daemon::ipc::now(), "not_member")?;
+    store.clear_roster()?;
+    println!("Left \"{name}\". This computer is on its own network again.");
+    Ok(0)
+}
+
 /// `leave`: after a yes, this computer leaves its team and is on its own network again. The
 /// service keeps running.
 pub fn leave() -> Result<i32> {
+    let dir = paths::state_dir();
+    if crate::embed::key_mismatch(&dir)? {
+        return leave_unsigned(&dir);
+    }
     let mut conn = connect()?;
     let me = conn.member()?;
     let t = ask(&mut conn, "team.get", json!({}))?;
@@ -1129,9 +1085,6 @@ pub fn relay(set: Option<String>, local: bool) -> Result<i32> {
     }
     for u in urls.iter().filter(|_| source != "default") {
         println!("{source}  {u}");
-    }
-    if let Some(e) = l["error"].as_str() {
-        println!("Our relay list was refused: {}", cell(e));
     }
     Ok(0)
 }

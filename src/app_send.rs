@@ -255,6 +255,7 @@ async fn serve(
             eprintln!("app: marking {m} read: {e}");
         }
     }
+    d.peers.outbox.notify_one();
 }
 
 /// `mine`'s newest waiting records (of the newest `INBOX_ROWS`) within `INBOX_BUDGET`, newest

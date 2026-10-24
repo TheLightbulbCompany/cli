@@ -27,7 +27,7 @@ pub enum Invite {
     /// This member's live link, minted when it has none.
     #[default]
     Reusable,
-    /// A new link in place of the live one.
+    /// A new link in place of the live one, ending every earlier link of this computer.
     New,
     /// A link for one join.
     Once,
@@ -143,22 +143,12 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, caller: Caller) 
                 }),
             )
         }
-        // `relay.get {}` -> `{urls, source, error}`: the relays in effect and where they came
-        // from (`config`, `team`, `lightbulb` or `none`); the snapshot `status` reads too.
+        // `relay.get {}` -> `{urls, source}`: the relays in effect and where they came
+        // from (`config`, `team`, `default` or `none`); the snapshot `status` reads too.
         "relay.get" => Response::ok(id, json!(*daemon.peers.relays.lock().unwrap())),
         "relay.set" => relay_set(id, body, daemon, caller),
         // An agent fed a hostile sign-in must not move this computer into another person.
-        "identity.proof" | "identity.device_start" if !caller.is_person() => {
-            refused(id, "not_a_person")
-        }
-        // `identity.device_start {}` -> `{member_key, computer, at, sig}`: `device/start`'s
-        // body, `sig` by this computer's key over the rest (person-only).
-        "identity.device_start" => {
-            let computer = daemon.team.lock().unwrap().config.computer.clone();
-            let at = super::ipc::now() as i64;
-            let body = json!({"member_key": daemon.identity.key, "computer": computer, "at": at});
-            Response::ok(id, daemon.identity.signed(body))
-        }
+        "identity.proof" if !caller.is_person() => refused(id, "not_a_person"),
         // `identity.proof {proof}` -> `{name, person_id, solo}`: this computer's sign-in proof,
         // written to the roster (`proof::record`), person-only; `bad_request` when it does not
         // verify (reason `other_person` when it names another person than this computer's).
@@ -659,13 +649,17 @@ impl TeamOps<'_> {
                             && l.expires_at > self.now
                     })
                     .cloned();
-                let replaced = invite == Invite::New && live.is_some();
+                let replaced = invite == Invite::New
+                    && r.links
+                        .values()
+                        .any(|l| l.signer == me_key && l.expires_at > self.now);
                 let t = match live {
                     Some(l) if invite != Invite::New => {
                         let hint = self.daemon.peers.hints();
                         ticket::sign(identity, r, l.ticket_id, l.secret, mode, l.expires_at, hint)
                     }
-                    _ => self.new_link(mode, invite.once())?,
+                    // `--new` ends every earlier link of this computer, `open` and once ones too.
+                    _ => self.new_link(mode, invite.once(), invite == Invite::New)?,
                 };
                 let s = ticket::encode(&t);
                 Response::ok(
@@ -702,7 +696,7 @@ impl TeamOps<'_> {
                     return Ok(Response::err(id, BAD_REQUEST));
                 }
                 self.write(Kind::Remove, json!({"member": t.key}))?;
-                let link = self.new_link("ask", false)?;
+                let link = self.new_link("ask", false, false)?;
                 Response::ok(id, json!({"name": t.name, "line": ticket::line(&link)}))
             }
             _ => Response::err(id, UNKNOWN_OP),
@@ -714,8 +708,13 @@ impl TeamOps<'_> {
     }
 
     /// Mints a link of `mode` off the cached roster (signed into the roster, recorded in
-    /// `team_link`): its ticket.
-    fn new_link(&mut self, mode: &str, once: bool) -> crate::Result<ticket::Ticket> {
+    /// `team_link`; with `ends_all`, ending every earlier link of ours): its ticket.
+    fn new_link(
+        &mut self,
+        mode: &str,
+        once: bool,
+        ends_all: bool,
+    ) -> crate::Result<ticket::Ticket> {
         let (t, hashed) = ticket::mint(
             &self.daemon.identity,
             &self.team.roster,
@@ -724,7 +723,11 @@ impl TeamOps<'_> {
             self.now,
             self.daemon.peers.hints(),
         );
-        self.write(Kind::Link, ticket::link_body(&t, hashed.as_deref()))?;
+        let mut body = ticket::link_body(&t, hashed.as_deref());
+        if ends_all {
+            body["ends_all"] = true.into();
+        }
+        self.write(Kind::Link, body)?;
         self.store.put_link(
             &t.ticket_id,
             &t.secret,

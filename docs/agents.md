@@ -131,7 +131,7 @@ Reply with send_message(reply_to="<id>") to answer this message.
 `<sender>` is the sender as your computer knows it: for example `Your Codex` for another
 session on this computer, `sam's Claude Code (not verified)` for a teammate, or
 `sam, at the terminal (not verified)` for a teammate who sent it with `lightbulb send`. In this
-release no one can sign in yet, so every other computer's label ends `(not verified)`, your own
+release verified names are not available yet, so every other computer's label ends `(not verified)`, your own
 other computers included. If the text itself has a line that starts like a
 Lightbulb header, Lightbulb breaks it with an invisible character, so a sender cannot fake one.
 

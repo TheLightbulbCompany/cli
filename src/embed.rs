@@ -23,8 +23,6 @@ pub struct EmbedOpts {
     pub kind: MemberKind,
     /// The relay this instance uses (`config.toml: relay` for a computer).
     pub relay: Option<RelayUrl>,
-    /// Where our signed relay list comes from (`config.toml: issuer`).
-    pub issuer: String,
     /// Where `Instance::shutdown` leaves a final copy of `state.db`, if anywhere.
     pub snapshot: Option<PathBuf>,
     /// The workspace's display name: the name it joins as, and its solo network's.
@@ -42,7 +40,7 @@ pub struct Instance {
 }
 
 /// Starts the instance whose state is `home` (made 0700 if missing): the daemon's roster,
-/// transport and outbox, with `opts`' relay and issuer and no LAN discovery. `Err` while
+/// transport and outbox, with `opts`' relay and no LAN discovery. `Err` while
 /// another engine (instance or daemon) holds `home`.
 pub async fn start(home: &Path, opts: EmbedOpts) -> Result<Instance> {
     if opts.kind != MemberKind::Cloud {
@@ -62,7 +60,6 @@ pub async fn start(home: &Path, opts: EmbedOpts) -> Result<Instance> {
     // every peer's roster.
     let config = Config {
         computer: opts.name.clone(),
-        issuer: opts.issuer,
         relay: opts.relay.map(|u| u.to_string()),
         lan: false,
         ..Config::load(home)?
@@ -74,6 +71,38 @@ pub async fn start(home: &Path, opts: EmbedOpts) -> Result<Instance> {
         snapshot: opts.snapshot,
         closed: false,
     })
+}
+
+/// `boot`'s refusal when `identity.key` was replaced (or lost) under a kept `state.db`: the
+/// team record is signed for the old key, which nothing here can sign as any more.
+pub const KEY_MISMATCH: &str = "identity.key does not match this computer's team record. Run lightbulb leave, then join again with a new invite.";
+
+/// Whether `roster` never knew `identity`'s key, as a member or a signer: `identity.key` is
+/// not the key the team record was made for.
+fn mismatched(identity: &Identity, roster: &roster::Roster) -> bool {
+    let key = identity.key.as_str();
+    !roster.members.contains_key(key)
+        && !(roster.log().iter()).any(|(_, e)| e.signer == key || e.body["member"] == key)
+}
+
+/// `mismatched` for `dir` as it is on disk, for a caller that does not hold the lock: nothing
+/// is written. No roster: `false`; a roster but no `identity.key`: `true` (a start would make a
+/// key the record never knew).
+pub fn key_mismatch(dir: &Path) -> Result<bool> {
+    if !dir.join("state.db").exists() {
+        return Ok(false);
+    }
+    let entries = roster::entries(&Store::open(&dir.join("state.db"))?)?;
+    if entries.is_empty() {
+        return Ok(false);
+    }
+    if !dir.join("identity.key").exists() {
+        return Ok(true);
+    }
+    Ok(mismatched(
+        &Identity::load_or_create(dir)?,
+        &roster::replay(&entries),
+    ))
 }
 
 /// The start path the daemon and an instance share, under `dir`'s lock (the caller's):
@@ -97,6 +126,19 @@ pub(crate) async fn boot(
         entries.push(g);
     }
     let mut roster = roster::replay(&entries);
+    if mismatched(&identity, &roster) {
+        return Err(KEY_MISMATCH.into());
+    }
+    // Known but no member: removed (a stop before `removed_here`'s new genesis, or a fork that
+    // dropped us). On our own network again, as `removed_here` leaves it.
+    if !roster.members.contains_key(&identity.key) {
+        crate::outbox::refuse_all(&store, now as u64, "not_member")?;
+        store.clear_roster()?;
+        let at = now.max(roster.created_at + 1);
+        let g = net_ops::solo_genesis(&identity, cloud.as_deref(), &config.computer, at);
+        roster::accept(&store, &g, now)?;
+        roster = roster::replay(&[g]);
+    }
     roster.lapse(now);
     let mut team = TeamState {
         roster,
@@ -235,6 +277,7 @@ pub(crate) fn take_read(d: &Daemon, key: &Key) -> Result<Vec<Value>> {
         m.iter().try_for_each(|m| mail::mark_read(&store, &m.id))?;
         m
     };
+    d.peers.outbox.notify_one();
     Ok(ipc::records(d, &taken)
         .iter()
         .map(ipc::inbox_record)
