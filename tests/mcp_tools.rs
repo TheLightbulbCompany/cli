@@ -755,7 +755,7 @@ fn loop_refusals_name_their_limit_here_and_on_a_teammate() {
         .json();
     assert_eq!(v["limit"], "hops", "{v}");
     assert_eq!(
-        v["note"], "paused after 4 agent replies; a person must speak",
+        v["note"], "paused after 3 agent replies; a person must speak",
         "{v}"
     );
 

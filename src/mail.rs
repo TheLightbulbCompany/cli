@@ -155,7 +155,11 @@ pub fn receipt_note(r: &Value, person: Option<&ForPerson>) -> Option<String> {
     let until = || crate::date::local_time(r["until"].as_i64().unwrap_or_default());
     let limit = || match at("limit") {
         RATE => format!("loop limit: {LOOP_LIMIT} messages in 10 minutes to this session"),
-        HOPS => format!("paused after {MAX_HOPS} agent replies; a person must speak"),
+        // A person's message is hop 0, so `MAX_HOPS - 1` agent replies get through.
+        HOPS => format!(
+            "paused after {} agent replies; a person must speak",
+            MAX_HOPS - 1
+        ),
         _ => "paused by a loop limit".into(),
     };
     let Some(p) = person else {
@@ -235,7 +239,14 @@ pub fn receipt_note(r: &Value, person: Option<&ForPerson>) -> Option<String> {
         "delivered" => "Delivered.".into(),
         "read" if remote => format!("Read by {who} on {computer}."),
         "read" => "Read.".into(),
-        "expired" => "Not delivered: the other computer could not be reached for 24 hours.".into(),
+        // The sender's outbox gave up (`unreachable`), or it waited unread in the mailbox.
+        "expired" if at("reason") == "unreachable" => {
+            "Not delivered: the other computer could not be reached for 24 hours.".into()
+        }
+        "expired" => format!(
+            "{} did not come back within 24 hours; the message expired.",
+            crate::label::plain(name.unwrap_or("The session"), usize::MAX)
+        ),
         other => format!("Sent ({}).", crate::label::plain(other, usize::MAX)),
     })
 }
@@ -1012,7 +1023,7 @@ mod tests {
         };
         assert_eq!(
             r(Some("hops")),
-            "paused after 4 agent replies; a person must speak"
+            "paused after 3 agent replies; a person must speak"
         );
         assert_eq!(
             r(Some("rate")),
@@ -1722,5 +1733,24 @@ mod tests {
         advance(s.conn(), "m/codex:b", "r2", State::Read, None, None, 3).unwrap();
         forget(&s).unwrap();
         assert_eq!(body("r2").as_deref(), Some("yo"));
+    }
+
+    #[test]
+    fn an_expiry_says_who_did_not_come_back() {
+        let p = ForPerson {
+            to: Some("m/codex:b"),
+            rid: "r1",
+            cmd: "lightbulb",
+            check: false,
+        };
+        let note = |r: serde_json::Value| receipt_note(&r, Some(&p)).unwrap();
+        assert_eq!(
+            note(serde_json::json!({"state": "expired"})),
+            "codex:b did not come back within 24 hours; the message expired."
+        );
+        assert_eq!(
+            note(serde_json::json!({"state": "expired", "reason": "unreachable"})),
+            "Not delivered: the other computer could not be reached for 24 hours."
+        );
     }
 }
