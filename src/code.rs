@@ -76,21 +76,32 @@ pub fn normalize(s: &str) -> Option<String> {
     (parts.len() == 4 && parts.iter().all(|p| words().any(|w| w == *p))).then(|| parts.join("-"))
 }
 
-/// The endpoint key a normalized `code` stands for: Argon2id over the code, salted with a fixed
-/// context string. Slow on purpose (see `MEM_KIB`): call it off the async threads.
-pub fn secret(code: &str) -> SecretKey {
+/// A release build always derives with 64 MiB; this fails the build, not a test, if it doesn't.
+const _: () = assert!(cfg!(debug_assertions) || MEM_KIB == 65536);
+
+/// The `LIFE_S` window `t` (unix seconds) falls in. A code lives at most one window, so the
+/// joiner finds it under its own window or the one before.
+pub fn window(t: i64) -> i64 {
+    t.div_euclid(LIFE_S)
+}
+
+/// The endpoint key a normalized `code` stands for in `window`: Argon2id over the code, salted
+/// with a context string and the window, so a table of every code's key goes stale in ten
+/// minutes. Slow on purpose (see `MEM_KIB`): call it off the async threads.
+pub fn secret(code: &str, window: i64) -> SecretKey {
     let params = Params::new(MEM_KIB, PASSES, 1, Some(32)).expect("fixed Argon2 parameters");
     let mut okm = [0u8; 32];
+    let salt = [INFO, &window.to_be_bytes()].concat();
     Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
-        .hash_password_into(code.as_bytes(), INFO, &mut okm)
+        .hash_password_into(code.as_bytes(), &salt, &mut okm)
         .expect("Argon2 with a 32-byte output and a long enough salt");
     SecretKey::from_bytes(&okm)
 }
 
 /// `secret` on a blocking thread.
-async fn secret_async(code: &str) -> Option<SecretKey> {
+async fn secret_async(code: &str, window: i64) -> Option<SecretKey> {
     let code = code.to_string();
-    tokio::task::spawn_blocking(move || secret(&code))
+    tokio::task::spawn_blocking(move || secret(&code, window))
         .await
         .ok()
 }
@@ -108,7 +119,7 @@ pub async fn offer(d: &Daemon, body: &mut Value) {
     }
     let now = crate::daemon::ipc::now() as i64;
     let code = generate();
-    let Some(key) = secret_async(&code).await else {
+    let Some(key) = secret_async(&code, window(now)).await else {
         return;
     };
     let urls = d.peers.relays.lock().unwrap().urls.clone();
@@ -183,19 +194,31 @@ async fn hand_off(incoming: iroh::endpoint::Incoming, ticket: &str) -> bool {
 /// or used code, or an inviter that is off.
 pub async fn fetch(d: &Daemon, ep: &Endpoint, code: &str) -> Option<String> {
     let urls = d.peers.relays.lock().unwrap().urls.clone();
-    let key = secret_async(code).await?;
-    let addr = urls
-        .into_iter()
-        .fold(EndpointAddr::new(key.public()), |a, u| a.with_relay_url(u));
-    let run = async {
-        let conn = ep.connect(addr, ALPN).await.ok()?;
-        let (mut send, mut recv) = conn.open_bi().await.ok()?;
-        send.write_all(ASK).await.ok()?;
-        send.finish().ok()?;
-        let got = recv.read_to_end(MAX_TICKET).await.ok()?;
-        String::from_utf8(got).ok()
-    };
-    tokio::time::timeout(FETCH, run).await.ok().flatten()
+    let w = window(crate::daemon::ipc::now() as i64);
+    let (now_key, last_key) = tokio::join!(secret_async(code, w), secret_async(code, w - 1));
+    // Both windows at once: the one nobody serves only ends at the timeout.
+    let mut tries = tokio::task::JoinSet::new();
+    for key in [now_key?, last_key?] {
+        let addr = urls
+            .iter()
+            .cloned()
+            .fold(EndpointAddr::new(key.public()), |a, u| a.with_relay_url(u));
+        let ep = ep.clone();
+        tries.spawn(tokio::time::timeout(FETCH, async move {
+            let conn = ep.connect(addr, ALPN).await.ok()?;
+            let (mut send, mut recv) = conn.open_bi().await.ok()?;
+            send.write_all(ASK).await.ok()?;
+            send.finish().ok()?;
+            let got = recv.read_to_end(MAX_TICKET).await.ok()?;
+            String::from_utf8(got).ok()
+        }));
+    }
+    while let Some(done) = tries.join_next().await {
+        if let Ok(Ok(Some(ticket))) = done {
+            return Some(ticket);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -221,22 +244,20 @@ mod tests {
             normalize(&format!("  {}  ", c.replace('-', " - "))),
             Some(c.clone())
         );
-        assert_eq!(secret(&c).public(), secret(&c).public());
+        assert_eq!(secret(&c, 7).public(), secret(&c, 7).public());
         let other = (0..).map(|_| generate()).find(|o| *o != c).unwrap();
-        assert_ne!(secret(&c).public(), secret(&other).public());
+        assert_ne!(secret(&c, 7).public(), secret(&other, 7).public());
     }
 
     #[test]
     fn the_derivation_is_deterministic_and_per_code() {
         let (a, b) = ("alpha-bravo-charlie-delta", "alpha-bravo-charlie-echo");
-        assert_eq!(secret(a).public(), secret(a).public());
-        assert_ne!(secret(a).public(), secret(b).public());
-    }
-
-    #[cfg(not(debug_assertions))]
-    #[test]
-    fn release_derivation_is_64_mib() {
-        assert_eq!(MEM_KIB, 65536);
+        assert_eq!(secret(a, 7).public(), secret(a, 7).public());
+        assert_ne!(secret(a, 7).public(), secret(b, 7).public());
+        // A precomputed table goes stale: the same code has another key in the next window.
+        assert_ne!(secret(a, 7).public(), secret(a, 8).public());
+        assert_eq!(window(599), 0);
+        assert_eq!(window(600), 1);
     }
 
     #[test]

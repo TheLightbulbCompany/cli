@@ -101,7 +101,21 @@ async fn five_bad_callers_close_the_listener() {
         .bind()
         .await
         .unwrap();
-    let to = || EndpointAddr::new(code::secret(&code).public()).with_relay_url(relay.clone());
+    let to = || {
+        EndpointAddr::new(
+            code::secret(
+                &code,
+                code::window(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs() as i64,
+                ),
+            )
+            .public(),
+        )
+        .with_relay_url(relay.clone())
+    };
     let mut served = 0;
     for i in 0..7 {
         let Ok(Ok(conn)) = tokio::time::timeout(

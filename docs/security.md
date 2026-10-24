@@ -42,6 +42,14 @@ code is never logged, but it appears in shell history and `ps` on the joiner's c
 is dead once used or after 10 minutes. 5 junk connections can close a live code (denial of
 service only; fall back to the full line).
 
+The key is also salted with the current 10-minute window, so no one can build a table of
+every code's key ahead of time: a guess only counts for the window it was made in. What is
+left: someone who sees the code endpoint on a relay and can run about 2^41 Argon2id guesses
+inside one 10-minute window could pose as the inviter and hand the joiner a different
+network's invite. That takes on the order of a billion cores at once, so we accept it for
+now; a password-authenticated key exchange (as in magic-wormhole) would close it, and the
+full line never had it.
+
 ## Transport encryption
 
 Computers talk over QUIC, using the iroh library. Each connection is encrypted end to end
