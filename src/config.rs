@@ -19,7 +19,7 @@ enum Kind {
 }
 
 /// Every setting: the one list `load` and `set` read.
-const KEYS: [(&str, Kind); 6] = [
+const KEYS: [(&str, Kind); 7] = [
     ("computer", Kind::Str(|c| &mut c.computer)),
     (
         "preview_to_workspace",
@@ -29,6 +29,7 @@ const KEYS: [(&str, Kind); 6] = [
     ("lan", Kind::Bool(|c| &mut c.lan)),
     ("relay", Kind::OptStr(|c| &mut c.relay)),
     ("folders_off", Kind::Paths(|c| &mut c.folders_off)),
+    ("telemetry", Kind::Bool(|c| &mut c.telemetry)),
 ];
 
 fn kind(key: &str) -> Option<Kind> {
@@ -43,6 +44,8 @@ pub struct Config {
     pub lan: bool,
     pub relay: Option<String>,
     pub folders_off: Vec<PathBuf>,
+    /// Anonymous usage counts (`telemetry`).
+    pub telemetry: bool,
 }
 
 impl Default for Config {
@@ -54,6 +57,7 @@ impl Default for Config {
             lan: true,
             relay: None,
             folders_off: vec![],
+            telemetry: true,
         }
     }
 }

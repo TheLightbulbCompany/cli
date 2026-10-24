@@ -520,6 +520,10 @@ pub fn invite(mode: Invite) -> Result<i32> {
     if r["ok"] != true {
         return refuse(&r, &[]);
     }
+    crate::telemetry::send(
+        &paths::state_dir(),
+        crate::telemetry::Event::InviteCreated(crate::telemetry::Via::Line),
+    );
     let line = r["line"].as_str().unwrap_or_default();
     match mode {
         Invite::Once => {
@@ -582,6 +586,10 @@ pub fn join(link: &str, name: Option<String>, kind: &str, proof: Option<String>)
                 .unwrap_or_default()
                 .to_string();
             let n = r["online"].as_u64().unwrap_or(1);
+            crate::telemetry::send(
+                &paths::state_dir(),
+                crate::telemetry::Event::NetworkJoined(crate::telemetry::Via::of_join(link)),
+            );
             println!("Connected as {name} ({computer}). Team \"{team}\": {n} computers online.");
             println!(
                 "Your agents here can now see and message the team's agents. Try: {} who --all",
@@ -1558,6 +1566,12 @@ pub fn doctor() -> Result<i32> {
         named.err().unwrap_or_default(),
         &setup,
     );
+    let counts = if crate::telemetry::active(&dir) {
+        "on"
+    } else {
+        "off"
+    };
+    println!("{:<20} {counts}", "Usage counts");
     for (name, state, _) in &rows {
         println!("{name:<20} {state}");
     }
@@ -1637,6 +1651,9 @@ pub fn setup(
     }
     if !fixes.is_empty() {
         return Ok(1);
+    }
+    if crate::telemetry::on_setup(&paths::state_dir()) {
+        println!("{}\n", crate::telemetry::NOTICE);
     }
     let connected: Vec<String> = (report.agents.iter())
         .filter(|a| a.connected())

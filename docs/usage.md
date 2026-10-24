@@ -91,7 +91,7 @@ encrypted between the two computers, and their text is not written to the log. A
 text is deleted from `state.db` once nothing waits on it (read, refused or expired); messages to
 your own terminal keep theirs.
 
-The engine makes no network call to Lightbulb: no relay list, no sign-in, no telemetry. It talks
+Apart from anonymous usage counts (`lightbulb telemetry off`), the engine makes no network call to Lightbulb: no relay list, no sign-in. It talks
 only to your teammates' computers and, when no direct path exists, to the relays. (`update`,
 when you run it, downloads from this project's GitHub releases.)
 
