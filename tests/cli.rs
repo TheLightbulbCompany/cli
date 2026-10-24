@@ -29,6 +29,7 @@ impl Env {
             .env("LIGHTBULB_CONNECT_CLAUDE_HOME", self.home.path())
             .env("LIGHTBULB_CONNECT_NO_LAUNCHCTL", "1")
             .env("LIGHTBULB_CONNECT_DEBUG_NO_DEFAULT_RELAYS", "1")
+            .env("LIGHTBULB_CONNECT_DEBUG_NO_TELEMETRY", "1")
             .env("HOME", self.home.path())
             .env_remove("LIGHTBULB_CONNECT_SESSION")
             .env_remove("LIGHTBULB_CONNECT_HOOK_CALLER");
@@ -854,6 +855,7 @@ fn the_daemon_starts_from_the_canonical_binary() {
         .env("LIGHTBULB_CONNECT_CLAUDE_HOME", home.path())
         .env("LIGHTBULB_CONNECT_NO_LAUNCHCTL", "1")
         .env("LIGHTBULB_CONNECT_DEBUG_NO_DEFAULT_RELAYS", "1")
+        .env("LIGHTBULB_CONNECT_DEBUG_NO_TELEMETRY", "1")
         .env("LIGHTBULB_CONNECT_DIALOG", "")
         .env_remove("LIGHTBULB_CONNECT_HOOK_CALLER")
         .output()

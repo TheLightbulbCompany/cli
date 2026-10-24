@@ -295,6 +295,7 @@ pub fn user_name() -> String {
 /// never a second owner; otherwise this binary spawns one.
 pub fn ensure_running() -> Result<()> {
     let dir = paths::state_dir();
+    crate::telemetry::sync_env_optout(&dir);
     let sock = dir.join(paths::SOCKET);
     if answers_ping(&sock) {
         return Ok(());

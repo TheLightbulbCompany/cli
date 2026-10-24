@@ -21,6 +21,8 @@ const KEY: &str = "phc_nzqnGGPwHfrKycptH3TViSAo3uaxT8CHAXovvHnBGEma";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Debug builds send nothing unless this is set (tests that force a send).
 const FORCE: &str = "LIGHTBULB_TELEMETRY_FORCE";
+/// Set only by the test harness (`tests/common`): a build that sets it never posts.
+const NO_TELEMETRY_ENV: &str = "LIGHTBULB_CONNECT_DEBUG_NO_TELEMETRY";
 const ID_FILE: &str = "install-id";
 const VERSION_FILE: &str = "telemetry-version";
 const DAILY_FILE: &str = "telemetry-daily";
@@ -129,8 +131,8 @@ pub fn build(event: &Event, install_id: &str) -> Value {
     json!({"api_key": KEY, "batch": [{"event": name, "distinct_id": install_id, "properties": p}]})
 }
 
-/// Whether to send: the config allows it, and this is not a debug build or a test state
-/// folder (`LIGHTBULB_CONNECT_HOME`) unless `force` (`LIGHTBULB_TELEMETRY_FORCE`).
+/// Whether to send: the config allows it, and this is not a debug build or a test harness
+/// (`LIGHTBULB_CONNECT_DEBUG_NO_TELEMETRY`) unless `force` (`LIGHTBULB_TELEMETRY_FORCE`).
 pub fn enabled(config_on: bool, quiet_build: bool, force: bool) -> bool {
     config_on && (!quiet_build || force)
 }
@@ -149,14 +151,15 @@ fn env_off() -> Option<&'static str> {
 /// launchd/systemd daemon, so a CLI command saves it to the config: `sync_env_optout`).
 pub fn active(dir: &Path) -> bool {
     let config_on = Config::load(dir).is_ok_and(|c| c.telemetry);
-    let quiet = cfg!(debug_assertions) || std::env::var_os(crate::paths::HOME_ENV).is_some();
+    let quiet = cfg!(debug_assertions) || std::env::var_os(NO_TELEMETRY_ENV).is_some();
     enabled(config_on, quiet, env_set(FORCE))
 }
 
 /// Saves an environment opt-out as `telemetry = false`, once. Whether it did.
 fn sync_env_optout_if(dir: &Path, opted_out: bool) -> bool {
     let on = Config::load(dir).is_ok_and(|c| c.telemetry);
-    opted_out && on && Config::set(dir, "telemetry", "false").is_ok()
+    // A missing state folder is left alone: `Config::set` would create it with loose modes.
+    opted_out && on && dir.is_dir() && Config::set(dir, "telemetry", "false").is_ok()
 }
 
 /// What every CLI command that sends (or reports) runs first.
@@ -236,6 +239,7 @@ fn send_if_active(dir: &Path, event: Event) {
 fn post(body: &Value) {
     let Ok(mut child) = Command::new("curl")
         .args([
+            "-q",
             "-s",
             "-m",
             "3",
