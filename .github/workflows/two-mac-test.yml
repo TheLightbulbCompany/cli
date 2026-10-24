@@ -1,0 +1,119 @@
+# The two-Mac acceptance: this runner (a Mac on GitHub's network) joins the owner's team with an
+# open invite and sends one message to a person's mailbox on the owner's Mac. See
+# docs/acceptance-two-mac.md.
+name: two-mac-test
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "A name on the owner's computer, e.g. prasiddha/inbox"
+        required: true
+        type: string
+      wait_seconds:
+        description: "How long to wait for delivered/read after the send"
+        required: false
+        default: "600"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  two-mac:
+    runs-on: macos-latest
+    timeout-minutes: 25
+    env:
+      TARGET: ${{ inputs.target }}
+      WAIT_SECONDS: ${{ inputs.wait_seconds }}
+      OUT: ${{ github.workspace }}/two-mac
+    steps:
+      - name: Install the released CLI
+        run: |
+          mkdir -p "$OUT"
+          curl -fsSL https://github.com/TheLightbulbCompany/cli/releases/latest/download/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.lightbulb/connect/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/bin:$HOME/.lightbulb/connect/bin:$PATH"
+          lightbulb version | tee "$OUT/version.txt"
+          lightbulb doctor || true
+
+      # Person-only ops (join, leave): the daemon walks the socket peer's process ancestry and
+      # refuses when any ancestor is an agent (claude, codex, cursor-agent, grok). It reads no
+      # TTY. `script` gives the command a pseudo-terminal anyway, as a person's shell would.
+      - name: Join the owner's team
+        env:
+          E2E_TICKET: ${{ secrets.E2E_TICKET }}
+        run: |
+          [ -n "$E2E_TICKET" ] || { echo "Secret E2E_TICKET is not set." >&2; exit 1; }
+          set +e
+          script -q /dev/null lightbulb join "$E2E_TICKET" --name ci-mac > "$OUT/join.raw" 2>&1
+          code=$?
+          set -e
+          # The ticket never reaches the log or the summary, whatever join prints.
+          tr -d '\r' < "$OUT/join.raw" | perl -pe 's/\Q$ENV{E2E_TICKET}\E/[ticket]/g' | tee "$OUT/join.txt"
+          rm -f "$OUT/join.raw"
+          echo "exit $code" >> "$OUT/join.txt"
+          exit $code
+
+      - name: Show the team
+        run: |
+          lightbulb team | tee "$OUT/team-before.txt"
+          lightbulb who --all
+          n=$(sed -n 's/^Team ".*" — \([0-9]*\) computers*$/\1/p' "$OUT/team-before.txt")
+          [ "${n:-0}" -ge 2 ] || { echo "Expected 2 or more computers, got ${n:-none}." >&2; exit 1; }
+
+      - name: Send and wait for the receipt
+        run: |
+          rid="two-mac-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          start=$(date +%s)
+          lightbulb send "$TARGET" "two-mac test $GITHUB_RUN_ID" --request-id "$rid" | tee "$OUT/send.txt"
+          echo "Request id: $rid"
+          : > "$OUT/states.txt"
+          last=""
+          deadline=$((start + WAIT_SECONDS))
+          while :; do
+            if ! state=$(lightbulb receipt "$rid" --json | jq -r '.state // "unknown"'); then
+              state=unreadable
+            fi
+            if [ "$state" != "$last" ]; then
+              echo "$(( $(date +%s) - start ))s $state" | tee -a "$OUT/states.txt"
+              last=$state
+            fi
+            case "$state" in
+              delivered|read)
+                echo "$(( $(date +%s) - start ))" > "$OUT/elapsed.txt"
+                exit 0 ;;
+              refused|expired)
+                lightbulb receipt "$rid"
+                exit 1 ;;
+            esac
+            [ "$(date +%s)" -lt "$deadline" ] || { echo "Final state $state after ${WAIT_SECONDS}s." >&2; exit 1; }
+            sleep 5
+          done
+
+      - name: Leave the team
+        if: always()
+        run: |
+          # `leave` asks [y/N] on stdin; the answer is piped in inside the pseudo-terminal.
+          script -q /dev/null sh -c 'echo y | lightbulb leave'
+          lightbulb team | tee "$OUT/team-after.txt"
+
+      - name: Summary
+        if: always()
+        run: |
+          show() { if [ -s "$1" ]; then printf '```\n%s\n```\n' "$(cat "$1")"; else echo "_none_"; fi; }
+          {
+            echo "## Two-Mac acceptance"
+            echo "**Version:** $(cat "$OUT/version.txt" 2>/dev/null || echo unknown)"
+            echo "**Target:** \`$TARGET\`"
+            echo "### Join"; show "$OUT/join.txt"
+            echo "### Team after join"; show "$OUT/team-before.txt"
+            echo "### Receipt states (seconds after send)"; show "$OUT/states.txt"
+            if [ -s "$OUT/elapsed.txt" ]; then
+              echo "**Send to delivered:** $(cat "$OUT/elapsed.txt") s"
+            else
+              echo "**Send to delivered:** not delivered"
+            fi
+            echo "### Team after leave"; show "$OUT/team-after.txt"
+          } >> "$GITHUB_STEP_SUMMARY"
