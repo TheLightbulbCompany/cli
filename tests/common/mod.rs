@@ -2,7 +2,7 @@
 //! on drop, a person's shell (`detached`) and socket client (`person`), the daemon env knobs,
 //! a two-member team seeded before start, and a member played by the test (`Peer`).
 //! ponytail: only `cli.rs`, `team_cli.rs`, `net_two.rs`, `join.rs`, `ui_claim.rs`, `dialog.rs`, `signin.rs`,
-//! `directory.rs` and `envelope.rs` use it;
+//! `directory.rs`, `envelope.rs` and `perf.rs` use it;
 //! the other test files keep their own copies.
 #![allow(dead_code)]
 

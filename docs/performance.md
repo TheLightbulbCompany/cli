@@ -1,0 +1,64 @@
+# Performance
+
+One team of 20 computers with 50 sessions, on one Mac. Each computer is its own `lightbulb
+daemon` with a temp home; they find each other through the loopback files in
+`/tmp/lightbulb-<uid>/` (Local Network is not used).
+
+## Command
+
+```sh
+cargo test --test perf -- --ignored --nocapture
+```
+
+The test is `tests/perf.rs`. It is ignored by default, so `cargo test` does not run it.
+
+## Machine and build
+
+- Apple M1 Pro, 16 GB, macOS 26.2.
+- Commit: v0.2.2 (`73d8e59`) plus this harness.
+- Debug build (the `cargo test` default). Other test runs were active on the same Mac at the
+  time.
+
+## What the test does
+
+1. Starts 20 daemons. Each one allows every other person first, so no message is held.
+2. Computer 0 makes the team. Each of the other 19 joins in turn, with a new open link
+   from computer 0.
+3. Registers 30 sessions round-robin, then 20 more one at a time (50 in total).
+4. Sends 100 messages across the mesh. Each one goes from computer X to a session on
+   computer Y.
+
+## Numbers (one clean run)
+
+| measure | result |
+|---|---|
+| join, invite to `admitted` (19 joins) | min 80 ms / median 130 ms / max 425 ms |
+| full mesh online after the last join | 107 ms |
+| directory refresh, new session on X until Y lists it (20 samples) | median 266 ms / p95 886 ms |
+| message, `send` on X until X's receipt reads `delivered` (100 messages) | median 960 ms / p95 1009 ms |
+| of which: `send` until X reads `stored` | median 7 ms / p95 17 ms |
+| of which: `send` until Y's session takes it | median 7 ms / p95 16 ms |
+| resident memory per daemon after the run | min 35.6 MB / median 36.0 MB / max 38.0 MB |
+| total wall time | 78.1 s |
+
+Join time includes two short `perl` helper processes, one for `invite` and one for `join`,
+because both operations are for a person only. Directory refresh polls the `directory`
+operation, which is what `who --all` prints; the test also runs `who --all` once to check
+it. Message time counts until Y's session takes the message from its inbox. This is when
+the receipt becomes `delivered`. The test polls every 2 ms.
+
+## What the numbers mean
+
+The charter's target is 50 sessions on 20 computers, and the test reaches it in about
+80 s on one laptop. The memory is flat: about 36 MB per daemon, with a spread of 2 MB. A
+join takes about 0.1 s, and the full mesh connects about 0.1 s after the last join. Two
+results look wrong. First, a message arrives in about 7 ms and is taken in about 7 ms, but
+the sender reads `delivered` only about 1 s later. The cause is the 1 s poll in `flush_loop`
+(`src/net/mod.rs`, which already has a `ponytail:` note): it sends the `delivered` receipt
+back to the sender, and nothing wakes it. If taking a message woke that loop when a receipt is
+queued, the round trip would drop to about 15 ms. Second, the median directory refresh is
+the 250 ms presence coalesce (`src/presence.rs`, `COALESCE`). But the p95 is 0.8 to 1 s in
+each run, and this is not explained. The directory from a few computers comes one or more
+coalesce windows late. It is worth a look before the team gets bigger. All the numbers are
+from a debug build: a release build will be faster on CPU-bound steps, but the 1 s and
+250 ms timers stay the same.
