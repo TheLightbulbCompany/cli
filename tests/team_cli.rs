@@ -384,6 +384,17 @@ fn a_replaced_identity_key_refuses_to_start_until_leave() {
 }
 
 #[test]
+fn doctor_names_a_replaced_identity_key() {
+    let (a, b) = (Env::new(), Env::new());
+    common::seed_pair(&a, &b);
+    std::fs::remove_file(a.state.path().join("identity.key")).unwrap();
+    let line = "identity.key does not match this computer's team record. Run lightbulb leave, then join again with a new invite.";
+    let o = a.run(&["doctor"]);
+    assert_eq!(o.status.code(), Some(1), "{}", out(&o));
+    assert_eq!(out(&o).matches(line).count(), 1, "{}", out(&o));
+}
+
+#[test]
 fn a_removal_found_at_start_makes_a_solo_network_not_a_key_error() {
     // B's store holds A's removal of B but never made B's own genesis (a stop in between).
     let (a, b) = (Env::new(), Env::new());

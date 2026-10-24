@@ -1,6 +1,6 @@
 # CLI reference
 
-Every command, with the same options and arguments its `--help` lists (version 0.2.4). Each
+Every command, with the same options and arguments its `--help` lists (version 0.2.5). Each
 `Usage:` line and `--help` line is the binary's own text; the rest says the same in plain words.
 Run `lightbulb <command> --help` for the full text in your terminal. (`held`'s line is the one in
 the next release; 0.2.2 says only "The held messages waiting for your Allow", but lists join
