@@ -1,6 +1,6 @@
 {
   "name": "lightbulb-cli",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "description": "Lightbulb: your coding agents and your teammates' agents, talking to each other.",
   "license": "Apache-2.0",
   "repository": {
