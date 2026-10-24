@@ -1163,33 +1163,22 @@ fn latest_tag(base: Option<&str>) -> Result<String> {
         .ok_or_else(|| "Could not learn the latest version; nothing changed.".into())
 }
 
-/// The Developer ID team every release is signed by.
-const TEAM_ID: &str = "WZX4U3C22Y";
-
-/// Whether `codesign -dv` output names our team.
-fn signed_by_us(dv: &str) -> bool {
-    dv.lines()
-        .any(|l| l.trim() == format!("TeamIdentifier={TEAM_ID}"))
-}
+/// The code requirement every release binary must meet: Apple-anchored, our Developer ID team.
+#[cfg(target_os = "macos")]
+const REQUIREMENT: &str = "=anchor apple generic and certificate leaf[subject.OU] = \"WZX4U3C22Y\"";
 
 /// Refuses a binary that is not validly signed by our team; the old binary is untouched.
 #[cfg(target_os = "macos")]
 fn verify_signature(bin: &Path) -> Result<()> {
-    let bad = || "The download is not signed by Lightbulb; nothing changed.";
     let ok = Command::new("codesign")
-        .args(["--verify", "--strict"])
+        .args(["--verify", "--strict", "-R", REQUIREMENT])
         .arg(bin)
         .output()
         .is_ok_and(|o| o.status.success());
-    let dv = Command::new("codesign")
-        .arg("-dv")
-        .arg(bin)
-        .output()
-        .map_err(|_| bad())?;
-    if ok && signed_by_us(&String::from_utf8_lossy(&dv.stderr)) {
+    if ok {
         Ok(())
     } else {
-        Err(bad().into())
+        Err("The download is not signed by Lightbulb; nothing changed.".into())
     }
 }
 
@@ -1223,15 +1212,21 @@ fn install_release(home: &Path, base: &str, tag: &str) -> Result<bool> {
             .status()
             .is_ok_and(|s| s.success());
         let new = dir.join("lightbulb");
-        if !ok || !new.is_file() {
+        if !ok || !fs::symlink_metadata(&new).is_ok_and(|m| m.is_file()) {
             return Err(
                 format!("The {tag} download holds no lightbulb binary; nothing changed.").into(),
             );
         }
         // "(tests)" debug builds only: a stub binary has no signature.
         #[cfg(target_os = "macos")]
-        if test_env("LIGHTBULB_ALLOW_UNSIGNED").is_none() {
-            verify_signature(&new)?;
+        {
+            #[cfg(debug_assertions)]
+            let skip = std::env::var_os("LIGHTBULB_ALLOW_UNSIGNED").is_some();
+            #[cfg(not(debug_assertions))]
+            let skip = false;
+            if !skip {
+                verify_signature(&new)?;
+            }
         }
         install_alias(home, &new)?;
         Ok(true)
@@ -1272,11 +1267,11 @@ fn setup_due(last: Option<&str>, current: &str) -> bool {
 /// canonical binary's `setup` once so hooks, MCP entries and the skill follow it. The marker is
 /// written first, so a failing setup is not retried on every start.
 pub fn refresh_setup(dir: &Path) {
-    if std::env::var_os(paths::HOME_ENV).is_some() {
+    let Ok(home) = home() else { return };
+    if !is_installed_exe(&home) {
         return;
     }
     let last = fs::read_to_string(dir.join(SETUP_VERSION)).ok();
-    let Ok(home) = home() else { return };
     if !setup_due(last.as_deref(), VERSION) || fs::write(dir.join(SETUP_VERSION), VERSION).is_err()
     {
         return;
@@ -1292,6 +1287,17 @@ pub fn refresh_setup(dir: &Path) {
     }
 }
 
+/// Whether this process is the real install's canonical binary (not a side-by-side state dir,
+/// not a dev or `cargo run` build).
+fn is_installed_exe(home: &Path) -> bool {
+    std::env::var_os(paths::HOME_ENV).is_none()
+        && std::env::current_exe()
+            .and_then(|e| e.canonicalize())
+            .ok()
+            .zip(canonical(home).canonicalize().ok())
+            .is_some_and(|(a, b)| a == b)
+}
+
 /// The daemon's daily check: installs the latest release when it is newer than this binary, by
 /// the same checksum-verified path as `update`. `Ok(true)`: installed, the daemon should exit so
 /// its service manager starts the new binary. Only the real install is touched (not a
@@ -1299,10 +1305,7 @@ pub fn refresh_setup(dir: &Path) {
 /// restart, so it only says a release exists.
 pub fn auto_update(dir: &Path) -> Result<bool> {
     let home = home()?;
-    let canon = canonical(&home);
-    if std::env::var_os(paths::HOME_ENV).is_some()
-        || std::env::current_exe()?.canonicalize()? != canon.canonicalize()?
-    {
+    if !is_installed_exe(&home) {
         return Ok(false);
     }
     let base = test_env(RELEASE_BASE).map(|b| b.to_string_lossy().into_owned());
@@ -1798,18 +1801,6 @@ mod tests {
             "installed last time"
         );
         assert!(go("0.3.2", "v0.3.4", Some("v0.3.3")));
-    }
-
-    #[test]
-    fn the_signature_must_name_our_team() {
-        assert!(super::signed_by_us(
-            "Identifier=x\nTeamIdentifier=WZX4U3C22Y\n"
-        ));
-        assert!(!super::signed_by_us("TeamIdentifier=ABCDE12345\n"));
-        assert!(!super::signed_by_us(
-            "TeamIdentifier=not set\nAuthority=x\n"
-        ));
-        assert!(!super::signed_by_us(""));
     }
 
     #[test]
