@@ -1103,6 +1103,7 @@ fn flush(d: &Daemon, all: bool, expire: bool) -> Result<()> {
             receipt_changed(d, &id, State::Expired.name(), Some("unreachable"));
         }
         holds::expire_here(d, &store, now as i64)?;
+        mail::forget(&store)?;
     }
     let since = now.saturating_sub(mail::HELD_S);
     let due = outbox::due(&store, &online, if all { u64::MAX } else { now }, since)?;

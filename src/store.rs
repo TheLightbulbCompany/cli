@@ -149,7 +149,8 @@ pub(crate) fn row_message(r: &rusqlite::Row) -> rusqlite::Result<Message> {
         thread: r.get("thread")?,
         hops: r.get("hops")?,
         origin: r.get("origin")?,
-        body: r.get("body")?,
+        // `NULL` once `mail::forget` dropped it.
+        body: r.get::<_, Option<String>>("body")?.unwrap_or_default(),
         sent_at: r.get("sent_at")?,
     })
 }
@@ -548,12 +549,13 @@ pub struct Untold {
 
 /// Mail between members: the mailbox, what peers sent (`seen_ids`) and the outbox.
 impl Store {
-    /// `from`'s message `request_id` as stored: `(to, body)`.
+    /// `from`'s message `request_id` as stored: `(to, body)`; the body `None` once
+    /// `mail::forget` dropped it.
     pub fn sent_as(
         &self,
         from: &str,
         request_id: &str,
-    ) -> rusqlite::Result<Option<(String, String)>> {
+    ) -> rusqlite::Result<Option<(String, Option<String>)>> {
         self.conn
             .query_row(
                 "SELECT to_key, body FROM messages WHERE from_key = ?1 AND request_id = ?2",
