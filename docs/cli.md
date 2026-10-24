@@ -309,6 +309,26 @@ only, when no direct path exists.
 | `--clear` | Clear the relay you set. |
 | `--local` | Only this computer, not the team (founder and admins set the team's by default). |
 
+### update
+
+When you use it: to move to the latest release (or a chosen one) without the install line.
+
+```
+lightbulb update [OPTIONS]
+```
+
+`--help`: Install the latest release (or `--version`) over this one, then run its `setup`
+
+Downloads the release, checks its checksum, replaces the installed binary and runs the new
+one's `setup`, so the hooks, the tool server and the background service move with it. Already
+on that version: it says so and changes nothing. Versions before 0.2.2 cannot be installed.
+Homebrew and npm users upgrade with their package manager instead (see troubleshooting if the
+version does not change afterwards).
+
+| Option | Meaning |
+|---|---|
+| `--version <VERSION>` | The release to install, like `v0.2.2` (default: the latest). |
+
 ### version
 
 ```
