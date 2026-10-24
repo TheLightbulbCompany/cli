@@ -313,7 +313,10 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
         "mark_read" => match body["key"].as_str() {
             Some(key) => {
                 match mail::mark_read_for(&daemon.store.lock().unwrap(), &Key(key.into()), now()) {
-                    Ok(()) => Response::ok(id, json!({})),
+                    Ok(()) => {
+                        daemon.peers.outbox.notify_one();
+                        Response::ok(id, json!({}))
+                    }
                     Err(_) => Response::err(id, INTERNAL),
                 }
             }
@@ -518,7 +521,11 @@ fn register(id: u64, body: &Value, daemon: &Daemon) -> Response {
     };
     // Every hook event registers: mail delivered before it has been seen.
     match put_row(daemon, &store, &row).and_then(|()| mail::mark_read_for(&store, &key, now())) {
-        Ok(()) => Response::ok(id, json!({ "key": key })),
+        Ok(()) => {
+            // A `read` owed to a sender goes now (`Net::flush_loop`).
+            daemon.peers.outbox.notify_one();
+            Response::ok(id, json!({ "key": key }))
+        }
         Err(_) => Response::err(id, INTERNAL),
     }
 }
@@ -899,6 +906,8 @@ async fn inbox(
         match taken {
             Err(_) => return Response::err(id, INTERNAL),
             Ok(m) if !m.is_empty() => {
+                // Their `delivered` goes to the senders now (`Net::flush_loop`).
+                daemon.peers.outbox.notify_one();
                 let messages = records(daemon, &m);
                 return Response::ok(id, json!({ "messages": messages }));
             }

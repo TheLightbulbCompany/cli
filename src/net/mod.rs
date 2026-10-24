@@ -144,7 +144,8 @@ pub struct Peers {
     pub changed: Notify,
     /// Woken (`notify_waiters`) whenever a member says `hello` in our protocol.
     pub connected: Notify,
-    /// Poked when mail joins the outbox.
+    /// Poked when mail joins the outbox, or a receipt owed to a sender moves (a take, a read):
+    /// the flush loop sends it now.
     pub outbox: Notify,
     /// Woken (`notify_waiters`) whenever a member's connection ends.
     pub disconnected: Notify,
@@ -691,11 +692,9 @@ impl Net {
     }
 
     /// Sends what members are owed: on each `hello` every queued envelope of an online member,
-    /// and every second the envelopes due (`outbox::due`'s per-row backoff) and the receipts
-    /// waiting; every 60 s (or the outbox knob, if shorter) expires what waited too long, here
+    /// and on every `peers.outbox` poke (or each second) the envelopes due (`outbox::due`'s
+    /// per-row backoff) and the receipts waiting; every 60 s (or the outbox knob, if shorter) expires what waited too long, here
     /// and in the outbox, and lapses sign-in proofs (`proof::tick`).
-    // ponytail: a 1 s poll (two small queries) picks up receipts that mail state changes queue;
-    // wake it from `mail` if that ever shows.
     async fn flush_loop(self) {
         let d = &self.0.daemon;
         let every = Duration::from_secs(d.peers.knobs().outbox_s.clamp(1, 60));

@@ -210,7 +210,8 @@ pub async fn deliver(daemon: Arc<Daemon>, to: Key) {
         }
         daemon.push_failed.lock().unwrap().remove(&to.0);
         match mail::take_one(&daemon.store.lock().unwrap(), &to, &m.id, ipc::now()) {
-            Ok(Some(_)) => {}
+            // Its `delivered` goes to the sender now, not on the flush loop's next tick.
+            Ok(Some(_)) => daemon.peers.outbox.notify_one(),
             Ok(None) => return,
             Err(e) => {
                 eprintln!("push to {}: {e}", to.0);

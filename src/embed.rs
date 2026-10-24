@@ -259,6 +259,7 @@ pub(crate) fn take_read(d: &Daemon, key: &Key) -> Result<Vec<Value>> {
         m.iter().try_for_each(|m| mail::mark_read(&store, &m.id))?;
         m
     };
+    d.peers.outbox.notify_one();
     Ok(ipc::records(d, &taken)
         .iter()
         .map(ipc::inbox_record)
