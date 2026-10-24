@@ -225,7 +225,7 @@ async fn always_on_a_computer_sender_is_bad_request() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn approve_from_agent_shell_is_refused() {
+async fn an_agent_shell_may_answer_a_hold_and_nothing_else() {
     // A's daemon takes this test process for an agent; `person` stays a person.
     let me = std::process::id();
     let birth = lightbulb::os::process(me).unwrap().birth_micros;
@@ -244,7 +244,6 @@ async fn approve_from_agent_shell_is_refused() {
     let h = one_hold(&a);
     for op in [
         json!({"id": 1, "op": "holds"}),
-        json!({"id": 1, "op": "hold.answer", "hold": h, "verdict": "allow"}),
         json!({"id": 1, "op": "hold.get", "hold": h}),
         json!({"id": 1, "op": "policy.set", "agents_send_without_asking": true}),
     ] {
@@ -256,7 +255,17 @@ async fn approve_from_agent_shell_is_refused() {
         );
     }
     assert_eq!(held(&a).len(), 1, "still open");
-    assert_eq!(answer(&a, &h, "allow", None)["ok"], true, "a person may");
+    // It may answer, and the answer says which session did.
+    register(&a, "claude", "c1", "/tmp/app");
+    let mut events = Events::on(&a);
+    let r = a.ask(json!({"id": 1, "op": "hold.answer", "hold": h, "verdict": "allow"}));
+    assert_eq!(r["ok"], true, "{r}");
+    let by = events.next("hold_closed")["by"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(by, format!("{}/claude-1", a.short()));
+    assert!(held(&a).is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

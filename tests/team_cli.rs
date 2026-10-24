@@ -151,7 +151,6 @@ fn remove_and_leave_from_an_agent_shell_are_refused() {
     for req in [
         json!({"op": "team.remove", "member": "aden"}),
         json!({"op": "team.leave"}),
-        json!({"op": "team.invite", "mode": "open"}),
     ] {
         let mut req = req;
         req["id"] = 1.into();
@@ -163,6 +162,17 @@ fn remove_and_leave_from_an_agent_shell_are_refused() {
         );
     }
     assert_eq!(e.entries(), before);
+}
+
+#[test]
+fn an_agent_shell_may_invite_in_every_mode() {
+    let e = Env::pinned();
+    e.seed(false);
+    assert!(e.run(&["team"]).status.success());
+    for mode in ["reusable", "once", "open"] {
+        let r = e.ask(json!({"id": 1, "op": "team.invite", "mode": mode}));
+        assert_eq!(r["ok"], true, "{mode}: {r}");
+    }
 }
 
 #[test]

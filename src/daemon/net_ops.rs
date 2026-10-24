@@ -56,10 +56,9 @@ struct Gate {
     member: bool,
 }
 
-fn gate(op: &str, invite: Invite) -> Gate {
+fn gate(op: &str) -> Gate {
     Gate {
-        person_only: matches!(op, "team.remove" | "team.admit")
-            || (op == "team.invite" && invite == Invite::Open),
+        person_only: op == "team.remove",
         member: matches!(op, "team.remove" | "team.invite"),
     }
 }
@@ -82,13 +81,17 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, caller: Caller) 
         if op == "team.invite" && (invite == Invite::Person) != (caller == Caller::Instance) {
             return Response::err(id, UNSUPPORTED);
         }
-        let gate = gate(op, invite);
+        let gate = gate(op);
         // Governance and open links need a person at the socket, before any authority check.
         if gate.person_only && !caller.is_person() {
             return refused(id, "not_a_person");
         }
         match op {
-            "team.admit" => return crate::admission::admit_op(id, body, daemon),
+            "team.admit" if caller == Caller::Instance => return refused(id, "not_a_person"),
+            "team.admit" => {
+                let by = (!caller.is_person()).then(|| caller.session(daemon));
+                return crate::admission::admit_op(id, body, daemon, by);
+            }
             "team.join_requests" => return crate::admission::requests_op(id, daemon),
             _ => {}
         }
@@ -791,6 +794,20 @@ pub async fn cloud_sessions_set(id: u64, body: &Value, daemon: &Daemon) -> Respo
 /// `peer_pid` up to pid 1 is an agent. Fails closed: a lookup that fails is no person.
 /// In debug builds, the process `CALLER_ENV` names counts as an agent.
 // ponytail: same-uid ceiling as `caller::walked_to_a_person` (a detached agent passes).
+/// The session of the agent above `peer_pid`, as `<member>/<handle>`.
+pub fn agent_session(d: &Daemon, peer_pid: u32) -> Option<String> {
+    let (agent, _) = caller::ancestors_from(peer_pid)
+        .filter_map(Result::ok)
+        .find(|(_, is_agent)| *is_agent)?;
+    let rows = d.store.lock().unwrap().sessions().ok()?;
+    let s = rows.into_iter().find(|s| {
+        s.pid == Some(agent.pid.into()) && s.birth_micros == i64::try_from(agent.birth_micros).ok()
+    })?;
+    Some(s.handle.map_or(s.key.clone(), |h| {
+        format!("{}/{h}", s.key.split('/').next().unwrap_or_default())
+    }))
+}
+
 pub fn person_only(peer_pid: u32) -> bool {
     no_agent(caller::ancestors_from(peer_pid))
 }

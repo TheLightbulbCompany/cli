@@ -215,6 +215,9 @@ pub fn receipt_note(r: &Value, person: Option<&ForPerson>) -> Option<String> {
             )
         }
         "queued" => format!("Not delivered yet.{check}"),
+        "stored" if at("reason").starts_with("approved by ") => {
+            format!("Sent. {}.{check}", shown("reason").replacen('a', "A", 1))
+        }
         "stored" if remote => match mailbox {
             Some(n) => format!(
                 "Sent. Stored on {computer} in the \"{}\" mailbox.{check}",
@@ -1839,6 +1842,10 @@ mod tests {
         assert_eq!(
             note(serde_json::json!({"state": "expired", "reason": "not_allowed"})),
             "Nobody answered the Allow for 7 days; the message expired."
+        );
+        assert_eq!(
+            note(serde_json::json!({"state": "stored", "reason": "approved by m/claude-1"})),
+            "Sent. Approved by m/claude-1."
         );
     }
 }

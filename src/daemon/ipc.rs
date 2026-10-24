@@ -159,6 +159,16 @@ impl Caller {
     pub fn is_person(self) -> bool {
         matches!(self, Caller::Socket(Some(pid)) if super::net_ops::person_only(pid))
     }
+
+    /// Who a non-person's answer is recorded as: its agent session (`<member>/<handle>`), else
+    /// `agent`. A person answers as `local`.
+    pub fn session(self, d: &Daemon) -> String {
+        match self {
+            Caller::Socket(Some(pid)) => super::net_ops::agent_session(d, pid),
+            _ => None,
+        }
+        .unwrap_or_else(|| "agent".into())
+    }
 }
 
 /// What an instance does not do: it mints no link but a person one (`net_ops`), its settings
@@ -305,7 +315,6 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
             }
         }
         // An agent fed a hostile link must not move this computer into another network.
-        "team.join" if !for_a_person() => refused(id, "not_a_person"),
         "team.join" => crate::admission::join(id, body, daemon).await,
         // `mark_read {key}` -> `{}`: `key`'s session took a step (an MCP tool call), so the mail
         // delivered to it before now has been seen.

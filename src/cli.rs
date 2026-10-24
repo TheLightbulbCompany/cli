@@ -516,10 +516,6 @@ fn refuse(r: &Value, texts: &[(&str, String)]) -> Result<i32> {
 
 /// `invite [--new|--once|--open]`: this computer's invite line.
 pub fn invite(mode: Invite) -> Result<i32> {
-    if mode == Invite::Open && session_identity() {
-        eprintln!("invite --open is for people at a terminal");
-        return Ok(1);
-    }
     let r = connect()?.call("team.invite", json!({ "mode": mode }))?;
     if r["ok"] != true {
         return refuse(&r, &[]);
@@ -663,8 +659,11 @@ pub fn answer(request: &str, allow: bool, always: bool) -> Result<i32> {
         return Ok(0);
     }
     let name = r["name"].as_str().unwrap_or_default();
+    let by = r["by"]
+        .as_str()
+        .map(|b| format!(" (approved by {})", cell(b)));
     match r["state"].as_str() {
-        Some("admitted") => println!("{name} joined the network."),
+        Some("admitted") => println!("{name} joined the network{}.", by.unwrap_or_default()),
         Some("declined") => println!("Declined {name}."),
         _ => {
             eprintln!(

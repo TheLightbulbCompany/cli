@@ -802,8 +802,8 @@ pub fn requests_op(id: u64, d: &Daemon) -> Response {
 }
 
 /// `team.admit {request: "J<n>", verdict: "allow"|"decline"}` -> `{name, state, reason?}`
-/// (person-only); `not_open` once it was answered or its candidate gave up.
-pub fn admit_op(id: u64, body: &Value, d: &Daemon) -> Response {
+/// (`by`: the agent session that answered, if one did); `not_open` once it was answered or its candidate gave up.
+pub fn admit_op(id: u64, body: &Value, d: &Daemon, by: Option<String>) -> Response {
     let allow = match body["verdict"].as_str() {
         Some("allow") => true,
         Some("decline") => false,
@@ -816,10 +816,15 @@ pub fn admit_op(id: u64, body: &Value, d: &Daemon) -> Response {
         return Response::err(id, BAD_REQUEST);
     };
     match answer(d, n, allow, "cli") {
-        Some((name, v)) => Response::ok(
-            id,
-            json!({"name": name, "state": words(v).1, "reason": v.err()}),
-        ),
+        Some((name, v)) => {
+            if let Some(by) = &by {
+                eprintln!("join: J{n} answered by {by}");
+            }
+            Response::ok(
+                id,
+                json!({"name": name, "state": words(v).1, "reason": v.err(), "by": by}),
+            )
+        }
         None => match d.store.lock().unwrap().join_exists(n) {
             Ok(true) => {
                 let by = d.answered_by.lock().unwrap().get(&format!("J{n}")).copied();

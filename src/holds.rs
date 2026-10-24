@@ -367,7 +367,17 @@ pub fn answer(
         let (f, rid, at) = (&m.from_key, &m.request_id, now as u64);
         if allow {
             store.put_mailbox(&m.to_key, &m.id, now, mail::expires_for(&m.to_key, now))?;
-            mail::advance(store.conn(), f, rid, State::Stored, None, None, at)?;
+            // Past a person at the terminal, say who allowed it (`receipt_note`).
+            let said = by.contains('/').then(|| format!("approved by {by}"));
+            mail::advance(
+                store.conn(),
+                f,
+                rid,
+                State::Stored,
+                said.as_deref(),
+                None,
+                at,
+            )?;
             if let (Some(f), false) = (from, scope == Scope::Once) {
                 policy::set(store, roster, &me.key, f, Verdict::Accept, by, now)?;
             }
@@ -551,10 +561,15 @@ const HOLD_NOT_FOUND: &str = "hold_not_found";
 /// `hold.answer`, the last with `decided_by`, the person who answered.
 pub fn op(id: u64, op: &str, body: &Value, d: &Arc<Daemon>, caller: Caller) -> Response {
     let instance = caller == Caller::Instance && matches!(op, "holds" | "hold.get" | "hold.answer");
+    // An agent may answer a hold (the answer records its session); nothing else here.
+    let mut agent = None;
     if op != "policy.get" && !instance && !caller.is_person() {
-        return refused(id, "not_a_person");
+        if op != "hold.answer" {
+            return refused(id, "not_a_person");
+        }
+        agent = Some(caller.session(d));
     }
-    match run(id, op, body, d, instance) {
+    match run(id, op, body, d, instance, agent.as_deref()) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("{op}: {e}");
@@ -563,7 +578,14 @@ pub fn op(id: u64, op: &str, body: &Value, d: &Arc<Daemon>, caller: Caller) -> R
     }
 }
 
-fn run(id: u64, op: &str, body: &Value, d: &Arc<Daemon>, instance: bool) -> Result<Response> {
+fn run(
+    id: u64,
+    op: &str,
+    body: &Value,
+    d: &Arc<Daemon>,
+    instance: bool,
+    agent: Option<&str>,
+) -> Result<Response> {
     let me = &d.identity.key;
     let missing = if instance { HOLD_NOT_FOUND } else { NOT_FOUND };
     let hold_id = body["hold"].as_str().and_then(|s| dialog::number(s, 'H'));
@@ -610,10 +632,10 @@ fn run(id: u64, op: &str, body: &Value, d: &Arc<Daemon>, instance: bool) -> Resu
         }
         // `hold.answer {hold, verdict: allow|decline, scope?}` -> `{id, verdict, scope}`;
         // `scope` is a `Scope` word or `always`. On an instance also `decided_by`, recorded as
-        // the answer's `by` (a computer's is `local`).
+        // the answer's `by` (a computer's is `local`, an agent's its session).
         "hold.answer" => {
             let (by, surface) = match body["decided_by"].as_str() {
-                _ if !instance => ("local", "cli"),
+                _ if !instance => (agent.unwrap_or("local"), "cli"),
                 Some(p) if !p.is_empty() => (p, "bridge"),
                 _ => return Ok(Response::err(id, BAD_REQUEST)),
             };
