@@ -24,6 +24,48 @@ jobs:
           gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes \
             lightbulb-macos-arm64.tar.gz lightbulb-macos-arm64.tar.gz.sha256 install.sh
 
+  # Static musl builds, uploaded to the release the macOS job creates (`--clobber` makes a
+  # rerun safe). Homebrew and npm stay macOS-only for now.
+  linux-arm64:
+    needs: macos-arm64
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get install -y musl-tools
+      - run: rustup target add aarch64-unknown-linux-musl
+      - run: cargo build --release --target aarch64-unknown-linux-musl
+      - name: Package
+        run: |
+          tar -czf lightbulb-linux-arm64.tar.gz -C target/aarch64-unknown-linux-musl/release lightbulb
+          sha256sum lightbulb-linux-arm64.tar.gz > lightbulb-linux-arm64.tar.gz.sha256
+      - name: Upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$GITHUB_REF_NAME" --clobber \
+            lightbulb-linux-arm64.tar.gz lightbulb-linux-arm64.tar.gz.sha256
+
+  linux-x86_64:
+    needs: macos-arm64
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get install -y musl-tools
+      - run: rustup target add x86_64-unknown-linux-musl
+      - run: cargo build --release --target x86_64-unknown-linux-musl
+      - name: Package
+        run: |
+          tar -czf lightbulb-linux-x86_64.tar.gz -C target/x86_64-unknown-linux-musl/release lightbulb
+          sha256sum lightbulb-linux-x86_64.tar.gz > lightbulb-linux-x86_64.tar.gz.sha256
+      - name: Upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$GITHUB_REF_NAME" --clobber \
+            lightbulb-linux-x86_64.tar.gz lightbulb-linux-x86_64.tar.gz.sha256
+
   # npm and Homebrew follow the release. npm publishes through trusted publishing (OIDC: the
   # package on npmjs.com trusts this repository's release.yml), so there is no npm token.
   # The brew job skips (green, with a log line) when its secret is not set.

@@ -4,7 +4,7 @@ Your coding agents, talking to each other and to the agents of people you invite
 
 ## Install
 
-Apple-silicon Mac, macOS 13 or newer:
+Apple-silicon Mac, macOS 13 or newer, or Linux (arm64, x86_64):
 
 ```sh
 curl -fsSL https://github.com/TheLightbulbCompany/cli/releases/latest/download/install.sh | sh
@@ -14,6 +14,7 @@ It downloads the latest release, checks its checksum, installs `~/.lightbulb/con
 wires Claude Code, Codex, Cursor and Grok CLI (hooks and a tool server), and starts the background service.
 Run the same line again to upgrade. Builds are not yet signed with a Developer ID: a `curl` download is not
 quarantined by Gatekeeper, a browser download would be. `lightbulb setup --remove` takes everything out.
+On Linux the same line installs a static binary and sets up the agents but no background service: start it with `lightbulb daemon` (or as a systemd `--user` service), and answer holds with `lightbulb approve`/`decline`. Homebrew and npm are macOS-only for now.
 
 `lightbulb update` keeps you current. To pin or roll back to a release:
 `curl -fsSL https://github.com/TheLightbulbCompany/cli/releases/latest/download/install.sh | LIGHTBULB_VERSION=v0.2.2 sh`.

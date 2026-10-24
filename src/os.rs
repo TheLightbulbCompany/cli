@@ -50,7 +50,7 @@ fn short_name(host: &str) -> String {
 }
 
 /// Whether `peer_pid` works here (Claude pushes need it).
-pub const PEER_PID: bool = cfg!(target_os = "macos");
+pub const PEER_PID: bool = cfg!(any(target_os = "macos", target_os = "linux"));
 
 /// The pid of the process at the other end of a connected Unix socket.
 pub fn peer_pid(fd: std::os::fd::RawFd) -> Result<u32> {
@@ -140,27 +140,132 @@ mod imp {
     }
 }
 
-// ponytail: Linux (/proc/<pid>/stat + btime) is not written; the crate builds, lookups fail.
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+mod imp {
+    use super::Info;
+    use crate::Result;
+    use std::mem::size_of;
+    use std::path::PathBuf;
+
+    /// From `/proc/<pid>/stat` (readable for any uid's process): the ppid, and the start
+    /// time in clock ticks since boot, placed on the epoch by `/proc/stat`'s `btime`.
+    pub fn info(pid: u32) -> Result<Info> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .map_err(|_| format!("no process {pid}"))?;
+        // `pid (comm) state ppid …`: comm may hold spaces and parentheses, so fields count
+        // from the last `)`; ppid is field 4 and starttime field 22.
+        let rest = stat.rsplit_once(')').ok_or("bad /proc stat")?.1;
+        let fields: Vec<&str> = rest.split_whitespace().collect();
+        let num = |i: usize| -> Result<u64> {
+            Ok(fields.get(i).ok_or("bad /proc stat")?.parse::<u64>()?)
+        };
+        let (ppid, ticks) = (num(1)? as u32, num(19)?);
+        Ok(Info {
+            ppid,
+            birth_micros: boot_micros().map_or(0, |b| b + ticks * 1_000_000 / clock_ticks()),
+        })
+    }
+
+    fn clock_ticks() -> u64 {
+        // SAFETY: sysconf takes no pointers.
+        match unsafe { libc::sysconf(libc::_SC_CLK_TCK) } {
+            n if n > 0 => n as u64,
+            _ => 100,
+        }
+    }
+
+    /// Boot time, microseconds since the epoch (`btime`, whole seconds).
+    fn boot_micros() -> Option<u64> {
+        let stat = std::fs::read_to_string("/proc/stat").ok()?;
+        let line = stat.lines().find(|l| l.starts_with("btime "))?;
+        Some(line[6..].trim().parse::<u64>().ok()? * 1_000_000)
+    }
+
+    /// `/proc/<pid>/exe`, less the ` (deleted)` Linux adds once the binary was replaced (an
+    /// agent updated mid-session is still that agent). Another uid's process (pid 1, root
+    /// `sshd`/`login`, WSL's `/init`) refuses that link; then its name from `comm`: an agent
+    /// never runs as another uid. A same-uid process that refuses it (it made itself
+    /// non-dumpable) is an error, so a walk through it fails closed.
+    pub fn executable(pid: u32) -> Result<PathBuf> {
+        match std::fs::read_link(format!("/proc/{pid}/exe")) {
+            Ok(p) => Ok(undeleted(p)),
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && other_uid(pid) => {
+                let comm = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                    .map_err(|_| format!("no executable path for {pid}"))?;
+                Ok(PathBuf::from(comm.trim_end_matches('\n')))
+            }
+            Err(_) => Err(format!("no executable path for {pid}").into()),
+        }
+    }
+
+    fn undeleted(p: PathBuf) -> PathBuf {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let b = p.as_os_str().as_bytes();
+        match b.strip_suffix(b" (deleted)") {
+            Some(b) => std::ffi::OsString::from_vec(b.to_vec()).into(),
+            None => p,
+        }
+    }
+
+    /// Whether `/proc/<pid>/status` names a uid (real, effective, saved or fs) not ours;
+    /// false when it cannot be read.
+    fn other_uid(pid: u32) -> bool {
+        // SAFETY: getuid takes no arguments and cannot fail.
+        let me = unsafe { libc::getuid() }.to_string();
+        std::fs::read_to_string(format!("/proc/{pid}/status"))
+            .ok()
+            .and_then(|s| {
+                let line = s.lines().find(|l| l.starts_with("Uid:"))?;
+                Some(line[4..].split_whitespace().any(|u| u != me))
+            })
+            .unwrap_or(false)
+    }
+
+    pub fn peer_pid(fd: std::os::fd::RawFd) -> Result<u32> {
+        let mut cred = libc::ucred {
+            pid: 0,
+            uid: 0,
+            gid: 0,
+        };
+        let mut len = size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: `cred` is `len` bytes and getsockopt writes at most that.
+        if unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&mut cred as *mut libc::ucred).cast(),
+                &mut len,
+            )
+        } != 0
+            || cred.pid <= 0
+        {
+            return Err("no peer pid".into());
+        }
+        Ok(cred.pid as u32)
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 mod imp {
     use super::Info;
     use crate::Result;
     use std::path::PathBuf;
 
     pub fn info(_pid: u32) -> Result<Info> {
-        Err("process lookup is only implemented on macOS".into())
+        Err("process lookup is only implemented on macOS and Linux".into())
     }
 
     pub fn executable(_pid: u32) -> Result<PathBuf> {
-        Err("process lookup is only implemented on macOS".into())
+        Err("process lookup is only implemented on macOS and Linux".into())
     }
 
     pub fn peer_pid(_fd: std::os::fd::RawFd) -> Result<u32> {
-        Err("process lookup is only implemented on macOS".into())
+        Err("process lookup is only implemented on macOS and Linux".into())
     }
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod tests {
     use super::*;
 
@@ -186,11 +291,60 @@ mod tests {
             std::os::unix::process::parent_id()
         );
         assert!(process(999_999).is_err());
-        // Root-owned launchd: lookups work across uids.
+        // Root-owned pid 1 (launchd, systemd): lookups work across uids.
         assert_eq!(imp::info(1).unwrap().ppid, 0);
+        #[cfg(target_os = "macos")]
         assert_eq!(
             process(1).unwrap().executable,
             PathBuf::from("/sbin/launchd")
         );
+        #[cfg(target_os = "linux")]
+        {
+            let init = process(1).unwrap().executable;
+            assert!(!init.as_os_str().is_empty());
+            // Not root: `/proc/1/exe` is refused and the name comes from `comm`.
+            // SAFETY: getuid takes no arguments and cannot fail.
+            if unsafe { libc::getuid() } != 0 {
+                assert!(
+                    ["systemd", "init"].contains(&init.to_str().unwrap()),
+                    "{init:?}"
+                );
+            }
+        }
+    }
+
+    /// An agent whose binary is replaced mid-session keeps its path (Linux says
+    /// `<path> (deleted)`).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_replaced_binary_keeps_its_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let codex = dir.path().join("codex");
+        // `cp`, not `fs::copy`: a write fd held here races a parallel test's fork (ETXTBSY).
+        let cp = std::process::Command::new("cp")
+            .arg("/bin/sleep")
+            .arg(&codex)
+            .status();
+        assert!(cp.unwrap().success());
+        let mut child = std::process::Command::new(&codex)
+            .arg("30")
+            .spawn()
+            .unwrap();
+        // Until the child's exec lands, its exe is still this test binary.
+        let me = std::env::current_exe().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while process(child.id()).unwrap().executable == me {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the child never exec'd"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        std::fs::remove_file(&codex).unwrap();
+        let exe = process(child.id()).unwrap().executable;
+        assert_eq!(exe, codex);
+        assert_eq!(crate::agents::caller::classify(&exe), Some("codex"));
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 }

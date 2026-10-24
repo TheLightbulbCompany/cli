@@ -16,6 +16,8 @@ use std::process::Command;
 use std::time::Duration;
 
 pub const LABEL: &str = "company.thelightbulb.connect";
+/// What `daemon --install/--uninstall` says off macOS (launchd is the only service it writes).
+const NO_SERVICE: &str = "Lightbulb's background service is macOS-only; run lightbulb daemon.";
 /// Set to skip every `launchctl` call (tests).
 const NO_LAUNCHCTL: &str = "LIGHTBULB_CONNECT_NO_LAUNCHCTL";
 /// Names a session the invocation speaks as (nothing sets it yet).
@@ -1130,7 +1132,19 @@ pub fn install_alias(home: &Path, exe: &Path) -> Result<String> {
 /// The release this binary is: `Cargo.toml`'s version.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const RELEASES: &str = "https://github.com/TheLightbulbCompany/cli/releases";
-const ASSET: &str = "lightbulb-macos-arm64.tar.gz";
+/// This build's release asset (`install.sh` picks the same one).
+pub const ASSET: &str = if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+    "lightbulb-linux-arm64.tar.gz"
+} else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+    "lightbulb-linux-x86_64.tar.gz"
+} else {
+    "lightbulb-macos-arm64.tar.gz"
+};
+#[cfg(all(
+    target_os = "linux",
+    not(any(target_arch = "aarch64", target_arch = "x86_64"))
+))]
+compile_error!("no release asset for this Linux architecture (arm64 and x86_64 only)");
 /// The oldest release `update` can install: earlier ones shipped a differently named binary.
 const FIRST_UPDATABLE: (u64, u64, u64) = (0, 2, 2);
 /// "(tests)" A release folder (`file://…`) used in place of GitHub: it holds the asset, its
@@ -1324,8 +1338,8 @@ pub fn install_running(home: &Path) -> Result<()> {
 /// `daemon --install`: the canonical binary and alias, then the launchd job running it.
 pub fn daemon_install() -> Result<i32> {
     if !cfg!(target_os = "macos") {
-        eprintln!("not supported yet");
-        return Ok(1);
+        eprintln!("{NO_SERVICE}");
+        return Ok(2);
     }
     let home = home()?;
     install_running(&home)?;
@@ -1405,8 +1419,8 @@ pub fn install_job(home: &Path, exe: &Path) -> Result<i32> {
 
 pub fn daemon_uninstall() -> Result<i32> {
     if !cfg!(target_os = "macos") {
-        eprintln!("not supported yet");
-        return Ok(1);
+        eprintln!("{NO_SERVICE}");
+        return Ok(2);
     }
     let path = plist_path(&home()?);
     if use_launchctl() {
@@ -1472,7 +1486,7 @@ pub fn doctor() -> Result<i32> {
         };
         row("Relay", true, &state, "", "");
     }
-    if up && call("status").is_some_and(|r| r["lan"] == "blocked") {
+    if cfg!(target_os = "macos") && up && call("status").is_some_and(|r| r["lan"] == "blocked") {
         let fix = "Allow lightbulb in System Settings > Privacy & Security > Local Network";
         row("Local network", false, "", "blocked by macOS", fix);
     }

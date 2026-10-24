@@ -6,7 +6,11 @@
    - `macos-arm64` builds on Apple silicon and creates the GitHub release with
      `lightbulb-macos-arm64.tar.gz` (it holds one binary, `lightbulb`), its `.sha256` and
      `install.sh`. The curl installer
-     always takes the latest release, so it is live as soon as this job ends.
+     always takes the latest release, so it is live on macOS as soon as this job ends.
+   - `linux-arm64` and `linux-x86_64` then build static musl binaries and upload
+     `lightbulb-linux-arm64.tar.gz` and `lightbulb-linux-x86_64.tar.gz` (each with a `.sha256`) to
+     that release; `install.sh` picks the asset by `uname`. Until both jobs end, a Linux install of
+     `latest` fails with a 404 (curl names the missing asset). npm and Homebrew stay macOS-only.
    - `publish-npm` sets `npm/package.json` (package `lightbulb-cli`) to the tag's version and runs
      `npm publish --provenance --access public` through npm trusted publishing (the package on
      npmjs.com trusts this repository's `release.yml` over OIDC); no npm token exists.
