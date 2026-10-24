@@ -284,7 +284,16 @@ async fn a_workspace_joins_without_a_proof() {
     let a = computer_a();
     let home = tempfile::tempdir().unwrap();
     let i = start(home.path(), &[&a], None).await;
+    // A reusable link does not take it: a workspace with no proof joins through a once link.
     let t = a.ask(json!({"id": 1, "op": "team.invite"}));
+    let r = ok(
+        &i,
+        "team.join",
+        json!({"ticket": t["ticket"], "name": NAME, "kind": "cloud"}),
+    )
+    .await;
+    assert_eq!(r["state"], "refused", "{r}");
+    let t = a.ask(json!({"id": 1, "op": "team.invite", "mode": "once"}));
     let r = ok(
         &i,
         "team.join",

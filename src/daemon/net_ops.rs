@@ -764,17 +764,17 @@ pub(crate) fn remotes(short: &str, list: &[Value]) -> Option<Vec<crate::net::fra
     Some(out)
 }
 
-/// A sessions list's `members` (person ids): `None` when absent (no gate); anything but a list
-/// of strings gates everyone out, never no one.
-pub(crate) fn members_of(v: &Value) -> Option<HashSet<String>> {
+/// A present `members` value (person ids): `null` is no gate, a list of strings is the gate;
+/// anything else (a non-list, or a list with a non-string) is `Err`.
+pub(crate) fn members_of(v: &Value) -> Result<Option<HashSet<String>>, ()> {
     match v {
-        Value::Null => None,
-        Value::Array(l) => Some(
-            l.iter()
-                .filter_map(|p| p.as_str().map(String::from))
-                .collect(),
-        ),
-        _ => Some(HashSet::new()),
+        Value::Null => Ok(None),
+        Value::Array(l) => l
+            .iter()
+            .map(|p| p.as_str().map(String::from).ok_or(()))
+            .collect::<Result<_, _>>()
+            .map(Some),
+        _ => Err(()),
     }
 }
 
@@ -784,7 +784,8 @@ pub(crate) fn members_of(v: &Value) -> Option<HashSet<String>> {
 /// the presence sender (`presence::run`) has handed on the presence carrying them, so a `send`
 /// from a name just declared is never refused as unadvertised by a peer the envelope reaches
 /// first; `internal` if that takes over 5 s (the list stands, and goes out on the next send).
-/// `members` replaces the sessions' member gate (`mail::receive`); absent, there is none.
+/// `members` replaces the sessions' member gate (`mail::receive`): a list sets it, `null`
+/// removes it, absent keeps it; anything else is `bad_request`, before anything changes.
 pub async fn cloud_sessions_set(id: u64, body: &Value, daemon: &Daemon) -> Response {
     let Some(cloud) = &daemon.cloud else {
         return Response::err(id, UNSUPPORTED);
@@ -795,8 +796,15 @@ pub async fn cloud_sessions_set(id: u64, body: &Value, daemon: &Daemon) -> Respo
     else {
         return Response::err(id, BAD_REQUEST);
     };
+    let members = match body.get("members") {
+        None => cloud.declared().members.map(|m| (*m).clone()),
+        Some(v) => match members_of(v) {
+            Ok(m) => m,
+            Err(()) => return Response::err(id, BAD_REQUEST),
+        },
+    };
     let mut sent = cloud.sent.subscribe();
-    let version = cloud.set(out, members_of(&body["members"]));
+    let version = cloud.set(out, members);
     daemon.presence.notify_one();
     let handed = sent.wait_for(|v| *v >= version);
     let handed = matches!(

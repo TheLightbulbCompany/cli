@@ -387,11 +387,42 @@ async fn hold_expires_after_7_days() {
     assert!(holds::expire(&s, seven - 1).unwrap().is_empty());
     assert_eq!(ids(holds::expire(&s, seven).unwrap()), [h.id]);
     assert_eq!(receipt(&s, &aden).state, State::Expired);
-    let r = holds::answer(&s, &roster, &me, h.id, true, None, "local", seven + 1).unwrap();
+    let r = holds::answer(&s, &roster, &me, h.id, true, None, "local", None, seven + 1).unwrap();
     assert_eq!(r.err(), Some("not_open"));
     assert!(mail::waiting(&s, &Key(to), seven as u64 + 1)
         .unwrap()
         .is_empty());
+}
+
+/// A hold filed before a workspace's member gate excludes its sender is refused at the Allow,
+/// not delivered.
+#[tokio::test]
+async fn an_allowed_hold_whose_sender_is_no_longer_a_member_is_refused() {
+    let (_d, s, roster, me, aden) = lib();
+    let to = format!("{}/codex:t", me.short);
+    s.put_session(&row(&to)).unwrap();
+    let h = held_lib(&s, &roster, &me, &aden, &to, 1_000);
+    let gate: std::collections::HashSet<String> = ["user_x".to_string()].into();
+    let r = holds::answer(
+        &s,
+        &roster,
+        &me,
+        h.id,
+        true,
+        None,
+        "local",
+        Some(&gate),
+        1_001,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(!r.allow);
+    let rec = receipt(&s, &aden);
+    assert_eq!(
+        (rec.state, rec.reason.as_deref()),
+        (State::Refused, Some("not_a_member"))
+    );
+    assert!(mail::waiting(&s, &Key(to), 1_002).unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -408,7 +439,17 @@ async fn hold_expires_24h_after_its_target_session_ends() {
         (r.state, r.reason.as_deref()),
         (State::Expired, Some("session_ended"))
     );
-    let late = holds::answer(&s, &roster, &me, h.id, true, Some("once"), "local", 100_000);
+    let late = holds::answer(
+        &s,
+        &roster,
+        &me,
+        h.id,
+        true,
+        Some("once"),
+        "local",
+        None,
+        100_000,
+    );
     assert_eq!(late.unwrap().err(), Some("not_open"));
     assert!(mail::waiting(&s, &Key(to), 100_000).unwrap().is_empty());
     // A session that never had a row here is gone from the hold's start.
@@ -680,7 +721,7 @@ async fn a_reply_to_a_held_message_leaves_it_held() {
     );
     assert_eq!(r.unwrap().state, State::Stored);
     assert_eq!(receipt(&s, &aden).state, State::Held);
-    holds::answer(&s, &roster, &me, h.id, true, None, "local", 1_002)
+    holds::answer(&s, &roster, &me, h.id, true, None, "local", None, 1_002)
         .unwrap()
         .unwrap();
     assert_eq!(receipt(&s, &aden).state, State::Stored);

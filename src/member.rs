@@ -51,6 +51,12 @@ pub async fn run(opts: MemberOpts, token: String) -> Result<()> {
             vec![]
         }
     };
+    let members = match file.get("members") {
+        None => None,
+        Some(v) => net_ops::members_of(v).map_err(|()| {
+            "the sessions file's members must be null or a list of person id strings"
+        })?,
+    };
     let relay = opts
         .relay
         .as_deref()
@@ -64,7 +70,7 @@ pub async fn run(opts: MemberOpts, token: String) -> Result<()> {
             snapshot: Some(opts.snapshot),
             name: opts.name,
             sessions,
-            members: net_ops::members_of(&file["members"]),
+            members,
         },
     )
     .await?;

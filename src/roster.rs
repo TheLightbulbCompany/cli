@@ -172,12 +172,40 @@ impl std::fmt::Debug for Wake {
     }
 }
 
+/// Whether `rest` (a URL after `https://`) names a DNS host: labels of letters, digits and
+/// hyphens, at least two, ending in an alphabetic label (so no IPv4 or other number form, and no
+/// IPv6 literal), not `localhost` or under it, with no userinfo; an optional port.
+fn wake_host(rest: &str) -> bool {
+    let auth = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let (host, port) = match auth.split_once(':') {
+        Some((h, p)) => (h, Some(p)),
+        None => (auth, None),
+    };
+    let label = |l: &str| {
+        (1..=63).contains(&l.len())
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+            && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    };
+    let labels: Vec<&str> = host.split('.').collect();
+    let tld = labels.last().copied().unwrap_or_default();
+    port.is_none_or(|p| (1..=5).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_digit()))
+        && host.len() <= 253
+        && labels.len() >= 2
+        && labels.iter().all(|l| label(l))
+        && tld.len() >= 2
+        && tld.bytes().all(|b| b.is_ascii_alphabetic())
+        && !host.eq_ignore_ascii_case("localhost")
+        && !tld.eq_ignore_ascii_case("localhost")
+}
+
 impl Wake {
-    /// A `meta` body's `wake`: an http(s) URL of printable ASCII with no space or quote, and a
-    /// token of `[A-Za-z0-9._-]` (it is written into curl's config, never a command line).
+    /// A `meta` body's `wake`: an https URL of printable ASCII with no space or quote, whose
+    /// host is a public-looking DNS name (`wake_host`), and a token of `[A-Za-z0-9._-]` (it is
+    /// written into curl's config, never a command line).
     pub fn parse(v: &Value) -> Option<Wake> {
         let (url, token) = (v["url"].as_str()?, v["token"].as_str()?);
-        let url_ok = (url.starts_with("https://") || url.starts_with("http://"))
+        let url_ok = url.strip_prefix("https://").is_some_and(wake_host)
             && url.len() <= 2048
             && url
                 .bytes()
@@ -455,6 +483,12 @@ fn pass(
                 let same_person = same.is_some_and(|p| signer.person_id == p);
                 // Any member admits directly, or through any live link.
                 let authorised = e.text("ticket_id").is_empty() || via_link() || same_person;
+                // A workspace with no proof is nobody's word but a person's Allow on a once
+                // link: a hostile member cannot mint unverified members for keys it holds.
+                let authorised = authorised
+                    && (!cloud
+                        || claims.is_some()
+                        || (via_link() && link.is_some_and(|(_, l)| l.once)));
                 let collides = r.collides(e.text("name"), &target, same).is_some();
                 let role_ok = matches!(
                     e.body.get("role").and_then(Value::as_str),
@@ -966,6 +1000,29 @@ mod tests {
     }
 
     #[test]
+    fn a_proofless_cloud_admit_needs_a_once_link() {
+        let (f, k1, k2, k3) = (id(), id(), id(), id());
+        let g = genesis(&f);
+        let cloud = |parent: &Entry, who: &Identity, ticket: &str| {
+            let mut b = admit_body(&who.key, &who.short);
+            b["kind"] = json!("cloud");
+            b["ticket_id"] = json!(ticket);
+            op(&f, parent, Kind::Admit, b)
+        };
+        // Ticketless: dropped. A reusable link: dropped. A once link: stands.
+        let a1 = cloud(&g, &k1, "");
+        let (t2, t3) = (tid(&f, "reusable"), tid(&f, "once"));
+        let l2 = link_with(&f, &a1, &t2, false);
+        let a2 = cloud(&l2, &k2, &t2);
+        let l3 = link_with(&f, &a2, &t3, true);
+        let a3 = cloud(&l3, &k3, &t3);
+        let r = replay(&[g, a1, l2, a2, l3, a3]);
+        assert!(!r.members.contains_key(&k1.key));
+        assert!(!r.members.contains_key(&k2.key));
+        assert!(r.members.contains_key(&k3.key));
+    }
+
+    #[test]
     fn one_cloud_member_per_workspace_even_on_a_fork() {
         let (f, k1, k2) = (id(), id(), id());
         let g = genesis(&f);
@@ -1207,6 +1264,22 @@ mod tests {
             ok.map(|w| w.url),
             Some("https://example.test/api/v1/network/wake".into())
         );
+        for url in [
+            "http://example.test/w",
+            "https://127.0.0.1/w",
+            "https://[::1]/w",
+            "https://localhost/w",
+            "https://a.localhost/w",
+            "https://intranet/w",
+            "https://10.0.0.1:8443/w",
+            "https://example.test@evil.test.1/w",
+            "https://user@example.test/w",
+            "https://0x7f.1/w",
+            "https://example.test:/w",
+        ] {
+            assert!(w(url, "t").is_none(), "{url}");
+        }
+        assert!(w("https://wake.example.test:8443/w?x=1", "t").is_some());
         for (url, token) in [
             ("file:///etc/passwd", "t"),
             ("https://example.test/a b", "t"),

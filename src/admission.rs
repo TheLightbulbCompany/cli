@@ -376,6 +376,10 @@ fn check(
         "cloud" => true,
         _ => return Err(UNSUPPORTED),
     };
+    // A workspace with no proof joins through a once link only (`roster`'s admit rule).
+    if cloud && req.claims.is_none() && !link.once {
+        return Err(UNSUPPORTED);
+    }
     // A `person` link is for a person's computer.
     let person_link = link.mode == "person";
     if person_link && cloud {
