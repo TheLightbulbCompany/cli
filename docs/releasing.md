@@ -8,12 +8,13 @@
      `install.sh`. The curl installer
      always takes the latest release, so it is live as soon as this job ends.
    - `publish-npm` sets `npm/package.json` (package `lightbulb-cli`) to the tag's version and runs
-     `npm publish --provenance --access public`. Needs the `NPM_TOKEN` secret.
+     `npm publish --provenance --access public` through npm trusted publishing (the package on
+     npmjs.com trusts this repository's `release.yml` over OIDC); no npm token exists.
    - `bump-brew` rewrites `url`, `sha256` and the version in the test line (`lightbulb <x.y.z>`)
      of `Formula/lightbulb.rb` in `TheLightbulbCompany/homebrew-tap`, commits `lightbulb <x.y.z>`
      and pushes. Needs the `HOMEBREW_TAP_TOKEN` secret.
-4. A job whose secret is missing passes with `NPM_TOKEN not set; skipping npm publish` or
-   `HOMEBREW_TAP_TOKEN not set; skipping brew bump` in its log. Then do it by hand:
+4. The brew job passes with `HOMEBREW_TAP_TOKEN not set; skipping brew bump` in its log when its
+   secret is missing; the npm job fails if the trusted publisher is not configured. Then do it by hand:
    - npm: `cd npm && npm version <x.y.z> --no-git-tag-version --allow-same-version && npm publish --access public`
      (from a logged-in machine; no provenance outside CI).
    - brew: in a homebrew-tap clone, set `url` to the release's tarball URL, `sha256` to the
