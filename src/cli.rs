@@ -321,21 +321,29 @@ pub fn send(
     let rid = request_id.unwrap_or_else(|| ulid::Ulid::generate().to_string());
     // (address, its handle, request id)
     let targets: Vec<(String, String, String)> = if group {
-        let sessions = ask(&mut conn, "sessions", json!({}))?["sessions"].clone();
+        // `*`: this computer's sessions; `<member>/*`: theirs as `who --all` sees them.
+        let op = if target == "*" {
+            "sessions"
+        } else {
+            "directory"
+        };
+        let sessions = ask(&mut conn, op, json!({}))?["sessions"].clone();
         let prefix = target.trim_end_matches('*');
         sessions
             .as_array()
             .into_iter()
             .flatten()
-            .filter(|s| {
-                s["key"]
-                    .as_str()
-                    .is_some_and(|k| target == "*" || k.starts_with(prefix))
+            .filter(|s| s["hidden"] != true)
+            .filter_map(|s| {
+                let key = s["key"].as_str().or(s["session_id"].as_str())?;
+                (target == "*" || key.starts_with(prefix)).then_some((key, s))
             })
             .enumerate()
-            .map(|(i, s)| {
-                let at = |f: &str| s[f].as_str().unwrap_or_default().to_string();
-                (at("key"), at("handle"), format!("{rid}.{}", i + 1))
+            .map(|(i, (key, s))| {
+                let handle = s["handle"].as_str().filter(|h| !h.is_empty());
+                let agent = || crate::frame::agent_name(s["agent"].as_str().unwrap_or_default());
+                let handle = handle.map_or_else(agent, String::from);
+                (key.to_string(), handle, format!("{rid}.{}", i + 1))
             })
             .collect()
     } else {

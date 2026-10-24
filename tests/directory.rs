@@ -482,3 +482,30 @@ fn a_session_refused_under_an_off_folder_is_not_discovered_either() {
     let mine = a.ask(json!({"id": 1, "op": "sessions"}));
     assert_eq!(listed(&mine), Value::Null, "{mine}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_group_send_reaches_a_teammates_sessions() {
+    let (a, b) = (Env::new(), Env::new());
+    seed_pair(&a, &b);
+    start_pair(&a, &b, "", &[]);
+    assert_eq!(register(&b, "claude", "b1", "/tmp/work/web")["ok"], true);
+    let kb = format!("{}/claude:b1", b.short());
+    until(10, "A sees B's session", || {
+        ids(&directory(&a, None)).contains(&kb)
+    });
+    // From A's terminal, `bob/*`: B's sessions as `who --all` sees them.
+    let run = "exit(system(@ARGV) >> 8)";
+    let argv = [
+        "/usr/bin/perl",
+        "-e",
+        run,
+        EXE,
+        "send",
+        "bob/*",
+        "to the team",
+    ];
+    let o = a.detached(&argv, "");
+    assert!(o.status.success(), "{}{}", out(&o), common::err(&o));
+    assert!(out(&o).contains("(Claude Code)"), "{}", out(&o));
+    assert_eq!(b.take_one(&kb)["text"], "to the team");
+}
