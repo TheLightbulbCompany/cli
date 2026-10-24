@@ -1169,10 +1169,18 @@ const REQUIREMENT: &str = "=anchor apple generic and certificate leaf[subject.OU
 
 /// Refuses a binary that is not validly signed by our team; the old binary is untouched.
 #[cfg(target_os = "macos")]
+fn codesign_args(bin: &Path) -> Vec<std::ffi::OsString> {
+    ["--verify", "--strict", "-R", REQUIREMENT]
+        .into_iter()
+        .map(Into::into)
+        .chain([bin.as_os_str().to_owned()])
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
 fn verify_signature(bin: &Path) -> Result<()> {
     let ok = Command::new("codesign")
-        .args(["--verify", "--strict", "-R", REQUIREMENT])
-        .arg(bin)
+        .args(codesign_args(bin))
         .output()
         .is_ok_and(|o| o.status.success());
     if ok {
@@ -1788,6 +1796,28 @@ pub fn setup(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_signature_requirement_is_pinned_to_our_team() {
+        let bin = std::path::Path::new("/x/lightbulb");
+        assert_eq!(
+            super::REQUIREMENT,
+            "=anchor apple generic and certificate leaf[subject.OU] = \"WZX4U3C22Y\""
+        );
+        let want: Vec<std::ffi::OsString> = [
+            "--verify",
+            "--strict",
+            "-R",
+            super::REQUIREMENT,
+            "/x/lightbulb",
+        ]
+        .map(Into::into)
+        .to_vec();
+        assert_eq!(super::codesign_args(bin), want);
+        // Apple-signed, but not by our team.
+        assert!(super::verify_signature(std::path::Path::new("/bin/ls")).is_err());
+    }
+
     #[test]
     fn auto_update_installs_only_a_strictly_newer_release_once() {
         use super::should_auto_update as go;
