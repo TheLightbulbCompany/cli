@@ -75,23 +75,35 @@ impl Env {
 }
 
 const LINE: &str = "lightbulb join '";
-const HEADER: &str = "Send this line to the person (or paste it on your other computer):\n";
+const HEADER: &str =
+    "If the code doesn't work, send this line (or paste it on your other computer):\n";
 
-/// What `invite` printed before its header (a notice, or nothing), and the join command
-/// after it; the app link follows on its own line, for the same ticket.
+/// What `invite` printed before the code (a notice, or nothing), and the join command at the
+/// end; the code and the page link come between, for the same invite (at most 6 lines).
 fn invite_parts(o: &std::process::Output) -> (String, String) {
     let text = out(o);
-    let (notice, rest) = text.split_once(HEADER).unwrap_or_else(|| panic!("{text}"));
+    assert!(text.lines().count() <= 6, "{text}");
+    let (before, rest) = text.split_once(HEADER).unwrap_or_else(|| panic!("{text}"));
     let lines: Vec<&str> = rest.lines().collect();
-    let [line, "Replace NAME with the name they go by.", app] = lines[..] else {
-        panic!("{text}")
-    };
+    let [line] = lines[..] else { panic!("{text}") };
     let ticket = line
         .strip_prefix(LINE)
-        .and_then(|t| t.strip_suffix("' --name NAME"))
+        .and_then(|t| t.strip_suffix('\''))
         .unwrap_or_else(|| panic!("{text}"));
-    assert_eq!(app, format!("lightbulb://join/{ticket}"), "{text}");
-    (notice.to_string(), line.to_string())
+    let mut before: Vec<&str> = before.lines().collect();
+    let link = before.pop().unwrap_or_default();
+    assert_eq!(
+        link,
+        format!("Or send this link:  https://thelightbulb.company/j#{ticket}"),
+        "{text}"
+    );
+    let code = before.pop().unwrap_or_default();
+    assert!(
+        code.starts_with("Tell them to run:  ") && code.contains(" join "),
+        "{text}"
+    );
+    let notice = before.iter().map(|l| format!("{l}\n")).collect::<String>();
+    (notice, line.to_string())
 }
 
 /// The join command `invite` printed.
@@ -120,16 +132,10 @@ fn invite_reprints_the_same_link_until_new() {
 }
 
 #[test]
-fn non_admin_remove_prints_exact_text() {
+fn a_plain_member_opens_links_and_removes_the_founder() {
     // A team founded elsewhere by aden, which admitted this computer as a plain member.
     let e = Env::new();
     e.seed(true);
-    let o = e.run(&["remove", "aden"]);
-    assert_eq!(o.status.code(), Some(1));
-    assert_eq!(
-        err(&o).trim(),
-        "Only the founder and admins can remove computers. Ask aden."
-    );
     let team = out(&e.run(&["team"]));
     assert!(
         team.starts_with("Team \"acme\" — 2 computers\n  You ("),
@@ -137,28 +143,28 @@ fn non_admin_remove_prints_exact_text() {
     );
     assert!(team.contains("  aden · "), "{team}");
     assert!(
-        team.ends_with("Invite someone: lightbulb invite\n"),
+        team.ends_with(
+            "Invite someone: lightbulb invite\nAdd an always-on AI teammate: https://thelightbulb.company\n"
+        ),
         "{team}"
     );
     assert_eq!(e.entries().len(), 2, "no genesis over a joined team");
-    // An open link is for the founder and admins.
+    // Every network is flat: any member makes an open link and removes another member.
     let r = common::person(&e, json!({"id": 1, "op": "team.invite", "mode": "open"}));
-    assert_eq!(r["error"], "not_admin", "{r}");
-    assert_eq!(e.entries().len(), 2);
+    assert_eq!(r["ok"], true, "{r}");
+    let o = e.run(&["remove", "aden"]);
+    assert!(o.status.success(), "{}", err(&o));
 }
 
 #[test]
-fn remove_admin_and_leave_from_an_agent_shell_are_refused() {
+fn remove_and_leave_from_an_agent_shell_are_refused() {
     let e = Env::pinned();
     e.seed(false);
     assert!(e.run(&["team"]).status.success()); // starts the pinned daemon
     let before = e.entries();
     for req in [
         json!({"op": "team.remove", "member": "aden"}),
-        json!({"op": "team.admin", "member": "aden", "founder": false}),
-        json!({"op": "team.admin", "member": "aden", "founder": true}),
         json!({"op": "team.leave"}),
-        json!({"op": "team.invite", "mode": "open"}),
     ] {
         let mut req = req;
         req["id"] = 1.into();
@@ -170,6 +176,17 @@ fn remove_admin_and_leave_from_an_agent_shell_are_refused() {
         );
     }
     assert_eq!(e.entries(), before);
+}
+
+#[test]
+fn an_agent_shell_may_invite_in_every_mode() {
+    let e = Env::pinned();
+    e.seed(false);
+    assert!(e.run(&["team"]).status.success());
+    for mode in ["reusable", "once", "open"] {
+        let r = e.ask(json!({"id": 1, "op": "team.invite", "mode": mode}));
+        assert_eq!(r["ok"], true, "{mode}: {r}");
+    }
 }
 
 #[test]
@@ -212,21 +229,10 @@ fn leave_locally_recreates_a_solo_network() {
 }
 
 #[test]
-fn founder_admin_remove_and_leave_texts() {
+fn remove_text() {
     // This computer founded "acme" and admitted aden.
     let e = Env::new();
     e.seed(false);
-
-    let o = e.detached(&[EXE, "leave"], "y\n");
-    assert_eq!(o.status.code(), Some(1));
-    assert_eq!(
-        err(&o).trim(),
-        "You are the founder. Name a new founder first: lightbulb admin <name> --founder"
-    );
-    assert_eq!(
-        out(&e.run(&["admin", "ADEN"])),
-        "aden can now remove members.\n"
-    );
     let old = printed_link(&e.run(&["invite"]));
     let o = out(&e.run(&["remove", "aden"]));
     let line = o
@@ -263,9 +269,6 @@ fn founder_whose_only_other_member_is_cloud_can_leave() {
         10,
     )
     .unwrap();
-    // A cloud member can be neither admin nor founder.
-    let o = e.run(&["admin", "bridge"]);
-    assert_eq!(o.status.code(), Some(1), "{}", out(&o));
     let o = e.detached(&[EXE, "leave"], "y\n");
     assert!(o.status.success(), "{}", err(&o));
     assert_eq!(e.entries().len(), 1);

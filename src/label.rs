@@ -157,6 +157,7 @@ mod tests {
             admitted_at: 0,
             proof: proof.map(|n| self::proof(n, ProofKind::Computer)),
             workspace: None,
+            by: None,
         }
     }
 

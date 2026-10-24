@@ -63,8 +63,13 @@ async fn dial(sock: &Path, token: &str, who: &Identity) -> (Peer, iroh::Endpoint
     common::dial_at(key.as_str().unwrap(), port, who).await
 }
 
-/// `p` (member `who`) sends `text` to `to`: its envelope id and the member's ack state.
-async fn send(p: &mut Peer, who: &Identity, to: &str, text: &str) -> (String, String) {
+/// `p` (member `who`) sends `text` to `to`: its envelope id and the member's ack state and reason.
+async fn send_acked(
+    p: &mut Peer,
+    who: &Identity,
+    to: &str,
+    text: &str,
+) -> (String, String, Option<String>) {
     let id = common::ulid();
     p.send(&Frame::Envelope {
         id: id.clone(),
@@ -84,9 +89,15 @@ async fn send(p: &mut Peer, who: &Identity, to: &str, text: &str) -> (String, St
         .recv_where(|f| matches!(f, Frame::Ack { id: i, .. } if *i == id))
         .await
     {
-        Frame::Ack { state, .. } => (id, state),
+        Frame::Ack { state, reason, .. } => (id, state, reason),
         _ => unreachable!(),
     }
+}
+
+/// `send_acked` without the reason.
+async fn send(p: &mut Peer, who: &Identity, to: &str, text: &str) -> (String, String) {
+    let (id, state, _) = send_acked(p, who, to, text).await;
+    (id, state)
 }
 
 /// The receipt state `p` hears next for envelope `id`.
@@ -586,41 +597,49 @@ async fn ask_and_open_links_still_refuse_on_an_instance() {
     assert_eq!(r["error"], "unsupported", "{r}");
 }
 
-/// Any member may sign a `person` link into the roster: only the member's own admits with no
-/// Allow.
+/// A computer member's `person` link is no link: only a cloud member's vouches for a person.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_teammates_person_link_still_waits_for_an_allow() {
+async fn a_teammates_person_link_is_refused() {
     use lightbulb::ticket;
     let dir = tempfile::tempdir().unwrap();
+    // The member founds its network (a `cloud` genesis); then X, admitted by it, signs its own
+    // person link into the roster.
+    let (child, token, sock) = member(dir.path(), friday());
+    ok(&sock, &token, "stop", json!({}));
+    exits_zero(child);
     let home = dir.path().join("home");
-    std::fs::create_dir_all(&home).unwrap();
     let w = Identity::load_or_create(&home).unwrap();
     let x = identity();
-    let g = lightbulb::daemon::net_ops::genesis(&w, NAME, NAME, NAME, 1);
-    let ax = common::admit(&w, &g, &x, "x", json!({}));
-    let before = roster::replay(&[g.clone(), ax.clone()]);
+    let store = Store::open(&home.join("state.db")).unwrap();
+    let entries = roster::entries(&store).unwrap();
+    let ax = common::admit(&w, &entries[0], &x, "x", json!({}));
+    let before = roster::replay(&[entries[0].clone(), ax.clone()]);
     let hints = (String::new(), vec![]);
     let (t, hashed) = ticket::mint(&x, &before, "person", true, common::now_s(), hints);
     let t = ticket::for_person(&x, t, "user_x");
     let body = ticket::link_body(&t, hashed.as_deref());
     let link = Entry::signed(&x, vec![ax.hash()], Kind::Link, body, 3);
-    let store = Store::open(&home.join("state.db")).unwrap();
-    for e in [&g, &ax, &link] {
+    for e in [&ax, &link] {
         roster::accept(&store, e, 10).unwrap();
     }
     drop(store);
     let (child, token, sock) = member(dir.path(), friday());
-    let mac = identity();
-    let (s, tok, tk) = (sock.clone(), token.clone(), t.clone());
-    let joining = tokio::spawn(async move { join(&s, &tok, &tk, &mac, None).await });
-    until(10, "the request waits for an Allow", || {
-        ok(&sock, &token, "team.join_requests", json!({}))["requests"]
+    let members = ok(&sock, &token, "team.get", json!({}))["members"].clone();
+    assert!(
+        members
             .as_array()
-            .is_some_and(|r| r.len() == 1)
-    });
+            .unwrap()
+            .iter()
+            .any(|m| m["key"] == x.key),
+        "{members}"
+    );
+    let (verdict, reason) = join(&sock, &token, &t, &identity(), None).await;
+    assert_eq!(
+        (verdict.as_str(), reason.as_deref()),
+        ("refused", Some("bad_ticket"))
+    );
     let policy = ok(&sock, &token, "policy.get", json!({}));
     assert_eq!(policy["people"], json!({}), "{policy}");
-    joining.abort();
     ok(&sock, &token, "stop", json!({}));
     exits_zero(child);
 }
@@ -643,25 +662,61 @@ async fn a_cloud_member_mints_no_person_link() {
 /// PATH that keeps its argv and stdin under `dir/curl`. Returns A (running), the member, its
 /// token and socket, and the wake token.
 fn doorbell(dir: &Path) -> (common::Env, Child, String, std::path::PathBuf, String) {
+    doorbell_of(dir, true)
+}
+
+/// `doorbell`, the member its network's founder or, not, A's cloud member (admitted with no
+/// proof): either way its own `wake` is the one A rings.
+fn doorbell_of(
+    dir: &Path,
+    founder: bool,
+) -> (common::Env, Child, String, std::path::PathBuf, String) {
     let home = dir.join("home");
     std::fs::create_dir_all(&home).unwrap();
     let w = Identity::load_or_create(&home).unwrap();
     let a = common::Env::new();
-    let g = lightbulb::daemon::net_ops::genesis(&w, NAME, NAME, NAME, 1);
-    let aa = common::admit(
-        &w,
-        &g,
-        &a.identity(),
-        "prasiddha",
-        json!({"computer": "mac"}),
-    );
+    let entries: Vec<Entry> = if founder {
+        let g = common::workspace_genesis(
+            &w,
+            &lightbulb::daemon::net_ops::genesis(&w, NAME, NAME, NAME, 1),
+        );
+        let aa = common::admit(
+            &w,
+            &g,
+            &a.identity(),
+            "prasiddha",
+            json!({"computer": "mac"}),
+        );
+        vec![g, aa]
+    } else {
+        let g = lightbulb::daemon::net_ops::genesis(&a.identity(), "prasiddha", "mac", "acme", 1);
+        // No proof: the workspace is admitted through a once link, as `team.join` does.
+        let ai = a.identity();
+        let ticket = format!("{}.t1", ai.short);
+        let link = Entry::signed(
+            &ai,
+            vec![g.hash()],
+            Kind::Link,
+            json!({"ticket_id": ticket, "secret": "s", "mode": "ask", "once": true,
+                "expires_at": 99}),
+            2,
+        );
+        let aw = common::admit(
+            &ai,
+            &link,
+            &w,
+            NAME,
+            json!({"kind": "cloud", "person_id": w.key, "computer": NAME, "ticket_id": ticket}),
+        );
+        vec![g, link, aw]
+    };
     for s in [Store::open(&home.join("state.db")).unwrap(), a.store()] {
-        for e in [&g, &aa] {
+        for e in &entries {
             roster::accept(&s, e, 10).unwrap();
         }
     }
     let wake_token = format!("org_1.{}", common::ulid());
-    let wake = json!({"url": "http://127.0.0.1:9/api/v1/network/wake", "token": wake_token});
+    let wake = json!({"url": "https://wake.example.test/api/v1/network/wake", "token": wake_token});
     let file = json!({"workspace": NAME, "sessions": friday(), "wake": wake});
     let (child, token, sock) = common::member_with(dir, file);
     let bin = dir.join("bin");
@@ -747,13 +802,34 @@ async fn a_computer_rings_the_doorbell_only_after_a_failed_dial() {
             "POST",
             "-K",
             "-",
-            "http://127.0.0.1:9/api/v1/network/wake"
+            "https://wake.example.test/api/v1/network/wake"
         ]
     );
     // Backoff: more messages due ring no second time soon.
     a.send(&common::session(&a, "c1"), &to, "still parked", "r3", None);
     tokio::time::sleep(Duration::from_secs(5)).await;
     assert_eq!(rings(dir.path()).len(), 1);
+}
+
+/// A workspace member that is not its network's founder publishes its own doorbell, and a
+/// computer rings it after a failed dial (the founder case is the test above).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_computer_rings_a_non_founder_cloud_members_doorbell() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, child, token, sock, wake) = doorbell_of(dir.path(), false);
+    // Parked: a message for its Friday is due on A, and A rings the member's own doorbell.
+    let to = format!("{}/friday", short(&sock, &token));
+    ok(&sock, &token, "stop", json!({}));
+    exits_zero(child);
+    a.send(&common::session(&a, "c1"), &to, "while parked", "r1", None);
+    let stdin = dir.path().join("curl/0.stdin");
+    common::until(90, "A rings the doorbell", || {
+        std::fs::read_to_string(&stdin).is_ok_and(|t| !t.is_empty())
+    });
+    assert_eq!(
+        std::fs::read_to_string(&stdin).unwrap(),
+        format!("header = \"Authorization: Bearer {wake}\"\n")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -796,7 +872,7 @@ async fn a_join_to_a_parked_member_rings_its_doorbell() {
     let t = ticket_of(&line);
     assert_eq!(
         t.wake.as_ref().map(|w| w.url.as_str()),
-        Some("http://127.0.0.1:9/api/v1/network/wake"),
+        Some("https://wake.example.test/api/v1/network/wake"),
         "{r}"
     );
     let key = ok(&sock, &token, "identity.get", json!({}))["member_key"].clone();
@@ -831,7 +907,7 @@ async fn a_join_to_a_parked_member_rings_its_doorbell() {
     assert_eq!(calls.len(), 1, "{calls:?}");
     assert_eq!(
         calls[0].last().map(String::as_str),
-        Some("http://127.0.0.1:9/api/v1/network/wake")
+        Some("https://wake.example.test/api/v1/network/wake")
     );
     let stdin = std::fs::read_to_string(dir.path().join("curl/0.stdin")).unwrap();
     assert_eq!(
@@ -842,4 +918,152 @@ async fn a_join_to_a_parked_member_rings_its_doorbell() {
         !text.contains(&wake),
         "the token never reaches the person's terminal"
     );
+}
+
+/// The sessions file's `members` gates who may message the member's sessions: a listed person
+/// is delivered, any other is `refused` `not_a_member` (not held, nothing in the mailbox), no
+/// field gates no one, and `cloud.sessions.set` replaces the list.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_members_list_gates_who_may_message_the_sessions() {
+    let person = |a: &Identity| format!("p-{}", a.short);
+    // Listed: delivered.
+    let dir = tempfile::tempdir().unwrap();
+    let a = seed(dir.path());
+    let file = json!({"workspace": NAME, "sessions": friday(), "members": [person(&a), "user_x"]});
+    let (child, token, sock) = common::member_with(dir.path(), file);
+    let (mut pa, _ep) = dial(&sock, &token, &a).await;
+    let to = format!("{}/friday", short(&sock, &token));
+    assert_eq!(send(&mut pa, &a, &to, "in").await.1, "stored");
+    // Reloaded without A: refused, and nothing more reaches the mailbox.
+    ok(
+        &sock,
+        &token,
+        "cloud.sessions.set",
+        json!({"sessions": friday(), "members": ["user_x"]}),
+    );
+    let (_, state, reason) = send_acked(&mut pa, &a, &to, "out").await;
+    assert_eq!(
+        (state.as_str(), reason.as_deref()),
+        ("refused", Some("not_a_member"))
+    );
+    let peek = ok(&sock, &token, "inbox.peek", json!({}));
+    assert_eq!(
+        peek["sessions"][0]["records"].as_array().unwrap().len(),
+        1,
+        "{peek}"
+    );
+    // Reloaded with `members: null`: no gate.
+    ok(
+        &sock,
+        &token,
+        "cloud.sessions.set",
+        json!({"sessions": friday(), "members": null}),
+    );
+    assert_eq!(send(&mut pa, &a, &to, "again").await.1, "stored");
+    ok(&sock, &token, "stop", json!({}));
+    exits_zero(child);
+
+    // Not listed from the start: refused.
+    let dir = tempfile::tempdir().unwrap();
+    let a = seed(dir.path());
+    let file = json!({"workspace": NAME, "sessions": friday(), "members": ["user_x"]});
+    let (child, token, sock) = common::member_with(dir.path(), file);
+    let (mut pa, _ep) = dial(&sock, &token, &a).await;
+    let to = format!("{}/friday", short(&sock, &token));
+    let (_, state, reason) = send_acked(&mut pa, &a, &to, "no").await;
+    assert_eq!(
+        (state.as_str(), reason.as_deref()),
+        ("refused", Some("not_a_member"))
+    );
+    assert_eq!(
+        ok(&sock, &token, "inbox.peek", json!({}))["sessions"],
+        json!([])
+    );
+    ok(&sock, &token, "stop", json!({}));
+    exits_zero(child);
+}
+
+/// `members` on `cloud.sessions.set`: absent keeps the gate, `null` removes it, a list replaces
+/// it, and anything else (or a list with a non-string) is `bad_request` and changes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sessions_set_members_absent_keeps_null_removes_list_replaces_bad_refuses() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = seed(dir.path());
+    let file = json!({"workspace": NAME, "sessions": friday(), "members": ["user_x"]});
+    let (child, token, sock) = common::member_with(dir.path(), file);
+    let (mut pa, _ep) = dial(&sock, &token, &a).await;
+    let to = format!("{}/friday", short(&sock, &token));
+    let state = async |pa: &mut Peer| send_acked(pa, &a, &to, "x").await.1;
+    assert_eq!(state(&mut pa).await, "refused");
+    // Absent: the gate stays.
+    ok(
+        &sock,
+        &token,
+        "cloud.sessions.set",
+        json!({"sessions": friday()}),
+    );
+    assert_eq!(state(&mut pa).await, "refused");
+    // Bad values: refused, the gate stays.
+    for bad in [json!("p"), json!({"a": 1}), json!([1]), json!(["ok", null])] {
+        let r = line(
+            &sock,
+            &token,
+            "cloud.sessions.set",
+            json!({"sessions": friday(), "members": bad}),
+        );
+        assert_eq!(r["error"], "bad_request", "{r}");
+    }
+    assert_eq!(state(&mut pa).await, "refused");
+    // A list replaces it.
+    let list = json!([format!("p-{}", a.short)]);
+    ok(
+        &sock,
+        &token,
+        "cloud.sessions.set",
+        json!({"sessions": friday(), "members": list}),
+    );
+    assert_eq!(state(&mut pa).await, "stored");
+    // Null removes it.
+    ok(
+        &sock,
+        &token,
+        "cloud.sessions.set",
+        json!({"sessions": friday(), "members": null}),
+    );
+    assert_eq!(state(&mut pa).await, "stored");
+    ok(&sock, &token, "stop", json!({}));
+    exits_zero(child);
+}
+
+/// A sessions file whose `members` is not a list of strings keeps the member from starting.
+#[test]
+fn a_bad_members_in_the_sessions_file_is_a_startup_error() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("home")).unwrap();
+    let file = dir.path().join("sessions.json");
+    std::fs::write(
+        &file,
+        json!({"sessions": [], "members": "everyone"}).to_string(),
+    )
+    .unwrap();
+    let mut child = std::process::Command::new(common::EXE)
+        .arg("member")
+        .arg("--home")
+        .arg(dir.path().join("home"))
+        .arg("--snapshot")
+        .arg(dir.path().join("last.db"))
+        .arg("--socket")
+        .arg(dir.path().join("sock"))
+        .args(["--name", NAME, "--sessions"])
+        .arg(&file)
+        .env("HOME", dir.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(child.stdin.take().unwrap(), "t").unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("members"));
 }

@@ -143,10 +143,26 @@ pub struct ForPerson<'a> {
     pub check: bool,
 }
 
+/// A receipt's reason when a person or agent allowed the held message: `approved by <who>`.
+pub const APPROVED: &str = "approved by ";
+
 /// What receipt `r` means in words. With `person`, the sentence for the person who sent it at
 /// a terminal (always one). Without, the note an agent's `send_message` and `message_receipt`
 /// carry, only for mail on a teammate's computer or a `loop` refusal.
 pub fn receipt_note(r: &Value, person: Option<&ForPerson>) -> Option<String> {
+    let text = receipt_text(r, person)?;
+    Some(
+        match r["reason"].as_str().and_then(|w| w.strip_prefix(APPROVED)) {
+            Some(who) if person.is_some() => format!(
+                "{text} Approved by {}.",
+                crate::label::plain(who, usize::MAX)
+            ),
+            _ => text,
+        },
+    )
+}
+
+fn receipt_text(r: &Value, person: Option<&ForPerson>) -> Option<String> {
     let at = |f: &str| r[f].as_str().unwrap_or_default();
     // A teammate's words, printed to a terminal: one line, nothing it would act on.
     let shown = |f: &str| crate::label::plain(&at(f).replace(['\n', '\t'], " "), usize::MAX);
@@ -197,6 +213,7 @@ pub fn receipt_note(r: &Value, person: Option<&ForPerson>) -> Option<String> {
                 "policy" => "they do not take messages from you".to_string(),
                 "declined" => "they declined it".into(),
                 "not_member" => "that computer is not in your team".into(),
+                "not_a_member" => "that workspace only takes messages from its members".into(),
                 "request_id_reused" => "that request id was used for another message".into(),
                 "unsupported" => "their computer cannot take it".into(),
                 _ => shown("reason").replace('_', " "),
@@ -284,15 +301,20 @@ pub(crate) fn advance(
 ) -> Result<bool> {
     let old = conn
         .query_row(
-            "SELECT state FROM receipts WHERE from_key = ?1 AND request_id = ?2",
+            "SELECT state, reason FROM receipts WHERE from_key = ?1 AND request_id = ?2",
             [from, request_id],
-            |r| r.get::<_, String>(0),
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
         )
         .optional()?;
-    let moves = match old {
-        Some(o) => state.later_than(State::parse(&o)?),
+    let moves = match &old {
+        Some((o, _)) => state.later_than(State::parse(o)?),
         None => true,
     };
+    // Who approved a held message stays on the receipt as it moves on.
+    let kept = old
+        .and_then(|(_, r)| r)
+        .filter(|r| reason.is_none() && r.starts_with(APPROVED));
+    let reason = reason.or(kept.as_deref());
     if moves {
         if state == State::Read {
             // `updated_at` stays the delivery time: the hops trigger window runs on it.
@@ -704,7 +726,9 @@ pub fn send(
 /// `policy`, or kept under a hold (`holds::hold`, `held`, in no mailbox), or stored for `to`
 /// with origin `net:<peer short>`, timed by its arrival (`now`). Held or stored, it is
 /// remembered in `seen_ids`. On a workspace member, `declared` are its sessions: new mail for
-/// any other is `policy` (after the resend checks, so a resend gets the state it has).
+/// any other is `policy` (after the resend checks, so a resend gets the state it has). With
+/// `members` (person ids), mail from a peer whose person is not in it is `not_a_member`: no hold.
+#[allow(clippy::too_many_arguments)]
 pub fn receive(
     store: &Store,
     env: &Frame,
@@ -712,6 +736,7 @@ pub fn receive(
     roster: &Roster,
     me: &str,
     declared: Option<&std::collections::HashSet<String>>,
+    members: Option<&std::collections::HashSet<String>>,
     now: u64,
 ) -> Result<Answer> {
     let Frame::Envelope {
@@ -776,6 +801,9 @@ pub fn receive(
     }
     if declared.is_some_and(|d| !d.contains(to)) {
         return refused("policy");
+    }
+    if members.is_some_and(|m| !m.contains(&peer.person_id)) {
+        return refused("not_a_member");
     }
     // An answer to (or in the thread of) a message this computer sent is at least one hop
     // past it, whatever `hops` the peer claims; only a person (`/terminal`, fenced by the
@@ -1639,6 +1667,7 @@ mod tests {
             admitted_at: 0,
             proof: None,
             workspace: None,
+            by: None,
         };
         let mine = Member {
             key: "mkey".into(),
@@ -1676,7 +1705,7 @@ mod tests {
         allow_p(&s);
         for (i, to) in ["m/terminal", "m/codex:c"].iter().enumerate() {
             let (peer, roster, env) = peer_mail(to, &format!("r{i}"));
-            let got = receive(&s, &env, &peer, &roster, "m", None, 1000).unwrap();
+            let got = receive(&s, &env, &peer, &roster, "m", None, None, 1000).unwrap();
             let fresh = Answer {
                 fresh: true,
                 ..Answer::is(State::Stored)
@@ -1695,10 +1724,10 @@ mod tests {
         allow_p(&s);
         let (peer, roster, env) = peer_mail("m/codex:c", "r1");
         let again = || {
-            let r = receive(&s, &env, &peer, &roster, "m", None, 1001).unwrap();
+            let r = receive(&s, &env, &peer, &roster, "m", None, None, 1001).unwrap();
             (r.state, r.reason, r.fresh)
         };
-        receive(&s, &env, &peer, &roster, "m", None, 1000).unwrap();
+        receive(&s, &env, &peer, &roster, "m", None, None, 1000).unwrap();
         advance(
             s.conn(),
             "p/codex:a",
@@ -1839,6 +1868,29 @@ mod tests {
         assert_eq!(
             note(serde_json::json!({"state": "expired", "reason": "not_allowed"})),
             "Nobody answered the Allow for 7 days; the message expired."
+        );
+        // The approval stays on the receipt as it moves to delivered.
+        let dir = tempfile::tempdir().unwrap();
+        let s = crate::store::Store::open(&dir.path().join("state.db")).unwrap();
+        advance(
+            s.conn(),
+            "f",
+            "r",
+            State::Stored,
+            Some("approved by m/claude-1"),
+            None,
+            1,
+        )
+        .unwrap();
+        advance(s.conn(), "f", "r", State::Delivered, None, None, 2).unwrap();
+        let kept: Option<String> = s
+            .conn()
+            .query_row("SELECT reason FROM receipts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kept.as_deref(), Some("approved by m/claude-1"));
+        assert_eq!(
+            note(serde_json::json!({"state": "stored", "reason": "approved by m/claude-1"})),
+            "Sent. It waits until that session is back. Approved by m/claude-1."
         );
     }
 }

@@ -138,6 +138,7 @@ mod tests {
             admitted_at: 0,
             proof: None,
             workspace: None,
+            by: None,
         }
     }
 

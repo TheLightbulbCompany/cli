@@ -42,6 +42,7 @@ fn update(env: &Env, dir: &Path, args: &[&str]) -> Output {
     env.base_cmd(Command::new(EXE))
         .arg("update")
         .args(args)
+        .env("LIGHTBULB_ALLOW_UNSIGNED", "1")
         .env(
             "LIGHTBULB_RELEASE_BASE",
             format!("file://{}", dir.display()),

@@ -118,10 +118,12 @@ fn row<'a>(roster: &Roster, me: &str, from: &'a Member) -> (&'static str, &'a st
     }
 }
 
-/// The verdict on member `from`'s message to a session of member `me`: my own person accepts;
-/// my workspace's member follows the switch; anyone else what its row says, else hold.
+/// The verdict on member `from`'s message to a session of member `me`: my own person accepts
+/// (this computer, or the same account id; a key-form id is only ever its own computer's); my
+/// workspace's member follows the switch; anyone else what its row says, else hold.
 pub fn decide(store: &Store, roster: &Roster, me: &str, from: &Member) -> Result<Verdict> {
-    if from.person_id == roster.person_of(me) {
+    let mine = roster.person_of(me);
+    if from.key == me || (from.person_id == mine && !crate::identity::is_key(mine)) {
         return Ok(Verdict::Accept);
     }
     let (scope, pid) = row(roster, me, from);
@@ -255,6 +257,7 @@ mod tests {
             admitted_at: 0,
             proof: None,
             workspace: ws.map(Into::into),
+            by: None,
         }
     }
 
@@ -308,6 +311,23 @@ mod tests {
         set(&s, &r3, "me", &odd, Verdict::Refuse, "local", 1).unwrap();
         assert!(Policy::load(&s).unwrap().agents_send_without_asking);
         assert_eq!(d(&r3, &odd), Verdict::Refuse);
+    }
+
+    #[test]
+    fn a_key_form_person_id_is_only_its_own_computer() {
+        let (_d, s) = store();
+        let key = |i: u8| crate::identity::key_of(&[i; 32]);
+        // X, unverified: its person is its own key. K carries X's key as its person id.
+        let x = member(&key(1), &key(1), MemberKind::Computer, None);
+        let k = member(&key(2), &key(1), MemberKind::Computer, None);
+        let r = roster(&[&x, &k]);
+        assert_eq!(decide(&s, &r, &x.key, &k).unwrap(), Verdict::Hold);
+        assert_eq!(decide(&s, &r, &x.key, &x).unwrap(), Verdict::Accept);
+        // The same account id is the same person.
+        let a = member(&key(3), "user_a", MemberKind::Computer, None);
+        let b = member(&key(4), "user_a", MemberKind::Computer, None);
+        let r = roster(&[&a, &b]);
+        assert_eq!(decide(&s, &r, &a.key, &b).unwrap(), Verdict::Accept);
     }
 
     #[test]

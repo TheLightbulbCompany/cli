@@ -26,11 +26,14 @@ pub enum Kind {
     Merge,
     Proof,
     Remove,
-    Admin,
-    Transfer,
     Leave,
     Link,
     Meta,
+    /// Any kind this build does not know (the retired `admin`/`transfer`). It parses, so a frame
+    /// or a stored row never fails to load, but it re-serialises as "other" and so never
+    /// verifies: `accept` refuses it, and `replay` applies nothing for it.
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -73,12 +76,11 @@ impl Entry {
     }
 }
 
-/// Ordered by authority: `Member < Admin < Founder`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+/// The founder is whoever created the network; every network is flat otherwise.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     Member,
-    Admin,
     Founder,
 }
 
@@ -105,6 +107,10 @@ pub struct Member {
     /// `proof`'s `workspace.id`: the workspace the person is signed into (the workspace
     /// member's own); `None` with no proof in force. The admit body's `workspace` is ignored.
     pub workspace: Option<String>,
+    /// Who approved this member's join, from the `admit` body (`local` is left out): an agent
+    /// session, `<member>/<handle>`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub by: Option<String>,
 }
 
 impl Member {
@@ -143,8 +149,9 @@ pub struct Roster {
     pub heads: Vec<String>,
     pub links: BTreeMap<String, Link>,
     pub relay: Option<String>,
-    /// The founder's doorbell (a parked workspace member's), from its latest `meta` with one.
-    pub wake: Option<Wake>,
+    /// A parked workspace member's doorbell, by member key: its own latest `meta` with one
+    /// (the founder's, or a cloud member's; a computer's is not taken). Members only.
+    pub wakes: BTreeMap<String, Wake>,
     parents: BTreeMap<String, Vec<String>>,
     /// Every replayed entry with its hash, parents first.
     log: Vec<(String, Entry)>,
@@ -165,12 +172,41 @@ impl std::fmt::Debug for Wake {
     }
 }
 
+/// Whether `rest` (a URL after `https://`) names a DNS host: labels of letters, digits and
+/// hyphens, at least two, ending in an alphabetic label (so no IPv4 or other number form, and no
+/// IPv6 literal), not `localhost` or under it, with no userinfo; an optional port.
+fn wake_host(rest: &str) -> bool {
+    let auth = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let (host, port) = match auth.split_once(':') {
+        Some((h, p)) => (h, Some(p)),
+        None => (auth, None),
+    };
+    let label = |l: &str| {
+        (1..=63).contains(&l.len())
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+            && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    };
+    let labels: Vec<&str> = host.split('.').collect();
+    let tld = labels.last().copied().unwrap_or_default();
+    port.is_none_or(|p| (1..=5).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_digit()))
+        && host.len() <= 253
+        && labels.len() >= 2
+        && labels.iter().all(|l| label(l))
+        && tld.len() >= 2
+        && tld.bytes().all(|b| b.is_ascii_alphabetic())
+        && !host.eq_ignore_ascii_case("localhost")
+        && !tld.eq_ignore_ascii_case("localhost")
+}
+
 impl Wake {
-    /// A `meta` body's `wake`: an http(s) URL of printable ASCII with no space or quote, and a
-    /// token of `[A-Za-z0-9._-]` (it is written into curl's config, never a command line).
+    /// A `meta` body's `wake`: an https URL of printable ASCII with no space or quote, whose
+    /// host is a public-looking DNS name (`wake_host`), and a token of `[A-Za-z0-9._-]` (it is
+    /// written into curl's config, never a command line). A DNS name that resolves to a private
+    /// address is not filtered (accepted: only a member's own signed `meta` supplies it).
     pub fn parse(v: &Value) -> Option<Wake> {
         let (url, token) = (v["url"].as_str()?, v["token"].as_str()?);
-        let url_ok = (url.starts_with("https://") || url.starts_with("http://"))
+        let url_ok = url.strip_prefix("https://").is_some_and(wake_host)
             && url.len() <= 2048
             && url
                 .bytes()
@@ -374,7 +410,8 @@ fn pass(
     // Links by `ticket_id`, each with the hash of its entry.
     let mut links: BTreeMap<String, (String, Link)> = BTreeMap::new();
     let mut used_once: BTreeSet<String> = BTreeSet::new();
-    let mut admins: Vec<String> = Vec::new();
+    // Whether the genesis is a workspace instance's own (`solo_genesis`'s `cloud`).
+    let mut cloud_founder = false;
     while let Some((_, h)) = ready.pop_first() {
         for c in children.get(h.as_str()).into_iter().flatten() {
             let n = waiting.get_mut(c).expect("a child is an entry");
@@ -390,6 +427,7 @@ fn pass(
                 r.team_id = h.clone();
                 r.team_name = e.text("team_name").to_string();
                 r.created_at = e.at;
+                cloud_founder = e.body["cloud"] == true;
                 r.members
                     .insert(e.signer.clone(), new_member(e, Role::Founder, claims));
             }
@@ -420,9 +458,13 @@ fn pass(
         {
             continue;
         }
-        let elevated = signer.role != Role::Member;
         let computer = signer.kind == MemberKind::Computer;
         let founder = signer.role == Role::Founder;
+        // A workspace's cloud member, the one engine that knows a person's real id: the
+        // instance that founded this network as one, or a cloud member with its workspace
+        // proof. Only its `person` links vouch for a person.
+        let cloud_member = (founder && cloud_founder)
+            || (signer.kind == MemberKind::Cloud && signer.workspace.is_some());
         match e.kind {
             // A cloud (bridge) member never admits.
             Kind::Admit if computer => {
@@ -432,8 +474,7 @@ fn pass(
                 }
                 let via_link = || {
                     link.is_some_and(|(lh, l)| {
-                        l.signer == e.signer
-                            && anc[h.as_str()].contains(lh)
+                        anc[h.as_str()].contains(lh)
                             && !retired(&links, anc, lh, l, |n| anc[h.as_str()].contains(n))
                             // Every removal the link does not descend from ends it; an
                             // admission it already knew of stands.
@@ -449,23 +490,29 @@ fn pass(
                 // Another computer of a signed-in person: admitted by one of that person's.
                 let same = (!cloud && claims.is_some()).then(|| e.text("person_id"));
                 let same_person = same.is_some_and(|p| signer.person_id == p);
+                // Any member admits directly, or through any live link.
+                let authorised = e.text("ticket_id").is_empty() || via_link() || same_person;
+                // A workspace with no proof is nobody's word but a person's Allow on a once
+                // link: a hostile member cannot mint unverified members for keys it holds.
+                let authorised = authorised
+                    && (!cloud
+                        || claims.is_some()
+                        || (via_link() && link.is_some_and(|(_, l)| l.once)));
                 let collides = r.collides(e.text("name"), &target, same).is_some();
                 let role_ok = matches!(
                     e.body.get("role").and_then(Value::as_str),
                     None | Some("member")
                 );
-                // A link's signer admits only computers; a cloud member needs an admin, and a
-                // workspace has one: on a fork, the first replayed stands.
+                // A workspace has one cloud member: on a fork, the first replayed stands.
                 let taken = cloud
                     && r.members
                         .values()
                         .any(|m| m.kind == MemberKind::Cloud && m.person_id == e.text("person_id"));
-                let kind_ok = (elevated || !cloud) && !taken;
-                let authorised = elevated || via_link() || same_person;
-                // The signer of a `person` link admitting through it vouches for the person it
-                // minted the link for (the backend handed that link to exactly that person).
-                let vouched = link.is_some_and(|(_, l)| l.mode == "person" && l.signer == e.signer);
-                if authorised && kind_ok && !collides && role_ok && own_person(e, claims, vouched) {
+                // A cloud member admitting through its own `person` link vouches for the person
+                // it minted the link for (the backend handed that link to exactly that person).
+                let vouched = cloud_member
+                    && link.is_some_and(|(_, l)| l.mode == "person" && l.signer == e.signer);
+                if authorised && !taken && !collides && role_ok && own_person(e, claims, vouched) {
                     r.members
                         .insert(target, new_member(e, Role::Member, claims));
                     if let Some((lh, _)) = link.filter(|(_, l)| l.once) {
@@ -501,55 +548,21 @@ fn pass(
                 }
             }
             Kind::Remove => {
-                let Some(t) = r.members.get(&target) else {
-                    continue;
-                };
-                // `unlink` (retired): a member removing its own person's cloud member. It can no
-                // longer fire: a cloud member's person is `ws:<id>`, never a computer's.
-                let unlink = t.kind == MemberKind::Cloud && t.person_id == signer.person_id;
-                if (elevated || unlink) && take(&mut r, &mut gone, &target, &h) {
+                if computer && target != e.signer && take(&mut r, &mut gone, &target, &h) {
                     removals.insert(h.clone());
                     applied.insert(h.clone());
-                }
-            }
-            // A cloud member is never made an admin or the founder.
-            Kind::Admin if founder => {
-                if let Some(t) = r.members.get_mut(&target) {
-                    if t.role == Role::Member && t.kind == MemberKind::Computer {
-                        t.role = Role::Admin;
-                        admins.push(target);
-                    }
-                }
-            }
-            Kind::Transfer if founder && target != e.signer => {
-                let to = r.members.get_mut(&target);
-                if let Some(t) = to.filter(|t| t.kind == MemberKind::Computer) {
-                    t.role = Role::Founder;
-                    // The old founder's doorbell is not the new one's.
-                    r.wake = None;
-                    r.members.get_mut(&e.signer).expect("active").role = Role::Admin;
-                    admins.push(e.signer.clone());
                 }
             }
             Kind::Leave => {
                 if target == e.signer {
                     r.members.remove(&target);
-                    if founder {
-                        let oldest = admins
-                            .iter()
-                            .find(|a| r.members.get(*a).is_some_and(|m| m.role == Role::Admin));
-                        if let Some(a) = oldest.cloned() {
-                            r.members.get_mut(&a).expect("active").role = Role::Founder;
-                            r.wake = None;
-                        }
-                    }
                 }
             }
-            // Only a computer member mints links, under its own `<short>.` prefix, and a
-            // `ticket_id` names one link ever; an `open` one only the founder and admins.
+            // Only a computer member mints links (a `person` one only a cloud member), under its
+            // own `<short>.` prefix, and a `ticket_id` names one link ever.
             Kind::Link
                 if computer
-                    && (elevated || e.text("mode") != "open")
+                    && (e.text("mode") != "person" || cloud_member)
                     && e.text("ticket_id")
                         .strip_prefix(signer.short.as_str())
                         .is_some_and(|rest| rest.len() > 1 && rest.starts_with('.')) =>
@@ -570,7 +583,7 @@ fn pass(
                     });
             }
             Kind::Meta => {
-                if elevated {
+                if computer {
                     if let Some(n) = e.body["team_name"].as_str() {
                         r.team_name = n.to_string();
                     }
@@ -578,13 +591,15 @@ fn pass(
                         r.relay = Some(relay.to_string());
                     }
                 }
-                if let Some(w) = Wake::parse(&e.body["wake"]).filter(|_| founder) {
-                    r.wake = Some(w);
+                let own = founder || signer.kind == MemberKind::Cloud;
+                if let Some(w) = Wake::parse(&e.body["wake"]).filter(|_| own) {
+                    r.wakes.insert(e.signer.clone(), w);
                 }
             }
-            Kind::Admit | Kind::Link | Kind::Admin | Kind::Transfer => {}
+            Kind::Admit | Kind::Link | Kind::Other => {}
         }
     }
+    r.wakes.retain(|k, _| r.members.contains_key(k));
     // Live links: unused, not retired, and descended from every removal (a removal it did not
     // see ends it).
     for (lh, l) in links.values() {
@@ -616,7 +631,8 @@ fn retired(
     })
 }
 
-/// Removes `target` (never the founder) by removal `h`; whether it was removed.
+/// Removes `target` (never a cloud founder: the workspace's own member) by removal `h`;
+/// whether it was removed.
 fn take(
     r: &mut Roster,
     gone: &mut BTreeMap<String, (Member, String)>,
@@ -624,7 +640,7 @@ fn take(
     h: &str,
 ) -> bool {
     match r.members.get(target) {
-        Some(m) if m.role != Role::Founder => {
+        Some(m) if !(m.role == Role::Founder && m.kind == MemberKind::Cloud) => {
             let m = r.members.remove(target).expect("present");
             gone.insert(target.to_string(), (m, h.to_string()));
             true
@@ -642,7 +658,13 @@ fn own_person(e: &Entry, claims: Option<&Proof>, vouched: bool) -> bool {
         Some(p) => p.sub == e.text("person_id") && (p.kind == ProofKind::Workspace) == cloud,
         // `vouched`: the signer of a `person` link admitting through it names the computer's
         // person — that link went to exactly that person, once (a Mac has no proof of its own).
-        None => !cloud && (e.text("person_id") == e.text("member") || vouched),
+        // A vouched id is an account id, never a key: the `cloud` marker is self-declared, and a
+        // key-form id is some unverified computer's own. A workspace member without a proof is
+        // its own key's person, as a computer is.
+        None => {
+            let p = e.text("person_id");
+            p == e.text("member") || (!cloud && vouched && !crate::identity::is_key(p))
+        }
     }
 }
 
@@ -679,6 +701,10 @@ fn new_member(e: &Entry, role: Role, claims: Option<&Proof>) -> Member {
         admitted_at: e.at,
         proof: None,
         workspace: None,
+        // An approval names a session of the signer's own computer; any other is dropped.
+        by: (e.body["by"].as_str())
+            .filter(|b| b.split('/').next() == e.signer.get(..12))
+            .map(String::from),
         key,
     };
     if let Some(p) = claims {
@@ -839,32 +865,25 @@ mod tests {
         )
     }
 
-    /// X admitted, then made an admin, so X's own admissions are authorised.
-    fn admit_admin(f: &Identity, parent: &Entry, x: &Identity) -> [Entry; 2] {
-        let ax = admit(f, parent, &x.key, "x");
-        let px = member(f, &ax, Kind::Admin, &x.key);
-        [ax, px]
-    }
-
     /// Same parent: X admits C | founder removes X.
     fn fork() -> (Vec<Entry>, [String; 2]) {
         let (f, x, c) = (id(), id(), id());
         let g = genesis(&f);
-        let [ax0, ax] = admit_admin(&f, &g, &x);
+        let ax = admit(&f, &g, &x.key, "x");
         let xc = admit(&x, &ax, &c.key, "c");
         let rx = member(&f, &ax, Kind::Remove, &x.key);
-        (vec![g, ax0, ax, xc, rx], [x.key, c.key])
+        (vec![g, ax, xc, rx], [x.key, c.key])
     }
 
     /// Fork at F: X admits C, then X admits D | founder removes X.
     fn deep_fork() -> (Vec<Entry>, [String; 3]) {
         let (f, x, c, d) = (id(), id(), id(), id());
         let g = genesis(&f);
-        let [ax0, ax] = admit_admin(&f, &g, &x);
+        let ax = admit(&f, &g, &x.key, "x");
         let xc = admit(&x, &ax, &c.key, "c");
         let xd = admit(&x, &xc, &d.key, "d");
         let rx = member(&f, &ax, Kind::Remove, &x.key);
-        (vec![g, ax0, ax, xc, xd, rx], [x.key, c.key, d.key])
+        (vec![g, ax, xc, xd, rx], [x.key, c.key, d.key])
     }
 
     /// `op` re-stamped until its hash sorts after `floor`, so Kahn order is known.
@@ -885,20 +904,6 @@ mod tests {
         assert_eq!(r.team_name, "acme");
         assert_eq!(r.members[&f.key].role, Role::Founder);
         assert_eq!(r.by_short(&f.short).unwrap().key, f.key);
-    }
-
-    #[test]
-    fn non_admin_admit_and_remove_are_dropped() {
-        let (f, x, b, c) = (id(), id(), id(), id());
-        let g = genesis(&f);
-        let ax = admit(&f, &g, &x.key, "x");
-        let ab = admit(&f, &ax, &b.key, "b");
-        let xc = admit(&x, &ab, &c.key, "c");
-        let xb = member(&x, &xc, Kind::Remove, &b.key);
-        let r = replay(&[g, ax, ab, xc, xb]);
-        assert!(r.members.contains_key(&b.key));
-        assert!(!r.members.contains_key(&c.key));
-        assert_eq!(r.members.len(), 3);
     }
 
     #[test]
@@ -928,12 +933,12 @@ mod tests {
         // drops it.
         let (f, x, c) = (id(), id(), id());
         let g = genesis(&f);
-        let [ax0, ax] = admit_admin(&f, &g, &x);
+        let ax = admit(&f, &g, &x.key, "x");
         let xc = admit(&x, &ax, &c.key, "c");
         let m1 = op_after(&f, &ax, Kind::Meta, json!({"relay": "r1"}), &xc);
         let m2 = op_after(&f, &m1, Kind::Meta, json!({"team_name": "acme2"}), &xc);
         let rx = member(&f, &m2, Kind::Remove, &x.key);
-        let r = replay(&[g, ax0, ax, xc, m1, m2, rx]);
+        let r = replay(&[g, ax, xc, m1, m2, rx]);
         assert_eq!(r.members.len(), 1);
         assert_eq!(r.team_name, "acme2");
         assert_eq!(r.relay.as_deref(), Some("r1"));
@@ -941,17 +946,13 @@ mod tests {
 
     #[test]
     fn removal_cycle_converges_and_is_stable() {
-        // Admins A, B, C concurrently remove B, C, A: removal wins, so all three go, and
+        // Members A, B, C concurrently remove B, C, A: removal wins, so all three go, and
         // unrelated entries that change the replay order change nothing.
         let (f, a, b, c) = (id(), id(), id(), id());
         let g = genesis(&f);
         let mut log = vec![g.clone()];
         for (who, name) in [(&a, "a"), (&b, "b"), (&c, "c")] {
             let e = admit(&f, log.last().unwrap(), &who.key, name);
-            log.push(e);
-        }
-        for who in [&a, &b, &c] {
-            let e = member(&f, log.last().unwrap(), Kind::Admin, &who.key);
             log.push(e);
         }
         let fork = log.last().unwrap().clone();
@@ -1007,12 +1008,34 @@ mod tests {
         let (f, k, d) = (id(), id(), id());
         let g = genesis(&f);
         let ak = admit_cloud(&f, &g, &k, "bridge", "W1");
-        let pk = member(&f, &ak, Kind::Admin, &k.key);
-        let lk = link_with(&k, &pk, &tid(&k, "tk"), false);
+        let lk = link_with(&k, &ak, &tid(&k, "tk"), false);
         let kd = admit(&k, &lk, &d.key, "d");
-        let r = replay(&[g, ak, pk, lk, kd]);
+        let r = replay(&[g, ak, lk, kd]);
         assert!(r.links.is_empty());
         assert!(!r.members.contains_key(&d.key));
+    }
+
+    #[test]
+    fn a_proofless_cloud_admit_needs_a_once_link() {
+        let (f, k1, k2, k3) = (id(), id(), id(), id());
+        let g = genesis(&f);
+        let cloud = |parent: &Entry, who: &Identity, ticket: &str| {
+            let mut b = admit_body(&who.key, &who.short);
+            b["kind"] = json!("cloud");
+            b["ticket_id"] = json!(ticket);
+            op(&f, parent, Kind::Admit, b)
+        };
+        // Ticketless: dropped. A reusable link: dropped. A once link: stands.
+        let a1 = cloud(&g, &k1, "");
+        let (t2, t3) = (tid(&f, "reusable"), tid(&f, "once"));
+        let l2 = link_with(&f, &a1, &t2, false);
+        let a2 = cloud(&l2, &k2, &t2);
+        let l3 = link_with(&f, &a2, &t3, true);
+        let a3 = cloud(&l3, &k3, &t3);
+        let r = replay(&[g, a1, l2, a2, l3, a3]);
+        assert!(!r.members.contains_key(&k1.key));
+        assert!(!r.members.contains_key(&k2.key));
+        assert!(r.members.contains_key(&k3.key));
     }
 
     #[test]
@@ -1034,20 +1057,56 @@ mod tests {
     }
 
     #[test]
-    fn cloud_member_cannot_be_admin_or_founder() {
-        let (f, k) = (id(), id());
+    fn retired_kinds_are_ignored() {
+        // Old `admin`/`transfer` entries parse as `Other`, never verify, and change nothing.
+        let (f, b) = (id(), id());
         let g = genesis(&f);
-        let ak = admit_cloud(&f, &g, &k, "bridge", "W1");
-        let pk = member(&f, &ak, Kind::Admin, &k.key);
-        let tk = member(&f, &pk, Kind::Transfer, &k.key);
-        let r = replay(&[g, ak, pk, tk]);
-        assert_eq!(r.members[&k.key].role, Role::Member);
+        let ab = admit(&f, &g, &b.key, "b");
+        let old = member(&f, &ab, Kind::Other, &b.key);
+        let child = op(&f, &old, Kind::Meta, json!({"team_name": "kid"}));
+        let r = replay(&[g, ab, old, child]);
+        assert_eq!(r.members[&b.key].role, Role::Member);
         assert_eq!(r.members[&f.key].role, Role::Founder);
+        let wire: Entry = serde_json::from_value(json!({"v": 1, "parents": [], "kind": "transfer",
+            "body": {}, "signer": f.key, "at": 1, "sig": ""}))
+        .unwrap();
+        assert_eq!(wire.kind, Kind::Other);
+    }
+
+    #[test]
+    fn plain_member_invites_removes_and_renames() {
+        let (f, x, b) = (id(), id(), id());
+        let g = genesis(&f);
+        let ax = admit(&f, &g, &x.key, "x");
+        let ab = admit(&f, &ax, &b.key, "b");
+        // An open link, a rename and a relay, all by a plain member; it removes another.
+        let (open_id, rename) = (tid(&x, "open"), "acme2");
+        let mut lo = link_with(&x, &ab, &open_id, false).body;
+        lo["mode"] = json!("open");
+        let lo = op(&x, &ab, Kind::Link, lo);
+        let mn = op(
+            &x,
+            &lo,
+            Kind::Meta,
+            json!({"team_name": rename, "relay": "r"}),
+        );
+        assert!(
+            replay(&[g.clone(), ax.clone(), ab.clone(), lo.clone(), mn.clone()])
+                .links
+                .contains_key(&open_id)
+        );
+        let xb = member(&x, &mn, Kind::Remove, &b.key);
+        let xx = member(&x, &xb, Kind::Remove, &x.key); // not itself
+        let r = replay(&[g, ax, ab, lo, mn, xb, xx]);
+        assert_eq!(r.team_name, rename);
+        assert_eq!(r.relay.as_deref(), Some("r"));
+        assert!(!r.members.contains_key(&b.key));
+        assert!(r.members.contains_key(&x.key));
     }
 
     #[test]
     fn stale_known_removal_stops_when_its_signers_admission_drops() {
-        // Plain member X admits Y through its link; Y (an admin's equal there) removes the
+        // Member X admits Y through its link; Y removes the
         // workspace member M; the founder removes X concurrently. Y never survives, so neither
         // does its removal of M, whether the founder's removal is shallow or behind entries
         // replayed after Y's.
@@ -1088,6 +1147,65 @@ mod tests {
     }
 
     #[test]
+    fn only_a_cloud_members_person_link_vouches_for_a_person() {
+        let (w, x, v, k) = (id(), id(), id(), id());
+        let person_link = |by: &Identity, parent: &Entry| {
+            let body = json!({"ticket_id": tid(by, "p"), "secret": "s", "mode": "person",
+                "once": true, "expires_at": 99});
+            op(by, parent, Kind::Link, body)
+        };
+        let as_user_v = |by: &Identity, parent: &Entry, who: &Identity| {
+            let mut b = admit_body(&who.key, &who.short);
+            b["ticket_id"] = json!(tid(by, "p"));
+            b["person_id"] = json!("user_v");
+            op(by, parent, Kind::Admit, b)
+        };
+        let log = |g: Entry| {
+            let ax = admit(&w, &g, &x.key, "x");
+            let wl = person_link(&w, &ax);
+            let av = as_user_v(&w, &wl, &v);
+            // X, a computer member, mints its own person link and admits K as V's person.
+            let xl = person_link(&x, &av);
+            let ak = as_user_v(&x, &xl, &k);
+            replay(&[g, ax, wl, av, xl, ak])
+        };
+        let r = log(crate::daemon::net_ops::solo_genesis(
+            &w,
+            Some("Acme"),
+            "Acme",
+            1,
+        ));
+        assert_eq!(r.members[&v.key].person_id, "user_v");
+        assert!(!r.members.contains_key(&k.key));
+        assert_ne!(r.person_of(&k.key), r.person_of(&v.key));
+        assert!(!r.links.contains_key(&tid(&x, "p")));
+        // A computer's network (no `cloud` genesis): its founder vouches for no one either.
+        let r = log(genesis(&w));
+        assert!(!r.members.contains_key(&v.key));
+        assert!(!r.members.contains_key(&k.key));
+    }
+
+    #[test]
+    fn a_cloud_founder_vouches_account_ids_never_a_computers_key() {
+        let (w, x, k) = (id(), id(), id());
+        let g = crate::daemon::net_ops::solo_genesis(&w, Some("Acme"), "Acme", 1);
+        let ax = admit(&w, &g, &x.key, "x");
+        let body = json!({"ticket_id": tid(&w, "p"), "secret": "s", "mode": "person",
+            "once": true, "expires_at": 99});
+        let wl = op(&w, &ax, Kind::Link, body);
+        // The founder, marker and all, vouches K as X's own key-form id: in any case.
+        for forged in [x.key.clone(), x.key.to_uppercase()] {
+            let mut b = admit_body(&k.key, "k");
+            b["ticket_id"] = json!(tid(&w, "p"));
+            b["person_id"] = json!(forged);
+            let ak = op(&w, &wl, Kind::Admit, b);
+            let r = replay(&[g.clone(), ax.clone(), wl.clone(), ak]);
+            assert!(!r.members.contains_key(&k.key), "{forged}");
+            assert!(!r.same_person_computer(&x.key, &k.key));
+        }
+    }
+
+    #[test]
     fn admit_cannot_claim_another_persons_id() {
         let (f, c, k) = (id(), id(), id());
         let g = genesis(&f);
@@ -1108,8 +1226,8 @@ mod tests {
 
     #[test]
     fn duplicate_ticket_id_link_is_dropped() {
-        // Z reuses X's `ticket_id` for a once-link and admits a puppet through it: Z's link is
-        // dropped, so the puppet is too, and X's link still admits.
+        // Z reuses X's `ticket_id` for a once-link: Z's link is dropped and X's stays, still
+        // reusable. Any member admits through a live link, so Z's admission through it stands.
         let (f, x, z, p, c) = (id(), id(), id(), id(), id());
         let g = genesis(&f);
         let ax = admit(&f, &g, &x.key, "x");
@@ -1120,7 +1238,7 @@ mod tests {
         let zp = admit_via(&z, &lz, &p.key, "p", &t);
         let xc = admit_via(&x, &zp, &c.key, "c", &t);
         let r = replay(&[g, ax, az, lx, lz, zp, xc]);
-        assert!(!r.members.contains_key(&p.key));
+        assert!(r.members.contains_key(&p.key));
         assert!(r.members.contains_key(&c.key));
         assert_eq!(r.links[&t].signer, x.key);
         assert!(!r.links[&t].once);
@@ -1214,21 +1332,6 @@ mod tests {
     }
 
     #[test]
-    fn founder_leave_promotes_oldest_admin() {
-        let (f, b, c) = (id(), id(), id());
-        let g = genesis(&f);
-        let ab = admit(&f, &g, &b.key, "b");
-        let ac = admit(&f, &ab, &c.key, "c");
-        let pc = member(&f, &ac, Kind::Admin, &c.key);
-        let pb = member(&f, &pc, Kind::Admin, &b.key);
-        let fl = member(&f, &pb, Kind::Leave, &f.key);
-        let r = replay(&[g, ab, ac, pc, pb, fl]);
-        assert!(!r.members.contains_key(&f.key));
-        assert_eq!(r.members[&c.key].role, Role::Founder);
-        assert_eq!(r.members[&b.key].role, Role::Admin);
-    }
-
-    #[test]
     fn wake_parse_takes_http_s_and_a_plain_token_only() {
         let w = |url: &str, token: &str| Wake::parse(&json!({"url": url, "token": token}));
         let ok = w("https://example.test/api/v1/network/wake", "org_1.abc-D");
@@ -1236,6 +1339,22 @@ mod tests {
             ok.map(|w| w.url),
             Some("https://example.test/api/v1/network/wake".into())
         );
+        for url in [
+            "http://example.test/w",
+            "https://127.0.0.1/w",
+            "https://[::1]/w",
+            "https://localhost/w",
+            "https://a.localhost/w",
+            "https://intranet/w",
+            "https://10.0.0.1:8443/w",
+            "https://example.test@evil.test.1/w",
+            "https://user@example.test/w",
+            "https://0x7f.1/w",
+            "https://example.test:/w",
+        ] {
+            assert!(w(url, "t").is_none(), "{url}");
+        }
+        assert!(w("https://wake.example.test:8443/w?x=1", "t").is_some());
         for (url, token) in [
             ("file:///etc/passwd", "t"),
             ("https://example.test/a b", "t"),
@@ -1251,47 +1370,46 @@ mod tests {
     }
 
     #[test]
-    fn a_new_founder_clears_the_old_founders_wake() {
+    fn only_the_founders_or_a_cloud_members_wake_is_taken() {
         let (f, b) = (id(), id());
         let g = genesis(&f);
         let ab = admit(&f, &g, &b.key, "b");
         let wake = json!({"wake": {"url": "https://example.test/w", "token": "o.s"}});
         let m = op(&f, &ab, Kind::Meta, wake);
-        let r = replay(&[g.clone(), ab.clone(), m.clone()]);
-        assert_eq!(r.wake.map(|w| w.token), Some("o.s".into()));
-        // A non-founder's wake is not taken.
         let mb = op(
             &b,
             &m,
             Kind::Meta,
             json!({"wake": {"url": "https://x.test/", "token": "b"}}),
         );
-        assert_eq!(
-            replay(&[g.clone(), ab.clone(), m.clone(), mb])
-                .wake
-                .map(|w| w.token),
-            Some("o.s".into())
-        );
-        let t = member(&f, &m, Kind::Transfer, &b.key);
-        assert_eq!(replay(&[g.clone(), ab.clone(), m.clone(), t]).wake, None);
-        // The founder leaves: the oldest admin is promoted, and the wake goes with it.
-        let pb = member(&f, &m, Kind::Admin, &b.key);
-        let lf = member(&f, &pb, Kind::Leave, &f.key);
-        let r = replay(&[g, ab, m, pb, lf]);
-        assert_eq!(r.founder().map(|x| x.key.clone()), Some(b.key.clone()));
-        assert_eq!(r.wake, None);
+        let r = replay(&[g, ab, m, mb]);
+        assert_eq!(r.wakes.get(&f.key).map(|w| w.token.as_str()), Some("o.s"));
+        assert_eq!(r.wakes.get(&b.key), None);
     }
 
     #[test]
-    fn transfer_swaps_founder_and_admin() {
-        let (f, b) = (id(), id());
-        let g = genesis(&f);
-        let ab = admit(&f, &g, &b.key, "b");
-        let t = member(&f, &ab, Kind::Transfer, &b.key);
-        let rf = member(&f, &t, Kind::Remove, &b.key); // naming the new founder: dropped
-        let r = replay(&[g, ab, t, rf]);
-        assert_eq!(r.members[&b.key].role, Role::Founder);
-        assert_eq!(r.members[&f.key].role, Role::Admin);
+    fn an_admit_keeps_by_only_for_a_session_of_its_signer() {
+        let (f, b, c, d) = (id(), id(), id(), id());
+        let mut e = genesis(&f);
+        let mut entries = vec![e.clone()];
+        for (who, by) in [
+            (&b, Some(format!("{}/codex-1", f.short))),
+            (&c, Some(format!("{}/codex-1", b.short))),
+            (&d, None),
+        ] {
+            let mut body = admit_body(&who.key, &who.short);
+            if let Some(by) = by {
+                body["by"] = json!(by);
+            }
+            e = op(&f, &e, Kind::Admit, body);
+            entries.push(e.clone());
+        }
+        let r = replay(&entries);
+        let got = |w: &Identity| r.members[&w.key].by.clone();
+        assert_eq!(got(&b), Some(format!("{}/codex-1", f.short)));
+        // Another member's session: the admission stands, the claim is dropped.
+        assert_eq!(got(&c), None);
+        assert_eq!(got(&d), None);
     }
 
     fn merge(by: &Identity, parent: &Entry, who: &Identity, pid: &str, proof: &str) -> Entry {
@@ -1382,15 +1500,15 @@ mod tests {
         // its link that the removal knew of stands; one concurrent with it drops.
         let (f, a, x, p, c, d) = (id(), id(), id(), id(), id(), id());
         let g = genesis(&f);
-        let [aa0, aa] = admit_admin(&f, &g, &a);
-        let ax = admit(&f, &aa, &x.key, "m"); // `admit_admin` names A "x"
+        let aa = admit(&f, &g, &a.key, "a");
+        let ax = admit(&f, &aa, &x.key, "m");
         let ap = admit(&f, &ax, &p.key, "p");
         let lf = link_with(&f, &ap, &tid(&f, "tf"), false);
         let tp = tid(&p, "tp");
         let lp = link_with(&p, &lf, &tp, false);
         let pc = admit_via(&p, &lp, &c.key, "c", &tp);
         let rx = member(&a, &ap, Kind::Remove, &x.key);
-        let base = vec![g, aa0, aa, ax, ap.clone(), lf.clone(), lp.clone()];
+        let base = vec![g, aa, ax, ap.clone(), lf.clone(), lp.clone()];
         let r = replay(&[base.clone(), vec![pc.clone(), rx]].concat());
         assert!(!r.members.contains_key(&x.key));
         assert!(!r.members.contains_key(&c.key));
@@ -1456,7 +1574,7 @@ mod tests {
     }
 
     #[test]
-    fn inviter_may_admit_through_its_own_link_only() {
+    fn any_member_admits_through_any_live_link_until_a_removal_ends_it() {
         let (f, x, y, c, d, e) = (id(), id(), id(), id(), id(), id());
         let g = genesis(&f);
         let ax = admit(&f, &g, &x.key, "x");
@@ -1476,48 +1594,30 @@ mod tests {
         log.extend([ry, xe]);
         let r = replay(&log);
         assert!(r.members.contains_key(&c.key));
-        assert!(!r.members.contains_key(&d.key));
+        assert!(r.members.contains_key(&d.key));
         assert!(!r.members.contains_key(&y.key));
         assert!(!r.members.contains_key(&e.key));
         assert!(r.links.is_empty());
     }
 
     #[test]
-    fn member_open_link_and_elevated_or_cloud_admits_are_dropped() {
-        let (f, x, c, k, m, z) = (id(), id(), id(), id(), id(), id());
+    fn a_member_admits_a_cloud_member_through_its_link_but_never_an_admin() {
+        let (f, x, k, m) = (id(), id(), id(), id());
         let g = genesis(&f);
         let ax = admit(&f, &g, &x.key, "x");
-        // Member X: an open link is dropped, an ask link stands.
-        let (open_id, ask_id) = (tid(&x, "open"), tid(&x, "ask"));
-        let mut lo = link_with(&x, &ax, &open_id, false);
-        lo.body["mode"] = json!("open");
-        let lo = op(&x, &ax, Kind::Link, lo.body);
-        let la = link_with(&x, &lo, &ask_id, false);
-        // Through its own link X admits a computer, but neither a cloud member nor an admin.
-        let xc = admit_via(&x, &la, &c.key, "c", &ask_id);
+        let ask_id = tid(&x, "ask");
+        let la = link_with(&x, &ax, &ask_id, false);
         let mut kb = admit_body(&k.key, "k");
         kb["kind"] = json!("cloud");
         kb["person_id"] = json!("ws:W2");
         kb["proof"] = json!(workspace_proof(&k.key, "W2", "k", &[], IAT));
         kb["ticket_id"] = json!(ask_id);
-        let xk = op(&x, &xc, Kind::Admit, kb);
+        let xk = op(&x, &la, Kind::Admit, kb);
         let mut mb = admit_body(&m.key, "m");
         mb["role"] = json!("admin");
-        mb["ticket_id"] = json!(ask_id);
-        let xm = op(&x, &xk, Kind::Admit, mb.clone());
-        // The founder may admit a cloud member (with its workspace proof), but not an admin.
-        let mut zb = admit_body(&z.key, "z");
-        zb["kind"] = json!("cloud");
-        zb["person_id"] = json!("ws:W1");
-        zb["proof"] = json!(workspace_proof(&z.key, "W1", "z", &[], IAT));
-        let fz = op(&f, &xm, Kind::Admit, zb);
-        let fm = op(&f, &fz, Kind::Admit, mb);
-        let r = replay(&[g, ax, lo, la, xc, xk, xm, fz, fm]);
-        assert!(!r.links.contains_key(&open_id));
-        assert!(r.links.contains_key(&ask_id));
-        assert!(r.members.contains_key(&c.key));
-        assert!(!r.members.contains_key(&k.key));
+        let xm = op(&x, &xk, Kind::Admit, mb);
+        let r = replay(&[g, ax, la, xk, xm]);
+        assert_eq!(r.members[&k.key].kind, MemberKind::Cloud);
         assert!(!r.members.contains_key(&m.key));
-        assert_eq!(r.members[&z.key].kind, MemberKind::Cloud);
     }
 }

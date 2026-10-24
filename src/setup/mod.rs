@@ -156,6 +156,9 @@ pub fn status(home: &Path, agent: &str, dir: &str) -> State {
     }
 }
 
+/// The one quiet mention of the paid workspace: last line of `setup`, `who` and `team`.
+pub const UPSELL: &str = "Add an always-on AI teammate: https://thelightbulb.company";
+
 /// `setup`'s closing words: what is connected (product names) and what to try next, with
 /// `cmd` the command name that works on this computer.
 pub fn summary(connected: &[&str], cmd: &str) -> String {
@@ -166,8 +169,31 @@ pub fn summary(connected: &[&str], cmd: &str) -> String {
     };
     let first = connected.first().copied().unwrap_or("Claude Code");
     format!(
-        "Lightbulb is on.\n  Connected: {list}\n\nTry it: open {first} in any folder and ask \"list my other sessions\".\nAdd your other computer or a teammate: {cmd} invite\nCheck everything: {cmd} doctor"
+        "Lightbulb is on.\n  Connected: {list}\n\nTry it: open {first} in any folder and ask \"list my other sessions\".\nAdd your other computer or a teammate: {cmd} invite\nCheck everything: {cmd} doctor\n{UPSELL}"
     )
+}
+
+/// The agent skill that teaches the tool, installed for agents with a skills folder.
+const SKILL: &str = include_str!("SKILL.md");
+/// Where it lives under an agent's home folder (`~/.claude`, `~/.codex`).
+const SKILL_FILE: &str = "skills/lightbulb-network/SKILL.md";
+
+/// Installs the skill under `agent_dir` (or, `remove`, deletes it and its folder when empty).
+pub(crate) fn skill(ctx: &Ctx, agent_dir: &Path, r: &mut AgentReport) -> Result<()> {
+    let file = agent_dir.join(SKILL_FILE);
+    if ctx.remove {
+        if fs::remove_file(&file).is_ok() {
+            r.wrote.push(file.clone());
+            let _ = fs::remove_dir(file.parent().unwrap()); // only if empty
+        }
+        return Ok(());
+    }
+    if fs::read_to_string(&file).is_ok_and(|t| t == SKILL) {
+        return Ok(());
+    }
+    write(&file, SKILL, false, r)?;
+    r.notes.push("skill lightbulb-network".into());
+    Ok(())
 }
 
 /// The agents setup wires: name, home directory, configure.
@@ -247,11 +273,11 @@ impl AgentReport {
             State::Failed { why, .. } => format!("{who}: not connected — {why}"),
             State::Removed => format!("{who}: removed"),
         };
-        if self.trusted {
-            line.push_str(". Its hook prompt was answered for you.");
-        }
         for note in &self.notes {
             line.push_str(&format!("; {note}"));
+        }
+        if self.trusted {
+            line.push_str(". Its hook prompt was answered for you.");
         }
         line
     }

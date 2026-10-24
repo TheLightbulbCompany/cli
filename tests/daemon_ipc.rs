@@ -183,6 +183,7 @@ async fn a_lock_loser_waits_and_takes_over() {
         std::process::Command::new(env!("CARGO_BIN_EXE_lightbulb"))
             .arg("daemon")
             .env("LIGHTBULB_CONNECT_DEBUG_NO_DEFAULT_RELAYS", "1")
+            .env("LIGHTBULB_CONNECT_DEBUG_NO_TELEMETRY", "1")
             .env(paths::HOME_ENV, dir.path())
             .env("LIGHTBULB_CONNECT_CLAUDE_HOME", dir.path())
             .stdout(std::process::Stdio::null())

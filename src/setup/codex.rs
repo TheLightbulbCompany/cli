@@ -79,6 +79,7 @@ pub(super) fn configure(ctx: &Ctx, r: &mut AgentReport) -> Result<Owner> {
         Ok(())
     })?;
     r.trusted |= fresh;
+    super::skill(ctx, &dir, r)?;
     Ok(owner)
 }
 

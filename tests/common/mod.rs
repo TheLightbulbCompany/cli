@@ -48,6 +48,7 @@ impl Env {
             .env("LIGHTBULB_CONNECT_CLAUDE_HOME", self.home.path())
             .env("LIGHTBULB_CONNECT_NO_LAUNCHCTL", "1")
             .env("LIGHTBULB_CONNECT_DEBUG_NO_DEFAULT_RELAYS", "1")
+            .env("LIGHTBULB_CONNECT_DEBUG_NO_TELEMETRY", "1")
             .env("HOME", self.home.path())
             .env("USER", "prasiddha");
         c
@@ -289,6 +290,7 @@ pub async fn instance(
         snapshot: snapshot.map(std::path::Path::to_path_buf),
         name: name.into(),
         sessions: vec![],
+        members: None,
     };
     let i = lightbulb::embed::start(home, opts).await;
     for (k, _) in &knobs {
@@ -643,6 +645,7 @@ pub fn member_with(
         .arg(&file)
         .env("HOME", dir)
         .env("LIGHTBULB_CONNECT_DEBUG_NO_DEFAULT_RELAYS", "1")
+        .env("LIGHTBULB_CONNECT_DEBUG_NO_TELEMETRY", "1")
         .env_remove("LIGHTBULB_CONNECT_PEERS")
         .stdin(Stdio::piped())
         .stdout(log.try_clone().unwrap())
@@ -679,4 +682,15 @@ pub fn line(sock: &std::path::Path, token: &str, op: &str, body: Value) -> Value
     let mut answer = String::new();
     BufReader::new(s).read_line(&mut answer).unwrap();
     serde_json::from_str(&answer).unwrap_or_else(|_| panic!("{op}: {answer:?}"))
+}
+
+/// `g` (a genesis by workspace instance `w`) marked as a workspace's own network, as
+/// `solo_genesis` writes it for an instance.
+pub fn workspace_genesis(
+    w: &lightbulb::identity::Identity,
+    g: &lightbulb::roster::Entry,
+) -> lightbulb::roster::Entry {
+    let mut body = g.body.clone();
+    body["cloud"] = true.into();
+    lightbulb::roster::Entry::signed(w, vec![], lightbulb::roster::Kind::Admit, body, g.at)
 }

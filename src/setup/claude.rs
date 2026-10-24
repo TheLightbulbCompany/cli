@@ -35,5 +35,6 @@ pub(super) fn configure(ctx: &Ctx, r: &mut AgentReport) -> Result<Owner> {
         owner = set_json_server(ctx, doc, "mcpServers", entry)?;
         Ok(())
     })?;
+    super::skill(ctx, &ctx.home.join(".claude"), r)?;
     Ok(owner)
 }

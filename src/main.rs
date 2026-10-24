@@ -30,7 +30,6 @@ Everyday:
 
 Team:
   team      The team and its computers
-  admin     Make a member an admin (or with --founder, the founder)
   remove    Remove a member
   leave     Leave the team
   policy    Who may message your sessions without asking
@@ -113,19 +112,13 @@ enum Command {
         /// An invite for one join, valid 24 hours.
         #[arg(long, conflicts_with = "open")]
         once: bool,
-        /// An invite whose joins need no Allow (founder and admins).
+        /// An invite whose joins need no Allow.
         #[arg(long)]
         open: bool,
     },
     /// Show the team and its members.
     Team,
-    /// Make a member an admin (founder only), or with --founder the founder in your place.
-    Admin {
-        name: String,
-        #[arg(long)]
-        founder: bool,
-    },
-    /// Remove a member (founder and admins); the invite is replaced.
+    /// Remove a member; the invite is replaced.
     Remove { name: String },
     /// Leave the team; this computer is on its own network again.
     Leave,
@@ -137,7 +130,7 @@ enum Command {
         /// The name you go by in the network (default: your user name).
         #[arg(long)]
         name: Option<String>,
-        /// `cloud`: join as a workspace member (tests and ops; needs `--proof`).
+        /// `cloud`: join as a workspace member (an embedded instance's; `--proof` is optional).
         #[arg(long, hide = true, default_value = "computer", value_parser = ["computer", "cloud"])]
         kind: String,
         /// The workspace member's `kind=workspace` proof.
@@ -170,20 +163,25 @@ enum Command {
         /// accept, hold or refuse.
         value: Option<String>,
     },
+    /// Anonymous usage counts: `on`, `off`, or (no argument) their state.
+    Telemetry {
+        #[arg(value_parser = ["on", "off", "status"])]
+        state: Option<String>,
+    },
     /// Show (`on`) or hide (`off`) the sessions under a folder from your teammates.
     Folder {
         path: String,
         #[arg(value_parser = ["on", "off"])]
         state: String,
     },
-    /// The relays this computer uses (with a URL, sets yours; from the founder or an admin,
-    /// the team's too). Relays carry encrypted traffic only, when no direct path exists.
+    /// The relays this computer uses (with a URL, sets yours and the team's too). Relays
+    /// carry encrypted traffic only, when no direct path exists.
     Relay {
         url: Option<String>,
         /// Clear the relay you set.
         #[arg(long, conflicts_with = "url")]
         clear: bool,
-        /// Only this computer, not the team (founder and admins set the team's by default).
+        /// Only this computer, not the team (otherwise the team's too).
         #[arg(long)]
         local: bool,
     },
@@ -304,7 +302,6 @@ fn run() -> lightbulb::Result<()> {
             _ => Invite::Reusable,
         })?),
         Command::Team => exit(cli::team()?),
-        Command::Admin { name, founder } => exit(cli::admin(&name, founder)?),
         Command::Remove { name } => exit(cli::remove(&name)?),
         Command::Leave => exit(cli::leave()?),
         Command::Join {
@@ -319,6 +316,10 @@ fn run() -> lightbulb::Result<()> {
         Command::Decline { request } => exit(cli::answer(&request, false, false)?),
         Command::Held => exit(cli::held()?),
         Command::Policy { person, value } => exit(cli::policy(person, value)?),
+        Command::Telemetry { state } => exit(lightbulb::telemetry::command(
+            &lightbulb::paths::state_dir(),
+            state.as_deref().filter(|s| *s != "status"),
+        )?),
         Command::Folder { path, state } => exit(cli::folder(&path, state == "on")?),
         Command::Relay { url, clear, local } => {
             exit(cli::relay(clear.then(String::new).or(url), local)?)

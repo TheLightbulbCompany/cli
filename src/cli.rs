@@ -2,6 +2,7 @@
 //! `daemon --install/--uninstall`, and the `lightbulb` alias.
 //! Each is a client of the daemon, like the hook.
 
+use crate::code::Via;
 use crate::daemon::ipc;
 use crate::daemon::net_ops::Invite;
 use crate::hook::{self, Conn};
@@ -22,6 +23,8 @@ const NO_SERVICE: &str = "Lightbulb's background service is macOS-only; run ligh
 const NO_LAUNCHCTL: &str = "LIGHTBULB_CONNECT_NO_LAUNCHCTL";
 /// Names a session the invocation speaks as (nothing sets it yet).
 const SESSION_ENV: &str = "LIGHTBULB_CONNECT_SESSION";
+/// (tests) Treat stdout as a terminal: a person at it (`install_running`).
+const TTY_ENV: &str = "LIGHTBULB_CONNECT_DEBUG_TTY";
 
 /// A "(tests)" environment override: read in debug builds only, as `net::Knobs::read` does.
 fn test_env(name: &str) -> Option<std::ffi::OsString> {
@@ -67,7 +70,6 @@ fn refusal(r: &Value) -> String {
     match code.unwrap_or("failed") {
         "not_member" => "This computer is not in the network.".into(),
         "not_a_person" => "Run this from your own terminal, not from an agent.".into(),
-        "not_admin" => "Only the founder and admins can do that.".into(),
         "name_taken" => "That name is taken by your other computer's session.".into(),
         c => format!("Lightbulb could not do that ({}).", c.replace('_', " ")),
     }
@@ -267,6 +269,7 @@ pub fn who(as_json: bool, all: bool) -> Result<i32> {
             .map(|s| columns.iter().map(|c| (c.1)(s)).collect()),
     );
     table(&rows);
+    println!("{}", setup::UPSELL);
     Ok(0)
 }
 
@@ -517,15 +520,14 @@ fn refuse(r: &Value, texts: &[(&str, String)]) -> Result<i32> {
 
 /// `invite [--new|--once|--open]`: this computer's invite line.
 pub fn invite(mode: Invite) -> Result<i32> {
-    if mode == Invite::Open && session_identity() {
-        eprintln!("invite --open is for people at a terminal");
-        return Ok(1);
-    }
     let r = connect()?.call("team.invite", json!({ "mode": mode }))?;
     if r["ok"] != true {
-        let text = "Only the founder and admins can make an open link.".to_string();
-        return refuse(&r, &[("not_admin", text)]);
+        return refuse(&r, &[]);
     }
+    crate::telemetry::send(
+        &paths::state_dir(),
+        crate::telemetry::Event::InviteCreated(crate::telemetry::Via::Line),
+    );
     let line = r["line"].as_str().unwrap_or_default();
     match mode {
         Invite::Once => {
@@ -542,10 +544,26 @@ pub fn invite(mode: Invite) -> Result<i32> {
         }
         _ => {}
     }
-    println!("Send this line to the person (or paste it on your other computer):");
+    // Code first (the easy way), then the link, then the full line.
+    // The form the invite leads with, for usage counts.
+    let _via = if r["code"].is_string() {
+        Via::Code
+    } else {
+        Via::Link
+    };
+    if let Some(code) = r["code"].as_str() {
+        println!(
+            "Tell them to run:  {} join {code}   (the code works for {} minutes)",
+            command(),
+            (r["code_secs"].as_i64().unwrap_or(600) + 59) / 60
+        );
+    }
+    println!(
+        "Or send this link:  {}",
+        r["link"].as_str().unwrap_or_default()
+    );
+    println!("If the code doesn't work, send this line (or paste it on your other computer):");
     println!("{line}");
-    println!("Replace NAME with the name they go by.");
-    println!("{}", r["app_link"].as_str().unwrap_or_default());
     Ok(0)
 }
 
@@ -553,14 +571,19 @@ pub fn invite(mode: Invite) -> Result<i32> {
 /// for its person to allow it. Hidden: `--kind cloud --proof <jws>`, a workspace member (the
 /// bridge joins in process; this is for tests and ops).
 pub fn join(link: &str, name: Option<String>, kind: &str, proof: Option<String>) -> Result<i32> {
+    // Which form the person was given; usage counts read it.
+    let (code, _via) = match crate::code::normalize(link) {
+        Some(c) => (Some(c), Via::Code),
+        None if link.trim().starts_with("https://") => (None, Via::Link),
+        None => (None, Via::Line),
+    };
     let name = name.unwrap_or_else(daemon::user_name);
     let mut conn = connect()?;
     // Said once a member took an `ask` ticket and is asking its person (`join_asking`), or
     // once the daemon rang a parked workspace's doorbell (`join_waking`); never before a
     // ticket it refuses at once, nor for an open link (it asks no one).
     let ticket = crate::ticket::decode(link).ok();
-    let has_wake = ticket.as_ref().is_some_and(|t| t.wake.is_some());
-    if ticket.is_some_and(|t| t.mode == "ask" || t.wake.is_some()) {
+    if code.is_some() || ticket.is_some_and(|t| t.mode == "ask" || t.wake.is_some()) {
         let mut asking = Conn::open()?;
         asking.call("subscribe", json!({}))?;
         asking.wait_up_to(Duration::from_secs(660))?;
@@ -575,12 +598,14 @@ pub fn join(link: &str, name: Option<String>, kind: &str, proof: Option<String>)
         });
     }
     conn.wait_up_to(Duration::from_secs(660))?;
-    let r = ask(
-        &mut conn,
-        "team.join",
-        json!({"ticket": link, "name": name, "kind": kind, "proof": proof}),
-    )?;
+    let body = match &code {
+        Some(c) => json!({"code": c, "name": name, "kind": kind, "proof": proof}),
+        None => json!({"ticket": link, "name": name, "kind": kind, "proof": proof}),
+    };
+    let r = ask(&mut conn, "team.join", body)?;
     let team = r["team"].as_str().unwrap_or_default();
+    // The ticket named a workspace (for a code, the daemon saw the ticket, not this process).
+    let has_wake = r["wake"] == true;
     let text = match (r["state"].as_str(), r["reason"].as_str()) {
         (Some("admitted"), _) => {
             let computer = ask(&mut conn, "identity.get", json!({}))?["computer"]
@@ -588,6 +613,10 @@ pub fn join(link: &str, name: Option<String>, kind: &str, proof: Option<String>)
                 .unwrap_or_default()
                 .to_string();
             let n = r["online"].as_u64().unwrap_or(1);
+            crate::telemetry::send(
+                &paths::state_dir(),
+                crate::telemetry::Event::NetworkJoined(crate::telemetry::Via::of_join(link)),
+            );
             println!("Connected as {name} ({computer}). Team \"{team}\": {n} computers online.");
             println!(
                 "Your agents here can now see and message the team's agents. Try: {} who --all",
@@ -599,8 +628,9 @@ pub fn join(link: &str, name: Option<String>, kind: &str, proof: Option<String>)
         (Some("waiting"), _) => "No one has answered yet. Run the same command again to keep asking.".to_string(),
         (_, Some(admission::ALREADY_IN_TEAM)) => format!("You are in \"{team}\". Leave it first: {} leave", command()),
         (_, Some(admission::NAME_TAKEN)) => format!(
-            "The name \"{name}\" is already used in this network. Try: {} join '{link}' --name {name}-2", command()
+            "The name \"{name}\" is already used in this network. Run the same command again with: --name {name}-2"
         ),
+        (_, Some(admission::NO_CODE)) => "That code did not work. Check the words. Ask them to open their computer, or send the full line instead. A code works once.".to_string(),
         (_, Some(admission::UNREACHABLE)) if has_wake => "Your workspace did not answer. Run the same command again in a minute. Your key is ready; nothing was lost.".to_string(),
         (_, Some(admission::UNREACHABLE)) => "No one from this network is online right now. Ask them to open their laptop, then run the same command again. Your key is ready; nothing was lost.".to_string(),
         (_, Some(admission::DECLINED)) => "Your request to join was declined.".to_string(),
@@ -665,8 +695,11 @@ pub fn answer(request: &str, allow: bool, always: bool) -> Result<i32> {
         return Ok(0);
     }
     let name = r["name"].as_str().unwrap_or_default();
+    let by = r["by"]
+        .as_str()
+        .map(|b| format!(" (approved by {})", cell(b)));
     match r["state"].as_str() {
-        Some("admitted") => println!("{name} joined the network."),
+        Some("admitted") => println!("{name} joined the network{}.", by.unwrap_or_default()),
         Some("declined") => println!("Declined {name}."),
         _ => {
             eprintln!(
@@ -915,34 +948,16 @@ pub fn team() -> Result<i32> {
         if m["online"] == false {
             line.push_str(" · offline");
         }
+        if m["by"].is_string() {
+            line.push_str(&format!(" · admitted by {}", f("by")));
+        }
         if members.iter().filter(|o| o["name"] == m["name"]).count() > 1 {
             line.push_str(&format!(" · address: {}", f("short")));
         }
         println!("{line}");
     }
     println!("Invite someone: {} invite", command());
-    Ok(0)
-}
-
-/// `admin <name> [--founder]`.
-pub fn admin(name: &str, founder: bool) -> Result<i32> {
-    let r = connect()?.call("team.admin", json!({ "member": name, "founder": founder }))?;
-    if r["ok"] != true {
-        let texts = [
-            (
-                "not_founder",
-                "Only the founder can make admins.".to_string(),
-            ),
-            ("not_found", format!("No member called {name}.")),
-        ];
-        return refuse(&r, &texts);
-    }
-    let n = r["name"].as_str().unwrap_or(name);
-    if founder {
-        println!("{n} is now the founder.");
-    } else {
-        println!("{n} can now remove members.");
-    }
+    println!("{}", setup::UPSELL);
     Ok(0)
 }
 
@@ -950,14 +965,7 @@ pub fn admin(name: &str, founder: bool) -> Result<i32> {
 pub fn remove(name: &str) -> Result<i32> {
     let r = connect()?.call("team.remove", json!({ "member": name }))?;
     if r["ok"] != true {
-        let ask = r["founder"].as_str().unwrap_or("the founder");
-        let texts = [
-            (
-                "not_admin",
-                format!("Only the founder and admins can remove computers. Ask {ask}."),
-            ),
-            ("not_found", format!("No member called {name}.")),
-        ];
+        let texts = [("not_found", format!("No member called {name}."))];
         return refuse(&r, &texts);
     }
     let n = r["name"].as_str().unwrap_or(name);
@@ -1031,11 +1039,7 @@ pub fn leave() -> Result<i32> {
     }
     let r = conn.call("team.leave", json!({}))?;
     if r["ok"] != true {
-        let text = format!(
-            "You are the founder. Name a new founder first: {} admin <name> --founder",
-            command()
-        );
-        return refuse(&r, &[("founder_must_transfer", text)]);
+        return refuse(&r, &[]);
     }
     println!("Left \"{name}\". This computer is on its own network again.");
     if r["told"] == false {
@@ -1045,7 +1049,7 @@ pub fn leave() -> Result<i32> {
 }
 
 /// `relay [<url> | --clear] [--local]`: sets this computer's relay to `set` (`""` clears it),
-/// and from the founder or an admin the team's unless `local`; alone, prints the relays in
+/// and the team's unless `local`; alone, prints the relays in
 /// effect and where they come from.
 pub fn relay(set: Option<String>, local: bool) -> Result<i32> {
     let mut conn = connect()?;
@@ -1106,8 +1110,9 @@ fn relay_host(url: &str) -> String {
 
 /// Puts this executable at the canonical path (unless it is already there with the same
 /// bytes) and `~/.local/bin/lightbulb` at that, replacing any link there; a regular file there
-/// is left alone. Returns what to say.
-pub fn install_alias(home: &Path, exe: &Path) -> Result<String> {
+/// is left alone. Returns what to say; only a person's own run (`person`) edits their shell
+/// profile (`command_lines`).
+pub fn install_alias(home: &Path, exe: &Path, person: bool) -> Result<String> {
     let canon = canonical(home);
     if exe != canon {
         let same = fs::read(&canon)
@@ -1126,10 +1131,10 @@ pub fn install_alias(home: &Path, exe: &Path) -> Result<String> {
     let short = home.join(".local/bin/lightbulb");
     match short_link(home) {
         Link::File => Ok("~/.local/bin/lightbulb belongs to another program and was left alone; put ~/.lightbulb/connect/bin on your PATH to type lightbulb.".into()),
-        Link::Ours => Ok(command_lines(home)),
+        Link::Ours => Ok(command_lines(home, person)),
         _ => {
             relink(&short, &canon)?;
-            Ok(command_lines(home))
+            Ok(command_lines(home, person))
         }
     }
 }
@@ -1165,6 +1170,9 @@ fn parse_version(v: &str) -> Option<(u64, u64, u64)> {
 /// `curl -fsSL url` (with `-I`: the headers only); its stdout, or an error naming the URL.
 fn curl(url: &str, head: bool) -> Result<Vec<u8>> {
     let mut c = Command::new("curl");
+    // -q first: ignore ~/.curlrc. Bounded, so a stalled download cannot hang the daemon's daily check.
+    c.arg("-q");
+    c.args(["--connect-timeout", "30", "--max-time", "600"]);
     c.arg(if head { "-fsSI" } else { "-fsSL" }).arg(url);
     let out = c.output().map_err(|e| format!("curl: {e}"))?;
     if !out.status.success() {
@@ -1190,6 +1198,180 @@ fn latest_tag(base: Option<&str>) -> Result<String> {
                 .then(|| v.trim().rsplit('/').next().unwrap_or("").to_string())
         })
         .ok_or_else(|| "Could not learn the latest version; nothing changed.".into())
+}
+
+/// The code requirement every release binary must meet: Apple-anchored, our Developer ID team.
+#[cfg(target_os = "macos")]
+const REQUIREMENT: &str = "=anchor apple generic and certificate leaf[subject.OU] = \"WZX4U3C22Y\"";
+
+/// Refuses a binary that is not validly signed by our team; the old binary is untouched.
+#[cfg(target_os = "macos")]
+fn codesign_args(bin: &Path) -> Vec<std::ffi::OsString> {
+    ["--verify", "--strict", "-R", REQUIREMENT]
+        .into_iter()
+        .map(Into::into)
+        .chain([bin.as_os_str().to_owned()])
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+fn verify_signature(bin: &Path) -> Result<()> {
+    let ok = Command::new("codesign")
+        .args(codesign_args(bin))
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if ok {
+        Ok(())
+    } else {
+        Err("The download is not signed by Lightbulb; nothing changed.".into())
+    }
+}
+
+/// Downloads release `tag` from `base`, checks its tarball against the release's `.sha256`, and
+/// only then makes it the canonical binary (`install_alias`). `Ok(false)`: the checksum did not
+/// match and nothing changed. Shared by `update` and the daemon's daily check.
+fn install_release(home: &Path, base: &str, tag: &str) -> Result<bool> {
+    let canon = canonical(home);
+    let bin = canon.parent().unwrap();
+    fs::create_dir_all(bin)?;
+    // Unpacked beside the canonical binary, so the final rename stays on one filesystem.
+    let dir = bin.join(format!(".update-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir)?;
+    let installed = (|| -> Result<bool> {
+        let sum = String::from_utf8_lossy(&curl(&format!("{base}/{ASSET}.sha256"), false)?)
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let tarball = curl(&format!("{base}/{ASSET}"), false)?;
+        if data_encoding::HEXLOWER.encode(&sha2::Sha256::digest(&tarball)) != sum {
+            return Ok(false);
+        }
+        fs::write(dir.join(ASSET), &tarball)?;
+        let ok = Command::new("tar")
+            .arg("-xzf")
+            .arg(dir.join(ASSET))
+            .arg("-C")
+            .arg(&dir)
+            .status()
+            .is_ok_and(|s| s.success());
+        let new = dir.join("lightbulb");
+        if !ok || !fs::symlink_metadata(&new).is_ok_and(|m| m.is_file()) {
+            return Err(
+                format!("The {tag} download holds no lightbulb binary; nothing changed.").into(),
+            );
+        }
+        // "(tests)" debug builds only: a stub binary has no signature.
+        #[cfg(target_os = "macos")]
+        {
+            #[cfg(debug_assertions)]
+            let skip = std::env::var_os("LIGHTBULB_ALLOW_UNSIGNED").is_some();
+            #[cfg(not(debug_assertions))]
+            let skip = false;
+            if !skip {
+                verify_signature(&new)?;
+            }
+        }
+        install_alias(home, &new, false)?;
+        Ok(true)
+    })();
+    let _ = fs::remove_dir_all(&dir);
+    installed
+}
+
+/// Set to `1` to turn the daemon's daily update off (with `auto_update = false` in config).
+const NO_AUTO_UPDATE: &str = "LIGHTBULB_NO_AUTO_UPDATE";
+/// The tag the last auto-update installed, in the state dir: a release that does not report the
+/// version it is tagged with is installed once, not on every restart.
+const AUTO_UPDATE_LAST: &str = "auto-update.last";
+
+/// Whether the daily update is on: the config setting, unless the environment turns it off.
+pub fn auto_update_on(config: &crate::config::Config) -> bool {
+    config.auto_update && std::env::var(NO_AUTO_UPDATE).as_deref() != Ok("1")
+}
+
+/// Whether `latest` is to be installed over `current`: strictly newer (never the same, never a
+/// downgrade, never something that is not a version) and not the one installed last time.
+fn should_auto_update(current: &str, latest: &str, last: Option<&str>) -> bool {
+    match (parse_version(current), parse_version(latest)) {
+        (Some(c), Some(l)) => l > c && last.and_then(parse_version) != Some(l),
+        _ => false,
+    }
+}
+
+/// The version whose `setup` last ran, in the state dir.
+const SETUP_VERSION: &str = "setup-version";
+
+/// Whether `setup` must run again: the binary is not the version that last ran it.
+fn setup_due(last: Option<&str>, current: &str) -> bool {
+    last.map(str::trim) != Some(current)
+}
+
+/// At a daemon's start on the real install: after a version change (an auto-update), runs the
+/// canonical binary's `setup` once so hooks, MCP entries and the skill follow it. The marker is
+/// written first, so a failing setup is not retried on every start.
+pub fn refresh_setup(dir: &Path) {
+    let Ok(home) = home() else { return };
+    if !is_installed_exe(&home) {
+        return;
+    }
+    let last = fs::read_to_string(dir.join(SETUP_VERSION)).ok();
+    if !setup_due(last.as_deref(), VERSION) || fs::write(dir.join(SETUP_VERSION), VERSION).is_err()
+    {
+        return;
+    }
+    let child = Command::new(canonical(&home))
+        .arg("setup")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    if let Ok(mut c) = child {
+        std::thread::spawn(move || c.wait());
+    }
+}
+
+/// Whether this process is the real install's canonical binary (not a side-by-side state dir,
+/// not a dev or `cargo run` build).
+fn is_installed_exe(home: &Path) -> bool {
+    std::env::var_os(paths::HOME_ENV).is_none()
+        && std::env::current_exe()
+            .and_then(|e| e.canonicalize())
+            .ok()
+            .zip(canonical(home).canonicalize().ok())
+            .is_some_and(|(a, b)| a == b)
+}
+
+/// The daemon's daily check: installs the latest release when it is newer than this binary, by
+/// the same checksum-verified path as `update`. `Ok(true)`: installed, the daemon should exit so
+/// its service manager starts the new binary. Only the real install is touched (not a
+/// side-by-side state dir, not a binary run from elsewhere); a Linux install has no service to
+/// restart, so it only says a release exists.
+pub fn auto_update(dir: &Path) -> Result<bool> {
+    let home = home()?;
+    if !is_installed_exe(&home) {
+        return Ok(false);
+    }
+    let base = test_env(RELEASE_BASE).map(|b| b.to_string_lossy().into_owned());
+    let tag = latest_tag(base.as_deref())?;
+    let last = fs::read_to_string(dir.join(AUTO_UPDATE_LAST)).ok();
+    if !should_auto_update(VERSION, &tag, last.as_deref().map(str::trim)) {
+        return Ok(false);
+    }
+    let want = parse_version(&tag).ok_or("not a version")?;
+    let tag = format!("v{}.{}.{}", want.0, want.1, want.2);
+    if !cfg!(target_os = "macos") {
+        eprintln!("auto-update: {tag} is available; run: lightbulb update");
+        return Ok(false);
+    }
+    let base = base.unwrap_or_else(|| format!("{RELEASES}/download/{tag}"));
+    if !install_release(&home, &base, &tag)? {
+        return Err("checksum mismatch; nothing changed".into());
+    }
+    eprintln!("auto-update: installed {tag}; restarting");
+    let _ = fs::write(dir.join(AUTO_UPDATE_LAST), &tag);
+    Ok(true)
 }
 
 /// `update [--version vX.Y.Z]`: installs that release (default: the latest) over the canonical
@@ -1219,41 +1401,7 @@ pub fn update(version: Option<String>) -> Result<i32> {
 
     let home = home()?;
     let canon = canonical(&home);
-    let bin = canon.parent().unwrap();
-    fs::create_dir_all(bin)?;
-    // Unpacked beside the canonical binary, so the final rename stays on one filesystem.
-    let dir = bin.join(format!(".update-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir)?;
-    let installed = (|| -> Result<bool> {
-        let sum = String::from_utf8_lossy(&curl(&format!("{base}/{ASSET}.sha256"), false)?)
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        let tarball = curl(&format!("{base}/{ASSET}"), false)?;
-        if data_encoding::HEXLOWER.encode(&sha2::Sha256::digest(&tarball)) != sum {
-            return Ok(false);
-        }
-        fs::write(dir.join(ASSET), &tarball)?;
-        let ok = Command::new("tar")
-            .arg("-xzf")
-            .arg(dir.join(ASSET))
-            .arg("-C")
-            .arg(&dir)
-            .status()
-            .is_ok_and(|s| s.success());
-        let new = dir.join("lightbulb");
-        if !ok || !new.is_file() {
-            return Err(
-                format!("The {tag} download holds no lightbulb binary; nothing changed.").into(),
-            );
-        }
-        install_alias(&home, &new)?;
-        Ok(true)
-    })();
-    let _ = fs::remove_dir_all(&dir);
-    if !installed? {
+    if !install_release(&home, &base, &tag)? {
         eprintln!("Checksum mismatch; nothing changed.");
         return Ok(1);
     }
@@ -1266,17 +1414,72 @@ pub fn update(version: Option<String>) -> Result<i32> {
     .into())
 }
 
-/// `Command: lightbulb`, plus the PATH line when `~/.local/bin` is not on this shell's PATH
-/// (a fresh Mac: the curl install lands there, and nothing else puts it on PATH).
-fn command_lines(home: &Path) -> String {
+/// `Command: lightbulb`. When `~/.local/bin` is not on this shell's PATH (a fresh Mac: the curl
+/// install lands there and nothing else puts it on PATH), the PATH line is added to the login
+/// shell's profile once, in a marked block, and the person is told to open a new terminal.
+/// Only on a `person`'s own run: an update or the daemon only says which line to add.
+fn command_lines(home: &Path, person: bool) -> String {
     let bin = home.join(".local/bin");
     let on_path =
         std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d == bin));
     if on_path {
-        "Command: lightbulb".into()
-    } else {
-        "Command: lightbulb\nAdd this line to your shell profile (~/.zshrc), then open a new terminal: export PATH=\"$HOME/.local/bin:$PATH\"".into()
+        return "Command: lightbulb".into();
     }
+    let profile = shell_profile(home);
+    let shown = format!(
+        "~/{}",
+        profile.strip_prefix(home).unwrap_or(&profile).display()
+    );
+    if person && add_to_path(&profile).is_ok() {
+        format!(
+            "Command: lightbulb (added ~/.local/bin to your PATH in {shown}; open a new terminal, or run {} now)",
+            canonical(home).display()
+        )
+    } else {
+        format!(
+            "Command: lightbulb\nAdd this line to {shown}, then open a new terminal: {PATH_LINE}"
+        )
+    }
+}
+
+const PATH_LINE: &str = "export PATH=\"$HOME/.local/bin:$PATH\"";
+const PATH_MARK: &str = "# Added by Lightbulb";
+
+/// The login shell's profile: `~/.zshrc` for zsh (the Mac default), `~/.bash_profile` on a Mac
+/// and `~/.bashrc` on Linux for bash, else `~/.profile`.
+fn shell_profile(home: &Path) -> PathBuf {
+    let shell = std::env::var("SHELL").unwrap_or_default();
+    let name = match shell.rsplit('/').next().unwrap_or_default() {
+        "zsh" => ".zshrc",
+        "bash" if cfg!(target_os = "macos") => ".bash_profile",
+        "bash" => ".bashrc",
+        _ => ".profile",
+    };
+    home.join(name)
+}
+
+/// Appends the marked PATH block to `profile` unless it already mentions `.local/bin`; never
+/// through a symlink (a dotfiles repo's file is the person's to edit).
+fn add_to_path(profile: &Path) -> Result<()> {
+    if fs::symlink_metadata(profile).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err("a symlinked profile".into());
+    }
+    let had = fs::read_to_string(profile).unwrap_or_default();
+    if had.contains(PATH_MARK) || had.contains(".local/bin") {
+        return Ok(());
+    }
+    let sep = if had.is_empty() || had.ends_with('\n') {
+        ""
+    } else {
+        "\n"
+    };
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(profile)?;
+    use std::io::Write;
+    write!(f, "{sep}\n{PATH_MARK}\n{PATH_LINE}\n")?;
+    Ok(())
 }
 
 /// Makes `path` a symlink to `target`, replacing whatever is there (atomically: a link made
@@ -1333,10 +1536,13 @@ fn plist(exe: &Path, log: &Path) -> String {
     )
 }
 
-/// Puts the running binary at the canonical path and the alias at that, printing the line.
+/// Puts the running binary at the canonical path and the alias at that, printing the line; a
+/// person at a terminal may get the PATH line added to their profile.
 pub fn install_running(home: &Path) -> Result<()> {
+    use std::io::IsTerminal;
     let exe = std::env::current_exe()?.canonicalize()?;
-    println!("{}", install_alias(home, &exe)?);
+    let person = std::io::stdout().is_terminal() || test_env(TTY_ENV).is_some();
+    println!("{}", install_alias(home, &exe, person)?);
     Ok(())
 }
 
@@ -1542,6 +1748,17 @@ pub fn doctor() -> Result<i32> {
         named.err().unwrap_or_default(),
         &setup,
     );
+    let on = crate::config::Config::load(&dir).is_ok_and(|c| auto_update_on(&c));
+    row("Auto-update", true, if on { "on" } else { "off" }, "", "");
+    crate::telemetry::sync_env_optout(&dir);
+    let counts = crate::telemetry::active(&dir);
+    row(
+        "Usage counts",
+        true,
+        if counts { "on" } else { "off" },
+        "",
+        "",
+    );
     for (name, state, _) in &rows {
         println!("{name:<20} {state}");
     }
@@ -1622,17 +1839,74 @@ pub fn setup(
     if !fixes.is_empty() {
         return Ok(1);
     }
+    if crate::telemetry::on_setup(&paths::state_dir()) {
+        println!("{}\n", crate::telemetry::NOTICE);
+    }
     let connected: Vec<String> = (report.agents.iter())
         .filter(|a| a.connected())
         .map(|a| a.product())
         .collect();
     let connected: Vec<&str> = connected.iter().map(String::as_str).collect();
     println!("\n{}", setup::summary(&connected, command()));
+    let _ = fs::write(paths::state_path().join(SETUP_VERSION), VERSION);
     Ok(0)
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_signature_requirement_is_pinned_to_our_team() {
+        let bin = std::path::Path::new("/x/lightbulb");
+        assert_eq!(
+            super::REQUIREMENT,
+            "=anchor apple generic and certificate leaf[subject.OU] = \"WZX4U3C22Y\""
+        );
+        let want: Vec<std::ffi::OsString> = [
+            "--verify",
+            "--strict",
+            "-R",
+            super::REQUIREMENT,
+            "/x/lightbulb",
+        ]
+        .map(Into::into)
+        .to_vec();
+        assert_eq!(super::codesign_args(bin), want);
+        // Apple-signed, but not by our team.
+        assert!(super::verify_signature(std::path::Path::new("/bin/ls")).is_err());
+    }
+
+    #[test]
+    fn auto_update_installs_only_a_strictly_newer_release_once() {
+        use super::should_auto_update as go;
+        assert!(go("0.3.2", "v0.3.3", None));
+        assert!(go("0.3.2", "v0.10.0", None), "versions compare as numbers");
+        assert!(!go("0.3.3", "v0.3.3", None), "same version");
+        assert!(!go("0.3.3", "v0.3.2", None), "never a downgrade");
+        assert!(!go("0.3.2", "latest", None) && !go("0.3.2", "v0.3.3; rm", None));
+        assert!(
+            !go("0.3.2", "v0.3.3", Some("v0.3.3")),
+            "installed last time"
+        );
+        assert!(go("0.3.2", "v0.3.4", Some("v0.3.3")));
+    }
+
+    #[test]
+    fn setup_reruns_after_a_version_change() {
+        assert!(super::setup_due(None, "0.3.3"));
+        assert!(super::setup_due(Some("0.3.2\n"), "0.3.3"));
+        assert!(!super::setup_due(Some("0.3.3\n"), "0.3.3"));
+    }
+
+    #[test]
+    fn auto_update_is_off_by_config() {
+        let mut c = crate::config::Config::default();
+        std::env::remove_var(super::NO_AUTO_UPDATE);
+        assert!(super::auto_update_on(&c));
+        c.auto_update = false;
+        assert!(!super::auto_update_on(&c));
+    }
+
     #[test]
     fn a_title_with_control_characters_prints_as_plain_text() {
         let title = "fix\u{1b}[2J\u{1b}]8;;http://x\u{7}\tit\u{85}\u{2066}now\r\nok";

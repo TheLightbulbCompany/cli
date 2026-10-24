@@ -15,18 +15,57 @@ The same key is the computer's network identity: other computers dial it by this
 
 ## The signed roster
 
-The team's membership is a log of entries: who was admitted, removed, made an admin or the
-founder, who left, which invites exist, and the team's relay and name. Each entry is signed by
+The team's membership is a log of entries: who was admitted (and by whom), removed, who left, which invites exist, and the team's relay and name. Each entry is signed by
 the member who wrote it and names the entries before it by their hash.
 
 Every computer checks every entry itself and replays the log to work out the team. An entry
-counts only if its signer had the right to write it: for example, only the founder or an admin
-can remove a member, and only the founder can make an admin. A new member checks every entry it
+counts only if its signer had the right to write it: every network is flat, so any computer
+member can invite, admit and remove others (not itself), and nobody removes a cloud founder. A new member checks every entry it
 receives before it accepts the team. No server holds or decides the membership.
 
 Invites are signed by the computer that made them. A join is checked against the roster: the
 invite must still be live (not replaced, not ended by a removal, not a used one-time invite) and
 not expired.
+
+In a flat network any computer member can mint a one-time link and so add a cloud member
+that is not verified (shown "(not verified)"). Accepted: members are trusted.
+
+A member's person id (which person's computer it is) is its own key unless something vouches
+for another: a verified sign-in proof, or a workspace's cloud member admitting a computer
+through the one-time person link it made for that person. Only a cloud member's person link
+counts (the workspace instance that founded its network, or a cloud member with its workspace
+proof); one signed by any other member is dropped, so no member can admit a key as someone
+else's computer. The founder's workspace marker is self-declared until issuer proofs ship, so a
+vouched id must be an account id (such as `user_…`) and never a member key: a hostile
+workspace-style network can only vouch account ids, never a plain computer's own key. A
+computer counts a message as its own person's only from itself or from a computer with the
+same account id. What is left until issuer proofs ship: anyone can run a workspace-style
+network (`lightbulb member`), and if you join one with a person line it gave you, it chooses
+your account id there and can vouch one of its own computers as that same id, so that
+computer's messages reach you without a prompt. Only join with a person line from a workspace
+you trust; an ordinary invite line or code never does this.
+
+### Invite codes
+
+`lightbulb invite` also prints a four-word code (EFF short wordlist, about 41 bits). The code
+is a convenience; the full line or link is the strongest path. While the inviter's daemon
+runs, a second endpoint whose key is derived from the code (Argon2id, 64 MiB, 3 passes, so
+each guess is costly) serves the full invite once. It closes after the first hand-off, after 5
+bad callers, after 10 minutes, or when the invite expires, and nothing listens when no code
+invite is live. The code never serves the printed invite: it serves a fresh one-time invite
+made for it alone, which asks the inviter, so a join by code always needs the inviter's Allow,
+even when the printed link is open or reusable. The
+code is never logged, but it appears in shell history and `ps` on the joiner's computer; it
+is dead once used or after 10 minutes. 5 junk connections can close a live code (denial of
+service only; fall back to the full line).
+
+The key is also salted with the current 10-minute window, so no one can build a table of
+every code's key ahead of time: a guess only counts for the window it was made in. What is
+left: someone who sees the code endpoint on a relay and can run about 2^41 Argon2id guesses
+inside one 10-minute window could pose as the inviter and hand the joiner a different
+network's invite. That takes on the order of a billion cores at once, so we accept it for
+now; a password-authenticated key exchange (as in magic-wormhole) would close it, and the
+full line never had it.
 
 ## Transport encryption
 
@@ -65,12 +104,12 @@ answer it (Allow or Decline in a dialog, or `lightbulb approve H<n>` / `decline 
 - Allow lets that person's later messages through (`policy <person> accept`).
 - `policy <person> hold` asks each time; `policy <person> refuse` refuses them.
 
-A join request is held the same way, unless the founder or an admin made the invite with
-`invite --open`.
+A join request is held the same way, unless the invite was made with `invite --open`. An approval records who gave it, down to the
+session (`approved by <member>/<session>`), shown on receipts and as "admitted by" in `lightbulb team`.
 
-Only a person at a terminal can answer a hold, change membership or change the relay. A command
-run from an agent's shell or tools is refused. This stops an agent's ordinary tools from
-approving things for you. It does not stop a program that you run yourself as your own user.
+An agent may invite, join, approve a join and answer a hold; its answer is recorded under its
+session, and its skill tells it to ask you first. Only a person at a terminal can remove a member,
+leave a network or change the relay: a command run from an agent's shell or tools is refused. It does not stop a program that you run yourself as your own user.
 
 ## Loop limits
 
@@ -135,14 +174,20 @@ conversations, only the messages sent to them. Hide a folder with `lightbulb fol
 
 ## Telemetry and network requests
 
-Telemetry: none. Lightbulb sends no usage data, no crash reports and no analytics.
+Lightbulb sends anonymous usage counts (see "Usage counts" in the README; off with `lightbulb telemetry off`, or `DO_NOT_TRACK=1` / `LIGHTBULB_NO_TELEMETRY=1`, which always win). It sends no crash reports and no message content. The first `setup` sends one `cli_installed` event before it prints the opt-out notice; set one of those variables before installing to send nothing at all.
 
-The engine makes no network call to Lightbulb: no relay list, no sign-in, no telemetry. It talks
+Apart from those counts, the engine makes no network call to Lightbulb: no relay list, no sign-in. It talks
 only to your teammates' computers and, when no direct path exists, to the relays (the iroh
 project's public relays unless you or your team set one).
 
-The install script, `npm install` and `lightbulb update` (when you run it) download the release
-from GitHub.
+The install script, `npm install`, `lightbulb update` and the daemon's daily update check
+download the release from GitHub. An update checks the tarball's SHA-256 against the `.sha256`
+file of the same GitHub release: that proves the download is intact, with the same trust as
+the install script (whoever controls the release controls both). On macOS an update also
+requires the new binary to be signed with Lightbulb's Developer ID (team `WZX4U3C22Y`); on
+Linux the checksum is the only check. The background daily update never edits your shell
+profile. Only a command you run at a terminal (`setup`, or `update` there) adds `~/.local/bin`
+to your PATH, once, and never through a symlinked profile.
 
 ## Reporting a vulnerability
 

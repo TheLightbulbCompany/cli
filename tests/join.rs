@@ -133,9 +133,7 @@ fn ask_ticket_admits_only_after_allow() {
     // `$USER` is A's name too.
     let o = b.detached(&[EXE, "join", &t], "");
     assert!(!o.status.success());
-    let taken = format!(
-        "The name \"prasiddha\" is already used in this network. Try: lightbulb join '{t}' --name prasiddha-2\n"
-    );
+    let taken = "The name \"prasiddha\" is already used in this network. Run the same command again with: --name prasiddha-2\n";
     assert_eq!(err(&o), taken);
     // Refused at once: it never said it was asking anyone.
     assert_eq!(out(&o), "");
@@ -522,7 +520,7 @@ fn admitted_candidate_that_lost_the_roster_rejoins() {
 }
 
 #[test]
-fn team_join_is_person_only() {
+fn an_agent_may_join() {
     let (a, b) = (Env::new(), Env::new());
     a.daemon(false, "", &[dialog("Allow")]);
     let t = invite(&a, "reusable");
@@ -532,12 +530,8 @@ fn team_join_is_person_only() {
     let pin = ("LIGHTBULB_CONNECT_HOOK_CALLER", format!("{me}:{birth}"));
     b.daemon(false, "", &[peers(&[&a]), pin]);
     let r = b.ask(json!({"id": 1, "op": "team.join", "ticket": t, "name": "bob"}));
-    assert_eq!(
-        (r["error"].as_str(), r["reason"].as_str()),
-        (Some("bad_request"), Some("not_a_person")),
-        "{r}"
-    );
-    assert_eq!((members(&a).len(), members(&b).len()), (1, 1));
+    assert_eq!(r["state"], "admitted", "{r}");
+    assert_eq!((members(&a).len(), members(&b).len()), (2, 2));
 }
 
 #[test]
@@ -587,6 +581,35 @@ async fn a_proof_that_expires_while_its_dialog_waits_is_refused_at_allow() {
     );
     assert_eq!(r["state"], "refused", "{r}");
     assert_eq!(members(&a).len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_agent_may_approve_a_join_and_the_answer_names_it() {
+    // A's daemon takes this test process for an agent.
+    let a = Env::new();
+    let me = std::process::id();
+    let birth = lightbulb::os::process(me).unwrap().birth_micros;
+    let pin = ("LIGHTBULB_CONNECT_HOOK_CALLER", format!("{me}:{birth}"));
+    a.daemon(false, "", &[dialog(""), pin]);
+    let t = ticket::decode(&invite(&a, "reusable")).unwrap();
+    let cand = identity();
+    let req = admission::request(&cand, &t, "carol", "mbp", "computer", None);
+    let _p = Played::send(&a, &cand, &req).await;
+    until(10, "J1 is listed", || requests(&a).len() == 1);
+    a.ask(
+        json!({"id": 1, "op": "register", "session": {"provider": "claude",
+        "conversation": "c1", "pid": me, "birth_micros": birth, "cwd": "/tmp"}}),
+    );
+    let r = a.ask(json!({"id": 1, "op": "team.admit", "request": "J1", "verdict": "allow"}));
+    assert_eq!(r["state"], "admitted", "{r}");
+    assert_eq!(r["by"], format!("{}/claude-1", a.short()), "{r}");
+    assert_eq!(members(&a).len(), 2);
+    // The signed `admit` carries the approver.
+    let entries = roster::entries(&a.store()).unwrap();
+    assert!(
+        entries.iter().any(|e| e.body["by"] == r["by"]),
+        "{entries:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

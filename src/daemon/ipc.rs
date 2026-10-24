@@ -159,6 +159,19 @@ impl Caller {
     pub fn is_person(self) -> bool {
         matches!(self, Caller::Socket(Some(pid)) if super::net_ops::person_only(pid))
     }
+
+    /// Who is asking, for the ops an agent may also run: `local` for a person, else the agent
+    /// session above the socket peer (`<member>/<handle>`, `agent` before it registers). `None`
+    /// for a caller that cannot be resolved (no pid, a failed lookup) and for an instance's.
+    pub fn actor(self, store: &crate::store::Store) -> Option<String> {
+        let Caller::Socket(Some(pid)) = self else {
+            return None;
+        };
+        if super::net_ops::person_only(pid) {
+            return Some("local".into());
+        }
+        super::net_ops::agent_session(store, pid)
+    }
 }
 
 /// What an instance does not do: it mints no link but a person one (`net_ops`), its settings
@@ -305,7 +318,9 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
             }
         }
         // An agent fed a hostile link must not move this computer into another network.
-        "team.join" if !for_a_person() => refused(id, "not_a_person"),
+        "team.join" if !instance && caller.actor(&daemon.store.lock().unwrap()).is_none() => {
+            refused(id, "not_a_person")
+        }
         "team.join" => crate::admission::join(id, body, daemon).await,
         // `mark_read {key}` -> `{}`: `key`'s session took a step (an MCP tool call), so the mail
         // delivered to it before now has been seen.
@@ -336,6 +351,13 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
         }
         "share.grant" | "stream.open" | "stream.send" | "stream.close" => {
             crate::streams::handle(id, op, body, daemon, caller).await
+        }
+        "team.invite" => {
+            let mut r = super::net_ops::handle(id, op, body, daemon, caller);
+            if r.ok {
+                crate::code::offer(daemon, &mut r.body).await;
+            }
+            r
         }
         op => super::net_ops::handle(id, op, body, daemon, caller),
     }

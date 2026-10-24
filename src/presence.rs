@@ -496,6 +496,7 @@ pub fn directory(d: &Daemon, query: Option<&str>) -> Value {
             admitted_at: 0,
             proof: None,
             workspace: None,
+            by: None,
         });
         (my_person(d, &t.roster), own)
     };

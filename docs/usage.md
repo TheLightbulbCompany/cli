@@ -39,7 +39,7 @@ Run `lightbulb <command> --help` for the options of each one.
 | `setup --remove` | Take out only what `setup` wrote. Backups are left as they are. |
 | `doctor` | Check the service, the local network, the state folder and each agent, and say how to fix what is not right. |
 | `who` | List the sessions on this computer. `who --all` adds your teammates' sessions. |
-| `invite` | Print the join command that adds your other computer or a teammate (`lightbulb join '<ticket>' --name NAME`; replace `NAME` with the name they go by), and a `lightbulb://join/…` link. `--once`: one join, valid 24 hours. `--new`: a new invite; every earlier one from this computer, `--open` and `--once` ones too, stops working. |
+| `invite` | Print a four-word code (good for 10 minutes), a link, and the join command (`lightbulb join '<ticket>'`) that add your other computer or a teammate. `--once`: one join, valid 24 hours. `--new`: a new invite; every earlier one from this computer, `--open` and `--once` ones too, stops working. |
 | `join '<ticket>'` | Join the team the invite is for. Takes the ticket or the whole `lightbulb://join/…` link. `--name <name>` sets the name you go by (default: your user name). The computer must be on its own first. |
 | `approve J1` / `approve H1` | Allow a join request (`J`) or a held message (`H`). |
 | `decline J1` / `decline H1` | Decline one. |
@@ -49,10 +49,9 @@ Run `lightbulb <command> --help` for the options of each one.
 | `receipt <id>` | Whether a message you sent arrived. `--json` for the raw receipt. |
 | `policy` | Who may message your sessions without asking. `policy <person> accept\|hold\|refuse` sets it. |
 | `team` | The team and its computers. |
-| `admin <name>` | Make a member an admin (founder only). `--founder` makes them the founder in your place. |
-| `remove <name>` | Remove a member (founder and admins). The invite is replaced. |
+| `remove <name>` | Remove a member. The invite is replaced. |
 | `leave` | Leave the team. This computer is on its own network again. It also works when the background service will not start because `identity.key` no longer matches the team record. |
-| `relay [<url>]` | Show the relays this computer uses, or set one. With nothing set it uses the iroh project's public relays (`default`). From the founder or an admin it sets the team's relay; `--local` sets only this computer's; `--clear` clears yours and goes back to the default. Relays carry encrypted bytes only. Lightbulb fetches no relay list of its own. |
+| `relay [<url>]` | Show the relays this computer uses, or set one. With nothing set it uses the iroh project's public relays (`default`). It sets the team's relay; `--local` sets only this computer's; `--clear` clears yours and goes back to the default. Relays carry encrypted bytes only. Lightbulb fetches no relay list of its own. |
 | `folder <path> on\|off` | Show or hide the sessions under a folder from your teammates. |
 | `version` | Print the version. |
 
@@ -76,8 +75,8 @@ A held message waits up to 7 days for an answer. To change a decision later, use
 `policy sam hold` asks again each time, `policy sam refuse` refuses them, `policy sam accept`
 lets them through. Your own computers always get through.
 
-Join requests work the same way: `invite` links ask you before anyone joins (`J<n>`), unless the
-founder or an admin made the link with `invite --open`.
+Join requests work the same way: `invite` links ask you before anyone joins (`J<n>`), unless
+the link was made with `invite --open`.
 
 ## What teammates can see
 
@@ -92,7 +91,7 @@ encrypted between the two computers, and their text is not written to the log. A
 text is deleted from `state.db` once nothing waits on it (read, refused or expired); messages to
 your own terminal keep theirs.
 
-The engine makes no network call to Lightbulb: no relay list, no sign-in, no telemetry. It talks
+Apart from anonymous usage counts (`lightbulb telemetry off`), the engine makes no network call to Lightbulb: no relay list, no sign-in. It talks
 only to your teammates' computers and, when no direct path exists, to the relays. (`update`,
 when you run it, downloads from this project's GitHub releases.)
 

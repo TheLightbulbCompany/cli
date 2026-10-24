@@ -77,6 +77,12 @@ pub fn key_bytes(key: &str) -> Option<[u8; 32]> {
     BASE32.decode(key.as_bytes()).ok()?.try_into().ok()
 }
 
+/// Whether `s`, in any case, spells a member key: the form an unverified computer's own person
+/// id takes, so never a vouched account id (`roster::own_person`, `policy::decide`).
+pub fn is_key(s: &str) -> bool {
+    key_bytes(&s.to_ascii_lowercase()).is_some()
+}
+
 /// Whether `sig` is `key`'s signature over `v` (its own `sig` field left out).
 pub fn verify(key: &str, v: &Value, sig: &str) -> bool {
     // `BASE32` is lowercase only: an uppercase spelling is another (invalid) key.

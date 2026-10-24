@@ -79,7 +79,7 @@ pub struct Knobs {
     /// How long the outbox keeps trying (`outbox::TTL_S`), or `LIGHTBULB_CONNECT_DEBUG_OUTBOX_S`.
     outbox_s: u64,
     /// `LIGHTBULB_CONNECT_DEBUG_RELAY_ONLY=1`: no direct (IP) transport, only the relays.
-    relay_only: bool,
+    pub(crate) relay_only: bool,
     /// `LIGHTBULB_CONNECT_DEBUG_NO_DEFAULT_RELAYS=1`: no public relays when nothing else is
     /// set (direct only), so a test never reaches the internet.
     no_default_relays: bool,
@@ -817,8 +817,8 @@ impl Net {
         }
     }
 
-    /// After a failed dial of `key` (a parked workspace member): when it is the founder and
-    /// published a doorbell (`Roster::wake`), mail to it is due and the backoff allows
+    /// After a failed dial of `key` (a parked workspace member): when it published a doorbell
+    /// (`Roster::wakes`, its own), mail to it is due and the backoff allows
     /// (`doorbell_wait`), one `curl` rings it in the background. A computer only.
     fn ring(&self, key: &str) {
         let d = &self.0.daemon;
@@ -828,9 +828,9 @@ impl Net {
         let wake = {
             let team = d.team.lock().unwrap();
             let r = &team.roster;
-            match (r.founder(), &r.wake) {
-                (Some(f), Some(w)) if f.key == key => w.clone(),
-                _ => return,
+            match r.wakes.get(key) {
+                Some(w) => w.clone(),
+                None => return,
             }
         };
         let due = d.store.lock().unwrap().outbox_due(&[key.into()], i64::MAX);
@@ -1119,19 +1119,15 @@ fn receive(d: &Arc<Daemon>, key: &str, env: &Frame, tx: &Tx) {
         let _ = tx.send((ack, None));
     };
     // An instance's sessions are the ones it declared: new mail for any other is refused.
-    let declared = d.cloud.as_ref().map(|c| c.declared().ids);
+    let declared = d.cloud.as_ref().map(|c| c.declared());
+    let (ids, members) = (
+        declared.as_ref().map(|c| &*c.ids),
+        declared.as_ref().and_then(|c| c.members.as_deref()),
+    );
     let store = d.store.lock().unwrap();
     let me = &d.identity.short;
     let now = ipc::now();
-    match mail::receive(
-        &store,
-        env,
-        peer,
-        &team.roster,
-        me,
-        declared.as_deref(),
-        now,
-    ) {
+    match mail::receive(&store, env, peer, &team.roster, me, ids, members, now) {
         Ok(mail::Answer {
             state,
             reason,
@@ -1428,7 +1424,7 @@ pub(crate) fn pages(entries: Vec<Entry>) -> Vec<Frame> {
 
 /// Relay `url`: iroh's own config for one of its public relays (QUIC address discovery on);
 /// any other without it (off in Phase 1: our relays serve HTTPS only).
-fn relay_config(url: RelayUrl) -> iroh::RelayConfig {
+pub(crate) fn relay_config(url: RelayUrl) -> iroh::RelayConfig {
     let public = iroh::defaults::prod::default_relay_map().get(&url);
     public.map_or_else(|| iroh::RelayConfig::new(url, None), |c| (*c).clone())
 }

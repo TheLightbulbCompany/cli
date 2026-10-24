@@ -29,6 +29,7 @@ impl Env {
             .env("LIGHTBULB_CONNECT_CLAUDE_HOME", self.home.path())
             .env("LIGHTBULB_CONNECT_NO_LAUNCHCTL", "1")
             .env("LIGHTBULB_CONNECT_DEBUG_NO_DEFAULT_RELAYS", "1")
+            .env("LIGHTBULB_CONNECT_DEBUG_NO_TELEMETRY", "1")
             .env("HOME", self.home.path())
             .env_remove("LIGHTBULB_CONNECT_SESSION")
             .env_remove("LIGHTBULB_CONNECT_HOOK_CALLER");
@@ -444,7 +445,7 @@ fn daemon_install_writes_the_plist_and_alias_without_touching_a_foreign_file() {
     // A symlink pointing elsewhere is replaced.
     std::fs::remove_file(bin.join("lightbulb")).unwrap();
     std::os::unix::fs::symlink("/usr/bin/true", bin.join("lightbulb")).unwrap();
-    assert!(out(&e.run(&["daemon", "--install"])).starts_with("Command: lightbulb\n"));
+    assert!(out(&e.run(&["daemon", "--install"])).starts_with("Command: lightbulb"));
     assert_eq!(std::fs::read_link(bin.join("lightbulb")).unwrap(), canon);
 
     let o = e.run(&["daemon", "--uninstall"]);
@@ -854,6 +855,7 @@ fn the_daemon_starts_from_the_canonical_binary() {
         .env("LIGHTBULB_CONNECT_CLAUDE_HOME", home.path())
         .env("LIGHTBULB_CONNECT_NO_LAUNCHCTL", "1")
         .env("LIGHTBULB_CONNECT_DEBUG_NO_DEFAULT_RELAYS", "1")
+        .env("LIGHTBULB_CONNECT_DEBUG_NO_TELEMETRY", "1")
         .env("LIGHTBULB_CONNECT_DIALOG", "")
         .env_remove("LIGHTBULB_CONNECT_HOOK_CALLER")
         .output()
@@ -1053,7 +1055,7 @@ fn the_command_is_lightbulb() {
     let o = e.run(&["setup"]);
     assert!(o.status.success(), "{}", err(&o));
     let text = out(&o);
-    assert!(text.starts_with("Command: lightbulb\n"), "{text}");
+    assert!(text.starts_with("Command: lightbulb"), "{text}");
     assert!(
         text.contains("Add your other computer or a teammate: lightbulb invite\n"),
         "{text}"
@@ -1061,4 +1063,92 @@ fn the_command_is_lightbulb() {
     let canon = h.join(".lightbulb/connect/bin/lightbulb");
     assert!(canon.is_file());
     assert_eq!(std::fs::read_link(bin.join("lightbulb")).unwrap(), canon);
+}
+
+/// `telemetry on` under an environment opt-out writes nothing and says the variable keeps it
+/// off.
+#[test]
+fn telemetry_on_under_do_not_track_stays_off() {
+    let e = Env::new();
+    let o = e
+        .cmd(&["telemetry", "on"])
+        .env("DO_NOT_TRACK", "1")
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(
+        out(&o).contains("DO_NOT_TRACK is set and keeps it off"),
+        "{}",
+        out(&o)
+    );
+    let o = e
+        .cmd(&["telemetry"])
+        .env_remove("DO_NOT_TRACK")
+        .output()
+        .unwrap();
+    assert!(
+        out(&o).contains("off (turned off in config)"),
+        "{}",
+        out(&o)
+    );
+}
+
+/// A fresh Mac: `~/.local/bin` is not on PATH, so setup adds it to the zsh profile once (a
+/// second run adds nothing) and says so, instead of asking the person to edit the file.
+#[cfg(target_os = "macos")]
+#[test]
+fn daemon_install_adds_local_bin_to_the_zsh_profile_once() {
+    let e = Env::new();
+    let run = || {
+        e.cmd(&["daemon", "--install"])
+            .env("SHELL", "/bin/zsh")
+            .env("PATH", "/usr/bin:/bin")
+            .env("LIGHTBULB_CONNECT_DEBUG_TTY", "1")
+            .output()
+            .unwrap()
+    };
+    let o = run();
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(
+        out(&o).contains("added ~/.local/bin to your PATH in ~/.zshrc; open a new terminal"),
+        "{}",
+        out(&o)
+    );
+    let zshrc = e.home.path().join(".zshrc");
+    let once = std::fs::read_to_string(&zshrc).unwrap();
+    assert_eq!(
+        once,
+        "\n# Added by Lightbulb\nexport PATH=\"$HOME/.local/bin:$PATH\"\n"
+    );
+    assert!(run().status.success());
+    assert_eq!(std::fs::read_to_string(&zshrc).unwrap(), once);
+}
+
+/// No person at a terminal (an update, the daemon's setup refresh, a pipe): the profile is not
+/// touched, and setup says which line to add. Nor is a symlinked profile written through.
+#[cfg(target_os = "macos")]
+#[test]
+fn setup_off_a_terminal_or_on_a_symlinked_profile_leaves_the_profile_alone() {
+    let e = Env::new();
+    let run = |tty: bool| {
+        let mut c = e.cmd(&["daemon", "--install"]);
+        c.env("SHELL", "/bin/zsh").env("PATH", "/usr/bin:/bin");
+        if tty {
+            c.env("LIGHTBULB_CONNECT_DEBUG_TTY", "1");
+        }
+        c.output().unwrap()
+    };
+    let advice = "Add this line to ~/.zshrc, then open a new terminal: export PATH=";
+    let zshrc = e.home.path().join(".zshrc");
+    let o = run(false);
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(out(&o).contains(advice), "{}", out(&o));
+    assert!(!zshrc.exists());
+    let dotfiles = e.home.path().join("dotfiles-zshrc");
+    std::fs::write(&dotfiles, "# mine\n").unwrap();
+    std::os::unix::fs::symlink(&dotfiles, &zshrc).unwrap();
+    let o = run(true);
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(out(&o).contains(advice), "{}", out(&o));
+    assert_eq!(std::fs::read_to_string(&dotfiles).unwrap(), "# mine\n");
 }

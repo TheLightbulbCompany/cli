@@ -87,6 +87,8 @@ pub struct Daemon {
     pub roster_changed: Notify,
     /// Held while a `team.join` runs: one at a time.
     pub joining: tokio::sync::Mutex<()>,
+    /// The live invite-code listeners (`code`), at most a few.
+    pub codes: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     /// Poked on a local session change: the presence sender (`presence::run`) looks again.
     pub presence: Notify,
     /// The presence last built (`presence::run`), sent stamped after each `hello`.
@@ -110,6 +112,8 @@ pub struct Cloud {
     declared: Mutex<Declared>,
     /// The last `Declared::version` the presence sender (`presence::run`) handed on.
     pub sent: tokio::sync::watch::Sender<u64>,
+    /// This member's own doorbell (the sessions file's `wake`), republished after a join.
+    pub wake: Mutex<Option<crate::roster::Wake>>,
 }
 
 /// The sessions an instance declared (`cloud.sessions.set`), as published; each set is a new
@@ -119,6 +123,8 @@ pub struct Declared {
     pub version: u64,
     pub sessions: Arc<Vec<net::frames::Remote>>,
     pub ids: Arc<HashSet<String>>,
+    /// The person ids whose computers may message these sessions; `None`: anyone the policy admits.
+    pub members: Option<Arc<HashSet<String>>>,
 }
 
 impl Cloud {
@@ -127,6 +133,7 @@ impl Cloud {
             name,
             declared: Mutex::default(),
             sent: tokio::sync::watch::Sender::new(0),
+            wake: Mutex::default(),
         }
     }
 
@@ -140,13 +147,14 @@ impl Cloud {
     }
 
     /// Makes `sessions` the declared list: its version.
-    pub fn set(&self, sessions: Vec<net::frames::Remote>) -> u64 {
+    pub fn set(&self, sessions: Vec<net::frames::Remote>, members: Option<HashSet<String>>) -> u64 {
         let mut d = self.declared.lock().unwrap();
         let ids = sessions.iter().map(|s| s.session_id.clone()).collect();
         *d = Declared {
             version: d.version + 1,
             sessions: Arc::new(sessions),
             ids: Arc::new(ids),
+            members: members.map(Arc::new),
         };
         d.version
     }
@@ -258,6 +266,9 @@ pub async fn run(dir: &Path) -> Result<()> {
     // Briefly wider than 0600 after bind; the 0700 state dir closes that window.
     fs::set_permissions(&sock, Permissions::from_mode(0o600))?;
     tokio::spawn(crate::admission::route(daemon.clone()));
+    cli::refresh_setup(dir);
+    tokio::spawn(auto_update(daemon.clone(), dir.to_path_buf()));
+    tokio::spawn(crate::telemetry::run_daily(daemon.clone()));
     // SIGTERM (launchd's stop) and SIGINT end it like a `shutdown` op: the socket and the
     // loopback address file (`net::local`) are removed on the way out.
     let d = daemon.clone();
@@ -281,6 +292,26 @@ pub async fn run(dir: &Path) -> Result<()> {
     Ok(()) // `lock` drops here, after the socket is gone.
 }
 
+/// Checks for a newer release ten minutes after the start and then daily (`cli::auto_update`).
+/// An installed one ends the daemon, and the service manager starts the new binary; a failed
+/// check logs one line and waits for the next day.
+async fn auto_update(daemon: Arc<Daemon>, dir: PathBuf) {
+    tokio::time::sleep(Duration::from_secs(600)).await;
+    loop {
+        let on = cli::auto_update_on(&daemon.team.lock().unwrap().config);
+        if on {
+            let dir = dir.clone();
+            match tokio::task::spawn_blocking(move || cli::auto_update(&dir)).await {
+                Ok(Ok(true)) => return daemon.shutdown.notify_one(),
+                Ok(Ok(false)) => {}
+                Ok(Err(e)) => eprintln!("auto-update: {e}"),
+                Err(_) => eprintln!("auto-update: the check failed"),
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(86_400)).await;
+    }
+}
+
 /// This person's name: `$USER`, else `me`.
 pub fn user_name() -> String {
     std::env::var("USER")
@@ -294,6 +325,7 @@ pub fn user_name() -> String {
 /// never a second owner; otherwise this binary spawns one.
 pub fn ensure_running() -> Result<()> {
     let dir = paths::state_dir();
+    crate::telemetry::sync_env_optout(&dir);
     let sock = dir.join(paths::SOCKET);
     if answers_ping(&sock) {
         return Ok(());

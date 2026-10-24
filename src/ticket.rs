@@ -9,10 +9,10 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 const APP: &str = "lightbulb://join/";
-/// The join line is the command itself; `NAME` is for the person to replace (a bare word, so
-/// the line pasted unedited still parses in a shell).
+/// The join page's link: the ticket rides in the fragment, which no server ever sees.
+const WEB: &str = "https://thelightbulb.company/j#";
+/// The join line is the command itself; `join` defaults the name to the user's.
 const COMMAND: &str = "lightbulb join '";
-const NAME: &str = "' --name NAME";
 /// A reusable (or open) link lasts 7 days; a once link 24 hours.
 const REUSABLE_S: i64 = 7 * 86_400;
 const ONCE_S: i64 = 86_400;
@@ -88,7 +88,7 @@ pub fn sign(
     expires_at: i64,
     (relay_hint, addrs): (String, Vec<String>),
 ) -> Ticket {
-    // The inviter first, then the founder and admins, by key.
+    // The inviter first, then the founder, by key.
     let mut members = vec![id.key.clone()];
     for m in roster.members.values().filter(|m| m.role != Role::Member) {
         if !members.contains(&m.key) {
@@ -136,10 +136,13 @@ pub fn encode(t: &Ticket) -> String {
     BASE64URL_NOPAD.encode(&canonical(&value(t)))
 }
 
-/// A ticket from the bare ticket or its `lightbulb://join/` link.
+/// A ticket from the bare ticket, its `lightbulb://join/` link or its join page link.
 pub fn decode(s: &str) -> Result<Ticket> {
     let s = s.trim();
-    let bare = s.strip_prefix(APP).unwrap_or(s);
+    let bare = s
+        .strip_prefix(APP)
+        .or_else(|| s.strip_prefix(WEB))
+        .unwrap_or(s);
     let t: Ticket = BASE64URL_NOPAD
         .decode(bare.trim().as_bytes())
         .ok()
@@ -185,7 +188,12 @@ pub fn line(t: &Ticket) -> String {
 
 /// The join line for an `encode`d ticket: the command the person runs.
 pub fn join_line(encoded: &str) -> String {
-    format!("{COMMAND}{encoded}{NAME}")
+    format!("{COMMAND}{encoded}'")
+}
+
+/// The join page link for an `encode`d ticket.
+pub fn web_link(encoded: &str) -> String {
+    format!("{WEB}{encoded}")
 }
 
 /// A `person` link's join line, `name` filled in (the caller keeps `'` out of it).
@@ -243,8 +251,8 @@ mod tests {
     fn ticket_round_trips_through_every_link_form() {
         let (_, x, r, t) = team("ask", false);
         let bare = encode(&t);
-        assert_eq!(line(&t), format!("lightbulb join '{bare}' --name NAME"));
-        for s in [bare.clone(), app_link(&bare)] {
+        assert_eq!(line(&t), format!("lightbulb join '{bare}'"));
+        for s in [bare.clone(), app_link(&bare), web_link(&bare)] {
             assert_eq!(decode(&s).unwrap(), t);
         }
         assert!(
@@ -257,6 +265,7 @@ mod tests {
         assert!(t.ticket_id.starts_with(&format!("{}.", x.short)));
         assert_eq!(t.expires_at, 100 + 7 * 86_400);
         assert!(decode(&format!("https://thelightbulb.company/j/#{bare}")).is_err());
+        assert!(decode(&format!("https://example.com/j#{bare}")).is_err());
         // A once ticket carries the secret; its link only the hash.
         let (_, _, r, t) = team("ask", true);
         assert_eq!(r.links[&t.ticket_id].secret, hash(&t.secret));
@@ -269,7 +278,8 @@ mod tests {
 
     #[test]
     fn a_tickets_wake_is_covered_by_the_signature() {
-        let (_, x, r, t) = team("person", true);
+        // (Any mode: only a cloud member's `person` link survives replay.)
+        let (_, x, r, t) = team("ask", true);
         let w = Wake {
             url: "https://example.test/api/v1/network/wake".into(),
             token: "org_1.abc".into(),

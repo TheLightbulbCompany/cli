@@ -6,11 +6,11 @@ Run `lightbulb <command> --help` for the full text in your terminal. (`held`'s l
 the next release; 0.2.2 says only "The held messages waiting for your Allow", but lists join
 requests too.)
 
-Commands that decide for you (`join`, `held`, `approve`, `decline`, `policy <person> <value>`,
-`remove`, `admin`, `invite --open`, `relay <url>`, `leave`) must be run by a person at
-a terminal, not by an agent. Run from an agent, most answer
-`Run this from your own terminal, not from an agent.`; `invite --open` answers
-`invite --open is for people at a terminal`.
+Commands that change who is in the team or how it connects (`held`, `policy <person> <value>`,
+`remove`, `relay <url>`, `leave`) must be run by a person at a terminal, not by an agent. Run
+from an agent, they answer `Run this from your own terminal, not from an agent.` An agent may
+run `invite` (every mode), `join`, `approve` and `decline`; its session is recorded as the
+approver.
 
 ## Getting started
 
@@ -66,7 +66,7 @@ Prints this computer's join line (the reusable invite unless an option says othe
 |---|---|
 | `--new` | A new invite; every earlier one from this computer (open ones too) stops working. |
 | `--once` | An invite for one join, valid 24 hours. |
-| `--open` | An invite whose joins need no Allow (founder and admins). |
+| `--open` | An invite whose joins need no Allow |
 
 ### join
 
@@ -216,18 +216,6 @@ lightbulb team
 
 `--help`: Show the team and its members.
 
-### admin
-
-When you use it: as the founder, to make an admin or hand over the founder role.
-
-```
-lightbulb admin [OPTIONS] <NAME>
-```
-
-`--help`: Make a member an admin (founder only), or with --founder the founder in your place.
-
-Founder only. With `--founder`, `<NAME>` becomes the founder and you become an admin.
-
 ### remove
 
 When you use it: to take a computer out of the team.
@@ -236,9 +224,9 @@ When you use it: to take a computer out of the team.
 lightbulb remove <NAME>
 ```
 
-`--help`: Remove a member (founder and admins); the invite is replaced.
+`--help`: Remove a member; the invite is replaced.
 
-Founder and admins. Every live invite in the team stops working; the answer has a new invite
+Any member can remove another. Every live invite in the team stops working; the answer has a new invite
 line.
 
 ### leave
@@ -287,16 +275,16 @@ When you use it: to see or change the relays.
 lightbulb relay [OPTIONS] [URL]
 ```
 
-`--help`: The relays this computer uses (with a URL, sets yours; from the founder or an admin, the team's too). Relays carry encrypted traffic only, when no direct path exists.
+`--help`: The relays this computer uses (with a URL, sets yours and the team's too). Relays carry encrypted traffic only, when no direct path exists.
 
 With no arguments, shows the relays in use and where they come from. With a URL (`https://`
-only), sets yours; from the founder or an admin, the team's too. Relays carry encrypted traffic
+only), sets yours and the team's too. Relays carry encrypted traffic
 only, when no direct path exists.
 
 | Option | Meaning |
 |---|---|
 | `--clear` | Clear the relay you set. |
-| `--local` | Only this computer, not the team (founder and admins set the team's by default). |
+| `--local` | Only this computer, not the team (otherwise the team's too). |
 
 ### update
 
