@@ -73,7 +73,11 @@ fn setup_writes_claude_hooks_and_mcp_and_backs_up_once() {
     assert_ne!(claude.state, State::NotInstalled);
     assert_eq!(
         claude.wrote,
-        [h.join(".claude/settings.json"), h.join(".claude.json")]
+        [
+            h.join(".claude/settings.json"),
+            h.join(".claude.json"),
+            h.join(".claude/skills/lightbulb-network/SKILL.md")
+        ]
     );
 
     let s = json_at(h, ".claude/settings.json");
@@ -113,7 +117,11 @@ fn setup_writes_codex_hooks_and_mcp_and_backs_up_once() {
     let r = setup(h, false);
     assert_eq!(
         agent(&r, "codex").wrote,
-        [h.join(".codex/hooks.json"), h.join(".codex/config.toml")]
+        [
+            h.join(".codex/hooks.json"),
+            h.join(".codex/config.toml"),
+            h.join(".codex/skills/lightbulb-network/SKILL.md")
+        ]
     );
     let doc = json_at(h, ".codex/hooks.json");
     let text = get(h, ".codex/config.toml");
@@ -506,7 +514,7 @@ fn codex_says_it_trusted_the_hooks() {
     let r = setup(home.path(), false);
     assert_eq!(
         agent(&r, "codex").line(),
-        "Codex: connected (hooks + tools). Its hook prompt was answered for you."
+        "Codex: connected (hooks + tools); skill lightbulb-network. Its hook prompt was answered for you."
     );
     // Said once: a second run has nothing new to trust.
     assert_eq!(
@@ -549,7 +557,8 @@ fn the_closing_words_name_what_is_connected_and_the_command_to_type() {
 
 Try it: open Claude Code in any folder and ask \"list my other sessions\".
 Add your other computer or a teammate: lightbulb invite
-Check everything: lightbulb doctor"
+Check everything: lightbulb doctor
+Add an always-on AI teammate: https://thelightbulb.company"
     );
     assert!(summary(&["Codex"], "lightbulb").contains("open Codex in any folder"));
 }
@@ -594,4 +603,26 @@ fn an_http_tool_server_under_the_name_is_replaced() {
         json_at(h, ".claude.json")["mcpServers"]["lightbulb"],
         json!({"command": EXE, "args": ["mcp"]})
     );
+}
+
+#[test]
+fn the_skill_is_installed_for_claude_and_codex_and_removed_with_setup() {
+    let d = tempfile::tempdir().unwrap();
+    let h = d.path();
+    for dir in [".claude", ".codex", ".cursor", ".grok"] {
+        fs::create_dir_all(h.join(dir)).unwrap();
+    }
+    setup(h, false);
+    let rel = ".claude/skills/lightbulb-network/SKILL.md";
+    let skill = get(h, rel);
+    assert!(skill.starts_with("---\nname: lightbulb-network\ndescription: "));
+    assert_eq!(get(h, ".codex/skills/lightbulb-network/SKILL.md"), skill);
+    assert!(!h.join(".cursor/skills").exists() && !h.join(".grok/skills").exists());
+    // A second run changes nothing; another tool's skills are left alone.
+    put(h, ".claude/skills/other/SKILL.md", "mine");
+    assert!(setup(h, false).agents[0].notes.is_empty());
+    setup(h, true);
+    assert!(!h.join(".claude/skills/lightbulb-network").exists());
+    assert!(!h.join(".codex/skills/lightbulb-network").exists());
+    assert_eq!(get(h, ".claude/skills/other/SKILL.md"), "mine");
 }

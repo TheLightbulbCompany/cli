@@ -15,13 +15,12 @@ The same key is the computer's network identity: other computers dial it by this
 
 ## The signed roster
 
-The team's membership is a log of entries: who was admitted, removed, made an admin or the
-founder, who left, which invites exist, and the team's relay and name. Each entry is signed by
+The team's membership is a log of entries: who was admitted (and by whom), removed, who left, which invites exist, and the team's relay and name. Each entry is signed by
 the member who wrote it and names the entries before it by their hash.
 
 Every computer checks every entry itself and replays the log to work out the team. An entry
-counts only if its signer had the right to write it: for example, only the founder or an admin
-can remove a member, and only the founder can make an admin. A new member checks every entry it
+counts only if its signer had the right to write it: every network is flat, so any computer
+member can invite, admit and remove others (not itself), and nobody removes a cloud founder. A new member checks every entry it
 receives before it accepts the team. No server holds or decides the membership.
 
 Invites are signed by the computer that made them. A join is checked against the roster: the
@@ -65,12 +64,12 @@ answer it (Allow or Decline in a dialog, or `lightbulb approve H<n>` / `decline 
 - Allow lets that person's later messages through (`policy <person> accept`).
 - `policy <person> hold` asks each time; `policy <person> refuse` refuses them.
 
-A join request is held the same way, unless the founder or an admin made the invite with
-`invite --open`.
+A join request is held the same way, unless the invite was made with `invite --open`. An approval records who gave it, down to the
+session (`approved by <member>/<session>`), shown on receipts and as "admitted by" in `lightbulb team`.
 
-Only a person at a terminal can answer a hold, change membership or change the relay. A command
-run from an agent's shell or tools is refused. This stops an agent's ordinary tools from
-approving things for you. It does not stop a program that you run yourself as your own user.
+An agent may invite, join, approve a join and answer a hold; its answer is recorded under its
+session, and its skill tells it to ask you first. Only a person at a terminal can remove a member,
+leave a network or change the relay: a command run from an agent's shell or tools is refused. It does not stop a program that you run yourself as your own user.
 
 ## Loop limits
 

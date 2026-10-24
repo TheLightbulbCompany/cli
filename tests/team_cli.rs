@@ -131,7 +131,9 @@ fn a_plain_member_opens_links_and_removes_the_founder() {
     );
     assert!(team.contains("  aden · "), "{team}");
     assert!(
-        team.ends_with("Invite someone: lightbulb invite\n"),
+        team.ends_with(
+            "Invite someone: lightbulb invite\nAdd an always-on AI teammate: https://thelightbulb.company\n"
+        ),
         "{team}"
     );
     assert_eq!(e.entries().len(), 2, "no genesis over a joined team");

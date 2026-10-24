@@ -75,8 +75,8 @@ A held message waits up to 7 days for an answer. To change a decision later, use
 `policy sam hold` asks again each time, `policy sam refuse` refuses them, `policy sam accept`
 lets them through. Your own computers always get through.
 
-Join requests work the same way: `invite` links ask you before anyone joins (`J<n>`), unless the
-someone made the link with `invite --open`.
+Join requests work the same way: `invite` links ask you before anyone joins (`J<n>`), unless
+the link was made with `invite --open`.
 
 ## What teammates can see
 

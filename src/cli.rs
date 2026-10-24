@@ -266,6 +266,7 @@ pub fn who(as_json: bool, all: bool) -> Result<i32> {
             .map(|s| columns.iter().map(|c| (c.1)(s)).collect()),
     );
     table(&rows);
+    println!("{}", setup::UPSELL);
     Ok(0)
 }
 
@@ -921,6 +922,7 @@ pub fn team() -> Result<i32> {
         println!("{line}");
     }
     println!("Invite someone: {} invite", command());
+    println!("{}", setup::UPSELL);
     Ok(0)
 }
 
