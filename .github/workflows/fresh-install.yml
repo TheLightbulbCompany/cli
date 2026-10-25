@@ -1,0 +1,104 @@
+name: fresh-install
+
+# A first run on a machine with nothing installed: the public install line, then two people on
+# one runner (two home folders, two background services) going invite → join by code → Allow →
+# message → reply. It uses the released CLI only and needs no secret. Run it after each release.
+
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  fresh:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - name: Install from the public line
+        run: |
+          t0=$(date +%s)
+          curl -fsSL https://github.com/TheLightbulbCompany/cli/releases/latest/download/install.sh | sh
+          echo "INSTALL_S=$(( $(date +%s) - t0 ))" >> "$GITHUB_ENV"
+          echo "LB=$HOME/.lightbulb/connect/bin/lightbulb" >> "$GITHUB_ENV"
+          echo "B=$RUNNER_TEMP/b" >> "$GITHUB_ENV"
+
+      - name: Invite, join by code, Allow, message, reply
+        run: |
+          set -euo pipefail
+          mkdir -p "$B"
+          # Person-only commands want a terminal: `script` gives them one, as a person's shell.
+          person() {
+            if [ "$(uname -s)" = Darwin ]; then script -q /dev/null "$@"; else script -qec "$(printf '%q ' "$@")" /dev/null; fi
+          }
+          latest=$(curl -fsSI https://github.com/TheLightbulbCompany/cli/releases/latest | tr -d '\r' | awk -F/ '/^location:/ {print $NF}')
+          version=$("$LB" --version)
+          echo "version: $version (latest $latest)"
+          [ "lightbulb ${latest#v}" = "$version" ]
+          "$LB" doctor || true
+
+          t0=$(date +%s)
+          inv=$(person "$LB" invite | tr -d '\r')
+          code=$(printf '%s\n' "$inv" | grep -oE 'join [a-z]+-[a-z]+-[a-z]+-[a-z]+' | head -1 | cut -d' ' -f2)
+          [ -n "$code" ] || { echo "no code in the invite output"; exit 1; }
+          echo "::add-mask::$code"
+          printf '%s\n' "$inv" | grep -q 'the code works for 10 minutes'
+
+          # The second person joins with the code and waits for the Allow.
+          (HOME="$B" person "$LB" join "$code" --name ci-b > "$RUNNER_TEMP/join.txt" 2>&1; echo "exit $?" >> "$RUNNER_TEMP/join.txt") &
+          for _ in $(seq 1 120); do
+            held=$(person "$LB" held | tr -d '\r')
+            j=$(printf '%s\n' "$held" | grep -oE '\bJ[0-9]+\b' | head -1 || true)
+            [ -n "$j" ] && break
+            sleep 1
+          done
+          [ -n "$j" ] || { echo "no join request reached the inviter"; cat "$RUNNER_TEMP/join.txt"; exit 1; }
+          person "$LB" approve "$j"
+          wait
+          cat "$RUNNER_TEMP/join.txt"
+          grep -q 'Connected as ci-b' "$RUNNER_TEMP/join.txt"
+          echo "JOIN_S=$(( $(date +%s) - t0 ))" >> "$GITHUB_ENV"
+
+          # The second person's first message to the first is held, then allowed and read.
+          t1=$(date +%s)
+          me=$(whoami)
+          sent=$(HOME="$B" person "$LB" send "$me/inbox" "hello from a fresh install" | tr -d '\r')
+          echo "$sent"
+          rid=$(printf '%s\n' "$sent" | grep -oE 'receipt [0-9A-Z]{26}' | cut -d' ' -f2)
+          for _ in $(seq 1 60); do
+            h=$(person "$LB" held | tr -d '\r' | grep -oE '\bH[0-9]+\b' | head -1 || true)
+            [ -n "$h" ] && break
+            sleep 1
+          done
+          [ -n "$h" ] || { echo "the first message was not held"; exit 1; }
+          person "$LB" approve "$h"
+          read=$(person "$LB" listen --as inbox --once | tr -d '\r')
+          echo "$read"
+          printf '%s\n' "$read" | grep -q 'hello from a fresh install'
+          state=""
+          for _ in $(seq 1 30); do
+            state=$(HOME="$B" "$LB" receipt "$rid" | tr -d '\r')
+            printf '%s\n' "$state" | grep -qE '^(Delivered|Read)' && break
+            sleep 1
+          done
+          echo "receipt: $state"
+          printf '%s\n' "$state" | grep -qE '^(Delivered|Read)'
+          echo "MESSAGE_S=$(( $(date +%s) - t1 ))" >> "$GITHUB_ENV"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### ${{ matrix.os }}"
+            echo "| step | seconds |"
+            echo "|---|---|"
+            echo "| install from the public line | ${INSTALL_S:-} |"
+            echo "| invite → join by code → Allow → connected | ${JOIN_S:-} |"
+            echo "| first message → held → Allow → read → receipt | ${MESSAGE_S:-} |"
+          } >> "$GITHUB_STEP_SUMMARY"
