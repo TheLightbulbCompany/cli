@@ -128,6 +128,8 @@ pub struct Roster {
     pub relay: Option<String>,
     /// A parked member's doorbell, by member key: its own latest `meta` with one. Members only.
     pub wakes: BTreeMap<String, Wake>,
+    /// The `remove` and `leave` entries replay applied (it took their member), by hash.
+    pub ended: BTreeSet<String>,
     parents: BTreeMap<String, Vec<String>>,
     /// Every replayed entry with its hash, parents first.
     log: Vec<(String, Entry)>,
@@ -420,11 +422,12 @@ fn pass(
                 if target != e.signer && take(&mut r, &mut gone, &target, &h) {
                     removals.insert(h.clone());
                     applied.insert(h.clone());
+                    r.ended.insert(h.clone());
                 }
             }
             Kind::Leave => {
-                if target == e.signer {
-                    r.members.remove(&target);
+                if target == e.signer && r.members.remove(&target).is_some() {
+                    r.ended.insert(h.clone());
                 }
             }
             // A member mints links under its own `<short>.` prefix, and a `ticket_id` names one
@@ -791,8 +794,14 @@ mod tests {
         let r = replay(&[g.clone(), ax.clone(), xf.clone()]);
         assert_eq!(r.members[&f.key].role, Role::Founder);
         assert!(r.members.contains_key(&x.key));
+        // Neither that nor a leave signed for another member is applied (`ended`).
+        let xl = member(&x, &xf, Kind::Leave, &f.key);
+        let r = replay(&[g.clone(), ax.clone(), xf.clone(), xl]);
+        assert!(r.members.contains_key(&f.key) && r.ended.is_empty());
         let fl = member(&f, &xf, Kind::Leave, &f.key);
-        assert!(!replay(&[g, ax, xf, fl]).members.contains_key(&f.key));
+        let r = replay(&[g, ax, xf, fl.clone()]);
+        assert!(!r.members.contains_key(&f.key));
+        assert!(r.ended.contains(&fl.hash()));
     }
 
     #[test]

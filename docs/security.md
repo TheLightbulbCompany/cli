@@ -39,10 +39,13 @@ it records that when a computer joins through a `person` link the workspace itse
 person (the link names the person under the workspace's signature and works once). With a
 members list, it takes a message for one of its agents only from a computer it recorded for a
 listed person; any other member's message is refused (`not_a_member`), with no hold. No frame a
-peer sends writes that record, and it is dropped by any install that removes the computer or
-sees it leave (even if it is admitted again in the same sync). A computer that joins with a
-person line accepts from its inviter only answers to its own messages (a `reply_to` or thread
-it started with that member); anything else from the inviter is held like anyone's. Labels
+peer sends writes that record, and it is dropped by any install whose replay applies a removal
+or leave of the computer (even if it is admitted again in the same sync); an entry replay
+ignores (a leave signed for someone else, a removal of the founder) drops nothing. A computer
+that joins with a person line accepts from its inviter only an answer to its own message: its
+`reply_to` must name a message, at most a day old, that the session it is sent to sent to the
+very session it comes from. Anything else from the inviter, a continued thread included, is held
+like anyone's, and the mark goes when the inviter leaves the team. Labels
 ending "(not verified)" are unproven names, never an identity. Only join with a person line from a workspace you
 trust; an ordinary invite line or code never does this.
 

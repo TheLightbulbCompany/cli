@@ -684,19 +684,15 @@ impl Store {
         )
     }
 
-    /// Whether one of `ids` is a message this computer sent to a session of member `short`.
-    pub fn sent_to(&self, ids: [Option<&str>; 2], short: &str) -> rusqlite::Result<bool> {
+    /// Whether message `id` is one this computer's session `from` sent to session `to` at or
+    /// after `since`.
+    pub fn sent_to(&self, id: &str, from: &str, to: &str, since: i64) -> rusqlite::Result<bool> {
         self.conn
             .prepare(
-                "SELECT 1 FROM messages WHERE id IN (?1, ?2) AND origin = 'local' \
-                 AND to_key >= ?3 AND to_key < ?4",
+                "SELECT 1 FROM messages WHERE id = ?1 AND origin = 'local' \
+                 AND from_key = ?2 AND to_key = ?3 AND sent_at >= ?4",
             )?
-            .exists(params![
-                ids[0],
-                ids[1],
-                format!("{short}/"),
-                format!("{short}0")
-            ])
+            .exists(params![id, from, to, since])
     }
 
     /// The peers' mail to `to` sent after `since`: `(from, origin)`.

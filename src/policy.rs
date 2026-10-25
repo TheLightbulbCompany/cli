@@ -110,6 +110,21 @@ pub fn replies_from(store: &Store, key: &str) -> Result<bool> {
         .exists([REPLIES, key])?)
 }
 
+/// Drops the `replies` mark of every key `keep` does not hold (an inviter gone or removed).
+pub fn prune_replies(store: &Store, keep: impl Fn(&str) -> bool) -> Result<()> {
+    let keys: Vec<String> = (store.conn())
+        .prepare("SELECT person_id FROM policy WHERE scope = ?1")?
+        .query_map([REPLIES], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for k in keys.iter().filter(|k| !keep(k)) {
+        store.conn().execute(
+            "DELETE FROM policy WHERE scope = ?1 AND person_id = ?2",
+            params![REPLIES, k],
+        )?;
+    }
+    Ok(())
+}
+
 /// Writes `v` for `from`, set by `by`.
 pub fn set(store: &Store, from: &Member, v: Verdict, by: &str, now: i64) -> Result<()> {
     set_person(store, &from.person_id, v, by, now)

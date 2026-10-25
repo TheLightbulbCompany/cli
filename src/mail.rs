@@ -13,6 +13,8 @@ use serde_json::Value;
 pub const LOOP_LIMIT: u32 = 12;
 /// Half-open: a send counts while `sent_at > now - LOOP_WINDOW_S`, so one sent at T stops counting at T + 600.
 pub const LOOP_WINDOW_S: u64 = 600;
+/// How long after this computer's message its inviter's answer to it needs no Allow.
+const REPLY_WINDOW_S: u64 = 86_400;
 /// Offline mail (and, later, the outbox) waits this long.
 pub const HOLD_S: u64 = 86_400;
 /// A held message waits this long for the person (nothing holds in Plan A).
@@ -822,10 +824,17 @@ pub fn receive(
     let verdict = match roster.by_short(me) {
         Some(_) if members.is_some() => Verdict::Accept,
         Some(mine) => match policy::decide(store, &mine.key, peer)? {
-            // My person-link inviter answering one of my own messages to it.
+            // My person-link inviter's session answering (`reply_to`, within a day) a message
+            // the session it writes to sent to that very session; a thread alone is not enough.
             Verdict::Hold
                 if policy::replies_from(store, &peer.key)?
-                    && store.sent_to([reply_to.as_deref(), thread.as_deref()], &peer.short)? =>
+                    && match reply_to.as_deref() {
+                        Some(r) => {
+                            let since = now.saturating_sub(REPLY_WINDOW_S) as i64;
+                            store.sent_to(r, to, from, since)?
+                        }
+                        None => false,
+                    } =>
             {
                 Verdict::Accept
             }

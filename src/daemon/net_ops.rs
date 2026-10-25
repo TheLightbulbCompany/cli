@@ -400,17 +400,17 @@ pub fn install(
     if !new.is_solo(me) {
         let _ = std::fs::remove_file(daemon.dir.join(REMOVED));
     }
-    // A `remove` or `leave` of `k` that this install brings.
+    // A `remove` or `leave` of `k` that this install brings and replay applied (`ended`).
     let took = |k: &str| {
-        new.log().iter().any(|(h, e)| {
-            matches!(e.kind, Kind::Remove | Kind::Leave)
-                && !team.roster.knows(h)
-                && e.body["member"] == k
-        })
+        new.log()
+            .iter()
+            .any(|(h, e)| new.ended.contains(h) && !team.roster.knows(h) && e.body["member"] == k)
     };
     // A computer gone from the team, or removed in this install (even if re-admitted in it), is
-    // nobody's any more (`persons`).
-    store.prune_persons(|k| new.members.contains_key(k) && !took(k))?;
+    // nobody's any more (`persons`), and no inviter whose answers need no Allow.
+    let keep = |k: &str| new.members.contains_key(k) && !took(k);
+    store.prune_persons(keep)?;
+    crate::policy::prune_replies(store, keep)?;
     let relay_changed = team.roster.relay != new.relay;
     // A removal or leave applied in this team (not a team left or joined, nor a member a fork's
     // resolution dropped): every subscriber hears of each member it took.

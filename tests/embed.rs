@@ -409,6 +409,44 @@ async fn only_a_listed_persons_computers_reach_its_sessions() {
     i.shutdown().await;
 }
 
+/// What replay does not apply prunes nothing: B's forged `leave` of C and its refused removal
+/// of the founder A leave both `user_a`'s, and their mail still goes in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unapplied_leave_or_founder_removal_keeps_a_persons_computer() {
+    let (home, i, [(ia, mut pa, _a), (ib, mut pb, _b), (ic, mut pc, _c)]) = seeded(None).await;
+    as_user_a(home.path(), &ic);
+    declare(&i, &["friday"]).await;
+    let friday = format!("{}/friday", me(&i).await);
+    let db = home.path().join("state.db");
+    let store = Store::open(&db).unwrap();
+    let before = roster::entries(&store).unwrap().len();
+    let heads = roster::replay(&roster::entries(&store).unwrap()).heads;
+    let leave = Entry::signed(&ib, heads, Kind::Leave, json!({"member": ic.key}), now_s());
+    let rm = Entry::signed(
+        &ib,
+        vec![leave.hash()],
+        Kind::Remove,
+        json!({"member": ia.key}),
+        now_s(),
+    );
+    pb.send(&Frame::Roster {
+        entries: vec![leave, rm],
+        more: false,
+    })
+    .await;
+    until(10, "both entries are taken in", || {
+        roster::entries(&store).unwrap().len() == before + 2
+    });
+    let r = roster::replay(&roster::entries(&store).unwrap());
+    assert!(r.members.contains_key(&ia.key) && r.members.contains_key(&ic.key));
+    for who in [&ia, &ic] {
+        assert_eq!(store.person(&who.key).unwrap().as_deref(), Some("user_a"));
+    }
+    assert_eq!(ask(&mut pa, &ia, "a1", &friday).await.0, "stored");
+    assert_eq!(ask(&mut pc, &ic, "c1", &friday).await.0, "stored");
+    i.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn snapshot_and_events() {
     let out = tempfile::tempdir().unwrap();
@@ -566,7 +604,8 @@ async fn a_person_line_reaches_friday_and_an_unlisted_teammate_does_not() {
     let i = common::instance(home.path(), &[], NAME, None, &[])
         .await
         .unwrap();
-    let friday_decl = json!([{"name": "friday", "agent": "Friday"}]);
+    let friday_decl =
+        json!([{"name": "friday", "agent": "Friday"}, {"name": "atlas", "agent": "Atlas"}]);
     ok(
         &i,
         "cloud.sessions.set",
@@ -640,20 +679,27 @@ async fn a_person_line_reaches_friday_and_an_unlisted_teammate_does_not() {
     assert_eq!(m["from"], friday.as_str());
     let a_db = a.state.path().join("state.db");
     assert_eq!(common::count(&a_db, "SELECT COUNT(*) FROM holds"), 0);
-    // Anything Friday starts on its own (a new thread, to another of A's sessions) is held on A,
-    // as anyone's.
+    // Only that: an answer to A's message from another instance session, one to another of A's
+    // sessions, and Friday's next message with no `reply_to` (its thread continues A's) are
+    // held on A, as anyone's.
+    let atlas = format!("{w}/atlas");
     let sa2 = common::session(&a, "a2");
-    let r = ok(
-        &i,
-        "send",
-        json!({"from": friday, "to": sa2, "text": "unasked", "request_id": "f2"}),
-    )
-    .await;
-    assert!(r["receipt"].is_object(), "{r}");
-    until(10, "Friday's own message is held on A", || {
-        common::count(&a_db, "SELECT COUNT(*) FROM holds WHERE state = 'open'") == 1
-    });
-    assert_eq!(a.unread(&sa2), 0);
+    for (n, (from, to, reply)) in [
+        (&atlas, &sa, msgs[0]["id"].clone()),
+        (&friday, &sa2, msgs[0]["id"].clone()),
+        (&friday, &sa, Value::Null),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let body = json!({"from": from, "to": to, "text": "unasked",
+            "request_id": format!("u{n}"), "reply_to": reply});
+        assert!(ok(&i, "send", body).await["receipt"].is_object());
+        until(10, "the message is held on A", || {
+            common::count(&a_db, "SELECT COUNT(*) FROM holds WHERE state = 'open'") == n as i64 + 1
+        });
+    }
+    assert_eq!(a.unread(&sa) + a.unread(&sa2), 0);
 
     // B joins through A's ask link (A allows it), sees Friday, and is refused `not_a_member`.
     let ask = common::invite(&a, "once");
