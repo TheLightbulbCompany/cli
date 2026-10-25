@@ -146,6 +146,19 @@ cargo build
 
 `lightbulb setup --remove` is the off switch (a live MCP process can restart the daemon after `daemon --uninstall`).
 
+## Updates
+
+The background service checks once a day for a newer release of this repository. It installs one
+only when its SHA-256 matches the release's checksum and, on macOS, it is signed by Lightbulb's
+Developer ID; it never installs an older version, and it never edits your shell profile. On Linux
+it prints that a release exists and leaves the install to `lightbulb update`.
+
+```sh
+lightbulb update --auto off   # stop the daily update (lightbulb doctor shows "Auto-update  off")
+lightbulb update --auto on    # turn it back on
+lightbulb update              # install the latest release now
+```
+
 ## Security
 
 See [docs/security.md](docs/security.md). To report a vulnerability, see [SECURITY.md](SECURITY.md).

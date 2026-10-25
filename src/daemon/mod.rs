@@ -298,7 +298,8 @@ pub async fn run(dir: &Path) -> Result<()> {
 async fn auto_update(daemon: Arc<Daemon>, dir: PathBuf) {
     tokio::time::sleep(Duration::from_secs(600)).await;
     loop {
-        let on = cli::auto_update_on(&daemon.team.lock().unwrap().config);
+        // From the file each time: `update --auto off` reaches a running service.
+        let on = crate::config::Config::load(&dir).is_ok_and(|c| cli::auto_update_on(&c));
         if on {
             let dir = dir.clone();
             match tokio::task::spawn_blocking(move || cli::auto_update(&dir)).await {

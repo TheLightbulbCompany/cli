@@ -101,7 +101,25 @@ was used by someone you do not know, remove them: `lightbulb remove <name>`.
 
 ## Bad release
 
-If a new release breaks something, go back to the previous one and pin it.
+If a new release breaks something, go back to the previous one and pin it. The daily automatic
+update would put the bad release back within a day, so turn it off first, and on again once a fixed
+release is out:
+
+```sh
+lightbulb update --auto off
+lightbulb update --version vX.Y.Z
+```
+
+**If you publish the releases:** automatic updates install only a *newer* version, so a computer that
+already took the bad one stays on it until a fixed release exists. Do both, right away:
+
+1. Mark the previous good release as Latest, so `releases/latest` (which install.sh, `lightbulb
+   update` and the daily check all read) stops pointing at the bad one:
+   `gh release edit vGOOD --repo TheLightbulbCompany/cli --latest`.
+2. Ship the fix as a new, higher patch release. Computers move to it within a day by themselves.
+
+Do not delete the bad release's assets: a computer mid-update would fail its checksum and keep its
+current binary, which is safe, but people pinning that version lose it.
 
 **curl install** (`vX.Y.Z` is the release tag you want; the setting goes before `sh`, which runs
 the script). This works only once the latest release's installer reads `LIGHTBULB_VERSION`

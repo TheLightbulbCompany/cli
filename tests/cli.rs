@@ -1152,3 +1152,25 @@ fn setup_off_a_terminal_or_on_a_symlinked_profile_leaves_the_profile_alone() {
     assert!(out(&o).contains(advice), "{}", out(&o));
     assert_eq!(std::fs::read_to_string(&dotfiles).unwrap(), "# mine\n");
 }
+
+/// `update --auto off` turns the daily update off (doctor says so) and installs nothing;
+/// `--auto on` turns it back on.
+#[test]
+fn update_auto_off_and_on_set_the_daily_update() {
+    let e = Env::new();
+    let auto = |e: &Env| {
+        let o = e.cmd(&["doctor"]).output().unwrap();
+        out(&o)
+            .lines()
+            .find(|l| l.starts_with("Auto-update"))
+            .map(|l| l.split_whitespace().last().unwrap_or("").to_string())
+    };
+    for (arg, want) in [("off", "off"), ("on", "on")] {
+        let o = e.cmd(&["update", "--auto", arg]).output().unwrap();
+        assert!(o.status.success(), "{}", err(&o));
+        assert_eq!(out(&o).trim(), format!("Automatic updates {arg}."));
+        assert_eq!(auto(&e).as_deref(), Some(want), "after --auto {arg}");
+    }
+    let o = e.cmd(&["update", "--auto", "maybe"]).output().unwrap();
+    assert!(!o.status.success());
+}
