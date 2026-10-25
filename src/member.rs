@@ -51,12 +51,11 @@ pub async fn run(opts: MemberOpts, token: String) -> Result<()> {
             vec![]
         }
     };
-    let members = match file.get("member_keys") {
-        None => None,
-        Some(v) => net_ops::members_of(v).map_err(|()| {
+    let members = net_ops::gate_of(&file)
+        .map_err(|()| {
             "the sessions file's member_keys must be null or a list of member key strings"
-        })?,
-    };
+        })?
+        .flatten();
     let relay = opts
         .relay
         .as_deref()

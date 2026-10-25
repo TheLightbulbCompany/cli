@@ -701,6 +701,39 @@ async fn the_members_list_gates_who_may_message_the_sessions() {
     exits_zero(child);
 }
 
+/// A sessions file (or set) written before `member_keys` existed still carries `members`: it
+/// gates everyone out until the backend writes the keys, never no gate at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn members_without_member_keys_refuses_everyone() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = seed(dir.path());
+    let file = json!({"workspace": NAME, "sessions": friday(), "members": ["user_1"]});
+    let (child, token, sock) = common::member_with(dir.path(), file);
+    let (mut pa, _ep) = dial(&sock, &token, &a).await;
+    let to = format!("{}/friday", short(&sock, &token));
+    let (_, state, reason) = send_acked(&mut pa, &a, &to, "no").await;
+    assert_eq!(
+        (state.as_str(), reason.as_deref()),
+        ("refused", Some("not_a_member"))
+    );
+    ok(
+        &sock,
+        &token,
+        "cloud.sessions.set",
+        json!({"sessions": friday(), "member_keys": [a.key]}),
+    );
+    assert_eq!(send_acked(&mut pa, &a, &to, "in").await.1, "stored");
+    ok(
+        &sock,
+        &token,
+        "cloud.sessions.set",
+        json!({"sessions": friday(), "members": ["user_1"]}),
+    );
+    assert_eq!(send_acked(&mut pa, &a, &to, "out").await.1, "refused");
+    ok(&sock, &token, "stop", json!({}));
+    exits_zero(child);
+}
+
 /// `member_keys` on `cloud.sessions.set`: absent keeps the gate, `null` removes it, a list replaces
 /// it, and anything else (or a list with a non-string) is `bad_request` and changes nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

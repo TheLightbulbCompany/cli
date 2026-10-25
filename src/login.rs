@@ -139,7 +139,7 @@ fn device(purpose: &str, ticket: Option<&str>) -> Result<Value> {
         );
     };
     println!("Confirm in your browser: {url}");
-    println!("The page shows {user_code}; continue only if it matches.");
+    println!("Type this code there: {user_code}");
     open(url);
     let every = Duration::from_secs(start["interval"].as_u64().unwrap_or(2).clamp(1, 10));
     let until =
@@ -174,7 +174,9 @@ pub fn login() -> Result<i32> {
         .as_str()
         .filter(|n| n.chars().all(crate::label::printable))
     {
-        Some(n) if !n.is_empty() => println!("This computer is signed in as {n}."),
+        Some(n) if !n.is_empty() => {
+            println!("This computer is signed in as {n}. Not you? Run lightbulb logout.")
+        }
         _ => println!("This computer is signed in."),
     }
     println!(
