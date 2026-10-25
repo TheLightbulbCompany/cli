@@ -280,7 +280,19 @@ fn opencode_calls_pick_and_register_their_session_from_meta() {
         assert_eq!(this(&v), std::slice::from_ref(key), "{v}");
     }
 
-    // A fresh session: registered to the OpenCode process, then the source.
+    // An OpenCode process with no session yet: its first call registers the one it names, to
+    // that process. An id that is no session id is refused first and registers nothing.
+    let oc = FakeOpencode::new();
+    let mut m = net.mcp(&oc.1);
+    let before = net.call(json!({"id": 1, "op": "sessions"}))["sessions"].clone();
+    for bad in ["a b", "", "x/y", &"s".repeat(129)] {
+        let out = m.tool_meta("find_sessions", json!({}), meta(bad));
+        assert_eq!(out.text, r#"{"error":"source_unidentified"}"#, "{bad:?}");
+    }
+    assert_eq!(
+        net.call(json!({"id": 1, "op": "sessions"}))["sessions"],
+        before
+    );
     let v = m
         .tool_meta("find_sessions", json!({}), meta("ses_new"))
         .json();
@@ -296,17 +308,34 @@ fn opencode_calls_pick_and_register_their_session_from_meta() {
         .unwrap();
     assert_eq!(row["pid"], oc.1.pid);
     assert_eq!(row["birth_micros"], oc.1.birth_micros);
+}
 
-    // An id that is no session id is refused and registers nothing.
-    let before = net.call(json!({"id": 1, "op": "sessions"}))["sessions"].clone();
-    for bad in ["a b", "", "x/y", &"s".repeat(129)] {
-        let out = m.tool_meta("find_sessions", json!({}), meta(bad));
-        assert_eq!(out.text, r#"{"error":"source_unidentified"}"#, "{bad:?}");
-    }
-    assert_eq!(
-        net.call(json!({"id": 1, "op": "sessions"}))["sessions"],
-        before
-    );
+/// A subagent's tool call names its child session, which no hook registers (the plugin skips
+/// child sessions): it never gets a row of its own. With one session on the OpenCode process
+/// it is that session's call; with several it is unidentified.
+#[test]
+fn an_opencode_subagent_call_registers_no_session() {
+    let net = Net::new();
+    let oc = FakeOpencode::new();
+    let parent = net.register("opencode", "ses_parent", &oc.1);
+    let mut m = net.mcp(&oc.1);
+    let rows = || net.call(json!({"id": 1, "op": "sessions"}))["sessions"].clone();
+    let meta = json!({"ai.opencode/sessionID": "ses_child"});
+    let v = m.tool_meta("find_sessions", json!({}), meta.clone()).json();
+    let this: Vec<&Value> = v["sessions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{v}"))
+        .iter()
+        .filter(|s| s["is_this_session"] == true)
+        .collect();
+    assert_eq!(this.len(), 1, "{v}");
+    assert_eq!(this[0]["session_id"], parent.as_str());
+    assert_eq!(rows().as_array().map(Vec::len), Some(1), "{}", rows());
+
+    net.register("opencode", "ses_other", &oc.1);
+    let out = m.tool_meta("find_sessions", json!({}), meta);
+    assert_eq!(out.text, r#"{"error":"source_unidentified"}"#);
+    assert_eq!(rows().as_array().map(Vec::len), Some(2), "{}", rows());
 }
 
 /// The OpenCode meta key means nothing to another agent: it never registers a session for it.

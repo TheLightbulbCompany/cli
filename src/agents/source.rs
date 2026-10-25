@@ -32,10 +32,19 @@ pub fn resolve(parent: &Process, meta: &Value, sessions: &[Session]) -> Result<K
     let thread = THREAD_FIELDS.iter().find_map(|f| meta[f].as_str());
     let opencode = meta[OPENCODE_SESSION].as_str();
     let picked: Vec<&Session> = match (thread, opencode) {
-        (_, Some(id)) if mine.iter().any(|s| s.provider == "opencode") => mine
-            .into_iter()
-            .filter(|s| s.provider == "opencode" && s.conversation == id)
-            .collect(),
+        // An id none of its sessions has is a subagent's child session (the plugin registers
+        // none): with one session, it is that session's call; with several, no guess.
+        (_, Some(id)) if mine.iter().any(|s| s.provider == "opencode") => {
+            let ours: Vec<&Session> = mine
+                .into_iter()
+                .filter(|s| s.provider == "opencode")
+                .collect();
+            match ours.iter().find(|s| s.conversation == id) {
+                Some(named) => vec![*named],
+                None if ours.len() == 1 => ours,
+                None => vec![],
+            }
+        }
         (Some(t), _) if mine.iter().any(|s| s.provider == "codex") => {
             mine.into_iter().filter(|s| s.conversation == t).collect()
         }
@@ -120,14 +129,16 @@ mod tests {
             resolve(&proc_(5), &meta("ses_b"), &all),
             Ok(Key::new("m", "opencode", "ses_b"))
         );
-        // Another process's session, or one not registered, is no source: never a guess.
+        // An id none of its several sessions has (another process's, or a subagent's) is no
+        // source: never a guess.
         assert_eq!(
             resolve(&proc_(5), &meta("ses_c"), &all),
             Err(SourceError::Unidentified)
         );
+        // With one session, an unknown id (its subagent's child session) is that session.
         assert_eq!(
-            resolve(&proc_(6), &meta("ses_new"), &all),
-            Err(SourceError::Unidentified)
+            resolve(&proc_(6), &meta("ses_child"), &all),
+            Ok(Key::new("m", "opencode", "ses_c"))
         );
         // Without the meta, one OpenCode process hosting several sessions is ambiguous.
         assert_eq!(

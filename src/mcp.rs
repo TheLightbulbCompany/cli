@@ -216,7 +216,13 @@ impl Server {
         };
         let meta = Value::Object(meta.0 .0);
         let mut sessions = Self::sessions().await?;
-        if source::resolve(&me, &meta, &sessions) == Err(SourceError::Unidentified)
+        // Only for an OpenCode process with no session yet: once it has one, an id none of
+        // its sessions has is a subagent's child session, never registered.
+        let has_one = sessions.iter().any(|s| {
+            s.provider == "opencode" && s.pid == me.pid && s.birth_micros == me.birth_micros
+        });
+        if !has_one
+            && source::resolve(&me, &meta, &sessions) == Err(SourceError::Unidentified)
             && Self::register_opencode(&me, &meta).await
         {
             sessions = Self::sessions().await?;
@@ -240,8 +246,8 @@ impl Server {
     }
 
     /// OpenCode 2.x names its session in every call's `_meta`, and one OpenCode process hosts
-    /// all of its sessions: a session no hook has registered yet (the plugin missed its start,
-    /// or its first tool call is this one) is registered here, to the OpenCode process above
+    /// all of its sessions: the first session of an OpenCode process no hook has registered yet
+    /// (the plugin missed its start, or its first tool call is this one) is registered here, to the OpenCode process above
     /// this server, as the hook would (`register`, with that process as the caller, so its
     /// ownership rules hold). Only for an OpenCode caller and a valid id; whether it did.
     async fn register_opencode(me: &Process, meta: &Value) -> bool {
