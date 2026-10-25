@@ -173,6 +173,45 @@ fn stop_hook_hands_waiting_mail_to_grok_as_block_decision() {
     assert_eq!(net.session(&key).unwrap()["status"], "idle");
 }
 
+#[test]
+fn opencode_hooks_hand_waiting_mail_to_the_plugin_as_text() {
+    let net = Net::new();
+    let conv = "ses_0a1b2c3d4e5fOpEnCoDe0001";
+    // session-start registers and takes no mail.
+    assert_eq!(
+        net.hook("opencode", "session-start", "opencode-session-start"),
+        ""
+    );
+    let key = net.key("opencode", conv);
+    assert!(net.session(&key).is_some());
+    net.send(&key, "body r1", "r1");
+    assert_eq!(
+        net.hook("opencode", "session-start", "opencode-session-start"),
+        ""
+    );
+    assert_eq!(net.receipt("r1"), "stored");
+
+    let out: Value =
+        serde_json::from_str(&net.hook("opencode", "post-tool-use", "opencode-post-tool-use"))
+            .unwrap();
+    assert_eq!(out, json!({"text": frame_of("r1")}));
+    assert_eq!(net.receipt("r1"), "delivered");
+    assert_eq!(net.session(&key).unwrap()["status"], "live");
+
+    net.send(&key, "body r2", "r2");
+    let out: Value = serde_json::from_str(&net.hook("opencode", "stop", "opencode-stop")).unwrap();
+    assert_eq!(out, json!({"text": frame_of("r2")}));
+    assert_eq!(net.session(&key).unwrap()["status"], "idle");
+    // Nothing waiting: the plugin is handed nothing, so it starts no turn.
+    assert_eq!(net.hook("opencode", "stop", "opencode-stop"), "");
+
+    assert_eq!(
+        net.hook("opencode", "session-end", "opencode-session-end"),
+        ""
+    );
+    assert!(net.session(&key).is_none());
+}
+
 /// An agent that changes its hook format: whatever arrives on stdin that no agent's shape
 /// names a conversation in (not JSON, another type, renamed fields, an event name we do not
 /// know), the hook, run as that very agent, exits 0, prints nothing for the agent, registers
@@ -198,7 +237,7 @@ fn an_unknown_hook_payload_exits_0_and_changes_nothing() {
         renamed.to_string(),
         wrong_types.to_string(),
     ];
-    for agent in ["claude", "codex", "cursor", "grok"] {
+    for agent in ["claude", "codex", "cursor", "grok", "opencode"] {
         // Cursor also reads `session_id`: an unknown event name is only unknown to the two
         // agents that name the event in the payload.
         let extra = ["claude", "codex"]

@@ -99,6 +99,7 @@ pub fn normalize(provider: &str, event_arg: &str, payload: &Value) -> Option<Hoo
         }
         "cursor" => cursor_grok::normalize_cursor(from_arg?, payload),
         "grok" => cursor_grok::normalize_grok(from_arg?, payload),
+        "opencode" => cursor_grok::normalize_opencode(from_arg?, payload),
         _ => None,
     }
 }
@@ -107,7 +108,7 @@ pub fn normalize(provider: &str, event_arg: &str, payload: &Value) -> Option<Hoo
 pub fn takes_mail(h: &Hook) -> bool {
     match (h.provider, h.event) {
         (_, Event::SessionEnd) => false,
-        ("cursor" | "grok", e) => matches!(e, Event::PostToolUse | Event::Stop),
+        ("cursor" | "grok" | "opencode", e) => matches!(e, Event::PostToolUse | Event::Stop),
         _ => true,
     }
 }
@@ -116,6 +117,8 @@ pub fn takes_mail(h: &Hook) -> bool {
 pub fn output(h: &Hook, text: &str) -> Value {
     match (h.provider, h.event) {
         ("cursor", e) => cursor_grok::cursor_output(e, text),
+        // Our OpenCode plugin, not OpenCode, reads this.
+        ("opencode", _) => json!({ "text": text }),
         (_, Event::Stop) => json!({ "decision": "block", "reason": text }),
         (_, e) => json!({
             "hookSpecificOutput": { "hookEventName": e.name(), "additionalContext": text }
@@ -340,6 +343,13 @@ mod tests {
         .is_none());
         assert!(normalize("vim", "stop", &p).is_none());
         assert!(normalize("cursor", "nope", &p).is_none());
+        let h = normalize(
+            "opencode",
+            "stop",
+            &json!({"session_id": "ses_1", "cwd": "/p"}),
+        )
+        .unwrap();
+        assert_eq!((h.provider, h.event), ("opencode", Event::Stop));
     }
 
     #[test]
@@ -351,6 +361,7 @@ mod tests {
             assert_eq!(takes_mail(&hook("codex", e)), both);
             assert_eq!(takes_mail(&hook("cursor", e)), tool_or_stop);
             assert_eq!(takes_mail(&hook("grok", e)), tool_or_stop);
+            assert_eq!(takes_mail(&hook("opencode", e)), tool_or_stop);
         }
     }
 
@@ -372,5 +383,8 @@ mod tests {
             output(&hook("cursor", Event::PostToolUse), "t"),
             json!({"additional_context": "t"})
         );
+        for e in [Event::PostToolUse, Event::Stop] {
+            assert_eq!(output(&hook("opencode", e), "t"), json!({"text": "t"}));
+        }
     }
 }

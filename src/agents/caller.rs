@@ -28,6 +28,8 @@ pub fn classify(path: &Path) -> Option<&'static str> {
         "codex" => Some("codex"),
         "cursor-agent" => Some("cursor"),
         "grok" | "grok-native" => Some("grok"),
+        // The npm install's native binary is `.../opencode-ai/bin/opencode.exe`, on macOS too.
+        "opencode" | "opencode.exe" => Some("opencode"),
         // Cursor's CLI runs as `.../cursor-agent/versions/<v>/node`.
         "node" if full.contains("/cursor-agent/") => Some("cursor"),
         // Claude's native binary is named by its version: `.../claude/versions/2.1.307`.
@@ -190,6 +192,11 @@ mod tests {
             ("/usr/local/bin/node", None),
             ("/Users/u/.grok/bin/grok", Some("grok")),
             ("/Users/u/.grok/bin/grok-native", Some("grok")),
+            (
+                "/opt/homebrew/lib/node_modules/opencode-ai/bin/opencode.exe",
+                Some("opencode"),
+            ),
+            ("/Users/u/.opencode/bin/opencode", Some("opencode")),
             ("/bin/zsh", None),
             ("/usr/bin/python3", None),
             ("/Applications/Cursor.app/Contents/MacOS/Cursor", None),
@@ -230,6 +237,24 @@ mod tests {
         ];
         assert_eq!(identify_in("grok", &chain), Err(CallerError::NotThatAgent));
         assert_eq!(identify_in("claude", &chain), Ok(chain[1].clone()));
+    }
+
+    #[test]
+    fn identify_accepts_opencode_and_refuses_it_for_another_agent() {
+        let chain = [
+            p(40, "/bin/zsh"),
+            p(
+                41,
+                "/opt/homebrew/lib/node_modules/opencode-ai/bin/opencode.exe",
+            ),
+        ];
+        assert_eq!(identify_in("opencode", &chain), Ok(chain[1].clone()));
+        assert_eq!(identify_in("grok", &chain), Err(CallerError::NotThatAgent));
+        let claude = [p(50, "/opt/homebrew/bin/claude")];
+        assert_eq!(
+            identify_in("opencode", &claude),
+            Err(CallerError::NotThatAgent)
+        );
     }
 
     #[test]
