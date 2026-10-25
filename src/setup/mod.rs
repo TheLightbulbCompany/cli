@@ -179,8 +179,14 @@ pub fn summary(connected: &[&str], cmd: &str) -> String {
         connected.join(", ")
     };
     let first = connected.first().copied().unwrap_or("Claude Code");
+    // OpenCode's shared service outlives its windows and reads plugins only at start.
+    let opencode = if connected.contains(&"OpenCode") {
+        "OpenCode loads Lightbulb when its background service starts: stop it once (pkill -f 'opencode.* serve') and open OpenCode again.\n"
+    } else {
+        ""
+    };
     format!(
-        "Lightbulb is on.\n  Connected: {list}\n\nTry it: open {first} in any folder and ask \"list my other sessions\".\nAdd your other computer or a teammate: {cmd} invite\nCheck everything: {cmd} doctor\n{UPSELL}"
+        "Lightbulb is on.\n  Connected: {list}\n\nTry it: open {first} in any folder and ask \"list my other sessions\".\n{opencode}Add your other computer or a teammate: {cmd} invite\nCheck everything: {cmd} doctor\n{UPSELL}"
     )
 }
 

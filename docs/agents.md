@@ -77,6 +77,10 @@ Grok's subagent hooks are ignored, and so is a stop that is not the end of a tur
 
 OpenCode has no command hooks, so setup adds a small plugin that runs them.
 
+OpenCode runs a background service (`opencode serve`) that outlives its windows and loads plugins
+only when it starts. After the first setup, stop it once (`pkill -f 'opencode.* serve'`) and open
+OpenCode again; until then OpenCode sessions do not appear and the tools answer `source_unidentified`.
+
 | File | What setup adds |
 |---|---|
 | `~/.config/opencode/plugins/lightbulb.js` | A plugin of our own. It runs `lightbulb hook opencode <event>` on `session.created` (session start), `tool.execute.after` (after a tool call), `session.idle` (end of a turn) and `session.deleted` (session end), with a 10 s limit, and ignores every failure. It skips subagent (child) sessions. It hands a message to a session only with that session's own agent and model, so a message never moves a session from `plan` to `build` or changes its model; until it has seen them (a session resumed before the plugin loaded, until you next type to it), the message waits for `check_inbox`. A message counts as delivered only once OpenCode has taken it in (the plugin then runs `lightbulb hook opencode ack`); one that did not go in is offered again at the next step, so after a crash a message can arrive twice, but none is lost. It is never backed up, because it is only ours. |
