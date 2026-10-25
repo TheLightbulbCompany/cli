@@ -214,12 +214,14 @@ impl Server {
                 Err(_) => return Err(code("source_unidentified")),
             },
         };
-        let r = ask("sessions", json!({}))
-            .await
-            .map_err(|_| code("internal"))?;
-        let sessions: Vec<Session> =
-            serde_json::from_value(r["sessions"].clone()).map_err(|_| code("internal"))?;
-        match source::resolve(&me, &Value::Object(meta.0 .0), &sessions) {
+        let meta = Value::Object(meta.0 .0);
+        let mut sessions = Self::sessions().await?;
+        if source::resolve(&me, &meta, &sessions) == Err(SourceError::Unidentified)
+            && Self::register_opencode(&me, &meta).await
+        {
+            sessions = Self::sessions().await?;
+        }
+        match source::resolve(&me, &meta, &sessions) {
             Ok(from) => {
                 // A tool call is a step: mail delivered before it has been seen.
                 let _ = ask("mark_read", json!({ "key": from })).await;
@@ -228,6 +230,40 @@ impl Server {
             Err(SourceError::Unidentified) => Err(code("source_unidentified")),
             Err(SourceError::Ambiguous) => Err(code("source_ambiguous")),
         }
+    }
+
+    async fn sessions() -> Result<Vec<Session>, CallToolResult> {
+        let r = ask("sessions", json!({}))
+            .await
+            .map_err(|_| code("internal"))?;
+        serde_json::from_value(r["sessions"].clone()).map_err(|_| code("internal"))
+    }
+
+    /// OpenCode 2.x names its session in every call's `_meta`, and one OpenCode process hosts
+    /// all of its sessions: a session no hook has registered yet (the plugin missed its start,
+    /// or its first tool call is this one) is registered here, to the OpenCode process above
+    /// this server, as the hook would (`register`, with that process as the caller, so its
+    /// ownership rules hold). Only for an OpenCode caller and a valid id; whether it did.
+    async fn register_opencode(me: &Process, meta: &Value) -> bool {
+        let Some(id) = meta[source::OPENCODE_SESSION].as_str() else {
+            return false;
+        };
+        if crate::agents::caller::classify(&me.executable) != Some("opencode")
+            || !crate::sessions::word(id, 128)
+        {
+            return false;
+        }
+        // The folder OpenCode started this server in: the session's location.
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let session = json!({ "provider": "opencode", "conversation": id, "pid": me.pid,
+            "birth_micros": me.birth_micros, "cwd": crate::presence::resolved(&cwd),
+            "status": "idle", "executable": me.executable });
+        let r = ask(
+            "register",
+            json!({ "session": session, "caller": hook::proc_json(me) }),
+        )
+        .await;
+        r.is_ok_and(|r| r["key"].is_string() && r["ignored"] != true)
     }
 
     /// `body` as the tool's result, with the unread note when mail waits for a session

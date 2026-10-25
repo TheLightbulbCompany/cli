@@ -1,6 +1,7 @@
 //! Which session an MCP tool call comes from. The model never names its own source: it is
 //! the registered session of the agent process above the MCP server, and for Codex (one
-//! app-server process, many threads) the thread the call's `_meta` names.
+//! app-server process, many threads) the thread the call's `_meta` names; for OpenCode (one
+//! server process, many sessions) the session its `_meta` names.
 
 use crate::os::Process;
 use crate::sessions::{Key, Session};
@@ -17,6 +18,10 @@ pub enum SourceError {
 /// The `_meta` fields a Codex call may carry its thread id in.
 const THREAD_FIELDS: [&str; 3] = ["threadId", "sessionId", "conversationId"];
 
+/// The `_meta` field OpenCode 2.x puts its session id in, on every tool call:
+/// https://github.com/anomalyco/opencode/blob/v2.1.4/packages/core/src/mcp/client.ts
+pub const OPENCODE_SESSION: &str = "ai.opencode/sessionID";
+
 /// The session `parent` (the agent process) is calling from. Sessions are matched by
 /// pid + birth; when they are Codex threads, `meta`'s thread id picks one of them.
 pub fn resolve(parent: &Process, meta: &Value, sessions: &[Session]) -> Result<Key, SourceError> {
@@ -25,8 +30,13 @@ pub fn resolve(parent: &Process, meta: &Value, sessions: &[Session]) -> Result<K
         .filter(|s| s.pid == parent.pid && s.birth_micros == parent.birth_micros)
         .collect();
     let thread = THREAD_FIELDS.iter().find_map(|f| meta[f].as_str());
-    let picked: Vec<&Session> = match thread {
-        Some(t) if mine.iter().any(|s| s.provider == "codex") => {
+    let opencode = meta[OPENCODE_SESSION].as_str();
+    let picked: Vec<&Session> = match (thread, opencode) {
+        (_, Some(id)) if mine.iter().any(|s| s.provider == "opencode") => mine
+            .into_iter()
+            .filter(|s| s.provider == "opencode" && s.conversation == id)
+            .collect(),
+        (Some(t), _) if mine.iter().any(|s| s.provider == "codex") => {
             mine.into_iter().filter(|s| s.conversation == t).collect()
         }
         _ => mine,
@@ -95,6 +105,52 @@ mod tests {
         assert_eq!(
             resolve(&proc_(6), &json!({}), &all),
             Ok(Key::new("m", "codex", "t3"))
+        );
+    }
+
+    #[test]
+    fn opencode_source_is_the_session_in_its_meta() {
+        let all = [
+            s("opencode", "ses_a", 5),
+            s("opencode", "ses_b", 5),
+            s("opencode", "ses_c", 6),
+        ];
+        let meta = |id: &str| json!({ OPENCODE_SESSION: id });
+        assert_eq!(
+            resolve(&proc_(5), &meta("ses_b"), &all),
+            Ok(Key::new("m", "opencode", "ses_b"))
+        );
+        // Another process's session, or one not registered, is no source: never a guess.
+        assert_eq!(
+            resolve(&proc_(5), &meta("ses_c"), &all),
+            Err(SourceError::Unidentified)
+        );
+        assert_eq!(
+            resolve(&proc_(6), &meta("ses_new"), &all),
+            Err(SourceError::Unidentified)
+        );
+        // Without the meta, one OpenCode process hosting several sessions is ambiguous.
+        assert_eq!(
+            resolve(&proc_(5), &json!({}), &all),
+            Err(SourceError::Ambiguous)
+        );
+        // Codex's thread fields do not pick an OpenCode session.
+        assert_eq!(
+            resolve(&proc_(5), &json!({"sessionId": "ses_a"}), &all),
+            Err(SourceError::Ambiguous)
+        );
+    }
+
+    #[test]
+    fn the_opencode_meta_key_means_nothing_to_another_agent() {
+        let all = [s("claude", "c1", 5), s("codex", "t1", 6)];
+        assert_eq!(
+            resolve(&proc_(5), &json!({ OPENCODE_SESSION: "ses_x" }), &all),
+            Ok(Key::new("m", "claude", "c1"))
+        );
+        assert_eq!(
+            resolve(&proc_(6), &json!({ OPENCODE_SESSION: "ses_x" }), &all),
+            Ok(Key::new("m", "codex", "t1"))
         );
     }
 
