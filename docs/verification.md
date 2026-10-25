@@ -131,6 +131,14 @@ proves a computer ignores app envelopes). The "no admins" rule is the flat netwo
 | `find_sessions` takes a session's `who` name (`claude-5`) as a query and returns it as `name`. | `src/mcp.rs:280`, `src/presence.rs:522`. | `tests/mcp_tools.rs::find_sessions_marks_is_this_session` | PASS |
 | Off macOS, `setup` restarts a daemon whose version differs from the binary; `doctor` names such a daemon and the fix. | `restart_if_old` `src/cli.rs:1557` (called `:1864`), doctor `:1706`. | **NO TEST** (found on a real Linux computer; see "Real computers") | NO TEST |
 
+### D5. 0.4.1 – 0.4.3 (found on prod on 2026-10-25)
+
+| Control | Where | Test | Result |
+|---|---|---|---|
+| A bare `from` (`friday`) is this member's own session, as `to` already was; before, every workspace agent send was refused `not_declared`. | `src/daemon/ipc.rs`, `send` | `tests/embed.rs::a_person_line_reaches_friday_and_an_unlisted_teammate_does_not` (sends in the bridge's shape: bare `from`, no `to`, `reply_to` = the request id) | PASS |
+| A receipt to a parked member with a doorbell carries `waking`; the CLI says it is waking up, not offline. | `src/daemon/ipc.rs`, `finish`; `src/mail.rs`, `receipt_text` | `src/mail.rs::a_parked_workspace_reads_as_waking_not_offline` | PASS |
+| OpenCode: provider, caller, hooks, setup (MCP entry and plugin). Every pushed message carries the session's own agent and model, so a teammate's mail cannot switch a session from `plan` to `build`; with none recorded the plugin does not push and the mail waits for `check_inbox`. | `src/setup/opencode.rs`, `src/hook.rs`, `src/agents/caller.rs` | the OpenCode cases in `tests/hooks.rs` and `src/setup/tests.rs`, and the plugin smoke test (needs node) | PASS (unit and integration); **not run in a live OpenCode session** |
+
 ## Real computers
 
 Observed on 2026-10-24 on v0.3.6 and v0.3.7 (nothing here was re-run for this file): the owner's
@@ -148,6 +156,13 @@ Mac (home network) and a Windows/WSL computer elsewhere, over the n0 relays.
   (fixed in 0.3.7: `setup` restarts it, `doctor` names it; D4, NO TEST).
 - A fresh Claude Code session found the `lightbulb-network` tools through the skill, and its
   message's receipt went `stored` then `delivered`.
+
+On 2026-10-25, on prod (engine 0.4.1 in the workspace, 0.4.1 on WSL): WSL sent
+`emxq…/friday` "reply with OK"; the parked workspace was woken by its doorbell (wake to stored
+about 10 s), Friday ran one turn, and WSL read "From The Lightbulb Company's hermes (not
+verified): OK" with nothing held. The label now reads the agent's name (backend change). Three
+earlier tries failed on the bugs D5 and the bridge fixed: the bridge's reply needed `to`, the
+engine refused a bare `from`, and the bridge's request ids held a `:`.
 
 Earlier real-Mac passes are cited row by row above from `docs/acceptance-plan-a.md` and
 `docs/acceptance-plan-b.md` (0.2.0 builds) and from `docs/acceptance-two-mac.md`; they stay as
@@ -181,7 +196,8 @@ Red rows: none. Untested or open:
    not re-run on 0.3.7.
 7. **C5**: held, Allow, next Cursor/Grok step is proven in two halves, not as one test.
 8. **C8**: the bridge (Friday) is not in this repo; only the engine's cloud-member side and the
-   member sidecar (`tests/member.rs`) are tested.
+   member sidecar (`tests/member.rs`) are tested here. A real reply from Friday passed on prod on
+   2026-10-25 (see "Real computers").
 9. **C10**: no fresh-Mac join on 0.3.7 with a Mac as the joiner.
 10. **NO TEST rows in D**: a self-signed `remove` entry; a started turn on a refused
     non-member; the 64 MiB Argon2 cost in a test run; the
