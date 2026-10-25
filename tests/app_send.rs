@@ -172,6 +172,59 @@ async fn the_recipient_reads_it_as_app_via_person() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_peeked_inbox_keeps_its_records_until_they_are_acked() {
+    let w = world();
+    let i = w.instance().await;
+    let q = w.q();
+    ok(&i, "app.send", send_body(&q, "r1")).await;
+    let m = w.b.take_one(&q);
+    w.b.send(&q, &w.app(), "hi chatgpt", "q1", m["id"].as_str());
+    let me = json!({"app": "chatgpt", "person": P});
+    let mut peek = me.clone();
+    peek["peek"] = true.into();
+    let mut records = vec![];
+    for _ in 0..250 {
+        records = ok(&i, "app.inbox", peek.clone()).await["records"]
+            .as_array()
+            .unwrap()
+            .clone();
+        if !records.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0]["text"], "hi chatgpt");
+    // A peek takes nothing: the record is handed out again, and still counts as unread.
+    let again = ok(&i, "app.inbox", peek.clone()).await;
+    assert_eq!(again["records"], json!(records), "{again}");
+    assert_eq!(ok(&i, "app.unread", me.clone()).await["unread"], 1);
+    assert!(!["delivered", "read"].contains(&w.b.state(&q, "q1").as_str()));
+    // An id that is not this session's mail acks nothing; nor does another app's ack.
+    let mut stray = me.clone();
+    stray["ids"] = json!(["nope"]);
+    assert_eq!(ok(&i, "app.ack", stray).await["acked"], 0);
+    let id = records[0]["id"].clone();
+    let mut ack = me.clone();
+    ack["ids"] = json!([id]);
+    assert_eq!(ok(&i, "app.ack", ack.clone()).await["acked"], 1);
+    assert_eq!(ok(&i, "app.inbox", peek).await["records"], json!([]));
+    assert_eq!(ok(&i, "app.unread", me.clone()).await["unread"], 0);
+    common::until(10, "Q's reply reads read", || w.b.state(&q, "q1") == "read");
+    // Acking again is harmless.
+    ok(&i, "app.ack", ack).await;
+    let mut bad = me.clone();
+    bad["ids"] = json!("x");
+    assert_eq!(
+        call(&i, "app.ack", bad.clone()).await["error"],
+        "bad_request"
+    );
+    bad["ids"] = json!(vec!["x"; 101]);
+    assert_eq!(call(&i, "app.ack", bad).await["error"], "bad_request");
+    i.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_undeclared_app_person_pair_is_refused() {
     let w = world();
     let i = w.instance().await;
@@ -182,6 +235,8 @@ async fn an_undeclared_app_person_pair_is_refused() {
         let bodies = [
             ("app.send", send),
             ("app.inbox", json!({"app": app, "person": who})),
+            ("app.ack", json!({"app": app, "person": who, "ids": []})),
+            ("app.unread", json!({"app": app, "person": who})),
             (
                 "app.receipt",
                 json!({"app": app, "person": who, "request_id": "r1"}),

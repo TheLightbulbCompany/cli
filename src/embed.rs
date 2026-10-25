@@ -255,7 +255,7 @@ impl Instance {
     /// op is refused (`bad_request`, reason `not_a_person`) but `team.join` and `team.leave`:
     /// the caller is the bridge, acting for a
     /// workspace admin who confirmed in the app. `inbox {session}` takes a declared session's
-    /// mail as Task 10's records, read. `app.send`, `app.inbox` and `app.receipt` send and read
+    /// mail as Task 10's records, read. `app.send`, `app.inbox`, `app.ack`, `app.unread` and `app.receipt` send and read
     /// as a hosted app's declared session `{app}-{person}` (`app_send`).
     pub async fn call(&self, req: Value) -> Value {
         json!(self.respond(req).await)

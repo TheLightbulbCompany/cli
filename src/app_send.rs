@@ -6,8 +6,11 @@
 //!
 //! `app.send {app, person, to, text, request_id, reply_to?}` -> the receipt with the message's
 //! `id` (a `request_id` sent before answers its first receipt and sends nothing);
-//! `app.inbox {app, person}` -> `{records}`, taken and read; `app.receipt {app, person,
-//! request_id}` -> the receipt. A pair not declared is `refused`, reason `not_declared` (the
+//! `app.inbox {app, person}` -> `{records}`, taken and read; with `peek: true` they are left
+//! as they are (delivered-unread, then waiting) until `app.ack {app, person, ids}` -> `{acked}`
+//! takes and reads those of them that are this session's (at most 100 ids), so an answer lost on its way to the
+//! app loses no mail (it is handed out again); `app.unread {app, person}` -> `{unread}`, what
+//! waits, taking nothing; `app.receipt {app, person, request_id}` -> the receipt. A pair not declared is `refused`, reason `not_declared` (the
 //! bridge declares it and asks once more). An instance's ops only.
 
 use crate::daemon::ipc::{self, Response, BAD_REQUEST, INTERNAL, NOT_FOUND, UNSUPPORTED};
@@ -16,6 +19,9 @@ use crate::mail;
 use crate::sessions::{self, Key};
 use serde_json::{json, Value};
 use std::sync::Arc;
+
+/// The most ids one `app.ack` takes: it holds the store's lock for the list.
+const MAX_ACK: usize = 100;
 
 pub(crate) async fn op(id: u64, op: &str, body: &Value, d: &Arc<Daemon>) -> Response {
     let Some(cloud) = &d.cloud else {
@@ -42,6 +48,31 @@ pub(crate) async fn op(id: u64, op: &str, body: &Value, d: &Arc<Daemon>) -> Resp
                 Err(e) => return e,
             }
         }
+        "app.inbox" if body["peek"] == true => {
+            return match peek(d, &from) {
+                Ok(records) => Response::ok(id, json!({ "records": records })),
+                Err(_) => Response::err(id, INTERNAL),
+            }
+        }
+        "app.ack" => {
+            let Some(ids) = body["ids"]
+                .as_array()
+                .filter(|a| a.len() <= MAX_ACK)
+                .and_then(|a| a.iter().map(Value::as_str).collect::<Option<Vec<_>>>())
+            else {
+                return Response::err(id, BAD_REQUEST);
+            };
+            return match ack(d, &from, &ids) {
+                Ok(n) => Response::ok(id, json!({ "acked": n })),
+                Err(_) => Response::err(id, INTERNAL),
+            };
+        }
+        "app.unread" => {
+            return match mail::unread(&d.store.lock().unwrap(), &from, ipc::now()) {
+                Ok(n) => Response::ok(id, json!({ "unread": n })),
+                Err(_) => Response::err(id, INTERNAL),
+            }
+        }
         "app.inbox" => {
             return match crate::embed::take_read(d, &from) {
                 Ok(records) => Response::ok(id, json!({ "records": records })),
@@ -66,4 +97,44 @@ pub(crate) async fn op(id: u64, op: &str, body: &Value, d: &Arc<Daemon>) -> Resp
     let msg: Option<String> = store.conn().query_row(q, [&from.0, rid], |x| x.get(0)).ok();
     r["id"] = msg.into();
     Response::ok(id, r)
+}
+
+/// What `key` has not read: delivered-unread, then waiting, each oldest first; nothing changes.
+fn peek(d: &Daemon, key: &Key) -> crate::Result<Vec<Value>> {
+    let listed = {
+        let store = d.store.lock().unwrap();
+        let now = ipc::now();
+        let mut m: Vec<_> = mail::delivered_unread(&store, &d.identity.short, now)?
+            .into_iter()
+            .filter(|m| m.to_key == key.0)
+            .collect();
+        m.extend(mail::waiting(&store, key, now)?);
+        m
+    };
+    // After the store lock: `records` takes the team's.
+    Ok(ipc::records(d, &listed)
+        .iter()
+        .map(ipc::inbox_record)
+        .collect())
+}
+
+/// Takes and reads each of `ids` that is mail to `key`; how many were. Another session's id,
+/// or one unknown, is skipped; one acked before counts again and changes nothing.
+fn ack(d: &Daemon, key: &Key, ids: &[&str]) -> crate::Result<usize> {
+    let n = {
+        let store = d.store.lock().unwrap();
+        let mut n = 0;
+        for m in ids {
+            mail::take_one(&store, key, m, ipc::now())?;
+            if store.message(m)?.is_some_and(|x| x.to_key == key.0) {
+                mail::mark_read(&store, m)?;
+                n += 1;
+            }
+        }
+        mail::forget(&store)?;
+        n
+    };
+    // Their `delivered` and `read` go to the senders now (`Net::flush_loop`).
+    d.peers.outbox.notify_one();
+    Ok(n)
 }
