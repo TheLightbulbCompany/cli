@@ -424,10 +424,10 @@ fn strip_jsonc_takes_out_comments_and_trailing_commas_only() {
     );
 }
 
-/// Runs the generated plugin under node (when it is installed) with a fake OpenCode client
-/// and a fake `lightbulb` that hands mail on `post-tool-use` and `stop`.
-#[test]
-fn the_opencode_plugin_runs_hooks_and_injects_their_text() {
+/// Runs `driver` (an ES module; its last argument is the plugin's path) under node with the
+/// generated plugin and a fake `lightbulb` that logs each call and offers mail `m1` when asked
+/// for mail. `None` when node is not installed. Returns what it printed (JSON) and the log.
+fn run_plugin(driver: &str) -> Option<(Value, String)> {
     use std::os::unix::fs::PermissionsExt;
     if std::process::Command::new("node")
         .arg("--version")
@@ -435,7 +435,7 @@ fn the_opencode_plugin_runs_hooks_and_injects_their_text() {
         .is_err()
     {
         eprintln!("node not installed: plugin smoke test skipped");
-        return;
+        return None;
     }
     let d = tempfile::tempdir().unwrap();
     let dir = d.path();
@@ -443,7 +443,6 @@ fn the_opencode_plugin_runs_hooks_and_injects_their_text() {
     // A path a shell or JS literal could trip on.
     let exe = dir.join("it's a dir").join("lightbulb");
     fs::create_dir(exe.parent().unwrap()).unwrap();
-    // Logs each call; offers mail `m1` when asked for mail.
     fs::write(
         &exe,
         format!(
@@ -461,8 +460,26 @@ fn the_opencode_plugin_runs_hooks_and_injects_their_text() {
         remove: false,
     };
     fs::write(dir.join("plugin.mjs"), opencode::plugin_js(&ctx)).unwrap();
+    let out = std::process::Command::new("node")
+        .args(["--input-type=module", "-e", driver])
+        .arg(dir.join("plugin.mjs"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let printed = serde_json::from_slice(&out.stdout).unwrap();
+    Some((printed, fs::read_to_string(&log).unwrap_or_default()))
+}
+
+/// OpenCode 1.x: the default export's `server()`, with a fake 1.x client.
+#[test]
+fn the_opencode_plugin_runs_hooks_and_injects_their_text() {
     let driver = r#"
-const { Lightbulb } = await import("file://" + process.argv.at(-1));
+const { default: plugin } = await import("file://" + process.argv.at(-1));
+const Lightbulb = plugin.server;
 const prompts = [];
 // The 1st prompt throws, the 2nd answers with an error (the SDK's default), the rest succeed.
 const client = { session: {
@@ -499,17 +516,9 @@ await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses
 await h.event({ event: { type: "message.updated", properties: {} } });
 console.log(JSON.stringify(prompts));
 "#;
-    let out = std::process::Command::new("node")
-        .args(["--input-type=module", "-e", driver])
-        .arg(dir.join("plugin.mjs"))
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let prompts: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let Some((prompts, text)) = run_plugin(driver) else {
+        return;
+    };
     // Every push keeps the session's own agent and model: mail never switches plan to build.
     let body = |no_reply: bool| {
         let mut b = json!({"parts": [{"type": "text", "text": "mail"}], "agent": "plan",
@@ -544,12 +553,100 @@ console.log(JSON.stringify(prompts));
         call("stop", "ses_b", false),
         call("session-end", "ses_a", false),
     ];
-    let text = fs::read_to_string(&log).unwrap();
     let mut got: Vec<_> = text.lines().map(String::from).collect();
     // Concurrent calls log in either order.
     got.sort();
     want.sort();
     assert_eq!(got, want, "{text}");
+}
+
+/// OpenCode 2.x: loaded the way 2.x loads it (a default `{id, setup}`), driven by a fake 2.x
+/// context: events from `ctx.event.subscribe`, `ctx.session.get` and `ctx.session.prompt`.
+#[test]
+fn the_opencode_plugin_runs_under_opencode_2() {
+    let driver = r#"
+const mod = await import("file://" + process.argv.at(-1));
+// What 2.x's PluginModule schema requires: default {id: string, setup: function}.
+if (typeof mod.default?.id !== "string" || typeof mod.default?.setup !== "function") throw new Error("2.x shape");
+const prompts = [];
+const ev = (type, data) => ({ id: "evt", created: 0, type, data });
+const events = [
+  ev("session.created", { sessionID: "ses_a", location: { directory: "/tmp/proj" } }),
+  ev("session.created", { sessionID: "child1", parentID: "ses_a", location: { directory: "/tmp/proj" } }),
+  ev("session.tool.success", { sessionID: "ses_a" }), // prompt throws: no ack
+  ev("session.tool.failed", { sessionID: "ses_a" }), // goes in: one ack
+  ev("session.tool.success", { sessionID: "child1" }),
+  ev("session.tool.success", { sessionID: "child2" }), // a subagent's, seen only by session.get
+  ev("session.tool.success", { sessionID: "ses_c" }), // resumed: its folder from session.get
+  ev("session.step.started", { sessionID: "ses_a" }),
+  ev("session.idle", { sessionID: "ses_a" }),
+  ev("session.deleted", { sessionID: "ses_a" }),
+];
+let drained;
+const done = new Promise((r) => (drained = r));
+let subscriptions = 0;
+const ctx = {
+  location: { directory: "/tmp/fallback" },
+  session: {
+    get: async ({ sessionID }) => ({ id: sessionID, parentID: sessionID === "child2" ? "p" : undefined,
+      location: { directory: sessionID === "ses_c" ? "/tmp/other" : "/tmp/proj" } }),
+    prompt: async (input) => {
+      prompts.push(input);
+      if (prompts.length === 1) throw new Error("refused");
+      return { id: "msg_1" };
+    },
+  },
+  event: {
+    subscribe: ({ signal }) => ({
+      [Symbol.asyncIterator]() {
+        subscriptions++;
+        let i = 0;
+        return {
+          next: () => {
+            if (i < events.length) return Promise.resolve({ done: false, value: events[i++] });
+            // Asked for more: every event has been handled.
+            drained();
+            return new Promise((r) => signal.addEventListener("abort", () => r({ done: true }), { once: true }));
+          },
+          return: () => Promise.resolve({ done: true }),
+        };
+      },
+    }),
+  },
+};
+const cleanup = await mod.default.setup(ctx);
+await done;
+await cleanup();
+console.log(JSON.stringify({ prompts, subscriptions }));
+"#;
+    let Some((out, text)) = run_plugin(driver) else {
+        return;
+    };
+    // A 2.x prompt names no agent or model: it runs as the session's own.
+    let prompt = |id: &str| json!({"sessionID": id, "text": "mail", "delivery": "steer"});
+    assert_eq!(
+        out,
+        json!({"prompts": [prompt("ses_a"), prompt("ses_a"), prompt("ses_c"), prompt("ses_a")],
+            "subscriptions": 1})
+    );
+    let call = |arg: &str, id: &str, cwd: &str, mail: bool| {
+        format!("opencode {arg} {{\"session_id\":\"{id}\",\"cwd\":\"{cwd}\",\"mail\":{mail}}}")
+    };
+    let ack = |id: &str, cwd: &str| {
+        format!("opencode ack {{\"session_id\":\"{id}\",\"cwd\":\"{cwd}\",\"mail\":false,\"ids\":[\"m1\"]}}")
+    };
+    let want = [
+        call("session-start", "ses_a", "/tmp/proj", false),
+        call("post-tool-use", "ses_a", "/tmp/proj", true),
+        call("post-tool-use", "ses_a", "/tmp/proj", true),
+        ack("ses_a", "/tmp/proj"),
+        call("post-tool-use", "ses_c", "/tmp/other", true),
+        ack("ses_c", "/tmp/other"),
+        call("stop", "ses_a", "/tmp/proj", true),
+        ack("ses_a", "/tmp/proj"),
+        call("session-end", "ses_a", "/tmp/proj", false),
+    ];
+    assert_eq!(text.lines().collect::<Vec<_>>(), want, "{text}");
 }
 
 #[test]
