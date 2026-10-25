@@ -87,6 +87,10 @@ it is plain JSON. A `.jsonc` with comments or trailing commas is left as it is: 
 `mcp` entry for you to paste in, and reads OpenCode as connected once it is there. Setup never
 makes an `opencode.json` beside an `opencode.jsonc`.
 
+One OpenCode process hosts all of its sessions, so Lightbulb cannot tell them apart by
+process: a tool in one OpenCode session could read or take another session's waiting messages in
+the same OpenCode. Messages from other computers and other agents are unaffected.
+
 ### After setup
 
 Restart any agent session that was already open. An open session does not load the new tool
