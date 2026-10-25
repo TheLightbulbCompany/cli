@@ -109,7 +109,7 @@ that person to `accept`.
 lightbulb remove sam
 ```
 
-Any member can remove another. Removing a member blocks new
+Any member can remove another, except the founder (it can leave). Removing a member blocks new
 connections and new messages from that computer. It also ends **every** live invite in the
 team, so a removed person cannot rejoin with an old one. You get a new invite line in the
 answer; send that to anyone still waiting to join. Other members get new invites with their

@@ -20,7 +20,8 @@ the member who wrote it and names the entries before it by their hash.
 
 Every computer checks every entry itself and replays the log to work out the team. An entry
 counts only if its signer had the right to write it: every network is flat, so any computer
-member can invite, admit and remove others (not itself). A new member checks every entry it
+member can invite, admit and remove others (not itself, and never the founder, which may only
+leave). A new member checks every entry it
 receives before it accepts the team. No server holds or decides the membership.
 
 Invites are signed by the computer that made them. A join is checked against the roster: the
@@ -38,9 +39,11 @@ it records that when a computer joins through a `person` link the workspace itse
 person (the link names the person under the workspace's signature and works once). With a
 members list, it takes a message for one of its agents only from a computer it recorded for a
 listed person; any other member's message is refused (`not_a_member`), with no hold. No frame a
-peer sends writes that record, and it is dropped when the computer leaves the team. A computer
-that joins with a person line accepts its inviter's messages from then on (`policy`): the
-person pasted their own workspace's line. Only join with a person line from a workspace you
+peer sends writes that record, and it is dropped by any install that removes the computer or
+sees it leave (even if it is admitted again in the same sync). A computer that joins with a
+person line accepts from its inviter only answers to its own messages (a `reply_to` or thread
+it started with that member); anything else from the inviter is held like anyone's. Labels
+ending "(not verified)" are unproven names, never an identity. Only join with a person line from a workspace you
 trust; an ordinary invite line or code never does this.
 
 ### Invite codes
