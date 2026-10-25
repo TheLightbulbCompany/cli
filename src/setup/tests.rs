@@ -443,10 +443,11 @@ fn the_opencode_plugin_runs_hooks_and_injects_their_text() {
     // A path a shell or JS literal could trip on.
     let exe = dir.join("it's a dir").join("lightbulb");
     fs::create_dir(exe.parent().unwrap()).unwrap();
+    // Logs each call; offers mail `m1` when asked for mail.
     fs::write(
         &exe,
         format!(
-            "#!/bin/sh\nprintf '%s %s ' \"$2\" \"$3\" >> '{log}'\ncat >> '{log}'\necho >> '{log}'\ncase \"$3\" in post-tool-use|stop) echo '{{\"text\":\"mail\"}}';; esac\n",
+            "#!/bin/sh\nin=$(cat)\nprintf '%s %s %s\\n' \"$2\" \"$3\" \"$in\" >> '{log}'\ncase \"$3:$in\" in post-tool-use:*'\"mail\":true'*|stop:*'\"mail\":true'*) echo '{{\"text\":\"mail\",\"ids\":[\"m1\"]}}';; esac\n",
             log = log.display()
         ),
     )
@@ -463,9 +464,15 @@ fn the_opencode_plugin_runs_hooks_and_injects_their_text() {
     let driver = r#"
 const { Lightbulb } = await import("file://" + process.argv.at(-1));
 const prompts = [];
+// The 1st prompt throws, the 2nd answers with an error (the SDK's default), the rest succeed.
 const client = { session: {
   get: async ({ path }) => ({ data: { id: path.id, parentID: path.id === "child2" ? "p" : undefined } }),
-  prompt: async (o) => { prompts.push(o); return {}; },
+  prompt: async (o) => {
+    prompts.push(o);
+    if (prompts.length === 1) throw new Error("down");
+    if (prompts.length === 2) return { error: { name: "BadRequest" } };
+    return { data: {} };
+  },
 } };
 const h = await Lightbulb({ client, directory: "/tmp/proj" });
 const tool = (id) => h["tool.execute.after"]({ tool: "bash", sessionID: id, callID: "c", args: {} }, {});
@@ -478,15 +485,18 @@ await h["chat.message"](
   { sessionID: "ses_a", agent: "plan", model: { providerID: "p", modelID: "m" }, variant: "high" },
   { message: { sessionID: "ses_a", role: "user", agent: "plan", model: { providerID: "p", modelID: "m" } }, parts: [] },
 );
-await tool("ses_a");
+await tool("ses_a"); // prompt throws: no ack
+await tool("ses_a"); // prompt answers an error: no ack
+// Two tool calls at once: only one is offered the mail; one ack.
+await Promise.all([tool("ses_a"), tool("ses_a")]);
 await tool("ses_b");
 await tool("child1");
 await tool("child2");
-await idle("ses_a");
+await idle("ses_a"); // a turn, not awaited by the event; one ack after it
 await idle("ses_b");
+await new Promise((r) => setTimeout(r, 300));
 await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_a" } } } });
 await h.event({ event: { type: "message.updated", properties: {} } });
-await new Promise((r) => setTimeout(r, 50));
 console.log(JSON.stringify(prompts));
 "#;
     let out = std::process::Command::new("node")
@@ -509,26 +519,37 @@ console.log(JSON.stringify(prompts));
         }
         json!({"path": {"id": "ses_a"}, "body": b})
     };
-    assert_eq!(prompts, json!([body(true), body(false)]));
-    // A session with no agent recorded asks for no mail, so it stays in the inbox.
-    let call = |arg: &str, id: &str, mail: bool| {
-        format!(
-            "opencode {arg} {{\"session_id\":\"{id}\",\"cwd\":\"/tmp/proj\",\"mail\":{mail}}}\n"
-        )
-    };
     assert_eq!(
-        fs::read_to_string(&log).unwrap(),
-        [
-            call("session-start", "ses_a", false),
-            call("session-start", "ses_b", false),
-            call("post-tool-use", "ses_a", true),
-            call("post-tool-use", "ses_b", false),
-            call("stop", "ses_a", true),
-            call("stop", "ses_b", false),
-            call("session-end", "ses_a", true),
-        ]
-        .concat()
+        prompts,
+        json!([body(true), body(true), body(true), body(false)])
     );
+    // A session with no agent recorded asks for no mail, so it stays in the inbox; only a
+    // prompt that went in is acked.
+    let call = |arg: &str, id: &str, mail: bool| {
+        format!("opencode {arg} {{\"session_id\":\"{id}\",\"cwd\":\"/tmp/proj\",\"mail\":{mail}}}")
+    };
+    let ack = r#"opencode ack {"session_id":"ses_a","cwd":"/tmp/proj","mail":false,"ids":["m1"]}"#
+        .to_string();
+    let mut want = vec![
+        call("session-start", "ses_a", false),
+        call("session-start", "ses_b", false),
+        call("post-tool-use", "ses_a", true),
+        call("post-tool-use", "ses_a", true),
+        call("post-tool-use", "ses_a", true),
+        call("post-tool-use", "ses_a", false),
+        ack.clone(),
+        call("post-tool-use", "ses_b", false),
+        call("stop", "ses_a", true),
+        ack,
+        call("stop", "ses_b", false),
+        call("session-end", "ses_a", false),
+    ];
+    let text = fs::read_to_string(&log).unwrap();
+    let mut got: Vec<_> = text.lines().map(String::from).collect();
+    // Concurrent calls log in either order.
+    got.sort();
+    want.sort();
+    assert_eq!(got, want, "{text}");
 }
 
 #[test]

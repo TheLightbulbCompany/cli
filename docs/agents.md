@@ -79,13 +79,17 @@ OpenCode has no command hooks, so setup adds a small plugin that runs them.
 
 | File | What setup adds |
 |---|---|
-| `~/.config/opencode/plugins/lightbulb.js` | A plugin of our own. It runs `lightbulb hook opencode <event>` on `session.created` (session start), `tool.execute.after` (after a tool call), `session.idle` (end of a turn) and `session.deleted` (session end), with a 10 s limit, and ignores every failure. It skips subagent (child) sessions. It hands a message to a session only with that session's own agent and model, so a message never moves a session from `plan` to `build` or changes its model; until it has seen them (a session resumed before the plugin loaded, until you next type to it), the message waits for `check_inbox`. It is never backed up, because it is only ours. |
+| `~/.config/opencode/plugins/lightbulb.js` | A plugin of our own. It runs `lightbulb hook opencode <event>` on `session.created` (session start), `tool.execute.after` (after a tool call), `session.idle` (end of a turn) and `session.deleted` (session end), with a 10 s limit, and ignores every failure. It skips subagent (child) sessions. It hands a message to a session only with that session's own agent and model, so a message never moves a session from `plan` to `build` or changes its model; until it has seen them (a session resumed before the plugin loaded, until you next type to it), the message waits for `check_inbox`. A message counts as delivered only once OpenCode has taken it in (the plugin then runs `lightbulb hook opencode ack`); one that did not go in is offered again at the next step, so after a crash a message can arrive twice, but none is lost. It is never backed up, because it is only ours. |
 | `~/.config/opencode/opencode.json` | `mcp.lightbulb-network`: `{"type": "local", "command": ["<path>", "mcp"], "enabled": true}`. |
 
 If you have `~/.config/opencode/opencode.jsonc` instead, setup edits that file, but only while
 it is plain JSON. A `.jsonc` with comments or trailing commas is left as it is: setup prints the
 `mcp` entry for you to paste in, and reads OpenCode as connected once it is there. Setup never
 makes an `opencode.json` beside an `opencode.jsonc`.
+
+One OpenCode process hosts all of its sessions, so Lightbulb cannot tell them apart by
+process: a tool in one OpenCode session could read or take another session's waiting messages in
+the same OpenCode. Messages from other computers and other agents are unaffected.
 
 ### After setup
 
