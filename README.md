@@ -119,6 +119,7 @@ beside the Lightbulb desktop app's own `lightbulb` server; neither replaces the 
 
 ## Docs
 
+- [Connect your agent](docs/connect/index.md): one short page per agent, and joining a network.
 - [Agents](docs/agents.md): what `setup` changes for Claude Code, Codex, Cursor, Grok CLI and OpenCode, and how a message reaches a session.
 - [Teams](docs/teams.md): invites, joining, roles, Allow and policy, removing and leaving, relays.
 - [Security](docs/security.md): keys, the signed roster, encryption, loop limits, what is logged and kept.
