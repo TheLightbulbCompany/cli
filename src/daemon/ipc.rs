@@ -355,7 +355,8 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
         }
         "team.invite" => {
             let mut r = super::net_ops::handle(id, op, body, daemon, caller);
-            if r.ok {
+            // `code: false` (`invite --agents`): the link alone, no second link behind a code.
+            if r.ok && body["code"] != false {
                 crate::code::offer(daemon, &mut r.body).await;
             }
             r

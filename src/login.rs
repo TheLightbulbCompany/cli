@@ -1,0 +1,234 @@
+//! `lightbulb login` / `logout` and `invite --agents`: the one tie between this computer and a
+//! person's Lightbulb account. A device flow: the backend hands out a one-time challenge, this
+//! computer signs it with its member key (so the backend learns the key is really this
+//! computer's), and the signed-in person confirms the code in their browser. The CLI never
+//! holds an account token; the poll `code` is single use and lives only in memory here.
+//!
+//! The wire is `curl`, as `lightbulb update` and the usage counts use; bodies go in on stdin
+//! (never in argv, which other processes can read).
+
+use crate::identity::Identity;
+use crate::{paths, Result};
+use serde_json::{json, Value};
+use std::io::Write;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+/// The public Lightbulb API. `LIGHTBULB_API` points a test or another environment elsewhere.
+const API: &str = "https://api.thelightbulb.company/api/v1";
+/// (tests) Set: no browser is opened.
+const NO_BROWSER: &str = "LIGHTBULB_CONNECT_NO_BROWSER";
+
+fn api() -> String {
+    std::env::var("LIGHTBULB_API")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| API.into())
+}
+
+/// What this computer signs for `purpose` (`login`, `logout` or `agents`): the backend's
+/// `challenge`, this computer's `key`, and for `agents` the once link the workspace joins with,
+/// so a captured proof cannot carry another link. Canonical JSON, Ed25519 (`Identity::sign`).
+pub fn proof(id: &Identity, purpose: &str, challenge: &str, ticket: Option<&str>) -> Value {
+    let mut v = json!({
+        "purpose": format!("lightbulb-{purpose}"),
+        "challenge": challenge,
+        "key": id.key,
+    });
+    if let Some(t) = ticket {
+        v["ticket"] = t.into();
+    }
+    id.signed(v)
+}
+
+/// `POST {api}{path}` with JSON `body`: the status and the answer's JSON (`null` when none).
+fn post(path: &str, body: &Value) -> Result<(u16, Value)> {
+    let mut c = Command::new("curl");
+    c.args(["-q", "-sS", "--connect-timeout", "10", "--max-time", "30"])
+        .args(["-X", "POST", "-H", "Content-Type: application/json"])
+        .args(["--data-binary", "@-", "-w", "\n%{http_code}"])
+        .arg(format!("{}{path}", api()))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = c.spawn().map_err(|e| format!("curl: {e}"))?;
+    child
+        .stdin
+        .take()
+        .ok_or("curl: no stdin")?
+        .write_all(body.to_string().as_bytes())?;
+    let out = child.wait_with_output()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let (answer, code) = text.rsplit_once('\n').unwrap_or(("", &text));
+    match code.trim().parse::<u16>() {
+        Ok(code) if code > 0 => Ok((code, serde_json::from_str(answer).unwrap_or(Value::Null))),
+        _ => Err("Could not reach Lightbulb. Check your connection and try again.".into()),
+    }
+}
+
+/// The answer to a 2xx, else the backend's sentence (`detail`, or `detail.message`) as the error.
+fn ok(path: &str, body: &Value) -> Result<Value> {
+    let (code, v) = post(path, body)?;
+    if (200..300).contains(&code) {
+        return Ok(v);
+    }
+    let detail = &v["detail"];
+    let said = detail
+        .as_str()
+        .or(detail["message"].as_str())
+        .filter(|s| !s.is_empty() && s.chars().all(crate::label::printable));
+    Err(said
+        .map_or_else(|| format!("Lightbulb refused that ({code})."), String::from)
+        .into())
+}
+
+/// This computer's identity, read only: one is made by `setup` (or the daemon's first start).
+fn identity() -> Result<Identity> {
+    let dir = paths::state_dir();
+    if !dir.join("identity.key").exists() {
+        return Err("This computer is not set up yet. Run lightbulb setup first.".into());
+    }
+    Identity::load_or_create(&dir)
+}
+
+/// A fresh challenge, signed for `purpose`: the body every signed call starts with.
+fn signed(id: &Identity, purpose: &str, ticket: Option<&str>) -> Result<Value> {
+    let ch = ok("/network/device/challenge", &json!({}))?;
+    let ch = ch["challenge"]
+        .as_str()
+        .ok_or("Lightbulb sent no challenge.")?;
+    let p = proof(id, purpose, ch, ticket);
+    Ok(json!({"key": id.key, "challenge": ch, "sig": p["sig"], "purpose": purpose}))
+}
+
+/// Opens `url` in the browser (an `https` one only); a failure is fine, the URL is printed.
+fn open(url: &str) {
+    if !url.starts_with("https://") || std::env::var_os(NO_BROWSER).is_some() {
+        return;
+    }
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let _ = Command::new(opener)
+        .arg(url)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+/// The device flow for `purpose`: start, show the code, open the browser, poll until the
+/// person confirms. The approved poll's answer.
+fn device(purpose: &str, ticket: Option<&str>) -> Result<Value> {
+    let id = identity()?;
+    let mut body = signed(&id, purpose, ticket)?;
+    let computer = crate::config::Config::load(&paths::state_dir())?.computer;
+    body["computer"] = computer.into();
+    if let Some(t) = ticket {
+        body["ticket"] = t.into();
+    }
+    let start = ok("/network/device/start", &body)?;
+    let (Some(code), Some(user_code), Some(url)) = (
+        start["code"].as_str(),
+        start["userCode"].as_str(),
+        start["verifyUrl"].as_str(),
+    ) else {
+        return Err(
+            "Lightbulb sent an answer this version cannot read. Run lightbulb update.".into(),
+        );
+    };
+    println!("Confirm in your browser: {url}");
+    println!("The page shows {user_code}; continue only if it matches.");
+    open(url);
+    let every = Duration::from_secs(start["interval"].as_u64().unwrap_or(2).clamp(1, 10));
+    let until =
+        Instant::now() + Duration::from_secs(start["expiresIn"].as_u64().unwrap_or(600).min(900));
+    let poll = json!({ "code": code });
+    loop {
+        let r = ok("/network/device/poll", &poll)?;
+        match r["status"].as_str() {
+            Some("approved") => return Ok(r),
+            Some("pending") if Instant::now() < until => std::thread::sleep(every),
+            _ => {
+                return Err(
+                    format!("The code expired. Run lightbulb {} again.", again(purpose)).into(),
+                )
+            }
+        }
+    }
+}
+
+fn again(purpose: &str) -> &'static str {
+    if purpose == "agents" {
+        "invite --agents"
+    } else {
+        "login"
+    }
+}
+
+/// `login`: ties this computer to the person who confirms in the browser.
+pub fn login() -> Result<i32> {
+    let r = device("login", None)?;
+    match r["name"]
+        .as_str()
+        .filter(|n| n.chars().all(crate::label::printable))
+    {
+        Some(n) if !n.is_empty() => println!("This computer is signed in as {n}."),
+        _ => println!("This computer is signed in."),
+    }
+    println!(
+        "Your workspace's agents answer it once an admin adds them: lightbulb invite --agents"
+    );
+    Ok(0)
+}
+
+/// `logout`: unties this computer; the workspace stops answering it.
+pub fn logout() -> Result<i32> {
+    let id = identity()?;
+    ok("/network/logout", &signed(&id, "logout", None)?)?;
+    println!("This computer is signed out. Workspaces no longer answer it.");
+    Ok(0)
+}
+
+/// `invite --agents`: a workspace admin adds their workspace's agents to this network. A once
+/// link minted here goes to the workspace, which joins with it; this computer then asks the
+/// usual Allow.
+pub fn invite_agents(ticket: &str) -> Result<i32> {
+    let r = device("agents", Some(ticket))?;
+    let ws = r["workspaceName"]
+        .as_str()
+        .filter(|n| !n.is_empty() && n.chars().all(crate::label::printable))
+        .unwrap_or("the workspace");
+    println!("Confirmed. {ws} is joining: allow it when this computer asks.");
+    Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_proof_is_the_keys_signature_over_purpose_challenge_key_and_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = Identity::load_or_create(dir.path()).unwrap();
+        let p = proof(&id, "agents", "n0nce", Some("t1"));
+        let sig = p["sig"].as_str().unwrap();
+        assert!(crate::identity::verify(&id.key, &p, sig));
+        // What the backend rebuilds and checks: sorted keys, no spaces.
+        let signed = format!(
+            r#"{{"challenge":"n0nce","key":"{}","purpose":"lightbulb-agents","ticket":"t1"}}"#,
+            id.key
+        );
+        assert_eq!(crate::identity::unsigned(&p), signed.as_bytes());
+        // Another purpose, challenge or link is another message.
+        for other in [
+            proof(&id, "login", "n0nce", Some("t1")),
+            proof(&id, "agents", "other", Some("t1")),
+            proof(&id, "agents", "n0nce", Some("t2")),
+        ] {
+            assert!(!crate::identity::verify(&id.key, &other, sig));
+        }
+        assert!(proof(&id, "login", "n0nce", None).get("ticket").is_none());
+    }
+}

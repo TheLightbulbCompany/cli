@@ -123,7 +123,7 @@ pub struct Declared {
     pub version: u64,
     pub sessions: Arc<Vec<net::frames::Remote>>,
     pub ids: Arc<HashSet<String>>,
-    /// The person ids whose computers may message these sessions; `None`: anyone the policy admits.
+    /// The member keys (computers) that may message these sessions; `None`: anyone the policy admits.
     pub members: Option<Arc<HashSet<String>>>,
 }
 

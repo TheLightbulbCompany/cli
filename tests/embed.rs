@@ -1,6 +1,6 @@
 //! An embedded instance: the engine in process (no socket, launchd, hooks or dialog) as a
 //! Lightbulb workspace's member, a member like any other, whose sessions are the workspace's
-//! agents and whose members list says whose computers they answer.
+//! agents and whose `member_keys` say which computers they answer.
 
 mod common;
 
@@ -75,11 +75,10 @@ fn computer_a() -> Env {
     a
 }
 
-/// The instance joins A's network through A's ask link (A allows it); A then lets the
-/// workspace's agents write without a hold, and the instance's home records A as `user_a`
-/// (what a person link of its own would have).
-async fn join(i: &Instance, a: &Env, home: &Path) -> Value {
-    let t = a.ask(json!({"id": 1, "op": "team.invite"}));
+/// The instance joins A's network through a once ask link A minted (A allows it), as
+/// `invite --agents` has it; A then lets the workspace's agents write without a hold.
+async fn join(i: &Instance, a: &Env) -> Value {
+    let t = a.ask(json!({"id": 1, "op": "team.invite", "mode": "once"}));
     let ticket = t["ticket"].as_str().unwrap();
     let r = ok(i, "team.join", json!({"ticket": ticket, "name": NAME})).await;
     let key = ok(i, "identity.get", json!({})).await["member_key"].clone();
@@ -87,18 +86,12 @@ async fn join(i: &Instance, a: &Env, home: &Path) -> Value {
     if r["state"] == "admitted" {
         assert_eq!(common::person(a, accept)["ok"], true);
     }
-    as_user_a(home, &a.identity());
     r
 }
 
-/// Records `who` as `user_a`'s computer in the instance's home (`persons`).
-fn as_user_a(home: &Path, who: &Identity) {
-    let store = Store::open(&home.join("state.db")).unwrap();
-    store.put_person(&who.key, "user_a", now_s()).unwrap();
-}
-
-/// Declares `names` (agent: the name uppercased), answering `user_a`'s computers.
-async fn declare(i: &Instance, names: &[&str]) {
+/// Declares `names` (agent: the name uppercased), answering the computers `keys`.
+async fn declare(i: &Instance, names: &[&str], keys: &[&Identity]) {
+    let keys: Vec<&str> = keys.iter().map(|k| k.key.as_str()).collect();
     let s: Vec<Value> = names
         .iter()
         .map(|n| json!({"name": n, "agent": n.to_uppercase(), "title": format!("{n} agent")}))
@@ -106,7 +99,7 @@ async fn declare(i: &Instance, names: &[&str]) {
     ok(
         i,
         "cloud.sessions.set",
-        json!({ "sessions": s, "members": ["user_a"] }),
+        json!({ "sessions": s, "member_keys": keys }),
     )
     .await;
 }
@@ -124,10 +117,10 @@ async fn embedded_instance_joins_and_talks_without_a_socket() {
     let home = tempfile::tempdir().unwrap();
     let i = start(home.path(), &[&a], None).await;
     let mut events = i.events();
-    let j = join(&i, &a, home.path()).await;
+    let j = join(&i, &a).await;
     assert_eq!(j["state"], "admitted", "{j}");
     assert!(!home.path().join("sock").exists());
-    declare(&i, &["friday"]).await;
+    declare(&i, &["friday"], &[&a.identity()]).await;
     let w = me(&i).await;
     let friday = format!("{w}/friday");
     until(10, "A sees friday", || common::sees(&a, &friday));
@@ -250,7 +243,7 @@ async fn person_only_ops_are_refused_in_process() {
 async fn an_undeclared_session_cannot_send() {
     let home = tempfile::tempdir().unwrap();
     let i = start(home.path(), &[], None).await;
-    declare(&i, &["friday"]).await;
+    declare(&i, &["friday"], &[]).await;
     let w = me(&i).await;
     let r = call(
         &i,
@@ -273,8 +266,8 @@ async fn workspace_instance_joins_and_leaves_in_process() {
     let a = computer_a();
     let home = tempfile::tempdir().unwrap();
     let i = start(home.path(), &[&a], None).await;
-    assert_eq!(join(&i, &a, home.path()).await["state"], "admitted");
-    let again = join(&i, &a, home.path()).await;
+    assert_eq!(join(&i, &a).await["state"], "admitted");
+    let again = join(&i, &a).await;
     assert_eq!(again["reason"], "already_in_team", "{again}");
     let me = ok(&i, "identity.get", json!({})).await;
     assert_eq!(me["person_id"], me["member_key"], "{me}");
@@ -309,8 +302,8 @@ async fn workspace_instance_joins_and_leaves_in_process() {
 /// The three members an instance's test plays: identity, connection, endpoint.
 type Played = (Identity, Peer, iroh::Endpoint);
 
-/// An instance whose stored team (before it starts) is A (founder, `user_a`'s computer in the
-/// instance's `persons`), B, C and itself; returns its home, it and the three, connected.
+/// An instance whose stored team (before it starts) is A (founder), B, C and itself; returns
+/// its home, it and the three, connected.
 async fn seeded(snapshot: Option<&Path>) -> (tempfile::TempDir, Instance, [Played; 3]) {
     let home = tempfile::tempdir().unwrap();
     let w = Identity::load_or_create(home.path()).unwrap();
@@ -324,7 +317,6 @@ async fn seeded(snapshot: Option<&Path>) -> (tempfile::TempDir, Instance, [Playe
         roster::accept(&store, e, 10).unwrap();
     }
     drop(store);
-    as_user_a(home.path(), &ia);
     let i = start(home.path(), &[], snapshot).await;
     let mut out = vec![];
     for id in [ia, ib, ic] {
@@ -366,9 +358,9 @@ async fn ask(p: &mut Peer, who: &Identity, rid: &str, to: &str) -> (String, Opti
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn only_a_listed_persons_computers_reach_its_sessions() {
+async fn only_listed_computers_reach_its_sessions() {
     let (home, i, [(ia, mut pa, _a), (ib, mut pb, _b), (ic, mut pc, _c)]) = seeded(None).await;
-    declare(&i, &["friday"]).await;
+    declare(&i, &["friday"], &[&ia]).await;
     let friday = format!("{}/friday", me(&i).await);
     let no = ("refused".to_string(), Some("not_a_member".to_string()));
     assert_eq!(ask(&mut pa, &ia, "a1", &friday).await.0, "stored");
@@ -386,64 +378,9 @@ async fn only_a_listed_persons_computers_reach_its_sessions() {
     assert_eq!(ok(&i, "holds", json!({})).await["holds"], json!([]));
     let db = home.path().join("state.db");
     assert_eq!(common::count(&db, "SELECT COUNT(*) FROM holds"), 0);
-    // C, made `user_a`'s, then removed by A and admitted again by B in one sync, is nobody's
-    // computer any more: its message is refused again.
-    as_user_a(home.path(), &ic);
+    // C, listed once the backend writes its key, gets in.
+    declare(&i, &["friday"], &[&ia, &ic]).await;
     assert_eq!(ask(&mut pc, &ic, "c2", &friday).await.0, "stored");
-    let store = Store::open(&db).unwrap();
-    let heads = roster::replay(&roster::entries(&store).unwrap()).heads;
-    let rm = Entry::signed(&ia, heads, Kind::Remove, json!({"member": ic.key}), now_s());
-    let again = common::admit(&ib, &rm, &ic, "carol", json!({}));
-    pa.send(&Frame::Roster {
-        entries: vec![rm, again],
-        more: false,
-    })
-    .await;
-    until(10, "C's person is forgotten", || {
-        store.person(&ic.key).unwrap().is_none()
-    });
-    let members = roster::replay(&roster::entries(&store).unwrap()).members;
-    assert!(members.contains_key(&ic.key), "C is a member again");
-    let (mut pc, _c2) = common::dial_instance(&i, &ic).await;
-    assert_eq!(ask(&mut pc, &ic, "c3", &friday).await, no);
-    i.shutdown().await;
-}
-
-/// What replay does not apply prunes nothing: B's forged `leave` of C and its refused removal
-/// of the founder A leave both `user_a`'s, and their mail still goes in.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_unapplied_leave_or_founder_removal_keeps_a_persons_computer() {
-    let (home, i, [(ia, mut pa, _a), (ib, mut pb, _b), (ic, mut pc, _c)]) = seeded(None).await;
-    as_user_a(home.path(), &ic);
-    declare(&i, &["friday"]).await;
-    let friday = format!("{}/friday", me(&i).await);
-    let db = home.path().join("state.db");
-    let store = Store::open(&db).unwrap();
-    let before = roster::entries(&store).unwrap().len();
-    let heads = roster::replay(&roster::entries(&store).unwrap()).heads;
-    let leave = Entry::signed(&ib, heads, Kind::Leave, json!({"member": ic.key}), now_s());
-    let rm = Entry::signed(
-        &ib,
-        vec![leave.hash()],
-        Kind::Remove,
-        json!({"member": ia.key}),
-        now_s(),
-    );
-    pb.send(&Frame::Roster {
-        entries: vec![leave, rm],
-        more: false,
-    })
-    .await;
-    until(10, "both entries are taken in", || {
-        roster::entries(&store).unwrap().len() == before + 2
-    });
-    let r = roster::replay(&roster::entries(&store).unwrap());
-    assert!(r.members.contains_key(&ia.key) && r.members.contains_key(&ic.key));
-    for who in [&ia, &ic] {
-        assert_eq!(store.person(&who.key).unwrap().as_deref(), Some("user_a"));
-    }
-    assert_eq!(ask(&mut pa, &ia, "a1", &friday).await.0, "stored");
-    assert_eq!(ask(&mut pc, &ic, "c1", &friday).await.0, "stored");
     i.shutdown().await;
 }
 
@@ -453,7 +390,7 @@ async fn snapshot_and_events() {
     let last = out.path().join("last.db");
     let (home, i, [(ia, mut pa, _a), (ib, _pb, _b), _c]) = seeded(Some(&last)).await;
     let mut events = i.events();
-    declare(&i, &["friday"]).await;
+    declare(&i, &["friday"], &[&ia]).await;
     let friday = format!("{}/friday", me(&i).await);
     let to = format!("{}/codex:a1", ia.short);
     ok(
@@ -527,7 +464,7 @@ async fn snapshot_and_events() {
 async fn one_message_event_per_message_and_none_for_an_undeclared_name() {
     let (_home, i, [(ia, mut pa, _a), _b, _c]) = seeded(None).await;
     let mut events = i.events();
-    declare(&i, &["friday"]).await;
+    declare(&i, &["friday"], &[&ia]).await;
     let w = me(&i).await;
     let friday = format!("{w}/friday");
     let from = format!("{}/codex:c1", ia.short);
@@ -593,65 +530,21 @@ async fn a_dropped_instance_shuts_down_before_its_home_is_free() {
     assert!(r.err().is_some_and(|e| e.to_string().contains("snapshot")));
 }
 
-/// The prod path, end to end: the instance founds its own network and mints a person link for
-/// `user_a` (in its `members`); computer A joins with it, finds `<instance>/friday` ("Friday")
-/// in its directory, writes to it (the instance's inbox for `friday` has it), and Friday's
-/// reply reaches A without a hold. Computer B, admitted through A's ask link, sees Friday too,
-/// but its message is refused `not_a_member`, with no hold on the instance.
+/// The prod path, end to end: an admin's computer A mints a once ask link (`invite --agents`)
+/// and the workspace's instance joins with it, A allowing it; with A's key in `member_keys`,
+/// A writes to `<instance>/friday` (in the instance's inbox) and Friday's reply reaches A.
+/// Computer B, admitted through A's own link, sees Friday too, but its key is not listed: its
+/// message is refused `not_a_member`, with no hold on the instance.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_person_line_reaches_friday_and_an_unlisted_teammate_does_not() {
+async fn an_admins_once_link_brings_the_workspace_in_and_only_member_keys_reach_friday() {
+    let a = computer_a();
     let home = tempfile::tempdir().unwrap();
-    let i = common::instance(home.path(), &[], NAME, None, &[])
-        .await
-        .unwrap();
-    let friday_decl =
-        json!([{"name": "friday", "agent": "Friday"}, {"name": "atlas", "agent": "Atlas"}]);
-    ok(
-        &i,
-        "cloud.sessions.set",
-        json!({"sessions": friday_decl, "members": ["user_a"]}),
-    )
-    .await;
-    let w = me(&i).await;
-    let friday = format!("{w}/friday");
-    let key = ok(&i, "identity.get", json!({})).await["member_key"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let port = ok(&i, "status", json!({})).await["port"].as_u64().unwrap();
-    let at_instance = format!("{key}@127.0.0.1:{port}");
-    let inv = ok(
-        &i,
-        "team.invite",
-        json!({"mode": "person", "for": "user_a", "name": "A"}),
-    )
-    .await;
-    let line = inv["line"].as_str().unwrap().to_string();
-    let ticket = line.split('\'').nth(1).unwrap().to_string();
-
-    // A joins with the person line, no Allow asked.
-    let a = Env::new();
-    a.daemon(
-        false,
-        "",
-        &[("LIGHTBULB_CONNECT_PEERS", at_instance.clone())],
-    );
-    let out = a.detached(&[common::EXE, "join", &ticket, "--name", "A"], "");
-    assert!(
-        out.status.success(),
-        "{}{}",
-        common::out(&out),
-        common::err(&out)
-    );
+    let i = start(home.path(), &[&a], None).await;
+    assert_eq!(join(&i, &a).await["state"], "admitted");
+    declare(&i, &["friday"], &[&a.identity()]).await;
+    let friday = format!("{}/friday", me(&i).await);
     until(10, "A sees friday", || common::sees(&a, &friday));
-    let dir = a.ask(json!({"id": 1, "op": "directory"}));
-    let rec = (dir["sessions"].as_array().unwrap().iter())
-        .find(|s| s["session_id"] == friday.as_str())
-        .cloned()
-        .unwrap();
-    assert_eq!(rec["agent"], "Friday", "{rec}");
 
-    // A writes to Friday: in the instance's inbox for `friday`.
     let sa = common::session(&a, "a1");
     a.send(&sa, &friday, "hi friday", "a1", None);
     until(10, "A's message is stored", || {
@@ -661,13 +554,9 @@ async fn a_person_line_reaches_friday_and_an_unlisted_teammate_does_not() {
     let msgs = got["messages"].as_array().unwrap();
     assert_eq!(msgs.len(), 1, "{got}");
     assert_eq!(msgs[0]["text"], "hi friday");
-    assert_eq!(msgs[0]["from"], sa.as_str());
-
-    // Friday's reply reaches A, held nowhere.
     let r = ok(
         &i,
         "send",
-        // The bridge's shape: a bare `from`, no `to`, and the request id the frame showed.
         json!({"from": "friday", "text": "hello A", "request_id": "f1", "reply_to": "a1"}),
     )
     .await;
@@ -675,56 +564,23 @@ async fn a_person_line_reaches_friday_and_an_unlisted_teammate_does_not() {
     until(10, "Friday's reply is in A's mailbox", || {
         a.unread(&sa) == 1
     });
-    let m = a.take_one(&sa);
-    assert_eq!(m["from"], friday.as_str());
-    let a_db = a.state.path().join("state.db");
-    assert_eq!(common::count(&a_db, "SELECT COUNT(*) FROM holds"), 0);
-    // Only that: an answer to A's message from another instance session, one to another of A's
-    // sessions, and Friday's next message with no `reply_to` (its thread continues A's) are
-    // held on A, as anyone's.
-    let atlas = format!("{w}/atlas");
-    let sa2 = common::session(&a, "a2");
-    for (n, (from, to, reply)) in [
-        (&atlas, &sa, msgs[0]["id"].clone()),
-        (&friday, &sa2, msgs[0]["id"].clone()),
-        (&friday, &sa, Value::Null),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let body = json!({"from": from, "to": to, "text": "unasked",
-            "request_id": format!("u{n}"), "reply_to": reply});
-        assert!(ok(&i, "send", body).await["receipt"].is_object());
-        until(10, "the message is held on A", || {
-            common::count(&a_db, "SELECT COUNT(*) FROM holds WHERE state = 'open'") == n as i64 + 1
-        });
-    }
-    assert_eq!(a.unread(&sa) + a.unread(&sa2), 0);
 
-    // B joins through A's ask link (A allows it), sees Friday, and is refused `not_a_member`.
+    let key = ok(&i, "identity.get", json!({})).await["member_key"].clone();
+    let port = ok(&i, "status", json!({})).await["port"].clone();
+    let peers = format!(
+        "{},{}@127.0.0.1:{port}",
+        a.peer_arg(),
+        key.as_str().unwrap()
+    );
     let ask = common::invite(&a, "once");
     let b = Env::new();
-    let peers = format!("{},{at_instance}", a.peer_arg());
     b.daemon(false, "", &[("LIGHTBULB_CONNECT_PEERS", peers)]);
-    let (a_req, b_join) = std::thread::scope(|s| {
-        let join = s.spawn(|| b.detached(&[common::EXE, "join", &ask, "--name", "B"], ""));
-        let mut req = Value::Null;
-        until(20, "B's join request reaches A", || {
-            req = a.ask(json!({"id": 1, "op": "team.join_requests"}))["requests"][0]["id"].clone();
-            req.is_string()
-        });
-        let r = common::person(
-            &a,
-            json!({"id": 1, "op": "team.admit", "request": req, "verdict": "allow"}),
-        );
-        (r, join.join().unwrap())
-    });
-    assert_eq!(a_req["ok"], true, "{a_req}");
+    let out = b.detached(&[common::EXE, "join", &ask, "--name", "B"], "");
     assert!(
-        b_join.status.success(),
+        out.status.success(),
         "{}{}",
-        common::out(&b_join),
-        common::err(&b_join)
+        common::out(&out),
+        common::err(&out)
     );
     until(10, "B sees friday", || common::sees(&b, &friday));
     let sb = common::session(&b, "b1");
@@ -737,4 +593,5 @@ async fn a_person_line_reaches_friday_and_an_unlisted_teammate_does_not() {
     assert_eq!(holds["holds"], json!([]), "{holds}");
     let got = ok(&i, "inbox", json!({"session": "friday"})).await;
     assert_eq!(got["messages"], json!([]), "{got}");
+    i.shutdown().await;
 }

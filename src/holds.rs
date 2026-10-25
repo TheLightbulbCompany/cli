@@ -317,12 +317,10 @@ pub fn answer(
         Some(t) => t.clone(),
         None => dialog(store, roster, &me.key, &h)?.0,
     };
-    // An instance's members gate (`mail::receive`) binds a hold filed before it changed: its
-    // sender, no computer of a member, is refused, never delivered.
-    let person = store.person(&h.from_member)?;
-    let gated = allow
-        && h.kind() == Kind::Message
-        && members.is_some_and(|m| !person.is_some_and(|p| m.contains(&p)));
+    // An instance's member gate (`mail::receive`) binds a hold filed before it changed: its
+    // sender, no member's computer, is refused, never delivered.
+    let gated =
+        allow && h.kind() == Kind::Message && members.is_some_and(|m| !m.contains(&h.from_member));
     let allow = allow && !gated;
     let c = Closed {
         hold: h,

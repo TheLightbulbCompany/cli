@@ -24,7 +24,7 @@ pub struct Ticket {
     pub ticket_id: String,
     pub team_id: String,
     pub secret: String,
-    /// `ask`, `open` or `person` (a member's link for one person's computer).
+    /// `ask` or `open`.
     pub mode: String,
     pub inviter: String,
     pub relay_hint: String,
@@ -34,10 +34,6 @@ pub struct Ticket {
     pub addrs: Vec<String>,
     pub members: Vec<String>,
     pub expires_at: i64,
-    /// A `person` link's person (an account id): the member that signed it records the
-    /// computer the link admits as theirs (`persons`). Absent from other tickets.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub person: Option<String>,
     /// A workspace member's doorbell (its roster `wake`): a joiner that reaches no member rings
     /// it and keeps dialing while the workspace wakes. Absent from a computer's tickets.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -107,17 +103,9 @@ pub fn sign(
         addrs,
         members,
         expires_at,
-        person: None,
         wake: None,
         sig: String::new(),
     };
-    t.sig = id.sign(&value(&t));
-    t
-}
-
-/// `t` for `person`, signed again by `id`.
-pub fn for_person(id: &Identity, mut t: Ticket, person: &str) -> Ticket {
-    t.person = Some(person.into());
     t.sig = id.sign(&value(&t));
     t
 }
@@ -194,11 +182,6 @@ pub fn join_line(encoded: &str) -> String {
 /// The join page link for an `encode`d ticket.
 pub fn web_link(encoded: &str) -> String {
     format!("{WEB}{encoded}")
-}
-
-/// A `person` link's join line, `name` filled in (the caller keeps `'` out of it).
-pub fn person_line(encoded: &str, name: &str) -> String {
-    format!("{COMMAND}{encoded}' --name '{name}'")
 }
 
 /// The link the Lightbulb app opens, for an `encode`d ticket.
@@ -289,7 +272,8 @@ mod tests {
             !signed_by_inviter(&added),
             "an added wake breaks the signature"
         );
-        let signed = for_person(&x, added, "user_1");
+        let mut signed = added;
+        signed.sig = x.sign(&value(&signed));
         assert!(signed_by_inviter(&signed));
         verify(&signed, &r).unwrap();
         assert_eq!(decode(&encode(&signed)).unwrap().wake, Some(w));
