@@ -62,3 +62,22 @@ each run, and this is not explained. The directory from a few computers comes on
 coalesce windows late. It is worth a look before the team gets bigger. All the numbers are
 from a debug build: a release build will be faster on CPU-bound steps, but the 250 ms
 timer stays the same.
+
+## Re-run on 0.4.4 (2026-10-25)
+
+Same command, same Mac and debug build, commit `cea7369` (v0.4.4), one clean run:
+
+| measure | 0.2.2 | 0.4.4 |
+|---|---|---|
+| join, invite to `admitted` (19 joins) | 80 / 130 / 425 ms | min 117 / median 178 / max 400 ms |
+| full mesh online after the last join | 107 ms | 50 ms |
+| directory refresh (20 samples) | median 266 / p95 886 ms | median 265 / p95 902 ms |
+| message, `send` until `delivered` (100) | median 8 / p95 9 ms | median 9 / p95 11 ms |
+| of which `send` until `stored` | 7 / 17 ms | 6 / 7 ms |
+| of which `send` until Y takes it | 7 / 16 ms | 6 / 7 ms |
+| resident memory per daemon | 35.6 / 36.0 / 38.0 MB | min 35.0 / median 35.5 / max 41.5 MB |
+| total wall time | 78.1 s | 15.1 s |
+
+Nothing regressed beyond run-to-run noise; join is about 50 ms slower at the median (not profiled; the four-word
+code and Argon2 work added since 0.2.2 are the likely cause). The directory p95 (~0.9 s) is unchanged
+and still unexplained. Still no numbers for a network of real computers.
