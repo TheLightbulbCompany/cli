@@ -30,9 +30,9 @@ pub struct MemberOpts {
     /// The workspace's display name.
     pub name: String,
     pub relay: Option<String>,
-    /// `{workspace, sessions: [{name, agent, title?, ...}], wake?, member_keys?}`: the sessions
-    /// declared before the transport starts; `member_keys`, the keys of the workspace's
-    /// signed-in members' computers, gate who may message them (`members` is ignored).
+    /// `{workspace, sessions: [{name, agent, title?, ...}], wake?, members?}`: the sessions
+    /// declared before the transport starts; `members`, the workspace's people, gate who may
+    /// message them: a computer whose sign-in proof names one of them (`proof::admitted`).
     pub sessions: PathBuf,
 }
 
@@ -52,9 +52,7 @@ pub async fn run(opts: MemberOpts, token: String) -> Result<()> {
         }
     };
     let members = net_ops::gate_of(&file)
-        .map_err(|()| {
-            "the sessions file's member_keys must be null or a list of member key strings"
-        })?
+        .map_err(|()| "the sessions file's members must be null or a list of user id strings")?
         .flatten();
     let relay = opts
         .relay

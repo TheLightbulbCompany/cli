@@ -710,9 +710,8 @@ pub(crate) fn remotes(short: &str, list: &[Value]) -> Option<Vec<crate::net::fra
     Some(out)
 }
 
-/// A present `member_keys` value (the member keys of the workspace's signed-in members'
-/// computers): `null` is no gate, a list of strings is the gate; anything else (a non-list, or
-/// a list with a non-string) is `Err`.
+/// A present `members` value (the workspace's people): `null` is no gate, a list of strings is
+/// the gate; anything else (a non-list, or a list with a non-string) is `Err`.
 pub(crate) fn members_of(v: &Value) -> Result<Option<HashSet<String>>, ()> {
     match v {
         Value::Null => Ok(None),
@@ -726,26 +725,23 @@ pub(crate) fn members_of(v: &Value) -> Result<Option<HashSet<String>>, ()> {
 }
 
 /// The member gate a sessions document (the file, or `cloud.sessions.set`'s body) sets: its
-/// `member_keys` (`members_of`), else none named (`Ok(None)`). A document with the older
-/// `members` but no `member_keys` gates everyone out (`Some(empty)`): a backend that has not
-/// yet written the keys must not leave a member's agents open to any computer.
+/// `members`, the people (Lightbulb user ids) whose computers' sign-in proofs it admits
+/// (`proof::admitted`); `null` is no gate; absent names none (`Ok(None)`). Anything else is `Err`.
 pub(crate) fn gate_of(doc: &Value) -> Result<Option<Option<HashSet<String>>>, ()> {
-    match (doc.get("member_keys"), doc.get("members")) {
-        (Some(v), _) => members_of(v).map(Some),
-        (None, Some(_)) => Ok(Some(Some(HashSet::new()))),
-        (None, None) => Ok(None),
+    match doc.get("members") {
+        Some(v) => members_of(v).map(Some),
+        None => Ok(None),
     }
 }
 
-/// `cloud.sessions.set {sessions: [{name, agent, title?}], member_keys?}` -> `{}` (an embedded instance only;
+/// `cloud.sessions.set {sessions: [{name, agent, title?}], members?}` -> `{}` (an embedded instance only;
 /// `unsupported` on a computer): the workspace's agents, published as `<short>/<name>` with
 /// `agent` and `title` (at most `presence::MAX`, each name a `valid_name`, once). Answers once
 /// the presence sender (`presence::run`) has handed on the presence carrying them, so a `send`
 /// from a name just declared is never refused as unadvertised by a peer the envelope reaches
 /// first; `internal` if that takes over 5 s (the list stands, and goes out on the next send).
-/// `member_keys` replaces the sessions' member gate (`mail::receive`): a list sets it, `null`
-/// removes it, absent keeps it (absent beside `members`: nobody, `gate_of`); anything else is
-/// `bad_request`, before anything changes.
+/// `members` replaces the sessions' member gate (`mail::receive`, by sign-in proof): a list sets
+/// it, `null` removes it, absent keeps it; anything else is `bad_request`, before anything changes.
 pub async fn cloud_sessions_set(id: u64, body: &Value, daemon: &Daemon) -> Response {
     let Some(cloud) = &daemon.cloud else {
         return Response::err(id, UNSUPPORTED);

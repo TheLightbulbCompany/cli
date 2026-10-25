@@ -99,6 +99,11 @@ pub struct Daemon {
     pub streams: crate::streams::Streams,
     /// What an embedded (cloud) instance is; `None` on a computer.
     pub cloud: Option<Cloud>,
+    /// Each member's sign-in proof from its latest `hello` (`proof`): what a workspace member's
+    /// `members` gate reads.
+    pub proofs: Mutex<HashMap<String, String>>,
+    /// A computer's route link to Lightbulb, for its person's hosted apps (`link`).
+    pub link: Mutex<crate::link::State>,
     /// An instance's `daemon.lock` (`lock_dir`): released only when the last task holding the
     /// daemon ends, so no second engine starts on this home while one still runs. The socket
     /// daemon holds its own across `run`.
@@ -123,7 +128,8 @@ pub struct Declared {
     pub version: u64,
     pub sessions: Arc<Vec<net::frames::Remote>>,
     pub ids: Arc<HashSet<String>>,
-    /// The member keys (computers) that may message these sessions; `None`: anyone the policy admits.
+    /// The people (Lightbulb user ids) whose computers may message these sessions, by their
+    /// sign-in proof (`proof::admitted`); `None`: anyone the policy admits.
     pub members: Option<Arc<HashSet<String>>>,
 }
 
@@ -269,6 +275,8 @@ pub async fn run(dir: &Path) -> Result<()> {
     cli::refresh_setup(dir);
     tokio::spawn(auto_update(daemon.clone(), dir.to_path_buf()));
     tokio::spawn(crate::telemetry::run_daily(daemon.clone()));
+    // While signed in: the route link for this person's hosted apps.
+    tokio::spawn(crate::link::run(daemon.clone()));
     // SIGTERM (launchd's stop) and SIGINT end it like a `shutdown` op: the socket and the
     // loopback address file (`net::local`) are removed on the way out.
     let d = daemon.clone();

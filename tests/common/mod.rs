@@ -6,6 +6,8 @@
 //! the other test files keep their own copies.
 #![allow(dead_code)]
 
+pub mod issuer;
+
 use iroh::endpoint::{presets, Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, PublicKey, SecretKey};
 use lightbulb::daemon::net_ops;
@@ -32,6 +34,18 @@ pub struct Env {
 }
 
 impl Env {
+    /// This computer signed in (`lightbulb login`) as Lightbulb user `user`: a test-issuer proof
+    /// in `login.json`, shown in its `hello`s (start the daemon after).
+    pub fn sign_in(&self, user: &str, route_url: Option<&str>) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let proof = issuer::proof(&self.identity().key, user, now);
+        let v = serde_json::json!({"proof": proof, "route_url": route_url, "name": user});
+        std::fs::write(self.state.path().join("login.json"), v.to_string()).unwrap();
+    }
+
     pub fn new() -> Env {
         Env {
             state: tempfile::tempdir().unwrap(),
@@ -306,16 +320,33 @@ pub async fn online(i: &lightbulb::embed::Instance, n: u64) {
 pub async fn dial_instance(i: &lightbulb::embed::Instance, who: &Identity) -> (Peer, Endpoint) {
     let key = call(i, "identity.get", json!({})).await["member_key"].clone();
     let port = call(i, "status", json!({})).await["port"].as_u64().unwrap();
-    dial_at(key.as_str().unwrap(), port, who).await
+    // Signed in as its own test person (`user_of`): a workspace's `members` decide the rest.
+    let proof = issuer::proof(&who.key, &user_of(&who.short), now_s());
+    dial_at_with(key.as_str().unwrap(), port, who, Some(proof)).await
+}
+
+/// The test person a played or seeded computer `short` signs in as.
+pub fn user_of(short: &str) -> String {
+    format!("user_{short}")
 }
 
 /// `who` played by the test, dialing the member `key` listening on loopback `port`, `hello` sent.
 pub async fn dial_at(key: &str, port: u64, who: &Identity) -> (Peer, Endpoint) {
+    dial_at_with(key, port, who, None).await
+}
+
+/// `dial_at`, its `hello` showing sign-in proof `proof` (`issuer::proof`).
+pub async fn dial_at_with(
+    key: &str,
+    port: u64,
+    who: &Identity,
+    proof: Option<String>,
+) -> (Peer, Endpoint) {
     let ep = endpoint(who).await;
     let conn = ep.connect(loopback(key, port), ALPN).await.unwrap();
     let (send, recv) = conn.open_bi().await.unwrap();
     let mut p = Peer { conn, send, recv };
-    p.hello(vec![]).await;
+    p.hello_with(vec![], proof).await;
     (p, ep)
 }
 
@@ -507,12 +538,18 @@ impl Peer {
     }
 
     pub async fn hello(&mut self, heads: Vec<String>) {
+        self.hello_with(heads, None).await;
+    }
+
+    /// A `hello` showing sign-in proof `proof` (`common::issuer::proof`).
+    pub async fn hello_with(&mut self, heads: Vec<String>, proof: Option<String>) {
         let protocol = PROTOCOL;
         let addrs = vec![];
         self.send(&Frame::Hello {
             protocol,
             heads,
             addrs,
+            proof,
         })
         .await;
     }

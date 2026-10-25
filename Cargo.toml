@@ -21,6 +21,11 @@ iroh-mdns-address-lookup = { version = "=0.6.1", default-features = false }
 libc = "0.2"
 rand = "0.10"
 rmcp = { version = "3.6.0", features = ["server", "macros", "transport-io"] }
+# The route link (`link`): one outbound WebSocket to Lightbulb. Already in the tree (iroh's
+# relay client), so no new crates; ring and webpki roots as iroh's.
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+tokio-websockets = { version = "0.13", default-features = false, features = ["client", "ring", "rustls-webpki-roots", "rand", "sha1_smol", "getrandom"] }
 rusqlite = { version = "0.40", default-features = false, features = ["bundled", "cache", "fallible_uint"] }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
@@ -34,3 +39,5 @@ ulid = "3.0.0"
 # A test relay server (`tests/relay.rs`).
 iroh-relay = { version = "=1.4.1", features = ["server"] }
 tempfile = "3"
+# A stub Lightbulb route-link server (`tests/link.rs`).
+tokio-websockets = { version = "0.13", default-features = false, features = ["server", "sha1_smol"] }

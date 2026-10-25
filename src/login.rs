@@ -1,8 +1,11 @@
 //! `lightbulb login` / `logout` and `invite --agents`: the one tie between this computer and a
 //! person's Lightbulb account. A device flow: the backend hands out a one-time challenge, this
 //! computer signs it with its member key (so the backend learns the key is really this
-//! computer's), and the signed-in person confirms the code in their browser. The CLI never
-//! holds an account token; the poll `code` is single use and lives only in memory here.
+//! computer's), and the signed-in person confirms the code in their browser. The answer is a
+//! sign-in proof (`proof`), kept in `login.json` (0600) with the route link's URL: this
+//! computer shows it in its `hello` (a workspace answers only its own people's computers) and
+//! on its route link (`link`). The CLI never holds an account token; the poll `code` is single
+//! use and lives only in memory here. Logout deletes the file; nothing is asked of Lightbulb.
 //!
 //! The wire is `curl`, as `lightbulb update` and the usage counts use; bodies go in on stdin
 //! (never in argv, which other processes can read).
@@ -18,6 +21,33 @@ use std::time::{Duration, Instant};
 const API: &str = "https://api.thelightbulb.company/api/v1";
 /// (tests) Set: no browser is opened.
 const NO_BROWSER: &str = "LIGHTBULB_CONNECT_NO_BROWSER";
+/// The sign-in, `{proof, route_url, name}`, in the state dir.
+pub const FILE: &str = "login.json";
+
+/// This computer's sign-in, when it has one.
+pub fn stored(dir: &std::path::Path) -> Option<Value> {
+    serde_json::from_slice(&std::fs::read(dir.join(FILE)).ok()?).ok()
+}
+
+/// This computer's sign-in proof, when it has one.
+pub fn stored_proof(dir: &std::path::Path) -> Option<String> {
+    stored(dir)?["proof"].as_str().map(String::from)
+}
+
+/// Writes the sign-in, 0600 (it is a credential), replacing any.
+pub fn save(dir: &std::path::Path, v: &Value) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let tmp = dir.join(format!("{FILE}.tmp"));
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    f.write_all(v.to_string().as_bytes())?;
+    std::fs::rename(tmp, dir.join(FILE))?;
+    Ok(())
+}
 
 fn api() -> String {
     std::env::var("LIGHTBULB_API")
@@ -42,7 +72,7 @@ pub fn proof(id: &Identity, purpose: &str, challenge: &str, ticket: Option<&str>
 }
 
 /// `POST {api}{path}` with JSON `body`: the status and the answer's JSON (`null` when none).
-fn post(path: &str, body: &Value) -> Result<(u16, Value)> {
+pub(crate) fn post(path: &str, body: &Value) -> Result<(u16, Value)> {
     let mut c = Command::new("curl");
     c.args(["-q", "-sS", "--connect-timeout", "10", "--max-time", "30"])
         .args(["-X", "POST", "-H", "Content-Type: application/json"])
@@ -92,7 +122,7 @@ fn identity() -> Result<Identity> {
 }
 
 /// A fresh challenge, signed for `purpose`: the body every signed call starts with.
-fn signed(id: &Identity, purpose: &str, ticket: Option<&str>) -> Result<Value> {
+pub(crate) fn signed(id: &Identity, purpose: &str, ticket: Option<&str>) -> Result<Value> {
     let ch = ok("/network/device/challenge", &json!({}))?;
     let ch = ch["challenge"]
         .as_str()
@@ -127,6 +157,10 @@ fn device(purpose: &str, ticket: Option<&str>) -> Result<Value> {
     body["computer"] = computer.into();
     if let Some(t) = ticket {
         body["ticket"] = t.into();
+        // Whose computer this is: an admin adds a workspace only from their own.
+        body["proof"] = stored_proof(&paths::state_dir())
+            .ok_or("Sign this computer in first: run lightbulb login.")?
+            .into();
     }
     let start = ok("/network/device/start", &body)?;
     let (Some(code), Some(user_code), Some(url)) = (
@@ -170,6 +204,15 @@ fn again(purpose: &str) -> &'static str {
 /// `login`: ties this computer to the person who confirms in the browser.
 pub fn login() -> Result<i32> {
     let r = device("login", None)?;
+    let Some(proof) = r["proof"].as_str() else {
+        return Err(
+            "Lightbulb sent an answer this version cannot read. Run lightbulb update.".into(),
+        );
+    };
+    save(
+        &paths::state_dir(),
+        &json!({"proof": proof, "route_url": r["routeUrl"], "name": r["name"]}),
+    )?;
     match r["name"]
         .as_str()
         .filter(|n| n.chars().all(crate::label::printable))
@@ -185,12 +228,48 @@ pub fn login() -> Result<i32> {
     Ok(0)
 }
 
-/// `logout`: unties this computer; the workspace stops answering it.
+/// `logout`: deletes this computer's sign-in; its route link drops within seconds (`link`)
+/// and workspaces stop answering it once its connections to them are made again.
 pub fn logout() -> Result<i32> {
-    let id = identity()?;
-    ok("/network/logout", &signed(&id, "logout", None)?)?;
-    println!("This computer is signed out. Workspaces no longer answer it.");
+    match std::fs::remove_file(paths::state_dir().join(FILE)) {
+        Ok(()) => println!("This computer is signed out."),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            println!("This computer was not signed in.")
+        }
+        Err(e) => return Err(e.into()),
+    }
     Ok(0)
+}
+
+/// Renews this computer's proof in its last week (the daemon's link calls it daily): a signed
+/// call, no browser. `Ok(false)` when there is nothing to renew.
+pub fn refresh(dir: &std::path::Path) -> Result<bool> {
+    let Some(mut v) = stored(dir) else {
+        return Ok(false);
+    };
+    let Some(old) = v["proof"].as_str().map(String::from) else {
+        return Ok(false);
+    };
+    let id = Identity::load_or_create(dir)?;
+    let now = crate::daemon::ipc::now() as i64;
+    let Some(p) = crate::proof::peek(&old) else {
+        return Ok(false);
+    };
+    if now > p.exp || p.exp - now > 7 * 86_400 {
+        // Expired: only a login renews it. Else not yet its last week.
+        return Ok(false);
+    }
+    let mut body = signed(&id, "refresh", None)?;
+    body["proof"] = old.clone().into();
+    let r = ok("/network/proof/refresh", &body)?;
+    match r["proof"].as_str() {
+        Some(new) if new != old => {
+            v["proof"] = new.into();
+            save(dir, &v)?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
 }
 
 /// `invite --agents`: a workspace admin adds their workspace's agents to this network. A once

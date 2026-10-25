@@ -1,6 +1,6 @@
 //! Whether another member's message may reach a session here: `people`, one `policy` row per
 //! member (by its `person_id`, its own key), else held. On a workspace's instance its
-//! `member_keys` decide instead (`mail::receive`).
+//! `members` decide instead, by sign-in proof (`mail::receive`, `proof::admitted`).
 
 use crate::roster::Member;
 use crate::store::Store;

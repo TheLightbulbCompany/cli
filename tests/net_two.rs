@@ -347,6 +347,7 @@ async fn older_protocol_is_reported_not_served() {
         protocol: 0,
         heads: vec![],
         addrs: vec![],
+        proof: None,
     })
     .await;
     assert!(matches!(p.recv().await, Frame::Hello { .. }));

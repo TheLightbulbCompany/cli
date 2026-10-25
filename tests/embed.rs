@@ -1,6 +1,6 @@
 //! An embedded instance: the engine in process (no socket, launchd, hooks or dialog) as a
 //! Lightbulb workspace's member, a member like any other, whose sessions are the workspace's
-//! agents and whose `member_keys` say which computers they answer.
+//! agents and whose `members` say whose computers they answer (by sign-in proof).
 
 mod common;
 
@@ -71,6 +71,7 @@ fn genesis(id: &Identity) -> Entry {
 fn computer_a() -> Env {
     let a = Env::new();
     roster::accept(&a.store(), &genesis(&a.identity()), 10).unwrap();
+    a.sign_in(&common::user_of(&a.short()), None);
     a.daemon(false, "", &[dialog("Allow")]);
     a
 }
@@ -89,9 +90,10 @@ async fn join(i: &Instance, a: &Env) -> Value {
     r
 }
 
-/// Declares `names` (agent: the name uppercased), answering the computers `keys`.
+/// Declares `names` (agent: the name uppercased), answering the people of the computers `keys`
+/// (each signed in as `common::user_of` its short).
 async fn declare(i: &Instance, names: &[&str], keys: &[&Identity]) {
-    let keys: Vec<&str> = keys.iter().map(|k| k.key.as_str()).collect();
+    let people: Vec<String> = keys.iter().map(|k| common::user_of(&k.short)).collect();
     let s: Vec<Value> = names
         .iter()
         .map(|n| json!({"name": n, "agent": n.to_uppercase(), "title": format!("{n} agent")}))
@@ -99,7 +101,7 @@ async fn declare(i: &Instance, names: &[&str], keys: &[&Identity]) {
     ok(
         i,
         "cloud.sessions.set",
-        json!({ "sessions": s, "member_keys": keys }),
+        json!({ "sessions": s, "members": people }),
     )
     .await;
 }
@@ -378,7 +380,7 @@ async fn only_listed_computers_reach_its_sessions() {
     assert_eq!(ok(&i, "holds", json!({})).await["holds"], json!([]));
     let db = home.path().join("state.db");
     assert_eq!(common::count(&db, "SELECT COUNT(*) FROM holds"), 0);
-    // C, listed once the backend writes its key, gets in.
+    // C, listed once its person joins the workspace, gets in.
     declare(&i, &["friday"], &[&ia, &ic]).await;
     assert_eq!(ask(&mut pc, &ic, "c2", &friday).await.0, "stored");
     i.shutdown().await;
@@ -531,12 +533,12 @@ async fn a_dropped_instance_shuts_down_before_its_home_is_free() {
 }
 
 /// The prod path, end to end: an admin's computer A mints a once ask link (`invite --agents`)
-/// and the workspace's instance joins with it, A allowing it; with A's key in `member_keys`,
+/// and the workspace's instance joins with it, A allowing it; with A's person in `members`,
 /// A writes to `<instance>/friday` (in the instance's inbox) and Friday's reply reaches A.
 /// Computer B, admitted through A's own link, sees Friday too, but its key is not listed: its
 /// message is refused `not_a_member`, with no hold on the instance.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_admins_once_link_brings_the_workspace_in_and_only_member_keys_reach_friday() {
+async fn an_admins_once_link_brings_the_workspace_in_and_only_members_reach_friday() {
     let a = computer_a();
     let home = tempfile::tempdir().unwrap();
     let i = start(home.path(), &[&a], None).await;

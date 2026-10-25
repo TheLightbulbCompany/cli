@@ -11,9 +11,10 @@
 //! takes and reads those of them that are this session's (at most 100 ids), so an answer lost on its way to the
 //! app loses no mail (it is handed out again); `app.unread {app, person}` -> `{unread}`, what
 //! waits, taking nothing; `app.receipt {app, person, request_id}` -> the receipt. A pair not declared is `refused`, reason `not_declared` (the
-//! bridge declares it and asks once more). An instance's ops only.
+//! bridge declares it and asks once more). An instance's ops, and a signed-in computer's over
+//! its route link (`link`), for its own person's app sessions.
 
-use crate::daemon::ipc::{self, Response, BAD_REQUEST, INTERNAL, NOT_FOUND, UNSUPPORTED};
+use crate::daemon::ipc::{self, Response, BAD_REQUEST, INTERNAL, NOT_FOUND};
 use crate::daemon::Daemon;
 use crate::mail;
 use crate::sessions::{self, Key};
@@ -24,9 +25,6 @@ use std::sync::Arc;
 const MAX_ACK: usize = 100;
 
 pub(crate) async fn op(id: u64, op: &str, body: &Value, d: &Arc<Daemon>) -> Response {
-    let Some(cloud) = &d.cloud else {
-        return Response::err(id, UNSUPPORTED);
-    };
     let (Some(app), Some(person)) = (body["app"].as_str(), body["person"].as_str()) else {
         return Response::err(id, BAD_REQUEST);
     };
@@ -35,7 +33,13 @@ pub(crate) async fn op(id: u64, op: &str, body: &Value, d: &Arc<Daemon>) -> Resp
         return Response::err(id, BAD_REQUEST);
     }
     let from = Key(format!("{}/{name}", d.identity.short));
-    if !cloud.declares(&from.0) {
+    // An instance's declared sessions; a computer's, the ones its route link declared for its
+    // own signed-in person (`link`).
+    let declared = match &d.cloud {
+        Some(cloud) => cloud.declares(&from.0),
+        None => crate::link::declares(d, &name, person),
+    };
+    if !declared {
         return Response::err_with(id, "refused", json!({ "reason": "not_declared" }));
     }
     // A send's receipt waits for the recipient's word (`ipc::finish`), as `send {wait}` does.

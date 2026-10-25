@@ -73,11 +73,14 @@ fn api(path: &str, _body: &Value, n: usize) -> (u16, Value) {
         ("/network/device/start", _) => (
             200,
             json!({"code": "secret-code", "userCode": "ABCD-EFGH", "interval": 1,
-                "expiresIn": 60, "verifyUrl": "https://example.test/auth/network?code=ABCD-EFGH"}),
+                "expiresIn": 60, "verifyUrl": "https://example.test/auth/network"}),
         ),
         ("/network/device/poll", 0) => (200, json!({"status": "pending"})),
-        ("/network/device/poll", _) => (200, json!({"status": "approved", "name": "Prasiddha"})),
-        ("/network/logout", _) => (200, json!({})),
+        ("/network/device/poll", _) => (
+            200,
+            json!({"status": "approved", "name": "Prasiddha", "proof": "h.p.s",
+                "routeUrl": "wss://example.test/api/v1/gateway/network"}),
+        ),
         _ => (404, json!({"detail": "Not Found"})),
     }
 }
@@ -91,8 +94,21 @@ fn login_signs_the_challenge_shows_the_code_and_waits_for_the_confirm() {
     let text = common::out(&out);
     assert!(out.status.success(), "{text}{}", common::err(&out));
     assert!(text.contains("ABCD-EFGH"), "{text}");
-    assert!(text.contains("https://example.test/auth/network?code=ABCD-EFGH"));
+    assert!(text.contains("https://example.test/auth/network"));
     assert!(text.contains("signed in as Prasiddha"), "{text}");
+    // The proof and the route link's URL are kept, owner-only (a credential).
+    let path = e.state.path().join("login.json");
+    let kept: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(kept["proof"], "h.p.s");
+    assert_eq!(
+        kept["route_url"],
+        "wss://example.test/api/v1/gateway/network"
+    );
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
     assert!(
         !text.contains("secret-code"),
         "the poll code is never shown"
@@ -117,21 +133,18 @@ fn login_signs_the_challenge_shows_the_code_and_waits_for_the_confirm() {
 }
 
 #[test]
-fn logout_sends_a_signed_challenge() {
+fn logout_deletes_the_sign_in_and_asks_nothing_of_lightbulb() {
     let e = Env::new();
-    let me = e.identity();
+    e.identity();
+    e.sign_in("user_aden", None);
     let (base, seen) = stub(api);
     let out = run(&e, &base, &["logout"]);
     assert!(out.status.success(), "{}", common::err(&out));
     assert!(common::out(&out).contains("signed out"));
-    let seen = seen.lock().unwrap();
-    let (_, body) = seen.iter().find(|(p, _)| p == "/network/logout").unwrap();
-    let signed = json!({"purpose": "lightbulb-logout", "challenge": "c0", "key": me.key});
-    assert!(lightbulb::identity::verify(
-        &me.key,
-        &signed,
-        body["sig"].as_str().unwrap()
-    ));
+    assert!(!e.state.path().join("login.json").exists());
+    assert!(seen.lock().unwrap().is_empty(), "no call");
+    let again = run(&e, &base, &["logout"]);
+    assert!(common::out(&again).contains("was not signed in"));
 }
 
 #[test]
@@ -171,6 +184,7 @@ fn invite_agents_hands_the_backend_a_once_ask_link_under_this_computers_signatur
     let e = Env::new();
     e.daemon(false, "", &[]);
     let me = e.identity();
+    e.sign_in("user_aden", None);
     let (base, seen) = stub(agents);
     let api_env = format!("LIGHTBULB_API={base}");
     let argv = ["/usr/bin/env", &api_env, "LIGHTBULB_CONNECT_NO_BROWSER=1"];
@@ -187,6 +201,10 @@ fn invite_agents_hands_the_backend_a_once_ask_link_under_this_computers_signatur
         .find(|(p, _)| p == "/network/device/start")
         .unwrap();
     assert_eq!(start["purpose"], "agents");
+    // Whose computer this is: its sign-in proof rides the start.
+    let kept: Value =
+        serde_json::from_slice(&std::fs::read(e.state.path().join("login.json")).unwrap()).unwrap();
+    assert_eq!(start["proof"], kept["proof"]);
     let ticket = start["ticket"].as_str().unwrap();
     let t = lightbulb::ticket::decode(ticket).unwrap();
     assert_eq!(

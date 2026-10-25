@@ -702,6 +702,9 @@ pub(crate) fn send(
 /// an embedded instance's caller hears `message {to_session, id}` (the declared name).
 pub(crate) fn stored(daemon: &Arc<Daemon>, to: &Key, id: Option<&str>) {
     daemon.mail.notify_waiters();
+    if daemon.cloud.is_none() && id.is_some() {
+        crate::link::stored(daemon, &to.0); // a hosted app's session: wake its bot, if it asked
+    }
     if let (Some(_), Some(id)) = (&daemon.cloud, id) {
         if let Some((_, name)) = sessions::split_addr(&to.0) {
             let e = json!({"event": "message", "to_session": name, "id": id});

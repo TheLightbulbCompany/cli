@@ -777,7 +777,8 @@ impl Net {
                     continue;
                 };
                 push_delta(&l.tx, r, heads, &mut memo, true);
-                let _ = l.tx.send((hello(r, protocol, addrs.clone()), None));
+                let _ =
+                    l.tx.send((hello(r, protocol, addrs.clone(), own_proof(d)), None));
                 // After the push the peer holds all of ours: the next change sends only itself.
                 l.protocol = Protocol::Ok(r.heads.clone());
             }
@@ -868,7 +869,7 @@ impl Net {
                     // The first frame, written once the stream is open.
                     let protocol = d.peers.knobs().protocol;
                     let addrs = d.peers.own_addrs();
-                    let _ = tx.send((hello(&team.roster, protocol, addrs), None));
+                    let _ = tx.send((hello(&team.roster, protocol, addrs, own_proof(d)), None));
                     None
                 } else {
                     Some((SUPERSEDED, b"superseded"))
@@ -986,8 +987,16 @@ impl Net {
             protocol: p,
             heads,
             addrs,
+            proof,
         } = f
         {
+            // Its person, as Lightbulb signed it (`proof::admitted` verifies it when it counts).
+            let mut proofs = d.proofs.lock().unwrap();
+            match proof.filter(|t| t.len() <= crate::proof::MAX_TOKEN) {
+                Some(t) => proofs.insert(key.to_string(), t),
+                None => proofs.remove(key),
+            };
+            drop(proofs);
             // A hint: bad ones are dropped, the hello is served.
             let addrs = parse_addrs(&addrs).unwrap_or_default();
             d.peers.learn(&d.dir, key, addrs, &team.roster);
@@ -1114,10 +1123,10 @@ fn receive(d: &Arc<Daemon>, key: &str, env: &Frame, tx: &Tx) {
     };
     // An instance's sessions are the ones it declared: new mail for any other is refused.
     let declared = d.cloud.as_ref().map(|c| c.declared());
-    let (ids, members) = (
-        declared.as_ref().map(|c| &*c.ids),
-        declared.as_ref().and_then(|c| c.members.as_deref()),
-    );
+    // `members` names people: the computers admitted are those whose proof names one.
+    let admitted = (declared.as_ref().and_then(|c| c.members.as_deref()))
+        .map(|people| crate::proof::admitted(d, people));
+    let (ids, members) = (declared.as_ref().map(|c| &*c.ids), admitted.as_ref());
     let store = d.store.lock().unwrap();
     let me = &d.identity.short;
     let now = ipc::now();
@@ -1271,12 +1280,21 @@ fn apply(d: &Daemon, pending: &mut Vec<Entry>, from: &str) -> Result<Vec<String>
     Ok(team.roster.heads.clone())
 }
 
-fn hello(r: &Roster, protocol: u32, addrs: Vec<String>) -> Frame {
+fn hello(r: &Roster, protocol: u32, addrs: Vec<String>, proof: Option<String>) -> Frame {
     Frame::Hello {
         protocol,
         heads: r.heads.clone(),
         addrs,
+        proof,
     }
+}
+
+/// This computer's sign-in proof, shown in every `hello` (an instance has none).
+fn own_proof(d: &Daemon) -> Option<String> {
+    d.cloud
+        .is_none()
+        .then(|| crate::login::stored_proof(&d.dir))
+        .flatten()
 }
 
 /// Answers a removed member's `hello` with the roster pages it lacks, the removal among them,

@@ -247,9 +247,11 @@ When you use it: to use your Lightbulb workspace's agents from this computer.
 lightbulb login
 ```
 
-Prints a code and opens `thelightbulb.company` in your browser; confirm there (the page shows the
-same code). This computer is then yours in Lightbulb: your workspaces' agents answer it. The code
-works for 10 minutes. `lightbulb logout` undoes it.
+Prints a code and opens `thelightbulb.company` in your browser; sign in (or make a free account)
+and type the code there. This computer is then yours in Lightbulb: it keeps a sign-in proof
+(`login.json`, renewed before its 30 days end), your workspaces' agents answer it, and while it
+runs it keeps one connection to Lightbulb for your hosted apps ([apps](connect/apps.md)). The code
+works for 10 minutes.
 
 ### logout
 
@@ -257,7 +259,8 @@ works for 10 minutes. `lightbulb logout` undoes it.
 lightbulb logout
 ```
 
-Unlinks this computer from your Lightbulb account; workspaces stop answering it.
+Deletes this computer's sign-in proof and drops its connection for hosted apps; workspaces stop
+answering it on their next connection to it.
 
 ### policy
 

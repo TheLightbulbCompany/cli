@@ -733,7 +733,8 @@ pub fn send(
 /// with origin `net:<peer short>`, timed by its arrival (`now`). Held or stored, it is
 /// remembered in `seen_ids`. On a workspace member, `declared` are its sessions: new mail for
 /// any other is `policy` (after the resend checks, so a resend gets the state it has). With
-/// `members` (the member keys the workspace answers, `member_keys`), mail from a peer whose key
+/// `members` (the member keys the workspace answers: those whose sign-in proof names one of its
+/// people, `proof::admitted`), mail from a peer whose key
 /// is not listed is `not_a_member`: refused, no hold.
 #[allow(clippy::too_many_arguments)]
 pub fn receive(

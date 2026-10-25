@@ -50,11 +50,22 @@ fn seed(dir: &Path) -> Identity {
 
 /// `who` dialing the member behind `sock`: the connection, `hello` sent.
 async fn dial(sock: &Path, token: &str, who: &Identity) -> (Peer, iroh::Endpoint) {
+    dial_as(sock, token, who, None).await
+}
+
+/// `dial`, `who` signed in as Lightbulb user `user` (a test-issuer proof in its `hello`).
+async fn dial_as(
+    sock: &Path,
+    token: &str,
+    who: &Identity,
+    user: Option<&str>,
+) -> (Peer, iroh::Endpoint) {
     let key = ok(sock, token, "identity.get", json!({}))["member_key"].clone();
     let port = ok(sock, token, "status", json!({}))["port"]
         .as_u64()
         .unwrap();
-    common::dial_at(key.as_str().unwrap(), port, who).await
+    let proof = user.map(|u| common::issuer::proof(&who.key, u, common::now_s()));
+    common::dial_at_with(key.as_str().unwrap(), port, who, proof).await
 }
 
 /// `p` (member `who`) sends `text` to `to`: its envelope id and the member's ack state and reason.
@@ -637,26 +648,25 @@ async fn the_doorbell_token_is_absent_from_logs() {
     );
 }
 
-/// The sessions file's `member_keys` gates who may message the member's sessions: a listed
-/// computer is delivered, any other is `refused` `not_a_member` (not held, nothing in the
-/// mailbox), no field gates no one, `members` (person ids) is ignored, and
-/// `cloud.sessions.set` replaces the list.
+/// The sessions file's `members` (people) gates who may message the member's sessions: a
+/// computer whose sign-in proof names one of them is delivered; any other (another person's
+/// proof, or none) is `refused` `not_a_member` (not held, nothing in the mailbox); `null` gates
+/// no one; `cloud.sessions.set` replaces the list.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_members_list_gates_who_may_message_the_sessions() {
-    // Listed: delivered.
     let dir = tempfile::tempdir().unwrap();
     let a = seed(dir.path());
-    let file = json!({"workspace": NAME, "sessions": friday(), "member_keys": [a.key, "other"]});
+    let file = json!({"workspace": NAME, "sessions": friday(), "members": ["user_a", "user_x"]});
     let (child, token, sock) = common::member_with(dir.path(), file);
-    let (mut pa, _ep) = dial(&sock, &token, &a).await;
+    let (mut pa, _ep) = dial_as(&sock, &token, &a, Some("user_a")).await;
     let to = format!("{}/friday", short(&sock, &token));
     assert_eq!(send(&mut pa, &a, &to, "in").await.1, "stored");
-    // Reloaded without A: refused, and nothing more reaches the mailbox.
+    // Reloaded without A's person: refused, and nothing more reaches the mailbox.
     ok(
         &sock,
         &token,
         "cloud.sessions.set",
-        json!({"sessions": friday(), "member_keys": ["other"]}),
+        json!({"sessions": friday(), "members": ["user_x"]}),
     );
     let (_, state, reason) = send_acked(&mut pa, &a, &to, "out").await;
     assert_eq!(
@@ -669,80 +679,59 @@ async fn the_members_list_gates_who_may_message_the_sessions() {
         1,
         "{peek}"
     );
-    // Reloaded with `member_keys: null`: no gate.
+    // Reloaded with `members: null`: no gate.
     ok(
         &sock,
         &token,
         "cloud.sessions.set",
-        json!({"sessions": friday(), "member_keys": null}),
+        json!({"sessions": friday(), "members": null}),
     );
     assert_eq!(send(&mut pa, &a, &to, "again").await.1, "stored");
     ok(&sock, &token, "stop", json!({}));
     exits_zero(child);
-
-    // Not listed from the start: refused, whatever the retired `members` says.
-    let dir = tempfile::tempdir().unwrap();
-    let a = seed(dir.path());
-    let file = json!({"workspace": NAME, "sessions": friday(), "member_keys": ["other"],
-        "members": [a.key, format!("p-{}", a.short)]});
-    let (child, token, sock) = common::member_with(dir.path(), file);
-    let (mut pa, _ep) = dial(&sock, &token, &a).await;
-    let to = format!("{}/friday", short(&sock, &token));
-    let (_, state, reason) = send_acked(&mut pa, &a, &to, "no").await;
-    assert_eq!(
-        (state.as_str(), reason.as_deref()),
-        ("refused", Some("not_a_member"))
-    );
-    assert_eq!(
-        ok(&sock, &token, "inbox.peek", json!({}))["sessions"],
-        json!([])
-    );
-    ok(&sock, &token, "stop", json!({}));
-    exits_zero(child);
 }
 
-/// A sessions file (or set) written before `member_keys` existed still carries `members`: it
-/// gates everyone out until the backend writes the keys, never no gate at all.
+/// No proof, another person's, or one for another computer: refused, however the hello reads.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn members_without_member_keys_refuses_everyone() {
-    let dir = tempfile::tempdir().unwrap();
-    let a = seed(dir.path());
-    let file = json!({"workspace": NAME, "sessions": friday(), "members": ["user_1"]});
-    let (child, token, sock) = common::member_with(dir.path(), file);
-    let (mut pa, _ep) = dial(&sock, &token, &a).await;
-    let to = format!("{}/friday", short(&sock, &token));
-    let (_, state, reason) = send_acked(&mut pa, &a, &to, "no").await;
-    assert_eq!(
-        (state.as_str(), reason.as_deref()),
-        ("refused", Some("not_a_member"))
-    );
-    ok(
-        &sock,
-        &token,
-        "cloud.sessions.set",
-        json!({"sessions": friday(), "member_keys": [a.key]}),
-    );
-    assert_eq!(send_acked(&mut pa, &a, &to, "in").await.1, "stored");
-    ok(
-        &sock,
-        &token,
-        "cloud.sessions.set",
-        json!({"sessions": friday(), "members": ["user_1"]}),
-    );
-    assert_eq!(send_acked(&mut pa, &a, &to, "out").await.1, "refused");
-    ok(&sock, &token, "stop", json!({}));
-    exits_zero(child);
+async fn a_computer_without_a_members_proof_is_refused() {
+    for shown in [None, Some("user_b"), Some("other-computer")] {
+        let dir = tempfile::tempdir().unwrap();
+        let a = seed(dir.path());
+        let file = json!({"workspace": NAME, "sessions": friday(), "members": ["user_a"]});
+        let (child, token, sock) = common::member_with(dir.path(), file);
+        let (mut pa, _ep) = match shown {
+            Some("other-computer") => {
+                let key = ok(&sock, &token, "identity.get", json!({}))["member_key"].clone();
+                let port = ok(&sock, &token, "status", json!({}))["port"]
+                    .as_u64()
+                    .unwrap();
+                let proof =
+                    common::issuer::proof(&common::identity().key, "user_a", common::now_s());
+                common::dial_at_with(key.as_str().unwrap(), port, &a, Some(proof)).await
+            }
+            user => dial_as(&sock, &token, &a, user).await,
+        };
+        let to = format!("{}/friday", short(&sock, &token));
+        let (_, state, reason) = send_acked(&mut pa, &a, &to, "no").await;
+        assert_eq!(
+            (state.as_str(), reason.as_deref()),
+            ("refused", Some("not_a_member")),
+            "{shown:?}"
+        );
+        ok(&sock, &token, "stop", json!({}));
+        exits_zero(child);
+    }
 }
 
-/// `member_keys` on `cloud.sessions.set`: absent keeps the gate, `null` removes it, a list replaces
+/// `members` on `cloud.sessions.set`: absent keeps the gate, `null` removes it, a list replaces
 /// it, and anything else (or a list with a non-string) is `bad_request` and changes nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sessions_set_members_absent_keeps_null_removes_list_replaces_bad_refuses() {
     let dir = tempfile::tempdir().unwrap();
     let a = seed(dir.path());
-    let file = json!({"workspace": NAME, "sessions": friday(), "member_keys": ["other"]});
+    let file = json!({"workspace": NAME, "sessions": friday(), "members": ["user_x"]});
     let (child, token, sock) = common::member_with(dir.path(), file);
-    let (mut pa, _ep) = dial(&sock, &token, &a).await;
+    let (mut pa, _ep) = dial_as(&sock, &token, &a, Some("user_a")).await;
     let to = format!("{}/friday", short(&sock, &token));
     let state = async |pa: &mut Peer| send_acked(pa, &a, &to, "x").await.1;
     assert_eq!(state(&mut pa).await, "refused");
@@ -760,18 +749,17 @@ async fn sessions_set_members_absent_keeps_null_removes_list_replaces_bad_refuse
             &sock,
             &token,
             "cloud.sessions.set",
-            json!({"sessions": friday(), "member_keys": bad}),
+            json!({"sessions": friday(), "members": bad}),
         );
         assert_eq!(r["error"], "bad_request", "{r}");
     }
     assert_eq!(state(&mut pa).await, "refused");
     // A list replaces it.
-    let list = json!([a.key]);
     ok(
         &sock,
         &token,
         "cloud.sessions.set",
-        json!({"sessions": friday(), "member_keys": list}),
+        json!({"sessions": friday(), "members": ["user_a"]}),
     );
     assert_eq!(state(&mut pa).await, "stored");
     // Null removes it.
@@ -779,14 +767,14 @@ async fn sessions_set_members_absent_keeps_null_removes_list_replaces_bad_refuse
         &sock,
         &token,
         "cloud.sessions.set",
-        json!({"sessions": friday(), "member_keys": null}),
+        json!({"sessions": friday(), "members": null}),
     );
     assert_eq!(state(&mut pa).await, "stored");
     ok(&sock, &token, "stop", json!({}));
     exits_zero(child);
 }
 
-/// A sessions file whose `member_keys` is not a list of strings keeps the member from starting.
+/// A sessions file whose `members` is not a list of strings keeps the member from starting.
 #[test]
 fn a_bad_members_in_the_sessions_file_is_a_startup_error() {
     let dir = tempfile::tempdir().unwrap();
@@ -794,7 +782,7 @@ fn a_bad_members_in_the_sessions_file_is_a_startup_error() {
     let file = dir.path().join("sessions.json");
     std::fs::write(
         &file,
-        json!({"sessions": [], "member_keys": "everyone"}).to_string(),
+        json!({"sessions": [], "members": "everyone"}).to_string(),
     )
     .unwrap();
     let mut child = std::process::Command::new(common::EXE)
@@ -816,5 +804,5 @@ fn a_bad_members_in_the_sessions_file_is_a_startup_error() {
     writeln!(child.stdin.take().unwrap(), "t").unwrap();
     let out = child.wait_with_output().unwrap();
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("member_keys"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("members"));
 }

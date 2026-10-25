@@ -486,7 +486,8 @@ fn answer_here(
         let team = d.team.lock().unwrap();
         let store = d.store.lock().unwrap();
         let now = ipc::now() as i64;
-        let members = d.cloud.as_ref().and_then(|c| c.declared().members);
+        let members = (d.cloud.as_ref().and_then(|c| c.declared().members))
+            .map(|people| crate::proof::admitted(d, &people));
         answer(
             &store,
             &team.roster,
@@ -495,7 +496,7 @@ fn answer_here(
             allow,
             scope,
             by,
-            members.as_deref(),
+            members.as_ref(),
             now,
         )?
     };

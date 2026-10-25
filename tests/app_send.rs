@@ -60,15 +60,16 @@ fn world() -> World {
 impl World {
     /// W1's member dialing B (A stays off), once B is online, with P's ChatGPT declared.
     async fn instance(&self) -> Instance {
+        self.a.sign_in("user_aden", None);
+        self.b.sign_in("user_quinn", None);
         self.b.daemon(false, "", &[]);
         let i = common::instance(self.w1.path(), &[&self.b], NAME, None, &[])
             .await
             .unwrap();
         online(&i, 1).await;
         let app = json!({"name": APP, "agent": "chatgpt", "title": TITLE});
-        // P's and Q's computers are signed-in members' (`member_keys`).
-        let keys = [self.a.identity().key, self.b.identity().key];
-        let set = json!({ "sessions": [app], "member_keys": keys });
+        // P and Q are the workspace's people: their signed-in computers' proofs admit them.
+        let set = json!({ "sessions": [app], "members": ["user_aden", "user_quinn"] });
         ok(&i, "cloud.sessions.set", set).await;
         i
     }
