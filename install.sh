@@ -1,7 +1,7 @@
 #!/bin/sh
 # Lightbulb installer: downloads the latest release (or $LIGHTBULB_VERSION, a tag like v0.2.2) for this Mac or Linux
 # computer, checks its checksum, puts it at ~/.lightbulb/connect/bin/lightbulb and runs `setup`
-# (which wires Claude Code, Codex, Cursor and Grok CLI and, on a Mac, starts the background service).
+# (which wires Claude Code, Codex, Cursor, Grok CLI and OpenCode and, on a Mac, starts the background service).
 # Re-running it upgrades an existing install in place.
 set -eu
 

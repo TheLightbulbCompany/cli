@@ -57,7 +57,7 @@ fn who_lists_a_registered_session_by_its_handle() {
     let none = out(&e.run(&["who"]));
     assert_eq!(
         none.trim(),
-        "No sessions yet. Open Claude Code, Codex, Cursor or Grok and they appear here."
+        "No sessions yet. Open Claude Code, Codex, Cursor, Grok or OpenCode and they appear here."
     );
     let key = e.session();
     let table = out(&e.run(&["who"]));

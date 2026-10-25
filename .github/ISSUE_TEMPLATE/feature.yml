@@ -19,4 +19,4 @@ body:
     id: agent
     attributes:
       label: Agent
-      description: Which agent this is about (Claude Code, Codex, Cursor, Grok CLI), if any.
+      description: Which agent this is about (Claude Code, Codex, Cursor, Grok CLI, OpenCode), if any.

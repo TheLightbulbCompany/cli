@@ -49,7 +49,7 @@ addresses. Computers on other networks connect through a relay and do not need i
 
 ### An agent: `not connected` or `hooks only — tools missing (run setup)`
 
-The line is named after the agent (`Claude Code`, `Codex`, `Cursor`, `Grok CLI`).
+The line is named after the agent (`Claude Code`, `Codex`, `Cursor`, `Grok CLI`, `OpenCode`).
 `not installed` is fine: that agent's folder does not exist.
 
 - `hooks only — tools missing (run setup)`: the hooks are there, but the `lightbulb-network` tool

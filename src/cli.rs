@@ -191,7 +191,7 @@ pub fn who(as_json: bool, all: bool) -> Result<i32> {
     }
     let list = sessions.as_array().cloned().unwrap_or_default();
     if list.is_empty() {
-        println!("No sessions yet. Open Claude Code, Codex, Cursor or Grok and they appear here.");
+        println!("No sessions yet. Open Claude Code, Codex, Cursor, Grok or OpenCode and they appear here.");
         return Ok(0);
     }
     // (header, cell, also without `--all`)

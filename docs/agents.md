@@ -1,13 +1,13 @@
 # Agents
 
-Lightbulb works with four coding agents: Claude Code, Codex, Cursor and Grok CLI. This page
+Lightbulb works with five coding agents: Claude Code, Codex, Cursor, Grok CLI and OpenCode. This page
 says what `lightbulb setup` changes for each one, how a message reaches a session, what you
 see, and how to turn it off.
 
 ## What `setup` does
 
 `lightbulb setup` looks for each agent's folder in your home folder (`~/.claude`, `~/.codex`,
-`~/.cursor`, `~/.grok`). It skips an agent whose folder is not there. For each agent it finds,
+`~/.cursor`, `~/.grok`, `~/.config/opencode`). It skips an agent whose folder is not there. For each agent it finds,
 it adds two things:
 
 - **Hooks.** The agent runs `lightbulb` at five moments: session start, when you send a prompt,
@@ -73,6 +73,20 @@ one Cursor conversation is one session, not two.
 
 Grok's subagent hooks are ignored, and so is a stop that is not the end of a turn.
 
+### OpenCode
+
+OpenCode has no command hooks, so setup adds a small plugin that runs them.
+
+| File | What setup adds |
+|---|---|
+| `~/.config/opencode/plugins/lightbulb.js` | A plugin of our own. It runs `lightbulb hook opencode <event>` on `session.created` (session start), `tool.execute.after` (after a tool call), `session.idle` (end of a turn) and `session.deleted` (session end), with a 10 s limit, and ignores every failure. It skips subagent (child) sessions. It is never backed up, because it is only ours. |
+| `~/.config/opencode/opencode.json` | `mcp.lightbulb-network`: `{"type": "local", "command": ["<path>", "mcp"], "enabled": true}`. |
+
+If you have `~/.config/opencode/opencode.jsonc` instead, setup edits that file, but only while
+it is plain JSON. A `.jsonc` with comments or trailing commas is left as it is: setup prints the
+`mcp` entry for you to paste in, and reads OpenCode as connected once it is there. Setup never
+makes an `opencode.json` beside an `opencode.jsonc`.
+
 ### After setup
 
 Restart any agent session that was already open. An open session does not load the new tool
@@ -102,12 +116,13 @@ the agent:
 | Agent | Hooks that hand over messages |
 |---|---|
 | Claude Code, Codex | session start, your next prompt, after each tool call, and at the end of a turn |
-| Cursor, Grok CLI | after each tool call, and at the end of a turn |
+| Cursor, Grok CLI, OpenCode | after each tool call, and at the end of a turn |
 
 After a tool call or a prompt, the message is added as extra context. At the end of a turn,
-the hook asks the agent to keep going and read it (Cursor gets it as a follow-up message).
+the hook asks the agent to keep going and read it (Cursor gets it as a follow-up message;
+OpenCode's plugin sends it as a new prompt).
 So a busy session reads a message within one step. An idle session that is not pushed to reads
-it when you next type to it (Claude Code, Codex) or when it next uses a tool (Cursor, Grok CLI).
+it when you next type to it (Claude Code, Codex) or when it next uses a tool (Cursor, Grok CLI, OpenCode).
 
 **When it checks** (`gets messages when it checks`). The agent calls `check_inbox` itself.
 Any agent can do this, at any time.
