@@ -13,6 +13,7 @@ pub(crate) fn agent_name(provider: &str) -> String {
         "codex" => "Codex".into(),
         "cursor" => "Cursor".into(),
         "grok" => "Grok CLI".into(),
+        "opencode" => "OpenCode".into(),
         p => {
             let mut c = p.chars();
             c.next()
@@ -91,6 +92,7 @@ mod tests {
     #[test]
     fn agent_names() {
         assert_eq!(agent_name("grok"), "Grok CLI");
+        assert_eq!(agent_name("opencode"), "OpenCode");
         assert_eq!(agent_name("claude"), "Claude Code");
         assert_eq!(agent_name("foo"), "Foo");
     }

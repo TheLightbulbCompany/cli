@@ -25,7 +25,7 @@ Until then, run `~/.lightbulb/connect/bin/lightbulb` instead of `lightbulb`.
 Set `DO_NOT_TRACK=1` before installing to send nothing (see [Usage counts](#usage-counts)).
 
 The line downloads the latest release, checks its checksum, installs `~/.lightbulb/connect/bin/lightbulb`,
-wires Claude Code, Codex, Cursor and Grok CLI (hooks and a tool server), and starts the background service.
+wires Claude Code, Codex, Cursor, Grok CLI and OpenCode (hooks and a tool server), and starts the background service.
 Run the same line again to upgrade. Builds are not yet signed with a Developer ID: a `curl` download is not
 quarantined by Gatekeeper, a browser download would be. `lightbulb setup --remove` takes everything out.
 On Linux (and WSL) the same line installs a static binary and sets up the agents. There is no service manager off macOS: the CLI starts the daemon when a command needs it. To keep it running, start `lightbulb daemon` yourself (for example in tmux, or as a systemd `--user` unit). `lightbulb update` and `lightbulb setup` restart a daemon that runs an older version. There are no dialogs on Linux: run `lightbulb held`, then `lightbulb approve H1` or `lightbulb approve J1` (or `decline`). Homebrew and npm are macOS-only for now.
@@ -72,14 +72,14 @@ A computer is on one network at a time: run `lightbulb leave` first to join anot
 A dialog opens on your Mac: `sam (computer "…") wants to join your team using your invite link.`
 Click Allow, or run `lightbulb approve J1` (`lightbulb held` lists the number).
 Their Terminal then says `Connected as <name> (…)`. Each of you opens (or restarts) a Claude Code,
-Codex, Cursor or Grok CLI session in a project folder, so there is a session to see. Then each of
+Codex, Cursor, Grok CLI or OpenCode session in a project folder, so there is a session to see. Then each of
 you can see the other's sessions:
 
 ```sh
 lightbulb who --all
 ```
 
-From any Claude Code, Codex, Cursor or Grok CLI session, ask the agent: "Use the lightbulb tools to
+From any Claude Code, Codex, Cursor, Grok CLI or OpenCode session, ask the agent: "Use the lightbulb tools to
 find sam's sessions and send their Claude a message." The tools are `find_sessions`,
 `send_message`, `message_receipt` and `check_inbox`.
 
@@ -119,7 +119,7 @@ beside the Lightbulb desktop app's own `lightbulb` server; neither replaces the 
 
 ## Docs
 
-- [Agents](docs/agents.md): what `setup` changes for Claude Code, Codex, Cursor and Grok CLI, and how a message reaches a session.
+- [Agents](docs/agents.md): what `setup` changes for Claude Code, Codex, Cursor, Grok CLI and OpenCode, and how a message reaches a session.
 - [Teams](docs/teams.md): invites, joining, roles, Allow and policy, removing and leaving, relays.
 - [Security](docs/security.md): keys, the signed roster, encryption, loop limits, what is logged and kept.
 - [CLI reference](docs/cli.md): every command and option.

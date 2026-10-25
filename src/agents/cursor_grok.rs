@@ -1,5 +1,6 @@
-//! Cursor's and Grok's hook payloads and replies, written from their own documentation
-//! (cursor.com/docs/agent/hooks; the Grok CLI manual) and payloads captured live.
+//! Cursor's, Grok's and OpenCode's hook payloads and replies, written from their own
+//! documentation (cursor.com/docs/agent/hooks; the Grok CLI manual) and payloads captured live.
+//! OpenCode has no command hooks: our plugin (`setup/opencode.rs`) builds its payload.
 
 use crate::hook::{Event, Hook};
 use serde_json::{json, Value};
@@ -39,6 +40,17 @@ pub fn normalize_grok(event: Event, p: &Value) -> Option<Hook> {
     })
 }
 
+/// OpenCode: the payload our plugin sends, `{session_id, cwd}` (it drops child sessions).
+pub fn normalize_opencode(event: Event, p: &Value) -> Option<Hook> {
+    Some(Hook {
+        provider: "opencode",
+        event,
+        conversation: text(&p["session_id"])?,
+        cwd: text(&p["cwd"]).unwrap_or_default(),
+        transcript_path: None,
+    })
+}
+
 /// Cursor reads `followup_message` from stop and `additional_context` from postToolUse.
 /// (Grok reads Claude's shapes for its two mail events.)
 pub fn cursor_output(event: Event, text: &str) -> Value {
@@ -72,6 +84,34 @@ mod tests {
         );
         assert!(normalize_grok(Event::Stop, &fixture("grok-stop-shutdown")).is_none());
         assert!(normalize_grok(Event::Stop, &fixture("grok-stop")).is_some());
+    }
+
+    #[test]
+    fn opencode_reads_session_id_and_cwd() {
+        for (event, name) in [
+            (Event::SessionStart, "opencode-session-start"),
+            (Event::PostToolUse, "opencode-post-tool-use"),
+            (Event::Stop, "opencode-stop"),
+            (Event::SessionEnd, "opencode-session-end"),
+        ] {
+            let h = normalize_opencode(event, &fixture(name)).unwrap();
+            assert_eq!(
+                (h.provider, h.event, h.conversation.as_str(), h.cwd.as_str()),
+                (
+                    "opencode",
+                    event,
+                    "ses_0a1b2c3d4e5fOpEnCoDe0001",
+                    "/tmp/proj"
+                )
+            );
+            assert_eq!(h.transcript_path, None);
+        }
+    }
+
+    #[test]
+    fn opencode_empty_payload_ignored() {
+        assert!(normalize_opencode(Event::Stop, &json!({})).is_none());
+        assert!(normalize_opencode(Event::Stop, &json!({"session_id": ""})).is_none());
     }
 
     #[test]

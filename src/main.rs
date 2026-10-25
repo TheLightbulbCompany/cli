@@ -13,7 +13,7 @@ computers and on your teammates'.
 Usage: lightbulb <command> [options]
 
 Getting started:
-  setup     Connect Claude Code, Codex, Cursor and Grok CLI here and start the background service
+  setup     Connect Claude Code, Codex, Cursor, Grok CLI and OpenCode here and start the background service
   doctor    Check that everything is connected, and say how to fix what is not
   invite    Print the join line that adds your other computer or a teammate
   join      Join the team a join line is for: join '<ticket>'
@@ -179,7 +179,7 @@ enum Command {
     },
     #[command(external_subcommand)]
     External(Vec<OsString>),
-    /// Run by an agent's hook config: `hook <claude|codex|cursor|grok> <session-start|user-prompt-submit|post-tool-use|stop|session-end>`.
+    /// Run by an agent's hook config: `hook <claude|codex|cursor|grok|opencode> <session-start|user-prompt-submit|post-tool-use|stop|session-end>`.
     ///
     /// Always exits 0; errors go to stderr.
     #[command(hide = true)]
@@ -212,7 +212,7 @@ enum Command {
         #[arg(long, default_value = setup::DEFAULT_SERVER)]
         server_name: String,
     },
-    /// Wire the installed agents (Claude Code, Codex, Cursor, Grok CLI) to this engine:
+    /// Wire the installed agents (Claude Code, Codex, Cursor, Grok CLI, OpenCode) to this engine:
     /// their hooks and MCP server entry. Each file is backed up once as <file>.lightbulb-backup.
     Setup {
         /// Take out only what setup wrote; backups are left as they are.

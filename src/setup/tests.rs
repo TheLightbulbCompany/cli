@@ -265,6 +265,272 @@ fn setup_writes_grok_hooks_and_mcp_and_backs_up_once() {
     backed_up_once(h, ".grok/config.toml", config);
 }
 
+const OC_PLUGIN: &str = ".config/opencode/plugins/lightbulb.js";
+const OC_JSON: &str = ".config/opencode/opencode.json";
+const OC_JSONC: &str = ".config/opencode/opencode.jsonc";
+
+fn oc_entry(args: &[&str]) -> Value {
+    let mut command = vec![EXE];
+    command.extend(args);
+    json!({"type": "local", "command": command, "enabled": true})
+}
+
+#[test]
+fn setup_writes_opencode_plugin_and_mcp_and_backs_up_once() {
+    let home = tempfile::tempdir().unwrap();
+    let h = home.path();
+    let config = json!({"$schema": "https://opencode.ai/config.json",
+        "mcp": {"other": {"type": "remote", "url": "https://x/mcp"}}})
+    .to_string();
+    put(h, OC_JSON, &config);
+
+    let r = setup(h, false);
+    let oc = agent(&r, "opencode");
+    assert_eq!(oc.state, State::Connected("lightbulb-network".into()));
+    assert_eq!(oc.wrote, [h.join(OC_PLUGIN), h.join(OC_JSON)]);
+    assert_eq!(oc.line(), "OpenCode: connected (hooks + tools)");
+    let plugin = get(h, OC_PLUGIN);
+    for arg in ["session-start", "post-tool-use", "stop", "session-end"] {
+        assert!(plugin.contains(&format!("\"{arg}\"")), "{arg}");
+    }
+    // The executable is only in the JS string literal, never in a comment.
+    assert_eq!(plugin.matches(EXE).count(), 1, "{plugin}");
+    assert!(
+        plugin.contains(&format!("const EXE = \"{EXE}\"")),
+        "{plugin}"
+    );
+    assert!(wired(h, "opencode"));
+    let c = json_at(h, OC_JSON);
+    assert_eq!(c["mcp"]["lightbulb-network"], oc_entry(&["mcp"]));
+    assert_eq!(
+        c["mcp"]["other"],
+        json!({"type": "remote", "url": "https://x/mcp"})
+    );
+    assert_eq!(c["$schema"], "https://opencode.ai/config.json");
+    assert_eq!(tools(h, "opencode").as_deref(), Some("lightbulb-network"));
+    assert_eq!(
+        status(h, "opencode", ".config/opencode"),
+        State::Connected("lightbulb-network".into())
+    );
+
+    assert!(agent(&setup(h, false), "opencode").wrote.is_empty());
+    backed_up_once(h, OC_JSON, &config);
+    // The plugin is ours alone: never backed up.
+    assert!(!backup_path(&h.join(OC_PLUGIN)).exists());
+}
+
+#[test]
+fn opencode_json_is_created_when_there_is_no_config() {
+    let home = tempfile::tempdir().unwrap();
+    let h = home.path();
+    fs::create_dir_all(h.join(".config/opencode")).unwrap();
+    setup(h, false);
+    assert_eq!(
+        json_at(h, OC_JSON),
+        json!({"mcp": {"lightbulb-network": oc_entry(&["mcp"])}})
+    );
+    setup(h, true);
+    assert_eq!(json_at(h, OC_JSON), json!({}));
+    assert!(!h.join(OC_PLUGIN).exists());
+}
+
+#[test]
+fn a_plain_opencode_jsonc_is_edited_and_no_json_is_made_beside_it() {
+    let home = tempfile::tempdir().unwrap();
+    let h = home.path();
+    let config = "{\n  \"theme\": \"opencode\"\n}\n";
+    put(h, OC_JSONC, config);
+    let r = setup(h, false);
+    assert_eq!(
+        agent(&r, "opencode").state,
+        State::Connected("lightbulb-network".into())
+    );
+    assert!(!h.join(OC_JSON).exists());
+    let c = json_at(h, OC_JSONC);
+    assert_eq!(c["mcp"]["lightbulb-network"], oc_entry(&["mcp"]));
+    assert_eq!(c["theme"], "opencode");
+    assert_eq!(tools(h, "opencode").as_deref(), Some("lightbulb-network"));
+    backed_up_once(h, OC_JSONC, config);
+    setup(h, true);
+    assert_eq!(json_at(h, OC_JSONC), json!({"theme": "opencode"}));
+}
+
+#[test]
+fn an_opencode_jsonc_with_comments_is_left_alone_and_the_entry_is_printed() {
+    let home = tempfile::tempdir().unwrap();
+    let h = home.path();
+    let config = "{\n  // mine\n  \"theme\": \"opencode\", /* keep */\n}\n";
+    put(h, OC_JSONC, config);
+    let r = setup(h, false);
+    let oc = agent(&r, "opencode");
+    assert!(
+        matches!(oc.state, State::Failed { hooks: true, .. }),
+        "{oc:?}"
+    );
+    let snippet = format!("\"lightbulb-network\": {}", oc_entry(&["mcp"]));
+    let line = oc.line();
+    assert!(
+        line.starts_with("OpenCode: hooks added, but not its tools — ") && line.contains(&snippet),
+        "{line}"
+    );
+    assert!(line.contains("opencode.jsonc"), "{line}");
+    assert_eq!(oc.wrote, [h.join(OC_PLUGIN)]);
+    assert_eq!(get(h, OC_JSONC), config);
+    assert!(!h.join(OC_JSON).exists());
+    assert!(!backup_path(&h.join(OC_JSONC)).exists());
+    assert_eq!(tools(h, "opencode"), None);
+
+    // Pasted by the person, comments and all: connected, and the file is still not rewritten.
+    let pasted =
+        format!("{{\n  // mine\n  \"theme\": \"opencode\",\n  \"mcp\": {{ {snippet}, }},\n}}\n");
+    put(h, OC_JSONC, &pasted);
+    let r = setup(h, false);
+    assert_eq!(
+        agent(&r, "opencode").state,
+        State::Connected("lightbulb-network".into())
+    );
+    assert_eq!(get(h, OC_JSONC), pasted);
+    assert_eq!(tools(h, "opencode").as_deref(), Some("lightbulb-network"));
+
+    // Removing cannot take it out either: the person is told to.
+    let r = setup(h, true);
+    let oc = agent(&r, "opencode");
+    assert!(
+        matches!(&oc.state, State::Failed { why, .. } if why.contains("take \"lightbulb-network\" out of \"mcp\"")),
+        "{oc:?}"
+    );
+    assert_eq!(get(h, OC_JSONC), pasted);
+    assert!(!h.join(OC_PLUGIN).exists());
+}
+
+#[test]
+fn an_opencode_jsonc_that_is_not_even_jsonc_is_a_syntax_error() {
+    let home = tempfile::tempdir().unwrap();
+    let h = home.path();
+    put(h, OC_JSONC, "{\n  // mine\n  \"theme\": \n}\n");
+    let r = setup(h, false);
+    let line = agent(&r, "opencode").line();
+    assert!(line.contains("opencode.jsonc has a syntax error"), "{line}");
+    assert!(!line.contains("has comments"), "{line}");
+    assert_eq!(get(h, OC_JSONC), "{\n  // mine\n  \"theme\": \n}\n");
+}
+
+#[test]
+fn strip_jsonc_takes_out_comments_and_trailing_commas_only() {
+    let text = "{\"a\": \"// not a comment\", /* x */ \"b\": [1, 2,], // y\n \"c\": \"\\\"/*\",}";
+    assert_eq!(
+        serde_json::from_str::<Value>(&strip_jsonc(text)).unwrap(),
+        json!({"a": "// not a comment", "b": [1, 2], "c": "\"/*"})
+    );
+}
+
+/// Runs the generated plugin under node (when it is installed) with a fake OpenCode client
+/// and a fake `lightbulb` that hands mail on `post-tool-use` and `stop`.
+#[test]
+fn the_opencode_plugin_runs_hooks_and_injects_their_text() {
+    use std::os::unix::fs::PermissionsExt;
+    if std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("node not installed: plugin smoke test skipped");
+        return;
+    }
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    let log = dir.join("calls.log");
+    // A path a shell or JS literal could trip on.
+    let exe = dir.join("it's a dir").join("lightbulb");
+    fs::create_dir(exe.parent().unwrap()).unwrap();
+    fs::write(
+        &exe,
+        format!(
+            "#!/bin/sh\nprintf '%s %s ' \"$2\" \"$3\" >> '{log}'\ncat >> '{log}'\necho >> '{log}'\ncase \"$3\" in post-tool-use|stop) echo '{{\"text\":\"mail\"}}';; esac\n",
+            log = log.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+    let exe_s = exe.to_string_lossy();
+    let ctx = Ctx {
+        home: dir,
+        exe: &exe_s,
+        server: DEFAULT_SERVER,
+        remove: false,
+    };
+    fs::write(dir.join("plugin.mjs"), opencode::plugin_js(&ctx)).unwrap();
+    let driver = r#"
+const { Lightbulb } = await import("file://" + process.argv.at(-1));
+const prompts = [];
+const client = { session: {
+  get: async ({ path }) => ({ data: { id: path.id, parentID: path.id === "child2" ? "p" : undefined } }),
+  prompt: async (o) => { prompts.push(o); return {}; },
+} };
+const h = await Lightbulb({ client, directory: "/tmp/proj" });
+const tool = (id) => h["tool.execute.after"]({ tool: "bash", sessionID: id, callID: "c", args: {} }, {});
+const idle = (id) => h.event({ event: { type: "session.idle", properties: { sessionID: id } } });
+await h.event({ event: { type: "session.created", properties: { info: { id: "ses_a" } } } });
+// ses_b: no chat.message seen (resumed before the plugin loaded), so it is never pushed to.
+await h.event({ event: { type: "session.created", properties: { info: { id: "ses_b" } } } });
+await h.event({ event: { type: "session.created", properties: { info: { id: "child1", parentID: "ses_a" } } } });
+await h["chat.message"](
+  { sessionID: "ses_a", agent: "plan", model: { providerID: "p", modelID: "m" }, variant: "high" },
+  { message: { sessionID: "ses_a", role: "user", agent: "plan", model: { providerID: "p", modelID: "m" } }, parts: [] },
+);
+await tool("ses_a");
+await tool("ses_b");
+await tool("child1");
+await tool("child2");
+await idle("ses_a");
+await idle("ses_b");
+await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_a" } } } });
+await h.event({ event: { type: "message.updated", properties: {} } });
+await new Promise((r) => setTimeout(r, 50));
+console.log(JSON.stringify(prompts));
+"#;
+    let out = std::process::Command::new("node")
+        .args(["--input-type=module", "-e", driver])
+        .arg(dir.join("plugin.mjs"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let prompts: Value = serde_json::from_slice(&out.stdout).unwrap();
+    // Every push keeps the session's own agent and model: mail never switches plan to build.
+    let body = |no_reply: bool| {
+        let mut b = json!({"parts": [{"type": "text", "text": "mail"}], "agent": "plan",
+            "model": {"providerID": "p", "modelID": "m"}, "variant": "high"});
+        if no_reply {
+            b["noReply"] = json!(true);
+        }
+        json!({"path": {"id": "ses_a"}, "body": b})
+    };
+    assert_eq!(prompts, json!([body(true), body(false)]));
+    // A session with no agent recorded asks for no mail, so it stays in the inbox.
+    let call = |arg: &str, id: &str, mail: bool| {
+        format!(
+            "opencode {arg} {{\"session_id\":\"{id}\",\"cwd\":\"/tmp/proj\",\"mail\":{mail}}}\n"
+        )
+    };
+    assert_eq!(
+        fs::read_to_string(&log).unwrap(),
+        [
+            call("session-start", "ses_a", false),
+            call("session-start", "ses_b", false),
+            call("post-tool-use", "ses_a", true),
+            call("post-tool-use", "ses_b", false),
+            call("stop", "ses_a", true),
+            call("stop", "ses_b", false),
+            call("session-end", "ses_a", true),
+        ]
+        .concat()
+    );
+}
+
 #[test]
 fn remove_takes_only_our_entries() {
     let home = tempfile::tempdir().unwrap();
@@ -292,6 +558,10 @@ fn remove_takes_only_our_entries() {
             ".cursor/cli-config.json",
             json!({"permissions": {"allow": ["Mcp(other:*)"]}}),
         ),
+        (
+            ".config/opencode/opencode.json",
+            json!({"mcp": {"other": {"type": "local", "command": [APP, "serve"]}}}),
+        ),
     ];
     for (rel, v) in &json_files {
         put(h, rel, &v.to_string());
@@ -314,8 +584,9 @@ fn remove_takes_only_our_entries() {
     }
     assert_eq!(get(h, ".codex/config.toml").trim_end(), codex.trim_end());
     assert_eq!(get(h, ".grok/config.toml").trim_end(), grok.trim_end());
-    // Our own Grok hook file is gone.
+    // Our own Grok hook file and OpenCode plugin are gone.
     assert!(!h.join(".grok/hooks/lightbulb.json").exists());
+    assert!(!h.join(OC_PLUGIN).exists());
     // Nothing left to remove.
     assert!(setup(h, true).agents.iter().all(|a| a.wrote.is_empty()));
 }
@@ -328,7 +599,9 @@ fn any_lightbulb_mcp_entry_is_replaced_by_ours_and_a_foreign_one_survives_remove
     let other_toml = format!(
         "[mcp_servers.lightbulb-network]\ncommand = \"{APP}\"\nargs = [\"serve\"]\nstartup_timeout_sec = 30\n"
     );
+    let other_oc = json!({"mcp": {"lightbulb-network": {"type": "local", "command": [APP, "serve"], "environment": {"A": "1"}}}});
     let put_all = || {
+        put(h, OC_JSON, &other_oc.to_string());
         put(h, ".claude.json", &other.to_string());
         put(h, ".cursor/mcp.json", &other.to_string());
         put(h, ".codex/config.toml", &other_toml);
@@ -337,7 +610,7 @@ fn any_lightbulb_mcp_entry_is_replaced_by_ours_and_a_foreign_one_survives_remove
     fs::create_dir(h.join(".claude")).unwrap();
     put_all();
     let r = run(h, Path::new(EXE), None, false);
-    for name in ["claude", "codex", "cursor", "grok"] {
+    for name in ["claude", "codex", "cursor", "grok", "opencode"] {
         assert_eq!(
             agent(&r, name).state,
             State::Connected("lightbulb-network".into()),
@@ -361,6 +634,10 @@ fn any_lightbulb_mcp_entry_is_replaced_by_ours_and_a_foreign_one_survives_remove
         assert_eq!(server["command"].as_str(), Some(EXE), "{rel}");
         assert!(server.get("startup_timeout_sec").is_none(), "{rel}");
     }
+    assert_eq!(
+        json_at(h, OC_JSON)["mcp"]["lightbulb-network"],
+        oc_entry(&["mcp"])
+    );
     // Removing takes out only ours.
     run(h, Path::new(EXE), None, true);
     assert!(json_at(h, ".claude.json").get("mcpServers").is_none());
@@ -369,6 +646,7 @@ fn any_lightbulb_mcp_entry_is_replaced_by_ours_and_a_foreign_one_survives_remove
     assert_eq!(json_at(h, ".claude.json"), other);
     assert_eq!(json_at(h, ".cursor/mcp.json"), other);
     assert_eq!(get(h, ".codex/config.toml"), other_toml);
+    assert_eq!(json_at(h, OC_JSON), other_oc);
 }
 
 #[test]
@@ -384,7 +662,7 @@ fn setup_touches_only_installed_agents() {
         .map(|a| a.name)
         .collect();
     assert_eq!(found, ["grok"]);
-    for missing in [".claude", ".claude.json", ".codex", ".cursor"] {
+    for missing in [".claude", ".claude.json", ".codex", ".cursor", ".config"] {
         assert!(!h.join(missing).exists(), "{missing}");
     }
     assert_eq!(agent(&r, "claude").line(), "Claude Code: not installed");
@@ -486,10 +764,14 @@ fn a_bad_server_name_writes_nothing() {
 fn a_non_default_server_name_is_passed_to_mcp() {
     let home = tempfile::tempdir().unwrap();
     let h = home.path();
-    for dir in [".claude", ".codex", ".cursor", ".grok"] {
-        fs::create_dir(h.join(dir)).unwrap();
+    for dir in [".claude", ".codex", ".cursor", ".grok", ".config/opencode"] {
+        fs::create_dir_all(h.join(dir)).unwrap();
     }
     run(h, Path::new(EXE), Some("work-tools"), false);
+    assert_eq!(
+        json_at(h, OC_JSON)["mcp"]["work-tools"],
+        oc_entry(&["mcp", "--server-name", "work-tools"])
+    );
     let args = json!(["mcp", "--server-name", "work-tools"]);
     assert_eq!(
         json_at(h, ".claude.json")["mcpServers"]["work-tools"]["args"],
@@ -555,9 +837,12 @@ fn a_codex_hook_in_a_shared_group_says_codex_will_ask() {
 #[test]
 fn the_closing_words_name_what_is_connected_and_the_command_to_type() {
     assert_eq!(
-        summary(&["Claude Code", "Codex", "Cursor", "Grok CLI"], "lightbulb"),
+        summary(
+            &["Claude Code", "Codex", "Cursor", "Grok CLI", "OpenCode"],
+            "lightbulb"
+        ),
         "Lightbulb is on.
-  Connected: Claude Code, Codex, Cursor, Grok CLI
+  Connected: Claude Code, Codex, Cursor, Grok CLI, OpenCode
 
 Try it: open Claude Code in any folder and ask \"list my other sessions\".
 Add your other computer or a teammate: lightbulb invite
@@ -614,10 +899,11 @@ fn an_http_tool_server_under_the_name_is_replaced() {
 fn the_skill_is_installed_for_claude_and_codex_and_removed_with_setup() {
     let d = tempfile::tempdir().unwrap();
     let h = d.path();
-    for dir in [".claude", ".codex", ".cursor", ".grok"] {
+    for dir in [".claude", ".codex", ".cursor", ".grok", ".config/opencode"] {
         fs::create_dir_all(h.join(dir)).unwrap();
     }
     setup(h, false);
+    assert!(!h.join(".config/opencode/skills").exists());
     let rel = ".claude/skills/lightbulb-network/SKILL.md";
     let skill = get(h, rel);
     assert!(skill.starts_with("---\nname: lightbulb-network\ndescription: "));

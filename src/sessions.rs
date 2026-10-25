@@ -17,7 +17,7 @@ impl Key {
     }
 }
 
-pub const PROVIDERS: [&str; 4] = ["claude", "codex", "cursor", "grok"];
+pub const PROVIDERS: [&str; 5] = ["claude", "codex", "cursor", "grok", "opencode"];
 
 /// `[A-Za-z0-9._-]{1,max}`.
 pub fn word(s: &str, max: usize) -> bool {
@@ -269,6 +269,12 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::PathBuf;
+
+    #[test]
+    fn an_opencode_address_qualifies() {
+        let a = "k3f9ab7cd2ef/opencode:ses_0a1b2c";
+        assert_eq!(qualify("k3f9ab7cd2ef", a).as_deref(), Some(a));
+    }
 
     #[test]
     fn key_is_member_slash_provider_colon_conversation() {

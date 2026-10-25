@@ -21,9 +21,10 @@ other people can see. For a first run, see the quick start in the [README](../RE
   is no such job: the CLI starts the daemon when a command needs it, or you run `lightbulb daemon`
   yourself (keep it running, for example in tmux or a systemd `--user` unit). `update` and `setup`
   restart a daemon that runs an older version.
-- **Agent wiring:** for Claude Code, Codex, Cursor and Grok CLI, `setup` adds hooks (session start,
-  prompt, tool use, stop, session end) and one tool server, in each agent's own config files
-  (`~/.claude/settings.json`, `~/.claude.json`, `~/.codex/`, `~/.cursor/`, `~/.grok/`). Each file
+- **Agent wiring:** for Claude Code, Codex, Cursor, Grok CLI and OpenCode, `setup` adds hooks (session start,
+  prompt, tool use, stop, session end; for OpenCode a plugin that runs them) and one tool server,
+  in each agent's own config files (`~/.claude/settings.json`, `~/.claude.json`, `~/.codex/`,
+  `~/.cursor/`, `~/.grok/`, `~/.config/opencode/`). Each file
   is backed up once as `<file>.lightbulb-backup`. The tool server is named `lightbulb-network`. It sits beside the
   Lightbulb desktop app's own `lightbulb` server; `setup` replaces only its own old entry. Run `setup --verbose` to
   list the files it changed.
@@ -37,7 +38,7 @@ Run `lightbulb <command> --help` for the options of each one.
 
 | Command | What it does |
 |---|---|
-| `setup` | Connect Claude Code, Codex, Cursor and Grok CLI here and start the background service. |
+| `setup` | Connect Claude Code, Codex, Cursor, Grok CLI and OpenCode here and start the background service. |
 | `update` | Install the latest release over this one and restart the background service. `--version v0.2.3` installs that release instead (0.2.2 or later; an example tag). `--auto on\|off` turns the daily automatic update on or off and installs nothing. |
 | `setup --remove` | Take out only what `setup` wrote. Backups are left as they are. |
 | `doctor` | Check the service, the local network, the state folder and each agent, and say how to fix what is not right. |
@@ -83,7 +84,7 @@ the link was made with `invite --open`.
 
 For each session on your computer, teammates see:
 
-- the agent (Claude Code, Codex, Cursor, Grok CLI) and the computer it runs on;
+- the agent (Claude Code, Codex, Cursor, Grok CLI, OpenCode) and the computer it runs on;
 - the folder's name (its last part, not the full path), and the repository and branch;
 - whether it is busy or idle, and a short title of what it is doing.
 

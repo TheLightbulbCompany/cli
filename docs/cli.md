@@ -20,9 +20,9 @@ When you use it: once after installing, after an upgrade, or to turn Lightbulb o
 lightbulb setup [OPTIONS]
 ```
 
-`--help`: Wire the installed agents (Claude Code, Codex, Cursor, Grok CLI) to this engine: their hooks and MCP server entry. Each file is backed up once as `<file>.lightbulb-backup`.
+`--help`: Wire the installed agents (Claude Code, Codex, Cursor, Grok CLI, OpenCode) to this engine: their hooks and MCP server entry. Each file is backed up once as `<file>.lightbulb-backup`.
 
-Connects Claude Code, Codex, Cursor and Grok CLI here (their hooks and the `lightbulb-network` tool
+Connects Claude Code, Codex, Cursor, Grok CLI and OpenCode here (their hooks and the `lightbulb-network` tool
 server) and starts the background service (on macOS; off macOS it restarts a daemon that runs an older version). Each file is backed up once as
 `<file>.lightbulb-backup`. Details: [agents](agents.md).
 

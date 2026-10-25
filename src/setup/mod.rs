@@ -18,6 +18,7 @@ mod claude;
 mod codex;
 mod cursor;
 mod grok;
+mod opencode;
 
 use crate::Result;
 use serde_json::{json, Value};
@@ -92,6 +93,7 @@ pub fn wired(home: &Path, agent: &str) -> bool {
         "codex" => ".codex/hooks.json",
         "cursor" => ".cursor/hooks.json",
         "grok" => ".grok/hooks/lightbulb.json",
+        "opencode" => opencode::PLUGIN,
         _ => return false,
     };
     fs::read_to_string(home.join(file)).is_ok_and(|t| t.contains(&format!(" hook {agent} ")))
@@ -101,14 +103,16 @@ pub fn wired(home: &Path, agent: &str) -> bool {
 /// command (an http server), which is never ours (reads, never writes).
 fn servers(home: &Path, agent: &str) -> Vec<(String, String)> {
     let (file, key) = match agent {
-        "claude" => (".claude.json", "mcpServers"),
-        "codex" => (".codex/config.toml", "mcp_servers"),
-        "cursor" => (".cursor/mcp.json", "mcpServers"),
-        "grok" => (".grok/config.toml", "mcp_servers"),
+        "claude" => (".claude.json".into(), "mcpServers"),
+        "codex" => (".codex/config.toml".into(), "mcp_servers"),
+        "cursor" => (".cursor/mcp.json".into(), "mcpServers"),
+        "grok" => (".grok/config.toml".into(), "mcp_servers"),
+        "opencode" => (opencode::config(home), "mcp"),
         _ => return vec![],
     };
     let read = || -> Option<Vec<(String, String)>> {
-        let text = fs::read_to_string(home.join(file)).ok()?;
+        let text = fs::read_to_string(home.join(&file)).ok()?;
+        let file = file.to_string_lossy();
         Some(if file.ends_with(".toml") {
             let doc: toml_edit::DocumentMut = text.parse().ok()?;
             let command = |v: &toml_edit::Item| {
@@ -123,8 +127,8 @@ fn servers(home: &Path, agent: &str) -> Vec<(String, String)> {
                 .map(|(k, v)| (k.to_string(), command(v)))
                 .collect()
         } else {
-            let doc: Value = serde_json::from_str(&text).ok()?;
-            let command = |v: &Value| v["command"].as_str().unwrap_or_default().to_string();
+            let doc: Value = serde_json::from_str(&strip_jsonc(&text)).ok()?;
+            let command = |v: &Value| json_command(v).unwrap_or_default().to_string();
             doc[key]
                 .as_object()?
                 .iter()
@@ -169,7 +173,8 @@ pub const UPSELL: &str = "Add an always-on AI teammate: https://thelightbulb.com
 /// `cmd` the command name that works on this computer.
 pub fn summary(connected: &[&str], cmd: &str) -> String {
     let list = if connected.is_empty() {
-        "none yet. Install Claude Code, Codex, Cursor or Grok CLI, then run setup again".into()
+        "none yet. Install Claude Code, Codex, Cursor, Grok CLI or OpenCode, then run setup again"
+            .into()
     } else {
         connected.join(", ")
     };
@@ -203,11 +208,12 @@ pub(crate) fn skill(ctx: &Ctx, agent_dir: &Path, r: &mut AgentReport) -> Result<
 }
 
 /// The agents setup wires: name, home directory, configure.
-pub const AGENTS: [(&str, &str); 4] = [
+pub const AGENTS: [(&str, &str); 5] = [
     ("claude", ".claude"),
     ("codex", ".codex"),
     ("cursor", ".cursor"),
     ("grok", ".grok"),
+    ("opencode", ".config/opencode"),
 ];
 
 /// Wires (or, `remove`, unwires) every installed agent. `server`: the MCP entry's name
@@ -215,11 +221,12 @@ pub const AGENTS: [(&str, &str); 4] = [
 pub fn run(home: &Path, executable: &Path, server: Option<&str>, remove: bool) -> Report {
     let exe = executable.to_string_lossy();
     let server = server.unwrap_or(DEFAULT_SERVER);
-    let configures: [Configure; 4] = [
+    let configures: [Configure; 5] = [
         claude::configure,
         codex::configure,
         cursor::configure,
         grok::configure,
+        opencode::configure,
     ];
     let mut report = Report::default();
     for ((name, dir), configure) in AGENTS.into_iter().zip(configures) {
@@ -556,6 +563,58 @@ pub(crate) fn set_hook_group(
     Ok(index)
 }
 
+/// A JSON server entry's command: a string, or the first item of OpenCode's command list.
+fn json_command(entry: &Value) -> Option<&str> {
+    entry["command"]
+        .as_str()
+        .or_else(|| entry["command"][0].as_str())
+}
+
+/// `text` with JSONC's comments and trailing commas taken out. For reading only: setup never
+/// writes this back, so the person's comments are never lost.
+pub(crate) fn strip_jsonc(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    let (mut string, mut escaped) = (false, false);
+    while let Some(c) = chars.next() {
+        if string {
+            out.push(c);
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match (c, chars.peek().copied()) {
+            ('/', Some('/')) => while chars.next_if(|&n| n != '\n').is_some() {},
+            ('/', Some('*')) => {
+                chars.next();
+                let mut prev = ' ';
+                for n in chars.by_ref() {
+                    if prev == '*' && n == '/' {
+                        break;
+                    }
+                    prev = n;
+                }
+            }
+            ('}' | ']', _) => {
+                let end = out.trim_end().len();
+                if out[..end].ends_with(',') {
+                    out.truncate(end - 1);
+                }
+                out.push(c);
+            }
+            _ => {
+                string = c == '"';
+                out.push(c);
+            }
+        }
+    }
+    out
+}
+
 /// Puts `entry` under `doc[key][server]` or, removing, deletes ours; a foreign one is left.
 pub(crate) fn set_json_server(
     ctx: &Ctx,
@@ -567,15 +626,14 @@ pub(crate) fn set_json_server(
         return Err(format!("`{key}` is not an object").into());
     }
     let old = &doc[key][OLD_SERVER];
-    if ctx.server != OLD_SERVER && ctx.owner(!old.is_null(), old["command"].as_str()) == Owner::Ours
-    {
+    if ctx.server != OLD_SERVER && ctx.owner(!old.is_null(), json_command(old)) == Owner::Ours {
         doc[key]
             .as_object_mut()
             .expect("holds our old entry")
             .remove(OLD_SERVER);
     }
     let current = &doc[key][ctx.server];
-    let owner = ctx.owner(!current.is_null(), current["command"].as_str());
+    let owner = ctx.owner(!current.is_null(), json_command(current));
     match owner {
         Owner::Foreign => return Ok(Owner::Foreign),
         Owner::Ours if ctx.remove => {
