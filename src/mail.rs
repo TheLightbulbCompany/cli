@@ -2,7 +2,7 @@
 
 use crate::net::frames::Frame;
 use crate::policy::{self, Verdict};
-use crate::roster::{Member, MemberKind, Roster};
+use crate::roster::{Member, Roster};
 use crate::sessions::{self, Key};
 use crate::store::{Message, Store, MSG_RECEIPT};
 use crate::Result;
@@ -13,6 +13,8 @@ use serde_json::Value;
 pub const LOOP_LIMIT: u32 = 12;
 /// Half-open: a send counts while `sent_at > now - LOOP_WINDOW_S`, so one sent at T stops counting at T + 600.
 pub const LOOP_WINDOW_S: u64 = 600;
+/// How long after this computer's message its inviter's answer to it needs no Allow.
+const REPLY_WINDOW_S: u64 = 86_400;
 /// Offline mail (and, later, the outbox) waits this long.
 pub const HOLD_S: u64 = 86_400;
 /// A held message waits this long for the person (nothing holds in Plan A).
@@ -713,21 +715,19 @@ pub fn send(
 }
 
 /// What member `peer`'s envelope `env` becomes on this computer (member prefix `me`), checked
-/// in this order: a `from` outside `peer`'s prefix is dropped unanswered (`Err`); a cloud
-/// member's `from` must be a session of its latest presence (`policy`); a `kind` other than
+/// in this order: a `from` outside `peer`'s prefix is dropped unanswered (`Err`); a `kind` other than
 /// `message` (the `app_*` kinds never reach here: `net::receive` drops them), any `files`, a body over `MAX_TEXT`, or a malformed id, `thread` or `request_id`
 /// is `unsupported`; a `to` that is not one address is `policy`, one under another prefix
 /// `not_member`; an envelope seen before gets the state it has now and is not delivered again;
 /// a `request_id` reused with another text or recipient is `request_id_reused`; `hops` at
 /// `MAX_HOPS` or more, or below one past a message of ours it answers (`hops_ok`), or the
-/// `LOOP_LIMIT`th send in `LOOP_WINDOW_S` from one principal to `to` (the person for a computer
-/// member, the sending session for a cloud member), is `loop`; then `policy::decide` (on a
-/// workspace member, `policy::cloud_inbound`): refused
-/// `policy`, or kept under a hold (`holds::hold`, `held`, in no mailbox), or stored for `to`
+/// `LOOP_LIMIT`th send in `LOOP_WINDOW_S` from one member to `to`, is `loop`; then
+/// `policy::decide` (on an instance with `members`, accept): refused `policy`, or kept under a hold (`holds::hold`, `held`, in no mailbox), or stored for `to`
 /// with origin `net:<peer short>`, timed by its arrival (`now`). Held or stored, it is
 /// remembered in `seen_ids`. On a workspace member, `declared` are its sessions: new mail for
 /// any other is `policy` (after the resend checks, so a resend gets the state it has). With
-/// `members` (person ids), mail from a peer whose person is not in it is `not_a_member`: no hold.
+/// `members` (person ids), mail from a peer that is no computer of one of them (`persons`, the
+/// people this member's own person links admitted) is `not_a_member`: no hold.
 #[allow(clippy::too_many_arguments)]
 pub fn receive(
     store: &Store,
@@ -761,9 +761,6 @@ pub fn receive(
     let ulid = |a: &str| ulid::Ulid::from_string(a).is_ok();
     if !address(from) || sessions::member_of(from) != Some(peer.short.as_str()) {
         return Err("an envelope from outside its member's prefix".into());
-    }
-    if peer.kind == MemberKind::Cloud && !advertised(store, &peer.key, from)? {
-        return refused("policy");
     }
     if kind != "message"
         || !files.is_empty()
@@ -802,8 +799,10 @@ pub fn receive(
     if declared.is_some_and(|d| !d.contains(to)) {
         return refused("policy");
     }
-    if members.is_some_and(|m| !m.contains(&peer.person_id)) {
-        return refused("not_a_member");
+    if let Some(m) = members {
+        if !store.person(&peer.key)?.is_some_and(|p| m.contains(&p)) {
+            return refused("not_a_member");
+        }
     }
     // An answer to (or in the thread of) a message this computer sent is at least one hop
     // past it, whatever `hops` the peer claims; only a person (`/terminal`, fenced by the
@@ -814,23 +813,33 @@ pub fn receive(
         return looped(HOPS);
     }
     let since = now.saturating_sub(LOOP_WINDOW_S) as i64;
-    let same_principal = |(f, origin): &(String, String)| match peer.kind {
-        MemberKind::Cloud => f == from,
-        MemberKind::Computer => roster.members.values().any(|m| {
-            m.person_id == peer.person_id && origin.strip_prefix("net:") == Some(m.short.as_str())
-        }),
-    };
+    let same_member =
+        |(_, origin): &(String, String)| origin.strip_prefix("net:") == Some(peer.short.as_str());
     let recent = store.net_mail_to(to, since)?;
-    if loop_refused(recent.iter().filter(|r| same_principal(r)).count()) {
+    if loop_refused(recent.iter().filter(|r| same_member(r)).count()) {
         return looped(RATE);
     }
-    // Not in my own roster (removed): nothing is mine to accept. A workspace member has its
-    // own fixed rule.
+    // Not in my own roster (removed): nothing is mine to accept. Past an instance's members
+    // list, there is nothing to ask.
     let verdict = match roster.by_short(me) {
-        Some(mine) if mine.kind == MemberKind::Cloud => {
-            policy::cloud_inbound(store, roster, mine, peer, from, now)?
-        }
-        Some(mine) => policy::decide(store, roster, &mine.key, peer)?,
+        Some(_) if members.is_some() => Verdict::Accept,
+        Some(mine) => match policy::decide(store, &mine.key, peer)? {
+            // My person-link inviter's session answering (`reply_to`, within a day) a message
+            // the session it writes to sent to that very session; a thread alone is not enough.
+            Verdict::Hold
+                if policy::replies_from(store, &peer.key)?
+                    && match reply_to.as_deref() {
+                        Some(r) => {
+                            let since = now.saturating_sub(REPLY_WINDOW_S) as i64;
+                            store.sent_to(r, to, from, since)?
+                        }
+                        None => false,
+                    } =>
+            {
+                Verdict::Accept
+            }
+            v => v,
+        },
         None => Verdict::Hold,
     };
     if verdict == Verdict::Refuse {
@@ -863,24 +872,6 @@ pub fn receive(
         held,
         fresh: true,
         ..Answer::is(state)
-    })
-}
-
-/// Whether `member`'s latest presence names `address` among its sessions, `known` or `kept`
-/// addresses.
-fn advertised(store: &Store, member: &str, address: &str) -> Result<bool> {
-    let presence = store.presence_of(member)?;
-    Ok(match presence.and_then(|t| serde_json::from_str(&t).ok()) {
-        Some(Frame::Presence {
-            sessions,
-            known,
-            kept,
-            ..
-        }) => {
-            sessions.iter().any(|s| s.session_id == address)
-                || known.iter().chain(&kept).any(|a| a == address)
-        }
-        _ => false,
     })
 }
 
@@ -1663,10 +1654,7 @@ mod tests {
             computer: "mbp".into(),
             person_id: "pkey".into(),
             role: crate::roster::Role::Member,
-            kind: MemberKind::Computer,
             admitted_at: 0,
-            proof: None,
-            workspace: None,
             by: None,
         };
         let mine = Member {

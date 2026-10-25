@@ -123,7 +123,7 @@ pub fn told(store: &Store, member: &str, id: &str, state: &str) -> Result<()> {
 mod tests {
     use super::*;
     use crate::mail::Prep;
-    use crate::roster::{MemberKind, Role};
+    use crate::roster::Role;
     use crate::sessions::Key;
 
     fn member(key: &str) -> Member {
@@ -134,10 +134,7 @@ mod tests {
             computer: "mbp".into(),
             person_id: key.into(),
             role: Role::Member,
-            kind: MemberKind::Computer,
             admitted_at: 0,
-            proof: None,
-            workspace: None,
             by: None,
         }
     }

@@ -44,7 +44,6 @@ async fn identity_get_matches_status() {
     assert!(key.starts_with(me["member_key_short"].as_str().unwrap()));
     assert_eq!(me["computer"], "mac-b");
     assert_eq!(me["person_id"], key);
-    assert_eq!(me["verified"], false);
     assert!(me["name"].as_str().is_some_and(|n| !n.is_empty()));
 
     call(&mut lines, &mut w, json!({"id": 3, "op": "shutdown"})).await;

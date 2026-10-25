@@ -5,8 +5,8 @@
 use crate::daemon::{ipc, Daemon, Declared};
 use crate::mail;
 use crate::net::frames::{Frame, Remote, STATUSES};
-use crate::roster::{Member, MemberKind, Role, Roster};
-use crate::sessions::{split_addr, Session, Status};
+use crate::roster::{Member, Role, Roster};
+use crate::sessions::{Session, Status};
 use crate::store::Store;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -417,29 +417,6 @@ fn stored(d: &Daemon) -> Vec<(Member, Latest)> {
         .collect()
 }
 
-/// Whether another computer of this person keeps `rest` (the part of an address after the
-/// member prefix), by its latest presence here. Best effort: only what is held.
-fn kept_elsewhere(d: &Daemon, rest: &str) -> bool {
-    let me = {
-        let t = d.team.lock().unwrap();
-        my_person(d, &t.roster)
-    };
-    stored(d).iter().any(|(m, l)| {
-        m.key != d.identity.key
-            && m.person_id == me
-            && l.kept
-                .iter()
-                .any(|k| split_addr(k).is_some_and(|(_, r)| r == rest))
-    })
-}
-
-/// Whether this computer may take the address `key` (`register`, `inbox --as`): it has a row
-/// for it already, or no other computer of this person keeps it. Call it without `store`.
-pub fn claim(d: &Daemon, key: &str) -> bool {
-    let held = d.store.lock().unwrap().holds(key).unwrap_or(false);
-    held || !kept_elsewhere(d, split_addr(key).map_or(key, |(_, r)| r))
-}
-
 /// A directory record (architecture §9); `cwd` is empty for another computer's session.
 /// `verified` as its label says it (`label::verified`); `online`, whether its computer is
 /// connected now (this one always is).
@@ -492,10 +469,7 @@ pub fn directory(d: &Daemon, query: Option<&str>) -> Value {
             computer: t.config.computer.clone(),
             person_id: d.identity.key.clone(),
             role: Role::Member,
-            kind: MemberKind::Computer,
             admitted_at: 0,
-            proof: None,
-            workspace: None,
             by: None,
         });
         (my_person(d, &t.roster), own)

@@ -3,11 +3,11 @@
 //! refused on the same person's other computer, and an `off` folder is never published.
 
 use iroh::Endpoint;
-use lightbulb::daemon::{ipc, net_ops};
+use lightbulb::daemon::ipc;
 use lightbulb::identity::Identity;
 use lightbulb::net::frames::{Frame, Remote};
 use lightbulb::os;
-use lightbulb::roster::{self, Entry, Kind};
+use lightbulb::roster::Entry;
 use serde_json::{json, Value};
 
 mod common;
@@ -232,67 +232,6 @@ async fn presence_naming_another_prefix_is_dropped() {
     let text = out(&o);
     assert!(text.contains("]0;pwnedred[31mtxt"), "{text}");
     assert!(!text.contains(['\u{1b}', '\u{7}', '\u{202e}']), "{text:?}");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn kept_name_is_refused_on_the_persons_other_computer() {
-    // The same person on two computers: A signed in as `user_p`, and B's admit names that
-    // person with B's own proof.
-    let (a, b) = (Env::new(), Env::new());
-    let (ia, ib) = (a.identity(), b.identity());
-    let g = net_ops::genesis(&ia, "prasiddha", "mac", "acme", 1);
-    let proof = |k: &str| {
-        common::issuer::computer_proof(
-            k,
-            "user_p",
-            "Prasiddha",
-            None,
-            lightbulb::daemon::ipc::now() as i64,
-        )
-    };
-    let merge = Entry::signed(
-        &ia,
-        vec![g.hash()],
-        Kind::Merge,
-        json!({"member": ia.key, "person_id": "user_p", "proof": proof(&ia.key)}),
-        2,
-    );
-    let admit = Entry::signed(
-        &ia,
-        vec![merge.hash()],
-        Kind::Admit,
-        json!({"member": ib.key, "name": "prasiddha-mbp", "computer": "mbp", "person_id": "user_p",
-               "kind": "computer", "role": "member", "proof": proof(&ib.key)}),
-        3,
-    );
-    for env in [&a, &b] {
-        let store = env.store();
-        for e in [&g, &merge, &admit] {
-            roster::accept(&store, e, 10).unwrap();
-        }
-    }
-    start_pair(&a, &b, "", &[]);
-
-    // A ends a session and listens on a name: both are kept for a day.
-    assert_eq!(register(&a, "codex", "c1", "/tmp/k")["ok"], true);
-    let r = a.ask(json!({"id": 1, "op": "end", "key": format!("{}/codex:c1", ia.short)}));
-    assert_eq!(r["ended"], true, "{r}");
-    let r = a.ask(json!({"id": 1, "op": "inbox", "key": format!("{}/desk", ia.short)}));
-    assert_eq!(r["ok"], true, "{r}");
-
-    // A later session as a fence: once B lists it, B holds the presence that keeps both.
-    assert_eq!(register(&a, "codex", "fence", "/tmp/k")["ok"], true);
-    let fence = format!("{}/codex:fence", ia.short);
-    until(10, "B has A's latest presence", || sees(&b, &fence));
-    let r = register(&b, "codex", "c1", "/tmp/k");
-    assert_eq!(r["error"], "name_taken", "{r}");
-    let r = b.ask(json!({"id": 1, "op": "inbox", "key": format!("{}/desk", ib.short)}));
-    assert_eq!(r["error"], "name_taken", "{r}");
-    // Names A does not keep stay free, and A may use its own again.
-    assert_eq!(register(&b, "codex", "c2", "/tmp/k")["ok"], true);
-    let r = b.ask(json!({"id": 1, "op": "inbox", "key": format!("{}/lab", ib.short)}));
-    assert_eq!(r["ok"], true, "{r}");
-    assert_eq!(register(&a, "codex", "c1", "/tmp/k")["ok"], true);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

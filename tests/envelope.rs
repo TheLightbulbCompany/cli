@@ -23,38 +23,14 @@ fn wait_state(e: &Env, from: &str, rid: &str, want: &str) {
     });
 }
 
-/// `who` admitted into `e`'s stored team as "carol" (computer "cmac"), a computer or (with
-/// `cloud`) a cloud member of workspace `ws:<key>` with its workspace proof, signed by the founder
-/// `founder`; `e` already allows carol's mail (`people` or `cloud_of` accept).
-fn admit(e: &Env, founder: &Identity, parent: &Entry, who: &Identity, cloud: bool) -> Entry {
-    let mut extra = json!({"computer": "cmac"});
-    if cloud {
-        extra["kind"] = json!("cloud");
-        let proof = common::issuer::workspace_proof(
-            &who.key,
-            &who.key,
-            "carol",
-            &[],
-            lightbulb::daemon::ipc::now() as i64,
-        );
-        extra["proof"] = json!(proof);
-        extra["person_id"] = json!(format!("ws:{}", who.key));
-    }
-    let entry = common::admit(founder, parent, who, "carol", extra);
+/// `who` admitted into `e`'s stored team as "carol" (computer "cmac"), signed by the founder
+/// `founder`; `e` already allows carol's mail (`people` accept).
+fn admit(e: &Env, founder: &Identity, parent: &Entry, who: &Identity) -> Entry {
+    let entry = common::admit(founder, parent, who, "carol", json!({"computer": "cmac"}));
     let store = e.store();
     assert!(roster::accept(&store, &entry, 10).unwrap());
-    let r = roster::replay(&roster::entries(&store).unwrap());
     let accept = policy::Verdict::Accept;
-    policy::set(
-        &store,
-        &r,
-        &e.identity().key,
-        &r.members[&who.key],
-        accept,
-        "local",
-        1,
-    )
-    .unwrap();
+    policy::set_person(&store, &who.key, accept, "local", 1).unwrap();
     entry
 }
 
@@ -460,45 +436,31 @@ async fn envelope_from_another_members_prefix_is_dropped() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn cloud_envelope_from_an_unadvertised_session_is_refused() {
+async fn a_named_session_of_any_member_is_delivered_and_its_loop_limit_is_the_members() {
     let (a, b) = (Env::new(), Env::new());
     let [_, admitted] = seed_pair(&a, &b);
     let c = identity();
-    admit(&a, &a.identity(), &admitted, &c, true);
+    admit(&a, &a.identity(), &admitted, &c);
     a.daemon(false, "", &[]);
     let ep = endpoint(&c).await;
     let mut p = Peer::dial(&ep, &a).await;
     p.hello(vec![]).await;
     let (friday, atlas) = (format!("{}/friday", c.short), format!("{}/atlas", c.short));
-    p.send(&Frame::Presence {
-        member: c.key.clone(),
-        seq: now_ms(),
-        sessions: vec![],
-        known: vec![friday.clone(), atlas.clone()],
-        kept: vec![],
-    })
-    .await;
     let to = session(&a, "a1");
     let id = ulid();
-    p.send(&envelope(&id, "r1", &format!("{friday}-2"), &to, "hi"))
-        .await;
-    assert_eq!(p.ack(&id).await, ("refused".into(), Some("policy".into())));
-    let id = ulid();
-    p.send(&envelope(&id, "r2", &friday, &to, "hi")).await;
+    p.send(&envelope(&id, "r0", &friday, &to, "hi")).await;
     assert_eq!(p.ack(&id).await.0, "stored");
     assert_eq!(a.take_one(&to)["from"], friday.as_str());
-    // A cloud member's principal is the sending session: friday's 13th in ten minutes is a
-    // loop, atlas still gets through.
-    for i in 1..13 {
+    // One member is one principal: its 13th send in ten minutes is a loop, whichever session.
+    for i in 1..12 {
         let id = ulid();
         p.send(&envelope(&id, &format!("f{i}"), &friday, &to, "x"))
             .await;
-        let want = if i < 12 { "stored" } else { "refused" };
-        assert_eq!(p.ack(&id).await.0, want, "send {i}");
+        assert_eq!(p.ack(&id).await.0, "stored", "send {i}");
     }
     let id = ulid();
     p.send(&envelope(&id, "a1", &atlas, &to, "x")).await;
-    assert_eq!(p.ack(&id).await.0, "stored");
+    assert_eq!(p.ack(&id).await.0, "refused");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -506,7 +468,7 @@ async fn ack_from_a_third_member_is_ignored() {
     let (a, b) = (Env::new(), Env::new());
     let [_, admitted] = seed_pair(&a, &b);
     let c = identity();
-    admit(&a, &a.identity(), &admitted, &c, false);
+    admit(&a, &a.identity(), &admitted, &c);
     a.daemon(false, "", &[]);
     let (ep_b, ep_c) = (endpoint(&b.identity()).await, endpoint(&c).await);
     let mut pb = Peer::dial(&ep_b, &a).await;
@@ -533,8 +495,8 @@ async fn fourth_hop_and_thirteenth_send_are_refused_loop() {
     let (a, b) = (Env::new(), Env::new());
     let [_, admitted] = seed_pair(&a, &b);
     let c = identity();
-    admit(&a, &a.identity(), &admitted, &c, false);
-    admit(&b, &a.identity(), &admitted, &c, false);
+    admit(&a, &a.identity(), &admitted, &c);
+    admit(&b, &a.identity(), &admitted, &c);
     common::start_pair(&a, &b, "", &[]);
 
     // With reply_to: hops 0, 1, 2, 3 go; the fourth agent reply is refused.

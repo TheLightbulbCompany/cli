@@ -1,5 +1,5 @@
 //! Streams: a viewer watching a session's live bytes over its own QUIC stream, on a signed
-//! `share_grant` (or as the same person's computer). Real daemons; the forged grants come from
+//! `share_grant`. Real daemons; the forged grants come from
 //! a member the test plays (`Peer`).
 
 use iroh::endpoint::{RecvStream, SendStream};
@@ -18,8 +18,8 @@ use std::time::{Duration, Instant};
 
 mod common;
 
-use common::{admit, endpoint, identity, now_s as now, pair, peers, person, person_proof, session};
-use common::{start_pair, ulid, until, ws_proof, Env, Peer};
+use common::{admit, endpoint, identity, now_s as now, pair, peers, person, session};
+use common::{ulid, until, Env, Peer};
 
 /// The session every test streams: `c1` on `e`.
 fn c1(e: &Env) -> String {
@@ -116,53 +116,6 @@ fn seed(envs: &[&Env], entries: &[Entry]) {
             assert!(roster::accept(&store, x, 10).unwrap());
         }
     }
-}
-
-/// A and B, two computers of the same person (B's admit carries A's `person_id`).
-fn same_person() -> (Env, Env) {
-    let (a, b) = (Env::new(), Env::new());
-    let (ia, ib) = (a.identity(), b.identity());
-    let g = net_ops::genesis(&ia, "prasiddha", "mac", "acme", 1);
-    let ab = admit(
-        &ia,
-        &g,
-        &ib,
-        "mbp",
-        json!({"person_id": ia.key, "proof": person_proof(&ib, &ia.key, "prasiddha", None)}),
-    );
-    seed(&[&a, &b], &[g, ab]);
-    start_pair(&a, &b, "", &[]);
-    (a, b)
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn same_person_opens_without_grant() {
-    let (a, b) = same_person();
-    let (sa, sb) = (Sub::new(&a), Sub::new(&b));
-    let viewer_id = open(&b, &c1(&a));
-    let opened = sa.next("stream_opened");
-    assert_eq!(opened["viewer"], b.identity().key);
-    let owner_id = opened["stream_id"].as_str().unwrap();
-    assert_eq!(send(&a, owner_id, b"hello")["ok"], true);
-    let got = sb.next("stream");
-    assert_eq!(
-        (got["stream_id"].as_str(), got["seq"].as_u64()),
-        (Some(viewer_id.as_str()), Some(1))
-    );
-    assert_eq!(got["data_b64"], b64(b"hello"));
-    // Closing is seen on both ends.
-    assert_eq!(
-        a.ask(json!({"id": 1, "op": "stream.close", "stream_id": owner_id}))["ok"],
-        true
-    );
-    assert_eq!(sb.next("stream_closed")["stream_id"], viewer_id);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn teammate_without_grant_gets_no_grant() {
-    let (a, b) = pair(&[]);
-    let r = b.ask(json!({"id": 1, "op": "stream.open", "session": c1(&a)}));
-    assert_eq!(r["error"], "no_grant", "{r}");
 }
 
 /// A team whose founder runs no daemon, admitting `members` in order (each `extra` over a
@@ -358,6 +311,9 @@ async fn granted_viewer_receives_bytes_in_order_until_expiry() {
 async fn viewer_bytes_never_reach_the_owner() {
     let (a, b) = pair(&[]);
     let sa = Sub::new(&a);
+    // No viewer types into a session.
+    let r = grant(&a, &c1(&a), &b.identity().key, true, now() + 600);
+    assert_eq!(r["error"], "unsupported", "{r}");
     let r = grant(&a, &c1(&a), &b.identity().key, false, now() + 600);
     assert_eq!(r["ok"], true, "{r}");
     let viewer_id = open(&b, &c1(&a));
@@ -370,57 +326,11 @@ async fn viewer_bytes_never_reach_the_owner() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn own_bridge_input_grant_delivers_viewer_frames() {
-    // F founds; A (the owner, workspace "test") and C (the workspace's cloud member) join.
-    let (f, a, c) = (Env::new(), Env::new(), Env::new());
-    let (i_f, ia, ic) = (f.identity(), a.identity(), c.identity());
-    let g = net_ops::genesis(&i_f, "founder", "fmac", "acme", 1);
-    let fa = admit(&i_f, &g, &ia, "prasiddha", owner(&ia));
-    let fc = admit(
-        &i_f,
-        &fa,
-        &ic,
-        "bridge",
-        json!({"kind": "cloud", "person_id": "ws:test", "proof": ws_proof(&ic, "test", "test")}),
-    );
-    // Another workspace's cloud member (no daemon).
-    let other = identity();
-    let fo = admit(
-        &i_f,
-        &fc,
-        &other,
-        "elsewhere",
-        json!({"kind": "cloud", "person_id": "ws:other",
-            "proof": ws_proof(&other, "other", "other")}),
-    );
-    seed(&[&f, &a, &c], &[g, fa, fc, fo]);
-    f.daemon(false, "", &[]);
-    c.daemon(false, "", &[]);
-    a.daemon(false, "", &[peers(&[&f, &c])]);
-    until(10, "A sees both", || a.status()["peers"]["online"] == 2);
-
-    let sa = Sub::new(&a);
-    for viewer in [&i_f.key, &other.key] {
-        let r = grant(&a, &c1(&a), viewer, true, now() + 600);
-        assert_eq!(r["error"], "unsupported", "{r}");
-    }
-    let r = grant(&a, &c1(&a), &ic.key, true, now() + 600);
-    assert_eq!(r["ok"], true, "{r}");
-    let viewer_id = open(&c, &c1(&a));
-    let owner_id = sa.next("stream_opened")["stream_id"].clone();
-    assert_eq!(send(&c, &viewer_id, b"ls\n")["ok"], true);
-    let got = sa.next("stream_input");
-    assert_eq!(got["stream_id"], owner_id);
-    assert_eq!(got["seq"], 1);
-    assert_eq!(got["data_b64"], b64(b"ls\n"));
-    // Input frames are at most 4 KB.
-    assert_eq!(send(&c, &viewer_id, &[b'x'; 4097])["error"], "bad_request");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn chunk_over_64k_is_bad_request() {
-    let (a, b) = same_person();
+    let (a, b) = pair(&[]);
     let sa = Sub::new(&a);
+    let r = grant(&a, &c1(&a), &b.identity().key, false, now() + 600);
+    assert_eq!(r["ok"], true, "{r}");
     open(&b, &c1(&a));
     let owner_id: String = sa.next("stream_opened")["stream_id"]
         .as_str()
@@ -451,19 +361,14 @@ async fn raw_open(
     }
 }
 
-/// The owner A's admit fields: person `user_a`, signed into workspace "test".
-fn owner(ia: &Identity) -> Value {
-    json!({"person_id": "user_a", "proof": person_proof(ia, "user_a", "prasiddha", Some("test"))})
-}
-
-/// A (the owner, a daemon, workspace "test") and M (played, connected to A), M admitted with
+/// A (the owner, a daemon) and M (played, connected to A), M admitted with
 /// `m_extra(M)` over a computer member's fields.
 async fn owner_and(m_extra: impl FnOnce(&Identity) -> Value) -> (Env, Identity, (Endpoint, Peer)) {
     let (a, m) = (Env::new(), identity());
     let ia = a.identity();
     team(
         &[&a],
-        &[(&ia, "prasiddha", owner(&ia)), (&m, "mal", m_extra(&m))],
+        &[(&ia, "prasiddha", json!({})), (&m, "mal", m_extra(&m))],
     );
     a.daemon(false, "", &[]);
     let j = join(&m, &a).await;
@@ -500,88 +405,14 @@ async fn owner_refuses_another_viewers_grant() {
     assert!(!sa.any("stream_opened", 300));
 }
 
-/// A cloud member never carries a computer's person: its proof's `sub` is `ws:<id>`
-/// (`proof::parse`), so an admit claiming the owner's is dropped and never opens a stream.
-#[test]
-fn owner_refuses_a_cloud_member_with_my_person_id() {
-    let (a, m) = (Env::new(), identity());
-    let ia = a.identity();
-    let claim = json!({"kind": "cloud", "person_id": "user_a", "proof": ws_proof(&m, "test", "t")});
-    team(&[&a], &[(&ia, "prasiddha", owner(&ia)), (&m, "mal", claim)]);
-    let r = roster::replay(&roster::entries(&a.store()).unwrap());
-    assert!(r.members.contains_key(&ia.key));
-    assert!(!r.members.contains_key(&m.key));
-}
-
-/// A and its workspace member M (played), M's input grant ending in `secs`, M's stream open:
-/// A, M's connection, the stream, A's events, the grant's end.
-async fn input_stream(secs: i64) -> (Env, (Endpoint, Peer), SendStream, RecvStream, Sub, i64) {
-    let (a, m, j) = owner_and(
-        |m| json!({"kind": "cloud", "person_id": "ws:test", "proof": ws_proof(m, "test", "t")}),
-    )
-    .await;
-    let end = now() + secs;
-    let r = grant(&a, &c1(&a), &m.key, true, end);
-    assert_eq!(r["ok"], true, "{r}");
-    let sa = Sub::new(&a);
-    let grant_id = r["grant_id"].as_str().unwrap();
-    let (s, rv) = raw_open(&j.1, grant_id, &c1(&a)).await.unwrap();
-    sa.next("stream_opened");
-    (a, j, s, rv, sa, end)
-}
-
-fn input(a: &Env, seq: u32, n: usize) -> Frame {
-    Frame::Stream {
-        grant_id: String::new(),
-        session: c1(a),
-        seq,
-        bytes: b64(&vec![b'x'; n]),
-    }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn owner_caps_input_at_4k_and_counts_other_frames() {
-    let (a, _j, mut s, _r, sa, _) = input_stream(600).await;
-    frames::write(&mut s, &input(&a, 1, 4097)).await.unwrap();
-    let hello = Frame::Hello {
-        protocol: 1,
-        heads: vec![],
-        addrs: vec![],
-    };
-    frames::write(&mut s, &hello).await.unwrap();
-    frames::write(&mut s, &input(&a, 3, 4096)).await.unwrap();
-    let got = sa.next("stream_input");
-    assert_eq!(got["seq"], 3);
-    assert_eq!(got["data_b64"], b64(&[b'x'; 4096]));
-    assert_eq!(dropped(&a, "input"), 2);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn expired_input_grant_never_raises_input() {
-    let (a, _j, mut s, _r, sa, end) = input_stream(3).await;
-    std::thread::sleep(Duration::from_secs((end - now() + 1).max(0) as u64));
-    // The owner closed the stream at the grant's end, so this write may be refused.
-    let _ = frames::write(&mut s, &input(&a, 1, 2)).await;
-    loop {
-        let v =
-            sa.0.recv_timeout(Duration::from_secs(10))
-                .expect("an event");
-        assert_ne!(v["event"], "stream_input", "{v}");
-        if v["event"] == "stream_closed" {
-            break;
-        }
-    }
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn close_unblocks_a_send_waiting_on_flow_control() {
-    // M is the owner's own computer (no grant needed) and never reads its stream.
-    let (a, _m, (_ep, peer)) = owner_and(|m| {
-        json!({"person_id": "user_a", "proof": person_proof(m, "user_a", "prasiddha", Some("test"))})
-    })
-    .await;
+    // M holds a grant and never reads its stream.
+    let (a, m, (_ep, peer)) = owner_and(|_| json!({})).await;
+    let r = grant(&a, &c1(&a), &m.key, false, now() + 600);
+    let grant_id = r["grant_id"].as_str().unwrap();
     let sa = Sub::new(&a);
-    let (_s, _r) = raw_open(&peer, "", &c1(&a)).await.unwrap();
+    let (_s, _r) = raw_open(&peer, grant_id, &c1(&a)).await.unwrap();
     let owner_id: String = sa.next("stream_opened")["stream_id"]
         .as_str()
         .unwrap()
@@ -619,52 +450,4 @@ async fn close_unblocks_a_send_waiting_on_flow_control() {
         .recv_timeout(Duration::from_secs(5))
         .expect("the blocked send returns");
     assert_eq!(blocked["ok"], false, "{blocked}");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn no_input_at_or_after_the_grants_end() {
-    let (a, _j, mut s, _r, sa, end) = input_stream(2).await;
-    // Each frame carries its send time (Unix ms); one every 50 ms until a second past the end.
-    let mut seq = 1;
-    while now_ms() < end as u64 * 1000 + 1000 {
-        let f = Frame::Stream {
-            grant_id: String::new(),
-            session: c1(&a),
-            seq,
-            bytes: b64(now_ms().to_string().as_bytes()),
-        };
-        if frames::write(&mut s, &f).await.is_err() {
-            break; // closed at the end
-        }
-        seq += 1;
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    let mut last = 0;
-    loop {
-        let v =
-            sa.0.recv_timeout(Duration::from_secs(10))
-                .expect("an event");
-        if v["event"] == "stream_input" {
-            let sent = data_encoding::BASE64
-                .decode(v["data_b64"].as_str().unwrap().as_bytes())
-                .unwrap();
-            last = String::from_utf8(sent).unwrap().parse().unwrap();
-        }
-        if v["event"] == "stream_closed" {
-            break;
-        }
-    }
-    assert!(last > 0, "some input before the end");
-    assert!(
-        last < end as u64 * 1000,
-        "input sent at {last}, the grant ended at {end}"
-    );
-}
-
-/// Unix milliseconds.
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64
 }

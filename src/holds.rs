@@ -10,7 +10,7 @@ use crate::frame::{agent_name, defang, Sender};
 use crate::identity::Identity;
 use crate::mail::{self, Origin, Prepared, State};
 use crate::policy::{self, Policy, Verdict};
-use crate::roster::{Member, MemberKind, Roster};
+use crate::roster::{Member, Roster};
 use crate::sessions::{self, Key};
 use crate::store::{row_message, Message, Store};
 use crate::{dialog, label, Result};
@@ -19,15 +19,12 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
-/// What an answer covers: this message, every message from its person (`people`), my own
-/// workspace's member (`agents_send_without_asking`), or another workspace (`cloud_of`).
+/// What an answer covers: this message, or every message from its sender (`people`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Scope {
     Once,
     Person,
-    OwnCloud,
-    CloudOf,
 }
 
 impl Scope {
@@ -35,8 +32,6 @@ impl Scope {
         match self {
             Scope::Once => "once",
             Scope::Person => "person",
-            Scope::OwnCloud => "own_cloud",
-            Scope::CloudOf => "cloud_of",
         }
     }
 }
@@ -219,8 +214,7 @@ fn agent(session: &str) -> String {
     }
 }
 
-/// `h`'s dialog: its text, its buttons (`Always allow` only for a cloud sender) and the
-/// sender's label in it.
+/// `h`'s dialog: its text, its buttons and the sender's label in it.
 pub fn dialog(
     store: &Store,
     roster: &Roster,
@@ -244,11 +238,7 @@ pub fn dialog(
             .map_or(String::new(), |f| format!(" in {f}"));
         message_text(&who, &h.target_session, &agent, &folder, &quote)
     };
-    let mut buttons = vec!["Decline", "Allow"];
-    if always_scope(roster, me, h).is_some() {
-        buttons.push("Always allow");
-    }
-    Ok((text, buttons, who))
+    Ok((text, vec!["Decline", "Allow"], who))
 }
 
 /// A held message's dialog words: `who` wants to message the session (`agent`, in `folder`)
@@ -263,26 +253,13 @@ fn message_text(who: &str, target: &str, agent: &str, folder: &str, quote: &str)
     }
 }
 
-/// What "Always allow" means for `h`'s sender: `OwnCloud` for my workspace's member, `CloudOf`
-/// for another cloud member, nothing for a computer (or a permission hold).
-pub fn always_scope(roster: &Roster, me: &str, h: &Hold) -> Option<Scope> {
-    let from = roster.members.get(&h.from_member)?;
-    if h.kind() != Kind::Message || from.kind != MemberKind::Cloud {
-        return None;
-    }
-    Some(if policy::my_workspace(roster, me, &from.key, None) {
-        Scope::OwnCloud
-    } else {
-        Scope::CloudOf
-    })
-}
-
-/// What a plain Allow means: the sender's person for a computer member, this message for a
-/// cloud member (and a permission prompt).
+/// What a plain Allow means: the sender for a member's message, this one for a permission
+/// prompt (or a sender no longer a member).
 pub fn allow_scope(roster: &Roster, h: &Hold) -> Scope {
-    match roster.members.get(&h.from_member) {
-        Some(m) if h.kind() == Kind::Message && m.kind == MemberKind::Computer => Scope::Person,
-        _ => Scope::Once,
+    if h.kind() == Kind::Message && roster.members.contains_key(&h.from_member) {
+        Scope::Person
+    } else {
+        Scope::Once
     }
 }
 
@@ -306,9 +283,8 @@ impl Closed {
 
 /// The person's answer to hold `id` (`by` `local` or `bridge`): `Err(not_found)`,
 /// `Err(not_open)` once answered or expired, `Err(bad_request)` for a scope that does not fit
-/// the sender. `scope` is a `Scope` word, `always` (`always_scope`), or none (`allow_scope`);
-/// `OwnCloud` fits only my workspace's member, `CloudOf` only another cloud member, `Person`
-/// only a message. Allow puts the message in its recipient's mailbox (`stored`) and, past
+/// the sender. `scope` is a `Scope` word, or none or `always` (the bridge's word for the same,
+/// `allow_scope`); `Person` fits only a member's message. Allow puts the message in its recipient's mailbox (`stored`) and, past
 /// `Once`, allows its sender (`policy::set`); decline makes it `refused declined`. Either way
 /// a signed `approvals` record keeps the text the dialog showed.
 #[allow(clippy::too_many_arguments)]
@@ -329,34 +305,24 @@ pub fn answer(
     if !h.is_open() {
         return Ok(Err(NOT_OPEN));
     }
-    let always = always_scope(roster, &me.key, &h);
     let from = roster.members.get(&h.from_member);
     let scope = match scope {
-        None => allow_scope(roster, &h),
-        Some("always") => match always {
-            Some(s) => s,
-            None => return Ok(Err(BAD_REQUEST)),
-        },
-        Some(word) => match [Scope::Once, Scope::Person, Scope::OwnCloud, Scope::CloudOf]
-            .into_iter()
-            .find(|s| s.as_str() == word)
-        {
-            Some(Scope::Once) => Scope::Once,
-            Some(Scope::Person) if h.kind() == Kind::Message && from.is_some() => Scope::Person,
-            Some(s) if always == Some(s) => s,
-            _ => return Ok(Err(BAD_REQUEST)),
-        },
+        None | Some("always") => allow_scope(roster, &h),
+        Some("once") => Scope::Once,
+        Some("person") if h.kind() == Kind::Message && from.is_some() => Scope::Person,
+        _ => return Ok(Err(BAD_REQUEST)),
     };
     // The text the person saw; one never shown (no dialog yet) is what it would show now.
     let shown = match &h.shown {
         Some(t) => t.clone(),
         None => dialog(store, roster, &me.key, &h)?.0,
     };
-    // A workspace's member gate (`mail::receive`) binds a hold filed before it changed: its
-    // sender, no longer a member, is refused, never delivered.
+    // An instance's members gate (`mail::receive`) binds a hold filed before it changed: its
+    // sender, no computer of a member, is refused, never delivered.
+    let person = store.person(&h.from_member)?;
     let gated = allow
         && h.kind() == Kind::Message
-        && members.is_some_and(|m| !from.is_some_and(|f| m.contains(&f.person_id)));
+        && members.is_some_and(|m| !person.is_some_and(|p| m.contains(&p)));
     let allow = allow && !gated;
     let c = Closed {
         hold: h,
@@ -386,7 +352,7 @@ pub fn answer(
                 at,
             )?;
             if let (Some(f), false) = (from, scope == Scope::Once) {
-                policy::set(store, roster, &me.key, f, Verdict::Accept, by, now)?;
+                policy::set(store, f, Verdict::Accept, by, now)?;
             }
         } else {
             mail::advance(
@@ -562,10 +528,9 @@ pub fn expire_here(d: &Daemon, store: &Store, now: i64) -> Result<()> {
     Ok(())
 }
 
-/// Dialog `H<n>` answered `button`: `Decline`, `Allow` or `Always allow`.
+/// Dialog `H<n>` answered `button`: `Decline` or `Allow`.
 pub fn on_dialog(d: &Arc<Daemon>, n: i64, button: &str) {
-    let always = (button == "Always allow").then_some("always");
-    if let Err(e) = answer_here(d, n, button != "Decline", always, "local", "dialog") {
+    if let Err(e) = answer_here(d, n, button != "Decline", None, "local", "dialog") {
         eprintln!("hold H{n}: {e}");
     }
 }
@@ -632,7 +597,7 @@ fn run(
             Response::ok(id, json!({ "holds": list }))
         }
         // `hold.get {hold}` -> the hold with its `body`, `state`, `target_birth_micros`, and the
-        // scopes its Allow and Always allow mean (`allow`, `always`, null when none).
+        // scope its Allow means (`allow`).
         "hold.get" => {
             let team = d.team.lock().unwrap();
             let store = d.store.lock().unwrap();
@@ -648,8 +613,7 @@ fn run(
                 json!({"id": h.name(), "kind": h.kind(), "target_session": h.target_session,
                     "from": h.from_session, "label": label::render(r, me, &h.from_session),
                     "body": h.message.body, "state": h.state, "created_at": h.created_at,
-                    "target_birth_micros": birth, "allow": allow_scope(r, &h),
-                    "always": always_scope(r, me, &h)}),
+                    "target_birth_micros": birth, "allow": allow_scope(r, &h)}),
             )
         }
         // `hold.answer {hold, verdict: allow|decline, scope?}` -> `{id, verdict, scope}`;
@@ -711,16 +675,13 @@ fn run(
             Response::ok(id, json!({ "hold": h.name() }))
         }
         "policy.get" => Response::ok(id, json!(Policy::load(&d.store.lock().unwrap())?)),
-        // `policy.set {person_id, value: accept|hold|refuse}` or `{agents_send_without_asking}`
-        // -> the policy. A member's person goes where its kind reads (`policy::set`); a person
-        // no member is, in `people`.
+        // `policy.set {person_id, value: accept|hold|refuse|forget}` -> the policy; a member's
+        // person only (`forget` takes any id).
         "policy.set" => {
             let team = d.team.lock().unwrap();
             let store = d.store.lock().unwrap();
             let now = ipc::now() as i64;
-            if let Some(on) = body["agents_send_without_asking"].as_bool() {
-                policy::set_switch(&store, on, "local", now)?;
-            } else if body["value"] == "forget" {
+            if body["value"] == "forget" {
                 let Some(pid) = body["person_id"].as_str() else {
                     return Ok(Response::err(id, BAD_REQUEST));
                 };
@@ -736,10 +697,7 @@ fn run(
                     return Ok(Response::err(id, "own_person"));
                 }
                 match r.members.values().find(|m| m.person_id == pid) {
-                    Some(m) => policy::set(&store, r, me, m, v, "local", now)?,
-                    None if pid.starts_with("ws:") => {
-                        policy::set_person(&store, pid, v, "local", now)?
-                    }
+                    Some(m) => policy::set(&store, m, v, "local", now)?,
                     // Nobody `decide` would look up: stored, it would be inert.
                     None => return Ok(Response::err(id, NOT_FOUND)),
                 }

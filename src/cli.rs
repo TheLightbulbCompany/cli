@@ -70,7 +70,6 @@ fn refusal(r: &Value) -> String {
     match code.unwrap_or("failed") {
         "not_member" => "This computer is not in the network.".into(),
         "not_a_person" => "Run this from your own terminal, not from an agent.".into(),
-        "name_taken" => "That name is taken by your other computer's session.".into(),
         c => format!("Lightbulb could not do that ({}).", c.replace('_', " ")),
     }
 }
@@ -568,9 +567,8 @@ pub fn invite(mode: Invite) -> Result<i32> {
 }
 
 /// `join '<ticket>' [--name <n>]`: joins the network the join line `link` is for, waiting up to 600 s
-/// for its person to allow it. Hidden: `--kind cloud --proof <jws>`, a workspace member (the
-/// bridge joins in process; this is for tests and ops).
-pub fn join(link: &str, name: Option<String>, kind: &str, proof: Option<String>) -> Result<i32> {
+/// for its person to allow it.
+pub fn join(link: &str, name: Option<String>) -> Result<i32> {
     // Which form the person was given; usage counts read it.
     let (code, _via) = match crate::code::normalize(link) {
         Some(c) => (Some(c), Via::Code),
@@ -599,8 +597,8 @@ pub fn join(link: &str, name: Option<String>, kind: &str, proof: Option<String>)
     }
     conn.wait_up_to(Duration::from_secs(660))?;
     let body = match &code {
-        Some(c) => json!({"code": c, "name": name, "kind": kind, "proof": proof}),
-        None => json!({"ticket": link, "name": name, "kind": kind, "proof": proof}),
+        Some(c) => json!({"code": c, "name": name}),
+        None => json!({"ticket": link, "name": name}),
     };
     let r = ask(&mut conn, "team.join", body)?;
     let team = r["team"].as_str().unwrap_or_default();
@@ -635,7 +633,6 @@ pub fn join(link: &str, name: Option<String>, kind: &str, proof: Option<String>)
         (_, Some(admission::UNREACHABLE)) => "No one from this network is online right now. Ask them to open their laptop, then run the same command again. Your key is ready; nothing was lost.".to_string(),
         (_, Some(admission::DECLINED)) => "Your request to join was declined.".to_string(),
         (_, Some(admission::BAD_NAME)) => "That name has characters Lightbulb cannot show. Use letters, numbers, spaces and punctuation.".to_string(),
-        (_, Some(admission::YOUR_COMPUTER_OFFLINE)) => "Open your other computer, then run the same command again.".to_string(),
         (_, Some(admission::BAD_TICKET)) => "This invite link does not work. Ask for a new one.".to_string(),
         (_, Some(admission::EXPIRED_TICKET)) => "This invite link has expired. Ask for a new one.".to_string(),
         (_, reason) => format!(
@@ -653,14 +650,12 @@ pub fn signin() -> Result<i32> {
     Ok(2)
 }
 
-/// `approve <id> [--always]` / `decline <id>`: answers join request `J<n>` or held message
-/// `H<n>`. `--always` (a held message from a cloud member) covers the sender's workspace.
-pub fn answer(request: &str, allow: bool, always: bool) -> Result<i32> {
+/// `approve <id>` / `decline <id>`: answers join request `J<n>` or held message `H<n>`.
+pub fn answer(request: &str, allow: bool) -> Result<i32> {
     let held = request.starts_with('H');
     let verdict = if allow { "allow" } else { "decline" };
     let (op, body, what, gone) = if held {
-        let scope = always.then_some("always");
-        let body = json!({"hold": request, "verdict": verdict, "scope": scope});
+        let body = json!({"hold": request, "verdict": verdict});
         (
             "hold.answer",
             body,
@@ -673,7 +668,6 @@ pub fn answer(request: &str, allow: bool, always: bool) -> Result<i32> {
     };
     let r = connect()?.call(op, body)?;
     if r["ok"] != true {
-        let always_text = "--always is only for messages from a cloud member's agents.";
         let texts = [
             (
                 admission::NOT_OPEN,
@@ -685,10 +679,8 @@ pub fn answer(request: &str, allow: bool, always: bool) -> Result<i32> {
                 },
             ),
             (ipc::NOT_FOUND, format!("No {what} {request}.")),
-            (ipc::BAD_REQUEST, always_text.into()),
         ];
-        let texts = &texts[..if held { 3 } else { 2 }];
-        return refuse(&r, texts);
+        return refuse(&r, &texts);
     }
     if held {
         println!("{} {request}.", if allow { "Allowed" } else { "Declined" });
@@ -747,7 +739,7 @@ pub fn held() -> Result<i32> {
 }
 
 /// `policy [<person> accept|hold|refuse]`: lists the policy (rows the bridge set marked so),
-/// or sets `<person>` (a `ws:<id>` workspace in `cloud_of`, anyone else in `people`).
+/// or sets `<person>`.
 pub fn policy(person: Option<String>, value: Option<String>) -> Result<i32> {
     if value
         .as_deref()
@@ -780,15 +772,12 @@ pub fn policy(person: Option<String>, value: Option<String>) -> Result<i32> {
         (None, None) => ask(&mut conn, "policy.get", json!({}))?,
         _ => {
             let cmd = command();
-            eprintln!("Usage: {cmd} policy [<person> accept|hold|refuse]\n  <person> is a teammate's name or short (as {cmd} team lists it), or ws:<id> for a workspace's agents.\n  Example: {cmd} policy aden hold");
+            eprintln!("Usage: {cmd} policy [<person> accept|hold|refuse]\n  <person> is a teammate's name or short (as {cmd} team lists it).\n  Example: {cmd} policy aden hold");
             return Ok(2);
         }
     };
-    const SCOPES: [&str; 2] = ["people", "cloud_of"];
     // The members' names only when some row needs them.
-    let rows = SCOPES
-        .iter()
-        .any(|s| p[*s].as_object().is_some_and(|o| !o.is_empty()));
+    let rows = p["people"].as_object().is_some_and(|o| !o.is_empty());
     let (members, mine) = match team {
         Some(t) => t,
         None if rows => team_members(&mut conn)?,
@@ -797,54 +786,43 @@ pub fn policy(person: Option<String>, value: Option<String>) -> Result<i32> {
     let member = |pid: &str| members.iter().find(|m| m["person_id"] == pid);
     let name =
         |pid: &str| member(pid).and_then(|m| Some((m["name"].as_str()?, m["short"].as_str()?)));
-    // `aden (qxcrztez36jw)`; a person no member is (a workspace) as stored.
+    // `aden (qxcrztez36jw)`; a person no member is as stored.
     let name_of = |pid: &str| match name(pid) {
         Some((name, short)) => format!("{} ({short})", cell(name)),
         None => cell(pid),
     };
-    let by = |key: String, who: Option<&str>| match p["set_by"][&key].as_str() {
-        Some("bridge") => match who {
-            Some(pid) => {
-                let n = name(pid).map_or(pid, |(n, _)| n);
-                format!(" (Allowed {} from your phone)", cell(n))
-            }
-            None => " (allowed from your phone)".into(),
-        },
+    let by = |key: String, pid: &str| match p["set_by"][&key].as_str() {
+        Some("bridge") => {
+            let n = name(pid).map_or(pid, |(n, _)| n);
+            format!(" (Allowed {} from your phone)", cell(n))
+        }
         _ => String::new(),
     };
-    let on = if p["agents_send_without_asking"] == true {
-        "yes"
-    } else {
-        "no"
-    };
-    println!(
-        "Your workspace's agents may message your sessions without asking: {on}.{}",
-        by(crate::policy::SWITCH.into(), None)
-    );
-    for scope in SCOPES {
-        for (pid, v) in p[scope].as_object().into_iter().flatten() {
-            let v = match v.as_str() {
-                Some("accept") => "accepted",
-                Some("hold") => "held for your Allow",
-                Some("refuse") => "refused",
-                _ => "unknown",
-            };
-            let forget = format!("run: {} policy {} forget", command(), cell(pid));
-            // A row for my own person (`decide` never reads it), or a `people` row no member
-            // has (an old one, stored under a literal name).
-            let note = if mine.as_deref() == Some(pid.as_str()) {
-                format!(" (ignored: your own computers always get through — {forget})")
-            } else if scope == "people" && member(pid).is_none() {
-                format!(" (old entry — {forget})")
-            } else {
-                String::new()
-            };
-            println!(
-                "Messages from {}: {v}.{note}{}",
-                name_of(pid),
-                by(format!("{scope}:{pid}"), Some(pid))
-            );
-        }
+    if !rows {
+        println!("No one has a policy yet: a teammate's first message waits for your Allow.");
+    }
+    for (pid, v) in p["people"].as_object().into_iter().flatten() {
+        let v = match v.as_str() {
+            Some("accept") => "accepted",
+            Some("hold") => "held for your Allow",
+            Some("refuse") => "refused",
+            _ => "unknown",
+        };
+        let forget = format!("run: {} policy {} forget", command(), cell(pid));
+        // A row for my own person (`decide` never reads it), or a `people` row no member
+        // has (an old one, stored under a literal name).
+        let note = if mine.as_deref() == Some(pid.as_str()) {
+            format!(" (ignored: your own computers always get through — {forget})")
+        } else if member(pid).is_none() {
+            format!(" (old entry — {forget})")
+        } else {
+            String::new()
+        };
+        println!(
+            "Messages from {}: {v}.{note}{}",
+            name_of(pid),
+            by(format!("people:{pid}"), pid)
+        );
     }
     Ok(0)
 }
@@ -862,7 +840,7 @@ fn team_members(conn: &mut Conn) -> Result<(Vec<Value>, Option<String>)> {
 }
 
 /// The person id `policy <who>` sets: the one member whose name (any case), short, key or
-/// person id is `who`; a `ws:` id as given. Several people, or none: a sentence.
+/// person id is `who`. Several people, or none: a sentence.
 fn policy_person(members: &[Value], who: &str) -> Result<String> {
     let field = |v: &Value, k: &str| v[k].as_str().unwrap_or_default().to_string();
     let hits: Vec<&Value> = members
@@ -879,7 +857,6 @@ fn policy_person(members: &[Value], who: &str) -> Result<String> {
     people.dedup();
     match people.len() {
         1 => Ok(people.remove(0)),
-        0 if who.starts_with("ws:") => Ok(who.into()),
         0 => {
             let names: Vec<String> = members.iter().map(|v| cell(&field(v, "name"))).collect();
             Err(format!(
@@ -965,7 +942,15 @@ pub fn team() -> Result<i32> {
 pub fn remove(name: &str) -> Result<i32> {
     let r = connect()?.call("team.remove", json!({ "member": name }))?;
     if r["ok"] != true {
-        let texts = [("not_found", format!("No member called {name}."))];
+        let texts = [
+            ("not_found", format!("No member called {name}.")),
+            (
+                crate::daemon::net_ops::FOUNDER,
+                format!(
+                    "{name} started this team and cannot be removed. It can leave the team itself."
+                ),
+            ),
+        ];
         return refuse(&r, &texts);
     }
     let n = r["name"].as_str().unwrap_or(name);

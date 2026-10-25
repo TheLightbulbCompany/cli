@@ -7,7 +7,7 @@ use super::{Daemon, TeamState};
 use crate::agents::caller;
 use crate::identity::Identity;
 use crate::net::frames::Frame;
-use crate::roster::{self, Entry, Kind, MemberKind, Role, Roster};
+use crate::roster::{self, Entry, Kind, Roster};
 use crate::store::Store;
 use crate::{os, ticket};
 use serde::{Deserialize, Serialize};
@@ -17,6 +17,8 @@ use std::time::Duration;
 
 pub const NOT_ADMIN: &str = "not_admin";
 pub const NOT_MEMBER: &str = "not_member";
+/// `team.remove`'s refusal of the founder (it may leave, nobody removes it).
+pub const FOUNDER: &str = "founder";
 
 /// `team.invite`'s `mode`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,7 +66,7 @@ fn gate(op: &str) -> Gate {
 }
 
 pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, caller: Caller) -> Response {
-    // Retired: a cloud member is removed like any member.
+    // Retired: the cloud-member unlink; any member is removed with `team.remove`.
     if op == "team.unlink" {
         return Response::err(id, UNSUPPORTED);
     }
@@ -123,20 +125,14 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, caller: Caller) 
         };
     }
     match op {
-        // `identity.get {}` -> who this computer (or instance: `kind` `cloud`, named for its
-        // workspace) is: until sign-in, a computer's `person_id` is its own key and `name` the
-        // user's; an instance's is its roster member's (`ws:<id>` once admitted). `verified`
-        // while its proof is in force (`expires_at`).
+        // `identity.get {}` -> who this computer (or instance, named for its workspace) is; its
+        // `person_id` is its own key.
         "identity.get" => {
             let t = daemon.team.lock().unwrap();
             let me = &daemon.identity.key;
-            let proof = t.roster.members.get(me).and_then(|m| m.proof.as_ref());
-            let (name, kind) = match &daemon.cloud {
-                Some(c) => (c.name.clone(), "cloud"),
-                None => (
-                    proof.map_or_else(super::user_name, |p| p.name.clone()),
-                    "computer",
-                ),
+            let name = match &daemon.cloud {
+                Some(c) => c.name.clone(),
+                None => super::user_name(),
             };
             Response::ok(
                 id,
@@ -144,11 +140,8 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, caller: Caller) 
                     "member_key": me,
                     "member_key_short": daemon.identity.short,
                     "name": name,
-                    "kind": kind,
                     "computer": t.config.computer,
                     "person_id": t.roster.person_of(me),
-                    "verified": proof.is_some(),
-                    "expires_at": proof.map(|p| p.exp),
                     "solo": t.roster.is_solo(me),
                 }),
             )
@@ -157,37 +150,6 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, caller: Caller) 
         // from (`config`, `team`, `default` or `none`); the snapshot `status` reads too.
         "relay.get" => Response::ok(id, json!(*daemon.peers.relays.lock().unwrap())),
         "relay.set" => relay_set(id, body, daemon, caller),
-        // An agent fed a hostile sign-in must not move this computer into another person.
-        "identity.proof" if !caller.is_person() => refused(id, "not_a_person"),
-        // `identity.proof {proof}` -> `{name, person_id, solo}`: this computer's sign-in proof,
-        // written to the roster (`proof::record`), person-only; `bad_request` when it does not
-        // verify (reason `other_person` when it names another person than this computer's).
-        "identity.proof" => match body["proof"]
-            .as_str()
-            .map(|t| crate::proof::record(daemon, t))
-        {
-            Some(Ok(p)) => {
-                let solo = daemon
-                    .team
-                    .lock()
-                    .unwrap()
-                    .roster
-                    .is_solo(&daemon.identity.key);
-                Response::ok(
-                    id,
-                    json!({"name": p.name, "person_id": p.sub, "solo": solo}),
-                )
-            }
-            Some(Err(e)) => {
-                eprintln!("identity.proof: refused: {e}");
-                if e.to_string() == crate::proof::OTHER_PERSON {
-                    refused(id, "other_person")
-                } else {
-                    Response::err(id, BAD_REQUEST)
-                }
-            }
-            None => Response::err(id, BAD_REQUEST),
-        },
         // `ui.claim {}` -> `{lease_s}`: the Lightbulb app shows the person's questions itself;
         // no OS dialog opens until it stops heartbeating.
         "ui.claim" if !caller.is_person() => refused(id, "not_a_person"),
@@ -383,23 +345,16 @@ async fn tell(daemon: &Daemon, leave: Entry) -> bool {
 /// The genesis of a solo network: `me`, called `name`, the founder of a team `team_name`.
 pub fn genesis(me: &Identity, name: &str, computer: &str, team_name: &str, at: i64) -> Entry {
     let body = json!({"member": me.key, "name": name, "computer": computer,
-        "person_id": me.key, "kind": "computer", "role": "founder", "ticket_id": "",
-        "team_name": team_name});
+        "role": "founder", "ticket_id": "", "team_name": team_name});
     Entry::signed(me, vec![], Kind::Admit, body, at)
 }
 
-/// This engine's solo network: a computer's (`genesis`, as its person), or a workspace
-/// member's (`cloud`: the workspace's name, member and team alike). An instance founds it as a
-/// plain member of its own key (a `cloud` member needs a workspace proof, which only
-/// `team.join` brings), marked `cloud` so its `person` links vouch (`roster::pass`).
+/// This engine's solo network (`genesis`): a computer's, named for its user, or an instance's
+/// (`cloud`: the workspace's name, member and team alike).
 pub(crate) fn solo_genesis(me: &Identity, cloud: Option<&str>, computer: &str, at: i64) -> Entry {
     let user = super::user_name();
     let name = cloud.unwrap_or(&user);
-    let mut body = genesis(me, name, computer, name, at).body;
-    if cloud.is_some() {
-        body["cloud"] = true.into();
-    }
-    Entry::signed(me, vec![], Kind::Admit, body, at)
+    genesis(me, name, computer, name, at)
 }
 
 /// Whether `path` is absolute and names nothing in (or of) state dir `dir`: a snapshot never
@@ -430,7 +385,7 @@ pub(crate) fn sync_team_row(store: &Store, old: &Roster, new: &Roster) -> crate:
 }
 
 /// The one post-write hook, for local writes and entries from peers alike: makes `new` the
-/// cached roster (its expired proofs lapsed), rewrites Plan A's `team` row if it changed, and tells `net` (which closes
+/// cached roster, rewrites Plan A's `team` row if it changed, and tells `net` (which closes
 /// the connections of members gone, dials new ones and pushes the change).
 pub fn install(
     daemon: &Daemon,
@@ -445,19 +400,21 @@ pub fn install(
     if !new.is_solo(me) {
         let _ = std::fs::remove_file(daemon.dir.join(REMOVED));
     }
-    let mut new = new;
-    new.lapse(super::ipc::now() as i64);
+    // A `remove` or `leave` of `k` that this install brings and replay applied (`ended`).
+    let took = |k: &str| {
+        new.log()
+            .iter()
+            .any(|(h, e)| new.ended.contains(h) && !team.roster.knows(h) && e.body["member"] == k)
+    };
+    // A computer gone from the team, or removed in this install (even if re-admitted in it), is
+    // nobody's any more (`persons`), and no inviter whose answers need no Allow.
+    let keep = |k: &str| new.members.contains_key(k) && !took(k);
+    store.prune_persons(keep)?;
+    crate::policy::prune_replies(store, keep)?;
     let relay_changed = team.roster.relay != new.relay;
     // A removal or leave applied in this team (not a team left or joined, nor a member a fork's
     // resolution dropped): every subscriber hears of each member it took.
     if team.roster.team_id == new.team_id {
-        let took = |k: &str| {
-            new.log().iter().any(|(h, e)| {
-                matches!(e.kind, Kind::Remove | Kind::Leave)
-                    && !team.roster.knows(h)
-                    && e.body["member"] == k
-            })
-        };
         for k in team
             .roster
             .members
@@ -627,11 +584,6 @@ impl TeamOps<'_> {
             // `team.invite {mode: "person", for, name}` -> `{line, expires_at}`: a once link
             // for person `for`'s computer (24 h), its line with `name` filled in.
             "team.invite" if invite == Invite::Person => {
-                // Only a computer member's links survive replay and pass `check`: a cloud
-                // member's line could only ever get `bad_ticket`.
-                if r.members.get(&me_key).map(|m| m.kind) != Some(MemberKind::Computer) {
-                    return Ok(Response::err(id, UNSUPPORTED));
-                }
                 // Joinable as is (`admission::fits`) and safe inside the line's quotes.
                 let quotable = |n: &&str| crate::admission::fits(n) && !n.contains('\'');
                 let person = body["for"].as_str().filter(|p| !p.is_empty());
@@ -688,8 +640,12 @@ impl TeamOps<'_> {
                 let Some(t) = target() else {
                     return Ok(Response::err(id, NOT_FOUND));
                 };
-                if t.key == me_key || (t.role == Role::Founder && t.kind == MemberKind::Cloud) {
+                if t.key == me_key {
                     return Ok(Response::err(id, BAD_REQUEST));
+                }
+                // The founder is never removed (`roster::take`); it may leave.
+                if t.role == roster::Role::Founder {
+                    return Ok(Response::err(id, FOUNDER));
                 }
                 self.write(Kind::Remove, json!({"member": t.key}))?;
                 let link = self.new_link("ask", false, false)?;
@@ -775,7 +731,7 @@ pub(crate) fn remotes(short: &str, list: &[Value]) -> Option<Vec<crate::net::fra
             title: s["title"].as_str().map(String::from),
         }
         .clamp();
-        if !r.valid(short, true) {
+        if !r.valid(short) {
             return None;
         }
         out.push(r);

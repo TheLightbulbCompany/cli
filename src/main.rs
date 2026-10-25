@@ -130,12 +130,6 @@ enum Command {
         /// The name you go by in the network (default: your user name).
         #[arg(long)]
         name: Option<String>,
-        /// `cloud`: join as a workspace member (an embedded instance's; `--proof` is optional).
-        #[arg(long, hide = true, default_value = "computer", value_parser = ["computer", "cloud"])]
-        kind: String,
-        /// The workspace member's `kind=workspace` proof.
-        #[arg(long, hide = true)]
-        proof: Option<String>,
     },
     /// Verified names are not available yet (they come with the issuer's real keys).
     #[command(hide = true)]
@@ -150,12 +144,7 @@ enum Command {
         auto: Option<String>,
     },
     /// Allow a join request (`J<n>`) or a held message (`H<n>`).
-    Approve {
-        request: String,
-        /// For a held message from a cloud member: always allow that workspace's agents.
-        #[arg(long)]
-        always: bool,
-    },
+    Approve { request: String },
     /// Decline a join request (`J<n>`) or a held message (`H<n>`).
     Decline { request: String },
     /// The join requests and held messages waiting for your Allow.
@@ -307,12 +296,7 @@ fn run() -> lightbulb::Result<()> {
         Command::Team => exit(cli::team()?),
         Command::Remove { name } => exit(cli::remove(&name)?),
         Command::Leave => exit(cli::leave()?),
-        Command::Join {
-            link,
-            name,
-            kind,
-            proof,
-        } => exit(cli::join(&link, name, &kind, proof)?),
+        Command::Join { link, name } => exit(cli::join(&link, name)?),
         Command::Signin => exit(cli::signin()?),
         Command::Update { auto: Some(a), .. } => {
             let dir = lightbulb::paths::state_dir();
@@ -324,8 +308,8 @@ fn run() -> lightbulb::Result<()> {
             println!("Automatic updates {a}.");
         }
         Command::Update { version, .. } => exit(cli::update(version)?),
-        Command::Approve { request, always } => exit(cli::answer(&request, true, always)?),
-        Command::Decline { request } => exit(cli::answer(&request, false, false)?),
+        Command::Approve { request } => exit(cli::answer(&request, true)?),
+        Command::Decline { request } => exit(cli::answer(&request, false)?),
         Command::Held => exit(cli::held()?),
         Command::Policy { person, value } => exit(cli::policy(person, value)?),
         Command::Telemetry { state } => exit(lightbulb::telemetry::command(

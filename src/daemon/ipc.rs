@@ -3,7 +3,7 @@
 use super::Daemon;
 use crate::sessions::{self, Key};
 use crate::store;
-use crate::{admission, frame, label, mail, outbox, presence};
+use crate::{frame, label, mail, outbox, presence};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -483,7 +483,7 @@ fn register(id: u64, body: &Value, daemon: &Daemon) -> Response {
     // their key is remembered so a discovery of it (Claude's own file, whose cwd may name the
     // folder another way) is left out too, until a register finds it shown again.
     let hidden = presence::hidden(&daemon.team.lock().unwrap().off, &r.cwd);
-    let mut store = daemon.store.lock().unwrap();
+    let store = daemon.store.lock().unwrap();
     match store.set_hidden(&key.0, hidden, now() as i64) {
         // Its teammates learn at once (a discovery of it may be on their screens).
         Ok(true) => daemon.presence.notify_one(),
@@ -496,14 +496,6 @@ fn register(id: u64, body: &Value, daemon: &Daemon) -> Response {
     match row_process(&store, &key.0) {
         Ok(Some(owner)) if owner != me && sessions::alive(owner.0, owner.1) => {
             return refused(id, "owned_by_live_process")
-        }
-        // A new session may not take what the person's other computer keeps.
-        Ok(None) => {
-            drop(store);
-            if !presence::claim(daemon, &key.0) {
-                return Response::err(id, admission::NAME_TAKEN);
-            }
-            store = daemon.store.lock().unwrap();
         }
         Ok(_) => {}
         Err(_) => return Response::err(id, INTERNAL),
@@ -868,13 +860,10 @@ async fn inbox(
         },
     };
     // A name (`listen --as`) holds a row (no process, no folder) while it is in use here, so
-    // it is kept a day after; one the person's other computer keeps is refused.
+    // it is kept a day after.
     let short = &daemon.identity.short;
     if let frame::Sender::Name(_) = frame::Sender::of(short, &key.0) {
         if sessions::member_of(&key.0) == Some(short.as_str()) {
-            if !presence::claim(daemon, &key.0) {
-                return Response::err(id, admission::NAME_TAKEN);
-            }
             let row = store::Session {
                 key: key.0.clone(),
                 provider: String::new(),

@@ -1,9 +1,8 @@
 //! Streams: a viewer watching a session's live bytes over its own bidirectional QUIC stream
 //! (not the control stream), opened by `opener` and echoed back by the owner when it accepts;
-//! a refusal resets the stream with `REFUSED`. The owner accepts the same person's computers
-//! and the viewers a live `share_grant` it signed names; it drops every viewer→owner frame
-//! after the opener, except on an `input` grant to the person's own workspace member, where
-//! they become `stream_input` events. One task per stream writes and reads it; QUIC flow
+//! a refusal resets the stream with `REFUSED`. The owner accepts the viewers a live
+//! `share_grant` it signed names; it drops every viewer→owner frame after the opener. One task
+//! per stream writes and reads it; QUIC flow
 //! control is the backpressure. Logs carry ids and sizes, never the bytes.
 
 use crate::admission::{signed, signed_by};
@@ -60,12 +59,8 @@ pub struct Streams {
 /// What this end is to a stream.
 #[derive(Clone, Copy, PartialEq)]
 enum Role {
-    /// It owns the session and sends; `input` takes the viewer's frames; the stream ends at
-    /// `expires_at` (its grant's end; `None` for the same person).
-    Owner {
-        expires_at: Option<i64>,
-        input: bool,
-    },
+    /// It owns the session and sends; the stream ends at `expires_at`, its grant's end.
+    Owner { expires_at: i64 },
     /// It watches.
     Viewer,
 }
@@ -80,7 +75,7 @@ impl Role {
     }
 
     fn expired(self, now: i64) -> bool {
-        matches!(self, Role::Owner { expires_at: Some(e), .. } if e <= now)
+        matches!(self, Role::Owner { expires_at } if expires_at <= now)
     }
 }
 
@@ -242,9 +237,9 @@ pub async fn handle(
     }
 }
 
-/// `share.grant {session, viewer, input?, expires_at}` -> `{grant_id}`: a signed grant for
-/// this computer's own `session`, stored here and sent to `viewer`. `input: true` only for
-/// this person's own workspace member (`unsupported` otherwise).
+/// `share.grant {session, viewer, expires_at}` -> `{grant_id}`: a signed grant for this
+/// computer's own `session`, stored here and sent to `viewer`. `input: true` is `unsupported`:
+/// no viewer types into a session.
 fn share(id: u64, body: &Value, d: &Daemon) -> Response {
     let (Some(session), Some(viewer), Some(expires_at)) = (
         body["session"].as_str(),
@@ -253,11 +248,11 @@ fn share(id: u64, body: &Value, d: &Daemon) -> Response {
     ) else {
         return Response::err(id, BAD_REQUEST);
     };
-    let input = match body.get("input") {
-        None | Some(Value::Null) => false,
-        Some(Value::Bool(b)) => *b,
+    match body.get("input") {
+        None | Some(Value::Null) | Some(Value::Bool(false)) => {}
+        Some(Value::Bool(true)) => return Response::err(id, UNSUPPORTED),
         Some(_) => return Response::err(id, BAD_REQUEST),
-    };
+    }
     let me = &d.identity;
     let now = ipc::now() as i64;
     if !frames::own(&me.short, session)
@@ -273,9 +268,6 @@ fn share(id: u64, body: &Value, d: &Daemon) -> Response {
         if !r.members.contains_key(viewer) {
             return Response::err(id, NOT_MEMBER);
         }
-        if input && !crate::policy::my_workspace(r, &me.key, viewer, None) {
-            return Response::err(id, UNSUPPORTED);
-        }
     }
     let grant_id = ulid::Ulid::generate().to_string();
     let f = signed(
@@ -284,7 +276,7 @@ fn share(id: u64, body: &Value, d: &Daemon) -> Response {
             grant_id: grant_id.clone(),
             session: session.into(),
             viewer: viewer.into(),
-            input,
+            input: false,
             expires_at,
             granter: me.key.clone(),
             sig: String::new(),
@@ -302,14 +294,14 @@ fn share(id: u64, body: &Value, d: &Daemon) -> Response {
 }
 
 /// `stream.open {session}` -> `{stream_id}` (viewer side): a stream to `session`'s member,
-/// on a stored live grant naming this computer, or as the same person's computer. A refusal
+/// on a stored live grant naming this computer. A refusal
 /// is `no_grant`; no answer in 10 s, or a lost connection, `unreachable`.
 async fn open(id: u64, body: &Value, d: &Arc<Daemon>) -> Response {
     let Some(session) = body["session"].as_str() else {
         return Response::err(id, BAD_REQUEST);
     };
     let me = &d.identity.key;
-    let (owner, same) = {
+    let owner = {
         let team = d.team.lock().unwrap();
         let r = &team.roster;
         let prefix = crate::sessions::member_of(session).unwrap_or("");
@@ -322,14 +314,12 @@ async fn open(id: u64, body: &Value, d: &Arc<Daemon>) -> Response {
         if o.key == *me {
             return Response::err(id, BAD_REQUEST);
         }
-        (o.key.clone(), r.same_person_computer(&o.key, me))
+        o.key.clone()
     };
     let now = ipc::now() as i64;
     let grant = grant_for(&d.store.lock().unwrap(), session, me, &owner, now);
-    let grant_id = match grant {
-        Some(g) => g,
-        None if same => String::new(),
-        None => return Response::err(id, NO_GRANT),
+    let Some(grant_id) = grant else {
+        return Response::err(id, NO_GRANT);
     };
     let Some(conn) = d.peers.conn(&owner) else {
         return Response::err(id, UNREACHABLE);
@@ -365,15 +355,9 @@ fn reset_code(e: &(dyn std::error::Error + 'static)) -> Option<u32> {
 /// control one): accepted or refused, by the rule at the top.
 pub async fn accept(d: Arc<Daemon>, viewer: String, mut send: SendStream, mut recv: RecvStream) {
     let me = &d.identity;
-    let (same, own) = {
-        let team = d.team.lock().unwrap();
-        let r = &team.roster;
-        if !r.members.contains_key(&viewer) {
-            return;
-        }
-        let own = crate::policy::my_workspace(r, &me.key, &viewer, None);
-        (r.same_person_computer(&me.key, &viewer), own)
-    };
+    if !d.team.lock().unwrap().roster.members.contains_key(&viewer) {
+        return;
+    }
     let first = tokio::time::timeout(OPEN_WAIT, frames::read(&mut recv)).await;
     let Ok(Ok(Frame::Stream {
         grant_id,
@@ -390,24 +374,14 @@ pub async fn accept(d: Arc<Daemon>, viewer: String, mut send: SendStream, mut re
     };
     let now = ipc::now() as i64;
     let granted = || match by_id(&d.store.lock().unwrap(), &grant_id, now)? {
-        g @ Frame::ShareGrant {
-            input, expires_at, ..
-        } => {
+        g @ Frame::ShareGrant { expires_at, .. } => {
             allows(&g, &session, &viewer, &me.key).ok()?;
-            Some(Role::Owner {
-                expires_at: Some(expires_at),
-                input: input && own,
-            })
+            Some(Role::Owner { expires_at })
         }
         _ => None,
     };
     let role = if !frames::own(&me.short, &session) {
         None
-    } else if same {
-        Some(Role::Owner {
-            expires_at: None,
-            input: false,
-        })
     } else {
         granted()
     };
@@ -479,10 +453,7 @@ async fn run(
     mut stop: oneshot::Receiver<()>,
 ) {
     let end = match role {
-        Role::Owner {
-            expires_at: Some(e),
-            ..
-        } => {
+        Role::Owner { expires_at: e } => {
             let left = (e * 1000).saturating_sub(ipc::now_ms() as i64).max(0);
             Some(Instant::now() + Duration::from_millis(left as u64))
         }
@@ -554,12 +525,10 @@ async fn run(
 }
 
 /// A frame from the other end: the owner's chunk becomes `stream` on the viewer side; on
-/// the owner side the viewer's becomes `stream_input` on an input grant, and anything else
-/// is dropped and counted.
+/// the owner side the viewer's is dropped and counted.
 fn on_frame(d: &Daemon, sid: &str, role: Role, f: Frame) {
     let (name, cap) = match role {
         Role::Viewer => (Some("stream"), CHUNK_MAX),
-        Role::Owner { input: true, .. } => (Some("stream_input"), INPUT_MAX),
         Role::Owner { .. } => (None, 0),
     };
     match f {
