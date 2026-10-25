@@ -130,6 +130,9 @@ pub fn output(h: &Hook, text: &str) -> Value {
 pub fn run(agent: &str, event: &str, stdin: &str) -> Result<Option<String>> {
     crate::telemetry::sync_env_optout(&crate::paths::state_path());
     let payload: Value = serde_json::from_str(stdin)?;
+    if agent == "opencode" && event == "ack" {
+        return ack_opencode(&payload).map(|()| None);
+    }
     let Some(h) = normalize(agent, event, &payload) else {
         return Ok(None);
     };
@@ -192,17 +195,53 @@ pub fn run(agent: &str, event: &str, stdin: &str) -> Result<Option<String>> {
     if !takes_mail(&h) || (h.provider == "opencode" && payload["mail"] == false) {
         return Ok(None);
     }
-    let r = conn.call("inbox", json!({ "key": key, "caller": proc_json(&me) }))?;
-    let framed: Vec<&str> = r["messages"]
+    // OpenCode's plugin is offered the mail and acks it once it is in the session
+    // (`hook opencode ack`): a push that fails leaves it waiting, to be offered again.
+    let op = if h.provider == "opencode" {
+        "inbox.peek"
+    } else {
+        "inbox"
+    };
+    let r = conn.call(op, json!({ "key": key, "caller": proc_json(&me) }))?;
+    let messages = r["messages"]
         .as_array()
-        .ok_or_else(|| format!("inbox: {r}"))?
+        .ok_or_else(|| format!("{op}: {r}"))?;
+    let framed: Vec<&str> = messages
         .iter()
         .filter_map(|m| m["framed"].as_str())
         .collect();
     if framed.is_empty() {
         return Ok(None);
     }
-    Ok(Some(output(&h, &framed.join("\n\n")).to_string()))
+    let mut out = output(&h, &framed.join("\n\n"));
+    if h.provider == "opencode" {
+        out["ids"] = messages.iter().map(|m| m["id"].clone()).collect();
+    }
+    Ok(Some(out.to_string()))
+}
+
+/// `hook opencode ack`, payload `{session_id, ids}`: the plugin put those messages into the
+/// session, so they are delivered. Only that session's own OpenCode may ack its mail.
+fn ack_opencode(payload: &Value) -> Result<()> {
+    let Some(conversation) = payload["session_id"].as_str().filter(|s| !s.is_empty()) else {
+        return Ok(());
+    };
+    let me = match calling_agent(Some("opencode")) {
+        Ok(p) => p,
+        Err(CallerError::NotThatAgent) => return Ok(()),
+        Err(CallerError::Lookup(e)) => return Err(e.into()),
+    };
+    daemon::ensure_running()?;
+    let mut conn = Conn::open()?;
+    let key = crate::sessions::Key::new(&conn.member()?, "opencode", conversation);
+    let r = conn.call(
+        "inbox.ack",
+        json!({ "key": key, "caller": proc_json(&me), "ids": payload["ids"] }),
+    )?;
+    if r["ok"] != true {
+        return Err(format!("ack: {r}").into());
+    }
+    Ok(())
 }
 
 pub(crate) fn proc_json(p: &Process) -> Value {

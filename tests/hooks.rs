@@ -173,11 +173,15 @@ fn stop_hook_hands_waiting_mail_to_grok_as_block_decision() {
     assert_eq!(net.session(&key).unwrap()["status"], "idle");
 }
 
+/// OpenCode's hook offers mail without taking it; only the plugin's `ack`, sent once the
+/// mail is in the session, delivers it. Unacked mail is offered again; an ack moves only the
+/// acking session's own mail.
 #[test]
-fn opencode_hooks_hand_waiting_mail_to_the_plugin_as_text() {
+fn opencode_peek_then_ack() {
     let net = Net::new();
+    let me = os::process(std::process::id()).unwrap();
     let conv = "ses_0a1b2c3d4e5fOpEnCoDe0001";
-    // session-start registers and takes no mail.
+    // session-start registers and offers no mail.
     assert_eq!(
         net.hook("opencode", "session-start", "opencode-session-start"),
         ""
@@ -189,21 +193,57 @@ fn opencode_hooks_hand_waiting_mail_to_the_plugin_as_text() {
         net.hook("opencode", "session-start", "opencode-session-start"),
         ""
     );
+
+    // Offered, and still waiting.
+    let peek = || -> Value {
+        serde_json::from_str(&net.hook("opencode", "post-tool-use", "opencode-post-tool-use"))
+            .unwrap()
+    };
+    let out = peek();
+    assert_eq!(out["text"], frame_of("r1"));
+    let ids = out["ids"].clone();
+    assert_eq!(ids.as_array().map(Vec::len), Some(1), "{out}");
+    assert_eq!(net.receipt("r1"), "stored");
+    assert_eq!(net.session(&key).unwrap()["status"], "live");
+    // Not acked (the push failed or the plugin died): offered again, the same.
+    assert_eq!(peek(), out);
     assert_eq!(net.receipt("r1"), "stored");
 
-    let out: Value =
-        serde_json::from_str(&net.hook("opencode", "post-tool-use", "opencode-post-tool-use"))
-            .unwrap();
-    assert_eq!(out, json!({"text": frame_of("r1")}));
+    let ack = |conv: &str, pin: &os::Process| {
+        let p = json!({"session_id": conv, "cwd": "/tmp/proj", "ids": ids}).to_string();
+        let out = net.hook_raw("opencode", "ack", p.as_bytes(), Some(pin));
+        assert!(out.stdout.is_empty());
+    };
+    // Another session acking this one's ids moves nothing.
+    let other = "ses_0a1b2c3d4e5fOpEnCoDe0009";
+    let p = json!({"session_id": other, "cwd": "/tmp/proj"}).to_string();
+    net.hook_raw("opencode", "session-start", p.as_bytes(), Some(&me));
+    assert!(net.session(&net.key("opencode", other)).is_some());
+    ack(other, &me);
+    assert_eq!(net.receipt("r1"), "stored");
+    // Nor does an ack for this session from a process that is not its own.
+    let stranger = os::Process {
+        pid: 1,
+        birth_micros: 1,
+        executable: PathBuf::new(),
+    };
+    ack(conv, &stranger);
+    assert_eq!(net.receipt("r1"), "stored");
+
+    // Its own ack delivers it, and it is not offered again.
+    ack(conv, &me);
     assert_eq!(net.receipt("r1"), "delivered");
-    assert_eq!(net.session(&key).unwrap()["status"], "live");
+    assert_eq!(
+        net.hook("opencode", "post-tool-use", "opencode-post-tool-use"),
+        ""
+    );
+    // Acking twice is harmless.
+    ack(conv, &me);
 
     net.send(&key, "body r2", "r2");
     let out: Value = serde_json::from_str(&net.hook("opencode", "stop", "opencode-stop")).unwrap();
-    assert_eq!(out, json!({"text": frame_of("r2")}));
+    assert_eq!(out["text"], frame_of("r2"));
     assert_eq!(net.session(&key).unwrap()["status"], "idle");
-    // Nothing waiting: the plugin is handed nothing, so it starts no turn.
-    assert_eq!(net.hook("opencode", "stop", "opencode-stop"), "");
 
     assert_eq!(
         net.hook("opencode", "session-end", "opencode-session-end"),
@@ -238,7 +278,8 @@ fn an_opencode_hook_that_asks_for_no_mail_leaves_it_waiting() {
     assert_eq!(net.receipt("r1"), "stored");
     let out = net.hook_raw("opencode", "stop", payload(true).as_bytes(), Some(&me));
     let out: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(out, json!({"text": frame_of("r1")}));
+    assert_eq!(out["text"], frame_of("r1"));
+    assert_eq!(net.receipt("r1"), "stored");
 }
 
 /// An agent that changes its hook format: whatever arrives on stdin that no agent's shape

@@ -218,6 +218,7 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
         "inbox" if instance => crate::embed::inbox(id, body, daemon),
         "inbox.peek" if instance => crate::embed::peek(id, daemon),
         "inbox.ack" if instance => crate::embed::ack(id, body, daemon),
+        "inbox.peek" | "inbox.ack" => peek_or_ack(id, op, body, daemon).await,
         "cloud.sessions.set" => super::net_ops::cloud_sessions_set(id, body, daemon).await,
         "app.send" | "app.inbox" | "app.receipt" if instance => {
             crate::app_send::op(id, op, body, daemon).await
@@ -840,6 +841,54 @@ pub(crate) fn records(daemon: &Daemon, messages: &[store::Message]) -> Vec<Value
                 "framed": frame::framed(label, &m.request_id, &m.body) })
         })
         .collect()
+}
+
+/// For a hook that hands mail over only once it is in the session (OpenCode's plugin):
+/// `inbox.peek {key, caller}` -> `{messages}` (`records`), left waiting; `inbox.ack {key,
+/// caller, ids}` -> `{acked}` takes those messages from `key`'s mailbox, so delivers them (an
+/// id not waiting for `key`, another session's or one acked before, is skipped). Only the
+/// row's own process may do either (`bad_request`, reason `not_owner`, otherwise).
+async fn peek_or_ack(id: u64, op: &str, body: &Value, daemon: &Daemon) -> Response {
+    let (Some(key), Ok(Some(c))) = (body["key"].as_str().map(|k| Key(k.into())), caller(body))
+    else {
+        return Response::err(id, BAD_REQUEST);
+    };
+    match owner_process(daemon, &key.0) {
+        Ok(Some(owner)) if owner == c => {}
+        Ok(_) => return refused(id, "not_owner"),
+        Err(_) => return Response::err(id, INTERNAL),
+    }
+    // Under the key's lock, like `inbox`: nothing else takes this mail meanwhile.
+    let lock = daemon.key_lock(&key.0);
+    let _held = lock.lock().await;
+    if op == "inbox.peek" {
+        let Ok(waiting) = mail::waiting(&daemon.store.lock().unwrap(), &key, now()) else {
+            return Response::err(id, INTERNAL);
+        };
+        return Response::ok(id, json!({ "messages": records(daemon, &waiting) }));
+    }
+    let Some(ids) = body["ids"]
+        .as_array()
+        .and_then(|a| a.iter().map(Value::as_str).collect::<Option<Vec<_>>>())
+    else {
+        return Response::err(id, BAD_REQUEST);
+    };
+    let acked = {
+        let store = daemon.store.lock().unwrap();
+        let mut n = 0;
+        for m in ids {
+            match mail::take_one(&store, &key, m, now()) {
+                Ok(taken) => n += usize::from(taken.is_some()),
+                Err(_) => return Response::err(id, INTERNAL),
+            }
+        }
+        n
+    };
+    if acked > 0 {
+        // Their `delivered` goes to the senders now (`Net::flush_loop`).
+        daemon.peers.outbox.notify_one();
+    }
+    Response::ok(id, json!({ "acked": acked }))
 }
 
 /// `inbox {key, wait_secs?}` -> `{messages}` (`records`): takes (and so delivers) what waits for `key`;
