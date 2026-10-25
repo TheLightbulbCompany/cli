@@ -92,8 +92,11 @@ it is plain JSON. A `.jsonc` with comments or trailing commas is left as it is: 
 makes an `opencode.json` beside an `opencode.jsonc`.
 
 One OpenCode process hosts all of its sessions, so Lightbulb cannot tell them apart by
-process: a tool in one OpenCode session could read or take another session's waiting messages in
-the same OpenCode. Messages from other computers and other agents are unaffected.
+process. OpenCode 2.x names the session in every tool call (`_meta` `ai.opencode/sessionID`), so
+there the tools act for that session, and a session the plugin has not registered yet is registered
+on its first tool call. On OpenCode 1.x a tool in one OpenCode session could read or take another
+session's waiting messages in the same OpenCode. Messages from other computers and other agents are
+unaffected.
 
 ### After setup
 

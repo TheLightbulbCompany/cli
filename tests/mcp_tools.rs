@@ -208,6 +208,142 @@ impl Drop for Other {
     }
 }
 
+/// A live process whose executable is named `opencode` (this engine's binary copied under that
+/// name, a hook waiting for its stdin to end), for the agent above an OpenCode MCP server;
+/// killed on drop.
+/// The temp dir holds its executable: kept for the process's lifetime.
+struct FakeOpencode(Child, os::Process, #[allow(dead_code)] tempfile::TempDir);
+
+impl FakeOpencode {
+    fn new() -> FakeOpencode {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("opencode");
+        // A copy, not a hard link: macOS may name a hard-linked running image by its other link.
+        std::fs::copy(EXE, &exe).unwrap();
+        let mut child = Command::new(&exe)
+            .args(["hook", "none", "none"])
+            .env(paths::HOME_ENV, dir.path())
+            .env("LIGHTBULB_CONNECT_DEBUG_NO_TELEMETRY", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        // Until its exec lands, the child's executable is still this test's.
+        for _ in 0..50 {
+            let p = os::process(child.id()).unwrap();
+            if p.executable.file_name().is_some_and(|n| n == "opencode") {
+                return FakeOpencode(child, p, dir);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("the fake opencode never ran");
+    }
+}
+
+impl Drop for FakeOpencode {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// OpenCode 2.x names its session in every call's `_meta`: among one OpenCode process's
+/// sessions that picks the source, and a session no hook has registered yet is registered
+/// from the MCP side (to that OpenCode process) on its first call.
+#[test]
+fn opencode_calls_pick_and_register_their_session_from_meta() {
+    let net = Net::new();
+    let oc = FakeOpencode::new();
+    let a = net.register("opencode", "ses_a", &oc.1);
+    let b = net.register("opencode", "ses_b", &oc.1);
+    let mut m = net.mcp(&oc.1);
+    let this = |v: &Value| -> Vec<String> {
+        v["sessions"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{v}"))
+            .iter()
+            .filter(|s| s["is_this_session"] == true)
+            .map(|s| s["session_id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let meta = |id: &str| json!({"ai.opencode/sessionID": id});
+    assert_eq!(
+        m.tool("find_sessions", json!({})).text,
+        r#"{"error":"source_ambiguous"}"#
+    );
+    for key in [&b, &a] {
+        let id = key.rsplit(':').next().unwrap();
+        let v = m.tool_meta("find_sessions", json!({}), meta(id)).json();
+        assert_eq!(this(&v), std::slice::from_ref(key), "{v}");
+    }
+
+    // A fresh session: registered to the OpenCode process, then the source.
+    let v = m
+        .tool_meta("find_sessions", json!({}), meta("ses_new"))
+        .json();
+    let new = this(&v);
+    assert_eq!(new.len(), 1, "{v}");
+    assert!(new[0].ends_with("/opencode:ses_new"), "{v}");
+    let row = net.call(json!({"id": 1, "op": "sessions"}))["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["key"] == new[0].as_str())
+        .cloned()
+        .unwrap();
+    assert_eq!(row["pid"], oc.1.pid);
+    assert_eq!(row["birth_micros"], oc.1.birth_micros);
+
+    // An id that is no session id is refused and registers nothing.
+    let before = net.call(json!({"id": 1, "op": "sessions"}))["sessions"].clone();
+    for bad in ["a b", "", "x/y", &"s".repeat(129)] {
+        let out = m.tool_meta("find_sessions", json!({}), meta(bad));
+        assert_eq!(out.text, r#"{"error":"source_unidentified"}"#, "{bad:?}");
+    }
+    assert_eq!(
+        net.call(json!({"id": 1, "op": "sessions"}))["sessions"],
+        before
+    );
+}
+
+/// The OpenCode meta key means nothing to another agent: it never registers a session for it.
+#[test]
+fn a_non_opencode_caller_with_opencode_meta_is_unaffected() {
+    let net = Net::new();
+    let claude = Other::new();
+    let key = net.register("claude", "c1", &claude.1);
+    let mut m = net.mcp(&claude.1);
+    let v = m
+        .tool_meta(
+            "find_sessions",
+            json!({}),
+            json!({"ai.opencode/sessionID": "ses_x"}),
+        )
+        .json();
+    let this: Vec<&Value> = v["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["is_this_session"] == true)
+        .collect();
+    assert_eq!(this.len(), 1, "{v}");
+    assert_eq!(this[0]["session_id"], key.as_str());
+    // With no session of its own, it stays unidentified and nothing is registered.
+    let lone = Other::new();
+    let mut m = net.mcp(&lone.1);
+    let out = m.tool_meta(
+        "find_sessions",
+        json!({}),
+        json!({"ai.opencode/sessionID": "ses_y"}),
+    );
+    assert_eq!(out.text, r#"{"error":"source_unidentified"}"#);
+    let sessions = net.call(json!({"id": 1, "op": "sessions"}))["sessions"].clone();
+    assert_eq!(sessions.as_array().map(Vec::len), Some(1), "{sessions}");
+}
+
 fn me() -> os::Process {
     os::process(std::process::id()).unwrap()
 }

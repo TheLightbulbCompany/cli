@@ -270,10 +270,14 @@ pub(crate) fn pinned_caller() -> Option<std::result::Result<Process, CallerError
         let (pid, birth) = v.split_once(':')?;
         let bad = |_| CallerError::Lookup(format!("{CALLER_ENV} is not <pid>:<birth_micros>"));
         Some((|| {
+            let pid = pid.parse().map_err(bad)?;
             Ok(Process {
-                pid: pid.parse().map_err(bad)?,
+                pid,
                 birth_micros: birth.parse().map_err(bad)?,
-                executable: std::path::PathBuf::new(),
+                // As the walk would see it, so what it is (`classify`) holds in tests too.
+                executable: crate::os::process(pid)
+                    .map(|p| p.executable)
+                    .unwrap_or_default(),
             })
         })())
     }
