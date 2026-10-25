@@ -625,7 +625,8 @@ pub fn now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// `send {from, to?, text, request_id, reply_to?, kind?}` -> `{receipt}`; `to` may be left out
+/// `send {from, to?, text, request_id, reply_to?, kind?}` -> `{receipt}`; a bare `from` name is
+/// this member's (`<member>/<name>`), and `to` may be left out
 /// only with `reply_to` (the reply goes to the parent's sender). `to` follows
 /// `sessions::qualify` (a bare name is this member's; anything else, groups included, is
 /// refused with reason `bad_address`). `kind` is `message` (the default) or `unsupported`.
@@ -658,11 +659,16 @@ pub(crate) fn send(
         None if reply_to.is_some() => None,
         None => return Err(Response::err(id, BAD_REQUEST)),
     };
+    // A bare name is this member's own, as for `to` (the workspace bridge sends `friday`).
+    let from = match sessions::valid_name(from) {
+        true => format!("{}/{from}", daemon.identity.short),
+        false => from.to_string(),
+    };
     // A workspace member sends only as the agents it declared.
-    if daemon.cloud.as_ref().is_some_and(|c| !c.declares(from)) {
+    if daemon.cloud.as_ref().is_some_and(|c| !c.declares(&from)) {
         return Err(refused(id, "not_declared"));
     }
-    let from = Key(from.into());
+    let from = Key(from);
     let team = daemon.team.lock().unwrap();
     let store = daemon.store.lock().unwrap();
     let internal = |_| Response::err(id, INTERNAL);

@@ -667,8 +667,8 @@ async fn a_person_line_reaches_friday_and_an_unlisted_teammate_does_not() {
     let r = ok(
         &i,
         "send",
-        json!({"from": friday, "to": sa, "text": "hello A", "request_id": "f1",
-               "reply_to": msgs[0]["id"]}),
+        // The bridge's shape: a bare `from`, no `to`, and the request id the frame showed.
+        json!({"from": "friday", "text": "hello A", "request_id": "f1", "reply_to": "a1"}),
     )
     .await;
     assert!(r["receipt"].is_object(), "{r}");
