@@ -1546,6 +1546,23 @@ pub fn install_running(home: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The running daemon's version, when one answers.
+fn running_version() -> Option<String> {
+    let s = Conn::open().ok()?.call("status", json!({})).ok()?;
+    s["version"].as_str().map(String::from)
+}
+
+/// Off macOS no service manager restarts the daemon, so one started before an update (by
+/// hand, in tmux, by a hook) kept running the old binary. Restart it on this one.
+fn restart_if_old() -> Result<()> {
+    if running_version().is_some_and(|v| v != VERSION) {
+        stop_daemon()?;
+        daemon::ensure_running()?;
+        println!("Background service: restarted on {VERSION}.");
+    }
+    Ok(())
+}
+
 /// `daemon --install`: the canonical binary and alias, then the launchd job running it.
 pub fn daemon_install() -> Result<i32> {
     if !cfg!(target_os = "macos") {
@@ -1686,7 +1703,23 @@ pub fn doctor() -> Result<i32> {
     } else {
         &setup
     };
-    row("Background service", up, "running", "not running", fix);
+    // Running, but an older binary than this one (started before an update): it lacks what
+    // this version added.
+    let old = up
+        .then(|| call("status"))
+        .flatten()
+        .and_then(|s| s["version"].as_str().map(String::from))
+        .filter(|v| v != VERSION);
+    match old {
+        Some(v) => row(
+            "Background service",
+            false,
+            "",
+            &format!("running {v}, not {VERSION}"),
+            &setup,
+        ),
+        None => row("Background service", up, "running", "not running", fix),
+    }
     if let Some(l) = up.then(|| call("relay.get")).flatten() {
         let first = l["urls"][0].as_str().map(cell).unwrap_or_default();
         let state = match l["source"].as_str().unwrap_or("none") {
@@ -1827,6 +1860,8 @@ pub fn setup(
         if code != 0 {
             return Ok(code);
         }
+    } else {
+        restart_if_old()?;
     }
     let fixes: Vec<String> = report
         .agents
