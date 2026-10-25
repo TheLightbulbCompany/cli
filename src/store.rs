@@ -88,8 +88,7 @@ CREATE INDEX IF NOT EXISTS messages_to_sent ON messages (to_key, sent_at);
 /// A message's text digest, kept when `mail::forget` drops the text, so a retry under the same
 /// request id still compares.
 const V7: &str = "ALTER TABLE messages ADD COLUMN body_sha TEXT;";
-/// Which person each computer admitted through one of this member's own `person` links is
-/// (the link's `for`): an instance's members list reads it. Written only by that admission.
+/// Retired (the person links' key -> person map): kept so the schema version still counts.
 const V8: &str =
     "CREATE TABLE IF NOT EXISTS persons (key TEXT PRIMARY KEY, person TEXT, at INTEGER);";
 
@@ -544,36 +543,6 @@ impl Store {
             .prepare("SELECT 1 FROM join_requests WHERE id = ?1")?
             .exists([id])
     }
-
-    /// Records `key` as person `person`'s computer (`persons`).
-    pub fn put_person(&self, key: &str, person: &str, now: i64) -> rusqlite::Result<()> {
-        self.conn.execute(
-            "INSERT OR REPLACE INTO persons (key, person, at) VALUES (?1, ?2, ?3)",
-            params![key, person, now],
-        )?;
-        Ok(())
-    }
-
-    /// The person `key` was admitted as (`put_person`), if any.
-    pub fn person(&self, key: &str) -> rusqlite::Result<Option<String>> {
-        self.conn
-            .query_row("SELECT person FROM persons WHERE key = ?1", [key], |r| {
-                r.get(0)
-            })
-            .optional()
-    }
-
-    /// Drops the `persons` rows of keys `keep` does not hold (members gone).
-    pub fn prune_persons(&self, keep: impl Fn(&str) -> bool) -> rusqlite::Result<()> {
-        let keys: Vec<String> = (self.conn.prepare("SELECT key FROM persons")?)
-            .query_map([], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?;
-        for k in keys.iter().filter(|k| !keep(k)) {
-            self.conn
-                .execute("DELETE FROM persons WHERE key = ?1", [k])?;
-        }
-        Ok(())
-    }
 }
 
 /// Joins each `messages m` row to its receipt `r` (the sender's `receipts` row).
@@ -682,17 +651,6 @@ impl Store {
             params![ids[0], ids[1]],
             |r| r.get(0),
         )
-    }
-
-    /// Whether message `id` is one this computer's session `from` sent to session `to` at or
-    /// after `since`.
-    pub fn sent_to(&self, id: &str, from: &str, to: &str, since: i64) -> rusqlite::Result<bool> {
-        self.conn
-            .prepare(
-                "SELECT 1 FROM messages WHERE id = ?1 AND origin = 'local' \
-                 AND from_key = ?2 AND to_key = ?3 AND sent_at >= ?4",
-            )?
-            .exists(params![id, from, to, since])
     }
 
     /// The peers' mail to `to` sent after `since`: `(from, origin)`.

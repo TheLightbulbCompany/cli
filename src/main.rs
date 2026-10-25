@@ -16,6 +16,7 @@ Getting started:
   setup     Connect Claude Code, Codex, Cursor, Grok CLI and OpenCode here and start the background service
   doctor    Check that everything is connected, and say how to fix what is not
   invite    Print the join line that adds your other computer or a teammate
+            (invite --agents: add your Lightbulb workspace's agents, as a workspace admin)
   join      Join the team a join line is for: join '<ticket>'
   update    Install the latest release (or --version vX.Y.Z) and restart the background service
 
@@ -32,6 +33,8 @@ Team:
   team      The team and its computers
   remove    Remove a member
   leave     Leave the team
+  login     Sign this computer in to Lightbulb, so your workspace's agents answer it
+  logout    Sign this computer out
   policy    Who may message your sessions without asking
   folder    Show or hide the sessions in a folder from your teammates: folder <path> on|off
   relay     The relays used when no direct path exists; relay <url> sets yours
@@ -115,7 +118,16 @@ enum Command {
         /// An invite whose joins need no Allow.
         #[arg(long)]
         open: bool,
+        /// Add your Lightbulb workspace's agents to this network (a workspace admin, signed in
+        /// with `lightbulb login`): confirm in the browser, then allow the workspace here.
+        #[arg(long, conflicts_with_all = ["new", "once", "open"])]
+        agents: bool,
     },
+    /// Sign this computer in to Lightbulb (confirm in the browser): your workspace's agents
+    /// answer the computers of its signed-in members.
+    Login,
+    /// Sign this computer out of Lightbulb: workspaces stop answering it.
+    Logout,
     /// Show the team and its members.
     Team,
     /// Remove a member; the invite is replaced.
@@ -287,7 +299,12 @@ fn run() -> lightbulb::Result<()> {
             json,
         } => exit(cli::receipt(&request_id, from, json)?),
         Command::Doctor => exit(cli::doctor()?),
-        Command::Invite { new, once, open } => exit(cli::invite(match (new, once, open) {
+        Command::Invite { agents: true, .. } => exit(cli::invite_agents()?),
+        Command::Login => exit(lightbulb::login::login()?),
+        Command::Logout => exit(lightbulb::login::logout()?),
+        Command::Invite {
+            new, once, open, ..
+        } => exit(cli::invite(match (new, once, open) {
             (true, ..) => Invite::New,
             (_, true, _) => Invite::Once,
             (.., true) => Invite::Open,

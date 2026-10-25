@@ -51,10 +51,6 @@ fn world() -> World {
             roster::accept(s, e, 10).unwrap();
         }
     }
-    // W1's member knows P's and Q's computers (as its person links would have recorded them).
-    let w1s = &stores[2];
-    w1s.put_person(&ia.key, P, 1).unwrap();
-    w1s.put_person(&ib.key, Q, 1).unwrap();
     // Q lets the workspace's agents send without asking.
     let accept = policy::Verdict::Accept;
     policy::set_person(&b.store(), &iw1.key, accept, "local", 1).unwrap();
@@ -70,7 +66,9 @@ impl World {
             .unwrap();
         online(&i, 1).await;
         let app = json!({"name": APP, "agent": "chatgpt", "title": TITLE});
-        let set = json!({ "sessions": [app], "members": [P, Q] });
+        // P's and Q's computers are signed-in members' (`member_keys`).
+        let keys = [self.a.identity().key, self.b.identity().key];
+        let set = json!({ "sessions": [app], "member_keys": keys });
         ok(&i, "cloud.sessions.set", set).await;
         i
     }

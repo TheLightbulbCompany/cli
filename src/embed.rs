@@ -28,7 +28,7 @@ pub struct EmbedOpts {
     /// The sessions declared before the transport starts (`cloud.sessions.set`'s list), so mail
     /// for them that arrives right after start is kept, not refused as unadvertised.
     pub sessions: Vec<Value>,
-    /// The person ids whose computers (`persons`) may message the sessions; `None`: no gate.
+    /// The member keys (computers) that may message the sessions; `None`: no gate.
     pub members: Option<std::collections::HashSet<String>>,
 }
 
@@ -136,7 +136,7 @@ fn declarable(short: &str, list: &[Value]) -> Vec<net::frames::Remote> {
 }
 
 /// An instance's start: its workspace's name, the home lock it keeps, the sessions it declares
-/// from the start and the person ids that may message them.
+/// from the start and the member keys that may message them.
 pub(crate) type CloudStart = (
     String,
     std::fs::File,

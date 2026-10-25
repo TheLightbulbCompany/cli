@@ -108,7 +108,7 @@ async fn secret_async(code: &str, window: i64) -> Option<SecretKey> {
 
 /// Adds `code` to a successful `team.invite` answer `body` and serves, for it, a fresh once
 /// `ask` link of its own (never the printed link, which may be reusable or `open`): nothing
-/// when the invite has none (a person link), on a workspace member, or when no link is minted
+/// when the invite has none, on a workspace member, or when no link is minted
 /// or no endpoint binds (the printed line still works).
 pub async fn offer(d: &Daemon, body: &mut Value) {
     if body["ticket"].is_null() || d.cloud.is_some() {

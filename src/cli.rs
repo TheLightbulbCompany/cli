@@ -517,6 +517,18 @@ fn refuse(r: &Value, texts: &[(&str, String)]) -> Result<i32> {
     Ok(1)
 }
 
+/// `invite --agents`: a once link for the workspace to join with (`login::invite_agents`).
+pub fn invite_agents() -> Result<i32> {
+    let r = connect()?.call(
+        "team.invite",
+        json!({ "mode": Invite::Once, "code": false }),
+    )?;
+    match r["ticket"].as_str() {
+        Some(t) if r["ok"] == true => crate::login::invite_agents(t),
+        _ => refuse(&r, &[]),
+    }
+}
+
 /// `invite [--new|--once|--open]`: this computer's invite line.
 pub fn invite(mode: Invite) -> Result<i32> {
     let r = connect()?.call("team.invite", json!({ "mode": mode }))?;

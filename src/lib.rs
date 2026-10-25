@@ -14,6 +14,7 @@ pub mod holds;
 pub mod hook;
 pub mod identity;
 pub mod label;
+pub mod login;
 pub mod mail;
 pub mod mcp;
 pub mod member;
