@@ -866,11 +866,13 @@ fn the_closing_words_name_what_is_connected_and_the_command_to_type() {
   Connected: Claude Code, Codex, Cursor, Grok CLI, OpenCode
 
 Try it: open Claude Code in any folder and ask \"list my other sessions\".
+OpenCode loads Lightbulb when its background service starts: stop it once (pkill -f 'opencode.* serve') and open OpenCode again.
 Add your other computer or a teammate: lightbulb invite
 Check everything: lightbulb doctor
 Add an always-on AI teammate: https://thelightbulb.company"
     );
     assert!(summary(&["Codex"], "lightbulb").contains("open Codex in any folder"));
+    assert!(!summary(&["Codex"], "lightbulb").contains("OpenCode"));
 }
 
 #[test]
