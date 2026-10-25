@@ -106,7 +106,8 @@ Three things that catch people out:
 - **Restart open agent sessions.** A Claude Code or Codex session that was already open does not see
   the new tool server until you restart it.
 
-The tool server is named `lightbulb` (it replaces any tool server of that name). More detail:
+The tool server is named `lightbulb-network`, so its tools show as `mcp__lightbulb-network__…`. It sits
+beside the Lightbulb desktop app's own `lightbulb` server; neither replaces the other. More detail:
 [docs/usage.md](docs/usage.md) and the pages below.
 
 ## Docs

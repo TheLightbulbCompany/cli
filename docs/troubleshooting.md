@@ -48,8 +48,11 @@ addresses. Computers on other networks connect through a relay and do not need i
 The line is named after the agent (`Claude Code`, `Codex`, `Cursor`, `Grok CLI`).
 `not installed` is fine: that agent's folder does not exist.
 
-- `hooks only — tools missing (run setup)`: the hooks are there, but the `lightbulb` tool server
-  entry is not. Fix: `lightbulb setup`.
+- `hooks only — tools missing (run setup)`: the hooks are there, but the `lightbulb-network` tool
+  server entry is not. Fix: `lightbulb setup`. Before v0.3.4 the entry was named `lightbulb`, the
+  name the Lightbulb desktop app also uses, and the app replaced it whenever it relaunched (after a
+  restart, say), so agents lost these tools. From v0.3.4 the two entries sit side by side; if you
+  still see this line, update (`lightbulb update`) and update the app.
 - `not connected`: the hooks are not there. Fix: `lightbulb setup`. If setup prints
   `<agent>: not connected — <file>: <error>`, that config file could not be read (for example,
   it is not valid JSON or TOML). Fix the file, then run `setup` again. The backup is beside it as
