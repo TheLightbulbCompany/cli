@@ -1,7 +1,8 @@
 //! Cursor: hooks in `~/.cursor/hooks.json` (`{version: 1, hooks: {<event>: [{command,
 //! timeout, matcher?}]}}`), the MCP server in `~/.cursor/mcp.json`, and the allow rule in
-//! `~/.cursor/cli-config.json`'s `permissions.allow` (edited only if Cursor made the file).
-//! Written from those files' formats and cursor.com/docs/agent/hooks.
+//! `~/.cursor/cli-config.json`'s `permissions.allow` (created when missing).
+//! Written from those files' formats, cursor.com/docs/agent/hooks and the allow-list syntax
+//! `Mcp(server:tool)` (either part may be `*`) in cursor.com/docs/cli/reference/permissions.
 
 use super::{edit_json, set_json_rule, set_json_server, AgentReport, Ctx, Owner};
 use crate::hook::{Event, EVENTS};
@@ -55,7 +56,10 @@ pub(super) fn configure(ctx: &Ctx, r: &mut AgentReport) -> Result<Owner> {
         return Ok(owner);
     }
     let rule = format!("Mcp({}:*)", ctx.server);
-    edit_json(&dir.join("cli-config.json"), false, r, |doc| {
+    edit_json(&dir.join("cli-config.json"), !ctx.remove, r, |doc| {
+        if owner == Owner::Ours && doc.as_object().is_some_and(|o| o.is_empty()) {
+            doc["version"] = json!(1);
+        }
         set_json_rule(doc, "permissions", "allow", &rule, owner == Owner::Ours);
         Ok(())
     })?;
