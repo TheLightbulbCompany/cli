@@ -78,6 +78,6 @@ Same command, same Mac and debug build, commit `cea7369` (v0.4.4), one clean run
 | resident memory per daemon | 35.6 / 36.0 / 38.0 MB | min 35.0 / median 35.5 / max 41.5 MB |
 | total wall time | 78.1 s | 15.1 s |
 
-Nothing regressed beyond run-to-run noise; join is about 50 ms slower at the median (the four-word
-code and Argon2 work added since 0.2.2 sit on that path). The directory p95 (~0.9 s) is unchanged
+Nothing regressed beyond run-to-run noise; join is about 50 ms slower at the median (not profiled; the four-word
+code and Argon2 work added since 0.2.2 are the likely cause). The directory p95 (~0.9 s) is unchanged
 and still unexplained. Still no numbers for a network of real computers.
