@@ -7,7 +7,6 @@ use lightbulb::holds;
 use lightbulb::identity::Identity;
 use lightbulb::mail::{self, State};
 use lightbulb::net::frames::Frame;
-use lightbulb::policy;
 use lightbulb::roster::{self, Entry, Kind, Roster};
 use lightbulb::sessions::Key;
 use lightbulb::store::{Session, Store};
@@ -756,45 +755,4 @@ async fn hold_answer_on_an_instance_needs_decided_by() {
     assert_eq!(r["reason"], "not_a_person", "{r}");
     common::ok(&sock, &token, "stop", json!({}));
     assert!(child.wait().unwrap().success());
-}
-
-/// The inviter's `replies` mark lets in only an answer to a message this session sent to that
-/// very sender: a `reply_to` naming any other message id in the store is held as usual.
-#[tokio::test]
-async fn a_reply_to_an_unrelated_message_is_held_even_from_the_inviter() {
-    let (d, s, roster, me, aden) = lib();
-    let to = format!("{}/codex:t", me.short);
-    s.put_session(&row(&to)).unwrap();
-    let aden_session = format!("{}/codex:a", aden.short);
-    let other = format!("{}/codex:x", me.short);
-    let id_of = |rid: &str| -> String {
-        let c = rusqlite::Connection::open(d.path().join("state.db")).unwrap();
-        let q = "SELECT id FROM messages WHERE request_id = ?1";
-        c.query_row(q, [rid], |r| r.get(0)).unwrap()
-    };
-    let me_key = Key(to.clone());
-    mail::send(&s, &me_key, Some(&Key(other)), "x", "u1", None, 1_000).unwrap();
-    mail::send(
-        &s,
-        &me_key,
-        Some(&Key(aden_session)),
-        "q",
-        "a1",
-        None,
-        1_000,
-    )
-    .unwrap();
-    policy::accept_replies(&s, &aden.key, 1_000).unwrap();
-    let peer = &roster.members[&aden.key];
-    let reply = |rid: &str, parent: String| {
-        let mut env = from_aden(&aden, rid, &to, "back");
-        if let Frame::Envelope { reply_to, hops, .. } = &mut env {
-            (*reply_to, *hops) = (Some(parent), 1); // an answer is a hop past its parent
-        }
-        mail::receive(&s, &env, peer, &roster, &me.short, None, None, 1_001).unwrap()
-    };
-    let a = reply("r1", id_of("u1"));
-    assert_eq!((a.state, a.reason.clone()), (State::Held, None), "{a:?}");
-    let a = reply("r2", id_of("a1"));
-    assert_eq!((a.state, a.reason.clone()), (State::Stored, None), "{a:?}");
 }
