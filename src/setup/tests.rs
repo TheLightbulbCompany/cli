@@ -291,9 +291,10 @@ fn setup_writes_opencode_plugin_and_mcp_and_backs_up_once() {
     assert_eq!(oc.line(), "OpenCode: connected (hooks + tools)");
     let plugin = get(h, OC_PLUGIN);
     for arg in ["session-start", "post-tool-use", "stop", "session-end"] {
-        assert!(plugin.contains(&cmd("opencode", arg)), "{arg}");
         assert!(plugin.contains(&format!("\"{arg}\"")), "{arg}");
     }
+    // The executable is only in the JS string literal, never in a comment.
+    assert_eq!(plugin.matches(EXE).count(), 1, "{plugin}");
     assert!(
         plugin.contains(&format!("const EXE = \"{EXE}\"")),
         "{plugin}"
@@ -403,6 +404,18 @@ fn an_opencode_jsonc_with_comments_is_left_alone_and_the_entry_is_printed() {
 }
 
 #[test]
+fn an_opencode_jsonc_that_is_not_even_jsonc_is_a_syntax_error() {
+    let home = tempfile::tempdir().unwrap();
+    let h = home.path();
+    put(h, OC_JSONC, "{\n  // mine\n  \"theme\": \n}\n");
+    let r = setup(h, false);
+    let line = agent(&r, "opencode").line();
+    assert!(line.contains("opencode.jsonc has a syntax error"), "{line}");
+    assert!(!line.contains("has comments"), "{line}");
+    assert_eq!(get(h, OC_JSONC), "{\n  // mine\n  \"theme\": \n}\n");
+}
+
+#[test]
 fn strip_jsonc_takes_out_comments_and_trailing_commas_only() {
     let text = "{\"a\": \"// not a comment\", /* x */ \"b\": [1, 2,], // y\n \"c\": \"\\\"/*\",}";
     assert_eq!(
@@ -427,7 +440,9 @@ fn the_opencode_plugin_runs_hooks_and_injects_their_text() {
     let d = tempfile::tempdir().unwrap();
     let dir = d.path();
     let log = dir.join("calls.log");
-    let exe = dir.join("lightbulb");
+    // A path a shell or JS literal could trip on.
+    let exe = dir.join("it's a dir").join("lightbulb");
+    fs::create_dir(exe.parent().unwrap()).unwrap();
     fs::write(
         &exe,
         format!(
@@ -453,12 +468,22 @@ const client = { session: {
   prompt: async (o) => { prompts.push(o); return {}; },
 } };
 const h = await Lightbulb({ client, directory: "/tmp/proj" });
+const tool = (id) => h["tool.execute.after"]({ tool: "bash", sessionID: id, callID: "c", args: {} }, {});
+const idle = (id) => h.event({ event: { type: "session.idle", properties: { sessionID: id } } });
 await h.event({ event: { type: "session.created", properties: { info: { id: "ses_a" } } } });
+// ses_b: no chat.message seen (resumed before the plugin loaded), so it is never pushed to.
+await h.event({ event: { type: "session.created", properties: { info: { id: "ses_b" } } } });
 await h.event({ event: { type: "session.created", properties: { info: { id: "child1", parentID: "ses_a" } } } });
-await h["tool.execute.after"]({ tool: "bash", sessionID: "ses_a", callID: "c", args: {} }, {});
-await h["tool.execute.after"]({ tool: "bash", sessionID: "child1", callID: "c", args: {} }, {});
-await h["tool.execute.after"]({ tool: "bash", sessionID: "child2", callID: "c", args: {} }, {});
-await h.event({ event: { type: "session.idle", properties: { sessionID: "ses_a" } } });
+await h["chat.message"](
+  { sessionID: "ses_a", agent: "plan", model: { providerID: "p", modelID: "m" }, variant: "high" },
+  { message: { sessionID: "ses_a", role: "user", agent: "plan", model: { providerID: "p", modelID: "m" } }, parts: [] },
+);
+await tool("ses_a");
+await tool("ses_b");
+await tool("child1");
+await tool("child2");
+await idle("ses_a");
+await idle("ses_b");
 await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_a" } } } });
 await h.event({ event: { type: "message.updated", properties: {} } });
 await new Promise((r) => setTimeout(r, 50));
@@ -475,21 +500,34 @@ console.log(JSON.stringify(prompts));
         String::from_utf8_lossy(&out.stderr)
     );
     let prompts: Value = serde_json::from_slice(&out.stdout).unwrap();
-    let part = json!([{"type": "text", "text": "mail"}]);
-    assert_eq!(
-        prompts,
-        json!([
-            {"path": {"id": "ses_a"}, "body": {"parts": part, "noReply": true}},
-            {"path": {"id": "ses_a"}, "body": {"parts": part}},
-        ])
-    );
-    let payload = |id: &str| format!(r#"{{"session_id":"{id}","cwd":"/tmp/proj"}}"#);
+    // Every push keeps the session's own agent and model: mail never switches plan to build.
+    let body = |no_reply: bool| {
+        let mut b = json!({"parts": [{"type": "text", "text": "mail"}], "agent": "plan",
+            "model": {"providerID": "p", "modelID": "m"}, "variant": "high"});
+        if no_reply {
+            b["noReply"] = json!(true);
+        }
+        json!({"path": {"id": "ses_a"}, "body": b})
+    };
+    assert_eq!(prompts, json!([body(true), body(false)]));
+    // A session with no agent recorded asks for no mail, so it stays in the inbox.
+    let call = |arg: &str, id: &str, mail: bool| {
+        format!(
+            "opencode {arg} {{\"session_id\":\"{id}\",\"cwd\":\"/tmp/proj\",\"mail\":{mail}}}\n"
+        )
+    };
     assert_eq!(
         fs::read_to_string(&log).unwrap(),
-        format!(
-            "opencode session-start {p}\nopencode post-tool-use {p}\nopencode stop {p}\nopencode session-end {p}\n",
-            p = payload("ses_a")
-        )
+        [
+            call("session-start", "ses_a", false),
+            call("session-start", "ses_b", false),
+            call("post-tool-use", "ses_a", true),
+            call("post-tool-use", "ses_b", false),
+            call("stop", "ses_a", true),
+            call("stop", "ses_b", false),
+            call("session-end", "ses_a", true),
+        ]
+        .concat()
     );
 }
 

@@ -129,7 +129,8 @@ pub fn output(h: &Hook, text: &str) -> Value {
 /// Runs one hook; `Ok(Some(stdout))` when there is something for the agent.
 pub fn run(agent: &str, event: &str, stdin: &str) -> Result<Option<String>> {
     crate::telemetry::sync_env_optout(&crate::paths::state_path());
-    let Some(h) = normalize(agent, event, &serde_json::from_str(stdin)?) else {
+    let payload: Value = serde_json::from_str(stdin)?;
+    let Some(h) = normalize(agent, event, &payload) else {
         return Ok(None);
     };
     // Cursor runs Claude's hooks too, and ours are installed for both: its own hooks own the
@@ -186,7 +187,9 @@ pub fn run(agent: &str, event: &str, stdin: &str) -> Result<Option<String>> {
     if !key.is_string() {
         return Err(format!("register: {r}").into());
     }
-    if !takes_mail(&h) {
+    // Our OpenCode plugin sends `mail: false` when it could not hand mail over (it has not
+    // seen the session's agent and model yet): the mail waits for `check_inbox`.
+    if !takes_mail(&h) || (h.provider == "opencode" && payload["mail"] == false) {
         return Ok(None);
     }
     let r = conn.call("inbox", json!({ "key": key, "caller": proc_json(&me) }))?;

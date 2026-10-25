@@ -62,13 +62,13 @@ pub(super) fn configure(ctx: &Ctx, r: &mut AgentReport) -> Result<Owner> {
 /// entry there already (pasted by the person) counts; otherwise the person is told what to
 /// paste in or take out.
 fn commented(ctx: &Ctx, path: &Path, text: &str, entry: &Value) -> Result<Owner> {
-    let current = serde_json::from_str::<Value>(&strip_jsonc(text))
-        .map(|d| d["mcp"][ctx.server].clone())
-        .unwrap_or_default();
-    let ours = super::json_command(&current) == Some(ctx.exe);
+    let doc = serde_json::from_str::<Value>(&strip_jsonc(text))
+        .map_err(|e| format!("{} has a syntax error ({e})", path.display()))?;
+    let current = &doc["mcp"][ctx.server];
+    let ours = super::json_command(current) == Some(ctx.exe);
     let left = format!("{} has comments, so setup left it alone", path.display());
     match (ctx.remove, ours) {
-        (false, true) if &current == entry => Ok(Owner::Ours),
+        (false, true) if current == entry => Ok(Owner::Ours),
         (true, false) => Ok(Owner::Absent),
         (false, _) => Err(format!(
             "{left}; add this inside its \"mcp\" object yourself: \"{}\": {entry}",
@@ -83,27 +83,31 @@ fn commented(ctx: &Ctx, path: &Path, text: &str, entry: &Value) -> Result<Owner>
 
 /// The plugin's source, with this executable in it.
 pub(super) fn plugin_js(ctx: &Ctx) -> String {
-    let runs: String = [
-        ("session-start", "session.created"),
-        ("post-tool-use", "tool.execute.after"),
-        ("stop", "session.idle"),
-        ("session-end", "session.deleted"),
-    ]
-    .iter()
-    .map(|(arg, on)| format!("//   {}   (on {on})\n", ctx.hook_command("opencode", arg)))
-    .collect();
+    // The executable appears only in this JSON string literal (valid JS for any path), never
+    // in a comment a line break in the path could end.
     let exe = serde_json::to_string(ctx.exe).expect("a string");
     format!(
         r#"// Lightbulb: written by `lightbulb setup` and deleted by `lightbulb setup --remove`;
 // edits here are overwritten. For each OpenCode session that is not a subagent's it runs
-{runs}// with {{session_id, cwd}} on stdin, and puts the text a hook hands back into the session.
+//   EXE hook opencode session-start   (on session.created)
+//   EXE hook opencode post-tool-use   (on tool.execute.after)
+//   EXE hook opencode stop            (on session.idle)
+//   EXE hook opencode session-end     (on session.deleted)
+// with {{session_id, cwd, mail}} on stdin, and puts the text a hook hands back into the session.
 // A hook that fails or takes over 10 s is ignored: OpenCode is never held up.
+// Mail goes in only with the session's own agent and model (seen in chat.message), so a
+// teammate's message can never move a session from plan to build or change its model. Until
+// they are seen, `mail: false` leaves the mail waiting for check_inbox.
 // Event and hook shapes, from OpenCode v1.18.32:
 // https://github.com/anomalyco/opencode/blob/v1.18.32/packages/sdk/js/src/gen/types.gen.ts
 //   (session.created/deleted carry properties.info: Session {{id, parentID?}};
 //    session.idle carries properties.sessionID)
 // https://github.com/anomalyco/opencode/blob/v1.18.32/packages/plugin/src/index.ts
-//   ("tool.execute.after" input: {{tool, sessionID, callID, args}})
+//   ("tool.execute.after" input: {{tool, sessionID, callID, args}};
+//    "chat.message" input: {{sessionID, agent?, model?, variant?}}, output: {{message: UserMessage}},
+//    UserMessage {{agent, model: {{providerID, modelID}}}} in types.gen.ts above)
+// https://github.com/anomalyco/opencode/blob/v1.18.32/packages/opencode/src/session/prompt.ts
+//   (a prompt with no agent runs the default agent; with noReply it is only saved)
 import {{ spawn }} from "node:child_process"
 
 const EXE = {exe}
@@ -111,6 +115,8 @@ const EXE = {exe}
 export const Lightbulb = async ({{ client, directory }}) => {{
   // Session id -> whether it is a subagent's (has a parentID).
   const child = new Map()
+  // Session id -> {{agent, model, variant?}} of its latest user message.
+  const who = new Map()
   const isChild = async (id) => {{
     if (!child.has(id)) {{
       try {{
@@ -128,6 +134,7 @@ export const Lightbulb = async ({{ client, directory }}) => {{
       let out = ""
       try {{
         const p = spawn(EXE, ["hook", "opencode", arg], {{ stdio: ["pipe", "pipe", "ignore"] }})
+        p.stdout.setEncoding("utf8")
         const timer = setTimeout(() => {{
           try {{ p.kill() }} catch {{}}
           done(null)
@@ -146,17 +153,33 @@ export const Lightbulb = async ({{ client, directory }}) => {{
           }}
         }})
         p.stdin.on("error", () => {{}})
-        p.stdin.end(JSON.stringify({{ session_id: id, cwd: directory }}))
+        p.stdin.end(JSON.stringify({{ session_id: id, cwd: directory, mail: who.has(id) }}))
       }} catch {{
         done(null)
       }}
     }})
   // noReply: the text joins the session without starting a reply (the running turn reads it).
-  const say = (id, text, noReply) =>
-    client.session
-      .prompt({{ path: {{ id }}, body: {{ parts: [{{ type: "text", text }}], noReply }} }})
+  // ponytail: a prompt that fails loses the mail (the hook already took it from the inbox);
+  // a peek-then-ack hook would keep it.
+  const say = (id, text, noReply) => {{
+    const w = who.get(id)
+    if (!w) return
+    return client.session
+      .prompt({{ path: {{ id }}, body: {{ parts: [{{ type: "text", text }}], noReply, ...w }} }})
       .catch(() => {{}})
+  }}
   return {{
+    "chat.message": async (input, output) => {{
+      try {{
+        const m = output?.message
+        if (!input?.sessionID || !m?.agent || !m?.model) return
+        who.set(input.sessionID, {{
+          agent: m.agent,
+          model: m.model,
+          ...(input.variant ? {{ variant: input.variant }} : {{}}),
+        }})
+      }} catch {{}}
+    }},
     event: async ({{ event }}) => {{
       try {{
         const props = event?.properties ?? {{}}
@@ -166,7 +189,10 @@ export const Lightbulb = async ({{ client, directory }}) => {{
           child.set(info.id, !!info.parentID)
           if (info.parentID) return
           await hook(event.type === "session.created" ? "session-start" : "session-end", info.id)
-          if (event.type === "session.deleted") child.delete(info.id)
+          if (event.type === "session.deleted") {{
+            child.delete(info.id)
+            who.delete(info.id)
+          }}
         }} else if (event.type === "session.idle") {{
           const id = props.sessionID
           if (!id || (await isChild(id))) return
