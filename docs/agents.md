@@ -59,7 +59,7 @@ trust it (in Codex, `/hooks`).
 |---|---|
 | `~/.cursor/hooks.json` | Hooks for `sessionStart`, `beforeSubmitPrompt`, `postToolUse` (matcher `*`), `stop` and `sessionEnd` (timeout 10 s). |
 | `~/.cursor/mcp.json` | `mcpServers.lightbulb-network`: `{"type": "stdio", "command": "<path>", "args": ["mcp"]}`. |
-| `~/.cursor/cli-config.json` | `Mcp(lightbulb-network:*)` in `permissions.allow`. Only if Cursor already made this file. |
+| `~/.cursor/cli-config.json` | `Mcp(lightbulb-network:*)` in `permissions.allow`. Created if missing (`{"version": 1, ...}`). Syntax: cursor.com/docs/cli/reference/permissions. |
 
 Cursor also runs Claude Code's hooks. Lightbulb ignores a Claude Code hook that Cursor runs, so
 one Cursor conversation is one session, not two.
@@ -70,6 +70,8 @@ one Cursor conversation is one session, not two.
 |---|---|
 | `~/.grok/hooks/lightbulb.json` | A file of our own with the five hooks (timeout 10 s; `SessionEnd` 3 s; `PostToolUse` matcher `*`). It is never backed up, because it is only ours. |
 | `~/.grok/config.toml` | `[mcp_servers.lightbulb-network]` with `command`, `args` and `enabled = true`, and `MCPTool(lightbulb-network__*)` in `permission.allow`. |
+
+Grok runs hooks only in folders you trust: run `/hooks-trust` in Grok or start it with `--trust` (saved in `~/.grok/trusted_folders.toml`). Lightbulb never trusts a folder for you; setup and `doctor` remind you. Source: docs.x.ai/build/features/hooks.
 
 Grok's subagent hooks are ignored, and so is a stop that is not the end of a turn.
 

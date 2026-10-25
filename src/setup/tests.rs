@@ -217,11 +217,30 @@ fn setup_writes_cursor_hooks_and_mcp_and_backs_up_once() {
 }
 
 #[test]
-fn cursor_cli_config_is_edited_never_created() {
+fn cursor_cli_config_is_created_and_removed_with_our_rule() {
     let home = tempfile::tempdir().unwrap();
-    fs::create_dir(home.path().join(".cursor")).unwrap();
-    setup(home.path(), false);
-    assert!(!home.path().join(".cursor/cli-config.json").exists());
+    let h = home.path();
+    fs::create_dir(h.join(".cursor")).unwrap();
+    setup(h, false);
+    assert_eq!(
+        json_at(h, ".cursor/cli-config.json"),
+        json!({"version": 1, "permissions": {"allow": ["Mcp(lightbulb-network:*)"]}})
+    );
+    setup(h, true);
+    assert_eq!(
+        json_at(h, ".cursor/cli-config.json")["permissions"]["allow"],
+        json!([])
+    );
+}
+
+#[test]
+fn grok_line_says_hooks_need_trusted_folders() {
+    let r = AgentReport {
+        name: "grok",
+        state: State::Connected("lightbulb-network".into()),
+        ..Default::default()
+    };
+    assert!(r.line().contains("/hooks-trust"), "{}", r.line());
 }
 
 #[test]

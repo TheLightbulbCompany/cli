@@ -10,8 +10,7 @@
 //! only while the MCP entry is ours.
 //!
 //! A vendor config file that is missing is created, but only when that agent's home
-//! directory exists (the agent reads it from there); Cursor's `cli-config.json` is the
-//! exception: it is edited only if Cursor made it. Backups, temp files and new files are
+//! directory exists (the agent reads it from there). Backups, temp files and new files are
 //! created with the source file's mode (0600 for a new file), never wider.
 
 mod claude;
@@ -292,6 +291,9 @@ impl AgentReport {
             State::Failed { why, .. } => format!("{who}: not connected — {why}"),
             State::Removed => format!("{who}: removed"),
         };
+        if self.name == "grok" && self.connected() {
+            line.push_str("; hooks run only in folders you trust (/hooks-trust or grok --trust)");
+        }
         for note in &self.notes {
             line.push_str(&format!("; {note}"));
         }
