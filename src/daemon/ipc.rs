@@ -745,9 +745,10 @@ pub(crate) async fn finish(daemon: &Daemon, from: &Key, mut r: mail::Receipt, wa
             .filter(|m| m.key != daemon.identity.key)?;
         let mine = m.person_id == team.roster.person_of(&daemon.identity.key);
         let person = if mine { "you".into() } else { label::name(m) };
-        Some((m.key.clone(), m.computer.clone(), person))
+        let bell = team.roster.wakes.contains_key(&m.key);
+        Some((m.key.clone(), m.computer.clone(), person, bell))
     });
-    let Some((member, computer, person)) = member else {
+    let Some((member, computer, person, bell)) = member else {
         return with_thread(&r);
     };
     if wait {
@@ -756,7 +757,10 @@ pub(crate) async fn finish(daemon: &Daemon, from: &Key, mut r: mail::Receipt, wa
     let mut v = with_thread(&r);
     v["where"] = computer.into();
     v["person"] = person.into();
-    v["online"] = daemon.peers.is_online(&member).into();
+    let online = daemon.peers.is_online(&member);
+    v["online"] = online.into();
+    // A parked workspace with a doorbell: the outbox rang it, so it is starting, not gone.
+    v["waking"] = (bell && !online).into();
     let latest = daemon.latest.lock().unwrap();
     let to = r.to.as_deref().unwrap_or_default();
     if let Some(s) = latest
