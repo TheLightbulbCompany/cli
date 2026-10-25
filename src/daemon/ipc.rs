@@ -220,7 +220,7 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
         "inbox.ack" if instance => crate::embed::ack(id, body, daemon),
         "inbox.peek" | "inbox.ack" => peek_or_ack(id, op, body, daemon).await,
         "cloud.sessions.set" => super::net_ops::cloud_sessions_set(id, body, daemon).await,
-        "app.send" | "app.inbox" | "app.receipt" if instance => {
+        "app.send" | "app.inbox" | "app.ack" | "app.unread" | "app.receipt" if instance => {
             crate::app_send::op(id, op, body, daemon).await
         }
         "status" => {
