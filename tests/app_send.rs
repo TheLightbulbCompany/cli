@@ -4,13 +4,13 @@
 //! the hub-era relay to a person's own computer is gone, and a computer drops what the member
 //! still sends of it.
 //!
-//! The world: person P ("Aden") on Mac A ("mac", off unless a test starts it) and teammate Q's
-//! Mac B ("mbp"), both signed into workspace W1, and W1's member. One roster, seeded in every
-//! store before anything starts.
+//! The world: person P ("Aden") on Mac A ("mac", off unless a test starts it), teammate Q's
+//! Mac B ("mbp"), and workspace W1's member. One roster, seeded in every store before anything
+//! starts.
 
 mod common;
 
-use common::{admit, call, now_s, online, person_proof, played, Env};
+use common::{admit, call, now_s, online, played, Env};
 use lightbulb::embed::Instance;
 use lightbulb::identity::Identity;
 use lightbulb::net::frames::{self, Frame};
@@ -33,28 +33,17 @@ struct World {
     w1: tempfile::TempDir,
 }
 
-/// Person `pid` (proof name `name`) on `computer`, signed into `ws`.
-fn person(who: &Identity, pid: &str, name: &str, computer: &str, ws: &str) -> Value {
-    json!({"person_id": pid, "computer": computer,
-        "proof": person_proof(who, pid, name, Some(ws))})
-}
-
 fn world() -> World {
     let (a, b) = (Env::new(), Env::new());
     let w1 = tempfile::tempdir().unwrap();
     let iw1 = Identity::load_or_create(w1.path()).unwrap();
     let ia = a.identity();
-    let mut gb = json!({"member": ia.key, "name": "aden", "kind": "computer",
+    let gb = json!({"member": ia.key, "name": "aden", "computer": "mac",
         "role": "founder", "ticket_id": "", "team_name": "acme"});
-    for (k, v) in person(&ia, P, "Aden", "mac", "W1").as_object().unwrap() {
-        gb[k] = v.clone();
-    }
     let g = Entry::signed(&ia, vec![], Kind::Admit, gb, 1);
     let ib = b.identity();
-    let e1 = admit(&ia, &g, &ib, "quinn", person(&ib, Q, "Quinn", "mbp", "W1"));
-    let ws = json!({"kind": "cloud", "person_id": "ws:W1",
-        "proof": common::ws_proof(&iw1, "W1", NAME)});
-    let e2 = admit(&ia, &e1, &iw1, NAME, ws);
+    let e1 = admit(&ia, &g, &ib, "quinn", json!({"computer": "mbp"}));
+    let e2 = admit(&ia, &e1, &iw1, NAME, json!({}));
     let mut stores: Vec<Store> = [&a, &b].iter().map(|e| e.store()).collect();
     stores.push(Store::open(&w1.path().join("state.db")).unwrap());
     for s in &stores {
@@ -62,8 +51,13 @@ fn world() -> World {
             roster::accept(s, e, 10).unwrap();
         }
     }
+    // W1's member knows P's and Q's computers (as its person links would have recorded them).
+    let w1s = &stores[2];
+    w1s.put_person(&ia.key, P, 1).unwrap();
+    w1s.put_person(&ib.key, Q, 1).unwrap();
     // Q lets the workspace's agents send without asking.
-    policy::set_switch(&b.store(), true, "local", 1).unwrap();
+    let accept = policy::Verdict::Accept;
+    policy::set_person(&b.store(), &iw1.key, accept, "local", 1).unwrap();
     World { a, b, w1 }
 }
 
@@ -76,7 +70,8 @@ impl World {
             .unwrap();
         online(&i, 1).await;
         let app = json!({"name": APP, "agent": "chatgpt", "title": TITLE});
-        ok(&i, "cloud.sessions.set", json!({ "sessions": [app] })).await;
+        let set = json!({ "sessions": [app], "members": [P, Q] });
+        ok(&i, "cloud.sessions.set", set).await;
         i
     }
 
@@ -139,7 +134,11 @@ async fn the_recipient_reads_it_as_app_via_person() {
     let q = w.q();
     ok(&i, "app.send", send_body(&q, "r1")).await;
     let m = w.b.take_one(&q);
-    assert_eq!(m["label"], TITLE, "{m}");
+    assert_eq!(
+        m["label"],
+        format!("{NAME}'s {TITLE} (not verified)"),
+        "{m}"
+    );
     // Q answers; the app reads it from its own session, taken and read.
     w.b.send(&q, &w.app(), "hi chatgpt", "q1", m["id"].as_str());
     let inbox = json!({"app": "chatgpt", "person": P});

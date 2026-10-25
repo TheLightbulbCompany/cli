@@ -1,5 +1,6 @@
 //! An embedded instance: the engine in process (no socket, launchd, hooks or dialog) as a
-//! Lightbulb workspace's one `kind: cloud` member, whose sessions are the workspace's agents.
+//! Lightbulb workspace's member, a member like any other, whose sessions are the workspace's
+//! agents and whose members list says whose computers they answer.
 
 mod common;
 
@@ -8,7 +9,6 @@ use lightbulb::embed::Instance;
 use lightbulb::identity::{key_bytes, Identity};
 use lightbulb::net::frames::Frame;
 use lightbulb::net::ALPN;
-use lightbulb::policy;
 use lightbulb::roster::{self, Entry, Kind};
 use lightbulb::store::Store;
 use serde_json::{json, Value};
@@ -60,60 +60,55 @@ async fn event(rx: &mut Receiver<Value>, pred: impl Fn(&Value) -> bool) -> Value
     .expect("the event within 10 s")
 }
 
-/// A genesis by `id` ("prasiddha" on "mac", team "acme") signed into workspace `ws`.
-fn genesis(id: &Identity, ws: Option<&str>) -> Entry {
-    let mut body = json!({"member": id.key, "name": "prasiddha", "computer": "mac",
-        "person_id": id.key, "kind": "computer", "role": "founder", "ticket_id": "",
-        "team_name": "acme"});
-    if let Some(ws) = ws {
-        signed_into(&mut body, id, "prasiddha", ws);
-    }
+/// A genesis by `id` ("prasiddha" on "mac", team "acme").
+fn genesis(id: &Identity) -> Entry {
+    let body = json!({"member": id.key, "name": "prasiddha", "computer": "mac",
+        "role": "founder", "ticket_id": "", "team_name": "acme"});
     Entry::signed(id, vec![], Kind::Admit, body, 1)
 }
 
-/// A running computer A in workspace W1, founder of its own network, whose dialogs answer
-/// Allow and whose own workspace's member may write without a hold.
+/// A running computer A, founder of its own network, whose dialogs answer Allow.
 fn computer_a() -> Env {
     let a = Env::new();
-    let store = a.store();
-    roster::accept(&store, &genesis(&a.identity(), Some("W1")), 10).unwrap();
-    policy::set_switch(&store, true, "local", 1).unwrap();
+    roster::accept(&a.store(), &genesis(&a.identity()), 10).unwrap();
     a.daemon(false, "", &[dialog("Allow")]);
     a
 }
 
-/// `who`'s admit `body` as person `p-<short>` signed into workspace `ws`: a member's workspace
-/// is its proof's.
-fn signed_into(body: &mut Value, who: &Identity, name: &str, ws: &str) {
-    let person = format!("p-{}", who.short);
-    body["proof"] = common::person_proof(who, &person, name, Some(ws)).into();
-    body["person_id"] = person.into();
-}
-
-/// Instance `i`'s workspace proof for `ws` (`common::issuer`).
-async fn proof(i: &Instance, ws: &str) -> String {
-    let me = ok(i, "identity.get", json!({})).await;
-    let key = me["member_key"].as_str().unwrap();
-    common::issuer::workspace_proof(key, ws, NAME, &[], now_s())
-}
-
-async fn join(i: &Instance, a: &Env) -> Value {
+/// The instance joins A's network through A's ask link (A allows it); A then lets the
+/// workspace's agents write without a hold, and the instance's home records A as `user_a`
+/// (what a person link of its own would have).
+async fn join(i: &Instance, a: &Env, home: &Path) -> Value {
     let t = a.ask(json!({"id": 1, "op": "team.invite"}));
     let ticket = t["ticket"].as_str().unwrap();
-    ok(
-        i,
-        "team.join",
-        json!({"ticket": ticket, "name": NAME, "kind": "cloud", "proof": proof(i, "W1").await}),
-    )
-    .await
+    let r = ok(i, "team.join", json!({"ticket": ticket, "name": NAME})).await;
+    let key = ok(i, "identity.get", json!({})).await["member_key"].clone();
+    let accept = json!({"id": 1, "op": "policy.set", "person_id": key, "value": "accept"});
+    if r["state"] == "admitted" {
+        assert_eq!(common::person(a, accept)["ok"], true);
+    }
+    as_user_a(home, &a.identity());
+    r
 }
 
+/// Records `who` as `user_a`'s computer in the instance's home (`persons`).
+fn as_user_a(home: &Path, who: &Identity) {
+    let store = Store::open(&home.join("state.db")).unwrap();
+    store.put_person(&who.key, "user_a", now_s()).unwrap();
+}
+
+/// Declares `names` (agent: the name uppercased), answering `user_a`'s computers.
 async fn declare(i: &Instance, names: &[&str]) {
     let s: Vec<Value> = names
         .iter()
         .map(|n| json!({"name": n, "agent": n.to_uppercase(), "title": format!("{n} agent")}))
         .collect();
-    ok(i, "cloud.sessions.set", json!({ "sessions": s })).await;
+    ok(
+        i,
+        "cloud.sessions.set",
+        json!({ "sessions": s, "members": ["user_a"] }),
+    )
+    .await;
 }
 
 async fn me(i: &Instance) -> String {
@@ -129,7 +124,7 @@ async fn embedded_instance_joins_and_talks_without_a_socket() {
     let home = tempfile::tempdir().unwrap();
     let i = start(home.path(), &[&a], None).await;
     let mut events = i.events();
-    let j = join(&i, &a).await;
+    let j = join(&i, &a, home.path()).await;
     assert_eq!(j["state"], "admitted", "{j}");
     assert!(!home.path().join("sock").exists());
     declare(&i, &["friday"]).await;
@@ -144,7 +139,8 @@ async fn embedded_instance_joins_and_talks_without_a_socket() {
         .find(|s| s["session_id"] == friday.as_str())
         .cloned()
         .unwrap();
-    assert_eq!(rec["person_id"], "ws:W1");
+    let key = ok(&i, "identity.get", json!({})).await["member_key"].clone();
+    assert_eq!(rec["person_id"], key);
     assert_eq!(rec["agent"], "FRIDAY");
 
     let sa = common::session(&a, "a1");
@@ -234,12 +230,8 @@ async fn person_only_ops_are_refused_in_process() {
     // Its solo network is the workspace's.
     let me = ok(&i, "identity.get", json!({})).await;
     assert_eq!(
-        (
-            me["kind"].as_str(),
-            me["name"].as_str(),
-            me["computer"].as_str()
-        ),
-        (Some("cloud"), Some(NAME), Some(NAME))
+        (me["name"].as_str(), me["computer"].as_str()),
+        (Some(NAME), Some(NAME))
     );
     // One engine per home; a snapshot never lands in it.
     assert!(try_start(home.path(), &[], None).await.is_err());
@@ -255,7 +247,7 @@ async fn person_only_ops_are_refused_in_process() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn undeclared_cloud_session_cannot_send() {
+async fn an_undeclared_session_cannot_send() {
     let home = tempfile::tempdir().unwrap();
     let i = start(home.path(), &[], None).await;
     declare(&i, &["friday"]).await;
@@ -276,88 +268,16 @@ async fn undeclared_cloud_session_cannot_send() {
     i.shutdown().await;
 }
 
-/// A workspace joins with no proof: the person at computer A allows it, and it is a cloud member
-/// named for its workspace, its own key's person, with no verified workspace. A computer still
-/// cannot join as cloud (`tests/join.rs`).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_workspace_joins_without_a_proof() {
-    let a = computer_a();
-    let home = tempfile::tempdir().unwrap();
-    let i = start(home.path(), &[&a], None).await;
-    // A reusable link does not take it: a workspace with no proof joins through a once link.
-    let t = a.ask(json!({"id": 1, "op": "team.invite"}));
-    let r = ok(
-        &i,
-        "team.join",
-        json!({"ticket": t["ticket"], "name": NAME, "kind": "cloud"}),
-    )
-    .await;
-    assert_eq!(r["state"], "refused", "{r}");
-    let t = a.ask(json!({"id": 1, "op": "team.invite", "mode": "once"}));
-    let r = ok(
-        &i,
-        "team.join",
-        json!({"ticket": t["ticket"], "name": NAME, "kind": "cloud"}),
-    )
-    .await;
-    assert_eq!(r["state"], "admitted", "{r}");
-    let me = ok(&i, "identity.get", json!({})).await;
-    let team = ok(&i, "team.get", json!({})).await;
-    let mine = (team["members"].as_array().unwrap().iter())
-        .find(|m| m["key"] == me["member_key"])
-        .cloned()
-        .unwrap();
-    assert_eq!(
-        (
-            mine["kind"].as_str(),
-            mine["name"].as_str(),
-            mine["person_id"].as_str()
-        ),
-        (Some("cloud"), Some(NAME), me["member_key"].as_str()),
-        "{mine}"
-    );
-    assert!(mine["workspace"].is_null(), "{mine}");
-    i.shutdown().await;
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn workspace_instance_joins_and_leaves_in_process() {
     let a = computer_a();
     let home = tempfile::tempdir().unwrap();
     let i = start(home.path(), &[&a], None).await;
-    // Only as the workspace member.
-    let t = a.ask(json!({"id": 1, "op": "team.invite"}));
-    let r = call(
-        &i,
-        "team.join",
-        json!({"ticket": t["ticket"], "name": NAME, "kind": "computer"}),
-    )
-    .await;
-    assert_eq!(r["error"], "bad_request", "{r}");
-    // A proof whose `sub` is not its workspace's: refused.
-    let key = ok(&i, "identity.get", json!({})).await["member_key"].clone();
-    let bad = common::issuer::mint(&json!({"iss": "test", "iat": now_s(), "exp": now_s() + 600,
-        "sub": "ws:W2", "name": NAME, "computer": key, "kind": "workspace",
-        "workspace": {"id": "W1", "name": NAME}, "agents": []}));
-    let r = ok(
-        &i,
-        "team.join",
-        json!({"ticket": t["ticket"], "name": NAME, "kind": "cloud", "proof": bad}),
-    )
-    .await;
-    assert_eq!(
-        (r["state"].as_str(), r["reason"].as_str()),
-        (Some("refused"), Some("bad_request")),
-        "{r}"
-    );
-    assert_eq!(join(&i, &a).await["state"], "admitted");
-    let again = join(&i, &a).await;
+    assert_eq!(join(&i, &a, home.path()).await["state"], "admitted");
+    let again = join(&i, &a, home.path()).await;
     assert_eq!(again["reason"], "already_in_team", "{again}");
     let me = ok(&i, "identity.get", json!({})).await;
-    assert_eq!(
-        (me["kind"].as_str(), me["person_id"].as_str()),
-        (Some("cloud"), Some("ws:W1"))
-    );
+    assert_eq!(me["person_id"], me["member_key"], "{me}");
     assert_eq!(
         call(&i, "team.invite", json!({})).await["error"],
         "unsupported"
@@ -372,12 +292,8 @@ async fn workspace_instance_joins_and_leaves_in_process() {
         .cloned()
         .unwrap();
     assert_eq!(
-        (
-            mine["person_id"].as_str(),
-            mine["workspace"].as_str(),
-            mine["kind"].as_str()
-        ),
-        (Some("ws:W1"), Some("W1"), Some("cloud"))
+        (mine["person_id"].as_str(), mine["name"].as_str()),
+        (key.as_str(), Some(NAME))
     );
     refused(
         &call(&i, "team.remove", json!({"member": a.identity().key})).await,
@@ -393,30 +309,22 @@ async fn workspace_instance_joins_and_leaves_in_process() {
 /// The three members an instance's test plays: identity, connection, endpoint.
 type Played = (Identity, Peer, iroh::Endpoint);
 
-/// An instance whose stored team (before it starts) is A (founder, W1), B (W2), C (no
-/// workspace) and itself, W1's member; returns its home, it and the three, connected.
+/// An instance whose stored team (before it starts) is A (founder, `user_a`'s computer in the
+/// instance's `persons`), B, C and itself; returns its home, it and the three, connected.
 async fn seeded(snapshot: Option<&Path>) -> (tempfile::TempDir, Instance, [Played; 3]) {
     let home = tempfile::tempdir().unwrap();
     let w = Identity::load_or_create(home.path()).unwrap();
     let (ia, ib, ic) = (identity(), identity(), identity());
-    let g = genesis(&ia, Some("W1"));
-    let mut b = json!({});
-    signed_into(&mut b, &ib, "bob", "W2");
-    let ab = common::admit(&ia, &g, &ib, "bob", b);
+    let g = genesis(&ia);
+    let ab = common::admit(&ia, &g, &ib, "bob", json!({}));
     let ac = common::admit(&ia, &ab, &ic, "carol", json!({}));
-    let aw = common::admit(
-        &ia,
-        &ac,
-        &w,
-        NAME,
-        json!({"kind": "cloud", "person_id": "ws:W1",
-        "proof": common::ws_proof(&w, "W1", NAME)}),
-    );
+    let aw = common::admit(&ia, &ac, &w, NAME, json!({}));
     let store = Store::open(&home.path().join("state.db")).unwrap();
     for e in [&g, &ab, &ac, &aw] {
         roster::accept(&store, e, 10).unwrap();
     }
     drop(store);
+    as_user_a(home.path(), &ia);
     let i = start(home.path(), &[], snapshot).await;
     let mut out = vec![];
     for id in [ia, ib, ic] {
@@ -458,21 +366,14 @@ async fn ask(p: &mut Peer, who: &Identity, rid: &str, to: &str) -> (String, Opti
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn only_own_workspace_computers_start_a_conversation() {
+async fn only_a_listed_persons_computers_reach_its_sessions() {
     let (home, i, [(ia, mut pa, _a), (ib, mut pb, _b), (ic, mut pc, _c)]) = seeded(None).await;
     declare(&i, &["friday"]).await;
     let friday = format!("{}/friday", me(&i).await);
-    let policy = Some("policy".to_string());
+    let no = ("refused".to_string(), Some("not_a_member".to_string()));
     assert_eq!(ask(&mut pa, &ia, "a1", &friday).await.0, "stored");
-    assert_eq!(
-        ask(&mut pb, &ib, "b1", &friday).await,
-        ("refused".into(), policy.clone())
-    );
-    assert_eq!(
-        ask(&mut pc, &ic, "c1", &friday).await,
-        ("refused".into(), policy.clone())
-    );
-    // Friday writes to C: C may answer for a day.
+    assert_eq!(ask(&mut pb, &ib, "b1", &friday).await, no);
+    // Friday writing to C first gives C no way in either.
     let to = format!("{}/codex:c1", ic.short);
     ok(
         &i,
@@ -480,41 +381,23 @@ async fn only_own_workspace_computers_start_a_conversation() {
         json!({"from": friday, "to": to, "text": "hello carol", "request_id": "f1"}),
     )
     .await;
-    let id = match pc.recv_where(|f| matches!(f, Frame::Envelope { .. })).await {
-        Frame::Envelope { id, .. } => id,
-        _ => unreachable!(),
-    };
-    // Until C's computer has taken it, C has not received it.
-    assert_eq!(
-        ask(&mut pc, &ic, "c2", &friday).await,
-        ("refused".into(), policy.clone())
-    );
-    let stored = Frame::Ack {
-        id,
-        state: "stored".into(),
-        reason: None,
-        limit: None,
-    };
-    pc.send(&stored).await;
-    let mut accepted = false;
-    for n in 0..50 {
-        if ask(&mut pc, &ic, &format!("c2-{n}"), &friday).await.0 == "stored" {
-            accepted = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert!(accepted, "C's answer is taken once friday's mail is stored");
-    let db = rusqlite::Connection::open(home.path().join("state.db")).unwrap();
-    db.execute(
-        "UPDATE messages SET sent_at = sent_at - 90000 WHERE from_key = ?1",
-        [&friday],
-    )
-    .unwrap();
-    assert_eq!(
-        ask(&mut pc, &ic, "c3", &friday).await,
-        ("refused".into(), policy)
-    );
+    assert_eq!(ask(&mut pc, &ic, "c1", &friday).await, no);
+    // Nothing held, nothing in the mailbox but A's.
+    assert_eq!(ok(&i, "holds", json!({})).await["holds"], json!([]));
+    let db = home.path().join("state.db");
+    assert_eq!(common::count(&db, "SELECT COUNT(*) FROM holds"), 0);
+    // A, removed from the team, is nobody's computer any more.
+    let store = Store::open(&db).unwrap();
+    let heads = roster::replay(&roster::entries(&store).unwrap()).heads;
+    let rm = Entry::signed(&ib, heads, Kind::Remove, json!({"member": ia.key}), now_s());
+    pb.send(&Frame::Roster {
+        entries: vec![rm],
+        more: false,
+    })
+    .await;
+    until(10, "A's person is forgotten", || {
+        store.person(&ia.key).unwrap().is_none()
+    });
     i.shutdown().await;
 }
 
@@ -664,19 +547,126 @@ async fn a_dropped_instance_shuts_down_before_its_home_is_free() {
     assert!(r.err().is_some_and(|e| e.to_string().contains("snapshot")));
 }
 
+/// The prod path, end to end: the instance founds its own network and mints a person link for
+/// `user_a` (in its `members`); computer A joins with it, finds `<instance>/friday` ("Friday")
+/// in its directory, writes to it (the instance's inbox for `friday` has it), and Friday's
+/// reply reaches A without a hold. Computer B, admitted through A's ask link, sees Friday too,
+/// but its message is refused `not_a_member`, with no hold on the instance.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_workspace_network_from_before_the_marker_is_founded_again() {
+async fn a_person_line_reaches_friday_and_an_unlisted_teammate_does_not() {
     let home = tempfile::tempdir().unwrap();
-    let w = Identity::load_or_create(home.path()).unwrap();
-    let old = genesis(&w, None); // the instance's own genesis, without `cloud`
-    let store = Store::open(&home.path().join("state.db")).unwrap();
-    roster::accept(&store, &old, 10).unwrap();
-    drop(store);
-    let i = start(home.path(), &[], None).await;
-    i.shutdown().await;
-    let entries = roster::entries(&Store::open(&home.path().join("state.db")).unwrap()).unwrap();
-    let roots: Vec<_> = entries.iter().filter(|e| e.parents.is_empty()).collect();
-    assert_eq!(roots.len(), 1, "only the new genesis is kept");
-    assert_eq!(roots[0].body["cloud"], true);
-    assert_ne!(roots[0].hash(), old.hash());
+    let i = common::instance(home.path(), &[], NAME, None, &[])
+        .await
+        .unwrap();
+    let friday_decl = json!([{"name": "friday", "agent": "Friday"}]);
+    ok(
+        &i,
+        "cloud.sessions.set",
+        json!({"sessions": friday_decl, "members": ["user_a"]}),
+    )
+    .await;
+    let w = me(&i).await;
+    let friday = format!("{w}/friday");
+    let key = ok(&i, "identity.get", json!({})).await["member_key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let port = ok(&i, "status", json!({})).await["port"].as_u64().unwrap();
+    let at_instance = format!("{key}@127.0.0.1:{port}");
+    let inv = ok(
+        &i,
+        "team.invite",
+        json!({"mode": "person", "for": "user_a", "name": "A"}),
+    )
+    .await;
+    let line = inv["line"].as_str().unwrap().to_string();
+    let ticket = line.split('\'').nth(1).unwrap().to_string();
+
+    // A joins with the person line, no Allow asked.
+    let a = Env::new();
+    a.daemon(
+        false,
+        "",
+        &[("LIGHTBULB_CONNECT_PEERS", at_instance.clone())],
+    );
+    let out = a.detached(&[common::EXE, "join", &ticket, "--name", "A"], "");
+    assert!(
+        out.status.success(),
+        "{}{}",
+        common::out(&out),
+        common::err(&out)
+    );
+    until(10, "A sees friday", || common::sees(&a, &friday));
+    let dir = a.ask(json!({"id": 1, "op": "directory"}));
+    let rec = (dir["sessions"].as_array().unwrap().iter())
+        .find(|s| s["session_id"] == friday.as_str())
+        .cloned()
+        .unwrap();
+    assert_eq!(rec["agent"], "Friday", "{rec}");
+
+    // A writes to Friday: in the instance's inbox for `friday`.
+    let sa = common::session(&a, "a1");
+    a.send(&sa, &friday, "hi friday", "a1", None);
+    until(10, "A's message is stored", || {
+        a.state(&sa, "a1") == "stored"
+    });
+    let got = ok(&i, "inbox", json!({"session": "friday"})).await;
+    let msgs = got["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 1, "{got}");
+    assert_eq!(msgs[0]["text"], "hi friday");
+    assert_eq!(msgs[0]["from"], sa.as_str());
+
+    // Friday's reply reaches A, held nowhere.
+    let r = ok(
+        &i,
+        "send",
+        json!({"from": friday, "to": sa, "text": "hello A", "request_id": "f1",
+               "reply_to": msgs[0]["id"]}),
+    )
+    .await;
+    assert!(r["receipt"].is_object(), "{r}");
+    until(10, "Friday's reply is in A's mailbox", || {
+        a.unread(&sa) == 1
+    });
+    let m = a.take_one(&sa);
+    assert_eq!(m["from"], friday.as_str());
+    let a_db = a.state.path().join("state.db");
+    assert_eq!(common::count(&a_db, "SELECT COUNT(*) FROM holds"), 0);
+
+    // B joins through A's ask link (A allows it), sees Friday, and is refused `not_a_member`.
+    let ask = common::invite(&a, "once");
+    let b = Env::new();
+    let peers = format!("{},{at_instance}", a.peer_arg());
+    b.daemon(false, "", &[("LIGHTBULB_CONNECT_PEERS", peers)]);
+    let (a_req, b_join) = std::thread::scope(|s| {
+        let join = s.spawn(|| b.detached(&[common::EXE, "join", &ask, "--name", "B"], ""));
+        let mut req = Value::Null;
+        until(20, "B's join request reaches A", || {
+            req = a.ask(json!({"id": 1, "op": "team.join_requests"}))["requests"][0]["id"].clone();
+            req.is_string()
+        });
+        let r = common::person(
+            &a,
+            json!({"id": 1, "op": "team.admit", "request": req, "verdict": "allow"}),
+        );
+        (r, join.join().unwrap())
+    });
+    assert_eq!(a_req["ok"], true, "{a_req}");
+    assert!(
+        b_join.status.success(),
+        "{}{}",
+        common::out(&b_join),
+        common::err(&b_join)
+    );
+    until(10, "B sees friday", || common::sees(&b, &friday));
+    let sb = common::session(&b, "b1");
+    b.send(&sb, &friday, "hi from b", "b1", None);
+    until(10, "B's message is refused", || {
+        b.state(&sb, "b1") == "refused"
+    });
+    assert_eq!(b.receipt(&sb, "b1")["reason"], "not_a_member");
+    let holds = ok(&i, "holds", json!({})).await;
+    assert_eq!(holds["holds"], json!([]), "{holds}");
+    let got = ok(&i, "inbox", json!({"session": "friday"})).await;
+    assert_eq!(got["messages"], json!([]), "{got}");
 }

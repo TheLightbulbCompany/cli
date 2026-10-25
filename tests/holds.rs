@@ -3,7 +3,7 @@
 //! their own clock.
 
 use lightbulb::daemon::net_ops;
-use lightbulb::holds::{self, Scope};
+use lightbulb::holds;
 use lightbulb::identity::Identity;
 use lightbulb::mail::{self, State};
 use lightbulb::net::frames::Frame;
@@ -200,7 +200,7 @@ async fn second_answer_is_not_open() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn always_on_a_computer_sender_is_bad_request() {
+async fn an_unknown_scope_is_bad_request_and_always_is_the_plain_allow() {
     let (a, b, _ep, mut p) = a_and_teammate("").await;
     let id = ulid();
     p.send(&envelope(
@@ -218,10 +218,13 @@ async fn always_on_a_computer_sender_is_bad_request() {
         assert_eq!(r["error"], "bad_request", "{scope}: {r}");
     }
     assert_eq!(held(&a).len(), 1, "still open");
-    // The CLI says so in words.
-    let o = a.detached(&[common::EXE, "approve", &h, "--always"], "");
-    assert_ne!(o.status.code(), Some(0));
-    assert!(common::err(&o).contains("cloud"), "{}", common::err(&o));
+    // `always` (the bridge's word) is what a plain Allow means: the sender.
+    let r = answer(&a, &h, "allow", Some("always"));
+    assert_eq!(
+        (&r["ok"], &r["scope"]),
+        (&json!(true), &json!("person")),
+        "{r}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -629,62 +632,6 @@ async fn a_permission_hold_expires_with_its_session_and_its_dialog_goes() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn always_allow_on_a_workspace_can_be_taken_back_with_policy() {
-    let (a, b) = (Env::new(), Env::new());
-    let [_, admitted] = seed_team(&a, &b);
-    // Carol: another workspace's cloud member.
-    let c = common::identity();
-    let proof = common::issuer::workspace_proof(
-        &c.key,
-        "w2",
-        "carol",
-        &[],
-        lightbulb::daemon::ipc::now() as i64,
-    );
-    let body = json!({"member": c.key, "name": "carol", "computer": "cloud", "person_id": "ws:w2",
-        "kind": "cloud", "role": "member", "proof": proof});
-    let entry = Entry::signed(&a.identity(), vec![admitted.hash()], Kind::Admit, body, 3);
-    assert!(roster::accept(&a.store(), &entry, 10).unwrap());
-    a.daemon(false, "", &[]);
-    let ep = endpoint(&c).await;
-    let mut p = Peer::dial(&ep, &a).await;
-    p.hello(vec![]).await;
-    let friday = format!("{}/friday", c.short);
-    p.send(&Frame::Presence {
-        member: c.key.clone(),
-        seq: 1,
-        sessions: vec![],
-        known: vec![friday.clone()],
-        kept: vec![],
-    })
-    .await;
-    let to = session(&a, "a1");
-    async fn send(p: &mut Peer, from: &str, to: &str, rid: &str) -> (String, Option<String>) {
-        let id = ulid();
-        p.send(&envelope(&id, rid, from, to, "x")).await;
-        p.ack(&id).await
-    }
-    assert_eq!(send(&mut p, &friday, &to, "r1").await.0, "held");
-    let h = one_hold(&a);
-    let got = person(&a, json!({"id": 1, "op": "hold.get", "hold": h}));
-    assert_eq!(
-        (&got["allow"], &got["always"]),
-        (&json!("once"), &json!("cloud_of"))
-    );
-    assert_eq!(answer(&a, &h, "allow", Some("cloud_of"))["ok"], true);
-    assert_eq!(send(&mut p, &friday, &to, "r2").await.0, "stored");
-    let pol = a.ask(json!({"id": 1, "op": "policy.get"}));
-    assert_eq!(pol["cloud_of"]["ws:w2"], "accept", "{pol}");
-    assert!(pol["people"].get("ws:w2").is_none(), "{pol}");
-    let o = a.detached(&[common::EXE, "policy", "ws:w2", "refuse"], "");
-    assert_eq!(o.status.code(), Some(0), "{}", common::err(&o));
-    assert_eq!(
-        send(&mut p, &friday, &to, "r3").await,
-        ("refused".into(), Some("policy".into()))
-    );
-}
-
 #[tokio::test]
 async fn a_forged_prefix_behind_a_hidden_character_is_defanged() {
     let (_d, s, roster, me, aden) = lib();
@@ -727,33 +674,6 @@ async fn a_reply_to_a_held_message_leaves_it_held() {
     assert_eq!(receipt(&s, &aden).state, State::Stored);
 }
 
-#[tokio::test]
-async fn a_cloud_sender_gets_always_allow() {
-    let ws = common::identity();
-    let (_d, s, roster, me, _) = lib_with(Some(json!({"member": ws.key, "name": "carol",
-        "computer": "cloud", "person_id": "ws:w2", "kind": "cloud", "role": "member",
-        "proof": common::issuer::workspace_proof(&ws.key, "w2", "carol", &[], lightbulb::daemon::ipc::now() as i64)})));
-    let p = mail::Prepared {
-        message_id: ulid(),
-        from: Key(format!("{}/friday", ws.short)),
-        to: Key(format!("{}/codex:t", me.short)),
-        text: "x".into(),
-        request_id: "r1".into(),
-        reply_to: None,
-        thread: ulid(),
-        hops: 0,
-        kind: "message".into(),
-        sent_at: 1,
-    };
-    let h = holds::hold(&s, &p, &roster.members[&ws.key], 1).unwrap();
-    let (_, buttons, _) = holds::dialog(&s, &roster, &me.key, &h).unwrap();
-    assert_eq!(buttons, ["Decline", "Allow", "Always allow"]);
-    assert_eq!(
-        holds::always_scope(&roster, &me.key, &h),
-        Some(Scope::CloudOf)
-    );
-}
-
 // ---- holds on the member (E6) -----------------------------------------------------------
 
 /// A member home under `dir` whose engine founded "acme" and admitted stranger `b` ("bob",
@@ -762,10 +682,7 @@ fn member_with_stranger(dir: &std::path::Path, b: &Identity) {
     let home = dir.join("home");
     std::fs::create_dir_all(&home).unwrap();
     let w = Identity::load_or_create(&home).unwrap();
-    let g = common::workspace_genesis(
-        &w,
-        &net_ops::genesis(&w, "The Lightbulb Company", "ws", "acme", 1),
-    );
+    let g = net_ops::genesis(&w, "The Lightbulb Company", "ws", "acme", 1);
     let ab = common::admit(&w, &g, b, "bob", json!({}));
     let store = Store::open(&home.join("state.db")).unwrap();
     for e in [&g, &ab] {

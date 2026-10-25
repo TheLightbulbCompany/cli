@@ -5,7 +5,7 @@ use crate::daemon::{ipc, Daemon};
 use crate::doing::TEXT_MAX;
 use crate::frame::Sender;
 use crate::mail::{self, State};
-use crate::roster::{Entry, Member, MemberKind};
+use crate::roster::{Entry, Member};
 use crate::sessions::Tier;
 use crate::{presence, sessions, Result};
 use serde::{Deserialize, Serialize};
@@ -57,15 +57,14 @@ impl Remote {
     }
 
     /// Whether member `peer_short` may publish this: its session id under that prefix, `agent`
-    /// the id's provider, a known `status` and `tier`, text at most `TEXT_MAX` characters. A
-    /// `cloud` member's sessions are names (a workspace's agents) with any printable `agent`.
-    pub fn valid(&self, peer_short: &str, cloud: bool) -> bool {
+    /// the id's provider (a named session, `<member>/<name>`, any printable `agent`, such as a
+    /// workspace's `Friday`), a known `status` and `tier`, text at most `TEXT_MAX` characters.
+    pub fn valid(&self, peer_short: &str) -> bool {
         let short = |t: &str| t.chars().count() <= TEXT_MAX;
         let agent = match Sender::of(peer_short, &self.session_id) {
             Sender::Agent(p) => p == self.agent,
             Sender::Name(_) => {
-                cloud
-                    && !self.agent.is_empty()
+                !self.agent.is_empty()
                     && short(&self.agent)
                     && self.agent.chars().all(crate::label::printable)
             }
@@ -173,8 +172,6 @@ pub enum Frame {
         candidate: String,
         name: String,
         computer: String,
-        kind: String,
-        proof: Option<String>,
         sig: String,
     },
     JoinDecision {
@@ -247,8 +244,7 @@ pub async fn read(recv: &mut (impl AsyncRead + Unpin)) -> Result<Frame> {
 /// list, every session `Remote::valid` for it and every address under its prefix, a `seq` at
 /// most a day ahead of now. An `envelope` is checked by `mail::receive`. An `ack` or `receipt`
 /// names a state past `queued`, with a known reason exactly when it is `refused`, and a `limit`
-/// only on a `loop` refusal (that it is bound to this member is `outbox::acked`'s check). A
-/// `join_request` or `join_decision` comes from a computer member. A `share_grant` passes
+/// only on a `loop` refusal (that it is bound to this member is `outbox::acked`'s check). A `share_grant` passes
 /// `streams::grant_ok`. A `stream` never rides the control stream, and a `hold_notice` or a
 /// `decision` (retired) is served nowhere. `Err` names the check.
 pub fn from_peer_ok(
@@ -260,11 +256,6 @@ pub fn from_peer_ok(
     match f {
         // Its `addrs` are a hint, checked where they are kept (`parse_addrs`).
         Frame::Hello { .. } | Frame::Roster { .. } | Frame::Envelope { .. } => Ok(()),
-        // A person's new computer, between its person's computers (`admission::from_member`
-        // checks the signatures).
-        Frame::JoinRequest { .. } | Frame::JoinDecision { .. } => {
-            check(peer.kind == MemberKind::Computer, "join")
-        }
         Frame::Ack {
             state,
             reason,
@@ -299,9 +290,7 @@ pub fn from_peer_ok(
                 && [sessions.len(), known.len(), kept.len()]
                     .iter()
                     .all(|n| *n <= presence::MAX)
-                && sessions
-                    .iter()
-                    .all(|s| s.valid(&peer.short, peer.kind == MemberKind::Cloud))
+                && sessions.iter().all(|s| s.valid(&peer.short))
                 && known.iter().chain(kept).all(|a| own(&peer.short, a));
             check(ok, "presence")
         }

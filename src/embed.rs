@@ -1,13 +1,13 @@
-//! The engine in process: what the Lightbulb bridge links against. An embedded instance is one
-//! `kind: cloud` member, a Lightbulb workspace, whose declared sessions are the workspace's
-//! agents (`cloud.sessions.set`). It opens no socket, installs no launchd job or hooks and
+//! The engine in process: what the Lightbulb bridge links against. An embedded instance is a
+//! Lightbulb workspace's member, a member like any other, whose declared sessions are the
+//! workspace's agents (`cloud.sessions.set`). It opens no socket, installs no launchd job or hooks and
 //! raises no dialog; otherwise it is the daemon: `boot` is the one start path both share.
 
 use crate::config::Config;
 use crate::daemon::ipc::{Caller, Request, Response, BAD_REQUEST, INTERNAL, NOT_FOUND};
 use crate::daemon::{ipc, net_ops, Cloud, Daemon, TeamState};
 use crate::identity::Identity;
-use crate::roster::{self, MemberKind};
+use crate::roster;
 use crate::sessions::{self, Key};
 use crate::store::{self, Store};
 use crate::{dialog, mail, net, presence, Result};
@@ -19,8 +19,6 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
 pub struct EmbedOpts {
-    /// Always `Cloud`: an instance is a workspace's member.
-    pub kind: MemberKind,
     /// The relay this instance uses (`config.toml: relay` for a computer).
     pub relay: Option<RelayUrl>,
     /// Where `Instance::shutdown` leaves a final copy of `state.db`, if anywhere.
@@ -30,7 +28,7 @@ pub struct EmbedOpts {
     /// The sessions declared before the transport starts (`cloud.sessions.set`'s list), so mail
     /// for them that arrives right after start is kept, not refused as unadvertised.
     pub sessions: Vec<Value>,
-    /// The person ids whose computers may message the sessions; `None`: no gate.
+    /// The person ids whose computers (`persons`) may message the sessions; `None`: no gate.
     pub members: Option<std::collections::HashSet<String>>,
 }
 
@@ -48,9 +46,6 @@ pub struct Instance {
 /// transport and outbox, with `opts`' relay and no LAN discovery. `Err` while
 /// another engine (instance or daemon) holds `home`.
 pub async fn start(home: &Path, opts: EmbedOpts) -> Result<Instance> {
-    if opts.kind != MemberKind::Cloud {
-        return Err("an embedded instance is a workspace's cloud member".into());
-    }
     std::fs::create_dir_all(home)?;
     std::fs::set_permissions(home, std::fs::Permissions::from_mode(0o700))?;
     if let Some(p) = &opts.snapshot {
@@ -151,7 +146,7 @@ pub(crate) type CloudStart = (
 
 /// The start path the daemon and an instance share, under `dir`'s lock (the caller's):
 /// identity, store, the solo genesis on first start, the team, the transport and the presence
-/// sender. A `cloud` instance (its workspace's name, the home lock it keeps and the sessions it
+/// sender. An instance (its workspace's name, the home lock it keeps and the sessions it
 /// declares from the start) has no dialogs; a computer's sessions are its agents'
 /// (`claude_home`).
 pub(crate) async fn boot(
@@ -178,15 +173,10 @@ pub(crate) async fn boot(
     if mismatched(&identity, &roster) {
         return Err(KEY_MISMATCH.into());
     }
-    // A workspace's network from before the `cloud` marker: its person links no longer vouch, so
-    // found it again, marked. Nobody ran those builds outside our own tests.
-    let unmarked = cloud.is_some()
-        && entries
-            .iter()
-            .any(|e| e.parents.is_empty() && e.signer == identity.key && e.body["cloud"] != true);
-    // Known but no member: removed (a stop before `removed_here`'s new genesis, or a fork that
-    // dropped us). On our own network again, as `removed_here` leaves it.
-    if unmarked || !roster.members.contains_key(&identity.key) {
+    // Known but no member: removed (a stop before `removed_here`'s new genesis, a fork that
+    // dropped us, or a roster this build's rules no longer replay us into). On our own network
+    // again, as `removed_here` leaves it.
+    if !roster.members.contains_key(&identity.key) {
         crate::outbox::refuse_all(&store, now as u64, "not_member")?;
         store.clear_roster()?;
         let at = now.max(roster.created_at + 1);
@@ -194,7 +184,6 @@ pub(crate) async fn boot(
         roster::accept(&store, &g, now)?;
         roster = roster::replay(&[g]);
     }
-    roster.lapse(now);
     let mut team = TeamState {
         roster,
         config: Config::default(),
@@ -263,8 +252,8 @@ pub(crate) async fn boot(
 
 impl Instance {
     /// One IPC op (`{id, op, ...}`, as on the socket), answered in process. Every person-only
-    /// op is refused (`bad_request`, reason `not_a_person`) but `team.join` as the workspace's
-    /// cloud member (its proof optional) and `team.leave`: the caller is the bridge, acting for a
+    /// op is refused (`bad_request`, reason `not_a_person`) but `team.join` and `team.leave`:
+    /// the caller is the bridge, acting for a
     /// workspace admin who confirmed in the app. `inbox {session}` takes a declared session's
     /// mail as Task 10's records, read. `app.send`, `app.inbox` and `app.receipt` send and read
     /// as a hosted app's declared session `{app}-{person}` (`app_send`).
@@ -341,7 +330,7 @@ impl Drop for Instance {
 }
 
 /// Signs this member's doorbell (`Cloud::wake`) into its roster as a `meta` when the roster's
-/// differs. Only a founder's or a cloud member's counts (`roster::pass`); skipped otherwise.
+/// differs.
 pub(crate) fn publish(d: &Daemon) -> Result<()> {
     let Some(w) = d
         .cloud
@@ -351,11 +340,6 @@ pub(crate) fn publish(d: &Daemon) -> Result<()> {
         return Ok(());
     };
     let mut team = d.team.lock().unwrap();
-    let me = team.roster.members.get(&d.identity.key);
-    if !me.is_some_and(|m| m.role == roster::Role::Founder || m.kind == MemberKind::Cloud) {
-        eprintln!("wake: this member cannot publish a doorbell; not published");
-        return Ok(());
-    }
     if team.roster.wakes.get(&d.identity.key) == Some(&w) {
         return Ok(());
     }

@@ -247,7 +247,7 @@ fn remove_text() {
 }
 
 #[test]
-fn founder_whose_only_other_member_is_cloud_can_leave() {
+fn founder_whose_only_other_member_is_offline_can_leave() {
     let e = Env::new();
     assert!(e.run(&["team"]).status.success());
     e.stop();
@@ -258,9 +258,7 @@ fn founder_whose_only_other_member_is_cloud_can_leave() {
         &me,
         vec![g.hash()],
         Kind::Admit,
-        json!({"member": bridge.key, "name": "bridge", "computer": "cloud", "person_id": "ws:W1",
-               "kind": "cloud", "role": "member",
-               "proof": common::issuer::workspace_proof(&bridge.key, "W1", "bridge", &[], lightbulb::daemon::ipc::now() as i64)}),
+        json!({"member": bridge.key, "name": "bridge", "computer": "cloud", "role": "member"}),
         2,
     );
     roster::accept(
@@ -328,8 +326,8 @@ fn policy_takes_a_teammates_name_and_lists_names() {
             && e2.trim_end().ends_with("(see lightbulb team)."),
         "{e2}"
     );
-    // A workspace id stays as given; any other id no member has is refused by the daemon.
-    assert!(e.run(&["policy", "ws:w1", "accept"]).status.success());
+    // An id no member has is refused, by the CLI and by the daemon.
+    assert_eq!(e.run(&["policy", "ws:w1", "accept"]).status.code(), Some(1));
     let r = common::person(
         &e,
         json!({"id": 1, "op": "policy.set", "person_id": "aden", "value": "hold"}),

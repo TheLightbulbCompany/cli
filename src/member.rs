@@ -10,7 +10,6 @@
 
 use crate::daemon::net_ops;
 use crate::embed::{self, EmbedOpts, Instance};
-use crate::roster::MemberKind;
 use crate::Result;
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -65,7 +64,6 @@ pub async fn run(opts: MemberOpts, token: String) -> Result<()> {
     let instance = embed::start(
         &opts.home,
         EmbedOpts {
-            kind: MemberKind::Cloud,
             relay,
             snapshot: Some(opts.snapshot),
             name: opts.name,

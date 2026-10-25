@@ -34,8 +34,8 @@ pub struct Ticket {
     pub addrs: Vec<String>,
     pub members: Vec<String>,
     pub expires_at: i64,
-    /// A `person` link's person (their sign-in id): the member accepts their messages once
-    /// the link admits their computer. Absent from other tickets.
+    /// A `person` link's person (an account id): the member that signed it records the
+    /// computer the link admits as theirs (`persons`). Absent from other tickets.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub person: Option<String>,
     /// A workspace member's doorbell (its roster `wake`): a joiner that reaches no member rings
@@ -278,7 +278,6 @@ mod tests {
 
     #[test]
     fn a_tickets_wake_is_covered_by_the_signature() {
-        // (Any mode: only a cloud member's `person` link survives replay.)
         let (_, x, r, t) = team("ask", true);
         let w = Wake {
             url: "https://example.test/api/v1/network/wake".into(),

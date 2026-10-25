@@ -110,7 +110,7 @@ fn errors_are_sentences() {
     let o = e.person(&["policy"]);
     assert_eq!(
         out(&o).lines().next(),
-        Some("Your workspace's agents may message your sessions without asking: no."),
+        Some("No one has a policy yet: a teammate's first message waits for your Allow."),
         "{}",
         err(&o)
     );

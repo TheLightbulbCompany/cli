@@ -1,12 +1,10 @@
 //! What the CLI and network test files share: a temp state dir and HOME, a daemon shut down
 //! on drop, a person's shell (`detached`) and socket client (`person`), the daemon env knobs,
 //! a two-member team seeded before start, and a member played by the test (`Peer`).
-//! ponytail: only `cli.rs`, `team_cli.rs`, `net_two.rs`, `join.rs`, `ui_claim.rs`, `dialog.rs`, `signin.rs`,
+//! ponytail: only `cli.rs`, `team_cli.rs`, `net_two.rs`, `join.rs`, `ui_claim.rs`, `dialog.rs`,
 //! `directory.rs`, `envelope.rs` and `perf.rs` use it;
 //! the other test files keep their own copies.
 #![allow(dead_code)]
-
-pub mod issuer;
 
 use iroh::endpoint::{presets, Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, PublicKey, SecretKey};
@@ -242,24 +240,11 @@ pub fn seed_pair(a: &Env, b: &Env) -> [Entry; 2] {
 /// `who` admitted by `by` after `parent` as `name` (its computer too), a computer member of
 /// its own person, with `extra`'s fields over those.
 pub fn admit(by: &Identity, parent: &Entry, who: &Identity, name: &str, extra: Value) -> Entry {
-    let mut body = json!({"member": who.key, "name": name, "computer": name,
-        "person_id": who.key, "kind": "computer", "role": "member"});
+    let mut body = json!({"member": who.key, "name": name, "computer": name, "role": "member"});
     for (k, v) in extra.as_object().expect("an object") {
         body[k] = v.clone();
     }
     Entry::signed(by, vec![parent.hash()], Kind::Admit, body, 2)
-}
-
-/// `who`'s computer proof (`issuer::computer_proof`), issued now: person `sub` called `name`,
-/// signed into workspace `ws` (named for its id) if any.
-pub fn person_proof(who: &Identity, sub: &str, name: &str, ws: Option<&str>) -> String {
-    issuer::computer_proof(&who.key, sub, name, ws.map(|w| (w, w)), now_s())
-}
-
-/// `who`'s workspace proof (`issuer::workspace_proof`) for workspace `ws` called `name`, with
-/// no agents, issued now.
-pub fn ws_proof(who: &Identity, ws: &str, name: &str) -> String {
-    issuer::workspace_proof(&who.key, ws, name, &[], now_s())
 }
 
 /// `LIGHTBULB_CONNECT_PEERS` is read from this process's environment when an instance starts:
@@ -285,7 +270,6 @@ pub async fn instance(
         std::env::set_var(k, v);
     }
     let opts = lightbulb::embed::EmbedOpts {
-        kind: roster::MemberKind::Cloud,
         relay: None,
         snapshot: snapshot.map(std::path::Path::to_path_buf),
         name: name.into(),
@@ -682,15 +666,4 @@ pub fn line(sock: &std::path::Path, token: &str, op: &str, body: Value) -> Value
     let mut answer = String::new();
     BufReader::new(s).read_line(&mut answer).unwrap();
     serde_json::from_str(&answer).unwrap_or_else(|_| panic!("{op}: {answer:?}"))
-}
-
-/// `g` (a genesis by workspace instance `w`) marked as a workspace's own network, as
-/// `solo_genesis` writes it for an instance.
-pub fn workspace_genesis(
-    w: &lightbulb::identity::Identity,
-    g: &lightbulb::roster::Entry,
-) -> lightbulb::roster::Entry {
-    let mut body = g.body.clone();
-    body["cloud"] = true.into();
-    lightbulb::roster::Entry::signed(w, vec![], lightbulb::roster::Kind::Admit, body, g.at)
 }
