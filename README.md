@@ -12,14 +12,26 @@ Apple-silicon Mac, macOS 13 or newer, or Linux (arm64, x86_64):
 curl -fsSL https://github.com/TheLightbulbCompany/cli/releases/latest/download/install.sh | sh
 ```
 
-It downloads the latest release, checks its checksum, installs `~/.lightbulb/connect/bin/lightbulb`,
+**On a fresh Mac, add the command to your PATH.** If setup printed
+`Add this line to your shell profile (~/.zshrc), then open a new terminal: export PATH="$HOME/.local/bin:$PATH"`,
+do that, then open a new terminal:
+
+```sh
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
+```
+
+Until then, run `~/.lightbulb/connect/bin/lightbulb` instead of `lightbulb`.
+
+Set `DO_NOT_TRACK=1` before installing to send nothing (see [Usage counts](#usage-counts)).
+
+The line downloads the latest release, checks its checksum, installs `~/.lightbulb/connect/bin/lightbulb`,
 wires Claude Code, Codex, Cursor and Grok CLI (hooks and a tool server), and starts the background service.
 Run the same line again to upgrade. Builds are not yet signed with a Developer ID: a `curl` download is not
 quarantined by Gatekeeper, a browser download would be. `lightbulb setup --remove` takes everything out.
-On Linux the same line installs a static binary and sets up the agents but no background service: start it with `lightbulb daemon` (or as a systemd `--user` service), and answer holds with `lightbulb approve`/`decline`. Homebrew and npm are macOS-only for now.
+On Linux (and WSL) the same line installs a static binary and sets up the agents. There is no service manager off macOS: the CLI starts the daemon when a command needs it. To keep it running, start `lightbulb daemon` yourself (for example in tmux, or as a systemd `--user` unit). `lightbulb update` and `lightbulb setup` restart a daemon that runs an older version. There are no dialogs on Linux: run `lightbulb held`, then `lightbulb approve H1` or `lightbulb approve J1` (or `decline`). Homebrew and npm are macOS-only for now.
 
 `lightbulb update` keeps you current. To pin or roll back to a release:
-`curl -fsSL https://github.com/TheLightbulbCompany/cli/releases/latest/download/install.sh | LIGHTBULB_VERSION=v0.2.2 sh`.
+`curl -fsSL https://github.com/TheLightbulbCompany/cli/releases/latest/download/install.sh | LIGHTBULB_VERSION=v0.2.2 sh` (an example: use the tag you want).
 
 Or with Homebrew (then run the setup yourself):
 
@@ -37,16 +49,6 @@ lightbulb setup
 
 All three paths install the same release binary; `setup` puts it at `~/.lightbulb/connect/bin/lightbulb` and the `lightbulb` command in `~/.local/bin`.
 
-**On a fresh Mac, add the command to your PATH.** If setup printed
-`Add this line to your shell profile (~/.zshrc), then open a new terminal: export PATH="$HOME/.local/bin:$PATH"`,
-do that:
-
-```sh
-echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
-```
-
-Then open a new terminal. Until then, run `~/.lightbulb/connect/bin/lightbulb` instead of `lightbulb`.
-
 ## Quick start: you and a teammate in five minutes
 
 Both of you run the install line above, and both of you add the PATH line if setup printed it
@@ -56,17 +58,20 @@ Both of you run the install line above, and both of you add the PATH line if set
 lightbulb invite
 ```
 
-It prints a four-word code (`lightbulb join <code>`, good for 10 minutes while your computer
-is on), a link, and the full join line (`lightbulb join '<ticket>'`). Send one to your
-teammate. They paste it into Terminal; `--name sam` sets the name they go by:
+It prints a four-word code (`lightbulb join <code>`; it works once, for 10 minutes while your
+computer is on), then a `https://thelightbulb.company/j#…` link and the full join line
+(`lightbulb join '<ticket>'`; reusable for 7 days). Send one to your teammate. `join` takes any of
+the three. They paste it into Terminal:
 
 ```sh
-lightbulb join '<ticket>' --name sam
+lightbulb join '<ticket>'
 ```
+
+A computer is on one network at a time: run `lightbulb leave` first to join another.
 
 A dialog opens on your Mac: `sam (computer "…") wants to join your team using your invite link.`
 Click Allow, or run `lightbulb approve J1` (`lightbulb held` lists the number).
-Their Terminal then says `Connected as sam (…)`. Each of you opens (or restarts) a Claude Code,
+Their Terminal then says `Connected as <name> (…)`. Each of you opens (or restarts) a Claude Code,
 Codex, Cursor or Grok CLI session in a project folder, so there is a session to see. Then each of
 you can see the other's sessions:
 
@@ -79,16 +84,18 @@ find sam's sessions and send their Claude a message." The tools are `find_sessio
 `send_message`, `message_receipt` and `check_inbox`.
 
 The first message from a new person is held until the receiver clicks Allow in a dialog (or runs
-`lightbulb approve H1`). After that, messages from that person go straight through. In this
-release your own other computer counts as a new person too, so its first message is held once.
+`lightbulb approve H1`). After that, messages from that person go straight through. Until verified
+names exist, your own other computer is another person too: its first message waits for your Allow
+there (`lightbulb approve H1`). Do not resend it.
 
 A busy session reads a message at its next step. An idle session reads it when you next type to
 it, unless its agent takes messages instantly (`lightbulb who` shows which).
 
-Every message gets a receipt. Check one with `lightbulb receipt <id>`:
+Every message gets a receipt. Check one with `lightbulb receipt <id>`. `lightbulb send` prints the id
+(`Check: lightbulb receipt <id>`); `send_message` returns it as the `request_id` you gave it.
 
 - `queued`: their Mac is offline; it keeps trying for 24 hours.
-- `held`: waiting for their Allow.
+- `held`: waiting for their Allow. Not a failure: do not resend.
 - `stored`: on their Mac, for the session's next step.
 - `delivered`: the session got it.
 - `read`: the session has taken a step since it got it.
