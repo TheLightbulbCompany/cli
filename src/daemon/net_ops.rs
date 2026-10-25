@@ -17,6 +17,8 @@ use std::time::Duration;
 
 pub const NOT_ADMIN: &str = "not_admin";
 pub const NOT_MEMBER: &str = "not_member";
+/// `team.remove`'s refusal of the founder (it may leave, nobody removes it).
+pub const FOUNDER: &str = "founder";
 
 /// `team.invite`'s `mode`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -398,19 +400,21 @@ pub fn install(
     if !new.is_solo(me) {
         let _ = std::fs::remove_file(daemon.dir.join(REMOVED));
     }
-    // A computer gone from the team is nobody's any more (`persons`).
-    store.prune_persons(|k| new.members.contains_key(k))?;
+    // A `remove` or `leave` of `k` that this install brings.
+    let took = |k: &str| {
+        new.log().iter().any(|(h, e)| {
+            matches!(e.kind, Kind::Remove | Kind::Leave)
+                && !team.roster.knows(h)
+                && e.body["member"] == k
+        })
+    };
+    // A computer gone from the team, or removed in this install (even if re-admitted in it), is
+    // nobody's any more (`persons`).
+    store.prune_persons(|k| new.members.contains_key(k) && !took(k))?;
     let relay_changed = team.roster.relay != new.relay;
     // A removal or leave applied in this team (not a team left or joined, nor a member a fork's
     // resolution dropped): every subscriber hears of each member it took.
     if team.roster.team_id == new.team_id {
-        let took = |k: &str| {
-            new.log().iter().any(|(h, e)| {
-                matches!(e.kind, Kind::Remove | Kind::Leave)
-                    && !team.roster.knows(h)
-                    && e.body["member"] == k
-            })
-        };
         for k in team
             .roster
             .members
@@ -638,6 +642,10 @@ impl TeamOps<'_> {
                 };
                 if t.key == me_key {
                     return Ok(Response::err(id, BAD_REQUEST));
+                }
+                // The founder is never removed (`roster::take`); it may leave.
+                if t.role == roster::Role::Founder {
+                    return Ok(Response::err(id, FOUNDER));
                 }
                 self.write(Kind::Remove, json!({"member": t.key}))?;
                 let link = self.new_link("ask", false, false)?;

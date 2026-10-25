@@ -684,6 +684,21 @@ impl Store {
         )
     }
 
+    /// Whether one of `ids` is a message this computer sent to a session of member `short`.
+    pub fn sent_to(&self, ids: [Option<&str>; 2], short: &str) -> rusqlite::Result<bool> {
+        self.conn
+            .prepare(
+                "SELECT 1 FROM messages WHERE id IN (?1, ?2) AND origin = 'local' \
+                 AND to_key >= ?3 AND to_key < ?4",
+            )?
+            .exists(params![
+                ids[0],
+                ids[1],
+                format!("{short}/"),
+                format!("{short}0")
+            ])
+    }
+
     /// The peers' mail to `to` sent after `since`: `(from, origin)`.
     pub fn net_mail_to(&self, to: &str, since: i64) -> rusqlite::Result<Vec<(String, String)>> {
         let mut stmt = self.conn.prepare(

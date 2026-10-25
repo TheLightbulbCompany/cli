@@ -495,20 +495,23 @@ fn retired(
     })
 }
 
-/// Removes `target` by removal `h`; whether it was removed.
+/// Removes `target` by removal `h` (never the founder, which may only leave); whether it was
+/// removed.
 fn take(
     r: &mut Roster,
     gone: &mut BTreeMap<String, (Member, String)>,
     target: &str,
     h: &str,
 ) -> bool {
-    match r.members.remove(target) {
-        Some(m) => {
-            gone.insert(target.to_string(), (m, h.to_string()));
-            true
-        }
-        None => false,
+    if r.members
+        .get(target)
+        .is_none_or(|m| m.role == Role::Founder)
+    {
+        return false;
     }
+    let m = r.members.remove(target).expect("present");
+    gone.insert(target.to_string(), (m, h.to_string()));
+    true
 }
 
 fn is_genesis(e: &Entry) -> bool {
@@ -777,6 +780,19 @@ mod tests {
             log.push(m.clone());
             parent = m;
         }
+    }
+
+    #[test]
+    fn nobody_removes_the_founder_who_may_still_leave() {
+        let (f, x) = (id(), id());
+        let g = genesis(&f);
+        let ax = admit(&f, &g, &x.key, "x");
+        let xf = member(&x, &ax, Kind::Remove, &f.key);
+        let r = replay(&[g.clone(), ax.clone(), xf.clone()]);
+        assert_eq!(r.members[&f.key].role, Role::Founder);
+        assert!(r.members.contains_key(&x.key));
+        let fl = member(&f, &xf, Kind::Leave, &f.key);
+        assert!(!replay(&[g, ax, xf, fl]).members.contains_key(&f.key));
     }
 
     #[test]

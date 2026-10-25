@@ -386,18 +386,26 @@ async fn only_a_listed_persons_computers_reach_its_sessions() {
     assert_eq!(ok(&i, "holds", json!({})).await["holds"], json!([]));
     let db = home.path().join("state.db");
     assert_eq!(common::count(&db, "SELECT COUNT(*) FROM holds"), 0);
-    // A, removed from the team, is nobody's computer any more.
+    // C, made `user_a`'s, then removed by A and admitted again by B in one sync, is nobody's
+    // computer any more: its message is refused again.
+    as_user_a(home.path(), &ic);
+    assert_eq!(ask(&mut pc, &ic, "c2", &friday).await.0, "stored");
     let store = Store::open(&db).unwrap();
     let heads = roster::replay(&roster::entries(&store).unwrap()).heads;
-    let rm = Entry::signed(&ib, heads, Kind::Remove, json!({"member": ia.key}), now_s());
-    pb.send(&Frame::Roster {
-        entries: vec![rm],
+    let rm = Entry::signed(&ia, heads, Kind::Remove, json!({"member": ic.key}), now_s());
+    let again = common::admit(&ib, &rm, &ic, "carol", json!({}));
+    pa.send(&Frame::Roster {
+        entries: vec![rm, again],
         more: false,
     })
     .await;
-    until(10, "A's person is forgotten", || {
-        store.person(&ia.key).unwrap().is_none()
+    until(10, "C's person is forgotten", || {
+        store.person(&ic.key).unwrap().is_none()
     });
+    let members = roster::replay(&roster::entries(&store).unwrap()).members;
+    assert!(members.contains_key(&ic.key), "C is a member again");
+    let (mut pc, _c2) = common::dial_instance(&i, &ic).await;
+    assert_eq!(ask(&mut pc, &ic, "c3", &friday).await, no);
     i.shutdown().await;
 }
 
@@ -632,6 +640,20 @@ async fn a_person_line_reaches_friday_and_an_unlisted_teammate_does_not() {
     assert_eq!(m["from"], friday.as_str());
     let a_db = a.state.path().join("state.db");
     assert_eq!(common::count(&a_db, "SELECT COUNT(*) FROM holds"), 0);
+    // Anything Friday starts on its own (a new thread, to another of A's sessions) is held on A,
+    // as anyone's.
+    let sa2 = common::session(&a, "a2");
+    let r = ok(
+        &i,
+        "send",
+        json!({"from": friday, "to": sa2, "text": "unasked", "request_id": "f2"}),
+    )
+    .await;
+    assert!(r["receipt"].is_object(), "{r}");
+    until(10, "Friday's own message is held on A", || {
+        common::count(&a_db, "SELECT COUNT(*) FROM holds WHERE state = 'open'") == 1
+    });
+    assert_eq!(a.unread(&sa2), 0);
 
     // B joins through A's ask link (A allows it), sees Friday, and is refused `not_a_member`.
     let ask = common::invite(&a, "once");

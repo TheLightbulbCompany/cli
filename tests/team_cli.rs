@@ -132,7 +132,7 @@ fn invite_reprints_the_same_link_until_new() {
 }
 
 #[test]
-fn a_plain_member_opens_links_and_removes_the_founder() {
+fn a_plain_member_opens_links_but_cannot_remove_the_founder() {
     // A team founded elsewhere by aden, which admitted this computer as a plain member.
     let e = Env::new();
     e.seed(true);
@@ -149,11 +149,20 @@ fn a_plain_member_opens_links_and_removes_the_founder() {
         "{team}"
     );
     assert_eq!(e.entries().len(), 2, "no genesis over a joined team");
-    // Every network is flat: any member makes an open link and removes another member.
+    // Every network is flat: any member makes an open link; nobody removes the founder.
     let r = common::person(&e, json!({"id": 1, "op": "team.invite", "mode": "open"}));
     assert_eq!(r["ok"], true, "{r}");
     let o = e.run(&["remove", "aden"]);
-    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(
+        err(&o).trim(),
+        "aden started this team and cannot be removed. It can leave the team itself."
+    );
+    assert!(out(&e.run(&["team"])).contains("  aden · "));
+    assert!(
+        e.entries().iter().all(|x| x.kind != Kind::Remove),
+        "no remove entry written"
+    );
 }
 
 #[test]

@@ -821,7 +821,16 @@ pub fn receive(
     // list, there is nothing to ask.
     let verdict = match roster.by_short(me) {
         Some(_) if members.is_some() => Verdict::Accept,
-        Some(mine) => policy::decide(store, &mine.key, peer)?,
+        Some(mine) => match policy::decide(store, &mine.key, peer)? {
+            // My person-link inviter answering one of my own messages to it.
+            Verdict::Hold
+                if policy::replies_from(store, &peer.key)?
+                    && store.sent_to([reply_to.as_deref(), thread.as_deref()], &peer.short)? =>
+            {
+                Verdict::Accept
+            }
+            v => v,
+        },
         None => Verdict::Hold,
     };
     if verdict == Verdict::Refuse {

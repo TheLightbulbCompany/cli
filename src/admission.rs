@@ -573,8 +573,8 @@ enum Outcome {
 
 /// `team.join {ticket | code, name?}` -> `{state: admitted|waiting|refused, reason?, team,
 /// online}`. Only a solo computer joins; it asks the ticket's members in order, one at a time.
-/// Joined through a `person` link, it accepts its inviter's messages (the person pasted their
-/// own workspace's line).
+/// Joined through a `person` link, it accepts its inviter's answers to its own messages
+/// (`policy::accept_replies`); anything else from the inviter is held as anyone's.
 pub async fn join(id: u64, body: &Value, d: &Arc<Daemon>) -> Response {
     let (ticket_in, code_in) = (body["ticket"].as_str(), body["code"].as_str());
     if ticket_in.is_some() == code_in.is_some() {
@@ -702,9 +702,8 @@ pub async fn join(id: u64, body: &Value, d: &Arc<Daemon>) -> Response {
                     }
                     if t.mode == "person" {
                         let store = d.store.lock().unwrap();
-                        let (accept, now) = (policy::Verdict::Accept, ipc::now() as i64);
-                        if let Err(e) = policy::set_person(&store, &t.inviter, accept, "local", now)
-                        {
+                        let now = ipc::now() as i64;
+                        if let Err(e) = policy::accept_replies(&store, &t.inviter, now) {
                             eprintln!("join: {e}");
                         }
                     }

@@ -942,7 +942,15 @@ pub fn team() -> Result<i32> {
 pub fn remove(name: &str) -> Result<i32> {
     let r = connect()?.call("team.remove", json!({ "member": name }))?;
     if r["ok"] != true {
-        let texts = [("not_found", format!("No member called {name}."))];
+        let texts = [
+            ("not_found", format!("No member called {name}.")),
+            (
+                crate::daemon::net_ops::FOUNDER,
+                format!(
+                    "{name} started this team and cannot be removed. It can leave the team itself."
+                ),
+            ),
+        ];
         return refuse(&r, &texts);
     }
     let n = r["name"].as_str().unwrap_or(name);

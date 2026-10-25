@@ -34,6 +34,9 @@ impl Verdict {
 }
 
 const PEOPLE: &str = "people";
+/// The `policy` scope of a person-link inviter (`admission::join`): its answers to this
+/// computer's own messages are accepted (`mail::receive`). Not listed by `Policy::load`.
+const REPLIES: &str = "replies";
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct Policy {
@@ -87,6 +90,24 @@ pub fn decide(store: &Store, me: &str, from: &Member) -> Result<Verdict> {
         .as_deref()
         .and_then(Verdict::parse)
         .unwrap_or(Verdict::Hold))
+}
+
+/// Marks `key` (the inviter of the `person` link this computer joined with) as one whose
+/// answers to this computer's own messages need no Allow.
+pub fn accept_replies(store: &Store, key: &str, now: i64) -> Result<()> {
+    store.conn().execute(
+        "INSERT OR REPLACE INTO policy VALUES (?1, ?2, 'accept', 'local', ?3)",
+        params![REPLIES, key, now],
+    )?;
+    Ok(())
+}
+
+/// Whether `accept_replies` marked `key`.
+pub fn replies_from(store: &Store, key: &str) -> Result<bool> {
+    Ok(store
+        .conn()
+        .prepare("SELECT 1 FROM policy WHERE scope = ?1 AND person_id = ?2")?
+        .exists([REPLIES, key])?)
 }
 
 /// Writes `v` for `from`, set by `by`.
