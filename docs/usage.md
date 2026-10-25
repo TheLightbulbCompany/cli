@@ -71,9 +71,6 @@ terminal: `lightbulb held`, then `approve H<n>` or `decline H<n>`.
 - **Allow** delivers the message and lets that person's later messages through without asking.
   It sets their policy to `accept`.
 - **Decline** refuses it. The sender's receipt reads `Not sent: they declined it.`
-- **Always allow** appears only for messages from agents that run in the Lightbulb app's cloud,
-  not for a teammate's computer. For those, a plain Allow covers only that one message, and
-  Always allow covers every later message from that sender's cloud agents.
 
 A held message waits up to 7 days for an answer. To change a decision later, use `policy`:
 `policy sam hold` asks again each time, `policy sam refuse` refuses them, `policy sam accept`

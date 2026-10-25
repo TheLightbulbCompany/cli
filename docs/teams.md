@@ -10,8 +10,7 @@ Every computer starts on its own: a team of one, with you as the founder. You gr
 
 Every team is flat. Any member can invite (open invites too), answer join requests, remove
 another member (not itself), rename the team and set the team's relay. The founder is only the
-computer that started the team: it publishes the team's doorbell, and a workspace's own member
-cannot be removed.
+computer that started the team.
 
 Only a person at a terminal can run `held`, `remove`, `leave`, `policy <person> <value>` and
 `relay <url>`. An agent may run `invite` (every mode), `join`, and `approve` or `decline` for a
@@ -110,7 +109,7 @@ that person to `accept`.
 lightbulb remove sam
 ```
 
-Any member can remove another. A workspace's own member cannot be removed. Removing a member blocks new
+Any member can remove another. Removing a member blocks new
 connections and new messages from that computer. It also ends **every** live invite in the
 team, so a removed person cannot rejoin with an old one. You get a new invite line in the
 answer; send that to anyone still waiting to join. Other members get new invites with their

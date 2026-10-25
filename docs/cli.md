@@ -182,17 +182,13 @@ Lists join requests (`J<n>`) and held messages (`H<n>`), each with the command t
 When you use it: to allow a join request or a held message.
 
 ```
-lightbulb approve [OPTIONS] <REQUEST>
+lightbulb approve <REQUEST>
 ```
 
 `--help`: Allow a join request (`J<n>`) or a held message (`H<n>`).
 
 `<REQUEST>` is `J<n>` or `H<n>` from `held`. Allowing a held message from a teammate's computer
 also lets that person's later messages through.
-
-| Option | Meaning |
-|---|---|
-| `--always` | Only for messages from a cloud member's agents. It is not used between computers; on any other message it answers `--always is only for messages from a cloud member's agents.` |
 
 ### decline
 

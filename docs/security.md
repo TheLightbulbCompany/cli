@@ -20,30 +20,28 @@ the member who wrote it and names the entries before it by their hash.
 
 Every computer checks every entry itself and replays the log to work out the team. An entry
 counts only if its signer had the right to write it: every network is flat, so any computer
-member can invite, admit and remove others (not itself), and nobody removes a cloud founder. A new member checks every entry it
+member can invite, admit and remove others (not itself). A new member checks every entry it
 receives before it accepts the team. No server holds or decides the membership.
 
 Invites are signed by the computer that made them. A join is checked against the roster: the
 invite must still be live (not replaced, not ended by a removal, not a used one-time invite) and
 not expired.
 
-In a flat network any computer member can mint a one-time link and so add a cloud member
-that is not verified (shown "(not verified)"). Accepted: members are trusted.
+In a flat network any member can mint a one-time link and so add a member that is not
+verified (shown "(not verified)"). Accepted: members are trusted.
 
-A member's person id (which person's computer it is) is its own key unless something vouches
-for another: a verified sign-in proof, or a workspace's cloud member admitting a computer
-through the one-time person link it made for that person. Only a cloud member's person link
-counts (the workspace instance that founded its network, or a cloud member with its workspace
-proof); one signed by any other member is dropped, so no member can admit a key as someone
-else's computer. The founder's workspace marker is self-declared until issuer proofs ship, so a
-vouched id must be an account id (such as `user_…`) and never a member key: a hostile
-workspace-style network can only vouch account ids, never a plain computer's own key. A
-computer counts a message as its own person's only from itself or from a computer with the
-same account id. What is left until issuer proofs ship: anyone can run a workspace-style
-network (`lightbulb member`), and if you join one with a person line it gave you, it chooses
-your account id there and can vouch one of its own computers as that same id, so that
-computer's messages reach you without a prompt. Only join with a person line from a workspace
-you trust; an ordinary invite line or code never does this.
+There is one kind of member. Every member is its own person: its person id is its own key, and
+nothing in the roster can say otherwise (an admit's other claims are ignored). A Lightbulb
+workspace's member (`lightbulb member`) is a member like any other; what it answers is its own
+local rule. It keeps, in its own state alone, which computer belongs to which workspace person:
+it records that when a computer joins through a `person` link the workspace itself made for that
+person (the link names the person under the workspace's signature and works once). With a
+members list, it takes a message for one of its agents only from a computer it recorded for a
+listed person; any other member's message is refused (`not_a_member`), with no hold. No frame a
+peer sends writes that record, and it is dropped when the computer leaves the team. A computer
+that joins with a person line accepts its inviter's messages from then on (`policy`): the
+person pasted their own workspace's line. Only join with a person line from a workspace you
+trust; an ordinary invite line or code never does this.
 
 ### Invite codes
 
