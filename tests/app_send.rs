@@ -217,6 +217,11 @@ async fn a_peeked_inbox_keeps_its_records_until_they_are_acked() {
     ok(&i, "app.ack", ack).await;
     let mut bad = me.clone();
     bad["ids"] = json!("x");
+    assert_eq!(
+        call(&i, "app.ack", bad.clone()).await["error"],
+        "bad_request"
+    );
+    bad["ids"] = json!(vec!["x"; 101]);
     assert_eq!(call(&i, "app.ack", bad).await["error"], "bad_request");
     i.shutdown().await;
 }

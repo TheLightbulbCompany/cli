@@ -8,7 +8,7 @@
 //! `id` (a `request_id` sent before answers its first receipt and sends nothing);
 //! `app.inbox {app, person}` -> `{records}`, taken and read; with `peek: true` they are left
 //! as they are (delivered-unread, then waiting) until `app.ack {app, person, ids}` -> `{acked}`
-//! takes and reads those of them that are this session's, so an answer lost on its way to the
+//! takes and reads those of them that are this session's (at most 100 ids), so an answer lost on its way to the
 //! app loses no mail (it is handed out again); `app.unread {app, person}` -> `{unread}`, what
 //! waits, taking nothing; `app.receipt {app, person, request_id}` -> the receipt. A pair not declared is `refused`, reason `not_declared` (the
 //! bridge declares it and asks once more). An instance's ops only.
@@ -19,6 +19,9 @@ use crate::mail;
 use crate::sessions::{self, Key};
 use serde_json::{json, Value};
 use std::sync::Arc;
+
+/// The most ids one `app.ack` takes: it holds the store's lock for the list.
+const MAX_ACK: usize = 100;
 
 pub(crate) async fn op(id: u64, op: &str, body: &Value, d: &Arc<Daemon>) -> Response {
     let Some(cloud) = &d.cloud else {
@@ -54,6 +57,7 @@ pub(crate) async fn op(id: u64, op: &str, body: &Value, d: &Arc<Daemon>) -> Resp
         "app.ack" => {
             let Some(ids) = body["ids"]
                 .as_array()
+                .filter(|a| a.len() <= MAX_ACK)
                 .and_then(|a| a.iter().map(Value::as_str).collect::<Option<Vec<_>>>())
             else {
                 return Response::err(id, BAD_REQUEST);
