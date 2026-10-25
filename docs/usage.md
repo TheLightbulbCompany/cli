@@ -17,12 +17,15 @@ other people can see. For a first run, see the quick start in the [README](../RE
 - **The command:** `lightbulb`, a link in `~/.local/bin` (an older link there is replaced). A
   regular file there is left alone; then put `~/.lightbulb/connect/bin` on your PATH.
 - **The background service:** the launchd job `company.thelightbulb.connect`, in
-  `~/Library/LaunchAgents/company.thelightbulb.connect.plist`. It starts at login.
+  `~/Library/LaunchAgents/company.thelightbulb.connect.plist`. It starts at login. Off macOS there
+  is no such job: the CLI starts the daemon when a command needs it, or you run `lightbulb daemon`
+  yourself (keep it running, for example in tmux or a systemd `--user` unit). `update` and `setup`
+  restart a daemon that runs an older version.
 - **Agent wiring:** for Claude Code, Codex, Cursor and Grok CLI, `setup` adds hooks (session start,
   prompt, tool use, stop, session end) and one tool server, in each agent's own config files
   (`~/.claude/settings.json`, `~/.claude.json`, `~/.codex/`, `~/.cursor/`, `~/.grok/`). Each file
-  is backed up once as `<file>.lightbulb-backup`. The tool server is named `lightbulb` (replacing
-  any tool server of that name). Run `setup --verbose` to
+  is backed up once as `<file>.lightbulb-backup`. The tool server is named `lightbulb-network`. It sits beside the
+  Lightbulb desktop app's own `lightbulb` server; `setup` replaces only its own old entry. Run `setup --verbose` to
   list the files it changed.
 
 It does not change your projects, your repositories or any other entry in those config files.
@@ -35,12 +38,12 @@ Run `lightbulb <command> --help` for the options of each one.
 | Command | What it does |
 |---|---|
 | `setup` | Connect Claude Code, Codex, Cursor and Grok CLI here and start the background service. |
-| `update` | Install the latest release over this one and restart the background service. `--version v0.2.3` installs that release instead (0.2.2 or later). |
+| `update` | Install the latest release over this one and restart the background service. `--version v0.2.3` installs that release instead (0.2.2 or later; an example tag). `--auto on\|off` turns the daily automatic update on or off and installs nothing. |
 | `setup --remove` | Take out only what `setup` wrote. Backups are left as they are. |
 | `doctor` | Check the service, the local network, the state folder and each agent, and say how to fix what is not right. |
 | `who` | List the sessions on this computer. `who --all` adds your teammates' sessions. |
-| `invite` | Print a four-word code (good for 10 minutes), a link, and the join command (`lightbulb join '<ticket>'`) that add your other computer or a teammate. `--once`: one join, valid 24 hours. `--new`: a new invite; every earlier one from this computer, `--open` and `--once` ones too, stops working. |
-| `join '<ticket>'` | Join the team the invite is for. Takes the ticket or the whole `lightbulb://join/…` link. `--name <name>` sets the name you go by (default: your user name). The computer must be on its own first. |
+| `invite` | Print a four-word code (works once, for 10 minutes), a `https://thelightbulb.company/j#…` link, and the join command (`lightbulb join '<ticket>'`) that add your other computer or a teammate. The link and line are reusable for 7 days. `--once`: one join, valid 24 hours. `--new`: a new invite; every earlier one from this computer, `--open` and `--once` ones too, stops working. |
+| `join '<ticket>'` | Join the team the invite is for. Takes the four-word code, the `https://thelightbulb.company/j#…` link, the `lightbulb://join/…` link or the bare ticket. The name you go by is your user name; `--name <name>` sets another. The computer must be on its own first. |
 | `approve J1` / `approve H1` | Allow a join request (`J`) or a held message (`H`). |
 | `decline J1` / `decline H1` | Decline one. |
 | `held` | The join requests and messages waiting for your Allow. |
@@ -53,6 +56,7 @@ Run `lightbulb <command> --help` for the options of each one.
 | `leave` | Leave the team. This computer is on its own network again. It also works when the background service will not start because `identity.key` no longer matches the team record. |
 | `relay [<url>]` | Show the relays this computer uses, or set one. With nothing set it uses the iroh project's public relays (`default`). It sets the team's relay; `--local` sets only this computer's; `--clear` clears yours and goes back to the default. Relays carry encrypted bytes only. Lightbulb fetches no relay list of its own. |
 | `folder <path> on\|off` | Show or hide the sessions under a folder from your teammates. |
+| `telemetry [on\|off\|status]` | Show or set anonymous usage counts (see the [README](../README.md#usage-counts)). |
 | `version` | Print the version. |
 
 `held`, `approve` and the other commands that decide for you refuse to run from an agent's shell
@@ -125,7 +129,7 @@ again later.
 lightbulb setup --remove
 ```
 
-It takes out the hooks and tool servers it added to each agent, removes the launchd job and stops
+It takes out the hooks and tool servers it added to each agent, removes the launchd job (on macOS) and stops
 the service. It prints `Lightbulb is off. Your settings and messages are kept in
 ~/.lightbulb/connect.` To erase this computer's key and messages too, delete that folder.
 Restart any open agent sessions so they drop the tool server.

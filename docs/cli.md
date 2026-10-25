@@ -1,10 +1,8 @@
 # CLI reference
 
-Every command, with the same options and arguments its `--help` lists (version 0.2.6). Each
+Every command, with the same options and arguments its `--help` lists (version 0.3.7). Each
 `Usage:` line and `--help` line is the binary's own text; the rest says the same in plain words.
-Run `lightbulb <command> --help` for the full text in your terminal. (`held`'s line is the one in
-the next release; 0.2.2 says only "The held messages waiting for your Allow", but lists join
-requests too.)
+Run `lightbulb <command> --help` for the full text in your terminal.
 
 Commands that change who is in the team or how it connects (`held`, `policy <person> <value>`,
 `remove`, `relay <url>`, `leave`) must be run by a person at a terminal, not by an agent. Run
@@ -24,15 +22,15 @@ lightbulb setup [OPTIONS]
 
 `--help`: Wire the installed agents (Claude Code, Codex, Cursor, Grok CLI) to this engine: their hooks and MCP server entry. Each file is backed up once as `<file>.lightbulb-backup`.
 
-Connects Claude Code, Codex, Cursor and Grok CLI here (their hooks and the `lightbulb` tool
-server) and starts the background service. Each file is backed up once as
+Connects Claude Code, Codex, Cursor and Grok CLI here (their hooks and the `lightbulb-network` tool
+server) and starts the background service (on macOS; off macOS it restarts a daemon that runs an older version). Each file is backed up once as
 `<file>.lightbulb-backup`. Details: [agents](agents.md).
 
 | Option | Meaning |
 |---|---|
 | `--remove` | Take out only what setup wrote, and stop the background service. Backups are left as they are. |
 | `--executable <path>` | The binary the hooks, tool servers and background service run. Default: `~/.lightbulb/connect/bin/lightbulb`, which setup installs from the binary you ran. |
-| `--server-name <name>` | The tool server's name, also used in Cursor's and Grok's allow rules. Default: `lightbulb`. |
+| `--server-name <name>` | The tool server's name, also used in Cursor's and Grok's allow rules. Default: `lightbulb-network`. |
 | `--verbose` | Also list the files each agent's setup changed. |
 
 ### doctor
@@ -45,8 +43,9 @@ lightbulb doctor
 
 `--help`: Check the daemon, state permissions, agent wiring, alias and launchd job.
 
-Checks the background service, the relay, the local network, the login item, the state folder,
-each agent and the `lightbulb` command, and prints the fix for the first thing that is wrong.
+Checks the background service, the relay, the local network (macOS only), the login item (macOS
+only), the state folder, each agent, the `lightbulb` command, auto-update and usage counts, and
+prints the fix for the first thing that is wrong.
 Exits 1 when something is wrong. Every line: [troubleshooting](troubleshooting.md).
 
 ### invite
@@ -59,8 +58,9 @@ lightbulb invite [OPTIONS]
 
 `--help`: Print this computer's join line (the reusable invite, unless a flag says otherwise).
 
-Prints this computer's join line (the reusable invite unless an option says otherwise). After
-`--new` it says `Every earlier invite from this computer stopped working.`
+Prints a four-word code (it works once, for 10 minutes), a `https://thelightbulb.company/j#…`
+link and this computer's join line (the reusable invite unless an option says otherwise; reusable
+for 7 days). After `--new` it says `Every earlier invite from this computer stopped working.`
 
 | Option | Meaning |
 |---|---|
@@ -82,8 +82,8 @@ Joins the team the line is for. This computer must be on its own.
 
 | Argument / option | Meaning |
 |---|---|
-| `<TICKET>` | The line your inviter sent: the long code after `join`, or the whole `lightbulb://join/…` link. |
-| `--name <name>` | The name you go by in the team. Default: your user name. |
+| `<TICKET>` | What your inviter sent: the four-word code, the `https://thelightbulb.company/j#…` link, the `lightbulb://join/…` link or the long ticket from the join line. |
+| `--name <name>` | The name you go by in the team. Default: your user name. Needed only if the name is taken (`The name "sam" is already used in this network.`): the message names one to try. |
 
 ## Everyday
 
@@ -304,7 +304,8 @@ version does not change afterwards).
 
 | Option | Meaning |
 |---|---|
-| `--version <VERSION>` | The release to install, like `v0.2.2` (default: the latest). |
+| `--version <VERSION>` | The release to install, like `v0.2.2` (an example; default: the latest). |
+| `--auto <on\|off>` | Turn the daily automatic update on or off, and install nothing. It prints `Automatic updates on.` or `Automatic updates off.`; it cannot be used with `--version`. `doctor` shows `Auto-update`. |
 
 ### version
 
@@ -315,9 +316,23 @@ lightbulb --version
 
 `--help`: Print the version.
 
-Prints the version, for example `lightbulb 0.2.2`.
+Prints the version, for example `lightbulb 0.3.7`.
+
+### telemetry
+
+When you use it: to see or change anonymous usage counts.
+
+```
+lightbulb telemetry [on|off|status]
+```
+
+`--help`: Anonymous usage counts: `on`, `off`, or (no argument) their state.
+
+Prints `Usage counts  on` or `Usage counts  off (…reason…)`. `off` and `on` save the choice in
+`config.toml`. `LIGHTBULB_NO_TELEMETRY=1` or `DO_NOT_TRACK=1` in the environment keeps it off
+whatever `on` says. What is counted: [README](../README.md#usage-counts).
 
 ## Commands the agents and macOS run
 
 `hook`, `mcp` and `daemon` are not for typing. The agents run `lightbulb hook <agent> <event>`
-and `lightbulb mcp`; macOS's login service runs `lightbulb daemon`. `setup` wires them.
+and `lightbulb mcp`; macOS's login service runs `lightbulb daemon` (off macOS, run it yourself, or let the CLI start it). `setup` wires them.

@@ -14,7 +14,11 @@ It prints one line per check, then `All good.` or the fix for the first check th
 ### `Background service   not running`
 
 The background service is not answering. Fix: `lightbulb setup`. It installs the service and
-starts it.
+starts it. Off macOS there is no service manager: any `lightbulb` command starts the daemon, or run
+`lightbulb daemon` and keep it running (for example in tmux, or a systemd `--user` unit).
+
+A line `running 0.3.6, not 0.3.7` means a daemon started before an update still runs. `lightbulb setup`
+or `lightbulb update` restarts it (off macOS since v0.3.7).
 
 If `setup` then says `The old background service did not stop (pid N). Run: kill N, then
 lightbulb setup again.`, an old copy is still running and holds the state folder. Do what it
@@ -22,7 +26,7 @@ says.
 
 ### `Starts at login      no`
 
-The login item (`~/Library/LaunchAgents/company.thelightbulb.connect.plist`) is not loaded, so
+macOS only; Linux has no such line. The login item (`~/Library/LaunchAgents/company.thelightbulb.connect.plist`) is not loaded, so
 the service will not start at login. Fix: `lightbulb setup`.
 
 If `setup` prints `Background service: could not start it (…)`, macOS refused to load the job.
@@ -30,7 +34,7 @@ Check that the file named there exists, then log out and in, and run `setup` aga
 
 ### `Local network        blocked by macOS`
 
-macOS has not allowed lightbulb on the local network, so your other Macs on the same Wi-Fi
+macOS only; Linux has no such line. macOS has not allowed lightbulb on the local network, so your other Macs on the same Wi-Fi
 cannot find this one. Fix: System Settings > Privacy & Security > Local Network, and turn on
 lightbulb. macOS asks once; if you missed the question, the switch is there.
 
@@ -71,6 +75,11 @@ Setup replaces the link.
 If the line reads `~/.local/bin/lightbulb is another program's; put ~/.lightbulb/connect/bin on
 your PATH`, a real file (not a link) is there. Setup leaves it alone. Add
 `export PATH="$HOME/.lightbulb/connect/bin:$PATH"` to `~/.zshrc` and open a new terminal.
+
+### `Auto-update` and `Usage counts`
+
+These lines are never red. They show `on` or `off`. Change them with `lightbulb update --auto on|off`
+and `lightbulb telemetry on|off`.
 
 ### `Relay`
 
@@ -113,6 +122,11 @@ The full text ends `If macOS is asking whether lightbulb may read a folder, clic
 again.` Look for a macOS permission window, answer it, and run the command again. If no window
 is open, run `lightbulb doctor`.
 
+### No dialog appears (Linux)
+
+There are no dialogs on Linux. Run `lightbulb held`, then `lightbulb approve J1` or
+`lightbulb approve H1` (or `decline`).
+
 ### Codex asks you to trust a hook
 
 `setup` writes Codex's hook trust for its own hooks, so Codex normally does not ask. It asks
@@ -149,7 +163,7 @@ call `message_receipt`. What the answer means:
 |---|---|---|
 | `Not delivered yet: <computer> is offline. Lightbulb keeps trying until <time>.` | The other Mac is asleep or unreachable. | Wake it. Lightbulb retries for 24 hours. |
 | `… has not confirmed it yet` | It was sent; the other Mac has not answered. | Wait, or check the relay (above). |
-| `Sent. <person> has to allow it first (they see a prompt).` | Held: the receiver has not allowed you yet. | The receiver runs `lightbulb held`, then `approve H<n>`. |
+| `Sent. <person> has to allow it first (they see a prompt).` | Held: the receiver has not allowed you yet. This is not a failure. Your own other computer is another person until verified names exist, so its first message is held too. | Do not resend. The receiver runs `lightbulb held`, then `approve H<n>`. |
 | `Sent. Stored on <computer>.` | On their Mac, waiting for the session. | The session reads it at its next step; an idle session when someone next types to it. See [agents](agents.md#how-a-message-reaches-a-session). |
 | `Delivered …` / `Read …` | The session got it. | Nothing. |
 | `Not sent: they declined it.` | The receiver clicked Decline. | Ask them. |
@@ -169,9 +183,10 @@ sides, and whether the session's folder is hidden (`lightbulb folder <path> on`)
 |---|---|---|
 | `This invite link does not work. Ask for a new one.` | The line was cut or changed when pasted; or the invite was ended by `invite --new` (which ends every earlier invite of that computer, open and one-time ones too), ended by a `remove`, or was a one-time invite already used. | Ask for a fresh line (`lightbulb invite`), and paste it whole, in single quotes. |
 | `This invite link has expired. Ask for a new one.` | One-time invites last 24 hours, others 7 days. | Ask for a fresh line. |
+| `That code did not work. Check the words. …` | The four-word code works once, for 10 minutes while the inviter's computer is on; or a word is wrong. | Check the words, or ask for the full line (`lightbulb invite`). |
 | `No one from this network is online right now. …` | None of the members listed on it are reachable. | Ask them to open their laptop, then run the same command again. |
 | `No one has answered yet. Run the same command again to keep asking.` | The person did not click Allow in 10 minutes. | Run it again, and tell them to look for the dialog or run `lightbulb held`. |
-| `The name "sam" is already used in this network. …` | Another member has that name. | Use the name it suggests, or another `--name`. |
+| `The name "sam" is already used in this network. Run the same command again with: --name sam-2` | Another member has that name. `join` uses your user name unless you pass `--name`. | Run it again with the `--name` it prints, or another one. |
 | `You are in "<team>". Leave it first: lightbulb leave` | This computer is already in a team. | `lightbulb leave`, then join. |
 | `Your request to join was declined.` | They clicked Decline. | Ask them. |
 | `That name has characters Lightbulb cannot show. …` | The name or computer name has control characters. | Use a plain name. |

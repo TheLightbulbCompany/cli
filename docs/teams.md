@@ -26,9 +26,10 @@ recorded as `local`.
 lightbulb invite
 ```
 
-It prints a four-word code (`lightbulb join <code>`, good for 10 minutes while your computer
-is on), a link, and the full join line, `lightbulb join '<ticket>'`. Send any of them to the
-person.
+It prints a four-word code (`lightbulb join <code>`; it works once, for 10 minutes while your
+computer is on), a `https://thelightbulb.company/j#…` link, and the full join line,
+`lightbulb join '<ticket>'`. Send any of them to the person. The link and the line last as the
+table below says.
 
 | Command | The invite you get |
 |---|---|
@@ -42,14 +43,15 @@ network addresses, and the keys of up to six members to ask: you, then the found
 
 ## Join
 
-On the new computer, paste the line with a name:
+On the new computer, paste what you were sent:
 
 ```sh
-lightbulb join '<ticket>' --name sam
+lightbulb join '<ticket>'
 ```
 
-You can paste the ticket or the whole `lightbulb://join/…` link. Without `--name`, the name is
-your user name on that Mac.
+`join` takes the four-word code, the `https://thelightbulb.company/j#…` link, the
+`lightbulb://join/…` link or the bare ticket. The name you go by is your user name on that Mac;
+`--name <name>` sets another.
 
 The computer must be on its own first. If it is in another team, `join` says
 `You are in "<team>". Leave it first: lightbulb leave`.
@@ -57,7 +59,7 @@ The computer must be on its own first. If it is in another team, `join` says
 `join` dials the inviter (or, if the inviter is offline, another member listed on the
 ticket). That computer asks its person. While it waits, `join` prints
 `Asking whoever sent the link to allow this computer…` and waits up to 10 minutes. When the
-person allows it, you see `Connected as sam (<computer>). Team "<team>": <n> computers online.`
+person allows it, you see `Connected as <name> (<computer>). Team "<team>": <n> computers online.`
 
 If no one answers in time, run the same command again. What the other replies mean:
 see [troubleshooting](troubleshooting.md#join-says-the-invite-does-not-work-or-has-expired).
