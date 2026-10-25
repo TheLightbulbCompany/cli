@@ -145,6 +145,9 @@ enum Command {
         /// The release to install, like v0.2.2 (default: the latest).
         #[arg(long)]
         version: Option<String>,
+        /// Turn the daily automatic update `on` or `off` (and install nothing).
+        #[arg(long, value_parser = ["on", "off"], conflicts_with = "version")]
+        auto: Option<String>,
     },
     /// Allow a join request (`J<n>`) or a held message (`H<n>`).
     Approve {
@@ -311,7 +314,16 @@ fn run() -> lightbulb::Result<()> {
             proof,
         } => exit(cli::join(&link, name, &kind, proof)?),
         Command::Signin => exit(cli::signin()?),
-        Command::Update { version } => exit(cli::update(version)?),
+        Command::Update { auto: Some(a), .. } => {
+            let dir = lightbulb::paths::state_dir();
+            lightbulb::config::Config::set(
+                &dir,
+                "auto_update",
+                if a == "on" { "true" } else { "false" },
+            )?;
+            println!("Automatic updates {a}.");
+        }
+        Command::Update { version, .. } => exit(cli::update(version)?),
         Command::Approve { request, always } => exit(cli::answer(&request, true, always)?),
         Command::Decline { request } => exit(cli::answer(&request, false, false)?),
         Command::Held => exit(cli::held()?),

@@ -837,8 +837,13 @@ async fn the_doorbell_token_is_absent_from_logs() {
     let dir = tempfile::tempdir().unwrap();
     let (a, child, token, sock, wake) = doorbell(dir.path());
     rang(dir.path(), &a, child, &token, &sock);
-    // On curl's stdin, as a config line: never on its command line.
-    let stdin = std::fs::read_to_string(dir.path().join("curl/0.stdin")).unwrap();
+    // On curl's stdin, as a config line: never on its command line. The fake writes its argv
+    // before its stdin, so wait for the stdin file itself.
+    let path = dir.path().join("curl/0.stdin");
+    common::until(30, "curl's stdin is written", || {
+        std::fs::read_to_string(&path).is_ok_and(|t| !t.is_empty())
+    });
+    let stdin = std::fs::read_to_string(&path).unwrap();
     assert_eq!(
         stdin,
         format!("header = \"Authorization: Bearer {wake}\"\n")
