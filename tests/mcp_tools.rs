@@ -582,7 +582,7 @@ fn a_failed_push_brings_the_unread_note_back() {
     let sessions = net.claude.path().join(".claude/sessions");
     std::fs::create_dir_all(&sessions).unwrap();
     let entry = json!({"pid": me().pid, "sessionId": "c9", "cwd": "/tmp",
-        "startedAt": me().birth_micros / 1000, "status": "idle", "messagingSocketPath": sock});
+        "startedAt": lightbulb::os::started_ms(me().pid).unwrap(), "status": "idle", "messagingSocketPath": sock});
     std::fs::write(sessions.join("a.json"), entry.to_string()).unwrap();
     let short = net.call(json!({"id": 1, "op": "status"}))["member_key_short"]
         .as_str()

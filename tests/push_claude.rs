@@ -37,7 +37,7 @@ fn claude_home() -> &'static Path {
         let dir = home.path().join(".claude/sessions");
         std::fs::create_dir_all(&dir).unwrap();
         let me = std::process::id();
-        let started = os::process(me).unwrap().birth_micros / 1000;
+        let started = os::started_ms(me).unwrap();
         for (file, conv, sock) in [("a", "ok-conv", "ok.sock"), ("b", "gone-conv", "gone.sock")] {
             let entry = json!({"pid": me, "sessionId": conv, "cwd": "/tmp", "startedAt": started,
                 "kind": "interactive", "status": "idle",

@@ -572,7 +572,7 @@ fn a_discovered_claude_session_drains_its_own_inbox() {
     std::fs::write(
         dir.join(format!("{}.json", me.pid)),
         json!({"pid": me.pid, "sessionId": "found-only", "cwd": "/tmp",
-            "startedAt": me.birth_micros / 1000})
+            "startedAt": lightbulb::os::started_ms(me.pid).unwrap()})
         .to_string(),
     )
     .unwrap();

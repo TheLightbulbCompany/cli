@@ -6,8 +6,10 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Process {
     pub pid: u32,
-    /// Start time, microseconds since the Unix epoch. With the pid it names one
-    /// process for good: a reused pid has a different birth.
+    /// Start time in microseconds: since the Unix epoch on macOS, since boot on Linux (whose
+    /// boot time, `/proc/stat`'s `btime`, moves with every clock step: an epoch birth read
+    /// later would no longer match). With the pid it names one process for good: a reused pid
+    /// has a different birth. Never a wall-clock time: that is `started_ms`.
     pub birth_micros: u64,
     pub executable: PathBuf,
 }
@@ -24,6 +26,12 @@ pub fn process(pid: u32) -> Result<Process> {
         birth_micros: imp::info(pid)?.birth_micros,
         executable: imp::executable(pid)?,
     })
+}
+
+/// When `pid` started, milliseconds since the Unix epoch (to compare with another program's
+/// record of it). On Linux it moves with the clock: compare it with a margin.
+pub fn started_ms(pid: u32) -> Result<u64> {
+    imp::started_ms(pid)
 }
 
 /// This computer's short host name (its first label, at most 64 characters, so a member
@@ -83,6 +91,10 @@ mod imp {
             ppid: short.pbsi_ppid,
             birth_micros,
         })
+    }
+
+    pub fn started_ms(pid: u32) -> Result<u64> {
+        Ok(info(pid)?.birth_micros / 1000)
     }
 
     /// One `proc_pidinfo` struct of `flavor`, when the kernel fills it whole.
@@ -148,8 +160,25 @@ mod imp {
     use std::path::PathBuf;
 
     /// From `/proc/<pid>/stat` (readable for any uid's process): the ppid, and the start
-    /// time in clock ticks since boot, placed on the epoch by `/proc/stat`'s `btime`.
+    /// time in clock ticks since boot. Never placed on the epoch: `btime` is now minus uptime,
+    /// whole seconds, so a clock step (NTP, a VM's host sync: WSL) moves it and every birth
+    /// read after it, and then no registered session matches its own process (`started_ms`).
     pub fn info(pid: u32) -> Result<Info> {
+        let (ppid, ticks) = stat(pid)?;
+        Ok(Info {
+            ppid,
+            birth_micros: ticks * 1_000_000 / clock_ticks(),
+        })
+    }
+
+    /// `info`'s start placed on the epoch by `btime`: as good as the clock now.
+    pub fn started_ms(pid: u32) -> Result<u64> {
+        let boot = boot_micros().ok_or("no btime in /proc/stat")?;
+        Ok((boot + info(pid)?.birth_micros) / 1000)
+    }
+
+    /// `/proc/<pid>/stat`'s ppid and starttime (clock ticks since boot).
+    fn stat(pid: u32) -> Result<(u32, u64)> {
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
             .map_err(|_| format!("no process {pid}"))?;
         // `pid (comm) state ppid …`: comm may hold spaces and parentheses, so fields count
@@ -159,11 +188,7 @@ mod imp {
         let num = |i: usize| -> Result<u64> {
             Ok(fields.get(i).ok_or("bad /proc stat")?.parse::<u64>()?)
         };
-        let (ppid, ticks) = (num(1)? as u32, num(19)?);
-        Ok(Info {
-            ppid,
-            birth_micros: boot_micros().map_or(0, |b| b + ticks * 1_000_000 / clock_ticks()),
-        })
+        Ok((num(1)? as u32, num(19)?))
     }
 
     fn clock_ticks() -> u64 {
@@ -256,6 +281,10 @@ mod imp {
         Err("process lookup is only implemented on macOS and Linux".into())
     }
 
+    pub fn started_ms(_pid: u32) -> Result<u64> {
+        Err("process lookup is only implemented on macOS and Linux".into())
+    }
+
     pub fn executable(_pid: u32) -> Result<PathBuf> {
         Err("process lookup is only implemented on macOS and Linux".into())
     }
@@ -305,6 +334,34 @@ mod tests {
             let init = process(1).unwrap().executable;
             assert!(!init.as_os_str().is_empty());
         }
+    }
+
+    /// A birth is since boot, never on the epoch through `btime`, which a clock step moves
+    /// (WSL's host sync): a birth read after one would match no registered session.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_birth_does_not_move_with_the_clock() {
+        let me = process(std::process::id()).unwrap();
+        let uptime: f64 = std::fs::read_to_string("/proc/uptime")
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(
+            me.birth_micros <= (uptime * 1e6) as u64 + 1_000_000,
+            "{me:?}"
+        );
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let started = started_ms(me.pid).unwrap();
+        assert!(
+            started <= now + 2_000 && now - started < 3_600_000,
+            "{started} vs {now}"
+        );
     }
 
     /// An agent whose binary is replaced mid-session keeps its path (Linux says
