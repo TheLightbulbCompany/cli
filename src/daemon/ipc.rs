@@ -220,7 +220,7 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
         "inbox.ack" if instance => crate::embed::ack(id, body, daemon),
         "inbox.peek" | "inbox.ack" => peek_or_ack(id, op, body, daemon).await,
         "cloud.sessions.set" => super::net_ops::cloud_sessions_set(id, body, daemon).await,
-        "app.send" | "app.inbox" | "app.receipt" if instance => {
+        "app.send" | "app.inbox" | "app.ack" | "app.unread" | "app.receipt" if instance => {
             crate::app_send::op(id, op, body, daemon).await
         }
         "status" => {
@@ -355,7 +355,8 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
         }
         "team.invite" => {
             let mut r = super::net_ops::handle(id, op, body, daemon, caller);
-            if r.ok {
+            // `code: false` (`invite --agents`): the link alone, no second link behind a code.
+            if r.ok && body["code"] != false {
                 crate::code::offer(daemon, &mut r.body).await;
             }
             r
@@ -607,6 +608,10 @@ fn live_count(daemon: &Daemon) -> usize {
 
 /// `m`'s sender as this computer's agents are told it (`label::sender`).
 pub(crate) fn sender_label(daemon: &Daemon, m: &store::Message) -> String {
+    if m.origin.as_deref() == Some(mail::APP_ORIGIN) {
+        let title = crate::link::title_of(daemon, &m.from_key);
+        return label::hosted_app(&m.from_key, title.as_deref());
+    }
     let from = label::from(&daemon.identity.short, m);
     let declared = presence::declared_agents(daemon).remove(&from);
     let team = daemon.team.lock().unwrap();
@@ -638,6 +643,19 @@ pub(crate) fn send(
     id: u64,
     body: &Value,
     daemon: &Arc<Daemon>,
+) -> Result<(Key, mail::Receipt), Response> {
+    send_as(id, body, daemon, false)
+}
+
+/// `send`; with `app`, from a hosted app's session on this computer (`link`): never hop 0 (the
+/// agents' loop limits apply), and its mail for a session here is stored as from that app
+/// (origin `app`: framed as "<App> (you)", never as typed at the terminal). Not held: the person
+/// connected the app themselves.
+pub(crate) fn send_as(
+    id: u64,
+    body: &Value,
+    daemon: &Arc<Daemon>,
+    app: bool,
 ) -> Result<(Key, mail::Receipt), Response> {
     let (Some(from), Some(text), Some(rid)) = (
         body["from"].as_str(),
@@ -674,10 +692,13 @@ pub(crate) fn send(
     let store = daemon.store.lock().unwrap();
     let internal = |_| Response::err(id, INTERNAL);
     let prepared = mail::prepare(&store, &from, to.as_ref(), text, rid, reply_to, now());
-    let p = match prepared.map_err(internal)? {
+    let mut p = match prepared.map_err(internal)? {
         mail::Prep::Go(p) => p,
         mail::Prep::Done(r) => return Ok((from, r)),
     };
+    if app {
+        p.hops = p.hops.max(1);
+    }
     let prefix = sessions::member_of(&p.to.0).unwrap_or("");
     if prefix != daemon.identity.short {
         let Some(member) = team.roster.by_short(prefix) else {
@@ -688,7 +709,12 @@ pub(crate) fn send(
         return Ok((from, r));
     }
     drop(team);
-    let sent = mail::store_local(&store, &p).map_err(internal)?;
+    let sent = if app {
+        mail::store_local_from(&store, &p, mail::Origin::App)
+    } else {
+        mail::store_local(&store, &p)
+    }
+    .map_err(internal)?;
     drop(store);
     if sent.state == mail::State::Stored {
         stored(daemon, &p.to, Some(&p.message_id));
@@ -701,6 +727,9 @@ pub(crate) fn send(
 /// an embedded instance's caller hears `message {to_session, id}` (the declared name).
 pub(crate) fn stored(daemon: &Arc<Daemon>, to: &Key, id: Option<&str>) {
     daemon.mail.notify_waiters();
+    if daemon.cloud.is_none() && id.is_some() {
+        crate::link::stored(daemon, &to.0); // a hosted app's session: wake its bot, if it asked
+    }
     if let (Some(_), Some(id)) = (&daemon.cloud, id) {
         if let Some((_, name)) = sessions::split_addr(&to.0) {
             let e = json!({"event": "message", "to_session": name, "id": id});
@@ -814,13 +843,28 @@ pub(crate) fn records(daemon: &Daemon, messages: &[store::Message]) -> Vec<Value
     let (key, short) = (&daemon.identity.key, &daemon.identity.short);
     // Before `team`: the presences' own lock.
     let declared = presence::declared_agents(daemon);
+    // A hosted app's session here (`link`): named as the app, never as this computer's person.
+    let apps = crate::link::apps(daemon);
     let team = daemon.team.lock().unwrap();
     let mut senders: HashMap<String, Value> = HashMap::new();
     messages
         .iter()
         .map(|m| {
             let from = label::from(short, m);
-            let who = senders.entry(from.clone()).or_insert_with(|| {
+            let app = m.origin.as_deref() == Some(mail::APP_ORIGIN);
+            let entry = if app {
+                format!("app:{from}")
+            } else {
+                from.clone()
+            };
+            let who = senders.entry(entry).or_insert_with(|| {
+                if app {
+                    let title = apps.iter().find(|r| r.session_id == m.from_key);
+                    let title = title.and_then(|r| r.title.as_deref());
+                    return json!({ "label": label::hosted_app(&m.from_key, title),
+                        "person": super::user_name(), "person_verified": false,
+                        "computer": team.config.computer });
+                }
                 let agent = declared.get(&from).map(String::as_str);
                 let label = label::render_as(&team.roster, key, &from, agent);
                 match team

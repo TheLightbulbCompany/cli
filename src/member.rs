@@ -31,7 +31,8 @@ pub struct MemberOpts {
     pub name: String,
     pub relay: Option<String>,
     /// `{workspace, sessions: [{name, agent, title?, ...}], wake?, members?}`: the sessions
-    /// declared before the transport starts; `members`, person ids, gate who may message them.
+    /// declared before the transport starts; `members`, the workspace's people, gate who may
+    /// message them: a computer whose sign-in proof names one of them (`proof::admitted`).
     pub sessions: PathBuf,
 }
 
@@ -50,12 +51,9 @@ pub async fn run(opts: MemberOpts, token: String) -> Result<()> {
             vec![]
         }
     };
-    let members = match file.get("members") {
-        None => None,
-        Some(v) => net_ops::members_of(v).map_err(|()| {
-            "the sessions file's members must be null or a list of person id strings"
-        })?,
-    };
+    let members = net_ops::gate_of(&file)
+        .map_err(|()| "the sessions file's members must be null or a list of user id strings")?
+        .flatten();
     let relay = opts
         .relay
         .as_deref()

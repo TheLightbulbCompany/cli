@@ -11,7 +11,6 @@ use crate::dialog;
 use crate::identity::{self, Identity};
 use crate::net::frames::{self, Frame};
 use crate::net::{self, JOIN_ALPN};
-use crate::policy;
 use crate::roster::{self, Collision, Entry, Kind, Roster};
 use crate::store::{Join, Store};
 use crate::ticket::{self, Ticket};
@@ -242,10 +241,9 @@ fn open(d: &Daemon, req: &Request) -> Result<(i64, Option<Verdict>), &'static st
     if all >= LIMITS.0 || by_inviter >= LIMITS.1 || by_candidate >= LIMITS.2 {
         return Err(TOO_MANY);
     }
-    // A `person` link of ours, and an `open` one, never wait for an Allow. Another member's
-    // waits: any member may sign a non-`open` link, so its word admits no one here. (A code
-    // serves a once `ask` link of its own, `code::offer`.)
-    let ask = !own_person_link(d, req) && req.ticket.mode != "open";
+    // An `open` link never waits for an Allow. (A code serves a once `ask` link of its own,
+    // `code::offer`.)
+    let ask = req.ticket.mode != "open";
     let n = store.put_join(&row(req, now)).map_err(fail)?;
     eprintln!("join: J{n} open for {}", net::short(&req.candidate));
     if ask {
@@ -254,11 +252,6 @@ fn open(d: &Daemon, req: &Request) -> Result<(i64, Option<Verdict>), &'static st
     let v = try_admit(d, &mut team, &store, n, req, once, None, now);
     close(&store, n, v);
     Ok((n, Some(v)))
-}
-
-/// Whether `req` comes with a `person` link this computer signed (`check` proved its link).
-fn own_person_link(d: &Daemon, req: &Request) -> bool {
-    req.ticket.mode == "person" && req.ticket.inviter == d.identity.key
 }
 
 /// `req`'s `join_requests` row, made at `now`.
@@ -319,9 +312,7 @@ pub fn fits(s: &str) -> bool {
         && s.chars().all(crate::label::printable)
 }
 
-/// Writes request `n`'s checked `admit`; for a `once` link, marks it used here; for a `person`
-/// link of ours, records the computer as the link's person (`persons`, what an instance's
-/// members list reads).
+/// Writes request `n`'s checked `admit`; for a `once` link, marks it used here.
 #[allow(clippy::too_many_arguments)]
 fn try_admit(
     d: &Daemon,
@@ -348,14 +339,6 @@ fn try_admit(
     }
     if once {
         let _ = store.use_link(&req.ticket.ticket_id, &req.candidate);
-    }
-    // Our `person` link (`check` proved it ours, its `for` under our signature) names who the
-    // computer is: local to this member, written by nothing a peer sends.
-    let person = req.ticket.person.as_deref();
-    if let Some(p) = person.filter(|_| own_person_link(d, req)) {
-        if let Err(e) = store.put_person(&req.candidate, p, now) {
-            eprintln!("join: J{n}: {e}");
-        }
     }
     Ok(())
 }
@@ -573,8 +556,6 @@ enum Outcome {
 
 /// `team.join {ticket | code, name?}` -> `{state: admitted|waiting|refused, reason?, team,
 /// online}`. Only a solo computer joins; it asks the ticket's members in order, one at a time.
-/// Joined through a `person` link, it accepts its inviter's answers to its own messages
-/// (`policy::accept_replies`); anything else from the inviter is held as anyone's.
 pub async fn join(id: u64, body: &Value, d: &Arc<Daemon>) -> Response {
     let (ticket_in, code_in) = (body["ticket"].as_str(), body["code"].as_str());
     if ticket_in.is_some() == code_in.is_some() {
@@ -699,13 +680,6 @@ pub async fn join(id: u64, body: &Value, d: &Arc<Daemon>) -> Response {
                     // A workspace member's doorbell goes into the team it just joined.
                     if let Err(e) = crate::embed::publish(d) {
                         eprintln!("join: wake: {e}");
-                    }
-                    if t.mode == "person" {
-                        let store = d.store.lock().unwrap();
-                        let now = ipc::now() as i64;
-                        if let Err(e) = policy::accept_replies(&store, &t.inviter, now) {
-                            eprintln!("join: {e}");
-                        }
                     }
                     let team = d.team.lock().unwrap().roster.team_name.clone();
                     return done("admitted", None, &team, d.peers.online().len() + 1);

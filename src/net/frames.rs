@@ -100,6 +100,10 @@ pub enum Frame {
         /// that moved networks can be dialed without mDNS. Absent from older builds.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         addrs: Vec<String>,
+        /// The sender's sign-in proof (`proof`), when its person ran `lightbulb login`: what a
+        /// workspace member admits it by. Absent from older builds.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        proof: Option<String>,
     },
     /// Each entry carries its own `sig`.
     Roster { entries: Vec<Entry>, more: bool },
@@ -336,6 +340,7 @@ mod tests {
             protocol: 1,
             heads: vec!["h".into()],
             addrs: vec!["127.0.0.1:1".into()],
+            proof: None,
         };
         write(&mut a, &hello).await.unwrap();
         assert_eq!(read(&mut b).await.unwrap(), hello);

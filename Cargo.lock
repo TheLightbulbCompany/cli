@@ -1799,13 +1799,14 @@ dependencies = [
 
 [[package]]
 name = "lightbulb"
-version = "0.4.7"
+version = "0.5.0"
 dependencies = [
  "argon2",
  "clap",
  "data-encoding",
  "dirs",
  "ed25519-dalek",
+ "futures-util",
  "iroh",
  "iroh-mdns-address-lookup",
  "iroh-relay",
@@ -1813,12 +1814,14 @@ dependencies = [
  "rand",
  "rmcp",
  "rusqlite",
+ "rustls",
  "schemars",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "tokio",
+ "tokio-websockets",
  "toml_edit",
  "ulid",
 ]
@@ -3783,6 +3786,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-util",
+ "webpki-roots",
 ]
 
 [[package]]

@@ -28,7 +28,7 @@ pub struct EmbedOpts {
     /// The sessions declared before the transport starts (`cloud.sessions.set`'s list), so mail
     /// for them that arrives right after start is kept, not refused as unadvertised.
     pub sessions: Vec<Value>,
-    /// The person ids whose computers (`persons`) may message the sessions; `None`: no gate.
+    /// The member keys (computers) that may message the sessions; `None`: no gate.
     pub members: Option<std::collections::HashSet<String>>,
 }
 
@@ -136,7 +136,7 @@ fn declarable(short: &str, list: &[Value]) -> Vec<net::frames::Remote> {
 }
 
 /// An instance's start: its workspace's name, the home lock it keeps, the sessions it declares
-/// from the start and the person ids that may message them.
+/// from the start and the member keys that may message them.
 pub(crate) type CloudStart = (
     String,
     std::fs::File,
@@ -242,6 +242,8 @@ pub(crate) async fn boot(
             c
         }),
         home_lock,
+        proofs: Mutex::default(),
+        link: Mutex::default(),
     });
     // No join connection outlives a restart: its open requests are over.
     daemon.store.lock().unwrap().expire_joins(i64::MAX, now)?;
@@ -255,7 +257,7 @@ impl Instance {
     /// op is refused (`bad_request`, reason `not_a_person`) but `team.join` and `team.leave`:
     /// the caller is the bridge, acting for a
     /// workspace admin who confirmed in the app. `inbox {session}` takes a declared session's
-    /// mail as Task 10's records, read. `app.send`, `app.inbox` and `app.receipt` send and read
+    /// mail as Task 10's records, read. `app.send`, `app.inbox`, `app.ack`, `app.unread` and `app.receipt` send and read
     /// as a hosted app's declared session `{app}-{person}` (`app_send`).
     pub async fn call(&self, req: Value) -> Value {
         json!(self.respond(req).await)

@@ -67,6 +67,7 @@ for 7 days). After `--new` it says `Every earlier invite from this computer stop
 | `--new` | A new invite; every earlier one from this computer (open ones too) stops working. |
 | `--once` | An invite for one join, valid 24 hours. |
 | `--open` | An invite whose joins need no Allow |
+| `--agents` | Add your Lightbulb workspace's agents to this network. You must be a workspace admin, signed in here with `lightbulb login`: confirm in the browser, then allow the workspace when this computer asks. |
 
 ### join
 
@@ -237,6 +238,29 @@ lightbulb leave
 
 Asks `[y/N]` first. This computer is on its own network again. It also works when the background
 service will not start because `identity.key` no longer matches the team record.
+
+### login
+
+When you use it: to use your Lightbulb workspace's agents from this computer.
+
+```
+lightbulb login
+```
+
+Prints a code and opens `thelightbulb.company` in your browser; sign in (or make a free account)
+and type the code there. This computer is then yours in Lightbulb: it keeps a sign-in proof
+(`login.json`, renewed before its 30 days end), your workspaces' agents answer it, and while it
+runs it keeps one connection to Lightbulb for your hosted apps ([apps](connect/apps.md)). The code
+works for 10 minutes.
+
+### logout
+
+```
+lightbulb logout
+```
+
+Deletes this computer's sign-in proof and drops its connection for hosted apps; workspaces stop
+answering it on their next connection to it.
 
 ### policy
 

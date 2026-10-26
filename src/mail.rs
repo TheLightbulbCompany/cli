@@ -13,8 +13,9 @@ use serde_json::Value;
 pub const LOOP_LIMIT: u32 = 12;
 /// Half-open: a send counts while `sent_at > now - LOOP_WINDOW_S`, so one sent at T stops counting at T + 600.
 pub const LOOP_WINDOW_S: u64 = 600;
-/// How long after this computer's message its inviter's answer to it needs no Allow.
-const REPLY_WINDOW_S: u64 = 86_400;
+/// What a sender the workspace does not answer is told (`not_a_member`).
+pub const NOT_A_MEMBER: &str =
+    "This workspace answers its members. Ask an admin to add you, then run `lightbulb login`";
 /// Offline mail (and, later, the outbox) waits this long.
 pub const HOLD_S: u64 = 86_400;
 /// A held message waits this long for the person (nothing holds in Plan A).
@@ -218,7 +219,7 @@ fn receipt_text(r: &Value, person: Option<&ForPerson>) -> Option<String> {
                 "policy" => "they do not take messages from you".to_string(),
                 "declined" => "they declined it".into(),
                 "not_member" => "that computer is not in your team".into(),
-                "not_a_member" => "that workspace only takes messages from its members".into(),
+                "not_a_member" => NOT_A_MEMBER.into(),
                 "request_id_reused" => "that request id was used for another message".into(),
                 "unsupported" => "their computer cannot take it".into(),
                 _ => shown("reason").replace('_', " "),
@@ -444,6 +445,8 @@ pub enum Prep {
 pub enum Origin<'a> {
     Local,
     Net(&'a str),
+    /// A hosted app's session on this computer (`link`): never framed as the person's own.
+    App,
 }
 
 impl From<&Prepared> for Message {
@@ -645,8 +648,10 @@ pub fn prepare(
 /// Writes `p`'s message (from `origin`) with receipt `state`.
 pub(crate) fn put(store: &Store, p: &Prepared, origin: Origin, state: State) -> Result<()> {
     let mut m = Message::from(p);
-    if let Origin::Net(short) = origin {
-        m.origin = Some(format!("net:{short}"));
+    match origin {
+        Origin::Net(short) => m.origin = Some(format!("net:{short}")),
+        Origin::App => m.origin = Some(APP_ORIGIN.into()),
+        Origin::Local => {}
     }
     store.put_message(&m)?;
     let at = p.sent_at as u64;
@@ -696,10 +701,18 @@ pub(crate) fn record_queued(store: &Store, p: &Prepared) -> Result<()> {
     answered(store, p)
 }
 
+/// A stored message's `origin` when a hosted app's session on this computer sent it.
+pub const APP_ORIGIN: &str = "app";
+
 /// Stores `p` here, in its recipient's mailbox; its receipt.
 pub fn store_local(store: &Store, p: &Prepared) -> Result<Receipt> {
+    store_local_from(store, p, Origin::Local)
+}
+
+/// `store_local`, from `origin` (`Local`, or `App`).
+pub fn store_local_from(store: &Store, p: &Prepared, origin: Origin) -> Result<Receipt> {
     let tx = store.conn().unchecked_transaction()?;
-    record(store, p, Origin::Local, true)?;
+    record(store, p, origin, true)?;
     tx.commit()?;
     Ok(receipt(store, &p.from, &p.request_id)?.ok_or("receipt missing after write")?)
 }
@@ -732,8 +745,9 @@ pub fn send(
 /// with origin `net:<peer short>`, timed by its arrival (`now`). Held or stored, it is
 /// remembered in `seen_ids`. On a workspace member, `declared` are its sessions: new mail for
 /// any other is `policy` (after the resend checks, so a resend gets the state it has). With
-/// `members` (person ids), mail from a peer that is no computer of one of them (`persons`, the
-/// people this member's own person links admitted) is `not_a_member`: no hold.
+/// `members` (the member keys the workspace answers: those whose sign-in proof names one of its
+/// people, `proof::admitted`), mail from a peer whose key
+/// is not listed is `not_a_member`: refused, no hold.
 #[allow(clippy::too_many_arguments)]
 pub fn receive(
     store: &Store,
@@ -805,10 +819,8 @@ pub fn receive(
     if declared.is_some_and(|d| !d.contains(to)) {
         return refused("policy");
     }
-    if let Some(m) = members {
-        if !store.person(&peer.key)?.is_some_and(|p| m.contains(&p)) {
-            return refused("not_a_member");
-        }
+    if members.is_some_and(|m| !m.contains(&peer.key)) {
+        return refused("not_a_member");
     }
     // An answer to (or in the thread of) a message this computer sent is at least one hop
     // past it, whatever `hops` the peer claims; only a person (`/terminal`, fenced by the
@@ -829,23 +841,7 @@ pub fn receive(
     // list, there is nothing to ask.
     let verdict = match roster.by_short(me) {
         Some(_) if members.is_some() => Verdict::Accept,
-        Some(mine) => match policy::decide(store, &mine.key, peer)? {
-            // My person-link inviter's session answering (`reply_to`, within a day) a message
-            // the session it writes to sent to that very session; a thread alone is not enough.
-            Verdict::Hold
-                if policy::replies_from(store, &peer.key)?
-                    && match reply_to.as_deref() {
-                        Some(r) => {
-                            let since = now.saturating_sub(REPLY_WINDOW_S) as i64;
-                            store.sent_to(r, to, from, since)?
-                        }
-                        None => false,
-                    } =>
-            {
-                Verdict::Accept
-            }
-            v => v,
-        },
+        Some(mine) => policy::decide(store, &mine.key, peer)?,
         None => Verdict::Hold,
     };
     if verdict == Verdict::Refuse {

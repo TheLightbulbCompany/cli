@@ -199,10 +199,12 @@ fn build(d: &Daemon, seq: u64) -> Frame {
         .map(|(k, ..)| k.clone())
         .take(MAX)
         .collect();
+    // The signed-in person's hosted apps' sessions, declared over the route link (`link`).
+    let apps = crate::link::apps(d);
     Frame::Presence {
         member: d.identity.key.clone(),
         seq,
-        sessions: live.iter().map(|s| remote(s, share)).collect(),
+        sessions: live.iter().map(|s| remote(s, share)).chain(apps).collect(),
         known,
         kept,
     }
@@ -456,6 +458,11 @@ pub fn directory(d: &Daemon, query: Option<&str>) -> Value {
         None => ipc::live_sessions(d)
             .iter()
             .map(|s| (remote(s, false), s.cwd.clone(), s.handle.clone(), s.hidden))
+            .chain(
+                crate::link::apps(d)
+                    .into_iter()
+                    .map(|r| (r, String::new(), None, false)),
+            )
             .collect(),
     };
     let remote_ones = stored(d);

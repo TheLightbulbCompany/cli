@@ -517,6 +517,18 @@ fn refuse(r: &Value, texts: &[(&str, String)]) -> Result<i32> {
     Ok(1)
 }
 
+/// `invite --agents`: a once link for the workspace to join with (`login::invite_agents`).
+pub fn invite_agents() -> Result<i32> {
+    let r = connect()?.call(
+        "team.invite",
+        json!({ "mode": Invite::Once, "code": false }),
+    )?;
+    match r["ticket"].as_str() {
+        Some(t) if r["ok"] == true => crate::login::invite_agents(t),
+        _ => refuse(&r, &[]),
+    }
+}
+
 /// `invite [--new|--once|--open]`: this computer's invite line.
 pub fn invite(mode: Invite) -> Result<i32> {
     let r = connect()?.call("team.invite", json!({ "mode": mode }))?;
@@ -1729,6 +1741,18 @@ pub fn doctor() -> Result<i32> {
             plist_path(&home).exists()
         };
         row("Starts at login", loaded, "yes", "no", &setup);
+    }
+    if crate::login::stored(&dir).is_some() {
+        let now = crate::daemon::ipc::now() as i64;
+        let ended = crate::login::ended(&dir, now);
+        let fix = "Sign in again: lightbulb login";
+        row(
+            "Lightbulb sign-in",
+            !ended,
+            "signed in",
+            "ended: run lightbulb login",
+            fix,
+        );
     }
     let mode = |p: &Path| fs::metadata(p).map(|m| m.permissions().mode() & 0o777).ok();
     let socket = dir.join(paths::SOCKET);

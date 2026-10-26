@@ -34,20 +34,22 @@ verified (shown "(not verified)"). Accepted: members are trusted.
 There is one kind of member. Every member is its own person: its person id is its own key, and
 nothing in the roster can say otherwise (an admit's other claims are ignored). A Lightbulb
 workspace's member (`lightbulb member`) is a member like any other; what it answers is its own
-local rule. It keeps, in its own state alone, which computer belongs to which workspace person:
-it records that when a computer joins through a `person` link the workspace itself made for that
-person (the link names the person under the workspace's signature and works once). With a
-members list, it takes a message for one of its agents only from a computer it recorded for a
-listed person; any other member's message is refused (`not_a_member`), with no hold. No frame a
-peer sends writes that record, and it is dropped by any install whose replay applies a removal
-or leave of the computer (even if it is admitted again in the same sync); an entry replay
-ignores (a leave signed for someone else, a removal of the founder) drops nothing. A computer
-that joins with a person line accepts from its inviter only an answer to its own message: its
-`reply_to` must name a message, at most a day old, that the session it is sent to sent to the
-very session it comes from. Anything else from the inviter, a continued thread included, is held
-like anyone's, and the mark goes when the inviter leaves the team. Labels
-ending "(not verified)" are unproven names, never an identity. Only join with a person line from a workspace you
-trust; an ordinary invite line or code never does this.
+local rule. The Lightbulb backend writes it `members`: its people's Lightbulb user ids. It takes
+a message for one of its agents only from a computer whose sign-in proof names one of them; any
+other member's message (no proof, an expired one, another person's, another computer's) is
+refused (`not_a_member`), with no hold. `lightbulb login` proves the key: the backend sends a
+one-time challenge (2 minutes), this computer signs `{challenge, key, purpose}` with its member
+key, and the signed-in person types the code their terminal shows on the confirm page (10
+minutes, single use). The answer is the sign-in proof: a compact EdDSA JWS from Lightbulb,
+`{iat, exp, sub: <user id>, computer: <member key>}`, kept in `login.json` (0600) and shown in
+this computer's `hello`. A workspace member verifies it offline against the issuer's public key.
+Proofs last 30 days and are renewed in their last week; they cannot be revoked sooner, but
+removing a person from a workspace takes effect at once (`members`). `lightbulb logout` deletes
+the proof. A
+workspace member never invites; it joins one network when a workspace admin runs
+`lightbulb invite --agents`, which hands it a one-time ask link that admin's computer signed (so
+that computer still asks Allow). Labels ending "(not verified)" are unproven names, never an
+identity.
 
 ### Invite codes
 

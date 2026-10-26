@@ -33,21 +33,18 @@ pub enum Invite {
     Once,
     /// A link whose joins need no Allow (founder and admins).
     Open,
-    /// A once link for one person's computer, admitted with no Allow (an instance only).
-    Person,
 }
 
 impl Invite {
     fn link_mode(self) -> &'static str {
         match self {
             Invite::Open => "open",
-            Invite::Person => "person",
             _ => "ask",
         }
     }
 
     fn once(self) -> bool {
-        matches!(self, Invite::Once | Invite::Person)
+        self == Invite::Once
     }
 }
 
@@ -79,8 +76,8 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, caller: Caller) 
         } else {
             Invite::default()
         };
-        // A person link is an instance's alone, and an instance mints no other link.
-        if op == "team.invite" && (invite == Invite::Person) != (caller == Caller::Instance) {
+        // A workspace member never invites: an admin adds it to a network (`team.join`).
+        if op == "team.invite" && caller == Caller::Instance {
             return Response::err(id, UNSUPPORTED);
         }
         let gate = gate(op);
@@ -89,10 +86,7 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, caller: Caller) 
         if gate.person_only && !caller.is_person() {
             return refused(id, "not_a_person");
         }
-        if op == "team.invite"
-            && caller != Caller::Instance
-            && caller.actor(&daemon.store.lock().unwrap()).is_none()
-        {
+        if op == "team.invite" && caller.actor(&daemon.store.lock().unwrap()).is_none() {
             return refused(id, "not_a_person");
         }
         match op {
@@ -406,11 +400,6 @@ pub fn install(
             .iter()
             .any(|(h, e)| new.ended.contains(h) && !team.roster.knows(h) && e.body["member"] == k)
     };
-    // A computer gone from the team, or removed in this install (even if re-admitted in it), is
-    // nobody's any more (`persons`), and no inviter whose answers need no Allow.
-    let keep = |k: &str| new.members.contains_key(k) && !took(k);
-    store.prune_persons(keep)?;
-    crate::policy::prune_replies(store, keep)?;
     let relay_changed = team.roster.relay != new.relay;
     // A removal or leave applied in this team (not a team left or joined, nor a member a fork's
     // resolution dropped): every subscriber hears of each member it took.
@@ -581,24 +570,6 @@ impl TeamOps<'_> {
                         "heads": r.heads, "removed": removed_notice(self.daemon)}),
                 )
             }
-            // `team.invite {mode: "person", for, name}` -> `{line, expires_at}`: a once link
-            // for person `for`'s computer (24 h), its line with `name` filled in.
-            "team.invite" if invite == Invite::Person => {
-                // Joinable as is (`admission::fits`) and safe inside the line's quotes.
-                let quotable = |n: &&str| crate::admission::fits(n) && !n.contains('\'');
-                let person = body["for"].as_str().filter(|p| !p.is_empty());
-                let (Some(person), Some(name)) = (person, body["name"].as_str().filter(quotable))
-                else {
-                    return Ok(Response::err(id, BAD_REQUEST));
-                };
-                let mut t = self.new_link(invite.link_mode(), true, false)?;
-                // A workspace member's line carries its doorbell: the person may paste it
-                // after the workspace parked, and the joiner has no roster to ring from.
-                t.wake = self.team.roster.wakes.get(&me_key).cloned();
-                let t = ticket::for_person(&self.daemon.identity, t, person);
-                let line = ticket::person_line(&ticket::encode(&t), name);
-                Response::ok(id, json!({"line": line, "expires_at": t.expires_at}))
-            }
             // `team.invite {mode}` -> `{ticket, line, app_link, expires_at, replaced}`. `reusable`
             // (and `open`) reprint this member's live link of that mode, minting one if none.
             "team.invite" => {
@@ -739,8 +710,8 @@ pub(crate) fn remotes(short: &str, list: &[Value]) -> Option<Vec<crate::net::fra
     Some(out)
 }
 
-/// A present `members` value (person ids): `null` is no gate, a list of strings is the gate;
-/// anything else (a non-list, or a list with a non-string) is `Err`.
+/// A present `members` value (the workspace's people): `null` is no gate, a list of strings is
+/// the gate; anything else (a non-list, or a list with a non-string) is `Err`.
 pub(crate) fn members_of(v: &Value) -> Result<Option<HashSet<String>>, ()> {
     match v {
         Value::Null => Ok(None),
@@ -753,14 +724,24 @@ pub(crate) fn members_of(v: &Value) -> Result<Option<HashSet<String>>, ()> {
     }
 }
 
+/// The member gate a sessions document (the file, or `cloud.sessions.set`'s body) sets: its
+/// `members`, the people (Lightbulb user ids) whose computers' sign-in proofs it admits
+/// (`proof::admitted`); `null` is no gate; absent names none (`Ok(None)`). Anything else is `Err`.
+pub(crate) fn gate_of(doc: &Value) -> Result<Option<Option<HashSet<String>>>, ()> {
+    match doc.get("members") {
+        Some(v) => members_of(v).map(Some),
+        None => Ok(None),
+    }
+}
+
 /// `cloud.sessions.set {sessions: [{name, agent, title?}], members?}` -> `{}` (an embedded instance only;
 /// `unsupported` on a computer): the workspace's agents, published as `<short>/<name>` with
 /// `agent` and `title` (at most `presence::MAX`, each name a `valid_name`, once). Answers once
 /// the presence sender (`presence::run`) has handed on the presence carrying them, so a `send`
 /// from a name just declared is never refused as unadvertised by a peer the envelope reaches
 /// first; `internal` if that takes over 5 s (the list stands, and goes out on the next send).
-/// `members` replaces the sessions' member gate (`mail::receive`): a list sets it, `null`
-/// removes it, absent keeps it; anything else is `bad_request`, before anything changes.
+/// `members` replaces the sessions' member gate (`mail::receive`, by sign-in proof): a list sets
+/// it, `null` removes it, absent keeps it; anything else is `bad_request`, before anything changes.
 pub async fn cloud_sessions_set(id: u64, body: &Value, daemon: &Daemon) -> Response {
     let Some(cloud) = &daemon.cloud else {
         return Response::err(id, UNSUPPORTED);
@@ -771,12 +752,10 @@ pub async fn cloud_sessions_set(id: u64, body: &Value, daemon: &Daemon) -> Respo
     else {
         return Response::err(id, BAD_REQUEST);
     };
-    let members = match body.get("members") {
-        None => cloud.declared().members.map(|m| (*m).clone()),
-        Some(v) => match members_of(v) {
-            Ok(m) => m,
-            Err(()) => return Response::err(id, BAD_REQUEST),
-        },
+    let members = match gate_of(body) {
+        Ok(None) => cloud.declared().members.map(|m| (*m).clone()),
+        Ok(Some(m)) => m,
+        Err(()) => return Response::err(id, BAD_REQUEST),
     };
     let mut sent = cloud.sent.subscribe();
     let version = cloud.set(out, members);
