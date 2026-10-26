@@ -2,7 +2,7 @@
 //! `[mcp_servers.<name>]` plus `permission.allow = ["MCPTool(<name>__*)"]` in
 //! `~/.grok/config.toml`. Written from those files' formats and the Grok CLI manual.
 
-use super::{edit_toml, set_toml_server, toml_table, write, AgentReport, Ctx, Owner};
+use super::{edit_toml, set_toml_server, toml_table, write, AgentReport, Ctx, Owner, OLD_SERVER};
 use crate::hook::{Event, EVENTS};
 use crate::Result;
 use serde_json::json;
@@ -44,6 +44,13 @@ pub(super) fn configure(ctx: &Ctx, r: &mut AgentReport) -> Result<Owner> {
             ("enabled", true.into()),
         ];
         owner = set_toml_server(ctx, doc, &fields)?;
+        let old = format!("MCPTool({OLD_SERVER}__*)");
+        if let Some(allow) = (ctx.server != OLD_SERVER)
+            .then(|| doc.get_mut("permission")?.get_mut("allow")?.as_array_mut())
+            .flatten()
+        {
+            allow.retain(|v| v.as_str() != Some(&old));
+        }
         if owner == Owner::Foreign {
             return Ok(());
         }

@@ -11,7 +11,7 @@ If setup prints an `export PATH=...` line, add it to `~/.zshrc` and open a new t
 ## What setup wires
 
 - `~/.codex/hooks.json`: hooks for the five events.
-- `~/.codex/config.toml`: the `lightbulb-network` tool server, and Codex's trust for our hooks.
+- `~/.codex/config.toml`: the `lightbulb` tool server, and Codex's trust for our hooks.
 - `~/.codex/skills/lightbulb-network/SKILL.md`: a skill that teaches the tools.
 
 ## What you may need to do

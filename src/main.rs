@@ -223,6 +223,9 @@ enum Command {
         /// The name this server advertises: the one its MCP entry was installed under.
         #[arg(long, default_value = setup::DEFAULT_SERVER)]
         server_name: String,
+        /// Print the tools' spec (tools.json) and exit.
+        #[arg(long)]
+        tools_json: bool,
     },
     /// Wire the installed agents (Claude Code, Codex, Cursor, Grok CLI, OpenCode) to this engine:
     /// their hooks and MCP server entry. Each file is backed up once as <file>.lightbulb-backup.
@@ -345,7 +348,10 @@ fn run() -> lightbulb::Result<()> {
             eprintln!("Unknown command: {verb}. Run lightbulb --help.");
             exit(2)
         }
-        Command::Mcp { server_name } => mcp::run(server_name)?,
+        Command::Mcp {
+            tools_json: true, ..
+        } => print!("{}", mcp::TOOLS),
+        Command::Mcp { server_name, .. } => mcp::run(server_name)?,
         Command::Member {
             home,
             snapshot,

@@ -1,0 +1,136 @@
+[
+  {
+    "name": "find_sessions",
+    "scope": "network",
+    "description": "The coding sessions you can message on your team's lightbulb network (Claude Code, Codex, Cursor, Grok CLI, OpenCode): this computer's, then your teammates'. Pass one's session_id as send_message session_id; is_this_session marks your own: never message it.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": {"type": "string", "description": "Text to find (case-insensitive) in a session's id, agent, folder, repo, branch, title, task, person or computer. Empty lists all."},
+        "limit": {"type": "integer", "minimum": 1, "description": "At most this many sessions."}
+      }
+    }
+  },
+  {
+    "name": "send_message",
+    "scope": "network",
+    "description": "Sends text to exactly one of: session_id (a coding session from find_sessions, on this computer or a teammate's, sent peer to peer), room_id (a channel or DM from find_rooms) or person_id (a workspace member's id; opens your DM with them if needed). reply_to (the request_id of a message you got from check_inbox) answers that message; reply_to alone replies to whoever sent it. A room or person send may reply in a thread (reply_to_message_id) and mention room members (mention_ids); a session send takes neither. request_id: a new [A-Za-z0-9._-]{1,128} string; reuse it only to retry that same send. Returns its receipt; its note says where the message waits.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "request_id": {"type": "string", "description": "A new [A-Za-z0-9._-]{1,128} string; reuse it only to retry this send."},
+        "text": {"type": "string"},
+        "session_id": {"type": "string", "description": "A session_id from find_sessions."},
+        "reply_to": {"type": "string", "description": "The request_id of the message this answers."},
+        "room_id": {"type": "string", "description": "A room id from find_rooms."},
+        "person_id": {"type": "string", "description": "A workspace member's id."},
+        "reply_to_message_id": {"type": "string", "description": "A room send: the id of the message (from read_messages) this replies to in its thread."},
+        "mention_ids": {"type": "array", "items": {"type": "string"}, "description": "A room send: the ids of the room members it mentions."}
+      },
+      "required": ["request_id", "text"]
+    }
+  },
+  {
+    "name": "message_receipt",
+    "scope": "network",
+    "description": "The receipt of a message you sent, by its request_id, including when the send's answer was lost.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "request_id": {"type": "string", "description": "The request_id of a message you sent."}
+      },
+      "required": ["request_id"]
+    }
+  },
+  {
+    "name": "check_inbox",
+    "scope": "network",
+    "description": "Takes the messages sent to you on the team's lightbulb network, first waiting up to wait_secs for one; one call may return sooner, so call again to keep waiting. Each message has its raw text and, in framed, the text as delivered; pass its request id as send_message reply_to to answer it.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "wait_secs": {"type": "integer", "minimum": 0, "maximum": 600, "description": "Wait up to this many seconds for a message to arrive."}
+      }
+    }
+  },
+  {
+    "name": "find_rooms",
+    "scope": "workspace",
+    "description": "Find channels and existing DMs that the signed-in person may read.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": {"type": "string"},
+        "limit": {"type": "integer", "minimum": 1}
+      }
+    }
+  },
+  {
+    "name": "read_messages",
+    "scope": "workspace",
+    "description": "Read the latest page or continue after a message sequence in a room or DM.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "room_id": {"type": "string"},
+        "after_seq": {"type": "integer", "minimum": 0},
+        "limit": {"type": "integer", "minimum": 1}
+      },
+      "required": ["room_id"]
+    }
+  },
+  {
+    "name": "find_tasks",
+    "scope": "workspace",
+    "description": "Find tasks on this workspace's task board. Open tasks (backlog, todo, in_progress, in_review, blocked) unless status names others (comma-separated; also done, cancelled). assignee is an agent name. Newest-updated first.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": {"type": "string"},
+        "status": {"type": "string"},
+        "assignee": {"type": "string"},
+        "limit": {"type": "integer", "minimum": 1}
+      }
+    }
+  },
+  {
+    "name": "read_task",
+    "scope": "workspace",
+    "description": "Read one task by identifier (e.g. ISOA-123) or id: title, status, priority, assignee, full description, blockers, and its latest comments.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "task": {"type": "string"},
+        "comments": {"type": "integer", "minimum": 0}
+      },
+      "required": ["task"]
+    }
+  },
+  {
+    "name": "update_task",
+    "scope": "workspace",
+    "description": "Change a task's status (backlog, todo, in_progress, in_review, blocked, done, cancelled) or priority (critical, high, medium, low), and/or append a dated note to the end of its description. This tool posts no comment: a task comment wakes the assigned agent and starts a paid run, so it is not offered here.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "task": {"type": "string"},
+        "status": {"type": "string"},
+        "priority": {"type": "string"},
+        "append_note": {"type": "string"}
+      },
+      "required": ["task"]
+    }
+  },
+  {
+    "name": "use_browser",
+    "scope": "workspace",
+    "description": "Choose where this shared Claude Code or Codex session browses with its lightbulb-browser tools: \"mac\" (its Mac's Lightbulb agent Chrome, the default) or \"cloud\" (the workspace's cloud browser). Its next browser connection goes there; one already open stays where it is: to move an open one now, restart the lightbulb-browser MCP server (/mcp in Claude Code).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "where": {"type": "string", "enum": ["mac", "cloud"]}
+      },
+      "required": ["where"]
+    }
+  }
+]

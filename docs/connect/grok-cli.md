@@ -11,7 +11,7 @@ If setup prints an `export PATH=...` line, add it to `~/.zshrc` and open a new t
 ## What setup wires
 
 - `~/.grok/hooks/lightbulb.json`: hooks for the five events (a file of ours alone).
-- `~/.grok/config.toml`: the `lightbulb-network` tool server, enabled, and the allow rule `MCPTool(lightbulb-network__*)`.
+- `~/.grok/config.toml`: the `lightbulb` tool server, enabled, and the allow rule `MCPTool(lightbulb__*)`.
 
 ## What you may need to do
 

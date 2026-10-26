@@ -65,7 +65,7 @@ pub fn save(dir: &std::path::Path, v: &Value) -> Result<()> {
     Ok(())
 }
 
-fn api() -> String {
+pub(crate) fn api() -> String {
     std::env::var("LIGHTBULB_API")
         .ok()
         .filter(|s| !s.is_empty())
@@ -89,11 +89,35 @@ pub fn proof(id: &Identity, purpose: &str, challenge: &str, ticket: Option<&str>
 
 /// `POST {api}{path}` with JSON `body`: the status and the answer's JSON (`null` when none).
 pub(crate) fn post(path: &str, body: &Value) -> Result<(u16, Value)> {
+    request("POST", path, Some(&body.to_string()), &[])
+}
+
+/// `method {api}{path}` with JSON `body` and `headers`: the status and the answer's JSON
+/// (`null` when none). All of it goes to curl as its config on stdin (`-K -`), so neither a
+/// body nor a credential header is ever in argv.
+pub(crate) fn request(
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+    headers: &[(&str, &str)],
+) -> Result<(u16, Value)> {
+    // A curl config string. Compact JSON holds no raw line break, so `\` and `"` are all.
+    let quoted = |s: &str| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""));
+    let mut config = format!(
+        "url = {}\nrequest = {}\n",
+        quoted(&format!("{}{path}", api())),
+        quoted(method)
+    );
+    for (k, v) in headers {
+        config.push_str(&format!("header = {}\n", quoted(&format!("{k}: {v}"))));
+    }
+    if let Some(b) = body {
+        config.push_str("header = \"Content-Type: application/json\"\n");
+        config.push_str(&format!("data-raw = {}\n", quoted(b)));
+    }
     let mut c = Command::new("curl");
     c.args(["-q", "-sS", "--connect-timeout", "10", "--max-time", "30"])
-        .args(["-X", "POST", "-H", "Content-Type: application/json"])
-        .args(["--data-binary", "@-", "-w", "\n%{http_code}"])
-        .arg(format!("{}{path}", api()))
+        .args(["-K", "-", "-w", "\n%{http_code}"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -102,7 +126,7 @@ pub(crate) fn post(path: &str, body: &Value) -> Result<(u16, Value)> {
         .stdin
         .take()
         .ok_or("curl: no stdin")?
-        .write_all(body.to_string().as_bytes())?;
+        .write_all(config.as_bytes())?;
     let out = child.wait_with_output()?;
     let text = String::from_utf8_lossy(&out.stdout);
     let (answer, code) = text.rsplit_once('\n').unwrap_or(("", &text));
@@ -112,24 +136,27 @@ pub(crate) fn post(path: &str, body: &Value) -> Result<(u16, Value)> {
     }
 }
 
-/// The answer to a 2xx, else the backend's sentence (`detail`, or `detail.message`) as the error.
+/// The backend's sentence for a refusal (`detail`, or `detail.message`), else a generic one.
+pub(crate) fn said(code: u16, v: &Value) -> String {
+    let detail = &v["detail"];
+    detail
+        .as_str()
+        .or(detail["message"].as_str())
+        .filter(|s| !s.is_empty() && s.chars().all(crate::label::printable))
+        .map_or_else(|| format!("Lightbulb refused that ({code})."), String::from)
+}
+
+/// The answer to a 2xx, else the backend's sentence (`said`) as the error.
 fn ok(path: &str, body: &Value) -> Result<Value> {
     let (code, v) = post(path, body)?;
     if (200..300).contains(&code) {
         return Ok(v);
     }
-    let detail = &v["detail"];
-    let said = detail
-        .as_str()
-        .or(detail["message"].as_str())
-        .filter(|s| !s.is_empty() && s.chars().all(crate::label::printable));
-    Err(said
-        .map_or_else(|| format!("Lightbulb refused that ({code})."), String::from)
-        .into())
+    Err(said(code, &v).into())
 }
 
 /// This computer's identity, read only: one is made by `setup` (or the daemon's first start).
-fn identity() -> Result<Identity> {
+pub(crate) fn identity() -> Result<Identity> {
     let dir = paths::state_dir();
     if !crate::identity::exists(&dir)? {
         return Err("This computer is not set up yet. Run lightbulb setup first.".into());

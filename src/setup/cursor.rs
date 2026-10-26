@@ -4,7 +4,7 @@
 //! Written from those files' formats, cursor.com/docs/agent/hooks and the allow-list syntax
 //! `Mcp(server:tool)` (either part may be `*`) in cursor.com/docs/cli/reference/permissions.
 
-use super::{edit_json, set_json_rule, set_json_server, AgentReport, Ctx, Owner};
+use super::{edit_json, set_json_rule, set_json_server, AgentReport, Ctx, Owner, OLD_SERVER};
 use crate::hook::{Event, EVENTS};
 use crate::Result;
 use serde_json::{json, Value};
@@ -61,6 +61,15 @@ pub(super) fn configure(ctx: &Ctx, r: &mut AgentReport) -> Result<Owner> {
             doc["version"] = json!(1);
         }
         set_json_rule(doc, "permissions", "allow", &rule, owner == Owner::Ours);
+        if ctx.server != OLD_SERVER {
+            set_json_rule(
+                doc,
+                "permissions",
+                "allow",
+                &format!("Mcp({OLD_SERVER}:*)"),
+                false,
+            );
+        }
         Ok(())
     })?;
     Ok(owner)

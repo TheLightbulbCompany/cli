@@ -113,8 +113,11 @@ Three things that catch people out:
 - **Restart open agent sessions.** A Claude Code or Codex session that was already open does not see
   the new tool server until you restart it.
 
-The tool server is named `lightbulb-network`, so its tools show as `mcp__lightbulb-network__…`. It sits
-beside the Lightbulb desktop app's own `lightbulb` server; neither replaces the other. More detail:
+The tool server is named `lightbulb`, so its tools show as `mcp__lightbulb__…`. Setup replaces an
+older `lightbulb-network` entry, and a `lightbulb` entry only when it is the Lightbulb desktop app's
+or the hosted Lightbulb MCP's; any other `lightbulb` entry stays, and `doctor` names it. While this
+computer is signed in (`lightbulb login`) the same server also has the workspace tools (rooms and
+tasks). More detail:
 [docs/usage.md](docs/usage.md) and the pages below.
 
 ## Docs

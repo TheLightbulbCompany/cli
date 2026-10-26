@@ -22,7 +22,7 @@ lightbulb setup [OPTIONS]
 
 `--help`: Wire the installed agents (Claude Code, Codex, Cursor, Grok CLI, OpenCode) to this engine: their hooks and MCP server entry. Each file is backed up once as `<file>.lightbulb-backup`.
 
-Connects Claude Code, Codex, Cursor, Grok CLI and OpenCode here (their hooks and the `lightbulb-network` tool
+Connects Claude Code, Codex, Cursor, Grok CLI and OpenCode here (their hooks and the `lightbulb` tool
 server) and starts the background service (on macOS; off macOS it restarts a daemon that runs an older version). Each file is backed up once as
 `<file>.lightbulb-backup`. Details: [agents](agents.md).
 
@@ -30,7 +30,7 @@ server) and starts the background service (on macOS; off macOS it restarts a dae
 |---|---|
 | `--remove` | Take out only what setup wrote, and stop the background service. Backups are left as they are. |
 | `--executable <path>` | The binary the hooks, tool servers and background service run. Default: `~/.lightbulb/connect/bin/lightbulb`, which setup installs from the binary you ran. |
-| `--server-name <name>` | The tool server's name, also used in Cursor's and Grok's allow rules. Default: `lightbulb-network`. |
+| `--server-name <name>` | The tool server's name, also used in Cursor's and Grok's allow rules. Default: `lightbulb`. |
 | `--verbose` | Also list the files each agent's setup changed. |
 
 ### doctor

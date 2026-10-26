@@ -107,7 +107,7 @@ impl Net {
         );
         assert_eq!(
             init["result"]["serverInfo"]["name"],
-            name.unwrap_or("lightbulb-network"),
+            name.unwrap_or("lightbulb"),
             "{init}"
         );
         m.write(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
@@ -464,28 +464,6 @@ fn source_unidentified_when_no_session_matches() {
 }
 
 #[test]
-fn files_or_notify_are_refused_unsupported() {
-    let net = Net::new();
-    let other = Other::new();
-    net.register("claude", "c1", &me());
-    let to = net.register("codex", "t1", &other.1);
-    let mut m = net.mcp(&me());
-    for extra in [json!({"files": []}), json!({"notify": false})] {
-        let mut args = json!({"request_id": "r1", "text": "t", "session_id": to});
-        args.as_object_mut()
-            .unwrap()
-            .extend(extra.as_object().unwrap().clone());
-        let out = m.tool("send_message", args);
-        assert!(out.error);
-        assert_eq!(out.json(), json!({"error": "unsupported"}));
-    }
-    // Nothing was sent.
-    let out = m.tool("message_receipt", json!({"request_id": "r1"}));
-    assert!(out.error);
-    assert_eq!(out.json(), json!({"error": "not_found"}));
-}
-
-#[test]
 fn tool_results_carry_the_unread_note_for_pull_tier() {
     let net = Net::new();
     let key = net.register("claude", "c1", &me());
@@ -685,8 +663,13 @@ mod common;
 
 /// The MCP server on `e`'s daemon, run as the agent process `as_`.
 fn mcp_on(e: &common::Env, as_: &os::Process) -> Mcp {
+    mcp_at(e, as_, "http://127.0.0.1:9")
+}
+
+/// `mcp_on`, its Lightbulb API at `api`.
+fn mcp_at(e: &common::Env, as_: &os::Process, api: &str) -> Mcp {
     let mut c = e.base_cmd(Command::new(EXE));
-    c.arg("mcp").env(
+    c.arg("mcp").env("LIGHTBULB_API", api).env(
         "LIGHTBULB_CONNECT_HOOK_CALLER",
         format!("{}:{}", as_.pid, as_.birth_micros),
     );
@@ -1022,4 +1005,345 @@ fn check_inbox_defangs_a_teammate_name_and_verifies_this_computer() {
     assert_eq!(here["label"], "Your Codex", "{here}");
     assert_eq!(here["person_verified"], true, "{here}");
     assert_eq!(here["computer"], "mac", "{here}");
+}
+
+// ---- one spec: the network tools, and the workspace tools while signed in ------------------
+
+const SPEC: &str = include_str!("../src/mcp/tools.json");
+
+fn spec() -> Vec<Value> {
+    serde_json::from_str(SPEC).unwrap()
+}
+
+fn names(tools: &[Value]) -> Vec<String> {
+    tools
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+impl Mcp {
+    fn tools(&mut self) -> Vec<Value> {
+        let r = self.rpc("tools/list", json!({}));
+        r["result"]["tools"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{r}"))
+            .clone()
+    }
+}
+
+/// One request the stub API got.
+#[derive(Clone, Debug)]
+struct Req {
+    method: String,
+    path: String,
+    headers: Vec<(String, String)>,
+    body: String,
+}
+
+impl Req {
+    fn header(&self, name: &str) -> &str {
+        self.headers
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+            .unwrap_or_else(|| panic!("no {name} in {self:?}"))
+    }
+}
+
+type Seen = std::sync::Arc<std::sync::Mutex<Vec<Req>>>;
+
+/// A stub Lightbulb API answering `answer(method, path)`: its base URL, and what it saw.
+fn stub(answer: fn(&str, &str) -> (u16, Value)) -> (String, Seen) {
+    use std::io::Read;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}/api/v1", listener.local_addr().unwrap());
+    let seen: Seen = Default::default();
+    let log = seen.clone();
+    std::thread::spawn(move || {
+        for s in listener.incoming() {
+            let mut s = s.unwrap();
+            let mut r = BufReader::new(s.try_clone().unwrap());
+            let mut first = String::new();
+            r.read_line(&mut first).unwrap();
+            let mut parts = first.split(' ');
+            let method = parts.next().unwrap_or_default().to_string();
+            let path = parts.next().unwrap_or_default().to_string();
+            let (mut headers, mut len) = (vec![], 0);
+            loop {
+                let mut h = String::new();
+                r.read_line(&mut h).unwrap();
+                if h == "\r\n" {
+                    break;
+                }
+                let (k, v) = h.trim_end().split_once(':').unwrap();
+                let (k, v) = (k.to_lowercase(), v.trim().to_string());
+                if k == "content-length" {
+                    len = v.parse().unwrap();
+                }
+                headers.push((k, v));
+            }
+            let mut body = vec![0; len];
+            r.read_exact(&mut body).unwrap();
+            let (code, v) = answer(&method, &path);
+            log.lock().unwrap().push(Req {
+                method,
+                path,
+                headers,
+                body: String::from_utf8(body).unwrap(),
+            });
+            let text = v.to_string();
+            let _ = write!(
+                s,
+                "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
+                text.len()
+            );
+        }
+    });
+    (base, seen)
+}
+
+fn api(method: &str, path: &str) -> (u16, Value) {
+    let path = path.split('?').next().unwrap();
+    match (method, path) {
+        ("POST", "/api/v1/messaging/rooms") => (201, json!({"roomId": "dm-1", "kind": "dm"})),
+        ("POST", p) if p.ends_with("/messages") => {
+            let room = p.split('/').nth(5).unwrap();
+            (
+                201,
+                json!({"roomId": room, "messageId": "m-1", "messageSeq": 7, "text": "x"}),
+            )
+        }
+        ("GET", "/api/v1/local-sessions/device/receipt") => (200, json!({"state": "posted"})),
+        ("GET", "/api/v1/local-sessions/device/rooms") => (200, json!({"rooms": [], "total": 0})),
+        ("PATCH", _) => (403, json!({"detail": {"message": "Not your task."}})),
+        _ => (404, json!({"detail": "Not Found"})),
+    }
+}
+
+/// A signed-in computer named mac, its daemon up, this process its Claude session `c1`.
+fn signed_in() -> common::Env {
+    let e = common::Env::new();
+    e.sign_in("user_1", None);
+    e.daemon(false, &common::computer("mac"), &[]);
+    register_on(&e, "claude", "c1", &me(), "/tmp");
+    e
+}
+
+#[test]
+fn tools_list_matches_tools_json() {
+    let e = signed_in();
+    let mut m = mcp_on(&e, &me());
+    let shape = |t: &Value| json!({"name": t["name"], "description": t["description"], "inputSchema": t["inputSchema"]});
+    let got: Vec<Value> = m.tools().iter().map(shape).collect();
+    let want: Vec<Value> = spec().iter().map(shape).collect();
+    assert_eq!(got, want);
+    assert_eq!(names(&got).len(), 10);
+}
+
+#[test]
+fn tools_json_flag_prints_the_spec() {
+    // Printed before anything else runs: no daemon, no state read.
+    let dir = tempfile::tempdir().unwrap();
+    let o = Command::new(EXE)
+        .args(["mcp", "--tools-json"])
+        .env(paths::HOME_ENV, dir.path().join("none"))
+        .output()
+        .unwrap();
+    assert!(!dir.path().join("none").exists());
+    assert!(o.status.success());
+    assert_eq!(o.stdout, SPEC.as_bytes());
+}
+
+#[test]
+fn workspace_tools_hidden_until_signed_in() {
+    let e = common::Env::new();
+    e.daemon(false, &common::computer("mac"), &[]);
+    register_on(&e, "claude", "c1", &me(), "/tmp");
+    let network: Vec<String> = spec()
+        .iter()
+        .filter(|t| t["scope"] == "network")
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(network.len(), 4);
+    let mut m = mcp_on(&e, &me());
+    assert_eq!(names(&m.tools()), network);
+    let out = m.tool("find_rooms", json!({}));
+    assert!(out.error);
+    assert_eq!(out.json()["error"], "not_signed_in", "{}", out.text);
+    let out = m.tool(
+        "send_message",
+        json!({"request_id": "r1", "text": "x", "room_id": "room-1"}),
+    );
+    assert_eq!(out.json()["error"], "not_signed_in", "{}", out.text);
+
+    // Signing in shows them to the same server; an ended sign-in hides them again.
+    e.sign_in("user_1", None);
+    assert_eq!(m.tools().len(), 10);
+    let old = common::now_s() - 40 * 86_400;
+    let proof = common::issuer::proof(&e.identity().key, "user_1", old);
+    let login = json!({"proof": proof, "name": "user_1"});
+    std::fs::write(e.state.path().join("login.json"), login.to_string()).unwrap();
+    assert_eq!(names(&m.tools()), network);
+}
+
+#[test]
+fn workspace_call_signs_method_path_body_and_session_not_args() {
+    use data_encoding::BASE64URL_NOPAD;
+    use sha2::{Digest, Sha256};
+    let e = signed_in();
+    let (base, seen) = stub(api);
+    let mut m = mcp_at(&e, &me(), &base);
+    // An argument naming another session changes nothing about who signs.
+    let out = m.tool(
+        "find_rooms",
+        json!({"query": "eng & ops", "limit": 5, "session": "Codex on evil", "label": "x"}),
+    );
+    assert!(!out.error, "{}", out.text);
+    assert_eq!(out.json(), json!({"rooms": [], "total": 0}));
+    let out = m.tool("update_task", json!({"task": "ISOA-1", "status": "done"}));
+    assert!(out.error, "{}", out.text);
+    assert_eq!(out.json()["error"], "Not your task.", "{}", out.text);
+
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2, "{seen:?}");
+    let key = e.identity().key;
+    let proof =
+        serde_json::from_slice::<Value>(&std::fs::read(e.state.path().join("login.json")).unwrap())
+            .unwrap()["proof"]
+            .clone();
+    let now = common::now_s();
+    for (req, method, path, body) in [
+        (
+            &seen[0],
+            "GET",
+            "/api/v1/local-sessions/device/rooms?limit=5&query=eng%20%26%20ops",
+            "",
+        ),
+        (
+            &seen[1],
+            "PATCH",
+            "/api/v1/local-sessions/device/tasks/ISOA-1",
+            r#"{"status":"done"}"#,
+        ),
+    ] {
+        assert_eq!((req.method.as_str(), req.path.as_str()), (method, path));
+        assert_eq!(req.body, body);
+        assert_eq!(req.header("x-lightbulb-proof"), proof.as_str().unwrap());
+        let challenge = BASE64URL_NOPAD
+            .decode(req.header("x-lightbulb-challenge").as_bytes())
+            .unwrap();
+        let challenge = String::from_utf8(challenge).unwrap();
+        let (ts, rest) = challenge.split_once(' ').unwrap();
+        assert!((ts.parse::<i64>().unwrap() - now).abs() < 30, "{challenge}");
+        let hash: String = Sha256::digest(body.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(
+            rest,
+            format!("{method} {path} {hash} Claude Code on mac"),
+            "{challenge}"
+        );
+        let signed = json!({"purpose": "lightbulb-tools", "challenge": challenge, "key": key});
+        assert!(lightbulb::identity::verify(
+            &key,
+            &signed,
+            req.header("x-lightbulb-sig")
+        ));
+    }
+}
+
+#[test]
+fn room_targets_go_to_rest_session_targets_stay_p2p() {
+    let e = signed_in();
+    let codex = Other::new();
+    let to = register_on(&e, "codex", "t1", &codex.1, "/tmp");
+    let (base, seen) = stub(api);
+    let mut m = mcp_at(&e, &me(), &base);
+
+    // A session send stays on the network: the API never hears of it.
+    let out = m.tool(
+        "send_message",
+        json!({"request_id": "s1", "text": "hi", "session_id": to}),
+    );
+    assert_eq!(out.json()["state"], "stored", "{}", out.text);
+    let out = m.tool("message_receipt", json!({"request_id": "s1"}));
+    assert_eq!(out.json()["state"], "stored", "{}", out.text);
+    assert!(seen.lock().unwrap().is_empty());
+
+    // A session send takes no thread or mentions; exactly one target.
+    for bad in [
+        json!({"request_id": "b1", "text": "x", "session_id": to, "mention_ids": ["u"]}),
+        json!({"request_id": "b2", "text": "x", "session_id": to, "room_id": "r"}),
+        json!({"request_id": "b3", "text": "x", "room_id": "r", "reply_to": "s1"}),
+    ] {
+        let out = m.tool("send_message", bad.clone());
+        assert_eq!(out.json()["error"], "bad_request", "{bad}: {}", out.text);
+    }
+
+    // A room send posts to the room, a thread reply and mentions with it.
+    let out = m.tool(
+        "send_message",
+        json!({"request_id": "r1", "text": "ship it", "room_id": "room-1",
+            "reply_to_message_id": "m-0", "mention_ids": ["user_2", "agent-9"]}),
+    );
+    assert!(!out.error, "{}", out.text);
+    assert_eq!(
+        out.json(),
+        json!({"roomId": "room-1", "messageId": "m-1", "messageSeq": 7, "state": "posted"})
+    );
+    // A person send opens the DM, then posts there.
+    let out = m.tool(
+        "send_message",
+        json!({"request_id": "p1", "text": "hey", "person_id": "user_2"}),
+    );
+    assert_eq!(out.json()["roomId"], "dm-1", "{}", out.text);
+    // Their receipts are read from the rooms they went to.
+    let out = m.tool("message_receipt", json!({"request_id": "p1"}));
+    assert_eq!(out.json()["state"], "posted", "{}", out.text);
+
+    let seen = seen.lock().unwrap().clone();
+    let calls: Vec<(String, String)> = seen
+        .iter()
+        .map(|r| {
+            (
+                r.method.clone(),
+                r.path.split('?').next().unwrap().to_string(),
+            )
+        })
+        .collect();
+    let call = |m: &str, p: &str| (m.to_string(), p.to_string());
+    assert_eq!(
+        calls,
+        [
+            call("POST", "/api/v1/messaging/rooms/room-1/messages"),
+            call("POST", "/api/v1/messaging/rooms"),
+            call("POST", "/api/v1/messaging/rooms/dm-1/messages"),
+            call("GET", "/api/v1/local-sessions/device/receipt"),
+        ]
+    );
+    let post: Value = serde_json::from_str(&seen[0].body).unwrap();
+    assert_eq!(post["text"], "ship it");
+    assert_eq!(post["replyToMessageId"], "m-0");
+    assert_eq!(
+        post["mentions"],
+        json!([{"kind": "human", "id": "user_2"}, {"kind": "agent", "id": "agent-9"}])
+    );
+    let uuid = post["clientMessageId"].as_str().unwrap();
+    assert_eq!((uuid.len(), uuid.matches('-').count()), (36, 4), "{uuid}");
+    let dm: Value = serde_json::from_str(&seen[1].body).unwrap();
+    assert_eq!(dm["kind"], "dm");
+    assert_eq!(dm["members"][0]["id"], "user_2");
+    assert_eq!(dm["members"][0]["kind"], "human");
+    let dm_post: Value = serde_json::from_str(&seen[2].body).unwrap();
+    assert!(
+        seen[3].path.contains("room_id=dm-1")
+            && seen[3].path.contains(&format!(
+                "request_id={}",
+                dm_post["clientMessageId"].as_str().unwrap()
+            )),
+        "{}",
+        seen[3].path
+    );
 }

@@ -5,9 +5,11 @@
 //! `--remove` takes out only entries whose command names our executable, and restores
 //! nothing from the backups (they are the person's safety net).
 //!
-//! Installing writes our MCP entry under our server name, replacing whatever entry has that
-//! name. Removing takes it out only when its command is our executable. Our allow rule exists
-//! only while the MCP entry is ours.
+//! Installing writes our MCP entry under our server name. An entry already under that name is
+//! replaced only when it is ours, the desktop app's old `session-mcp` server or the hosted
+//! Lightbulb MCP (`replaceable`); any other stays, and the agent is left with hooks only.
+//! Removing takes it out only when its command is our executable. Our allow rule exists only
+//! while the MCP entry is ours.
 //!
 //! A vendor config file that is missing is created, but only when that agent's home
 //! directory exists (the agent reads it from there). Backups, temp files and new files are
@@ -67,14 +69,29 @@ pub(crate) struct Ctx<'a> {
     pub remove: bool,
 }
 
-/// The MCP server name when `--server-name` is not given. Not `lightbulb`: the Lightbulb
-/// desktop app registers its own server under that name, and two owners of one name keep
-/// replacing each other.
-pub const DEFAULT_SERVER: &str = "lightbulb-network";
+/// The MCP server name when `--server-name` is not given: the one `lightbulb` server, which
+/// this engine serves (the desktop app runs this engine too).
+pub const DEFAULT_SERVER: &str = "lightbulb";
 
-/// The name this engine used before `DEFAULT_SERVER`: setup removes an entry under it only when
-/// it runs this executable (the app's own `lightbulb` stays).
-const OLD_SERVER: &str = "lightbulb";
+/// The name this engine used before `DEFAULT_SERVER`: setup removes an entry under it when it
+/// runs a `lightbulb` binary, and the allow rules named for it.
+pub(crate) const OLD_SERVER: &str = "lightbulb-network";
+
+/// The hosted Lightbulb MCP's URL: an entry for it under our name gives way to ours.
+const HOSTED: &str = "https://api.thelightbulb.company/mcp";
+
+/// Whether an entry under our name that is not ours gives way to ours: the desktop app's old
+/// server (args `["session-mcp"]`) or the hosted MCP's URL.
+fn replaceable(args: &[&str], url: Option<&str>) -> bool {
+    args == ["session-mcp"] || url == Some(HOSTED)
+}
+
+/// Whether `command` runs a `lightbulb` binary (any copy of this engine).
+fn is_engine(command: &str) -> bool {
+    Path::new(command)
+        .file_name()
+        .is_some_and(|f| f == "lightbulb")
+}
 
 /// Whether `name` can name the MCP server: it lands in TOML keys and allow rules.
 pub fn valid_server_name(name: &str) -> bool {
@@ -141,11 +158,15 @@ fn servers(home: &Path, agent: &str) -> Vec<(String, String)> {
 /// The name of `agent`'s MCP entry under `home` that runs a `lightbulb` binary, if any (what
 /// `doctor` checks; reads, never writes).
 pub fn tools(home: &Path, agent: &str) -> Option<String> {
-    let ours = |c: &str| Path::new(c).file_name().is_some_and(|f| f == "lightbulb");
     servers(home, agent)
         .into_iter()
-        .find(|(_, c)| ours(c))
+        .find(|(_, c)| is_engine(c))
         .map(|(k, _)| k)
+}
+
+/// What setup says when another tool's entry holds our name.
+fn in_the_way(server: &str) -> String {
+    format!("another \"{server}\" tool server is in the way (take it out, then run setup)")
 }
 
 /// `agent`'s state as its files under `home` are (`doctor`).
@@ -157,6 +178,14 @@ pub fn status(home: &Path, agent: &str, dir: &str) -> State {
     ) {
         (false, ..) => State::NotInstalled,
         (_, true, Some(name)) => State::Connected(name),
+        // Setup leaves another tool's `lightbulb` alone: say so, not "run setup".
+        (_, true, None)
+            if servers(home, agent)
+                .iter()
+                .any(|(k, _)| k == DEFAULT_SERVER) =>
+        {
+            State::HooksOnly(in_the_way(DEFAULT_SERVER))
+        }
         (_, true, None) => State::HooksOnly("tools missing (run setup)".into()),
         (_, false, _) => State::Failed {
             why: String::new(),
@@ -257,6 +286,7 @@ pub fn run(home: &Path, executable: &Path, server: Option<&str>, remove: bool) -
                     hooks: wired(home, name),
                 },
                 Ok(_) if remove => State::Removed,
+                Ok(Owner::Foreign) => State::HooksOnly(in_the_way(server)),
                 Ok(_) => State::Connected(server.to_string()),
             }
         };
@@ -315,12 +345,12 @@ impl AgentReport {
     }
 
     /// How `doctor` says it.
-    pub fn short(&self) -> &'static str {
-        match self.state {
-            State::NotInstalled => "not installed",
-            State::Connected(_) => "connected",
-            State::HooksOnly(_) => "hooks only — tools missing (run setup)",
-            State::Failed { .. } | State::Removed => "not connected",
+    pub fn short(&self) -> String {
+        match &self.state {
+            State::NotInstalled => "not installed".into(),
+            State::Connected(_) => "connected".into(),
+            State::HooksOnly(why) => format!("hooks only — {why}"),
+            State::Failed { .. } | State::Removed => "not connected".into(),
         }
     }
 }
@@ -356,13 +386,19 @@ impl Ctx<'_> {
         format!("'{}'", self.exe.replace('\'', "'\\''"))
     }
 
-    /// The owner of a server entry, given its command (`None`: the entry has none). Installing
-    /// replaces any entry under our name, so only removing sees one as foreign.
-    pub fn owner(&self, exists: bool, command: Option<&str>) -> Owner {
+    /// The owner of a server entry, given its command (`None`: the entry has none), its args
+    /// and its URL. Installing replaces a `replaceable` entry; any other one is foreign.
+    pub fn owner(
+        &self,
+        exists: bool,
+        command: Option<&str>,
+        args: &[&str],
+        url: Option<&str>,
+    ) -> Owner {
         match (exists, command) {
             (false, _) => Owner::Absent,
             (true, Some(c)) if c == self.exe => Owner::Ours,
-            _ if !self.remove => Owner::Absent,
+            _ if !self.remove && replaceable(args, url) => Owner::Absent,
             _ => Owner::Foreign,
         }
     }
@@ -578,6 +614,25 @@ fn json_command(entry: &Value) -> Option<&str> {
         .or_else(|| entry["command"][0].as_str())
 }
 
+/// A JSON server entry's args: its `args`, or the rest of OpenCode's command list.
+fn json_args(entry: &Value) -> Vec<&str> {
+    let list = match entry["command"].as_array() {
+        Some(c) => c.get(1..).unwrap_or_default(),
+        None => entry["args"].as_array().map_or(&[][..], Vec::as_slice),
+    };
+    list.iter().filter_map(Value::as_str).collect()
+}
+
+/// The owner of the JSON entry `e` (`Value::Null`: none).
+fn json_owner(ctx: &Ctx, e: &Value) -> Owner {
+    ctx.owner(
+        !e.is_null(),
+        json_command(e),
+        &json_args(e),
+        e["url"].as_str(),
+    )
+}
+
 /// `text` with JSONC's comments and trailing commas taken out. For reading only: setup never
 /// writes this back, so the person's comments are never lost.
 pub(crate) fn strip_jsonc(text: &str) -> String {
@@ -634,14 +689,13 @@ pub(crate) fn set_json_server(
         return Err(format!("`{key}` is not an object").into());
     }
     let old = &doc[key][OLD_SERVER];
-    if ctx.server != OLD_SERVER && ctx.owner(!old.is_null(), json_command(old)) == Owner::Ours {
+    if ctx.server != OLD_SERVER && json_command(old).is_some_and(is_engine) {
         doc[key]
             .as_object_mut()
             .expect("holds our old entry")
             .remove(OLD_SERVER);
     }
-    let current = &doc[key][ctx.server];
-    let owner = ctx.owner(!current.is_null(), json_command(current));
+    let owner = json_owner(ctx, &doc[key][ctx.server]);
     match owner {
         Owner::Foreign => return Ok(Owner::Foreign),
         Owner::Ours if ctx.remove => {
@@ -693,18 +747,23 @@ pub(crate) fn set_toml_server(
     use toml_edit::Item;
     let old = doc.get("mcp_servers").and_then(|s| s.get(OLD_SERVER));
     let old_cmd = old.and_then(|t| t.get("command")).and_then(Item::as_str);
-    if ctx.server != OLD_SERVER && ctx.owner(old.is_some(), old_cmd) == Owner::Ours {
+    if ctx.server != OLD_SERVER && old_cmd.is_some_and(is_engine) {
         doc["mcp_servers"]
             .as_table_like_mut()
             .expect("holds our old entry")
             .remove(OLD_SERVER);
     }
     let current = doc.get("mcp_servers").and_then(|s| s.get(ctx.server));
+    let field = |k: &str| current.and_then(|t| t.get(k));
+    let args: Vec<&str> = field("args")
+        .and_then(Item::as_array)
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
     let owner = ctx.owner(
         current.is_some(),
-        current
-            .and_then(|t| t.get("command"))
-            .and_then(Item::as_str),
+        field("command").and_then(Item::as_str),
+        &args,
+        field("url").and_then(Item::as_str),
     );
     if current.is_some() && owner == Owner::Absent {
         // None of the replaced entry's keys (env, timeouts) stay under ours.
