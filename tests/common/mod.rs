@@ -289,6 +289,7 @@ pub async fn instance(
         name: name.into(),
         sessions: vec![],
         members: None,
+        revoked: Default::default(),
     };
     let i = lightbulb::embed::start(home, opts).await;
     for (k, _) in &knobs {
@@ -365,7 +366,8 @@ pub fn now_s() -> i64 {
 
 /// `e`'s invite link of `mode` (`team.invite`): its ticket.
 pub fn invite(e: &Env, mode: &str) -> String {
-    let r = e.ask(json!({"id": 1, "op": "team.invite", "mode": mode}));
+    // A person: an agent's link is always one-time.
+    let r = person(e, json!({"id": 1, "op": "team.invite", "mode": mode}));
     assert_eq!(r["ok"], true, "{r}");
     r["ticket"].as_str().unwrap().into()
 }

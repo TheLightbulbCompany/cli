@@ -114,10 +114,12 @@ pub fn peek(token: &str) -> Option<Proof> {
 /// computers a workspace member answers (`members`).
 pub fn admitted(d: &Daemon, people: &HashSet<String>) -> HashSet<String> {
     let now = crate::daemon::ipc::now() as i64;
+    let revoked = d.cloud.as_ref().map(|c| c.declared().revoked);
     d.proofs
         .lock()
         .unwrap()
         .iter()
+        .filter(|(key, _)| !revoked.as_ref().is_some_and(|r| r.contains(*key)))
         .filter(|(key, token)| verify(token, key, now).is_ok_and(|p| people.contains(&p.sub)))
         .map(|(key, _)| key.clone())
         .collect()

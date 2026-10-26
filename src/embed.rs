@@ -30,6 +30,8 @@ pub struct EmbedOpts {
     pub sessions: Vec<Value>,
     /// The member keys (computers) that may message the sessions; `None`: no gate.
     pub members: Option<std::collections::HashSet<String>>,
+    /// Computer keys refused even with a valid proof.
+    pub revoked: std::collections::HashSet<String>,
 }
 
 /// A running instance. Dropping it without `shutdown` closes its endpoint all the same (no
@@ -67,7 +69,7 @@ pub async fn start(home: &Path, opts: EmbedOpts) -> Result<Instance> {
     let (daemon, net) = boot(
         home,
         config,
-        Some((opts.name, lock, opts.sessions, opts.members)),
+        Some((opts.name, lock, opts.sessions, opts.members, opts.revoked)),
     )
     .await?;
     Ok(Instance {
@@ -142,6 +144,7 @@ pub(crate) type CloudStart = (
     std::fs::File,
     Vec<Value>,
     Option<std::collections::HashSet<String>>,
+    std::collections::HashSet<String>,
 );
 
 /// The start path the daemon and an instance share, under `dir`'s lock (the caller's):
@@ -154,9 +157,11 @@ pub(crate) async fn boot(
     config: Config,
     cloud: Option<CloudStart>,
 ) -> Result<(Arc<Daemon>, net::Net)> {
-    let (cloud, home_lock, declared, members) = match cloud {
-        Some((name, lock, sessions, members)) => (Some(name), Some(lock), sessions, members),
-        None => (None, None, vec![], None),
+    let (cloud, home_lock, declared, members, revoked) = match cloud {
+        Some((name, lock, sessions, members, revoked)) => {
+            (Some(name), Some(lock), sessions, members, revoked)
+        }
+        None => (None, None, vec![], None, Default::default()),
     };
     let identity = Identity::load_or_create(dir)?;
     let declared = declarable(&identity.short, &declared);
@@ -227,6 +232,7 @@ pub(crate) async fn boot(
         dialog_answers: Mutex::new(Some(answers)),
         admissions: Mutex::default(),
         answered_by: Mutex::default(),
+        auto_admit: Mutex::default(),
         roster_changed: Default::default(),
         joining: tokio::sync::Mutex::new(()),
         codes: Mutex::default(),
@@ -236,8 +242,8 @@ pub(crate) async fn boot(
         streams: Default::default(),
         cloud: cloud.map(|name| {
             let c = Cloud::new(name);
-            if !declared.is_empty() || members.is_some() {
-                c.set(declared, members);
+            if !declared.is_empty() || members.is_some() || !revoked.is_empty() {
+                c.set(declared, members, revoked);
             }
             c
         }),

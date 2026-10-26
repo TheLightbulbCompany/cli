@@ -188,13 +188,28 @@ fn remove_and_leave_from_an_agent_shell_are_refused() {
 }
 
 #[test]
-fn an_agent_shell_may_invite_in_every_mode() {
+fn an_agent_invite_is_always_one_time() {
     let e = Env::pinned();
     e.seed(false);
     assert!(e.run(&["team"]).status.success());
-    for mode in ["reusable", "once", "open"] {
+    for mode in ["reusable", "once", "open", "new"] {
         let r = e.ask(json!({"id": 1, "op": "team.invite", "mode": mode}));
         assert_eq!(r["ok"], true, "{mode}: {r}");
+        assert_eq!(r["mode"], "once", "{mode}: {r}");
+    }
+}
+
+#[test]
+fn a_person_may_still_mint_reusable_and_open_links() {
+    let e = Env::new();
+    assert!(e.run(&["team"]).status.success());
+    for mode in ["reusable", "open", "once"] {
+        let r = common::person(&e, json!({"id": 1, "op": "team.invite", "mode": mode}));
+        assert_eq!(
+            (r["ok"].as_bool(), r["mode"].as_str()),
+            (Some(true), Some(mode)),
+            "{r}"
+        );
     }
 }
 

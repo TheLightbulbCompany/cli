@@ -697,7 +697,7 @@ fn invite_new_ends_every_earlier_invite_open_ones_too() {
     let (a, c) = (Env::new(), Env::new());
     a.daemon(false, &computer("mac"), &[dialog("Allow")]);
     let (open, once) = (invite_open(&a), invite(&a, "once"));
-    let r = a.ask(json!({"id": 1, "op": "team.invite", "mode": "new"}));
+    let r = person(&a, json!({"id": 1, "op": "team.invite", "mode": "new"}));
     assert_eq!(r["replaced"], true, "{r}");
     let new = r["ticket"].as_str().unwrap().to_string();
     c.daemon(false, &computer("mbp"), &[peers(&[&a])]);
@@ -705,4 +705,93 @@ fn invite_new_ends_every_earlier_invite_open_ones_too() {
     refused(&join(&c, &once, "carol"), "bad_ticket");
     assert_eq!(members(&a).len(), 1);
     assert_eq!(join(&c, &new, "carol")["state"], "admitted");
+}
+
+/// A fake `osascript` in `dir` that logs every dialog's argv to `log` and answers `Remove` to the
+/// notice that has `marker` in its text; any other dialog waits to be withdrawn.
+fn notice_osascript(dir: &std::path::Path, marker: &str) -> (&'static str, String) {
+    let d = dir.display();
+    let p = common::script(
+        dir,
+        &format!(
+            "printf '%s\\n' \"$@\" >>{d}/log\ncase \"$*\" in *'{marker}'*) \
+             echo 'button returned:Remove, gave up:false';; *) exec sleep 600;; esac"
+        ),
+    );
+    ("LIGHTBULB_CONNECT_DEBUG_OSASCRIPT", p.display().to_string())
+}
+
+/// A pinned (agent) daemon A with the notice fake, a candidate asking to join, and A's
+/// session registered so `team.admit` names it.
+async fn agent_admit(dir: &std::path::Path, as_agent: bool) -> (Env, String) {
+    let a = Env::new();
+    let me = std::process::id();
+    let birth = lightbulb::os::process(me).unwrap().birth_micros;
+    let pin = ("LIGHTBULB_CONNECT_HOOK_CALLER", format!("{me}:{birth}"));
+    a.daemon(
+        false,
+        "",
+        &[dialog(""), pin, notice_osascript(dir, "into your network")],
+    );
+    let t = ticket::decode(&invite(&a, "reusable")).unwrap();
+    let cand = identity();
+    let _p = Played::send(&a, &cand, &admission::request(&cand, &t, "carol", "mbp")).await;
+    until(10, "J1 is listed", || requests(&a).len() == 1);
+    let ans = json!({"id": 1, "op": "team.admit", "request": "J1", "verdict": "allow"});
+    let r = if as_agent {
+        a.ask(
+            json!({"id": 1, "op": "register", "session": {"provider": "claude",
+            "conversation": "c1", "pid": me, "birth_micros": birth, "cwd": "/tmp"}}),
+        );
+        a.ask(ans)
+    } else {
+        person(&a, ans)
+    };
+    assert_eq!(r["state"], "admitted", "{r}");
+    (a, cand.key)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_agent_admit_raises_a_notice_and_remove_removes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, _) = agent_admit(dir.path(), true).await;
+    until(30, "carol is removed again", || members(&a).len() == 1);
+    let log = std::fs::read_to_string(dir.path().join("log")).unwrap();
+    assert!(log.contains("let carol into your network."), "{log}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_person_admit_raises_no_notice() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, cand) = agent_admit(dir.path(), false).await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    // Allowing the join also allows the joiner's messages to this computer's sessions.
+    let pol = a.ask(json!({"id": 1, "op": "policy.get"}));
+    assert_eq!(pol["people"][&cand], "accept", "{pol}");
+    let log = std::fs::read_to_string(dir.path().join("log")).unwrap_or_default();
+    assert!(!log.contains("into your network"), "{log}");
+    assert_eq!(members(&a).len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn invite_agents_by_a_person_joins_with_no_allow_and_an_agents_does_not() {
+    let a = Env::new();
+    // No dialog answers: only the auto path can admit.
+    a.daemon(false, "", &[dialog("")]);
+    let r = person(
+        &a,
+        json!({"id": 1, "op": "team.invite", "mode": "once", "agents": true}),
+    );
+    let t = ticket::decode(r["ticket"].as_str().unwrap()).unwrap();
+    let cand = identity();
+    let _p = Played::send(&a, &cand, &admission::request(&cand, &t, "carol", "mbp")).await;
+    until(10, "carol is in with no Allow", || members(&a).len() == 2);
+    let pol = a.ask(json!({"id": 1, "op": "policy.get"}));
+    assert_eq!(pol["people"][&cand.key], "accept", "{pol}");
+    // The same flag on an ordinary once link waits for an Allow.
+    let t = ticket::decode(&invite(&a, "once")).unwrap();
+    let dan = identity();
+    let _q = Played::send(&a, &dan, &admission::request(&dan, &t, "dan", "mbp")).await;
+    until(10, "dan waits", || requests(&a).len() == 1);
+    assert_eq!(members(&a).len(), 2);
 }

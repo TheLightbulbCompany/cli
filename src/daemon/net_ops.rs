@@ -62,6 +62,38 @@ fn gate(op: &str) -> Gate {
     }
 }
 
+/// Removes member `key` as the person (the Remove button of an agent-approval notice).
+pub fn remove_member(d: &Daemon, key: &str) {
+    let mut team = d.team.lock().unwrap();
+    let store = d.store.lock().unwrap();
+    let ops = TeamOps {
+        id: 0,
+        daemon: d,
+        team: &mut team,
+        store: &store,
+        now: super::ipc::now() as i64,
+        auto: false,
+    };
+    let pid = ops
+        .team
+        .roster
+        .members
+        .get(key)
+        .map(|m| m.person_id.clone());
+    if let Err(e) = ops.run(
+        "team.remove",
+        &json!({ "member": key }),
+        Invite::default(),
+        true,
+    ) {
+        eprintln!("team.remove: {e}");
+    }
+    // The Allow that came with the join goes with the member.
+    if let Some(pid) = pid {
+        let _ = crate::policy::forget(&store, &pid);
+    }
+}
+
 pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, caller: Caller) -> Response {
     // Retired: the cloud-member unlink; any member is removed with `team.remove`.
     if op == "team.unlink" {
@@ -75,6 +107,11 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, caller: Caller) 
             }
         } else {
             Invite::default()
+        };
+        // An agent's link is for one join, whatever it asked for; only a person mints the rest.
+        let invite = match caller.actor(&daemon.store.lock().unwrap()) {
+            Some(a) if op == "team.invite" && a != "local" => Invite::Once,
+            _ => invite,
         };
         // A workspace member never invites: an admin adds it to a network (`team.join`).
         if op == "team.invite" && caller == Caller::Instance {
@@ -109,6 +146,7 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, caller: Caller) 
             team: &mut team,
             store: &store,
             now: super::ipc::now() as i64,
+            auto: body["agents"] == true && caller.is_person(),
         };
         return match ops.run(op, body, invite, gate.member) {
             Ok(r) => r,
@@ -522,6 +560,8 @@ struct TeamOps<'a> {
     team: &'a mut TeamState,
     store: &'a Store,
     now: i64,
+    /// A person asked for `invite --agents`: the link's join needs no Allow.
+    auto: bool,
 }
 
 impl TeamOps<'_> {
@@ -597,12 +637,20 @@ impl TeamOps<'_> {
                     // `--new` ends every earlier link of this computer, `open` and once ones too.
                     _ => self.new_link(mode, invite.once(), invite == Invite::New)?,
                 };
+                if self.auto {
+                    self.daemon
+                        .auto_admit
+                        .lock()
+                        .unwrap()
+                        .insert(t.ticket_id.clone());
+                }
                 let s = ticket::encode(&t);
                 Response::ok(
                     id,
                     json!({"line": ticket::join_line(&s), "app_link": ticket::app_link(&s),
                         "link": ticket::web_link(&s),
-                        "ticket": s, "expires_at": t.expires_at, "replaced": replaced}),
+                        "ticket": s, "expires_at": t.expires_at, "replaced": replaced,
+                        "mode": invite}),
                 )
             }
             // `team.remove {member}` -> `{name, line}`: the removal ends every live link, so a
@@ -672,6 +720,7 @@ pub(crate) fn code_link(daemon: &Daemon) -> crate::Result<ticket::Ticket> {
         team: &mut team,
         store: &store,
         now: super::ipc::now() as i64,
+        auto: false,
     };
     ops.new_link("ask", true, false)
 }
@@ -727,6 +776,19 @@ pub(crate) fn members_of(v: &Value) -> Result<Option<HashSet<String>>, ()> {
 /// The member gate a sessions document (the file, or `cloud.sessions.set`'s body) sets: its
 /// `members`, the people (Lightbulb user ids) whose computers' sign-in proofs it admits
 /// (`proof::admitted`); `null` is no gate; absent names none (`Ok(None)`). Anything else is `Err`.
+/// The `revoked_keys` of a sessions document: computer keys refused with any proof; absent is none.
+pub(crate) fn revoked_of(doc: &Value) -> Result<HashSet<String>, ()> {
+    match doc.get("revoked_keys") {
+        None | Some(Value::Null) => Ok(HashSet::new()),
+        Some(v) => v
+            .as_array()
+            .ok_or(())?
+            .iter()
+            .map(|k| k.as_str().map(String::from).ok_or(()))
+            .collect(),
+    }
+}
+
 pub(crate) fn gate_of(doc: &Value) -> Result<Option<Option<HashSet<String>>>, ()> {
     match doc.get("members") {
         Some(v) => members_of(v).map(Some),
@@ -757,8 +819,11 @@ pub async fn cloud_sessions_set(id: u64, body: &Value, daemon: &Daemon) -> Respo
         Ok(Some(m)) => m,
         Err(()) => return Response::err(id, BAD_REQUEST),
     };
+    let Ok(revoked) = revoked_of(body) else {
+        return Response::err(id, BAD_REQUEST);
+    };
     let mut sent = cloud.sent.subscribe();
-    let version = cloud.set(out, members);
+    let version = cloud.set(out, members, revoked);
     daemon.presence.notify_one();
     let handed = sent.wait_for(|v| *v >= version);
     let handed = matches!(

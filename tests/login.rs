@@ -225,7 +225,7 @@ fn invite_agents_hands_the_backend_a_once_ask_link_under_this_computers_signatur
 }
 
 #[test]
-fn a_sign_in_past_its_ninety_days_says_sign_in_again() {
+fn an_expired_sign_in_says_sign_in_again_and_its_age_does_not() {
     let e = Env::new();
     let key = e.identity().key;
     let now = common::now_s();
@@ -240,7 +240,8 @@ fn a_sign_in_past_its_ninety_days_says_sign_in_again() {
         !lightbulb::login::ended(dir, now),
         "not signed in: nothing ended"
     );
-    for (token, ended) in [(ok, false), (old, true), (expired, true)] {
+    // The browser login's age is the account server's to judge at renewal, not ours.
+    for (token, ended) in [(ok, false), (old, false), (expired, true)] {
         lightbulb::login::save(dir, &json!({ "proof": token })).unwrap();
         assert_eq!(lightbulb::login::ended(dir, now), ended);
     }

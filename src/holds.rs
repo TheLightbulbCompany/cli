@@ -502,6 +502,21 @@ fn answer_here(
     };
     if let Ok(c) = &r {
         after(d, c, by, Some(surface));
+        // An agent allowed a teammate's message: the person is told, and may take it back.
+        if surface == "cli" && by != "local" && c.allow && c.hold.kind() == Kind::Message {
+            let team = d.team.lock().unwrap();
+            if let Some(m) = team.roster.members.get(&c.hold.from_member) {
+                let (me, r) = (&d.identity.key, &team.roster);
+                let text = format!(
+                    "{} allowed {} to message {}.",
+                    label::render(r, me, by),
+                    m.name,
+                    label::render(r, me, &c.hold.target_session)
+                );
+                let args = dialog::args("Lightbulb", &text, &["Keep", "Remove"]);
+                d.dialogs.show(&format!("PH:{}", m.person_id), args);
+            }
+        }
     }
     Ok(r)
 }

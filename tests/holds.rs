@@ -756,3 +756,50 @@ async fn hold_answer_on_an_instance_needs_decided_by() {
     common::ok(&sock, &token, "stop", json!({}));
     assert!(child.wait().unwrap().success());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_agent_allow_raises_a_notice_and_remove_sets_hold() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path().display();
+    let fake = common::script(
+        dir.path(),
+        &format!(
+            "printf '%s\\n' \"$@\" >>{d}/log\ncase \"$*\" in *'allowed bob to message'*) \
+             echo 'button returned:Remove, gave up:false';; *) exec sleep 600;; esac"
+        ),
+    );
+    let me = std::process::id();
+    let birth = lightbulb::os::process(me).unwrap().birth_micros;
+    let (a, b) = (Env::new(), Env::new());
+    seed_team(&a, &b);
+    a.daemon(
+        false,
+        "",
+        &[
+            ("LIGHTBULB_CONNECT_HOOK_CALLER", format!("{me}:{birth}")),
+            (
+                "LIGHTBULB_CONNECT_DEBUG_OSASCRIPT",
+                fake.display().to_string(),
+            ),
+        ],
+    );
+    let ep = endpoint(&b.identity()).await;
+    let mut p = Peer::dial(&ep, &a).await;
+    p.hello(vec![]).await;
+    until(5, "B online", || a.status()["peers"]["online"] == 1);
+    let to = register(&a, "claude", "c1", "/tmp/app");
+    let id = ulid();
+    p.send(&envelope(&id, "r1", &session(&b, "b1"), &to, "x"))
+        .await;
+    p.ack(&id).await;
+    let h = one_hold(&a);
+    let r = a.ask(json!({"id": 1, "op": "hold.answer", "hold": h, "verdict": "allow"}));
+    assert_eq!(r["ok"], true, "{r}");
+    // The explicit `hold` row only exists once Remove ran (Allow wrote `accept`).
+    let key = b.identity().key;
+    until(10, "Remove sets the policy back to hold", || {
+        a.ask(json!({"id": 1, "op": "policy.get"}))["people"][&key] == "hold"
+    });
+    let log = std::fs::read_to_string(dir.path().join("log")).unwrap();
+    assert!(log.contains("allowed bob to message"), "{log}");
+}

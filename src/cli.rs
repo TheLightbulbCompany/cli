@@ -521,7 +521,7 @@ fn refuse(r: &Value, texts: &[(&str, String)]) -> Result<i32> {
 pub fn invite_agents() -> Result<i32> {
     let r = connect()?.call(
         "team.invite",
-        json!({ "mode": Invite::Once, "code": false }),
+        json!({ "mode": Invite::Once, "code": false, "agents": true }),
     )?;
     match r["ticket"].as_str() {
         Some(t) if r["ok"] == true => crate::login::invite_agents(t),

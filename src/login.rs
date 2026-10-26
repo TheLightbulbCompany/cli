@@ -31,16 +31,13 @@ pub fn stored(dir: &std::path::Path) -> Option<Value> {
 
 /// What this computer says once its sign-in can no longer be renewed.
 pub const SIGN_IN_AGAIN: &str = "This computer's sign-in has ended. Sign in again: lightbulb login";
-/// A renewal keeps the browser login's `auth_time`; Lightbulb renews for this long after it.
-const MAX_AUTH_AGE_S: i64 = 90 * 86_400;
-
-/// Whether this computer's sign-in has ended at `now` (expired, or its browser login is past
-/// `MAX_AUTH_AGE_S`): only `lightbulb login` brings it back. `false` when not signed in.
+/// Whether this computer's sign-in has ended at `now` (its proof expired): only
+/// `lightbulb login` brings it back. (A renewal asks the account server, which can refuse.) `false` when not signed in.
 pub fn ended(dir: &std::path::Path, now: i64) -> bool {
     let Some(p) = stored_proof(dir).and_then(|t| crate::proof::peek(&t)) else {
         return false;
     };
-    now > p.exp || p.auth_time.is_some_and(|t| now - t > MAX_AUTH_AGE_S)
+    now > p.exp
 }
 
 /// This computer's sign-in proof, when it has one.

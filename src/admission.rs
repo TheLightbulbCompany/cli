@@ -358,6 +358,27 @@ fn admit(d: &Daemon, n: i64, req: &Request, by: Option<&str>) -> Verdict {
     let v = check(&team.roster, &store, req, &d.identity.key, now)
         .and_then(|once| try_admit(d, &mut team, &store, n, req, once, by, now));
     close(&store, n, v);
+    // Allowing a join also allows that person to message this computer's sessions (the rest of
+    // the network still holds once).
+    if v.is_ok() {
+        if let Some(m) = team.roster.members.get(&req.candidate) {
+            let who = by.unwrap_or("local");
+            let _ = crate::policy::set_person(
+                &store,
+                &m.person_id,
+                crate::policy::Verdict::Accept,
+                who,
+                now,
+            );
+        }
+    }
+    // An agent let someone in: the person is told, and may take it back.
+    if let (Ok(()), Some(by)) = (v, by) {
+        let who = crate::label::render(&team.roster, &d.identity.key, by);
+        let text = format!("{who} let {} into your network.", req.name);
+        let args = dialog::args("Lightbulb", &text, &["Keep", "Remove"]);
+        d.dialogs.show(&format!("AR:{}", req.candidate), args);
+    }
     v
 }
 
@@ -367,6 +388,7 @@ fn admit(d: &Daemon, n: i64, req: &Request, by: Option<&str>) -> Verdict {
 async fn wait(d: &Daemon, gone: impl Future, n: i64, req: Request) -> Option<Verdict> {
     let (tx, rx) = oneshot::channel();
     let text = prompt(&req, n);
+    let ticket_id = req.ticket.ticket_id.clone();
     // Before the dialog: a headless one answers at once.
     d.admissions.lock().unwrap().insert(
         n,
@@ -375,9 +397,14 @@ async fn wait(d: &Daemon, gone: impl Future, n: i64, req: Request) -> Option<Ver
             tx,
         },
     );
-    let buttons = ["Decline", "Allow"];
-    d.dialogs
-        .show(&format!("J{n}"), dialog::args("Lightbulb", &text, &buttons));
+    // A link `invite --agents` minted: its person confirmed it in the browser, so no Allow.
+    if d.auto_admit.lock().unwrap().remove(&ticket_id) {
+        answer(d, n, true, "auto", None);
+    } else {
+        let buttons = ["Decline", "Allow"];
+        d.dialogs
+            .show(&format!("J{n}"), dialog::args("Lightbulb", &text, &buttons));
+    }
     answered(d, n, rx, gone, d.peers.knobs().join_wait).await
 }
 
@@ -484,6 +511,24 @@ pub async fn route(d: Arc<Daemon>) {
             answer(&d, n, b == "Allow", "dialog", None);
         } else if let Some(n) = dialog::number(&id, 'H') {
             crate::holds::on_dialog(&d, n, &b);
+        } else if let Some(key) = id.strip_prefix("AR:") {
+            if b == "Remove" {
+                net_ops::remove_member(&d, key);
+            }
+        } else if let Some(pid) = id.strip_prefix("PH:") {
+            if b == "Remove" {
+                let now = ipc::now() as i64;
+                let r = crate::policy::set_person(
+                    &d.store.lock().unwrap(),
+                    pid,
+                    crate::policy::Verdict::Hold,
+                    "local",
+                    now,
+                );
+                if let Err(e) = r {
+                    eprintln!("policy: {e}");
+                }
+            }
         } else {
             eprintln!("dialog {id}: nothing waits for it");
         }
