@@ -133,18 +133,53 @@ fn login_signs_the_challenge_shows_the_code_and_waits_for_the_confirm() {
 }
 
 #[test]
-fn logout_deletes_the_sign_in_and_asks_nothing_of_lightbulb() {
+fn logout_signs_this_computer_out_at_lightbulb_then_deletes_the_sign_in() {
+    fn revoke(path: &str, body: &Value, n: usize) -> (u16, Value) {
+        match path {
+            "/network/proof/revoke" => (200, json!({"state": "signed_out"})),
+            _ => api(path, body, n),
+        }
+    }
+    let e = Env::new();
+    let me = e.identity();
+    e.sign_in("user_aden", None);
+    let proof = lightbulb::login::stored_proof(e.state.path()).unwrap();
+    let (base, seen) = stub(revoke);
+    let out = run(&e, &base, &["logout"]);
+    assert!(out.status.success(), "{}", common::err(&out));
+    assert!(common::out(&out).contains("This computer is signed out."));
+    assert!(!e.state.path().join("login.json").exists());
+    {
+        let seen = seen.lock().unwrap();
+        let (_, body) = seen
+            .iter()
+            .find(|(p, _)| p == "/network/proof/revoke")
+            .expect("logout tells Lightbulb");
+        assert_eq!(body["proof"], proof.as_str());
+        assert_eq!(body["key"], me.key.as_str());
+        let signed =
+            json!({"purpose": "lightbulb-logout", "challenge": body["challenge"], "key": me.key});
+        assert!(lightbulb::identity::verify(
+            &me.key,
+            &signed,
+            body["sig"].as_str().unwrap()
+        ));
+    }
+    let again = run(&e, &base, &["logout"]);
+    assert!(common::out(&again).contains("was not signed in"));
+    assert_eq!(seen.lock().unwrap().len(), 2, "nothing more to tell");
+}
+
+#[test]
+fn offline_logout_still_signs_out_here_and_says_lightbulb_was_not_told() {
     let e = Env::new();
     e.identity();
     e.sign_in("user_aden", None);
-    let (base, seen) = stub(api);
-    let out = run(&e, &base, &["logout"]);
+    let out = run(&e, "http://127.0.0.1:9", &["logout"]);
     assert!(out.status.success(), "{}", common::err(&out));
-    assert!(common::out(&out).contains("signed out"));
+    let text = common::out(&out);
+    assert!(text.contains("Lightbulb was not told"), "{text}");
     assert!(!e.state.path().join("login.json").exists());
-    assert!(seen.lock().unwrap().is_empty(), "no call");
-    let again = run(&e, &base, &["logout"]);
-    assert!(common::out(&again).contains("was not signed in"));
 }
 
 #[test]

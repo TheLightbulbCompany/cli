@@ -5,7 +5,7 @@
 //! sign-in proof (`proof`), kept in `login.json` (0600) with the route link's URL: this
 //! computer shows it in its `hello` (a workspace answers only its own people's computers) and
 //! on its route link (`link`). The CLI never holds an account token; the poll `code` is single
-//! use and lives only in memory here. Logout deletes the file; nothing is asked of Lightbulb.
+//! use and lives only in memory here. Logout tells Lightbulb (signed), then deletes the file.
 //!
 //! The wire is `curl`, as `lightbulb update` and the usage counts use; bodies go in on stdin
 //! (never in argv, which other processes can read).
@@ -268,11 +268,24 @@ pub fn login() -> Result<i32> {
     Ok(0)
 }
 
-/// `logout`: deletes this computer's sign-in; its route link drops within seconds (`link`)
-/// and workspaces stop answering it once its connections to them are made again.
+/// `logout`: signs this computer out everywhere first (a signed call: the backend adds its key
+/// to every workspace's `revoked_keys`, so their agents stop answering it at once), then deletes
+/// its sign-in; its route link drops within seconds (`link`). Offline, it signs out here only.
 pub fn logout() -> Result<i32> {
-    match std::fs::remove_file(paths::state_dir().join(FILE)) {
-        Ok(()) => println!("This computer is signed out."),
+    let dir = paths::state_dir();
+    let told = stored_proof(&dir).map(|proof| -> Result<Value> {
+        let mut body = signed(&identity()?, "logout", None)?;
+        body["proof"] = proof.into();
+        ok("/network/proof/revoke", &body)
+    });
+    match std::fs::remove_file(dir.join(FILE)) {
+        Ok(()) => match told {
+            Some(Err(e)) => println!(
+                "This computer is signed out here, but Lightbulb was not told ({e}). Your \
+                 workspaces answer it until its sign-in ends (at most 30 days)."
+            ),
+            _ => println!("This computer is signed out."),
+        },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             println!("This computer was not signed in.")
         }
