@@ -35,6 +35,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync"
 toml_edit = "0.25"
 ulid = "3.0.0"
 
+# The member key's Keychain item (`identity.rs`). Already in the tree (rustls-native-certs).
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
+
 [dev-dependencies]
 # A test relay server (`tests/relay.rs`).
 iroh-relay = { version = "=1.4.1", features = ["server"] }

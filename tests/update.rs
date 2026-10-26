@@ -1,16 +1,24 @@
-//! `lightbulb update` against a fake release folder (`LIGHTBULB_RELEASE_BASE=file://…`).
+//! `lightbulb update` against a fake release folder (`LIGHTBULB_RELEASE_BASE=file://…`),
+//! its `.sha256` signed with a test release key (`LIGHTBULB_RELEASE_KEY`).
 
 mod common;
 
 use common::{Env, EXE};
+use ed25519_dalek::{Signer, SigningKey};
 use lightbulb::cli::ASSET;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Output};
 
+/// The tests' release key: a fixed seed, so the update helper can name its public half.
+fn release_key() -> SigningKey {
+    SigningKey::from_bytes(&[7; 32])
+}
+
 /// A release folder whose `latest` names `tag` and whose tarball holds a stub `lightbulb`;
-/// `sum` replaces the real checksum when set.
+/// `sum` replaces the real checksum when set. Its `.sha256` is signed with `release_key`, as
+/// `openssl pkeyutl -sign -rawin` signs it: the file's exact bytes.
 fn release(dir: &Path, tag: &str, sum: Option<&str>) {
     let stage = dir.join("stage");
     fs::create_dir_all(&stage).unwrap();
@@ -34,7 +42,9 @@ fn release(dir: &Path, tag: &str, sum: Option<&str>) {
         Some(s) => format!("{s}  {ASSET}\n"),
         None => sha,
     };
+    let sig = release_key().sign(sha.as_bytes()).to_bytes();
     fs::write(dir.join(format!("{ASSET}.sha256")), sha).unwrap();
+    fs::write(dir.join(format!("{ASSET}.sha256.sig")), sig).unwrap();
     fs::write(dir.join("latest"), format!("{tag}\n")).unwrap();
 }
 
@@ -43,6 +53,10 @@ fn update(env: &Env, dir: &Path, args: &[&str]) -> Output {
         .arg("update")
         .args(args)
         .env("LIGHTBULB_ALLOW_UNSIGNED", "1")
+        .env(
+            "LIGHTBULB_RELEASE_KEY",
+            data_encoding::HEXLOWER.encode(release_key().verifying_key().as_bytes()),
+        )
         .env(
             "LIGHTBULB_RELEASE_BASE",
             format!("file://{}", dir.display()),
@@ -60,7 +74,7 @@ fn text(o: &[u8]) -> String {
 }
 
 #[test]
-fn update_installs_the_release_and_runs_its_setup() {
+fn a_signed_release_installs() {
     let env = Env::new();
     let rel = tempfile::tempdir().unwrap();
     release(rel.path(), "v9.9.9", None);
@@ -95,6 +109,39 @@ fn a_wrong_checksum_changes_nothing() {
     assert_eq!(
         text(&o.stderr).trim(),
         "Checksum mismatch; nothing changed."
+    );
+    assert_eq!(fs::read_to_string(&canon).unwrap(), "old");
+}
+
+#[test]
+fn an_unsigned_or_wrongly_signed_release_changes_nothing() {
+    let env = Env::new();
+    let canon = canonical(&env);
+    fs::create_dir_all(canon.parent().unwrap()).unwrap();
+    fs::write(&canon, "old").unwrap();
+    let rel = tempfile::tempdir().unwrap();
+    release(rel.path(), "v9.9.9", None);
+    let sig = rel.path().join(format!("{ASSET}.sha256.sig"));
+    // Signed by another key.
+    let other = SigningKey::from_bytes(&[8; 32]);
+    let sum = fs::read(rel.path().join(format!("{ASSET}.sha256"))).unwrap();
+    fs::write(&sig, other.sign(&sum).to_bytes()).unwrap();
+    let o = update(&env, rel.path(), &[]);
+    assert_ne!(o.status.code(), Some(0));
+    assert!(
+        text(&o.stderr).contains("nothing changed"),
+        "{}",
+        text(&o.stderr)
+    );
+    assert_eq!(fs::read_to_string(&canon).unwrap(), "old");
+    // No signature at all.
+    fs::remove_file(&sig).unwrap();
+    let o = update(&env, rel.path(), &[]);
+    assert_ne!(o.status.code(), Some(0));
+    assert!(
+        text(&o.stderr).contains("nothing changed"),
+        "{}",
+        text(&o.stderr)
     );
     assert_eq!(fs::read_to_string(&canon).unwrap(), "old");
 }

@@ -91,8 +91,8 @@ fn mismatched(identity: &Identity, roster: &roster::Roster) -> bool {
 }
 
 /// `mismatched` for `dir` as it is on disk, for a caller that does not hold the lock: nothing
-/// is written. No roster: `false`; a roster but no `identity.key`: `true` (a start would make a
-/// key the record never knew).
+/// is written. No roster: `false`; a roster but no key: `true` (a start would make a key the
+/// record never knew).
 pub fn key_mismatch(dir: &Path) -> Result<bool> {
     if !dir.join("state.db").exists() {
         return Ok(false);
@@ -101,7 +101,7 @@ pub fn key_mismatch(dir: &Path) -> Result<bool> {
     if entries.is_empty() {
         return Ok(false);
     }
-    if !dir.join("identity.key").exists() {
+    if !crate::identity::exists(dir)? {
         return Ok(true);
     }
     Ok(mismatched(
