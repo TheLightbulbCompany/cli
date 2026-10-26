@@ -6,8 +6,10 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Process {
     pub pid: u32,
-    /// Start time, microseconds since the Unix epoch. With the pid it names one
-    /// process for good: a reused pid has a different birth.
+    /// Start time in microseconds: since the Unix epoch on macOS, since boot on Linux (whose
+    /// boot time, `/proc/stat`'s `btime`, moves with every clock step: an epoch birth read
+    /// later would no longer match). With the pid it names one process for good: a reused pid
+    /// has a different birth. Never a wall-clock time: that is `started_ms`.
     pub birth_micros: u64,
     pub executable: PathBuf,
 }
@@ -24,6 +26,12 @@ pub fn process(pid: u32) -> Result<Process> {
         birth_micros: imp::info(pid)?.birth_micros,
         executable: imp::executable(pid)?,
     })
+}
+
+/// When `pid` started, milliseconds since the Unix epoch (to compare with another program's
+/// record of it). On Linux it moves with the clock: compare it with a margin.
+pub fn started_ms(pid: u32) -> Result<u64> {
+    imp::started_ms(pid)
 }
 
 /// This computer's short host name (its first label, at most 64 characters, so a member
@@ -83,6 +91,10 @@ mod imp {
             ppid: short.pbsi_ppid,
             birth_micros,
         })
+    }
+
+    pub fn started_ms(pid: u32) -> Result<u64> {
+        Ok(info(pid)?.birth_micros / 1000)
     }
 
     /// One `proc_pidinfo` struct of `flavor`, when the kernel fills it whole.
@@ -148,8 +160,48 @@ mod imp {
     use std::path::PathBuf;
 
     /// From `/proc/<pid>/stat` (readable for any uid's process): the ppid, and the start
-    /// time in clock ticks since boot, placed on the epoch by `/proc/stat`'s `btime`.
+    /// time in clock ticks since boot. Never placed on the epoch: `btime` is now minus uptime,
+    /// whole seconds, so a clock step (NTP, a VM's host sync: WSL) moves it and every birth
+    /// read after it, and then no registered session matches its own process (`started_ms`).
     pub fn info(pid: u32) -> Result<Info> {
+        let (ppid, ticks) = stat(pid)?;
+        Ok(Info {
+            ppid,
+            birth_micros: boot_tag() | since_boot(ticks),
+        })
+    }
+
+    /// `info`'s start placed on the epoch by `btime`: as good as the clock now.
+    pub fn started_ms(pid: u32) -> Result<u64> {
+        let boot = boot_micros().ok_or("no btime in /proc/stat")?;
+        Ok((boot + since_boot(stat(pid)?.1)) / 1000)
+    }
+
+    fn since_boot(ticks: u64) -> u64 {
+        ticks * 1_000_000 / clock_ticks()
+    }
+
+    /// Bits above 2^45 µs of uptime (about 1.1 years) that name this boot, so a stored row
+    /// from an earlier boot never matches a new process with the same pid and start tick.
+    /// FNV-1a of `/proc/sys/kernel/random/boot_id`: stable across engine builds, unlike std's
+    /// hasher. No boot id: 0, the plain since-boot birth.
+    pub(super) fn boot_tag() -> u64 {
+        static TAG: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        *TAG.get_or_init(|| {
+            let id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap_or_default();
+            let id = id.trim();
+            if id.is_empty() {
+                return 0;
+            }
+            let h = id.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+                (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+            });
+            (h & 0x3FFFF) << 45
+        })
+    }
+
+    /// `/proc/<pid>/stat`'s ppid and starttime (clock ticks since boot).
+    fn stat(pid: u32) -> Result<(u32, u64)> {
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
             .map_err(|_| format!("no process {pid}"))?;
         // `pid (comm) state ppid …`: comm may hold spaces and parentheses, so fields count
@@ -159,11 +211,7 @@ mod imp {
         let num = |i: usize| -> Result<u64> {
             Ok(fields.get(i).ok_or("bad /proc stat")?.parse::<u64>()?)
         };
-        let (ppid, ticks) = (num(1)? as u32, num(19)?);
-        Ok(Info {
-            ppid,
-            birth_micros: boot_micros().map_or(0, |b| b + ticks * 1_000_000 / clock_ticks()),
-        })
+        Ok((num(1)? as u32, num(19)?))
     }
 
     fn clock_ticks() -> u64 {
@@ -256,6 +304,10 @@ mod imp {
         Err("process lookup is only implemented on macOS and Linux".into())
     }
 
+    pub fn started_ms(_pid: u32) -> Result<u64> {
+        Err("process lookup is only implemented on macOS and Linux".into())
+    }
+
     pub fn executable(_pid: u32) -> Result<PathBuf> {
         Err("process lookup is only implemented on macOS and Linux".into())
     }
@@ -305,6 +357,33 @@ mod tests {
             let init = process(1).unwrap().executable;
             assert!(!init.as_os_str().is_empty());
         }
+    }
+
+    /// A birth is since boot, never on the epoch through `btime`, which a clock step moves
+    /// (WSL's host sync): a birth read after one would match no registered session.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_birth_does_not_move_with_the_clock() {
+        let me = process(std::process::id()).unwrap();
+        let uptime: f64 = std::fs::read_to_string("/proc/uptime")
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let since_boot = me.birth_micros & ((1u64 << 45) - 1);
+        assert_eq!(me.birth_micros - since_boot, imp::boot_tag(), "{me:?}");
+        assert!(since_boot <= (uptime * 1e6) as u64 + 1_000_000, "{me:?}");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let started = started_ms(me.pid).unwrap();
+        assert!(
+            started <= now + 2_000 && started.abs_diff(now) < 3_600_000,
+            "{started} vs {now}"
+        );
     }
 
     /// An agent whose binary is replaced mid-session keeps its path (Linux says

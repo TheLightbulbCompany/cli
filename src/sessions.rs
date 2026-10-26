@@ -195,8 +195,10 @@ pub fn scan_claude(home: &Path, member_short: &str) -> Vec<Session> {
         ) else {
             continue;
         };
-        let Ok(p) = os::process(pid) else { continue };
-        if (p.birth_micros / 1000).abs_diff(started_ms) > 10_000 {
+        let (Ok(p), Ok(started)) = (os::process(pid), os::started_ms(pid)) else {
+            continue;
+        };
+        if started.abs_diff(started_ms) > 10_000 {
             continue;
         }
         // Pushing checks the socket's peer pid, which only `os::PEER_PID` platforms can.
@@ -295,11 +297,12 @@ mod tests {
 
         let me = std::process::id();
         let birth = os::process(me).unwrap().birth_micros;
+        let started = os::started_ms(me).unwrap();
         fs::write(
             dir.join(format!("{me}.json")),
             format!(
                 r#"{{"pid":{me},"sessionId":"live-conv","cwd":"/tmp/proj","startedAt":{},"kind":"interactive","name":"live one","status":"busy"}}"#,
-                birth / 1000 + 500
+                started + 500
             ),
         )
         .unwrap();
@@ -308,7 +311,7 @@ mod tests {
             dir.join("reused.json"),
             format!(
                 r#"{{"pid":{me},"sessionId":"stale","cwd":"/","startedAt":{}}}"#,
-                birth / 1000 - 3_600_000
+                started - 3_600_000
             ),
         )
         .unwrap();

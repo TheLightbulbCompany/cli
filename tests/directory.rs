@@ -323,13 +323,12 @@ fn a_discovered_claude_session_keeps_its_hooks_folder() {
     let link = root.path().join("via-link");
     std::os::unix::fs::symlink(&secret, &link).unwrap();
     let me = std::process::id();
-    let birth = os::process(me).unwrap().birth_micros;
     let claude = a.home.path().join(".claude/sessions");
     std::fs::create_dir_all(&claude).unwrap();
     let raw = link.join("proj");
     std::fs::write(
         claude.join(format!("{me}.json")),
-        json!({"pid": me, "sessionId": "s1", "cwd": raw, "startedAt": birth / 1000,
+        json!({"pid": me, "sessionId": "s1", "cwd": raw, "startedAt": lightbulb::os::started_ms(me).unwrap(),
             "status": "idle"})
         .to_string(),
     )
@@ -371,13 +370,12 @@ fn a_session_refused_under_an_off_folder_is_not_discovered_either() {
         assert_eq!(a.ask(json!({"id": 1, "op": "reload"}))["ok"], true);
     };
     let me = std::process::id();
-    let birth = os::process(me).unwrap().birth_micros;
     let claude = a.home.path().join(".claude/sessions");
     std::fs::create_dir_all(&claude).unwrap();
     let raw = link.join("proj");
     std::fs::write(
         claude.join(format!("{me}.json")),
-        json!({"pid": me, "sessionId": "s2", "cwd": raw, "startedAt": birth / 1000,
+        json!({"pid": me, "sessionId": "s2", "cwd": raw, "startedAt": lightbulb::os::started_ms(me).unwrap(),
             "status": "idle", "name": "secret plan"})
         .to_string(),
     )
