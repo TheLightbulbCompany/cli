@@ -6,7 +6,7 @@ use iroh_relay::server::{RelayConfig, Server, ServerConfig};
 use lightbulb::config::Config;
 use lightbulb::relay;
 use serde_json::{json, Value};
-use std::net::{Ipv4Addr, TcpListener};
+use std::net::Ipv4Addr;
 use std::time::Duration;
 
 mod common;
@@ -14,12 +14,24 @@ mod common;
 use common::{out, peers, person, seed_pair, session, until, Env, EXE};
 
 /// A relay server on the loopback, at `port` (0: any), and its URL.
+/// A fixed port can stay held for a moment after the last server on it shut down: retry.
 async fn relay_server(port: u16) -> (Server, String) {
-    let mut config = ServerConfig::default();
-    config.relay = Some(RelayConfig::new((Ipv4Addr::LOCALHOST, port)));
-    let server = Server::spawn(config).await.unwrap();
-    let url = format!("http://{}", server.http_addr().unwrap());
-    (server, url)
+    let mut tries = 0;
+    loop {
+        let mut config = ServerConfig::default();
+        config.relay = Some(RelayConfig::new((Ipv4Addr::LOCALHOST, port)));
+        match Server::spawn(config).await {
+            Ok(server) => {
+                let url = format!("http://{}", server.http_addr().unwrap());
+                return (server, url);
+            }
+            Err(_) if port != 0 && tries < 50 => {
+                tries += 1;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Err(e) => panic!("relay server on port {port}: {e:#}"),
+        }
+    }
 }
 
 /// The debug knob that takes this daemon's direct (IP) transports away: relay only.
@@ -67,13 +79,9 @@ async fn messages_flow_via_relay_when_direct_is_blocked() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn relay_down_keeps_mail_queued() {
-    // A fixed port, so the relay comes back at the same URL.
-    let port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let (server, url) = relay_server(port).await;
+    // The relay comes back on this same port, so at the same URL.
+    let (server, url) = relay_server(0).await;
+    let port = server.http_addr().unwrap().port();
     let (a, b) = (Env::new(), Env::new());
     seed_pair(&a, &b);
     let cfg = format!("relay = \"{url}\"\n");
