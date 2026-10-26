@@ -358,10 +358,55 @@ fn listen_once_prints_a_framed_message() {
         .success());
 }
 
+/// The Lightbulb app's words run in the app: `lightbulb claude …` is `<app> cli claude …`,
+/// with the same stdin, stdout and exit code; without the app, one line says where to get it.
+#[test]
+fn the_apps_words_run_in_the_app() {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    let e = Env::new();
+    let app = e.home.path().join("Lightbulb.app");
+    let exe = app.join("Contents/MacOS/lightbulb-desktop");
+    std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+    std::fs::write(&exe, "#!/bin/sh\necho \"args: $*\"; cat; exit 7\n").unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for (args, shown) in [
+        (&["claude", "--resume", "x"][..], "cli claude --resume x"),
+        (&["codex"][..], "cli codex"),
+        (&["continue", "<link>"][..], "cli continue <link>"),
+        (&["share", "on"][..], "cli share on"),
+        (&["pair", "--x"][..], "cli pair --x"),
+    ] {
+        let mut c = e.cmd(args);
+        c.env("LIGHTBULB_CONNECT_DEBUG_APP", &app)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped());
+        let mut child = c.spawn().unwrap();
+        child.stdin.take().unwrap().write_all(b"typed\n").unwrap();
+        let o = child.wait_with_output().unwrap();
+        assert_eq!(o.status.code(), Some(7), "{}", err(&o));
+        assert_eq!(out(&o), format!("args: {shown}\ntyped\n"));
+    }
+
+    let o = e
+        .cmd(&["claude"])
+        .env(
+            "LIGHTBULB_CONNECT_DEBUG_APP",
+            e.home.path().join("none.app"),
+        )
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(
+        err(&o),
+        "\"lightbulb claude\" needs the Lightbulb app: https://thelightbulb.company/download\n"
+    );
+}
+
 #[test]
 fn an_unknown_command_is_named() {
     let e = Env::new();
-    for sub in ["claude", "launch"] {
+    for sub in ["claud", "launch"] {
         let o = e.run(&[sub, "x"]);
         assert_eq!(o.status.code(), Some(2));
         assert_eq!(

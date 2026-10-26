@@ -26,6 +26,38 @@ const SESSION_ENV: &str = "LIGHTBULB_CONNECT_SESSION";
 /// (tests) Treat stdout as a terminal: a person at it (`install_running`).
 const TTY_ENV: &str = "LIGHTBULB_CONNECT_DEBUG_TTY";
 
+/// (tests) The Lightbulb app bundle to use instead of the installed one.
+const APP_ENV: &str = "LIGHTBULB_CONNECT_DEBUG_APP";
+/// The words the Lightbulb app answers (`lightbulb claude …`); none is one of ours.
+pub const APP_WORDS: [&str; 5] = ["claude", "codex", "continue", "share", "pair"];
+
+/// Runs `lightbulb <word> …` as the Lightbulb app's `cli <word> …` in this process (stdin,
+/// stdout and the exit code are the app's); without the app, says where to get it and exits 1.
+pub fn app_command(args: &[std::ffi::OsString]) -> Result<i32> {
+    let bundles = match test_env(APP_ENV) {
+        Some(p) => vec![PathBuf::from(p)],
+        None if cfg!(target_os = "macos") => vec![
+            PathBuf::from("/Applications/Lightbulb.app"),
+            home()?.join("Applications/Lightbulb.app"),
+        ],
+        None => vec![],
+    };
+    let exe = bundles
+        .iter()
+        .map(|b| b.join("Contents/MacOS/lightbulb-desktop"))
+        .find(|e| e.is_file());
+    let Some(exe) = exe else {
+        eprintln!(
+            "\"lightbulb {}\" needs the Lightbulb app: https://thelightbulb.company/download",
+            args[0].to_string_lossy()
+        );
+        return Ok(1);
+    };
+    use std::os::unix::process::CommandExt;
+    let e = Command::new(&exe).arg("cli").args(args).exec();
+    Err(format!("{}: {e}", exe.display()).into())
+}
+
 /// A "(tests)" environment override: read in debug builds only, as `net::Knobs::read` does.
 fn test_env(name: &str) -> Option<std::ffi::OsString> {
     if cfg!(debug_assertions) {
