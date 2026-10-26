@@ -574,10 +574,16 @@ async fn an_agents_invite_is_one_time_and_its_use_raises_a_notice_and_remove_rem
     let a = agent_daemon(dir.path());
     let r = a.ask(json!({"id": 1, "op": "team.invite", "mode": "reusable"}));
     assert_eq!(r["mode"], "once", "{r}");
-    carol_joins(&a, r["ticket"].as_str().unwrap()).await;
+    // The fake notice answers Remove at once, so carol may be in and out between two polls:
+    // the notice is the proof she was admitted.
+    let t = ticket::decode(r["ticket"].as_str().unwrap()).unwrap();
+    let cand = identity();
+    let _p = Played::send(&a, &cand, &admission::request(&cand, &t, "carol", "mbp")).await;
+    let log = || std::fs::read_to_string(dir.path().join("log")).unwrap_or_default();
+    until(30, "the notice names carol", || {
+        log().contains("invited carol into your network.")
+    });
     until(30, "carol is removed again", || members(&a).len() == 1);
-    let log = std::fs::read_to_string(dir.path().join("log")).unwrap();
-    assert!(log.contains("invited carol into your network."), "{log}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
