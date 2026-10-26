@@ -28,6 +28,7 @@ use tokio::net::UnixStream;
 
 /// Runs the server on stdin/stdout until the client closes it.
 pub fn run(name: String) -> crate::Result<()> {
+    STARTED.get_or_init(exe_id);
     daemon::ensure_running()?;
     tokio::runtime::Runtime::new()?.block_on(async {
         let signed = Arc::new(AtomicBool::new(signed_in()));
@@ -145,6 +146,40 @@ fn fail(body: Value) -> CallToolResult {
 
 fn code(code: &str) -> CallToolResult {
     fail(json!({ "error": code }))
+}
+
+/// The hint when `lightbulb update` has replaced this server's binary since it started.
+const REPLACED: &str = "This tool server is older than the installed Lightbulb. Start a new session (or restart your agent).";
+
+/// This server's binary (device, inode) when it started (`run`).
+static STARTED: OnceLock<Option<(u64, u64)>> = OnceLock::new();
+
+/// The (device, inode) at this process's executable path now.
+fn exe_id() -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(std::env::current_exe().ok()?).ok()?;
+    Some((m.dev(), m.ino()))
+}
+
+/// Whether the binary this server runs was replaced on disk (an update renames the new one
+/// over it). The Keychain then refuses this process: its access check reads the code on disk,
+/// which no longer matches what is running.
+fn replaced() -> bool {
+    STARTED
+        .get()
+        .copied()
+        .flatten()
+        .is_some_and(|s| exe_id() != Some(s))
+}
+
+/// An unexpected failure: `internal`, with what went wrong (or that this server is stale).
+fn internal(detail: impl std::fmt::Display) -> Value {
+    let hint = if replaced() {
+        REPLACED.to_string()
+    } else {
+        detail.to_string()
+    };
+    json!({ "error": "internal", "hint": hint })
 }
 
 /// A daemon refusal as the tool's error: its body without the envelope.
@@ -285,8 +320,8 @@ impl Server {
     async fn sessions() -> Result<Vec<Session>, CallToolResult> {
         let r = ask("sessions", json!({}))
             .await
-            .map_err(|_| code("internal"))?;
-        serde_json::from_value(r["sessions"].clone()).map_err(|_| code("internal"))
+            .map_err(|e| fail(internal(e)))?;
+        serde_json::from_value(r["sessions"].clone()).map_err(|e| fail(internal(e)))
     }
 
     /// OpenCode 2.x names its session in every call's `_meta`, and one OpenCode process hosts
@@ -431,7 +466,12 @@ fn rest(method: &str, path: &str, body: Option<&Value>, label: &str) -> Result<V
     if login::ended(&dir, crate::daemon::ipc::now() as i64) {
         return Err(json!({"error": "not_signed_in", "hint": login::SIGN_IN_AGAIN}));
     }
-    let id = login::identity().map_err(|_| json!({"error": "internal"}))?;
+    // Checked first: a stale server's Keychain read fails (or asks the person to allow it).
+    if replaced() {
+        return Err(json!({"error": "identity_unavailable", "hint": REPLACED}));
+    }
+    let id = login::identity()
+        .map_err(|e| json!({"error": "identity_unavailable", "hint": e.to_string()}))?;
     let body = body.map(Value::to_string).unwrap_or_default();
     let hash: String = Sha256::digest(body.as_bytes())
         .iter()
@@ -526,7 +566,7 @@ impl Server {
         let label = Self::label(call);
         tokio::task::spawn_blocking(move || rest(method, &path, body.as_ref(), &label))
             .await
-            .unwrap_or_else(|_| Err(json!({"error": "internal"})))
+            .unwrap_or_else(|e| Err(internal(e)))
             .map_err(fail)
     }
 
@@ -589,8 +629,9 @@ impl Server {
 
     /// The coding sessions you can message: this computer's, then your teammates'.
     async fn find_sessions(&self, call: Call, a: FindArgs) -> CallToolResult {
-        let Ok(r) = ask("directory", json!({ "query": a.query })).await else {
-            return code("internal");
+        let r = match ask("directory", json!({ "query": a.query })).await {
+            Ok(r) => r,
+            Err(e) => return fail(internal(e)),
         };
         let mut found: Vec<Value> = match r["sessions"].clone() {
             Value::Array(v) => v,
@@ -647,7 +688,7 @@ impl Server {
         match r {
             Ok(r) if r["ok"] == true => Self::done(&call, with_note(r["receipt"].clone())).await,
             Ok(r) => refused(r),
-            Err(_) => code("internal"),
+            Err(e) => fail(internal(e)),
         }
     }
 
@@ -668,7 +709,7 @@ impl Server {
                 match Self::signed(&call, "POST", "/messaging/rooms".into(), Some(body)).await {
                     Ok(v) => match v["roomId"].as_str() {
                         Some(r) => r.to_string(),
-                        None => return code("internal"),
+                        None => return fail(internal("Lightbulb answered without a roomId.")),
                     },
                     Err(e) => return e,
                 }
@@ -681,8 +722,8 @@ impl Server {
         let record = room_record(&call.from, &a.request_id);
         let written = std::fs::create_dir_all(record.parent().expect("in room-sends"))
             .and_then(|()| std::fs::write(&record, &room));
-        if written.is_err() {
-            return code("internal");
+        if let Err(e) = written {
+            return fail(internal(e));
         }
         let mentions: Vec<Value> = (a.mention_ids.unwrap_or_default().iter())
             .map(|id| json!({"kind": kind_of(id), "id": id}))
@@ -724,7 +765,7 @@ impl Server {
         {
             Ok(r) if r["ok"] == true => Self::done(&call, with_note(r["receipt"].clone())).await,
             Ok(r) => refused(r),
-            Err(_) => code("internal"),
+            Err(e) => fail(internal(e)),
         }
     }
 
@@ -752,7 +793,7 @@ impl Server {
                 Self::done(&call, json!({ "messages": messages })).await
             }
             Ok(r) => refused(r),
-            Err(_) => code("internal"),
+            Err(e) => fail(internal(e)),
         }
     }
 }

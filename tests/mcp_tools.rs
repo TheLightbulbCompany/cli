@@ -673,7 +673,12 @@ fn mcp_on(e: &common::Env, as_: &os::Process) -> Mcp {
 
 /// `mcp_on`, its Lightbulb API at `api`.
 fn mcp_at(e: &common::Env, as_: &os::Process, api: &str) -> Mcp {
-    let mut c = e.base_cmd(Command::new(EXE));
+    mcp_exe(e, as_, api, std::path::Path::new(EXE))
+}
+
+/// `mcp_at`, run from the binary at `exe`.
+fn mcp_exe(e: &common::Env, as_: &os::Process, api: &str, exe: &std::path::Path) -> Mcp {
+    let mut c = e.base_cmd(Command::new(exe));
     c.arg("mcp")
         .env("LIGHTBULB_API", api)
         .env("LIGHTBULB_CONNECT_DEBUG_TOOLS_POLL_MS", "200")
@@ -1361,4 +1366,60 @@ fn the_tool_list_changes_when_the_sign_in_does() {
     wait();
     m.tools();
     assert_eq!(changes(&mut m), 0);
+}
+
+#[test]
+fn a_server_whose_binary_was_replaced_says_so_and_sends_nothing() {
+    let e = signed_in();
+    let (base, seen) = stub(api);
+    let bin = tempfile::tempdir().unwrap();
+    let exe = bin.path().join("lightbulb");
+    std::fs::copy(EXE, &exe).unwrap();
+    let mut m = mcp_exe(&e, &me(), &base, &exe);
+    let out = m.tool("find_rooms", json!({}));
+    assert!(!out.error, "{}", out.text);
+
+    // `lightbulb update` renames the new binary over the running one.
+    let new = bin.path().join("lightbulb.new");
+    std::fs::copy(EXE, &new).unwrap();
+    std::fs::rename(&new, &exe).unwrap();
+    for (name, args) in [
+        ("find_rooms", json!({})),
+        ("read_messages", json!({"room_id": "room-1"})),
+        (
+            "send_message",
+            json!({"request_id": "r1", "text": "x", "room_id": "room-1"}),
+        ),
+    ] {
+        let out = m.tool(name, args);
+        assert!(out.error, "{}", out.text);
+        assert_eq!(out.json()["error"], "identity_unavailable", "{}", out.text);
+        assert!(
+            out.json()["hint"]
+                .as_str()
+                .unwrap()
+                .contains("Start a new session"),
+            "{}",
+            out.text
+        );
+    }
+    assert_eq!(seen.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn an_identity_that_cannot_load_is_named_not_internal() {
+    let e = signed_in();
+    let (base, seen) = stub(api);
+    let mut m = mcp_at(&e, &me(), &base);
+    std::fs::remove_file(e.state.path().join("identity.key")).unwrap();
+    let out = m.tool("find_rooms", json!({}));
+    assert!(out.error, "{}", out.text);
+    assert_eq!(
+        out.json(),
+        json!({"error": "identity_unavailable",
+            "hint": "This computer is not set up yet. Run lightbulb setup first."}),
+        "{}",
+        out.text
+    );
+    assert!(seen.lock().unwrap().is_empty());
 }
