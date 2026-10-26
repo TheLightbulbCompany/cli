@@ -29,7 +29,7 @@ const TTY_ENV: &str = "LIGHTBULB_CONNECT_DEBUG_TTY";
 /// (tests) The Lightbulb app bundle to use instead of the installed one.
 const APP_ENV: &str = "LIGHTBULB_CONNECT_DEBUG_APP";
 /// The words the Lightbulb app answers (`lightbulb claude …`); none is one of ours.
-pub const APP_WORDS: [&str; 4] = ["claude", "codex", "continue", "share"];
+pub const APP_WORDS: [&str; 5] = ["claude", "codex", "continue", "share", "pair"];
 
 /// Runs `lightbulb <word> …` as the Lightbulb app's `cli <word> …` in this process (stdin,
 /// stdout and the exit code are the app's); without the app, says where to get it and exits 1.

@@ -38,7 +38,7 @@ Team:
   folder    Show or hide the sessions in a folder from your teammates: folder <path> on|off
   relay     The relays used when no direct path exists; relay <url> sets yours
 
-With the Lightbulb app on this Mac: claude, codex, continue '<link>' and share on|off
+With the Lightbulb app on this Mac: claude, codex, continue '<link>', share on|off and pair
 
 Run lightbulb <command> --help for its options; lightbulb --version for the version.
 ";

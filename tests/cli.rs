@@ -375,6 +375,7 @@ fn the_apps_words_run_in_the_app() {
         (&["codex"][..], "cli codex"),
         (&["continue", "<link>"][..], "cli continue <link>"),
         (&["share", "on"][..], "cli share on"),
+        (&["pair", "--x"][..], "cli pair --x"),
     ] {
         let mut c = e.cmd(args);
         c.env("LIGHTBULB_CONNECT_DEBUG_APP", &app)
