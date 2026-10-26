@@ -29,6 +29,20 @@ pub fn stored(dir: &std::path::Path) -> Option<Value> {
     serde_json::from_slice(&std::fs::read(dir.join(FILE)).ok()?).ok()
 }
 
+/// What this computer says once its sign-in can no longer be renewed.
+pub const SIGN_IN_AGAIN: &str = "This computer's sign-in has ended. Sign in again: lightbulb login";
+/// A renewal keeps the browser login's `auth_time`; Lightbulb renews for this long after it.
+const MAX_AUTH_AGE_S: i64 = 90 * 86_400;
+
+/// Whether this computer's sign-in has ended at `now` (expired, or its browser login is past
+/// `MAX_AUTH_AGE_S`): only `lightbulb login` brings it back. `false` when not signed in.
+pub fn ended(dir: &std::path::Path, now: i64) -> bool {
+    let Some(p) = stored_proof(dir).and_then(|t| crate::proof::peek(&t)) else {
+        return false;
+    };
+    now > p.exp || p.auth_time.is_some_and(|t| now - t > MAX_AUTH_AGE_S)
+}
+
 /// This computer's sign-in proof, when it has one.
 pub fn stored_proof(dir: &std::path::Path) -> Option<String> {
     stored(dir)?["proof"].as_str().map(String::from)
@@ -38,6 +52,8 @@ pub fn stored_proof(dir: &std::path::Path) -> Option<String> {
 pub fn save(dir: &std::path::Path, v: &Value) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let tmp = dir.join(format!("{FILE}.tmp"));
+    // A leftover `.tmp` would keep its own (maybe wider) mode: `mode` applies only on create.
+    let _ = std::fs::remove_file(&tmp);
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create(true)

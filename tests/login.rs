@@ -223,3 +223,31 @@ fn invite_agents_hands_the_backend_a_once_ask_link_under_this_computers_signatur
         start["sig"].as_str().unwrap()
     ));
 }
+
+#[test]
+fn a_sign_in_past_its_ninety_days_says_sign_in_again() {
+    let e = Env::new();
+    let key = e.identity().key;
+    let now = common::now_s();
+    let ok = common::issuer::mint(&json!({"iat": now, "exp": now + 86_400, "sub": "user_a",
+        "computer": key, "auth_time": now - 10 * 86_400}));
+    let old = common::issuer::mint(&json!({"iat": now, "exp": now + 86_400, "sub": "user_a",
+        "computer": key, "auth_time": now - 91 * 86_400}));
+    let expired = common::issuer::mint(&json!({"iat": now - 40 * 86_400, "exp": now - 10 * 86_400,
+        "sub": "user_a", "computer": key}));
+    let dir = e.state.path();
+    assert!(
+        !lightbulb::login::ended(dir, now),
+        "not signed in: nothing ended"
+    );
+    for (token, ended) in [(ok, false), (old, true), (expired, true)] {
+        lightbulb::login::save(dir, &json!({ "proof": token })).unwrap();
+        assert_eq!(lightbulb::login::ended(dir, now), ended);
+    }
+    let out = e.detached(&[common::EXE, "doctor"], "");
+    let text = format!("{}{}", common::out(&out), common::err(&out));
+    assert!(
+        text.contains("Lightbulb sign-in") && text.contains("lightbulb login"),
+        "{text}"
+    );
+}
