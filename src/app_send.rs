@@ -47,7 +47,8 @@ pub(crate) async fn op(id: u64, op: &str, body: &Value, d: &Arc<Daemon>) -> Resp
         "app.send" => {
             let mut req = body.clone();
             req["from"] = from.0.clone().into();
-            match ipc::send(id, &req, d) {
+            // On a computer the app is no local session of its person's (`ipc::send_as`).
+            match ipc::send_as(id, &req, d, d.cloud.is_none()) {
                 Ok((_, r)) => (r, true),
                 Err(e) => return e,
             }
