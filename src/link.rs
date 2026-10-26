@@ -102,10 +102,18 @@ pub async fn run(d: Arc<Daemon>) {
             tokio::time::sleep(Duration::from_secs(60)).await;
             continue;
         };
+        if login::ended(&d.dir, ipc::now() as i64) {
+            eprintln!("link: {}", login::SIGN_IN_AGAIN);
+            tokio::time::sleep(Duration::from_secs(300)).await;
+            continue;
+        }
         let started = Instant::now();
         let refused = match session(&d, url, proof).await {
             Ok(code) => {
                 eprintln!("link: closed ({code})");
+                if code == NOT_SIGNED_IN {
+                    eprintln!("link: {}", login::SIGN_IN_AGAIN);
+                }
                 code == NOT_SIGNED_IN
             }
             Err(e) => {

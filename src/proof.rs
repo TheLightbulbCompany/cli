@@ -59,6 +59,9 @@ pub struct Proof {
     pub exp: i64,
     pub sub: String,
     pub computer: String,
+    /// When the person confirmed in the browser; renewals carry it unchanged.
+    #[serde(default)]
+    pub auth_time: Option<i64>,
 }
 
 /// `token`'s claims when it is a proof from a known issuer key for `member_key`, in force at
