@@ -13,7 +13,7 @@ Works with OpenCode 1.x and 2.x.
 ## What setup wires
 
 - `~/.config/opencode/plugins/lightbulb.js`: a plugin that runs the hooks (OpenCode has no command hooks).
-- `~/.config/opencode/opencode.json`: the `lightbulb-network` tool server. A `.jsonc` file is edited only if it is plain JSON; otherwise setup prints the entry for you to paste.
+- `~/.config/opencode/opencode.json`: the `lightbulb` tool server. A `.jsonc` file is edited only if it is plain JSON; otherwise setup prints the entry for you to paste.
 
 ## What you may need to do
 

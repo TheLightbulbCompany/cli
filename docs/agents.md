@@ -14,8 +14,8 @@ it adds two things:
   after each tool call, when a turn stops, and at session end. The hook command is
   `'~/.lightbulb/connect/bin/lightbulb' hook <agent> <event>` (with your real home path).
   Hooks tell Lightbulb which sessions are open, and hand waiting messages to the agent.
-- **A tool server** (an MCP server) named `lightbulb-network`. Its command is
-  `~/.lightbulb/connect/bin/lightbulb mcp`. It gives the agent four tools:
+- **A tool server** (an MCP server) named `lightbulb`. Its command is
+  `~/.lightbulb/connect/bin/lightbulb mcp`. It always gives the agent four network tools. While this computer is signed in (`lightbulb login`), it also gives the workspace tools (`find_rooms`, `read_messages`, `find_tasks`, `read_task`, `update_task`, `use_browser`), and `send_message` can post to a room (`room_id`) or a person (`person_id`). The names, descriptions and schemas are `src/mcp/tools.json`; `lightbulb mcp --tools-json` prints it.
 
   | Tool | What it does |
   |---|---|
@@ -26,7 +26,7 @@ it adds two things:
 
 Before it changes a file for the first time, `setup` saves a copy beside it as
 `<file>.lightbulb-backup`. It never overwrites a backup. It does not touch other entries in
-those files. The tool server sits beside the Lightbulb desktop app's own `lightbulb` server and never touches it. Setup replaces only its own old `lightbulb` entry (one that runs this program) and any entry already called `lightbulb-network`.
+those files. Setup removes an older `lightbulb-network` entry that runs a `lightbulb` program, with its allow rules. It replaces an entry already called `lightbulb` only when it is ours, the Lightbulb desktop app's old `session-mcp` server, or the hosted Lightbulb MCP (`https://api.thelightbulb.company/mcp`). Any other `lightbulb` entry stays: that agent gets hooks only, and `doctor` says which entry is in the way.
 
 `lightbulb setup --verbose` lists every file it changed. `lightbulb setup --server-name <name>`
 uses another name for the tool server (letters, digits, `-` and `_`).
@@ -36,7 +36,7 @@ uses another name for the tool server (letters, digits, `-` and `_`).
 | File | What setup adds |
 |---|---|
 | `~/.claude/settings.json` | Hooks for `SessionStart`, `UserPromptSubmit`, `PostToolUse`, `Stop` (timeout 5 s) and `SessionEnd` (timeout 1 s). |
-| `~/.claude.json` | `mcpServers.lightbulb-network`: `{"command": "<path>", "args": ["mcp"]}`. |
+| `~/.claude.json` | `mcpServers.lightbulb`: `{"command": "<path>", "args": ["mcp"]}`. |
 
 If `disableAllHooks` is set in `settings.json`, setup says so: the hooks will not run until you
 turn that off.
@@ -46,7 +46,7 @@ turn that off.
 | File | What setup adds |
 |---|---|
 | `~/.codex/hooks.json` | Hooks for the same five events (timeout 5 s; `SessionEnd` 1 s). |
-| `~/.codex/config.toml` | `[mcp_servers.lightbulb-network]` with `command` and `args`, and one `[hooks.state."…"]` table per hook with its `trusted_hash`. |
+| `~/.codex/config.toml` | `[mcp_servers.lightbulb]` with `command` and `args`, and one `[hooks.state."…"]` table per hook with its `trusted_hash`. |
 
 Codex silently skips a hook you have not trusted. So setup writes the trust for its own hooks,
 and prints `Its hook prompt was answered for you.` If one of our hooks shares a group with
@@ -58,8 +58,8 @@ trust it (in Codex, `/hooks`).
 | File | What setup adds |
 |---|---|
 | `~/.cursor/hooks.json` | Hooks for `sessionStart`, `beforeSubmitPrompt`, `postToolUse` (matcher `*`), `stop` and `sessionEnd` (timeout 10 s). |
-| `~/.cursor/mcp.json` | `mcpServers.lightbulb-network`: `{"type": "stdio", "command": "<path>", "args": ["mcp"]}`. |
-| `~/.cursor/cli-config.json` | `Mcp(lightbulb-network:*)` in `permissions.allow`. Created if missing (`{"version": 1, ...}`). Syntax: cursor.com/docs/cli/reference/permissions. |
+| `~/.cursor/mcp.json` | `mcpServers.lightbulb`: `{"type": "stdio", "command": "<path>", "args": ["mcp"]}`. |
+| `~/.cursor/cli-config.json` | `Mcp(lightbulb:*)` in `permissions.allow`. Created if missing (`{"version": 1, ...}`). Syntax: cursor.com/docs/cli/reference/permissions. |
 
 Cursor also runs Claude Code's hooks. Lightbulb ignores a Claude Code hook that Cursor runs, so
 one Cursor conversation is one session, not two.
@@ -69,7 +69,7 @@ one Cursor conversation is one session, not two.
 | File | What setup adds |
 |---|---|
 | `~/.grok/hooks/lightbulb.json` | A file of our own with the five hooks (timeout 10 s; `SessionEnd` 3 s; `PostToolUse` matcher `*`). It is never backed up, because it is only ours. |
-| `~/.grok/config.toml` | `[mcp_servers.lightbulb-network]` with `command`, `args` and `enabled = true`, and `MCPTool(lightbulb-network__*)` in `permission.allow`. |
+| `~/.grok/config.toml` | `[mcp_servers.lightbulb]` with `command`, `args` and `enabled = true`, and `MCPTool(lightbulb__*)` in `permission.allow`. |
 
 Grok runs hooks only in folders you trust: run `/hooks-trust` in Grok or start it with `--trust` (saved in `~/.grok/trusted_folders.toml`). Lightbulb never trusts a folder for you; setup and `doctor` remind you. Source: docs.x.ai/build/features/hooks.
 
@@ -86,7 +86,7 @@ OpenCode again; until then OpenCode sessions do not appear and the tools answer 
 | File | What setup adds |
 |---|---|
 | `~/.config/opencode/plugins/lightbulb.js` | A plugin of our own, for OpenCode 1.x and 2.x (one file loads on both). It runs `lightbulb hook opencode <event>` when a session starts, after each tool call, when a turn ends (the session goes idle) and when a session is deleted, with a 10 s limit, and ignores every failure. It skips subagent (child) sessions. A message never moves a session from `plan` to `build` or changes its model: on OpenCode 2.x a message runs as the session's own agent and model; on 1.x the plugin hands a message over only with that session's own agent and model, and until it has seen them (a session resumed before the plugin loaded, until you next type to it) the message waits for `check_inbox`. A message counts as delivered only once OpenCode has taken it in (the plugin then runs `lightbulb hook opencode ack`); one that did not go in is offered again at the next step, so after a crash a message can arrive twice, but none is lost. It is never backed up, because it is only ours. |
-| `~/.config/opencode/opencode.json` | `mcp.lightbulb-network`: `{"type": "local", "command": ["<path>", "mcp"], "enabled": true}`. |
+| `~/.config/opencode/opencode.json` | `mcp.lightbulb`: `{"type": "local", "command": ["<path>", "mcp"], "enabled": true}`. |
 
 If you have `~/.config/opencode/opencode.jsonc` instead, setup edits that file, but only while
 it is plain JSON. A `.jsonc` with comments or trailing commas is left as it is: setup prints the
@@ -105,7 +105,7 @@ unaffected.
 ### After setup
 
 Restart any agent session that was already open. An open session does not load the new tool
-server (its tools show as `mcp__lightbulb-network__…`). Then check with `lightbulb doctor`: each installed agent should read `connected`.
+server (its tools show as `mcp__lightbulb__…`). Then check with `lightbulb doctor`: each installed agent should read `connected`.
 
 ## How a message reaches a session
 

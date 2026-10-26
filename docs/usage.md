@@ -25,8 +25,8 @@ other people can see. For a first run, see the quick start in the [README](../RE
   prompt, tool use, stop, session end; for OpenCode a plugin that runs them) and one tool server,
   in each agent's own config files (`~/.claude/settings.json`, `~/.claude.json`, `~/.codex/`,
   `~/.cursor/`, `~/.grok/`, `~/.config/opencode/`). Each file
-  is backed up once as `<file>.lightbulb-backup`. The tool server is named `lightbulb-network`. It sits beside the
-  Lightbulb desktop app's own `lightbulb` server; `setup` replaces only its own old entry. Run `setup --verbose` to
+  is backed up once as `<file>.lightbulb-backup`. The tool server is named `lightbulb`; `setup` replaces an
+  existing `lightbulb` entry only when it is ours, the desktop app's or the hosted MCP's. Run `setup --verbose` to
   list the files it changed.
 
 It does not change your projects, your repositories or any other entry in those config files.

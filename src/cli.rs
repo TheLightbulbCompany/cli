@@ -1611,7 +1611,8 @@ pub fn doctor() -> Result<i32> {
             ..Default::default()
         };
         let ok = matches!(r.state, setup::State::NotInstalled) || r.connected();
-        row(&r.product(), ok, r.short(), r.short(), &setup);
+        let short = r.short();
+        row(&r.product(), ok, &short, &short, &setup);
     }
     let named = match short_link(&home) {
         Link::Ours => Ok("\"lightbulb\""),

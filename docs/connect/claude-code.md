@@ -11,7 +11,7 @@ If setup prints an `export PATH=...` line, add it to `~/.zshrc` and open a new t
 ## What setup wires
 
 - `~/.claude/settings.json`: hooks for session start, prompt, tool call, stop and session end.
-- `~/.claude.json`: the `lightbulb-network` tool server.
+- `~/.claude.json`: the `lightbulb` tool server.
 - `~/.claude/skills/lightbulb-network/SKILL.md`: a skill that teaches the tools.
 
 Each file is backed up once as `<file>.lightbulb-backup`.

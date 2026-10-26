@@ -11,12 +11,12 @@ If setup prints an `export PATH=...` line, add it to `~/.zshrc` and open a new t
 ## What setup wires
 
 - `~/.cursor/hooks.json`: hooks for the five events.
-- `~/.cursor/mcp.json`: the `lightbulb-network` tool server.
-- `~/.cursor/cli-config.json`: the allow rule `Mcp(lightbulb-network:*)`, only if Cursor already made this file.
+- `~/.cursor/mcp.json`: the `lightbulb` tool server.
+- `~/.cursor/cli-config.json`: the allow rule `Mcp(lightbulb:*)`, only if Cursor already made this file.
 
 ## What you may need to do
 
-Restart Cursor. If Cursor asks to approve a `lightbulb-network` tool call, approve it.
+Restart Cursor. If Cursor asks to approve a `lightbulb` tool call, approve it.
 <!-- TODO: not confirmed from code: whether the Cursor app (not the CLI) prompts for each tool; setup only writes the rule to cli-config.json. -->
 
 ## Try it

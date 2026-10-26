@@ -599,7 +599,7 @@ fn setup_installs_the_canonical_binary_and_wires_everything_to_it() {
     let canon_s = canon.to_str().unwrap();
     let mcp: Value =
         serde_json::from_str(&std::fs::read_to_string(h.join(".claude.json")).unwrap()).unwrap();
-    assert_eq!(mcp["mcpServers"]["lightbulb-network"]["command"], canon_s);
+    assert_eq!(mcp["mcpServers"]["lightbulb"]["command"], canon_s);
     let hooks = std::fs::read_to_string(h.join(".claude/settings.json")).unwrap();
     assert!(
         hooks.contains(&format!("'{canon_s}' hook claude ")),
@@ -636,11 +636,12 @@ fn setup_remove_also_stops_the_daemon_and_removes_the_job() {
 }
 
 #[test]
-fn setup_replaces_any_lightbulb_tool_server() {
+fn setup_replaces_the_apps_lightbulb_tool_server() {
     let e = Env::new();
     let h = e.home.path();
     std::fs::create_dir(h.join(".claude")).unwrap();
-    let other = json!({"mcpServers": {"lightbulb-network": {"command": "/opt/other/bin/lightbulb", "args": ["serve"], "env": {"A": "1"}}}});
+    let app = "/Applications/Lightbulb.app/Contents/MacOS/lightbulb-desktop";
+    let other = json!({"mcpServers": {"lightbulb": {"command": app, "args": ["session-mcp"], "env": {"A": "1"}}}});
     std::fs::write(h.join(".claude.json"), other.to_string()).unwrap();
     let o = e.run(&["setup"]);
     assert!(o.status.success(), "{}{}", out(&o), err(&o));
@@ -659,7 +660,7 @@ fn setup_replaces_any_lightbulb_tool_server() {
     let canon = h.join(".lightbulb/connect/bin/lightbulb");
     assert_eq!(
         mcp["mcpServers"],
-        json!({"lightbulb-network": {"command": canon, "args": ["mcp"]}})
+        json!({"lightbulb": {"command": canon, "args": ["mcp"]}})
     );
 
     // A file setup cannot read is a failure, with no name to change.
