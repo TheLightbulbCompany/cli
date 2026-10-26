@@ -38,6 +38,8 @@ Team:
   folder    Show or hide the sessions in a folder from your teammates: folder <path> on|off
   relay     The relays used when no direct path exists; relay <url> sets yours
 
+With the Lightbulb app on this Mac: claude, codex, continue '<link>' and share on|off
+
 Run lightbulb <command> --help for its options; lightbulb --version for the version.
 ";
 
@@ -325,6 +327,9 @@ fn run() -> lightbulb::Result<()> {
         Command::Folder { path, state } => exit(cli::folder(&path, state == "on")?),
         Command::Relay { url, clear, local } => {
             exit(cli::relay(clear.then(String::new).or(url), local)?)
+        }
+        Command::External(args) if cli::APP_WORDS.iter().any(|w| args[0] == *w) => {
+            exit(cli::app_command(&args)?)
         }
         Command::External(args) => {
             let verb = args
