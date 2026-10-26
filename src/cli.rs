@@ -1224,8 +1224,39 @@ fn verify_signature(bin: &Path) -> Result<()> {
     }
 }
 
-/// Downloads release `tag` from `base`, checks its tarball against the release's `.sha256`, and
-/// only then makes it the canonical binary (`install_alias`). `Ok(false)`: the checksum did not
+/// The release-signing public key (Ed25519, 32 bytes). Its private half lives only on the
+/// signing Mac, which signs every Linux asset's `.sha256` (`docs/releasing.md`); a Linux or WSL
+/// update installs nothing else.
+const RELEASE_KEY: [u8; 32] = [
+    0x5f, 0x56, 0xf6, 0x7c, 0xef, 0x03, 0x59, 0x00, 0xbf, 0xae, 0x7b, 0xca, 0x33, 0xe1, 0xee, 0x56,
+    0x12, 0xda, 0xb8, 0x2f, 0xb8, 0xd9, 0xae, 0x3e, 0x31, 0x76, 0x82, 0xd0, 0x9a, 0x6a, 0x78, 0xdf,
+];
+
+/// The key a release's `.sha256.sig` must verify under, or `None` where none is checked: macOS
+/// pins the binary's codesign team instead. "(tests)" debug builds take a hex key from
+/// `LIGHTBULB_RELEASE_KEY`, on macOS too.
+fn release_key() -> Option<[u8; 32]> {
+    if let Some(k) = test_env("LIGHTBULB_RELEASE_KEY") {
+        return data_encoding::HEXLOWER
+            .decode(k.to_string_lossy().as_bytes())
+            .ok()?
+            .try_into()
+            .ok();
+    }
+    (!cfg!(target_os = "macos")).then_some(RELEASE_KEY)
+}
+
+/// Whether `sig` (64 raw bytes, as `openssl pkeyutl -sign -rawin` writes it) is `key`'s
+/// Ed25519 signature over `sum`, the `.sha256` file's exact bytes.
+fn signed_by(key: &[u8; 32], sum: &[u8], sig: &[u8]) -> bool {
+    let key = ed25519_dalek::VerifyingKey::from_bytes(key);
+    let sig = ed25519_dalek::Signature::from_slice(sig);
+    matches!((key, sig), (Ok(k), Ok(s)) if k.verify_strict(sum, &s).is_ok())
+}
+
+/// Downloads release `tag` from `base`, checks the release's `.sha256` against its signature
+/// (`release_key`), then the tarball against that `.sha256`, and only then makes it the
+/// canonical binary (`install_alias`). `Ok(false)`: the checksum did not
 /// match and nothing changed. Shared by `update` and the daemon's daily check.
 fn install_release(home: &Path, base: &str, tag: &str) -> Result<bool> {
     let canon = canonical(home);
@@ -1236,7 +1267,14 @@ fn install_release(home: &Path, base: &str, tag: &str) -> Result<bool> {
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir)?;
     let installed = (|| -> Result<bool> {
-        let sum = String::from_utf8_lossy(&curl(&format!("{base}/{ASSET}.sha256"), false)?)
+        let sum = curl(&format!("{base}/{ASSET}.sha256"), false)?;
+        if let Some(key) = release_key() {
+            let sig = curl(&format!("{base}/{ASSET}.sha256.sig"), false)?;
+            if !signed_by(&key, &sum, &sig) {
+                return Err("The release is not signed by Lightbulb; nothing changed.".into());
+            }
+        }
+        let sum = String::from_utf8_lossy(&sum)
             .split_whitespace()
             .next()
             .unwrap_or("")
@@ -1717,6 +1755,11 @@ pub fn doctor() -> Result<i32> {
         ),
         None => row("Background service", up, "running", "not running", fix),
     }
+    // The daemon refuses to start without its key (`identity::keychain_error`): say why.
+    if crate::identity::exists(&dir).is_err() {
+        let fix = "Unlock your login keychain (open Keychain Access), then run: lightbulb setup";
+        row("Keychain", false, "", "cannot be read", fix);
+    }
     if let Some(l) = up.then(|| call("relay.get")).flatten() {
         let first = l["urls"][0].as_str().map(cell).unwrap_or_default();
         let state = match l["source"].as_str().unwrap_or("none") {
@@ -1898,6 +1941,27 @@ pub fn setup(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_checksum_verifies_only_under_its_signing_key() {
+        use ed25519_dalek::{Signer, SigningKey};
+        let k = SigningKey::from_bytes(&[7; 32]);
+        let sum = b"ab12  lightbulb-linux-x86_64.tar.gz\n";
+        let sig = k.sign(sum).to_bytes();
+        assert!(super::signed_by(k.verifying_key().as_bytes(), sum, &sig));
+        assert!(!super::signed_by(
+            k.verifying_key().as_bytes(),
+            b"other",
+            &sig
+        ));
+        assert!(!super::signed_by(
+            k.verifying_key().as_bytes(),
+            sum,
+            &sig[..63]
+        ));
+        // Not the release key's signature.
+        assert!(!super::signed_by(&super::RELEASE_KEY, sum, &sig));
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn the_signature_requirement_is_pinned_to_our_team() {

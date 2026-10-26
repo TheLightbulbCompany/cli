@@ -131,7 +131,7 @@ fn ok(path: &str, body: &Value) -> Result<Value> {
 /// This computer's identity, read only: one is made by `setup` (or the daemon's first start).
 fn identity() -> Result<Identity> {
     let dir = paths::state_dir();
-    if !dir.join("identity.key").exists() {
+    if !crate::identity::exists(&dir)? {
         return Err("This computer is not set up yet. Run lightbulb setup first.".into());
     }
     Identity::load_or_create(&dir)

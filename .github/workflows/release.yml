@@ -26,6 +26,10 @@ jobs:
 
   # Static musl builds, uploaded to the release the macOS job creates (`--clobber` makes a
   # rerun safe). Homebrew and npm stay macOS-only for now.
+  # A Linux or WSL `lightbulb update` also needs `<asset>.sha256.sig`, which no job here makes:
+  # the release key lives only on the signing Mac, whose `sign-cli-release.yml` (in the
+  # Lightbulb monorepo) signs and uploads them (docs/releasing.md). Until then a Linux update
+  # refuses the release.
   linux-arm64:
     needs: macos-arm64
     runs-on: ubuntu-24.04-arm

@@ -17,13 +17,30 @@
    - `bump-brew` rewrites `url`, `sha256` and the version in the test line (`lightbulb <x.y.z>`)
      of `Formula/lightbulb.rb` in `TheLightbulbCompany/homebrew-tap`, commits `lightbulb <x.y.z>`
      and pushes. Needs the `HOMEBREW_TAP_TOKEN` secret.
-4. The brew job passes with `HOMEBREW_TAP_TOKEN not set; skipping brew bump` in its log when its
+4. Sign the checksums (Linux and WSL `lightbulb update` installs nothing without them; macOS
+   checks the codesign team instead). This is automatic: the Lightbulb monorepo's
+   `sign-cli-release.yml` (run after every release on the self-hosted signing Mac) signs each
+   Linux asset's `.sha256` with the release key, checks each signature against the public key,
+   and uploads `<asset>.sha256.sig`. Each `.sig` is the raw 64-byte Ed25519 signature over the
+   `.sha256` file's exact bytes (`openssl pkeyutl -sign -rawin`). Until it has run, a Linux
+   update refuses the release.
+5. The brew job passes with `HOMEBREW_TAP_TOKEN not set; skipping brew bump` in its log when its
    secret is missing; the npm job fails if the trusted publisher is not configured. Then do it by hand:
    - npm: `cd npm && npm version <x.y.z> --no-git-tag-version --allow-same-version && npm publish --access public`
      (from a logged-in machine; no provenance outside CI).
    - brew: in a homebrew-tap clone, set `url` to the release's tarball URL, `sha256` to the
      first field of the release's `.sha256` asset and the test's version, then commit
      `lightbulb <x.y.z>` and push.
+
+## The release key
+
+The private key lives only on the signing Mac, at
+`~/Library/Application Support/lightbulb-release/release.key` (0600): never in this repository,
+in Actions secrets or anywhere else. Its public half is `RELEASE_KEY` in `src/cli.rs`. To rotate
+it, generate a new key there (`openssl genpkey -algorithm ed25519`), paste the 32 bytes that
+`openssl pkey -in release.key -pubout -outform DER | tail -c 32 | xxd -i` prints into
+`RELEASE_KEY` and into `sign-cli-release.yml`'s check, and release: installs on the old key
+take one last update signed by the old key first.
 
 Secrets live in this repo's Settings → Secrets and variables → Actions. The npm package
 downloads the binary from the release whose tag matches its own version, so publish npm only
