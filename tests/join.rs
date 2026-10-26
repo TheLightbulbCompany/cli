@@ -6,7 +6,7 @@ mod common;
 
 use common::{
     addr, computer, dialog, err, identity, invite, members, out, peers, person, seed_pair, until,
-    wait_s, Env, EXE,
+    Env, EXE,
 };
 use iroh::endpoint::{presets, Connection, RecvStream, SendStream};
 use iroh::{Endpoint, SecretKey};
@@ -62,14 +62,6 @@ fn refused(r: &Value, reason: &str) {
     );
 }
 
-fn requests(e: &Env) -> Vec<Value> {
-    let r = e.ask(json!({"id": 1, "op": "team.join_requests"}));
-    r["requests"]
-        .as_array()
-        .unwrap_or_else(|| panic!("{r}"))
-        .clone()
-}
-
 fn rows(e: &Env) -> Vec<String> {
     rusqlite::Connection::open(e.state.path().join("state.db"))
         .unwrap()
@@ -85,7 +77,7 @@ fn rows(e: &Env) -> Vec<String> {
 /// `request` to `env`'s daemon on the join ALPN.
 struct Played {
     _ep: Endpoint,
-    conn: Connection,
+    _conn: Connection,
     _send: SendStream,
     recv: RecvStream,
 }
@@ -102,7 +94,7 @@ impl Played {
         frames::write(&mut send, request).await.unwrap();
         Played {
             _ep: ep,
-            conn,
+            _conn: conn,
             _send: send,
             recv,
         }
@@ -123,73 +115,9 @@ impl Played {
 }
 
 #[test]
-fn ask_ticket_admits_only_after_allow() {
-    let (a, b, t) = pair("", "reusable");
-    // `$USER` is A's name too.
-    let o = b.detached(&[EXE, "join", &t], "");
-    assert!(!o.status.success());
-    let taken = "The name \"prasiddha\" is already used in this network. Run the same command again with: --name prasiddha-2\n";
-    assert_eq!(err(&o), taken);
-    // Refused at once: it never said it was asking anyone.
-    assert_eq!(out(&o), "");
-    std::thread::scope(|s| {
-        let joining = s.spawn(|| b.detached(&[EXE, "join", &t, "--name", "bob"], ""));
-        until(10, "J1 is listed", || requests(&a).len() == 1);
-        let r = &requests(&a)[0];
-        assert_eq!(r["id"], "J1");
-        // `held` lists it with the command that answers it.
-        let o = a.detached(&[EXE, "held"], "");
-        assert_eq!(
-            out(&o),
-            "J1  bob (mbp) wants to join — lightbulb approve J1\n",
-            "{}",
-            err(&o)
-        );
-        assert_eq!(r["candidate"], b.identity().key);
-        assert_eq!((&r["name"], &r["computer"]), (&json!("bob"), &json!("mbp")));
-        assert_eq!((members(&a).len(), members(&b).len()), (1, 1));
-        // Past the second after which the joiner says it is asking.
-        std::thread::sleep(Duration::from_millis(1_500));
-        let o = a.detached(&[EXE, "approve", "J1"], "");
-        assert!(o.status.success(), "{}", err(&o));
-        let o = joining.join().unwrap();
-        assert!(o.status.success(), "{}", err(&o));
-        assert_eq!(
-            out(&o),
-            "Asking whoever sent the link to allow this computer… (they get a prompt; this waits up to 10 minutes)\n\
-             Connected as bob (mbp). Team \"prasiddha\": 2 computers online.\n\
-             Your agents here can now see and message the team's agents. Try: lightbulb who --all\n\
-             Until verified names arrive, your other computer counts as another person and its first message needs your Allow.\n"
-        );
-    });
-    converged(&a, &b, 2);
-    let o = a.detached(&[EXE, "held"], "");
-    assert_eq!(out(&o), "No messages are waiting for your Allow.\n");
-    // A second answer finds nothing open.
-    let o = a.detached(&[EXE, "decline", "J1"], "");
-    assert!(!o.status.success());
-    assert_eq!(err(&o), "J1 was already answered at the command line.\n");
-    let log = std::fs::read_to_string(a.state.path().join("daemon.log")).unwrap();
-    assert!(log.contains("join: J1 answered from the cli"), "{log}");
-    let o = a.detached(&[EXE, "approve", "J9"], "");
-    assert!(!o.status.success());
-    assert_eq!(err(&o), "No join request J9.\n");
-}
-
-#[test]
-fn decline_refuses_and_writes_nothing() {
-    let (a, b, t) = pair("Decline", "reusable");
-    let heads = a.heads();
-    refused(&join(&b, &t, "bob"), "declined");
-    assert_eq!(a.heads(), heads);
-    assert_eq!((members(&a).len(), members(&b).len()), (1, 1));
-    assert!(requests(&a).is_empty());
-}
-
-#[test]
-fn open_ticket_admits_without_prompt() {
+fn an_invite_admits_without_a_prompt() {
     // A prompt would decline.
-    let (a, b, line) = pair("Decline", "open");
+    let (a, b, line) = pair("Decline", "reusable");
     let r = join(&b, &line, "bob");
     assert_eq!(r["state"], "admitted", "{r}");
     assert_eq!(r["team"], "prasiddha");
@@ -197,10 +125,10 @@ fn open_ticket_admits_without_prompt() {
 }
 
 #[test]
-fn forged_open_mode_is_refused() {
+fn forged_mode_is_refused() {
     let (a, b, t) = pair("Allow", "reusable");
     let mut t = ticket::decode(&t).unwrap();
-    t.mode = "open".into();
+    t.mode = "ask".into();
     refused(&join(&b, &ticket::encode(&t), "bob"), "bad_ticket");
     assert_eq!((members(&a).len(), members(&b).len()), (1, 1));
 }
@@ -296,55 +224,7 @@ async fn candidate_field_must_be_the_peer_key() {
     let mut p = Played::send(&a, &me, &req).await;
     let got = p.recv().await;
     assert!(got.is_err(), "answered: {got:?}");
-    assert!(requests(&a).is_empty());
     assert_eq!(members(&a).len(), 1);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn sixth_open_request_for_one_inviter_is_refused() {
-    let a = Env::new();
-    a.daemon(false, "", &[dialog("")]);
-    let t = ticket::decode(&invite(&a, "reusable")).unwrap();
-    let mut held = vec![];
-    for i in 0..5 {
-        held.push(Played::ask(&a, &t, &format!("c{i}")).await);
-    }
-    until(10, "five listed", || requests(&a).len() == 5);
-    let mut sixth = Played::ask(&a, &t, "c5").await;
-    match sixth.recv().await.unwrap() {
-        Frame::JoinDecision {
-            verdict, reason, ..
-        } => assert_eq!(
-            (verdict.as_str(), reason.as_deref()),
-            ("refused", Some("too_many_requests"))
-        ),
-        f => panic!("{f:?}"),
-    }
-    assert_eq!(requests(&a).len(), 5);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn abandoned_requests_expire_and_free_the_limit() {
-    let a = Env::new();
-    // The 600 s wait, shortened.
-    a.daemon(false, "", &[dialog(""), wait_s(3)]);
-    let t = ticket::decode(&invite(&a, "reusable")).unwrap();
-    let mut held = vec![];
-    for i in 0..5 {
-        held.push(Played::ask(&a, &t, &format!("c{i}")).await);
-    }
-    until(10, "five listed", || requests(&a).len() == 5);
-    // Two candidates hang up; the other three stop being waited for after the window.
-    for p in &held[..2] {
-        p.conn.close(0u32.into(), b"");
-    }
-    until(2, "two expired on close", || requests(&a).len() == 3);
-    until(10, "the rest expired", || requests(&a).is_empty());
-    assert_eq!(rows(&a), ["expired"; 5]);
-    let _sixth = Played::ask(&a, &t, "c5").await;
-    until(5, "a sixth is accepted", || {
-        requests(&a).first().is_some_and(|r| r["id"] == "J6")
-    });
 }
 
 #[test]
@@ -452,21 +332,6 @@ async fn candidate_with_a_bad_signature_is_dropped() {
 }
 
 #[test]
-fn unanswered_request_is_waiting_and_asks_no_one_else() {
-    let (f, x, c) = (Env::new(), Env::new(), Env::new());
-    seed_pair(&f, &x);
-    x.daemon(false, "", &[dialog(""), wait_s(2)]);
-    f.daemon(false, "", &[peers(&[&x]), dialog(""), wait_s(2)]);
-    let t = invite(&x, "reusable");
-    c.daemon(false, "", &[peers(&[&x, &f]), wait_s(2)]);
-    let r = join(&c, &t, "carol");
-    assert_eq!(r["state"], "waiting", "{r}");
-    assert_eq!(rows(&x), ["expired"]);
-    assert!(rows(&f).is_empty(), "the second member was asked");
-    assert_eq!(members(&c).len(), 1);
-}
-
-#[test]
 fn admitted_candidate_that_lost_the_roster_rejoins() {
     let (a, b, t) = pair("Allow", "reusable");
     assert_eq!(join(&b, &t, "bob")["state"], "admitted");
@@ -519,35 +384,6 @@ fn bad_ticket_at_the_first_member_tries_the_next() {
     assert_eq!(r["team"], "acme");
     assert!(rows(&f).is_empty(), "F refused before storing a request");
     assert_eq!(rows(&x), ["admitted"]);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_agent_may_approve_a_join_and_the_answer_names_it() {
-    // A's daemon takes this test process for an agent.
-    let a = Env::new();
-    let me = std::process::id();
-    let birth = lightbulb::os::process(me).unwrap().birth_micros;
-    let pin = ("LIGHTBULB_CONNECT_HOOK_CALLER", format!("{me}:{birth}"));
-    a.daemon(false, "", &[dialog(""), pin]);
-    let t = ticket::decode(&invite(&a, "reusable")).unwrap();
-    let cand = identity();
-    let req = admission::request(&cand, &t, "carol", "mbp");
-    let _p = Played::send(&a, &cand, &req).await;
-    until(10, "J1 is listed", || requests(&a).len() == 1);
-    a.ask(
-        json!({"id": 1, "op": "register", "session": {"provider": "claude",
-        "conversation": "c1", "pid": me, "birth_micros": birth, "cwd": "/tmp"}}),
-    );
-    let r = a.ask(json!({"id": 1, "op": "team.admit", "request": "J1", "verdict": "allow"}));
-    assert_eq!(r["state"], "admitted", "{r}");
-    assert_eq!(r["by"], format!("{}/claude-1", a.short()), "{r}");
-    assert_eq!(members(&a).len(), 2);
-    // The signed `admit` carries the approver.
-    let entries = roster::entries(&a.store()).unwrap();
-    assert!(
-        entries.iter().any(|e| e.body["by"] == r["by"]),
-        "{entries:?}"
-    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -632,35 +468,6 @@ fn a_forged_ticket_leaves_no_address_behind() {
     assert!(!kept.contains("192.0.2.7"), "{kept}");
 }
 
-/// A roster change while an `ask` join waits prunes the ticket's addresses (the inviter is no
-/// member yet); the admission keeps them again, so with no relay and no mDNS the two still
-/// connect.
-#[test]
-fn the_inviters_addresses_survive_a_waiting_join() {
-    let (a, b) = (Env::new(), Env::new());
-    a.daemon(false, &computer("mac"), &[dialog("")]);
-    let t = invite(&a, "reusable");
-    let inviter = a.identity().key;
-    b.daemon(false, &computer("mbp"), &[]);
-    let file = b.state.path().join("addrs.json");
-    std::thread::scope(|s| {
-        let joining = s.spawn(|| join(&b, &t, "bob"));
-        until(10, "J1 is listed", || requests(&a).len() == 1);
-        // A roster change on B while it waits: a link of its own.
-        invite(&b, "reusable");
-        let kept = std::fs::read_to_string(&file).unwrap_or_default();
-        assert!(!kept.contains(&inviter), "not pruned: {kept}");
-        let o = a.detached(&[EXE, "approve", "J1"], "");
-        assert!(o.status.success(), "{}", err(&o));
-        assert_eq!(joining.join().unwrap()["state"], "admitted");
-    });
-    let kept = std::fs::read_to_string(&file).unwrap();
-    assert!(kept.contains(&inviter), "{kept}");
-    until(15, "both online", || {
-        a.status()["peers"]["online"] == 1 && b.status()["peers"]["online"] == 1
-    });
-}
-
 /// An open link asks no one: `join` never says it is asking.
 #[test]
 fn an_open_link_join_never_says_asking() {
@@ -707,6 +514,24 @@ fn invite_new_ends_every_earlier_invite_open_ones_too() {
     assert_eq!(join(&c, &new, "carol")["state"], "admitted");
 }
 
+#[test]
+fn joining_says_nothing_of_asking_and_the_commands_know_no_join_requests() {
+    let (a, b, t) = pair("", "reusable");
+    let o = b.detached(&[EXE, "join", &t, "--name", "bob"], "");
+    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(
+        out(&o),
+        "Connected as bob (mbp). Team \"prasiddha\": 2 computers online.\n\
+         Your agents here can now see and message the team's agents. Try: lightbulb who --all\n"
+    );
+    converged(&a, &b, 2);
+    let o = a.detached(&[EXE, "held"], "");
+    assert_eq!(out(&o), "Nothing is waiting for your answer.\n");
+    let o = a.detached(&[EXE, "approve", "J1"], "");
+    assert!(!o.status.success());
+    assert_eq!(err(&o), "No prompt J1.\n");
+}
+
 /// A fake `osascript` in `dir` that logs every dialog's argv to `log` and answers `Remove` to the
 /// notice that has `marker` in its text; any other dialog waits to be withdrawn.
 fn notice_osascript(dir: &std::path::Path, marker: &str) -> (&'static str, String) {
@@ -721,77 +546,48 @@ fn notice_osascript(dir: &std::path::Path, marker: &str) -> (&'static str, Strin
     ("LIGHTBULB_CONNECT_DEBUG_OSASCRIPT", p.display().to_string())
 }
 
-/// A pinned (agent) daemon A with the notice fake, a candidate asking to join, and A's
-/// session registered so `team.admit` names it.
-async fn agent_admit(dir: &std::path::Path, as_agent: bool) -> (Env, String) {
+/// A pinned (agent) daemon A, with the notice fake; whoever calls `team.invite` from this
+/// process is an agent. A's session is registered so the notice names it.
+fn agent_daemon(dir: &std::path::Path) -> Env {
     let a = Env::new();
     let me = std::process::id();
     let birth = lightbulb::os::process(me).unwrap().birth_micros;
     let pin = ("LIGHTBULB_CONNECT_HOOK_CALLER", format!("{me}:{birth}"));
-    a.daemon(
-        false,
-        "",
-        &[dialog(""), pin, notice_osascript(dir, "into your network")],
+    a.daemon(false, "", &[pin, notice_osascript(dir, "invited carol")]);
+    a.ask(
+        json!({"id": 1, "op": "register", "session": {"provider": "claude",
+        "conversation": "c1", "pid": me, "birth_micros": birth, "cwd": "/tmp"}}),
     );
-    let t = ticket::decode(&invite(&a, "reusable")).unwrap();
+    a
+}
+
+async fn carol_joins(a: &Env, ticket: &str) {
+    let t = ticket::decode(ticket).unwrap();
     let cand = identity();
-    let _p = Played::send(&a, &cand, &admission::request(&cand, &t, "carol", "mbp")).await;
-    until(10, "J1 is listed", || requests(&a).len() == 1);
-    let ans = json!({"id": 1, "op": "team.admit", "request": "J1", "verdict": "allow"});
-    let r = if as_agent {
-        a.ask(
-            json!({"id": 1, "op": "register", "session": {"provider": "claude",
-            "conversation": "c1", "pid": me, "birth_micros": birth, "cwd": "/tmp"}}),
-        );
-        a.ask(ans)
-    } else {
-        person(&a, ans)
-    };
-    assert_eq!(r["state"], "admitted", "{r}");
-    (a, cand.key)
+    let _p = Played::send(a, &cand, &admission::request(&cand, &t, "carol", "mbp")).await;
+    until(10, "carol is in with no Allow", || members(a).len() == 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_agent_admit_raises_a_notice_and_remove_removes() {
+async fn an_agents_invite_is_one_time_and_its_use_raises_a_notice_and_remove_removes() {
     let dir = tempfile::tempdir().unwrap();
-    let (a, _) = agent_admit(dir.path(), true).await;
+    let a = agent_daemon(dir.path());
+    let r = a.ask(json!({"id": 1, "op": "team.invite", "mode": "reusable"}));
+    assert_eq!(r["mode"], "once", "{r}");
+    carol_joins(&a, r["ticket"].as_str().unwrap()).await;
     until(30, "carol is removed again", || members(&a).len() == 1);
     let log = std::fs::read_to_string(dir.path().join("log")).unwrap();
-    assert!(log.contains("let carol into your network."), "{log}");
+    assert!(log.contains("invited carol into your network."), "{log}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_person_admit_raises_no_notice() {
+async fn a_persons_invite_raises_no_notice() {
     let dir = tempfile::tempdir().unwrap();
-    let (a, cand) = agent_admit(dir.path(), false).await;
+    let a = agent_daemon(dir.path());
+    let t = invite(&a, "reusable");
+    carol_joins(&a, &t).await;
     tokio::time::sleep(Duration::from_millis(800)).await;
-    // Allowing the join also allows the joiner's messages to this computer's sessions.
-    let pol = a.ask(json!({"id": 1, "op": "policy.get"}));
-    assert_eq!(pol["people"][&cand], "accept", "{pol}");
     let log = std::fs::read_to_string(dir.path().join("log")).unwrap_or_default();
-    assert!(!log.contains("into your network"), "{log}");
-    assert_eq!(members(&a).len(), 2);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn invite_agents_by_a_person_joins_with_no_allow_and_an_agents_does_not() {
-    let a = Env::new();
-    // No dialog answers: only the auto path can admit.
-    a.daemon(false, "", &[dialog("")]);
-    let r = person(
-        &a,
-        json!({"id": 1, "op": "team.invite", "mode": "once", "agents": true}),
-    );
-    let t = ticket::decode(r["ticket"].as_str().unwrap()).unwrap();
-    let cand = identity();
-    let _p = Played::send(&a, &cand, &admission::request(&cand, &t, "carol", "mbp")).await;
-    until(10, "carol is in with no Allow", || members(&a).len() == 2);
-    let pol = a.ask(json!({"id": 1, "op": "policy.get"}));
-    assert_eq!(pol["people"][&cand.key], "accept", "{pol}");
-    // The same flag on an ordinary once link waits for an Allow.
-    let t = ticket::decode(&invite(&a, "once")).unwrap();
-    let dan = identity();
-    let _q = Played::send(&a, &dan, &admission::request(&dan, &t, "dan", "mbp")).await;
-    until(10, "dan waits", || requests(&a).len() == 1);
+    assert!(!log.contains("invited"), "{log}");
     assert_eq!(members(&a).len(), 2);
 }

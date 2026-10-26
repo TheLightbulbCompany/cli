@@ -286,15 +286,14 @@ pub fn refresh(dir: &std::path::Path) -> Result<bool> {
 }
 
 /// `invite --agents`: a workspace admin adds their workspace's agents to this network. A once
-/// link minted here goes to the workspace, which joins with it; this computer then asks the
-/// usual Allow.
+/// link minted here goes to the workspace, which joins with it (the invite is the approval).
 pub fn invite_agents(ticket: &str) -> Result<i32> {
     let r = device("agents", Some(ticket))?;
     let ws = r["workspaceName"]
         .as_str()
         .filter(|n| !n.is_empty() && n.chars().all(crate::label::printable))
         .unwrap_or("the workspace");
-    println!("Confirmed. {ws} is joining: allow it when this computer asks.");
+    println!("Confirmed. {ws} is joining this network.");
     Ok(0)
 }
 

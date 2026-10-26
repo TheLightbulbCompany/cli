@@ -104,16 +104,6 @@ fn send_takes_a_handle_and_a_member_name() {
 fn errors_are_sentences() {
     let e = Env::new();
     e.session();
-    let o = e.person(&["policy", "someone", "maybe"]);
-    assert_eq!(o.status.code(), Some(1));
-    assert_eq!(err(&o).trim(), "Policy takes accept, hold or refuse.");
-    let o = e.person(&["policy"]);
-    assert_eq!(
-        out(&o).lines().next(),
-        Some("No one has a policy yet: a teammate's first message waits for your Allow."),
-        "{}",
-        err(&o)
-    );
     let o = e.run(&["receipt", "NOPE"]);
     assert_eq!(o.status.code(), Some(1));
     assert_eq!(
@@ -943,51 +933,6 @@ fn install_ignores_a_stale_pid_of_a_live_process() {
         t.elapsed()
     );
     assert!(alive, "the unrelated process was left alone");
-}
-
-#[test]
-fn policy_refuses_your_own_person_and_forgets_an_old_row() {
-    let e = Env::new();
-    assert!(e.run(&["who"]).status.success());
-    let me = e.ask(json!({"id": 1, "op": "status"}))["member_key_short"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let o = e.person(&["policy", &me, "hold"]);
-    assert_eq!(o.status.code(), Some(1));
-    assert_eq!(
-        err(&o).trim(),
-        "That is you; your own computers always get through."
-    );
-    // A row an older build stored for my own person is shown as ignored.
-    let store = lightbulb::store::Store::open(&e.state.path().join("state.db")).unwrap();
-    let mine = e.ask(json!({"id": 1, "op": "team.get"}))["members"][0]["person_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    lightbulb::policy::set_person(&store, &mine, lightbulb::policy::Verdict::Hold, "local", 1)
-        .unwrap();
-    let o = e.person(&["policy"]);
-    assert!(
-        out(&o).contains(
-            ": held for your Allow. (ignored: your own computers always get through — run: "
-        ) && out(&o).contains(&format!(" policy {mine} forget)")),
-        "{}",
-        out(&o)
-    );
-    // A row an older build stored under a literal name is marked, and forgotten on request.
-    lightbulb::policy::set_person(&store, "aden", lightbulb::policy::Verdict::Hold, "local", 1)
-        .unwrap();
-    let o = e.person(&["policy"]);
-    assert!(
-        out(&o).contains("Messages from aden: held for your Allow. (old entry — run: ")
-            && out(&o).contains(" policy aden forget)"),
-        "{}",
-        out(&o)
-    );
-    let o = e.person(&["policy", "aden", "forget"]);
-    assert!(o.status.success(), "{}", err(&o));
-    assert!(!out(&o).contains("aden"), "{}", out(&o));
 }
 
 /// `daemon --install` over a loaded job boots it out BEFORE it stops the daemon: with the job

@@ -1,7 +1,6 @@
 //! Messages, the mailbox, receipts and the loop limit. Time is passed in (`now`, unix seconds).
 
 use crate::net::frames::Frame;
-use crate::policy::{self, Verdict};
 use crate::roster::{Member, Roster};
 use crate::sessions::{self, Key};
 use crate::store::{Message, Store, MSG_RECEIPT};
@@ -32,9 +31,7 @@ pub struct Answer {
     pub reason: Option<String>,
     /// The loop limit a `loop` refusal hit (`HOPS`, `RATE`).
     pub limit: Option<String>,
-    /// The hold it opened.
-    pub held: Option<crate::holds::Hold>,
-    /// Whether it is new mail (stored or held now), not a resend or a refusal.
+    /// Whether it is new mail (stored now), not a resend or a refusal.
     pub fresh: bool,
 }
 
@@ -44,7 +41,6 @@ impl Answer {
             state,
             reason: None,
             limit: None,
-            held: None,
             fresh: false,
         }
     }
@@ -196,9 +192,7 @@ fn receipt_text(r: &Value, person: Option<&ForPerson>) -> Option<String> {
                 };
                 format!("queued: {computer} {why}. Will retry until {}.", until())
             }
-            "stored" if remote => format!(
-                "stored on {computer}. It may be held for {person} to approve; you will see the receipt change."
-            ),
+            "stored" if remote => format!("stored on {computer}."),
             "held" if remote => format!("held: waiting for {person} to approve"),
             _ => return None,
         });
@@ -741,9 +735,8 @@ pub fn send(
 /// a `request_id` reused with another text or recipient is `request_id_reused`; `hops` at
 /// `MAX_HOPS` or more, or below one past a message of ours it answers (`hops_ok`), or the
 /// `LOOP_LIMIT`th send in `LOOP_WINDOW_S` from one member to `to`, is `loop`; then
-/// `policy::decide` (on an instance with `members`, accept): refused `policy`, or kept under a hold (`holds::hold`, `held`, in no mailbox), or stored for `to`
-/// with origin `net:<peer short>`, timed by its arrival (`now`). Held or stored, it is
-/// remembered in `seen_ids`. On a workspace member, `declared` are its sessions: new mail for
+/// stored for `to` with origin `net:<peer short>`, timed by its arrival (`now`), and
+/// remembered in `seen_ids`. (No one holds a member's message: membership is the gate.) On a workspace member, `declared` are its sessions: new mail for
 /// any other is `policy` (after the resend checks, so a resend gets the state it has). With
 /// `members` (the member keys the workspace answers: those whose sign-in proof names one of its
 /// people, `proof::admitted`), mail from a peer whose key
@@ -837,15 +830,10 @@ pub fn receive(
     if loop_refused(recent.iter().filter(|r| same_member(r)).count()) {
         return looped(RATE);
     }
-    // Not in my own roster (removed): nothing is mine to accept. Past an instance's members
-    // list, there is nothing to ask.
-    let verdict = match roster.by_short(me) {
-        Some(_) if members.is_some() => Verdict::Accept,
-        Some(mine) => policy::decide(store, &mine.key, peer)?,
-        None => Verdict::Hold,
-    };
-    if verdict == Verdict::Refuse {
-        return refused("policy");
+    // Not in my own roster (removed): nothing here is mine to accept. Every member of the
+    // network is trusted: membership is the gate.
+    if roster.by_short(me).is_none() {
+        return refused("not_member");
     }
     let p = Prepared {
         message_id: id.clone(),
@@ -860,18 +848,12 @@ pub fn receive(
         sent_at: now as i64,
     };
     let tx = store.conn().unchecked_transaction()?;
-    // Seen with what the sender is told, so a resend makes no second hold or copy.
-    let (state, held) = if verdict == Verdict::Hold {
-        let h = crate::holds::hold(store, &p, peer, now as i64)?;
-        (State::Held, Some(h))
-    } else {
-        record(store, &p, Origin::Net(&peer.short), false)?;
-        (State::Stored, None)
-    };
+    // Seen with what the sender is told, so a resend makes no second copy.
+    let state = State::Stored;
+    record(store, &p, Origin::Net(&peer.short), false)?;
     store.put_seen(&peer.key, id, state.name(), now as i64)?;
     tx.commit()?;
     Ok(Answer {
-        held,
         fresh: true,
         ..Answer::is(state)
     })
@@ -1684,15 +1666,9 @@ mod tests {
         (peer, roster, env)
     }
 
-    /// This computer allows `peer_mail`'s person.
-    fn allow_p(s: &Store) {
-        policy::set_person(s, "pkey", Verdict::Accept, "local", 0).unwrap();
-    }
-
     #[test]
     fn a_peers_mail_to_a_name_address_never_expires() {
         let (_d, s) = setup();
-        allow_p(&s);
         for (i, to) in ["m/terminal", "m/codex:c"].iter().enumerate() {
             let (peer, roster, env) = peer_mail(to, &format!("r{i}"));
             let got = receive(&s, &env, &peer, &roster, "m", None, None, 1000).unwrap();
@@ -1711,7 +1687,6 @@ mod tests {
     #[test]
     fn a_duplicate_envelope_is_reacked_with_its_reason_and_never_stored_twice() {
         let (_d, s) = setup();
-        allow_p(&s);
         let (peer, roster, env) = peer_mail("m/codex:c", "r1");
         let again = || {
             let r = receive(&s, &env, &peer, &roster, "m", None, None, 1001).unwrap();

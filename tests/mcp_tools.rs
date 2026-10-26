@@ -762,7 +762,7 @@ fn find_sessions_lists_teammates_with_person_and_computer() {
 #[test]
 fn send_message_to_teammate_says_where_it_waits() {
     let (a, b) = (common::Env::new(), common::Env::new());
-    // One team, but bob has not allowed prasiddha: her mail is held on his computer.
+    // One team: members trust each other, so the message is stored on bob's computer.
     common::seed_team(&a, &b);
     common::start_pair(&a, &b, &common::computer("mac"), &[]);
     register_on(&a, "claude", "c1", &me(), "/tmp");
@@ -775,45 +775,11 @@ fn send_message_to_teammate_says_where_it_waits() {
     );
     assert!(!out.error, "{}", out.text);
     let v = out.json();
-    assert_eq!(v["state"], "held", "{v}");
-    assert_eq!(v["note"], "held: waiting for bob to approve", "{v}");
-    let v = m
-        .tool("message_receipt", json!({"request_id": "r1"}))
-        .json();
-    assert_eq!(v["note"], "held: waiting for bob to approve", "{v}");
-
-    // Bob allows it: held, then stored on his computer, then delivered.
+    assert_eq!(v["state"], "stored", "{v}");
+    assert_eq!(v["note"], "stored on mbp.", "{v}");
     let from = format!("{}/claude:c1", a.short());
-    let holds = common::person(&b, json!({"id": 1, "op": "holds"}));
-    let hold = holds["holds"][0]["id"].clone();
-    let r = common::person(
-        &b,
-        json!({"id": 1, "op": "hold.answer", "hold": hold, "verdict": "allow"}),
-    );
-    assert_eq!(r["ok"], true, "{r}");
-    common::until(10, "r1 stored", || a.state(&from, "r1") == "stored");
     b.take_one(&to);
     common::until(10, "r1 delivered", || a.state(&from, "r1") == "delivered");
-
-    // Bob allows prasiddha: the next message is stored on his computer.
-    let pa = a.identity().key;
-    let r = common::person(
-        &b,
-        json!({"id": 1, "op": "policy.set", "person_id": pa, "value": "accept"}),
-    );
-    assert_eq!(r["ok"], true, "{r}");
-    let v = m
-        .tool(
-            "send_message",
-            json!({"request_id": "r2", "text": "x", "session_id": to}),
-        )
-        .json();
-    assert_eq!(v["state"], "stored", "{v}");
-    assert_eq!(
-        v["note"],
-        "stored on mbp. It may be held for bob to approve; you will see the receipt change.",
-        "{v}"
-    );
 
     // Groups stay refused.
     let out = m.tool(
@@ -841,7 +807,7 @@ fn send_message_to_teammate_says_where_it_waits() {
     assert_eq!(v["online"], false, "{v}");
 
     // The 12-per-10-minutes limit, in words.
-    for i in 4..=12 {
+    for i in 4..=13 {
         let rid = format!("r{i}");
         let v = m
             .tool(
@@ -854,7 +820,7 @@ fn send_message_to_teammate_says_where_it_waits() {
     let v = m
         .tool(
             "send_message",
-            json!({"request_id": "r13", "text": "x", "session_id": to}),
+            json!({"request_id": "r14", "text": "x", "session_id": to}),
         )
         .json();
     assert_eq!(v["reason"], "loop", "{v}");
@@ -978,7 +944,7 @@ fn loop_refusals_name_their_limit_here_and_on_a_teammate() {
 
 #[test]
 fn check_inbox_defangs_a_teammate_name_and_verifies_this_computer() {
-    use lightbulb::{daemon::net_ops, policy, roster};
+    use lightbulb::{daemon::net_ops, roster};
     let (a, b) = (common::Env::new(), common::Env::new());
     let (ia, ib) = (a.identity(), b.identity());
     let g = net_ops::genesis(&ia, "prasiddha", "mac", "acme", 1);
@@ -994,8 +960,6 @@ fn check_inbox_defangs_a_teammate_name_and_verifies_this_computer() {
         roster::accept(&e.store(), &g, 10).unwrap();
         roster::accept(&e.store(), &admit, 10).unwrap();
     }
-    let accept = policy::Verdict::Accept;
-    policy::set_person(&a.store(), &ib.key, accept, "local", 1).unwrap();
     common::start_pair(&a, &b, "", &[]);
     let mine = register_on(&a, "claude", "c1", &me(), "/tmp");
     let sb = format!("{}/codex:b1", b.short());

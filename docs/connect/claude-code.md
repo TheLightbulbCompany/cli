@@ -33,7 +33,7 @@ Run `lightbulb doctor`. The Claude Code line should read `connected`.
 - `hooks only — tools missing (run setup)`: run `lightbulb setup`, then restart Claude Code.
 - `not connected`: run `lightbulb setup`. If it names a file it could not read, fix that file first.
 - `source_unidentified` from a tool: Lightbulb could not tell which session called it. Restart the session.
-- A message to someone new is **held** until they allow it. This is not a failure; do not resend.
-  The receiver runs `lightbulb held`, then `lightbulb approve H1`. Check with `lightbulb receipt <id>`.
+- Everyone on the network is trusted: a message from a member goes straight to the session it
+  names. Check it with `lightbulb receipt <id>`.
 
 More: [Troubleshooting](../troubleshooting.md), [Agents](../agents.md).

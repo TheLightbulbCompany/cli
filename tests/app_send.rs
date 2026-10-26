@@ -14,7 +14,6 @@ use common::{admit, call, now_s, online, played, Env};
 use lightbulb::embed::Instance;
 use lightbulb::identity::Identity;
 use lightbulb::net::frames::{self, Frame};
-use lightbulb::policy;
 use lightbulb::roster::{self, Entry, Kind};
 use lightbulb::store::Store;
 use serde_json::{json, Value};
@@ -51,9 +50,6 @@ fn world() -> World {
             roster::accept(s, e, 10).unwrap();
         }
     }
-    // Q lets the workspace's agents send without asking.
-    let accept = policy::Verdict::Accept;
-    policy::set_person(&b.store(), &iw1.key, accept, "local", 1).unwrap();
     World { a, b, w1 }
 }
 

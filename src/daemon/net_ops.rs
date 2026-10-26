@@ -20,29 +20,26 @@ pub const NOT_MEMBER: &str = "not_member";
 /// `team.remove`'s refusal of the founder (it may leave, nobody removes it).
 pub const FOUNDER: &str = "founder";
 
+/// Every link is signed in this mode: joining with one is the approval (the word is the wire's
+/// own, `ask` links of older builds are admitted the same way).
+const LINK_MODE: &str = "open";
+
 /// `team.invite`'s `mode`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Invite {
-    /// This member's live link, minted when it has none.
+    /// This member's live link, minted when it has none. (`open`, the retired mode whose joins
+    /// needed no Allow, is this one now: every invite admits without asking.)
     #[default]
+    #[serde(alias = "open")]
     Reusable,
     /// A new link in place of the live one, ending every earlier link of this computer.
     New,
     /// A link for one join.
     Once,
-    /// A link whose joins need no Allow (founder and admins).
-    Open,
 }
 
 impl Invite {
-    fn link_mode(self) -> &'static str {
-        match self {
-            Invite::Open => "open",
-            _ => "ask",
-        }
-    }
-
     fn once(self) -> bool {
         self == Invite::Once
     }
@@ -72,14 +69,8 @@ pub fn remove_member(d: &Daemon, key: &str) {
         team: &mut team,
         store: &store,
         now: super::ipc::now() as i64,
-        auto: false,
+        agent: None,
     };
-    let pid = ops
-        .team
-        .roster
-        .members
-        .get(key)
-        .map(|m| m.person_id.clone());
     if let Err(e) = ops.run(
         "team.remove",
         &json!({ "member": key }),
@@ -87,10 +78,6 @@ pub fn remove_member(d: &Daemon, key: &str) {
         true,
     ) {
         eprintln!("team.remove: {e}");
-    }
-    // The Allow that came with the join goes with the member.
-    if let Some(pid) = pid {
-        let _ = crate::policy::forget(&store, &pid);
     }
 }
 
@@ -109,9 +96,14 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, caller: Caller) 
             Invite::default()
         };
         // An agent's link is for one join, whatever it asked for; only a person mints the rest.
-        let invite = match caller.actor(&daemon.store.lock().unwrap()) {
-            Some(a) if op == "team.invite" && a != "local" => Invite::Once,
-            _ => invite,
+        let actor = caller.actor(&daemon.store.lock().unwrap());
+        let agent = actor
+            .clone()
+            .filter(|a| op == "team.invite" && a != "local");
+        let invite = if agent.is_some() {
+            Invite::Once
+        } else {
+            invite
         };
         // A workspace member never invites: an admin adds it to a network (`team.join`).
         if op == "team.invite" && caller == Caller::Instance {
@@ -123,20 +115,8 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, caller: Caller) 
         if gate.person_only && !caller.is_person() {
             return refused(id, "not_a_person");
         }
-        if op == "team.invite" && caller.actor(&daemon.store.lock().unwrap()).is_none() {
+        if op == "team.invite" && actor.is_none() {
             return refused(id, "not_a_person");
-        }
-        match op {
-            "team.admit" => {
-                let actor = caller.actor(&daemon.store.lock().unwrap());
-                let Some(actor) = actor else {
-                    return refused(id, "not_a_person");
-                };
-                let by = Some(actor).filter(|a| a != "local");
-                return crate::admission::admit_op(id, body, daemon, by);
-            }
-            "team.join_requests" => return crate::admission::requests_op(id, daemon),
-            _ => {}
         }
         let mut team = daemon.team.lock().unwrap();
         let store = daemon.store.lock().unwrap();
@@ -146,7 +126,7 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, caller: Caller) 
             team: &mut team,
             store: &store,
             now: super::ipc::now() as i64,
-            auto: body["agents"] == true && caller.is_person(),
+            agent,
         };
         return match ops.run(op, body, invite, gate.member) {
             Ok(r) => r,
@@ -560,8 +540,8 @@ struct TeamOps<'a> {
     team: &'a mut TeamState,
     store: &'a Store,
     now: i64,
-    /// A person asked for `invite --agents`: the link's join needs no Allow.
-    auto: bool,
+    /// The agent session asking for an invite, if it is one.
+    agent: Option<String>,
 }
 
 impl TeamOps<'_> {
@@ -613,7 +593,7 @@ impl TeamOps<'_> {
             // `team.invite {mode}` -> `{ticket, line, app_link, expires_at, replaced}`. `reusable`
             // (and `open`) reprint this member's live link of that mode, minting one if none.
             "team.invite" => {
-                let mode = invite.link_mode();
+                let mode = LINK_MODE;
                 let live = r
                     .links
                     .values()
@@ -637,12 +617,9 @@ impl TeamOps<'_> {
                     // `--new` ends every earlier link of this computer, `open` and once ones too.
                     _ => self.new_link(mode, invite.once(), invite == Invite::New)?,
                 };
-                if self.auto {
-                    self.daemon
-                        .auto_admit
-                        .lock()
-                        .unwrap()
-                        .insert(t.ticket_id.clone());
+                if let Some(a) = &self.agent {
+                    let mut m = self.daemon.agent_invites.lock().unwrap();
+                    m.insert(t.ticket_id.clone(), a.clone());
                 }
                 let s = ticket::encode(&t);
                 Response::ok(
@@ -667,7 +644,7 @@ impl TeamOps<'_> {
                     return Ok(Response::err(id, FOUNDER));
                 }
                 self.write(Kind::Remove, json!({"member": t.key}))?;
-                let link = self.new_link("ask", false, false)?;
+                let link = self.new_link(LINK_MODE, false, false)?;
                 Response::ok(id, json!({"name": t.name, "line": ticket::line(&link)}))
             }
             _ => Response::err(id, UNKNOWN_OP),
@@ -720,9 +697,9 @@ pub(crate) fn code_link(daemon: &Daemon) -> crate::Result<ticket::Ticket> {
         team: &mut team,
         store: &store,
         now: super::ipc::now() as i64,
-        auto: false,
+        agent: None,
     };
-    ops.new_link("ask", true, false)
+    ops.new_link(LINK_MODE, true, false)
 }
 
 /// The published sessions of member `short` that `list` declares (`cloud.sessions.set`, the

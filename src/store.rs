@@ -56,10 +56,6 @@ CREATE TABLE IF NOT EXISTS holds (
     id INTEGER PRIMARY KEY, message_id TEXT, target_session TEXT, from_session TEXT,
     from_member TEXT, created_at INTEGER, state TEXT
 );
-CREATE TABLE IF NOT EXISTS policy (
-    scope TEXT, person_id TEXT, value TEXT, set_by TEXT, updated_at INTEGER,
-    PRIMARY KEY (scope, person_id)
-);
 CREATE TABLE IF NOT EXISTS approvals (
     hold_id INTEGER, verdict TEXT, scope TEXT, \"by\" TEXT, nonce TEXT UNIQUE,
     decided_at INTEGER, record TEXT

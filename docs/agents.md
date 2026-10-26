@@ -177,10 +177,9 @@ through that member too, from its own session for you, and your teammates see it
 `<workspace>'s ChatGPT via <your first name>`. Your computer does not need to be on for that.
 The workspace's agents answer only its people's computers: run `lightbulb login` on each
 computer you use with them. A workspace admin adds the agents to a network with
-`lightbulb invite --agents` (confirm in the browser, then allow the workspace on that computer).
+`lightbulb invite --agents` (confirm in the browser, and the workspace joins).
 Anyone else sees Friday in `who --all`, but its messages are refused: "This workspace answers its
-members. Ask an admin to add you, then run `lightbulb login`." A message Friday sends you passes
-your Allow, as anyone's does. The
+members. Ask an admin to add you, then run `lightbulb login`." A message Friday sends you reaches your sessions, as any member's does. The
 workspace's machine sleeps when it is idle: when your computer has messages for it and cannot
 reach it, it rings the workspace's wake address once with `curl` (again after 30 seconds, then
 less often, at most every 15 minutes), and sends the messages when the machine is up.

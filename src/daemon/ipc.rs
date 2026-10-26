@@ -347,7 +347,7 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
             None => Response::err(id, BAD_REQUEST),
         },
         "team.leave" => super::net_ops::leave(id, daemon, for_a_person()).await,
-        "holds" | "hold.get" | "hold.answer" | "hold.file" | "policy.get" | "policy.set" => {
+        "holds" | "hold.get" | "hold.answer" | "hold.file" => {
             crate::holds::op(id, op, body, daemon, caller)
         }
         "share.grant" | "stream.open" | "stream.send" | "stream.close" => {

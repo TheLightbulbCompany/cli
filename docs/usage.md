@@ -43,15 +43,13 @@ Run `lightbulb <command> --help` for the options of each one.
 | `setup --remove` | Take out only what `setup` wrote. Backups are left as they are. |
 | `doctor` | Check the service, the local network, the state folder and each agent, and say how to fix what is not right. |
 | `who` | List the sessions on this computer. `who --all` adds your teammates' sessions. |
-| `invite` | Print a four-word code (works once, for 10 minutes), a `https://thelightbulb.company/j#…` link, and the join command (`lightbulb join '<ticket>'`) that add your other computer or a teammate. The link and line are reusable for 7 days. `--once`: one join, valid 24 hours. `--new`: a new invite; every earlier one from this computer, `--open` and `--once` ones too, stops working. |
+| `invite` | Print a four-word code (works once, for 10 minutes), a `https://thelightbulb.company/j#…` link, and the join command (`lightbulb join '<ticket>'`) that add your other computer or a teammate. The link and line are reusable for 7 days. `--once`: one join, valid 24 hours. `--new`: a new invite; every earlier one from this computer, `--once` ones too, stops working. |
 | `join '<ticket>'` | Join the team the invite is for. Takes the four-word code, the `https://thelightbulb.company/j#…` link, the `lightbulb://join/…` link or the bare ticket. The name you go by is your user name; `--name <name>` sets another. The computer must be on its own first. |
-| `approve J1` / `approve H1` | Allow a join request (`J`) or a held message (`H`). |
-| `decline J1` / `decline H1` | Decline one. |
-| `held` | The join requests and messages waiting for your Allow. |
+| `approve H1` / `decline H1` | Answer a permission prompt the Lightbulb app filed. |
+| `held` | The permission prompts waiting for your answer. |
 | `send <to> "<text>"` | Send a message from the terminal: `send codex-1 "hi"`, or to a teammate's name: `send sam/inbox "hi"`. From your own terminal, `send 'sam/*' "hi"` sends to each of sam's sessions (as `who --all` lists them), and `send '*' "hi"` to every session on this computer. |
 | `listen --as <name>` | Print the messages sent to a name on this computer. |
 | `receipt <id>` | Whether a message you sent arrived. `--json` for the raw receipt. |
-| `policy` | Who may message your sessions without asking. `policy <person> accept\|hold\|refuse` sets it. |
 | `team` | The team and its computers. |
 | `remove <name>` | Remove a member. The invite is replaced. |
 | `leave` | Leave the team. This computer is on its own network again. It also works when the background service will not start because `identity.key` no longer matches the team record. |
@@ -63,22 +61,12 @@ Run `lightbulb <command> --help` for the options of each one.
 `held`, `approve` and the other commands that decide for you refuse to run from an agent's shell
 (`Run this from your own terminal, not from an agent.`). Only you answer them.
 
-## Holds and Allow
+## Trust
 
-A message from a person who has not messaged you before is held. A dialog shows who sent it, which
-session it is for and the start of the text, with Decline and Allow. You can also answer from the
-terminal: `lightbulb held`, then `approve H<n>` or `decline H<n>`.
-
-- **Allow** delivers the message and lets that person's later messages through without asking.
-  It sets their policy to `accept`.
-- **Decline** refuses it. The sender's receipt reads `Not sent: they declined it.`
-
-A held message waits up to 7 days for an answer. To change a decision later, use `policy`:
-`policy sam hold` asks again each time, `policy sam refuse` refuses them, `policy sam accept`
-lets them through. Your own computers always get through.
-
-Join requests work the same way: `invite` links ask you before anyone joins (`J<n>`), unless
-the link was made with `invite --open`.
+Everyone on the network is trusted: a message from a member goes straight to the session it
+names, and an invite is the approval for a join. Nothing is held and nothing asks you. To stop
+someone, `lightbulb remove <name>`. When an agent's invite brings someone in, a dialog tells you
+(Keep or Remove).
 
 ## What teammates can see
 
@@ -106,8 +94,7 @@ own computer marks them `hidden from teammates`. `folder <path> on` shows them a
 Nothing is lost when a Mac is asleep or offline. A message to it waits on the sender's computer,
 and its receipt reads `queued`:
 `Not delivered yet: <computer> is offline. Lightbulb keeps trying until <time>.`
-The sender keeps trying for 24 hours. When the other Mac comes back, the message arrives (held
-first, if the sender is new to it). After 24 hours an undelivered message expires.
+The sender keeps trying for 24 hours. When the other Mac comes back, the message arrives (stored on arrival). After 24 hours an undelivered message expires.
 
 A message that reaches the other Mac but waits there unread for 24 hours (the session never came
 back) expires too. The sender's receipt then reads

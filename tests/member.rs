@@ -43,8 +43,6 @@ fn seed(dir: &Path) -> Identity {
     for e in [&g, &aw] {
         roster::accept(&store, e, 10).unwrap();
     }
-    let accept = lightbulb::policy::Verdict::Accept;
-    lightbulb::policy::set_person(&store, &a.key, accept, "local", 1).unwrap();
     a
 }
 
@@ -553,10 +551,9 @@ fn rings(dir: &Path) -> Vec<Vec<String>> {
 fn rang(dir: &Path, a: &common::Env, child: Child, token: &str, sock: &Path) -> String {
     let to = format!("{}/friday", short(sock, token));
     let from = common::session(a, "c1");
-    // Up: it reaches the member over the connection (held there: A is no one it knows), no
-    // doorbell.
+    // Up: it reaches the member over the connection (stored there), no doorbell.
     a.send(&from, &to, "while up", "r1", None);
-    common::until(10, "on the member", || a.state(&from, "r1") == "held");
+    common::until(10, "on the member", || a.state(&from, "r1") == "stored");
     ok(sock, token, "stop", json!({}));
     exits_zero(child);
     assert!(rings(dir).is_empty(), "rang while the member was up");

@@ -14,7 +14,6 @@ use lightbulb::daemon::net_ops;
 use lightbulb::identity::{self, Identity};
 use lightbulb::net::frames::{self, Frame, Remote};
 use lightbulb::net::{ALPN, PROTOCOL};
-use lightbulb::policy;
 use lightbulb::roster::{self, Entry, Kind};
 use lightbulb::store::Store;
 use serde_json::{json, Value};
@@ -239,16 +238,9 @@ impl Drop for Env {
     }
 }
 
-/// `seed_team`, and each person already allows the other (`people` accept), so their mail is
-/// not held.
+/// `seed_team` (kept for the tests that name a pair: members trust each other).
 pub fn seed_pair(a: &Env, b: &Env) -> [Entry; 2] {
-    let seeded = seed_team(a, b);
-    for (env, other) in [(a, b), (b, a)] {
-        let key = other.identity().key;
-        let accept = policy::Verdict::Accept;
-        policy::set_person(&env.store(), &key, accept, "local", 1).unwrap();
-    }
-    seeded
+    seed_team(a, b)
 }
 
 /// `who` admitted by `by` after `parent` as `name` (its computer too), a computer member of

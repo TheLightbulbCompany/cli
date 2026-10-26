@@ -124,8 +124,8 @@ is open, run `lightbulb doctor`.
 
 ### No dialog appears (Linux)
 
-There are no dialogs on Linux. Run `lightbulb held`, then `lightbulb approve J1` or
-`lightbulb approve H1` (or `decline`).
+There are no dialogs on Linux. If the Lightbulb app filed a permission prompt, run
+`lightbulb held`, then `lightbulb approve H1` (or `decline`).
 
 ### Codex asks you to trust a hook
 
@@ -163,16 +163,12 @@ call `message_receipt`. What the answer means:
 |---|---|---|
 | `Not delivered yet: <computer> is offline. Lightbulb keeps trying until <time>.` | The other Mac is asleep or unreachable. | Wake it. Lightbulb retries for 24 hours. |
 | `… has not confirmed it yet` | It was sent; the other Mac has not answered. | Wait, or check the relay (above). |
-| `Sent. <person> has to allow it first (they see a prompt).` | Held: the receiver has not allowed you yet. This is not a failure. Your own other computer is another person until verified names exist, so its first message is held too. | Do not resend. The receiver runs `lightbulb held`, then `approve H<n>`. |
 | `Sent. Stored on <computer>.` | On their Mac, waiting for the session. | The session reads it at its next step; an idle session when someone next types to it. See [agents](agents.md#how-a-message-reaches-a-session). |
 | `Delivered …` / `Read …` | The session got it. | Nothing. |
-| `Not sent: they declined it.` | The receiver clicked Decline. | Ask them. |
-| `Not sent: they do not take messages from you.` | Their policy refuses you. | They run `lightbulb policy <you> accept`. |
 | `Not sent: loop limit: …` / `paused after … agent replies` | A loop limit (see [security](security.md#loop-limits)). | A person sends the next message, or waits 10 minutes. |
 | `Not sent: that computer is not in your team.` | The address is not a member. | Check `lightbulb team`. |
 | `Not delivered: the other computer could not be reached for 24 hours.` | Expired on your Mac: it never reached theirs. | Send it again. |
 | `<session> did not come back within 24 hours; the message expired.` | It reached their Mac, but the session never took it. | Send it again when the session is open. |
-| `Nobody answered the Allow for 7 days; the message expired.` | Held, and never allowed or declined. | Ask them to look at `lightbulb held`, then send it again. |
 
 If the receiver cannot see the sender's session at all, check `lightbulb who --all` on both
 sides, and whether the session's folder is hidden (`lightbulb folder <path> on`).
@@ -181,14 +177,12 @@ sides, and whether the session's folder is hidden (`lightbulb folder <path> on`)
 
 | `join` says | Why | What to do |
 |---|---|---|
-| `This invite link does not work. Ask for a new one.` | The line was cut or changed when pasted; or the invite was ended by `invite --new` (which ends every earlier invite of that computer, open and one-time ones too), ended by a `remove`, or was a one-time invite already used. | Ask for a fresh line (`lightbulb invite`), and paste it whole, in single quotes. |
+| `This invite link does not work. Ask for a new one.` | The line was cut or changed when pasted; or the invite was ended by `invite --new` (which ends every earlier invite of that computer, one-time ones too), ended by a `remove`, or was a one-time invite already used. | Ask for a fresh line (`lightbulb invite`), and paste it whole, in single quotes. |
 | `This invite link has expired. Ask for a new one.` | One-time invites last 24 hours, others 7 days. | Ask for a fresh line. |
 | `That code did not work. Check the words. …` | The four-word code works once, for 10 minutes while the inviter's computer is on; or a word is wrong. | Check the words, or ask for the full line (`lightbulb invite`). |
 | `No one from this network is online right now. …` | None of the members listed on it are reachable. | Ask them to open their laptop, then run the same command again. |
-| `No one has answered yet. Run the same command again to keep asking.` | The person did not click Allow in 10 minutes. | Run it again, and tell them to look for the dialog or run `lightbulb held`. |
 | `The name "sam" is already used in this network. Run the same command again with: --name sam-2` | Another member has that name. `join` uses your user name unless you pass `--name`. | Run it again with the `--name` it prints, or another one. |
 | `You are in "<team>". Leave it first: lightbulb leave` | This computer is already in a team. | `lightbulb leave`, then join. |
-| `Your request to join was declined.` | They clicked Decline. | Ask them. |
 | `That name has characters Lightbulb cannot show. …` | The name or computer name has control characters. | Use a plain name. |
 
 ## Collecting information for an issue

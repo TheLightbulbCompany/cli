@@ -23,15 +23,13 @@ lightbulb join <four-word code>
 lightbulb join '<ticket>'
 ```
 
-## Allow
+## Joined
 
-A dialog opens on the inviter's Mac: the new person wants to join. They click Allow, or run
-`lightbulb held` then `lightbulb approve J1`. On Linux there are no dialogs; use those commands.
-The joiner's Terminal then says `Connected as <name> (…)`.
+An invite is the approval: nobody is asked. The joiner's Terminal says `Connected as <name> (…)`.
 
 If `join` fails (expired, wrong word, name taken), see [Troubleshooting](../troubleshooting.md#join-says-the-invite-does-not-work-or-has-expired).
 
 ## Then
 
 Each of you opens an agent session in a project folder, and runs `lightbulb who --all` to see the other's sessions.
-The first message from a new person is held until the receiver allows it (`lightbulb approve H1`).
+Everyone on the network is trusted, so a message goes straight to the session it names.
