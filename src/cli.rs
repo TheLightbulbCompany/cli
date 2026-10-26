@@ -1224,11 +1224,13 @@ fn verify_signature(bin: &Path) -> Result<()> {
     }
 }
 
-/// The release-signing public key (Ed25519, 32 bytes): its offline private half signs every
-/// asset's `.sha256` (`docs/releasing.md`), and a Linux or WSL update installs nothing else.
-/// PLACEHOLDER, not a key: all zeros verify nothing, so until the owner pastes the real public
-/// key here, every Linux update is refused (nothing changes).
-const RELEASE_KEY: [u8; 32] = [0; 32];
+/// The release-signing public key (Ed25519, 32 bytes). Its private half lives only on the
+/// signing Mac, which signs every Linux asset's `.sha256` (`docs/releasing.md`); a Linux or WSL
+/// update installs nothing else.
+const RELEASE_KEY: [u8; 32] = [
+    0x5f, 0x56, 0xf6, 0x7c, 0xef, 0x03, 0x59, 0x00, 0xbf, 0xae, 0x7b, 0xca, 0x33, 0xe1, 0xee, 0x56,
+    0x12, 0xda, 0xb8, 0x2f, 0xb8, 0xd9, 0xae, 0x3e, 0x31, 0x76, 0x82, 0xd0, 0x9a, 0x6a, 0x78, 0xdf,
+];
 
 /// The key a release's `.sha256.sig` must verify under, or `None` where none is checked: macOS
 /// pins the binary's codesign team instead. "(tests)" debug builds take a hex key from
@@ -1956,7 +1958,7 @@ mod tests {
             sum,
             &sig[..63]
         ));
-        // The placeholder verifies nothing.
+        // Not the release key's signature.
         assert!(!super::signed_by(&super::RELEASE_KEY, sum, &sig));
     }
 
