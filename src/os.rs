@@ -167,14 +167,37 @@ mod imp {
         let (ppid, ticks) = stat(pid)?;
         Ok(Info {
             ppid,
-            birth_micros: ticks * 1_000_000 / clock_ticks(),
+            birth_micros: boot_tag() | since_boot(ticks),
         })
     }
 
     /// `info`'s start placed on the epoch by `btime`: as good as the clock now.
     pub fn started_ms(pid: u32) -> Result<u64> {
         let boot = boot_micros().ok_or("no btime in /proc/stat")?;
-        Ok((boot + info(pid)?.birth_micros) / 1000)
+        Ok((boot + since_boot(stat(pid)?.1)) / 1000)
+    }
+
+    fn since_boot(ticks: u64) -> u64 {
+        ticks * 1_000_000 / clock_ticks()
+    }
+
+    /// Bits above 2^45 µs of uptime (about 1.1 years) that name this boot, so a stored row
+    /// from an earlier boot never matches a new process with the same pid and start tick.
+    /// FNV-1a of `/proc/sys/kernel/random/boot_id`: stable across engine builds, unlike std's
+    /// hasher. No boot id: 0, the plain since-boot birth.
+    pub(super) fn boot_tag() -> u64 {
+        static TAG: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        *TAG.get_or_init(|| {
+            let id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap_or_default();
+            let id = id.trim();
+            if id.is_empty() {
+                return 0;
+            }
+            let h = id.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+                (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+            });
+            (h & 0x3FFFF) << 45
+        })
     }
 
     /// `/proc/<pid>/stat`'s ppid and starttime (clock ticks since boot).
@@ -349,17 +372,16 @@ mod tests {
             .unwrap()
             .parse()
             .unwrap();
-        assert!(
-            me.birth_micros <= (uptime * 1e6) as u64 + 1_000_000,
-            "{me:?}"
-        );
+        let since_boot = me.birth_micros & ((1u64 << 45) - 1);
+        assert_eq!(me.birth_micros - since_boot, imp::boot_tag(), "{me:?}");
+        assert!(since_boot <= (uptime * 1e6) as u64 + 1_000_000, "{me:?}");
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
         let started = started_ms(me.pid).unwrap();
         assert!(
-            started <= now + 2_000 && now - started < 3_600_000,
+            started <= now + 2_000 && started.abs_diff(now) < 3_600_000,
             "{started} vs {now}"
         );
     }
