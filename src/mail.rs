@@ -445,6 +445,8 @@ pub enum Prep {
 pub enum Origin<'a> {
     Local,
     Net(&'a str),
+    /// A hosted app's session on this computer (`link`): never framed as the person's own.
+    App,
 }
 
 impl From<&Prepared> for Message {
@@ -646,8 +648,10 @@ pub fn prepare(
 /// Writes `p`'s message (from `origin`) with receipt `state`.
 pub(crate) fn put(store: &Store, p: &Prepared, origin: Origin, state: State) -> Result<()> {
     let mut m = Message::from(p);
-    if let Origin::Net(short) = origin {
-        m.origin = Some(format!("net:{short}"));
+    match origin {
+        Origin::Net(short) => m.origin = Some(format!("net:{short}")),
+        Origin::App => m.origin = Some(APP_ORIGIN.into()),
+        Origin::Local => {}
     }
     store.put_message(&m)?;
     let at = p.sent_at as u64;
@@ -697,10 +701,18 @@ pub(crate) fn record_queued(store: &Store, p: &Prepared) -> Result<()> {
     answered(store, p)
 }
 
+/// A stored message's `origin` when a hosted app's session on this computer sent it.
+pub const APP_ORIGIN: &str = "app";
+
 /// Stores `p` here, in its recipient's mailbox; its receipt.
 pub fn store_local(store: &Store, p: &Prepared) -> Result<Receipt> {
+    store_local_from(store, p, Origin::Local)
+}
+
+/// `store_local`, from `origin` (`Local`, or `App`).
+pub fn store_local_from(store: &Store, p: &Prepared, origin: Origin) -> Result<Receipt> {
     let tx = store.conn().unchecked_transaction()?;
-    record(store, p, Origin::Local, true)?;
+    record(store, p, origin, true)?;
     tx.commit()?;
     Ok(receipt(store, &p.from, &p.request_id)?.ok_or("receipt missing after write")?)
 }

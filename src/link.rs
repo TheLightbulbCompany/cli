@@ -59,6 +59,15 @@ pub fn declares(d: &Daemon, name: &str, person: &str) -> bool {
     s.person.as_deref() == Some(person) && s.apps.iter().any(|r| r.session_id == id)
 }
 
+/// The declared title of app session `addr` (`ChatGPT via Aden`), while the link knows it.
+pub fn title_of(d: &Daemon, addr: &str) -> Option<String> {
+    let s = d.link.lock().unwrap();
+    s.apps
+        .iter()
+        .find(|r| r.session_id == addr)
+        .and_then(|r| r.title.clone())
+}
+
 /// The app sessions to publish with this computer's own (`presence`).
 pub fn apps(d: &Daemon) -> Vec<Remote> {
     d.link.lock().unwrap().apps.clone()
