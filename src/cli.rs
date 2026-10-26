@@ -545,11 +545,6 @@ pub fn invite(mode: Invite) -> Result<i32> {
             let at = crate::date::utc(r["expires_at"].as_i64().unwrap_or_default());
             println!("One-time invite, expires {at}.");
         }
-        Invite::Open => {
-            println!(
-                "Anyone with this line joins without asking. Use it only with people you trust."
-            );
-        }
         _ if r["replaced"] == true => {
             println!("Every earlier invite from this computer stopped working.")
         }
@@ -579,7 +574,7 @@ pub fn invite(mode: Invite) -> Result<i32> {
 }
 
 /// `join '<ticket>' [--name <n>]`: joins the network the join line `link` is for, waiting up to 600 s
-/// for its person to allow it.
+/// (the invite is the approval).
 pub fn join(link: &str, name: Option<String>) -> Result<i32> {
     // Which form the person was given; usage counts read it.
     let (code, _via) = match crate::code::normalize(link) {
@@ -589,20 +584,17 @@ pub fn join(link: &str, name: Option<String>) -> Result<i32> {
     };
     let name = name.unwrap_or_else(daemon::user_name);
     let mut conn = connect()?;
-    // Said once a member took an `ask` ticket and is asking its person (`join_asking`), or
-    // once the daemon rang a parked workspace's doorbell (`join_waking`); never before a
-    // ticket it refuses at once, nor for an open link (it asks no one).
+    // Said once the daemon rang a parked workspace's doorbell (`join_waking`); never before a
+    // ticket it refuses at once.
     let ticket = crate::ticket::decode(link).ok();
-    if code.is_some() || ticket.is_some_and(|t| t.mode == "ask" || t.wake.is_some()) {
+    if code.is_some() || ticket.is_some_and(|t| t.wake.is_some()) {
         let mut asking = Conn::open()?;
         asking.call("subscribe", json!({}))?;
         asking.wait_up_to(Duration::from_secs(660))?;
         std::thread::spawn(move || {
             while let Ok(e) = asking.next_line() {
-                match e["event"].as_str() {
-                    Some("join_asking") => println!("Asking whoever sent the link to allow this computer… (they get a prompt; this waits up to 10 minutes)"),
-                    Some("join_waking") => println!("Waking your workspace… this takes about a minute."),
-                    _ => {}
+                if e["event"] == "join_waking" {
+                    println!("Waking your workspace… this takes about a minute.");
                 }
             }
         });
@@ -632,7 +624,6 @@ pub fn join(link: &str, name: Option<String>) -> Result<i32> {
                 "Your agents here can now see and message the team's agents. Try: {} who --all",
                 command()
             );
-            println!("Until verified names arrive, your other computer counts as another person and its first message needs your Allow.");
             return Ok(0);
         }
         (Some("waiting"), _) => "No one has answered yet. Run the same command again to keep asking.".to_string(),
@@ -662,23 +653,10 @@ pub fn signin() -> Result<i32> {
     Ok(2)
 }
 
-/// `approve <id>` / `decline <id>`: answers join request `J<n>` or held message `H<n>`.
+/// `approve <id>` / `decline <id>`: answers permission prompt `H<n>`.
 pub fn answer(request: &str, allow: bool) -> Result<i32> {
-    let held = request.starts_with('H');
     let verdict = if allow { "allow" } else { "decline" };
-    let (op, body, what, gone) = if held {
-        let body = json!({"hold": request, "verdict": verdict});
-        (
-            "hold.answer",
-            body,
-            "held message",
-            "answered or has expired",
-        )
-    } else {
-        let body = json!({"request": request, "verdict": verdict});
-        ("team.admit", body, "join request", "answered or withdrawn")
-    };
-    let r = connect()?.call(op, body)?;
+    let r = connect()?.call("hold.answer", json!({"hold": request, "verdict": verdict}))?;
     if r["ok"] != true {
         let texts = [
             (
@@ -687,218 +665,33 @@ pub fn answer(request: &str, allow: bool) -> Result<i32> {
                     Some("dialog") => format!("{request} was already answered in the dialog."),
                     Some("phone") => format!("{request} was already answered from your phone."),
                     Some(_) => format!("{request} was already answered at the command line."),
-                    None => format!("{request} was already {gone}."),
+                    None => format!("{request} was already answered or has expired."),
                 },
             ),
-            (ipc::NOT_FOUND, format!("No {what} {request}.")),
+            (ipc::NOT_FOUND, format!("No prompt {request}.")),
         ];
         return refuse(&r, &texts);
     }
-    if held {
-        println!("{} {request}.", if allow { "Allowed" } else { "Declined" });
-        return Ok(0);
-    }
-    let name = r["name"].as_str().unwrap_or_default();
-    let by = r["by"]
-        .as_str()
-        .map(|b| format!(" (approved by {})", cell(b)));
-    match r["state"].as_str() {
-        Some("admitted") => println!("{name} joined the network{}.", by.unwrap_or_default()),
-        Some("declined") => println!("Declined {name}."),
-        _ => {
-            eprintln!(
-                "Could not admit {name}: {}",
-                r["reason"].as_str().unwrap_or("refused")
-            );
-            return Ok(1);
-        }
-    }
+    println!("{} {request}.", if allow { "Allowed" } else { "Declined" });
     Ok(0)
 }
 
-/// `held`: the join requests and held messages waiting for an Allow, one per line with the
-/// command that allows it; "not verified" is explained once.
+/// `held`: the permission prompts waiting for an answer, one per line with the command that
+/// answers it.
 pub fn held() -> Result<i32> {
-    let mut conn = connect()?;
-    let joins = ask(&mut conn, "team.join_requests", json!({}))?;
-    let holds = ask(&mut conn, "holds", json!({}))?;
+    let holds = ask(&mut connect()?, "holds", json!({}))?;
     let cmd = command();
     let f = |v: &Value, k: &str| v[k].as_str().map(cell).unwrap_or_default();
-    let mut lines: Vec<String> = joins["requests"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|j| {
-            let id = f(j, "id");
-            let (name, computer) = (f(j, "name"), f(j, "computer"));
-            format!("{id}  {name} ({computer}) wants to join — {cmd} approve {id}")
-        })
-        .collect();
+    let mut any = false;
     for h in holds["holds"].as_array().into_iter().flatten() {
-        let (id, who) = (f(h, "id"), f(h, "label"));
-        let (to, text) = (f(h, "target_session"), f(h, "preview"));
-        lines.push(format!(
-            "{id}  {who} -> {to}  \"{text}\" — {cmd} approve {id}"
-        ));
+        let (id, to, text) = (f(h, "id"), f(h, "target_session"), f(h, "preview"));
+        println!("{id}  {to}  \"{text}\" — {cmd} approve {id}");
+        any = true;
     }
-    if lines.is_empty() {
-        println!("No messages are waiting for your Allow.");
-    }
-    for line in lines {
-        println!("{line}");
+    if !any {
+        println!("Nothing is waiting for your answer.");
     }
     Ok(0)
-}
-
-/// `policy [<person> accept|hold|refuse]`: lists the policy (rows the bridge set marked so),
-/// or sets `<person>`.
-pub fn policy(person: Option<String>, value: Option<String>) -> Result<i32> {
-    if value
-        .as_deref()
-        .is_some_and(|v| !["accept", "hold", "refuse", "forget"].contains(&v))
-    {
-        return Err("Policy takes accept, hold or refuse.".into());
-    }
-    let mut conn = connect()?;
-    let mut team = None;
-    let p = match (person, value) {
-        // An old row, stored under whatever it says: dropped as written.
-        (Some(who), Some(v)) if v == "forget" => ask(
-            &mut conn,
-            "policy.set",
-            json!({"person_id": who, "value": v}),
-        )?,
-        (Some(who), Some(v)) => {
-            let (members, mine) = team_members(&mut conn)?;
-            let pid = policy_person(&members, &who)?;
-            if mine.as_deref() == Some(pid.as_str()) {
-                return Err("That is you; your own computers always get through.".into());
-            }
-            team = Some((members, mine));
-            ask(
-                &mut conn,
-                "policy.set",
-                json!({"person_id": pid, "value": v}),
-            )?
-        }
-        (None, None) => ask(&mut conn, "policy.get", json!({}))?,
-        _ => {
-            let cmd = command();
-            eprintln!("Usage: {cmd} policy [<person> accept|hold|refuse]\n  <person> is a teammate's name or short (as {cmd} team lists it).\n  Example: {cmd} policy aden hold");
-            return Ok(2);
-        }
-    };
-    // The members' names only when some row needs them.
-    let rows = p["people"].as_object().is_some_and(|o| !o.is_empty());
-    let (members, mine) = match team {
-        Some(t) => t,
-        None if rows => team_members(&mut conn)?,
-        None => (vec![], None),
-    };
-    let member = |pid: &str| members.iter().find(|m| m["person_id"] == pid);
-    let name =
-        |pid: &str| member(pid).and_then(|m| Some((m["name"].as_str()?, m["short"].as_str()?)));
-    // `aden (qxcrztez36jw)`; a person no member is as stored.
-    let name_of = |pid: &str| match name(pid) {
-        Some((name, short)) => format!("{} ({short})", cell(name)),
-        None => cell(pid),
-    };
-    let by = |key: String, pid: &str| match p["set_by"][&key].as_str() {
-        Some("bridge") => {
-            let n = name(pid).map_or(pid, |(n, _)| n);
-            format!(" (Allowed {} from your phone)", cell(n))
-        }
-        _ => String::new(),
-    };
-    if !rows {
-        println!("No one has a policy yet: a teammate's first message waits for your Allow.");
-    }
-    for (pid, v) in p["people"].as_object().into_iter().flatten() {
-        let v = match v.as_str() {
-            Some("accept") => "accepted",
-            Some("hold") => "held for your Allow",
-            Some("refuse") => "refused",
-            _ => "unknown",
-        };
-        let forget = format!("run: {} policy {} forget", command(), cell(pid));
-        // A row for my own person (`decide` never reads it), or a `people` row no member
-        // has (an old one, stored under a literal name).
-        let note = if mine.as_deref() == Some(pid.as_str()) {
-            format!(" (ignored: your own computers always get through — {forget})")
-        } else if member(pid).is_none() {
-            format!(" (old entry — {forget})")
-        } else {
-            String::new()
-        };
-        println!(
-            "Messages from {}: {v}.{note}{}",
-            name_of(pid),
-            by(format!("people:{pid}"), pid)
-        );
-    }
-    Ok(0)
-}
-
-/// The team's members (`team.get`) and this computer's person id among them.
-fn team_members(conn: &mut Conn) -> Result<(Vec<Value>, Option<String>)> {
-    let me = conn.member()?;
-    let team = ask(conn, "team.get", json!({}))?;
-    let members = team["members"].as_array().cloned().unwrap_or_default();
-    let mine = members
-        .iter()
-        .find(|m| m["short"] == me.as_str())
-        .and_then(|m| m["person_id"].as_str().map(String::from));
-    Ok((members, mine))
-}
-
-/// The person id `policy <who>` sets: the one member whose name (any case), short, key or
-/// person id is `who`. Several people, or none: a sentence.
-fn policy_person(members: &[Value], who: &str) -> Result<String> {
-    let field = |v: &Value, k: &str| v[k].as_str().unwrap_or_default().to_string();
-    let hits: Vec<&Value> = members
-        .iter()
-        .filter(|m| {
-            field(m, "name").eq_ignore_ascii_case(who)
-                || ["short", "key", "person_id"]
-                    .iter()
-                    .any(|k| field(m, k) == who)
-        })
-        .collect();
-    let mut people: Vec<String> = hits.iter().map(|m| field(m, "person_id")).collect();
-    people.sort();
-    people.dedup();
-    match people.len() {
-        1 => Ok(people.remove(0)),
-        0 => {
-            let names: Vec<String> = members.iter().map(|v| cell(&field(v, "name"))).collect();
-            Err(format!(
-                "No teammate called \"{}\". Teammates: {} (see {} team).",
-                cell(who),
-                names.join(", "),
-                command()
-            )
-            .into())
-        }
-        _ => {
-            let each: Vec<String> = hits
-                .iter()
-                .map(|m| {
-                    format!(
-                        "{} on {}: {}",
-                        cell(&field(m, "name")),
-                        cell(&field(m, "computer")),
-                        field(m, "short")
-                    )
-                })
-                .collect();
-            Err(format!(
-                "More than one teammate is called \"{}\". Use the short of the one you mean: {}.",
-                cell(who),
-                each.join("; ")
-            )
-            .into())
-        }
-    }
 }
 
 /// `team`: the team's name and members, this computer first as `You`; a member's address only

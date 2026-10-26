@@ -20,29 +20,26 @@ pub const NOT_MEMBER: &str = "not_member";
 /// `team.remove`'s refusal of the founder (it may leave, nobody removes it).
 pub const FOUNDER: &str = "founder";
 
+/// Every link is signed in this mode: joining with one is the approval (the word is the wire's
+/// own, `ask` links of older builds are admitted the same way).
+const LINK_MODE: &str = "open";
+
 /// `team.invite`'s `mode`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Invite {
-    /// This member's live link, minted when it has none.
+    /// This member's live link, minted when it has none. (`open`, the retired mode whose joins
+    /// needed no Allow, is this one now: every invite admits without asking.)
     #[default]
+    #[serde(alias = "open")]
     Reusable,
     /// A new link in place of the live one, ending every earlier link of this computer.
     New,
     /// A link for one join.
     Once,
-    /// A link whose joins need no Allow (founder and admins).
-    Open,
 }
 
 impl Invite {
-    fn link_mode(self) -> &'static str {
-        match self {
-            Invite::Open => "open",
-            _ => "ask",
-        }
-    }
-
     fn once(self) -> bool {
         self == Invite::Once
     }
@@ -62,6 +59,28 @@ fn gate(op: &str) -> Gate {
     }
 }
 
+/// Removes member `key` as the person (the Remove button of an agent-approval notice).
+pub fn remove_member(d: &Daemon, key: &str) {
+    let mut team = d.team.lock().unwrap();
+    let store = d.store.lock().unwrap();
+    let ops = TeamOps {
+        id: 0,
+        daemon: d,
+        team: &mut team,
+        store: &store,
+        now: super::ipc::now() as i64,
+        agent: None,
+    };
+    if let Err(e) = ops.run(
+        "team.remove",
+        &json!({ "member": key }),
+        Invite::default(),
+        true,
+    ) {
+        eprintln!("team.remove: {e}");
+    }
+}
+
 pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, caller: Caller) -> Response {
     // Retired: the cloud-member unlink; any member is removed with `team.remove`.
     if op == "team.unlink" {
@@ -76,6 +95,16 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, caller: Caller) 
         } else {
             Invite::default()
         };
+        // An agent's link is for one join, whatever it asked for; only a person mints the rest.
+        let actor = caller.actor(&daemon.store.lock().unwrap());
+        let agent = actor
+            .clone()
+            .filter(|a| op == "team.invite" && a != "local");
+        let invite = if agent.is_some() {
+            Invite::Once
+        } else {
+            invite
+        };
         // A workspace member never invites: an admin adds it to a network (`team.join`).
         if op == "team.invite" && caller == Caller::Instance {
             return Response::err(id, UNSUPPORTED);
@@ -86,20 +115,8 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, caller: Caller) 
         if gate.person_only && !caller.is_person() {
             return refused(id, "not_a_person");
         }
-        if op == "team.invite" && caller.actor(&daemon.store.lock().unwrap()).is_none() {
+        if op == "team.invite" && actor.is_none() {
             return refused(id, "not_a_person");
-        }
-        match op {
-            "team.admit" => {
-                let actor = caller.actor(&daemon.store.lock().unwrap());
-                let Some(actor) = actor else {
-                    return refused(id, "not_a_person");
-                };
-                let by = Some(actor).filter(|a| a != "local");
-                return crate::admission::admit_op(id, body, daemon, by);
-            }
-            "team.join_requests" => return crate::admission::requests_op(id, daemon),
-            _ => {}
         }
         let mut team = daemon.team.lock().unwrap();
         let store = daemon.store.lock().unwrap();
@@ -109,6 +126,7 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, caller: Caller) 
             team: &mut team,
             store: &store,
             now: super::ipc::now() as i64,
+            agent,
         };
         return match ops.run(op, body, invite, gate.member) {
             Ok(r) => r,
@@ -522,6 +540,8 @@ struct TeamOps<'a> {
     team: &'a mut TeamState,
     store: &'a Store,
     now: i64,
+    /// The agent session asking for an invite, if it is one.
+    agent: Option<String>,
 }
 
 impl TeamOps<'_> {
@@ -573,7 +593,7 @@ impl TeamOps<'_> {
             // `team.invite {mode}` -> `{ticket, line, app_link, expires_at, replaced}`. `reusable`
             // (and `open`) reprint this member's live link of that mode, minting one if none.
             "team.invite" => {
-                let mode = invite.link_mode();
+                let mode = LINK_MODE;
                 let live = r
                     .links
                     .values()
@@ -597,12 +617,17 @@ impl TeamOps<'_> {
                     // `--new` ends every earlier link of this computer, `open` and once ones too.
                     _ => self.new_link(mode, invite.once(), invite == Invite::New)?,
                 };
+                if let Some(a) = &self.agent {
+                    let mut m = self.daemon.agent_invites.lock().unwrap();
+                    m.insert(t.ticket_id.clone(), a.clone());
+                }
                 let s = ticket::encode(&t);
                 Response::ok(
                     id,
                     json!({"line": ticket::join_line(&s), "app_link": ticket::app_link(&s),
                         "link": ticket::web_link(&s),
-                        "ticket": s, "expires_at": t.expires_at, "replaced": replaced}),
+                        "ticket": s, "expires_at": t.expires_at, "replaced": replaced,
+                        "mode": invite}),
                 )
             }
             // `team.remove {member}` -> `{name, line}`: the removal ends every live link, so a
@@ -619,7 +644,7 @@ impl TeamOps<'_> {
                     return Ok(Response::err(id, FOUNDER));
                 }
                 self.write(Kind::Remove, json!({"member": t.key}))?;
-                let link = self.new_link("ask", false, false)?;
+                let link = self.new_link(LINK_MODE, false, false)?;
                 Response::ok(id, json!({"name": t.name, "line": ticket::line(&link)}))
             }
             _ => Response::err(id, UNKNOWN_OP),
@@ -672,8 +697,9 @@ pub(crate) fn code_link(daemon: &Daemon) -> crate::Result<ticket::Ticket> {
         team: &mut team,
         store: &store,
         now: super::ipc::now() as i64,
+        agent: None,
     };
-    ops.new_link("ask", true, false)
+    ops.new_link(LINK_MODE, true, false)
 }
 
 /// The published sessions of member `short` that `list` declares (`cloud.sessions.set`, the
@@ -727,6 +753,19 @@ pub(crate) fn members_of(v: &Value) -> Result<Option<HashSet<String>>, ()> {
 /// The member gate a sessions document (the file, or `cloud.sessions.set`'s body) sets: its
 /// `members`, the people (Lightbulb user ids) whose computers' sign-in proofs it admits
 /// (`proof::admitted`); `null` is no gate; absent names none (`Ok(None)`). Anything else is `Err`.
+/// The `revoked_keys` of a sessions document: computer keys refused with any proof; absent is none.
+pub(crate) fn revoked_of(doc: &Value) -> Result<HashSet<String>, ()> {
+    match doc.get("revoked_keys") {
+        None | Some(Value::Null) => Ok(HashSet::new()),
+        Some(v) => v
+            .as_array()
+            .ok_or(())?
+            .iter()
+            .map(|k| k.as_str().map(String::from).ok_or(()))
+            .collect(),
+    }
+}
+
 pub(crate) fn gate_of(doc: &Value) -> Result<Option<Option<HashSet<String>>>, ()> {
     match doc.get("members") {
         Some(v) => members_of(v).map(Some),
@@ -757,8 +796,11 @@ pub async fn cloud_sessions_set(id: u64, body: &Value, daemon: &Daemon) -> Respo
         Ok(Some(m)) => m,
         Err(()) => return Response::err(id, BAD_REQUEST),
     };
+    let Ok(revoked) = revoked_of(body) else {
+        return Response::err(id, BAD_REQUEST);
+    };
     let mut sent = cloud.sent.subscribe();
-    let version = cloud.set(out, members);
+    let version = cloud.set(out, members, revoked);
     daemon.presence.notify_one();
     let handed = sent.wait_for(|v| *v >= version);
     let handed = matches!(

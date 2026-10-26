@@ -69,9 +69,7 @@ lightbulb join '<ticket>'
 
 A computer is on one network at a time: run `lightbulb leave` first to join another.
 
-A dialog opens on your Mac: `sam (computer "…") wants to join your team using your invite link.`
-Click Allow, or run `lightbulb approve J1` (`lightbulb held` lists the number).
-Their Terminal then says `Connected as <name> (…)`. Each of you opens (or restarts) a Claude Code,
+An invite is the approval: nobody is asked. Their Terminal says `Connected as <name> (…)`. Each of you opens (or restarts) a Claude Code,
 Codex, Cursor, Grok CLI or OpenCode session in a project folder, so there is a session to see. Then each of
 you can see the other's sessions:
 
@@ -83,10 +81,8 @@ From any Claude Code, Codex, Cursor, Grok CLI or OpenCode session, ask the agent
 find sam's sessions and send their Claude a message." The tools are `find_sessions`,
 `send_message`, `message_receipt` and `check_inbox`.
 
-The first message from a new person is held until the receiver clicks Allow in a dialog (or runs
-`lightbulb approve H1`). After that, messages from that person go straight through. Until verified
-names exist, your own other computer is another person too: its first message waits for your Allow
-there (`lightbulb approve H1`). Do not resend it.
+Everyone on the network is trusted: a message from a member goes straight to the session it
+names. Membership is the only gate. To stop someone, run `lightbulb remove <name>`.
 
 A busy session reads a message at its next step. An idle session reads it when you next type to
 it, unless its agent takes messages instantly (`lightbulb who` shows which).
@@ -95,7 +91,6 @@ Every message gets a receipt. Check one with `lightbulb receipt <id>`. `lightbul
 (`Check: lightbulb receipt <id>`); `send_message` returns it as the `request_id` you gave it.
 
 - `queued`: their Mac is offline; it keeps trying for 24 hours.
-- `held`: waiting for their Allow. Not a failure: do not resend.
 - `stored`: on their Mac, for the session's next step.
 - `delivered`: the session got it.
 - `read`: the session has taken a step since it got it.
@@ -122,7 +117,7 @@ beside the Lightbulb desktop app's own `lightbulb` server; neither replaces the 
 - [Connect your agent](docs/connect/index.md): one short page per agent, and joining a network.
 - [Hosted apps](docs/connect/apps.md): the Claude app, ChatGPT, Muse and bots, through `lightbulb login`.
 - [Agents](docs/agents.md): what `setup` changes for Claude Code, Codex, Cursor, Grok CLI and OpenCode, and how a message reaches a session.
-- [Teams](docs/teams.md): invites, joining, roles, Allow and policy, removing and leaving, relays.
+- [Teams](docs/teams.md): invites, joining, roles, removing and leaving, relays.
 - [Security](docs/security.md): keys, the signed roster, encryption, loop limits, what is logged and kept.
 - [CLI reference](docs/cli.md): every command and option.
 - [Troubleshooting](docs/troubleshooting.md): each `doctor` line, and messages or joins that fail.
@@ -187,7 +182,7 @@ Lightbulb sends anonymous usage counts so the project can see adoption. Each eve
 - `cli_updated` (`from`, `to`): `setup` after the version changed.
 - `network_joined` (`via`: code, link or line).
 - `invite_created` (`via`).
-- `cli_daily`, at most once a day: messages sent and received, holds opened and allowed, computers on the network, and which agents (claude, codex, cursor, grok, opencode) are connected.
+- `cli_daily`, at most once a day: messages sent and received, computers on the network, and which agents (claude, codex, cursor, grok, opencode) are connected.
 
 The only identifier is a random ID made on first use and kept in the state folder (`install-id`); it is not derived from your key or computer name. Never sent: message text, names, person ids, keys, tickets, codes, folder paths, team ids. Sending runs in the background with a 3 second limit and failures are dropped. PostHog sees your IP address (HTTPS reveals it) but is told to discard it (geoip disabled).
 

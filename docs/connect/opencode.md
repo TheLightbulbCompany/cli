@@ -36,7 +36,7 @@ Run `lightbulb doctor`. The OpenCode line should read `connected`.
 - `hooks only — tools missing (run setup)`: run `lightbulb setup`, then restart OpenCode.
 - `not connected`: run `lightbulb setup`. If it names a file it could not read, fix that file first.
 - `source_unidentified` from a tool: Lightbulb could not tell which session called it. On OpenCode, this usually means the background service still runs an old plugin set: run the `pkill` line above and reopen OpenCode.
-- A message to someone new is **held** until they allow it. This is not a failure; do not resend.
-  The receiver runs `lightbulb held`, then `lightbulb approve H1`. Check with `lightbulb receipt <id>`.
+- Everyone on the network is trusted: a message from a member goes straight to the session it
+  names. Check it with `lightbulb receipt <id>`.
 
 More: [Troubleshooting](../troubleshooting.md), [Agents](../agents.md).

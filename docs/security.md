@@ -28,8 +28,11 @@ Invites are signed by the computer that made them. A join is checked against the
 invite must still be live (not replaced, not ended by a removal, not a used one-time invite) and
 not expired.
 
-In a flat network any member can mint a one-time link and so add a member that is not
-verified (shown "(not verified)"). Accepted: members are trusted.
+An invite is the approval: whoever holds a live link joins with no one asked, and every member of
+the network is trusted. In a flat network any member can mint a link and so add a member that is
+not verified (shown "(not verified)"). Accepted: members are trusted. Removing a member
+(`lightbulb remove`) is how you take that back. When an agent's invite brings someone in, a
+dialog tells the person and offers Remove; an agent's invite is always one-time.
 
 There is one kind of member. Every member is its own person: its person id is its own key, and
 nothing in the roster can say otherwise (an admit's other claims are ignored). A Lightbulb
@@ -37,18 +40,19 @@ workspace's member (`lightbulb member`) is a member like any other; what it answ
 local rule. The Lightbulb backend writes it `members`: its people's Lightbulb user ids. It takes
 a message for one of its agents only from a computer whose sign-in proof names one of them; any
 other member's message (no proof, an expired one, another person's, another computer's) is
-refused (`not_a_member`), with no hold. `lightbulb login` proves the key: the backend sends a
+refused (`not_a_member`). `lightbulb login` proves the key: the backend sends a
 one-time challenge (2 minutes), this computer signs `{challenge, key, purpose}` with its member
 key, and the signed-in person types the code their terminal shows on the confirm page (10
 minutes, single use). The answer is the sign-in proof: a compact EdDSA JWS from Lightbulb,
 `{iat, exp, sub: <user id>, computer: <member key>}`, kept in `login.json` (0600) and shown in
 this computer's `hello`. A workspace member verifies it offline against the issuer's public key.
-Proofs last 30 days and are renewed in their last week; they cannot be revoked sooner, but
-removing a person from a workspace takes effect at once (`members`). `lightbulb logout` deletes
+Proofs last 30 days and are renewed in their last week (renewal asks the account server, which
+can refuse); removing a person from a workspace takes effect at once (`members`), and a computer
+whose key is in the sessions file's `revoked_keys` is refused even with a valid proof. `lightbulb logout` deletes
 the proof. A
 workspace member never invites; it joins one network when a workspace admin runs
-`lightbulb invite --agents`, which hands it a one-time ask link that admin's computer signed (so
-that computer still asks Allow). Labels ending "(not verified)" are unproven names, never an
+`lightbulb invite --agents`, which hands it a one-time link that admin's computer signed (the admin
+confirmed it in the browser, so that computer admits it without a dialog). Labels ending "(not verified)" are unproven names, never an
 identity.
 
 ### Invite codes
@@ -59,8 +63,7 @@ runs, a second endpoint whose key is derived from the code (Argon2id, 64 MiB, 3 
 each guess is costly) serves the full invite once. It closes after the first hand-off, after 5
 bad callers, after 10 minutes, or when the invite expires, and nothing listens when no code
 invite is live. The code never serves the printed invite: it serves a fresh one-time invite
-made for it alone, which asks the inviter, so a join by code always needs the inviter's Allow,
-even when the printed link is open or reusable. The
+made for it alone, so a code works once. The
 code is never logged, but it appears in shell history and `ps` on the joiner's computer; it
 is dead once used or after 10 minutes. 5 junk connections can close a live code (denial of
 service only; fall back to the full line).
@@ -98,24 +101,21 @@ local network over mDNS, so your other Macs on the same Wi-Fi find it. Anyone on
 see the announcement. To turn it off, add `lan = false` to `~/.lightbulb/connect/config.toml`.
 Joins still work, because the invite carries the inviter's addresses.
 
-## Holds and policy
+## Trust
 
-A message from someone you have not allowed does not reach your sessions. It is held until you
-answer it (Allow or Decline in a dialog, or `lightbulb approve H<n>` / `decline H<n>`).
+Everyone on the network is trusted. A message from a member reaches the session it names; nothing
+is held and there is no per-person Allow or policy. Membership is the only gate, and `lightbulb
+remove <name>` ends it. (A workspace member also checks the sender's sign-in proof, see above.)
+Messages between sessions on this computer always get through.
 
-- Messages between sessions on this computer always get through.
-- Verified names are not available yet, so each computer counts as its own person, and your
-  other computer's first message is held once, like anyone's.
-- A person with no policy entry is held.
-- Allow lets that person's later messages through (`policy <person> accept`).
-- `policy <person> hold` asks each time; `policy <person> refuse` refuses them.
+A join is admitted by its invite, with no dialog. The signed `admit` records who minted the
+invite when it was an agent's, down to the session (`<member>/<session>`), shown as "admitted by"
+in `lightbulb team`.
 
-A join request is held the same way, unless the invite was made with `invite --open`. An approval records who gave it, down to the
-session (`approved by <member>/<session>`), shown on receipts and as "admitted by" in `lightbulb team`.
-
-An agent may invite, join, approve a join and answer a hold; its answer is recorded under its
-session, and its skill tells it to ask you first. Only a person at a terminal can remove a member,
-leave a network or change the relay: a command run from an agent's shell or tools is refused. It does not stop a program that you run yourself as your own user.
+An agent may invite and join; only a person at a terminal can remove a member, leave a network or
+change the relay: a command run from an agent's shell or tools is refused. It does not stop a
+program that you run yourself as your own user. The one prompt left is an agent's permission
+request that the Lightbulb app files (`lightbulb held`, `approve H<n>`).
 
 ## Loop limits
 
@@ -145,7 +145,7 @@ is `0600`):
 |---|---|
 | `identity.key` | This computer's secret key. |
 | `config.toml` | Settings (computer name, relay, `lan`, hidden folders). |
-| `state.db` | SQLite: the roster, sessions, messages, receipts, holds and their answers, policy. A message's text is deleted once nothing waits on it (read, refused or expired); messages to your own terminal keep theirs. |
+| `state.db` | SQLite: the roster, sessions, messages, receipts, permission prompts and their answers. A message's text is deleted once nothing waits on it (read, refused or expired); messages to your own terminal keep theirs. |
 | `daemon.log` | The log (see above). |
 | `addrs.json` | Teammates' last known network addresses. |
 | `sock`, `daemon.lock` | The service's socket and lock. |
@@ -157,8 +157,8 @@ How long things last:
 |---|---|
 | A message waiting for an offline computer | retried for 24 hours, then `expired` |
 | A message waiting on the receiving computer for its session, not picked up | 24 hours, then `expired` |
-| A held message with no answer | 7 days (sooner if its session has been gone for 24 hours) |
-| A one-time invite / a reusable or open invite | 24 hours / 7 days |
+| A permission prompt with no answer | 10 minutes (sooner if its session has ended) |
+| A one-time invite / a reusable invite | 24 hours / 7 days |
 | Answered join requests | kept 30 days |
 
 A message's text is deleted from `state.db` once nothing waits on it (read, refused or

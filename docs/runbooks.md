@@ -80,8 +80,7 @@ new invite line; give it only to people who should join. Check with `lightbulb t
 ### An invite line was seen by someone else
 
 A stolen invite line **can**: ask to join until it expires (7 days; 24 hours for `--once`). For
-a normal invite the inviter still has to click Allow. For an `--open` invite, it joins without
-asking.
+an invite, it joins without anyone being asked: an invite is the approval.
 
 It **cannot**: read messages, see sessions, or act as a member without being admitted.
 
@@ -90,14 +89,12 @@ members (the inviter and the founder).
 
 To end it:
 
-- A normal reusable invite: the inviter runs `lightbulb invite --new`. That ends their reusable
-  invite only.
-- An `--open` invite: `invite --new` is not enough. Any member removes another member
-  (that ends every live invite), or you wait out its 7 days.
+- A reusable invite: the inviter runs `lightbulb invite --new`. That ends every earlier invite of
+  their computer, one-time ones too. Any member removing another member also ends every live
+  invite.
 - A one-time invite: it ends when it is used, or after 24 hours. A `remove` ends it too.
 
-A later release makes `invite --new` end every invite of this computer. If an `--open` invite
-was used by someone you do not know, remove them: `lightbulb remove <name>`.
+If an invite was used by someone you do not know, remove them: `lightbulb remove <name>`.
 
 ## Bad release
 

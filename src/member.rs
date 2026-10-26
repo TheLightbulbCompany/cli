@@ -54,6 +54,8 @@ pub async fn run(opts: MemberOpts, token: String) -> Result<()> {
     let members = net_ops::gate_of(&file)
         .map_err(|()| "the sessions file's members must be null or a list of user id strings")?
         .flatten();
+    let revoked = net_ops::revoked_of(&file)
+        .map_err(|()| "the sessions file's revoked_keys must be a list of key strings")?;
     let relay = opts
         .relay
         .as_deref()
@@ -67,6 +69,7 @@ pub async fn run(opts: MemberOpts, token: String) -> Result<()> {
             name: opts.name,
             sessions,
             members,
+            revoked,
         },
     )
     .await?;

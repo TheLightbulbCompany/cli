@@ -22,7 +22,7 @@ async fn relay_server() -> (Server, String) {
     (server, url)
 }
 
-/// A founder whose dialogs Allow, and its invite's code.
+/// A founder and its invite's code.
 fn inviter(url: &str) -> (Env, String, Value) {
     let a = Env::new();
     a.daemon(
@@ -136,25 +136,7 @@ async fn five_bad_callers_close_the_listener() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_code_for_an_open_link_still_asks_the_inviter() {
-    let (_server, url) = relay_server().await;
-    let a = Env::new();
-    a.daemon(
-        false,
-        &format!("{}relay = \"{url}\"\n", computer("mac")),
-        &[dialog("Decline"), relay_only()],
-    );
-    let r = person(&a, json!({"id": 1, "op": "team.invite", "mode": "open"}));
-    let code = r["code"].as_str().expect("a code").to_string();
-    let r = join(&joiner(&url, "mbp"), &code);
-    assert_eq!(
-        r["reason"], "declined",
-        "an open link admits at once, a code asks: {r}"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_code_serves_a_single_use_ask_link_of_its_own() {
+async fn a_code_serves_a_single_use_link_of_its_own() {
     let (_server, url) = relay_server().await;
     let a = Env::new();
     a.daemon(
@@ -173,7 +155,7 @@ async fn a_code_serves_a_single_use_ask_link_of_its_own() {
     send.finish().unwrap();
     let served = String::from_utf8(recv.read_to_end(8192).await.unwrap()).unwrap();
     let t = lightbulb::ticket::decode(&served).unwrap();
-    assert_eq!(t.mode, "ask");
+    assert_eq!(t.mode, "open");
     assert_ne!(
         t.ticket_id, printed.ticket_id,
         "the code serves the printed link"

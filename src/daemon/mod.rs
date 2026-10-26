@@ -77,8 +77,9 @@ pub struct Daemon {
     pub dialogs: dialog::Queue,
     /// `dialogs`' answers, for the task that routes them (admission, holds) to take.
     pub dialog_answers: Mutex<Option<dialog::Answers>>,
-    /// The join requests waiting for their person's answer (`admission`).
-    pub admissions: crate::admission::Waiting,
+    /// Ticket id -> the agent session that minted that link: when it is used, its person is
+    /// told (Keep/Remove). In memory: a restart forgets the notice, never the invite.
+    pub agent_invites: Mutex<HashMap<String, String>>,
     /// Which surface answered each join request and hold (`J<n>`/`H<n>` -> `dialog`/`cli`),
     /// for the log and for `approve`'s "already answered" (in memory: what a person asks
     /// right after).
@@ -131,6 +132,8 @@ pub struct Declared {
     /// The people (Lightbulb user ids) whose computers may message these sessions, by their
     /// sign-in proof (`proof::admitted`); `None`: anyone the policy admits.
     pub members: Option<Arc<HashSet<String>>>,
+    /// Computers refused even with a valid proof (the backend's remote sign-out).
+    pub revoked: Arc<HashSet<String>>,
 }
 
 impl Cloud {
@@ -153,7 +156,12 @@ impl Cloud {
     }
 
     /// Makes `sessions` the declared list: its version.
-    pub fn set(&self, sessions: Vec<net::frames::Remote>, members: Option<HashSet<String>>) -> u64 {
+    pub fn set(
+        &self,
+        sessions: Vec<net::frames::Remote>,
+        members: Option<HashSet<String>>,
+        revoked: HashSet<String>,
+    ) -> u64 {
         let mut d = self.declared.lock().unwrap();
         let ids = sessions.iter().map(|s| s.session_id.clone()).collect();
         *d = Declared {
@@ -161,6 +169,7 @@ impl Cloud {
             sessions: Arc::new(sessions),
             ids: Arc::new(ids),
             members: members.map(Arc::new),
+            revoked: Arc::new(revoked),
         };
         d.version
     }

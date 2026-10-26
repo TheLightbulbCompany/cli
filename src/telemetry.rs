@@ -69,8 +69,6 @@ impl Via {
 pub struct Daily {
     pub messages_sent: u64,
     pub messages_received: u64,
-    pub holds_opened: u64,
-    pub holds_allowed: u64,
     pub computers_on_network: u64,
     /// Kinds of agent connected (`setup::AGENTS` names; anything else is dropped).
     pub agents: Vec<&'static str>,
@@ -115,8 +113,6 @@ pub fn build(event: &Event, install_id: &str) -> Value {
             let known = |a: &&str| setup::AGENTS.iter().any(|(n, _)| n == a);
             p["messages_sent"] = d.messages_sent.into();
             p["messages_received"] = d.messages_received.into();
-            p["holds_opened"] = d.holds_opened.into();
-            p["holds_allowed"] = d.holds_allowed.into();
             p["computers_on_network"] = d.computers_on_network.into();
             p["agents"] = d
                 .agents
@@ -332,12 +328,6 @@ fn daily_counts(d: &Daemon, since: i64) -> Daily {
             "SELECT COUNT(*) FROM messages WHERE origin LIKE 'net:%' AND sent_at > ?1",
             since,
         ),
-        holds_opened: count(d, "SELECT COUNT(*) FROM holds WHERE created_at > ?1", since),
-        holds_allowed: count(
-            d,
-            "SELECT COUNT(*) FROM holds WHERE state = 'allowed' AND created_at > ?1",
-            since,
-        ),
         computers_on_network: d.team.lock().unwrap().roster.members.len() as u64,
         agents,
     }
@@ -422,8 +412,6 @@ mod tests {
             with(&[
                 "agents",
                 "computers_on_network",
-                "holds_allowed",
-                "holds_opened",
                 "messages_received",
                 "messages_sent"
             ])

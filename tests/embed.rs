@@ -82,11 +82,6 @@ async fn join(i: &Instance, a: &Env) -> Value {
     let t = a.ask(json!({"id": 1, "op": "team.invite", "mode": "once"}));
     let ticket = t["ticket"].as_str().unwrap();
     let r = ok(i, "team.join", json!({"ticket": ticket, "name": NAME})).await;
-    let key = ok(i, "identity.get", json!({})).await["member_key"].clone();
-    let accept = json!({"id": 1, "op": "policy.set", "person_id": key, "value": "accept"});
-    if r["state"] == "admitted" {
-        assert_eq!(common::person(a, accept)["ok"], true);
-    }
     r
 }
 
@@ -207,7 +202,6 @@ async fn person_only_ops_are_refused_in_process() {
             "hold.file",
             json!({"kind": "permission", "session": "x", "prompt": "p"}),
         ),
-        ("policy.set", json!({"person_id": x, "value": "accept"})),
         ("share.grant", json!({"session": "x", "to": x})),
     ] {
         refused(&call(&i, op, body).await, "not_a_person");

@@ -188,13 +188,28 @@ fn remove_and_leave_from_an_agent_shell_are_refused() {
 }
 
 #[test]
-fn an_agent_shell_may_invite_in_every_mode() {
+fn an_agent_invite_is_always_one_time() {
     let e = Env::pinned();
     e.seed(false);
     assert!(e.run(&["team"]).status.success());
-    for mode in ["reusable", "once", "open"] {
+    for mode in ["reusable", "once", "new"] {
         let r = e.ask(json!({"id": 1, "op": "team.invite", "mode": mode}));
         assert_eq!(r["ok"], true, "{mode}: {r}");
+        assert_eq!(r["mode"], "once", "{mode}: {r}");
+    }
+}
+
+#[test]
+fn a_person_may_still_mint_reusable_and_once_links() {
+    let e = Env::new();
+    assert!(e.run(&["team"]).status.success());
+    for mode in ["reusable", "once"] {
+        let r = common::person(&e, json!({"id": 1, "op": "team.invite", "mode": mode}));
+        assert_eq!(
+            (r["ok"].as_bool(), r["mode"].as_str()),
+            (Some(true), Some(mode)),
+            "{r}"
+        );
     }
 }
 
@@ -293,55 +308,6 @@ fn a_computer_outside_the_roster_is_told_so() {
     let o = e.run(&["remove", "aden"]);
     assert_eq!(o.status.code(), Some(1));
     assert_eq!(err(&o).trim(), lightbulb::embed::KEY_MISMATCH);
-}
-
-#[test]
-fn policy_takes_a_teammates_name_and_lists_names() {
-    let e = Env::new();
-    e.seed(false);
-    let o = e.run(&["policy", "aden", "hold"]);
-    assert!(o.status.success(), "{}", err(&o));
-    let team = e.ask(json!({"id": 1, "op": "team.get"}));
-    let aden = team["members"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|m| m["name"] == "aden")
-        .unwrap()
-        .clone();
-    let line = format!(
-        "Messages from aden ({}): held for your Allow.",
-        aden["short"].as_str().unwrap()
-    );
-    assert!(out(&o).contains(&line), "{}", out(&o));
-    // Stored under aden's person id, the one `decide` looks up.
-    let p = e.ask(json!({"id": 1, "op": "policy.get"}));
-    assert_eq!(
-        p["people"][aden["person_id"].as_str().unwrap()],
-        "hold",
-        "{p}"
-    );
-    // By its short too, in any case for the name.
-    assert!(e.run(&["policy", "ADEN", "accept"]).status.success());
-    let short = aden["short"].as_str().unwrap();
-    assert!(e.run(&["policy", short, "refuse"]).status.success());
-    let o = e.run(&["policy", "nobody", "hold"]);
-    assert_eq!(o.status.code(), Some(1));
-    let e2 = err(&o);
-    assert!(
-        e2.starts_with("No teammate called \"nobody\". Teammates: ")
-            && e2.contains("prasiddha")
-            && e2.contains("aden")
-            && e2.trim_end().ends_with("(see lightbulb team)."),
-        "{e2}"
-    );
-    // An id no member has is refused, by the CLI and by the daemon.
-    assert_eq!(e.run(&["policy", "ws:w1", "accept"]).status.code(), Some(1));
-    let r = common::person(
-        &e,
-        json!({"id": 1, "op": "policy.set", "person_id": "aden", "value": "hold"}),
-    );
-    assert_eq!(r["error"], "not_found", "{r}");
 }
 
 #[test]

@@ -4,11 +4,11 @@ Every command, with the same options and arguments its `--help` lists (version 0
 `Usage:` line and `--help` line is the binary's own text; the rest says the same in plain words.
 Run `lightbulb <command> --help` for the full text in your terminal.
 
-Commands that change who is in the team or how it connects (`held`, `policy <person> <value>`,
-`remove`, `relay <url>`, `leave`) must be run by a person at a terminal, not by an agent. Run
-from an agent, they answer `Run this from your own terminal, not from an agent.` An agent may
-run `invite` (every mode), `join`, `approve` and `decline`; its session is recorded as the
-approver.
+Commands that change who is in the team or how it connects (`held`, `remove`, `relay <url>`,
+`leave`) must be run by a person at a terminal, not by an agent. Run from an agent, they answer
+`Run this from your own terminal, not from an agent.` An agent may run `invite` (always
+one-time; its person is told when it is used, with a Remove button), `join`, `approve` and
+`decline`.
 
 ## Getting started
 
@@ -64,10 +64,9 @@ for 7 days). After `--new` it says `Every earlier invite from this computer stop
 
 | Option | Meaning |
 |---|---|
-| `--new` | A new invite; every earlier one from this computer (open ones too) stops working. |
+| `--new` | A new invite; every earlier one from this computer stops working. |
 | `--once` | An invite for one join, valid 24 hours. |
-| `--open` | An invite whose joins need no Allow |
-| `--agents` | Add your Lightbulb workspace's agents to this network. You must be a workspace admin, signed in here with `lightbulb login`: confirm in the browser, then allow the workspace when this computer asks. |
+| `--agents` | Add your Lightbulb workspace's agents to this network. You must be a workspace admin, signed in here with `lightbulb login`: confirm in the browser, and the workspace joins. |
 
 ### join
 
@@ -120,7 +119,7 @@ lightbulb send [OPTIONS] <TARGET> <TEXT>...
 (for example `sam/inbox`, where `sam` is a teammate's name), `*` for every open session on
 this computer, or `<member>/*` (for example `'sam/*'`) for each of that teammate's sessions as
 `who --all` lists them. The rest of the line is the text. It prints the receipt, for example
-`Sent. sam has to allow it first (they see a prompt). Check: lightbulb receipt <id>`.
+`Sent. Check: lightbulb receipt <id>`.
 
 | Option | Meaning |
 |---|---|
@@ -158,7 +157,7 @@ lightbulb receipt [OPTIONS] <REQUEST_ID>
 
 `--help`: Print the receipt of a message sent from this terminal (or `--from` another address).
 
-Prints the receipt of a message sent from this terminal. States: `queued`, `held`, `stored`,
+Prints the receipt of a message sent from this terminal. States: `queued`, `stored`,
 `delivered`, `read`, `refused`, `expired`.
 
 | Option | Meaning |
@@ -168,38 +167,36 @@ Prints the receipt of a message sent from this terminal. States: `queued`, `held
 
 ### held
 
-When you use it: to see what waits for your Allow.
+When you use it: to see the permission prompts the Lightbulb app filed for you to answer.
 
 ```
 lightbulb held
 ```
 
-`--help`: The join requests and held messages waiting for your Allow.
+`--help`: The permission prompts waiting for your answer.
 
-Lists join requests (`J<n>`) and held messages (`H<n>`), each with the command that allows it.
+Lists them as `H<n>`, each with the command that answers it. Joins and messages never wait
+here: an invite is the approval, and everyone on the network is trusted.
 
 ### approve
 
-When you use it: to allow a join request or a held message.
+When you use it: to allow a permission prompt.
 
 ```
 lightbulb approve <REQUEST>
 ```
 
-`--help`: Allow a join request (`J<n>`) or a held message (`H<n>`).
-
-`<REQUEST>` is `J<n>` or `H<n>` from `held`. Allowing a held message from a teammate's computer
-also lets that person's later messages through.
+`--help`: Allow a permission prompt (`H<n>`).
 
 ### decline
 
-When you use it: to refuse a join request or a held message.
+When you use it: to refuse a permission prompt.
 
 ```
 lightbulb decline <REQUEST>
 ```
 
-`--help`: Decline a join request (`J<n>`) or a held message (`H<n>`).
+`--help`: Decline a permission prompt (`H<n>`).
 
 ## Team
 
@@ -261,19 +258,6 @@ lightbulb logout
 
 Deletes this computer's sign-in proof and drops its connection for hosted apps; workspaces stop
 answering it on their next connection to it.
-
-### policy
-
-When you use it: to choose who may message your sessions without asking.
-
-```
-lightbulb policy [PERSON] [VALUE]
-```
-
-`--help`: Who may message your sessions; with a person and a value, sets it.
-
-With no arguments, shows the policy. `<PERSON>` is a teammate's name or short address, as
-`team` shows it.
 
 ### folder
 

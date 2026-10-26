@@ -43,8 +43,6 @@ fn seed(dir: &Path) -> Identity {
     for e in [&g, &aw] {
         roster::accept(&store, e, 10).unwrap();
     }
-    let accept = lightbulb::policy::Verdict::Accept;
-    lightbulb::policy::set_person(&store, &a.key, accept, "local", 1).unwrap();
     a
 }
 
@@ -553,10 +551,9 @@ fn rings(dir: &Path) -> Vec<Vec<String>> {
 fn rang(dir: &Path, a: &common::Env, child: Child, token: &str, sock: &Path) -> String {
     let to = format!("{}/friday", short(sock, token));
     let from = common::session(a, "c1");
-    // Up: it reaches the member over the connection (held there: A is no one it knows), no
-    // doorbell.
+    // Up: it reaches the member over the connection (stored there), no doorbell.
     a.send(&from, &to, "while up", "r1", None);
-    common::until(10, "on the member", || a.state(&from, "r1") == "held");
+    common::until(10, "on the member", || a.state(&from, "r1") == "stored");
     ok(sock, token, "stop", json!({}));
     exits_zero(child);
     assert!(rings(dir).is_empty(), "rang while the member was up");
@@ -805,4 +802,40 @@ fn a_bad_members_in_the_sessions_file_is_a_startup_error() {
     let out = child.wait_with_output().unwrap();
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("members"));
+}
+
+/// A key in `revoked_keys` is refused even with a valid proof of an admitted person; an absent
+/// field is an empty list.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revoked_key_is_refused_even_with_a_valid_proof() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = seed(dir.path());
+    let file = json!({"workspace": NAME, "sessions": friday(), "members": ["user_a"],
+        "revoked_keys": [a.key]});
+    let (child, token, sock) = common::member_with(dir.path(), file);
+    let (mut pa, _ep) = dial_as(&sock, &token, &a, Some("user_a")).await;
+    let to = format!("{}/friday", short(&sock, &token));
+    let (_, state, reason) = send_acked(&mut pa, &a, &to, "no").await;
+    assert_eq!(
+        (state.as_str(), reason.as_deref()),
+        ("refused", Some("not_a_member"))
+    );
+    // Reloaded without the field: nobody is revoked.
+    ok(
+        &sock,
+        &token,
+        "cloud.sessions.set",
+        json!({"sessions": friday(), "members": ["user_a"]}),
+    );
+    assert_eq!(send(&mut pa, &a, &to, "yes").await.1, "stored");
+    // A bad list changes nothing.
+    let r = common::line(
+        &sock,
+        &token,
+        "cloud.sessions.set",
+        json!({"sessions": friday(), "revoked_keys": "all"}),
+    );
+    assert_eq!(r["error"], "bad_request", "{r}");
+    ok(&sock, &token, "stop", json!({}));
+    exits_zero(child);
 }

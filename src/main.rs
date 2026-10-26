@@ -25,8 +25,8 @@ Everyday:
   send      Send a message: send codex-1 \"hi\", or to a name: send demo2/inbox \"hi\"
   listen    Print the messages sent to a name: listen --as inbox
   receipt   Whether a message you sent arrived: receipt <id>
-  held      Join requests and messages waiting for your Allow
-  approve   Allow one: approve J1, approve H1
+  held      Permission prompts waiting for your answer
+  approve   Allow one: approve H1
   decline   Decline one: decline H1
 
 Team:
@@ -35,7 +35,6 @@ Team:
   leave     Leave the team
   login     Sign this computer in to Lightbulb, so your workspace's agents answer it
   logout    Sign this computer out
-  policy    Who may message your sessions without asking
   folder    Show or hide the sessions in a folder from your teammates: folder <path> on|off
   relay     The relays used when no direct path exists; relay <url> sets yours
 
@@ -109,18 +108,15 @@ enum Command {
     Doctor,
     /// Print this computer's join line (the reusable invite, unless a flag says otherwise).
     Invite {
-        /// A new invite; every earlier one from this computer (open ones too) stops working.
-        #[arg(long, conflicts_with_all = ["once", "open"])]
+        /// A new invite; every earlier one from this computer stops working.
+        #[arg(long, conflicts_with = "once")]
         new: bool,
         /// An invite for one join, valid 24 hours.
-        #[arg(long, conflicts_with = "open")]
-        once: bool,
-        /// An invite whose joins need no Allow.
         #[arg(long)]
-        open: bool,
+        once: bool,
         /// Add your Lightbulb workspace's agents to this network (a workspace admin, signed in
-        /// with `lightbulb login`): confirm in the browser, then allow the workspace here.
-        #[arg(long, conflicts_with_all = ["new", "once", "open"])]
+        /// with `lightbulb login`): confirm in the browser, and the workspace joins.
+        #[arg(long, conflicts_with_all = ["new", "once"])]
         agents: bool,
     },
     /// Sign this computer in to Lightbulb (confirm in the browser): your workspace's agents
@@ -155,18 +151,12 @@ enum Command {
         #[arg(long, value_parser = ["on", "off"], conflicts_with = "version")]
         auto: Option<String>,
     },
-    /// Allow a join request (`J<n>`) or a held message (`H<n>`).
+    /// Allow a permission prompt (`H<n>`).
     Approve { request: String },
-    /// Decline a join request (`J<n>`) or a held message (`H<n>`).
+    /// Decline a permission prompt (`H<n>`).
     Decline { request: String },
-    /// The join requests and held messages waiting for your Allow.
+    /// The permission prompts waiting for your answer.
     Held,
-    /// Who may message your sessions; with a person and a value, sets it.
-    Policy {
-        person: Option<String>,
-        /// accept, hold or refuse.
-        value: Option<String>,
-    },
     /// Anonymous usage counts: `on`, `off`, or (no argument) their state.
     Telemetry {
         #[arg(value_parser = ["on", "off", "status"])]
@@ -302,12 +292,9 @@ fn run() -> lightbulb::Result<()> {
         Command::Invite { agents: true, .. } => exit(cli::invite_agents()?),
         Command::Login => exit(lightbulb::login::login()?),
         Command::Logout => exit(lightbulb::login::logout()?),
-        Command::Invite {
-            new, once, open, ..
-        } => exit(cli::invite(match (new, once, open) {
-            (true, ..) => Invite::New,
-            (_, true, _) => Invite::Once,
-            (.., true) => Invite::Open,
+        Command::Invite { new, once, .. } => exit(cli::invite(match (new, once) {
+            (true, _) => Invite::New,
+            (_, true) => Invite::Once,
             _ => Invite::Reusable,
         })?),
         Command::Team => exit(cli::team()?),
@@ -328,7 +315,6 @@ fn run() -> lightbulb::Result<()> {
         Command::Approve { request } => exit(cli::answer(&request, true)?),
         Command::Decline { request } => exit(cli::answer(&request, false)?),
         Command::Held => exit(cli::held()?),
-        Command::Policy { person, value } => exit(cli::policy(person, value)?),
         Command::Telemetry { state } => exit(lightbulb::telemetry::command(
             &lightbulb::paths::state_dir(),
             state.as_deref().filter(|s| *s != "status"),

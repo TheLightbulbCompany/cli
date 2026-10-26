@@ -1135,12 +1135,8 @@ fn receive(d: &Arc<Daemon>, key: &str, env: &Frame, tx: &Tx) {
             state,
             reason,
             limit,
-            held,
             fresh,
         }) => {
-            if let Some(h) = held {
-                holds::shown(d, &team.roster, &store, &h);
-            }
             eprintln!("net: envelope {id} from {short}: {}", state.name());
             ack(state, reason, limit);
             if state == State::Stored {

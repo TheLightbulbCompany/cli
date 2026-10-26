@@ -4,7 +4,7 @@
 //! `join_decision`, followed after an allow by the whole roster in `roster` pages. The
 //! candidate checks every entry itself before that roster replaces its solo one.
 
-use crate::daemon::ipc::{self, Response, BAD_REQUEST, INTERNAL, NOT_FOUND, UNSUPPORTED};
+use crate::daemon::ipc::{self, Response, BAD_REQUEST, INTERNAL, UNSUPPORTED};
 use crate::daemon::TeamState;
 use crate::daemon::{net_ops, user_name, Daemon};
 use crate::dialog;
@@ -18,11 +18,8 @@ use data_encoding::HEXLOWER;
 use iroh::endpoint::{Connection, SendStream, VarInt};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
-use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::oneshot;
 
 pub const NOT_OPEN: &str = "not_open";
 pub const ALREADY_IN_TEAM: &str = "already_in_team";
@@ -78,16 +75,6 @@ fn words(v: Verdict) -> (&'static str, &'static str) {
     }
 }
 
-/// A request waiting for its person's answer (the dialog or `team.admit`), and the connection
-/// task to tell.
-pub struct Pending {
-    req: Box<Request>,
-    tx: oneshot::Sender<Verdict>,
-}
-
-/// The waiting requests by row id (`J<id>`). First answer wins: whoever takes the entry.
-pub type Waiting = Mutex<HashMap<i64, Pending>>;
-
 #[derive(Clone)]
 pub struct Request {
     ticket: Ticket,
@@ -120,18 +107,6 @@ impl Request {
             computer: computer.clone(),
         })
     }
-}
-
-/// What the person is asked about request `n` (`req`): plain text (`check` let only that in),
-/// and the command that answers it too.
-fn prompt(req: &Request, n: i64) -> String {
-    let ask = join_text(&req.name, &req.computer);
-    format!("{ask}\nOr run: {} approve J{n}", crate::cli::command())
-}
-
-/// The join dialog's words for a candidate called `name` on computer `computer`.
-fn join_text(name: &str, computer: &str) -> String {
-    format!("{name} (computer \"{computer}\") wants to join your team using your invite link. Allow only if you sent them the link.")
 }
 
 /// What a `join_request` proves it holds: hex sha256(secret ‖ candidate).
@@ -206,14 +181,7 @@ pub async fn serve(d: Arc<Daemon>, conn: Connection) {
         );
         return tell(&d, &conn, send, &ticket_id, &peer, Ok(())).await;
     }
-    let verdict = match open(&d, &req) {
-        Err(r) => Some(Err(r)),
-        Ok((_, Some(v))) => Some(v),
-        Ok((n, None)) => wait(&d, conn.closed(), n, req).await,
-    };
-    let Some(verdict) = verdict else {
-        return conn.close(VarInt::from_u32(0), b"");
-    };
+    let verdict = open(&d, &req).map_or_else(Err, |(_, v)| v);
     if let Err(r) = verdict {
         eprintln!("join: refused {} ({r})", net::short(&peer));
     }
@@ -222,7 +190,7 @@ pub async fn serve(d: Arc<Daemon>, conn: Connection) {
 
 /// Checks `req` and stores it as an `open` row within the limits; an `open` link's request is
 /// admitted at once, under the same locks. Its row id, and its verdict when decided already.
-fn open(d: &Daemon, req: &Request) -> Result<(i64, Option<Verdict>), &'static str> {
+fn open(d: &Daemon, req: &Request) -> Result<(i64, Verdict), &'static str> {
     let mut team = d.team.lock().unwrap();
     let store = d.store.lock().unwrap();
     let now = ipc::now() as i64;
@@ -241,17 +209,26 @@ fn open(d: &Daemon, req: &Request) -> Result<(i64, Option<Verdict>), &'static st
     if all >= LIMITS.0 || by_inviter >= LIMITS.1 || by_candidate >= LIMITS.2 {
         return Err(TOO_MANY);
     }
-    // An `open` link never waits for an Allow. (A code serves a once `ask` link of its own,
-    // `code::offer`.)
-    let ask = req.ticket.mode != "open";
+    // An invite is the approval: nobody is asked. (If an agent minted the link, its person is
+    // told afterwards and may remove the member.)
+    let by = d
+        .agent_invites
+        .lock()
+        .unwrap()
+        .remove(&req.ticket.ticket_id);
     let n = store.put_join(&row(req, now)).map_err(fail)?;
-    eprintln!("join: J{n} open for {}", net::short(&req.candidate));
-    if ask {
-        return Ok((n, None));
-    }
-    let v = try_admit(d, &mut team, &store, n, req, once, None, now);
+    eprintln!("join: J{n} for {}", net::short(&req.candidate));
+    let v = try_admit(d, &mut team, &store, n, req, once, by.as_deref(), now);
     close(&store, n, v);
-    Ok((n, Some(v)))
+    if v.is_ok() {
+        if let Some(by) = &by {
+            let who = crate::label::render(&team.roster, &d.identity.key, by);
+            let text = format!("{who} invited {} into your network.", req.name);
+            let args = dialog::args("Lightbulb", &text, &["Keep", "Remove"]);
+            d.dialogs.show(&format!("AR:{}", req.candidate), args);
+        }
+    }
+    Ok((n, v))
 }
 
 /// `req`'s `join_requests` row, made at `now`.
@@ -350,88 +327,6 @@ fn close(store: &Store, n: i64, v: Verdict) {
     eprintln!("join: J{n} {state}");
 }
 
-/// The person allowed request `n`: checked again (the roster may have moved), then admitted.
-fn admit(d: &Daemon, n: i64, req: &Request, by: Option<&str>) -> Verdict {
-    let mut team = d.team.lock().unwrap();
-    let store = d.store.lock().unwrap();
-    let now = ipc::now() as i64;
-    let v = check(&team.roster, &store, req, &d.identity.key, now)
-        .and_then(|once| try_admit(d, &mut team, &store, n, req, once, by, now));
-    close(&store, n, v);
-    v
-}
-
-/// Shows request `n` to the person and waits for an answer (dialog or `team.admit`), the
-/// candidate to hang up (`gone`), or the wait to run out (`not_answered`); `None` when the
-/// candidate is gone.
-async fn wait(d: &Daemon, gone: impl Future, n: i64, req: Request) -> Option<Verdict> {
-    let (tx, rx) = oneshot::channel();
-    let text = prompt(&req, n);
-    // Before the dialog: a headless one answers at once.
-    d.admissions.lock().unwrap().insert(
-        n,
-        Pending {
-            req: Box::new(req),
-            tx,
-        },
-    );
-    let buttons = ["Decline", "Allow"];
-    d.dialogs
-        .show(&format!("J{n}"), dialog::args("Lightbulb", &text, &buttons));
-    answered(d, n, rx, gone, d.peers.knobs().join_wait).await
-}
-
-/// Request `n`'s answer on `rx`, unless the candidate hangs up (`gone`, then `None`) or `wait`
-/// passes (`not_answered`): a request given up on leaves `admissions` (its dialog withdrawn,
-/// its open row `expired`) unless an answer took it first, whose verdict is then on the way.
-async fn answered(
-    d: &Daemon,
-    n: i64,
-    mut rx: oneshot::Receiver<Verdict>,
-    gone: impl Future,
-    wait: Duration,
-) -> Option<Verdict> {
-    let gone = tokio::select! {
-        v = &mut rx => return v.ok(),
-        _ = gone => true,
-        _ = tokio::time::sleep(wait) => false,
-    };
-    if d.admissions.lock().unwrap().remove(&n).is_none() {
-        return rx.await.ok();
-    }
-    d.dialogs.withdraw(&format!("J{n}"));
-    let _ = d.store.lock().unwrap().close_join(n, "expired");
-    eprintln!("join: J{n} expired");
-    (!gone).then_some(Err(NOT_ANSWERED))
-}
-
-/// The person's answer to request `n`, from `surface` (`dialog`, or `cli` for `team.admit`):
-/// its name and verdict, or `None` when it is not waiting here (answered, or its candidate
-/// gone).
-fn answer(
-    d: &Daemon,
-    n: i64,
-    allow: bool,
-    surface: &'static str,
-    by: Option<&str>,
-) -> Option<(String, Verdict)> {
-    let Pending { req, tx } = d.admissions.lock().unwrap().remove(&n)?;
-    d.dialogs.withdraw(&format!("J{n}"));
-    d.answered_by
-        .lock()
-        .unwrap()
-        .insert(format!("J{n}"), surface);
-    eprintln!("join: J{n} answered from the {surface}");
-    let v = if allow {
-        admit(d, n, &req, by)
-    } else {
-        close(&d.store.lock().unwrap(), n, Err(DECLINED));
-        Err(DECLINED)
-    };
-    let _ = tx.send(v);
-    Some((req.name, v))
-}
-
 /// Sends the signed decision (after an allow, the whole roster), then waits for the candidate
 /// to close.
 async fn tell(
@@ -480,66 +375,15 @@ pub async fn route(d: Arc<Daemon>) {
     };
     while let Some((id, button)) = answers.recv().await {
         let Some(b) = button else { continue };
-        if let Some(n) = dialog::number(&id, 'J') {
-            answer(&d, n, b == "Allow", "dialog", None);
-        } else if let Some(n) = dialog::number(&id, 'H') {
+        if let Some(n) = dialog::number(&id, 'H') {
             crate::holds::on_dialog(&d, n, &b);
+        } else if let Some(key) = id.strip_prefix("AR:") {
+            if b == "Remove" {
+                net_ops::remove_member(&d, key);
+            }
         } else {
             eprintln!("dialog {id}: nothing waits for it");
         }
-    }
-}
-
-/// `team.join_requests {}` -> `{requests: [{id, candidate, name, computer, created_at}]}`:
-/// the open ones.
-pub fn requests_op(id: u64, d: &Daemon) -> Response {
-    match d.store.lock().unwrap().open_joins() {
-        Ok(rows) => {
-            let requests: Vec<Value> = rows
-                .iter()
-                .map(|j| {
-                    json!({"id": format!("J{}", j.id), "candidate": j.candidate, "name": j.name,
-                        "computer": j.computer, "created_at": j.created_at})
-                })
-                .collect();
-            Response::ok(id, json!({ "requests": requests }))
-        }
-        Err(_) => Response::err(id, INTERNAL),
-    }
-}
-
-/// `team.admit {request: "J<n>", verdict: "allow"|"decline"}` -> `{name, state, reason?}`
-/// (`by`: the agent session that answered, if one did); `not_open` once it was answered or its candidate gave up.
-pub fn admit_op(id: u64, body: &Value, d: &Daemon, by: Option<String>) -> Response {
-    let allow = match body["verdict"].as_str() {
-        Some("allow") => true,
-        Some("decline") => false,
-        _ => return Response::err(id, BAD_REQUEST),
-    };
-    let Some(n) = body["request"]
-        .as_str()
-        .and_then(|r| dialog::number(r, 'J'))
-    else {
-        return Response::err(id, BAD_REQUEST);
-    };
-    match answer(d, n, allow, "cli", by.as_deref()) {
-        Some((name, v)) => {
-            if let Some(by) = &by {
-                eprintln!("join: J{n} answered by {by}");
-            }
-            Response::ok(
-                id,
-                json!({"name": name, "state": words(v).1, "reason": v.err(), "by": by}),
-            )
-        }
-        None => match d.store.lock().unwrap().join_exists(n) {
-            Ok(true) => {
-                let by = d.answered_by.lock().unwrap().get(&format!("J{n}")).copied();
-                Response::err_with(id, NOT_OPEN, json!({ "answered_in": by }))
-            }
-            Ok(false) => Response::err(id, NOT_FOUND),
-            Err(_) => Response::err(id, INTERNAL),
-        },
     }
 }
 
@@ -803,17 +647,4 @@ fn take_roster(d: &Daemon, entries: &[Entry], team_id: &str) -> crate::Result<bo
     tx.commit()?;
     net_ops::install(d, &mut team, &store, new)?;
     Ok(true)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_join_dialog_says_who_from_where_and_how_they_got_in() {
-        assert_eq!(
-            join_text("demo2", "demo-laptop"),
-            "demo2 (computer \"demo-laptop\") wants to join your team using your invite link. Allow only if you sent them the link."
-        );
-    }
 }

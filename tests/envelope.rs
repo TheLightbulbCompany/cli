@@ -4,7 +4,6 @@
 
 use lightbulb::identity::Identity;
 use lightbulb::net::frames::Frame;
-use lightbulb::policy;
 use lightbulb::roster::{self, Entry};
 use serde_json::json;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -24,13 +23,11 @@ fn wait_state(e: &Env, from: &str, rid: &str, want: &str) {
 }
 
 /// `who` admitted into `e`'s stored team as "carol" (computer "cmac"), signed by the founder
-/// `founder`; `e` already allows carol's mail (`people` accept).
+/// `founder`.
 fn admit(e: &Env, founder: &Identity, parent: &Entry, who: &Identity) -> Entry {
     let entry = common::admit(founder, parent, who, "carol", json!({"computer": "cmac"}));
     let store = e.store();
     assert!(roster::accept(&store, &entry, 10).unwrap());
-    let accept = policy::Verdict::Accept;
-    policy::set_person(&store, &who.key, accept, "local", 1).unwrap();
     entry
 }
 
@@ -216,9 +213,8 @@ async fn outbox_survives_restart_and_dedupes() {
 /// that was in flight is still queued and is sent again, the hold is still open and its
 /// Allow delivers, the stored message is still unread, and each receipt reads as before.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_kill_9_loses_no_outbox_row_hold_or_receipt() {
+async fn a_kill_9_loses_no_outbox_row_or_receipt() {
     let (a, b) = (Env::new(), Env::new());
-    // B's person is not allowed on A: its message is held.
     common::seed_team(&a, &b);
     a.daemon(false, "", &[common::dialog("")]);
     let ep = endpoint(&b.identity()).await;
@@ -226,10 +222,10 @@ async fn a_kill_9_loses_no_outbox_row_hold_or_receipt() {
     p.hello(vec![]).await;
     until(5, "B online", || a.status()["peers"]["online"] == 1);
     let (sa, sb, sc) = (session(&a, "a1"), session(&b, "b1"), session(&a, "c1"));
-    let held = ulid();
-    p.send(&envelope(&held, "h1", &sb, &sa, "held across a crash"))
+    let stored = ulid();
+    p.send(&envelope(&stored, "h1", &sb, &sa, "stored across a crash"))
         .await;
-    assert_eq!(p.ack(&held).await, ("held".into(), None));
+    assert_eq!(p.ack(&stored).await, ("stored".into(), None));
     a.send(&sa, &sb, "in flight", "r1", None);
     let (in_flight, ..) = p.envelope().await; // never acked
     assert_eq!(a.send(&sc, &sa, "waiting", "r2", None)["state"], "stored");
@@ -247,10 +243,7 @@ async fn a_kill_9_loses_no_outbox_row_hold_or_receipt() {
     a.daemon(false, "", &[common::dialog("")]);
     assert_eq!(a.state(&sa, "r1"), "queued");
     assert_eq!(a.state(&sc, "r2"), "stored");
-    assert_eq!(a.unread(&sa), 1);
-    let holds = person(&a, json!({"id": 1, "op": "holds"}))["holds"].clone();
-    assert_eq!(holds.as_array().map(Vec::len), Some(1), "{holds}");
-    assert_eq!(holds[0]["preview"], "held across a crash");
+    assert_eq!(a.unread(&sa), 2);
 
     // B comes back: the in-flight envelope is sent again under its id, and acked.
     let ep = endpoint(&b.identity()).await;
@@ -259,20 +252,11 @@ async fn a_kill_9_loses_no_outbox_row_hold_or_receipt() {
     assert_eq!(p.envelope().await.0, in_flight);
     p.answer(true, &in_flight, "stored").await;
     wait_state(&a, &sa, "r1", "stored");
-    let r = person(
-        &a,
-        json!({"id": 1, "op": "hold.answer", "hold": holds[0]["id"], "verdict": "allow"}),
-    );
-    assert_eq!(r["ok"], true, "{r}");
-    p.recv_where(
-        |f| matches!(f, Frame::Receipt { id, state, .. } if *id == held && state == "stored"),
-    )
-    .await;
     assert_eq!(a.unread(&sa), 2);
 }
 
 /// A peer whose clock is wrong moves no deadline here. Its `sent_at` (30 days ahead) is
-/// ignored: the hold, the message and its 24 h mailbox expiry are timed by arrival on this
+/// ignored: the message and its 24 h mailbox expiry are timed by arrival on this
 /// clock. Its `presence` seq is its own clock's milliseconds: one more than a day ahead is
 /// dropped, so it cannot freeze its later presences behind a seq this clock will not reach.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -311,21 +295,12 @@ async fn a_skewed_peer_clock_sets_no_deadline_here() {
         *sent_at = t0 + 30 * 86_400;
     }
     p.send(&f).await;
-    assert_eq!(p.ack(&id).await.0, "held");
+    assert_eq!(p.ack(&id).await.0, "stored");
     let db = a.state.path().join("state.db");
-    let held_at = common::count(&db, "SELECT created_at FROM holds");
-    assert!((t0..=secs()).contains(&held_at), "{held_at} vs {t0}");
-    let holds = person(&a, json!({"id": 1, "op": "holds"}))["holds"].clone();
-    let r = person(
-        &a,
-        json!({"id": 1, "op": "hold.answer", "hold": holds[0]["id"], "verdict": "allow"}),
-    );
-    assert_eq!(r["ok"], true, "{r}");
     until(5, "stored", || a.unread(&sa) == 1);
     let sent = common::count(&db, "SELECT sent_at FROM messages");
     let expires = common::count(&db, "SELECT expires_at FROM mailbox");
     assert!((t0..=secs()).contains(&sent), "{sent} vs {t0}");
-    // Held: the expiry is stamped at Allow (holds.rs), `sent_at` at arrival — up to a second apart.
     assert!(
         (sent + 86_400..=sent + 86_400 + 5).contains(&expires),
         "{expires} vs {sent}"

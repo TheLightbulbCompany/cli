@@ -174,7 +174,7 @@ fn a_refusal_is_the_backends_sentence_and_no_identity_is_a_setup_hint() {
 }
 
 #[test]
-fn invite_agents_hands_the_backend_a_once_ask_link_under_this_computers_signature() {
+fn invite_agents_hands_the_backend_a_once_link_under_this_computers_signature() {
     fn agents(path: &str, body: &Value, n: usize) -> (u16, Value) {
         match path {
             "/network/device/poll" => (200, json!({"status": "approved", "workspaceName": "Acme"})),
@@ -194,7 +194,7 @@ fn invite_agents_hands_the_backend_a_once_ask_link_under_this_computers_signatur
     );
     let text = common::out(&out);
     assert!(out.status.success(), "{text}{}", common::err(&out));
-    assert!(text.contains("Acme is joining"), "{text}");
+    assert!(text.contains("Acme is joining this network"), "{text}");
     let seen = seen.lock().unwrap();
     let (_, start) = seen
         .iter()
@@ -209,7 +209,7 @@ fn invite_agents_hands_the_backend_a_once_ask_link_under_this_computers_signatur
     let t = lightbulb::ticket::decode(ticket).unwrap();
     assert_eq!(
         (t.mode.as_str(), t.inviter.as_str()),
-        ("ask", me.key.as_str())
+        ("open", me.key.as_str())
     );
     let r = lightbulb::roster::replay(&lightbulb::roster::entries(&e.store()).unwrap());
     assert!(r.links[&t.ticket_id].once, "a once link");
@@ -225,7 +225,7 @@ fn invite_agents_hands_the_backend_a_once_ask_link_under_this_computers_signatur
 }
 
 #[test]
-fn a_sign_in_past_its_ninety_days_says_sign_in_again() {
+fn an_expired_sign_in_says_sign_in_again_and_its_age_does_not() {
     let e = Env::new();
     let key = e.identity().key;
     let now = common::now_s();
@@ -240,7 +240,8 @@ fn a_sign_in_past_its_ninety_days_says_sign_in_again() {
         !lightbulb::login::ended(dir, now),
         "not signed in: nothing ended"
     );
-    for (token, ended) in [(ok, false), (old, true), (expired, true)] {
+    // The browser login's age is the account server's to judge at renewal, not ours.
+    for (token, ended) in [(ok, false), (old, false), (expired, true)] {
         lightbulb::login::save(dir, &json!({ "proof": token })).unwrap();
         assert_eq!(lightbulb::login::ended(dir, now), ended);
     }

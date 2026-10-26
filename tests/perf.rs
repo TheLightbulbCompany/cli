@@ -7,7 +7,7 @@
 mod common;
 
 use common::{computer, members, person, until, Env};
-use lightbulb::{os, policy};
+use lightbulb::os;
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 
@@ -94,14 +94,6 @@ fn twenty_computers_fifty_sessions() {
     let wall = Instant::now();
     let team = Team((0..N).map(|_| Env::new()).collect());
     let envs = &team.0;
-    // Every person allows every other before any daemon starts, so no message is held.
-    let keys: Vec<String> = envs.iter().map(|e| e.identity().key).collect();
-    for e in envs {
-        let store = e.store();
-        for k in &keys {
-            policy::set_person(&store, k, policy::Verdict::Accept, "local", 1).unwrap();
-        }
-    }
 
     // `lan = true` with no PEERS: each daemon is found through its loopback file.
     for (i, e) in envs.iter().enumerate() {
