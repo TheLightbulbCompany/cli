@@ -13,14 +13,16 @@ use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ListToolsResult,
     PaginatedRequestParams, RequestMetaObject,
 };
-use rmcp::service::RequestContext;
+use rmcp::service::{Peer, RequestContext};
 use rmcp::{ErrorData, RoleServer, ServerHandler, ServiceExt};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
@@ -28,16 +30,43 @@ use tokio::net::UnixStream;
 pub fn run(name: String) -> crate::Result<()> {
     daemon::ensure_running()?;
     tokio::runtime::Runtime::new()?.block_on(async {
-        Server {
+        let signed = Arc::new(AtomicBool::new(signed_in()));
+        let service = Server {
             me: OnceLock::new(),
             name,
+            signed: signed.clone(),
         }
         .serve(rmcp::transport::stdio())
-        .await?
-        .waiting()
         .await?;
+        // A sign-in that ends (or a login, logout) with no request in between still shows.
+        let peer = service.peer().clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(poll()).await;
+                changed(&signed, &peer).await;
+            }
+        });
+        service.waiting().await?;
         Ok(())
     })
+}
+
+/// How often the sign-in is checked between requests. Debug builds:
+/// `LIGHTBULB_CONNECT_DEBUG_TOOLS_POLL_MS` (tests).
+fn poll() -> Duration {
+    let ms = std::env::var("LIGHTBULB_CONNECT_DEBUG_TOOLS_POLL_MS")
+        .ok()
+        .filter(|_| cfg!(debug_assertions))
+        .and_then(|v| v.parse().ok());
+    Duration::from_millis(ms.unwrap_or(30_000))
+}
+
+/// Tells the client its tool list changed when the sign-in state differs from `signed`'s.
+async fn changed(signed: &AtomicBool, peer: &Peer<RoleServer>) {
+    let now = signed_in();
+    if signed.swap(now, Ordering::SeqCst) != now {
+        let _ = peer.notify_tool_list_changed().await;
+    }
 }
 
 struct Server {
@@ -45,6 +74,8 @@ struct Server {
     me: OnceLock<Process>,
     /// The name this server advertises (`mcp --server-name`).
     name: String,
+    /// Whether the tools last listed held the workspace tools (`changed`).
+    signed: Arc<AtomicBool>,
 }
 
 /// The tools: `[{name, description, inputSchema, scope: "network"|"workspace"}]`. `mcp
@@ -731,6 +762,7 @@ impl ServerHandler for Server {
         rmcp::model::ServerConfig::new(
             rmcp::model::ServerCapabilities::builder()
                 .enable_tools()
+                .enable_tool_list_changed()
                 .build(),
         )
         .with_server_info(rmcp::model::Implementation::new(
@@ -747,6 +779,7 @@ impl ServerHandler for Server {
         _: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
         let workspace = signed_in();
+        self.signed.store(workspace, Ordering::SeqCst);
         let tools: Vec<Value> = spec()
             .iter()
             .filter(|t| workspace || t["scope"] == "network")
@@ -764,6 +797,7 @@ impl ServerHandler for Server {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        changed(&self.signed, &context.peer).await;
         let args = Value::Object(request.arguments.unwrap_or_default());
         Ok(self.call(&request.name, args, context.meta).await.into())
     }

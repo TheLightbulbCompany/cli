@@ -99,6 +99,7 @@ impl Net {
             lines: BufReader::new(child.stdout.take().unwrap()).lines(),
             child,
             next: 1,
+            seen: vec![],
         };
         let init = m.rpc(
             "initialize",
@@ -110,6 +111,7 @@ impl Net {
             name.unwrap_or("lightbulb"),
             "{init}"
         );
+        assert_eq!(init["result"]["capabilities"]["tools"]["listChanged"], true);
         m.write(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
         m
     }
@@ -128,6 +130,8 @@ struct Mcp {
     stdin: ChildStdin,
     lines: Lines<BufReader<ChildStdout>>,
     next: u64,
+    /// What the server sent that answered no request (notifications).
+    seen: Vec<Value>,
 }
 
 /// A tool call's outcome: whether it is an error, and its text.
@@ -160,6 +164,7 @@ impl Mcp {
             if v["id"] == id {
                 return v;
             }
+            self.seen.push(v);
         }
     }
 
@@ -669,10 +674,13 @@ fn mcp_on(e: &common::Env, as_: &os::Process) -> Mcp {
 /// `mcp_on`, its Lightbulb API at `api`.
 fn mcp_at(e: &common::Env, as_: &os::Process, api: &str) -> Mcp {
     let mut c = e.base_cmd(Command::new(EXE));
-    c.arg("mcp").env("LIGHTBULB_API", api).env(
-        "LIGHTBULB_CONNECT_HOOK_CALLER",
-        format!("{}:{}", as_.pid, as_.birth_micros),
-    );
+    c.arg("mcp")
+        .env("LIGHTBULB_API", api)
+        .env("LIGHTBULB_CONNECT_DEBUG_TOOLS_POLL_MS", "200")
+        .env(
+            "LIGHTBULB_CONNECT_HOOK_CALLER",
+            format!("{}:{}", as_.pid, as_.birth_micros),
+        );
     let mut child = c
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -684,6 +692,7 @@ fn mcp_at(e: &common::Env, as_: &os::Process, api: &str) -> Mcp {
         lines: BufReader::new(child.stdout.take().unwrap()).lines(),
         child,
         next: 1,
+        seen: vec![],
     };
     m.rpc(
         "initialize",
@@ -1346,4 +1355,46 @@ fn room_targets_go_to_rest_session_targets_stay_p2p() {
         "{}",
         seen[3].path
     );
+}
+
+#[test]
+fn the_tool_list_changes_when_the_sign_in_does() {
+    let e = common::Env::new();
+    e.daemon(false, &common::computer("mac"), &[]);
+    register_on(&e, "claude", "c1", &me(), "/tmp");
+    let mut m = mcp_on(&e, &me());
+    let changes = |m: &mut Mcp| {
+        m.seen
+            .drain(..)
+            .filter(|v| v["method"] == "notifications/tools/list_changed")
+            .count()
+    };
+    let wait = || std::thread::sleep(Duration::from_millis(800));
+    assert_eq!(m.tools().len(), 4);
+    // A login with no request after it: the timer tells the client.
+    e.sign_in("user_1", None);
+    wait();
+    assert_eq!(m.tools().len(), 10);
+    assert_eq!(changes(&mut m), 1);
+    // A logout: told once, by the next call at the latest.
+    std::fs::remove_file(e.state.path().join("login.json")).unwrap();
+    assert!(!m.tool("find_sessions", json!({})).error);
+    assert_eq!(changes(&mut m), 1);
+    assert_eq!(m.tools().len(), 4);
+    // A sign-in that ends.
+    e.sign_in("user_1", None);
+    wait();
+    m.tools();
+    assert_eq!(changes(&mut m), 1);
+    let old = common::now_s() - 40 * 86_400;
+    let proof = common::issuer::proof(&e.identity().key, "user_1", old);
+    let login = json!({"proof": proof, "name": "user_1"});
+    std::fs::write(e.state.path().join("login.json"), login.to_string()).unwrap();
+    wait();
+    assert_eq!(m.tools().len(), 4);
+    assert_eq!(changes(&mut m), 1);
+    // Nothing changed: nothing said.
+    wait();
+    m.tools();
+    assert_eq!(changes(&mut m), 0);
 }
