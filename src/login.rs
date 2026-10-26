@@ -253,6 +253,7 @@ pub fn login() -> Result<i32> {
         &paths::state_dir(),
         &json!({"proof": proof, "route_url": r["routeUrl"], "name": r["name"]}),
     )?;
+    tell_daemon();
     match r["name"]
         .as_str()
         .filter(|n| n.chars().all(crate::label::printable))
@@ -278,7 +279,9 @@ pub fn logout() -> Result<i32> {
         body["proof"] = proof.into();
         ok("/network/proof/revoke", &body)
     });
-    match std::fs::remove_file(dir.join(FILE)) {
+    let removed = std::fs::remove_file(dir.join(FILE));
+    tell_daemon();
+    match removed {
         Ok(()) => match told {
             Some(Err(e)) => println!(
                 "This computer is signed out here, but Lightbulb was not told ({e}). Your \
@@ -292,6 +295,14 @@ pub fn logout() -> Result<i32> {
         Err(e) => return Err(e.into()),
     }
     Ok(0)
+}
+
+/// Tells a running daemon its sign-in changed, so connected members get the new proof (or
+/// none) in a fresh `hello` now, not at their next reconnect. No daemon: nothing to tell.
+fn tell_daemon() {
+    if let Ok(mut c) = crate::hook::Conn::open() {
+        let _ = c.call("login.changed", json!({}));
+    }
 }
 
 /// Renews this computer's proof in its last week (the daemon's link calls it daily): a signed

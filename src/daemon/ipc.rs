@@ -213,6 +213,12 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
     let for_a_person = || instance || caller.is_person();
     match op {
         "ping" => Response::ok(id, json!({})),
+        // `login.changed` -> `{}`: `login`/`logout` rewrote this computer's sign-in; every
+        // connected member hears a fresh `hello` with the proof now on disk (or none).
+        "login.changed" => {
+            daemon.peers.changed.notify_one();
+            Response::ok(id, json!({}))
+        }
         // Events come from `Instance::events`.
         "subscribe" if instance => Response::ok(id, json!({})),
         "inbox" if instance => crate::embed::inbox(id, body, daemon),

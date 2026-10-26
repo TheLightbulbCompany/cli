@@ -591,3 +591,34 @@ async fn an_admins_once_link_brings_the_workspace_in_and_only_members_reach_frid
     assert_eq!(got["messages"], json!([]), "{got}");
     i.shutdown().await;
 }
+
+/// A connected computer's sign-in change reaches the workspace at once, with no restart:
+/// after `lightbulb logout` its next message is refused `not_a_member`; signed in again (the
+/// daemon told `login.changed`, as `lightbulb login` does), it is stored again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_logout_and_a_new_login_reach_a_connected_workspace_without_a_restart() {
+    let a = computer_a();
+    let home = tempfile::tempdir().unwrap();
+    let i = start(home.path(), &[&a], None).await;
+    assert_eq!(join(&i, &a).await["state"], "admitted");
+    declare(&i, &["friday"], &[&a.identity()]).await;
+    let friday = format!("{}/friday", me(&i).await);
+    until(10, "A sees friday", || common::sees(&a, &friday));
+    let sa = common::session(&a, "a1");
+    a.send(&sa, &friday, "signed in", "r1", None);
+    until(10, "stored", || a.state(&sa, "r1") == "stored");
+
+    let out = a.detached(&[common::EXE, "logout"], "");
+    assert!(out.status.success(), "{}", common::err(&out));
+    a.send(&sa, &friday, "signed out", "r2", None);
+    until(10, "refused after logout", || {
+        a.state(&sa, "r2") == "refused"
+    });
+    assert_eq!(a.receipt(&sa, "r2")["reason"], "not_a_member");
+
+    a.sign_in(&common::user_of(&a.short()), None);
+    assert_eq!(a.ask(json!({"id": 1, "op": "login.changed"}))["ok"], true);
+    a.send(&sa, &friday, "signed in again", "r3", None);
+    until(10, "stored after login", || a.state(&sa, "r3") == "stored");
+    i.shutdown().await;
+}
