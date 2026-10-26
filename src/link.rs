@@ -100,7 +100,10 @@ pub async fn run(d: Arc<Daemon>) {
             refreshed = Some(Instant::now());
             let dir = d.dir.clone();
             match tokio::task::spawn_blocking(move || login::refresh(&dir)).await {
-                Ok(Ok(true)) => eprintln!("link: sign-in renewed"),
+                Ok(Ok(true)) => {
+                    eprintln!("link: sign-in renewed");
+                    d.peers.changed.notify_one(); // members hear the new proof
+                }
                 Ok(Err(e)) => eprintln!("link: sign-in renewal failed: {e}"),
                 _ => {}
             }
