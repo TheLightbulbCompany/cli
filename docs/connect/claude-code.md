@@ -33,6 +33,8 @@ Run `lightbulb doctor`. The Claude Code line should read `connected`.
 - `hooks only — tools missing (run setup)`: run `lightbulb setup`, then restart Claude Code.
 - `not connected`: run `lightbulb setup`. If it names a file it could not read, fix that file first.
 - `source_unidentified` from a tool: Lightbulb could not tell which session called it. Restart the session.
+- `identity_unavailable` from a workspace tool: its `hint` says why. After `lightbulb update`, a
+  session that was already open runs the old tool server; start a new session.
 - Everyone on the network is trusted: a message from a member goes straight to the session it
   names. Check it with `lightbulb receipt <id>`.
 
