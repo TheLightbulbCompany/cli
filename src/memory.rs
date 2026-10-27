@@ -104,8 +104,14 @@ pub struct Fact {
     pub history: Vec<(String, String, i64)>,
 }
 
-/// Signs `op` as `id`'s next entry and stores it. `too_long` when it passes `MAX_ENTRY_BYTES`.
+/// Signs `op` as `id`'s next entry and stores it. `too_long` when it passes `MAX_ENTRY_BYTES`;
+/// `secret:<pattern>` when subject or fact looks like a credential (refused, never scrubbed).
 pub fn remember(store: &Store, id: &Identity, op: Op, now: i64) -> Result<Entry> {
+    if let Op::Remember { subject, fact, .. } = &op {
+        if let Some(name) = refuse_secret(subject).or_else(|| refuse_secret(fact)) {
+            return Err(format!("secret:{name}").into());
+        }
+    }
     let tx = store.conn().unchecked_transaction()?;
     let seq: Option<u64> = tx
         .query_row(

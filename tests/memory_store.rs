@@ -189,3 +189,37 @@ fn entry_over_16kb_is_refused() {
     assert_eq!(err.to_string(), "too_long");
     assert!(memory::remember(&s, &a, rem("ok", &"x".repeat(8 * 1024), &[]), 1).is_ok());
 }
+
+#[test]
+fn remember_refuses_secret_with_reason() {
+    let a = identity();
+    let (_d, s) = team(&a);
+    let err = memory::remember(
+        &s,
+        &a,
+        rem("deploy", "-----BEGIN RSA PRIVATE KEY-----", &[]),
+        1,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("private_key"), "{err}");
+    let err = memory::remember(&s, &a, rem("AKIAABCDEFGHIJKLMNOP", "x", &[]), 1).unwrap_err();
+    assert!(err.to_string().contains("aws_key"), "{err}");
+    assert!(memory::heads(&s).unwrap().is_empty());
+    assert!(memory::facts(&s, None, None).unwrap().is_empty());
+}
+
+#[test]
+fn search_survives_snapshot() {
+    let a = identity();
+    let (d, s) = team(&a);
+    // A gap in rowids: VACUUM would renumber a table without an explicit rowid.
+    let e = memory::remember(&s, &a, rem("gone", "temp", &[]), 1).unwrap();
+    memory::remember(&s, &a, Op::Forget { target: e.id }, 2).unwrap();
+    memory::remember(&s, &a, rem("database choice", "postgres", &[]), 3).unwrap();
+    memory::remember(&s, &a, rem("ci provider", "actions", &[]), 4).unwrap();
+    let copy = d.path().join("copy.db");
+    s.snapshot(&copy).unwrap();
+    let c = Store::open(&copy).unwrap();
+    assert_eq!(memory::search(&c, "database", 5).unwrap().len(), 1);
+    assert_eq!(memory::search(&c, "provider", 5).unwrap().len(), 1);
+}
