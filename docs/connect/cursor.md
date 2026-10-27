@@ -17,7 +17,6 @@ If setup prints an `export PATH=...` line, add it to `~/.zshrc` and open a new t
 ## What you may need to do
 
 Restart Cursor. If Cursor asks to approve a `lightbulb` tool call, approve it.
-<!-- TODO: not confirmed from code: whether the Cursor app (not the CLI) prompts for each tool; setup only writes the rule to cli-config.json. -->
 
 ## Try it
 

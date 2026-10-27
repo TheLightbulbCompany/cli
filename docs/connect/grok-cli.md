@@ -16,7 +16,6 @@ If setup prints an `export PATH=...` line, add it to `~/.zshrc` and open a new t
 ## What you may need to do
 
 Open Grok in a project folder and trust that folder if Grok asks. Hooks may not run in an untrusted folder.
-<!-- TODO: not confirmed from code: the exact Grok trusted-folder prompt and setting; the plan only says "hooks need a trusted folder". -->
 
 ## Try it
 

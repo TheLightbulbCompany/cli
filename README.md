@@ -22,13 +22,12 @@ echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
 
 Until then, run `~/.lightbulb/connect/bin/lightbulb` instead of `lightbulb`.
 
-Set `DO_NOT_TRACK=1` before installing to send nothing (see [Usage counts](#usage-counts)).
+To send nothing, set `DO_NOT_TRACK=1` before installing: run `export DO_NOT_TRACK=1`, then the install line, or put it in the pipe: `curl -fsSL https://github.com/TheLightbulbCompany/cli/releases/latest/download/install.sh | DO_NOT_TRACK=1 sh` (see [Usage counts](#usage-counts)).
 
 The line downloads the latest release, checks its checksum, installs `~/.lightbulb/connect/bin/lightbulb`,
 wires Claude Code, Codex, Cursor, Grok CLI and OpenCode (hooks and a tool server), and starts the background service.
-Run the same line again to upgrade. Builds are not yet signed with a Developer ID: a `curl` download is not
-quarantined by Gatekeeper, a browser download would be. `lightbulb setup --remove` takes everything out.
-On Linux (and WSL) the same line installs a static binary and sets up the agents. There is no service manager off macOS: the CLI starts the daemon when a command needs it. To keep it running, start `lightbulb daemon` yourself (for example in tmux, or as a systemd `--user` unit). `lightbulb update` and `lightbulb setup` restart a daemon that runs an older version. There are no dialogs on Linux: run `lightbulb held`, then `lightbulb approve H1` or `lightbulb approve J1` (or `decline`). Homebrew and npm are macOS-only for now.
+Run the same line again to upgrade. macOS builds are signed with Lightbulb's Developer ID and notarized by Apple. `lightbulb setup --remove` takes everything out.
+On Linux (and WSL) the same line installs a static binary and sets up the agents. There is no service manager off macOS: the CLI starts the daemon when a command needs it. To keep it running, start `lightbulb daemon` yourself (for example in tmux, or as a systemd `--user` unit). `lightbulb update` and `lightbulb setup` restart a daemon that runs an older version. There are no dialogs on Linux: when the Lightbulb app files a permission prompt, run `lightbulb held`, then `lightbulb approve H1` (or `decline H1`). Homebrew and npm are macOS-only for now.
 
 `lightbulb update` keeps you current. To pin or roll back to a release:
 `curl -fsSL https://github.com/TheLightbulbCompany/cli/releases/latest/download/install.sh | LIGHTBULB_VERSION=v0.2.2 sh` (an example: use the tag you want).
@@ -94,7 +93,7 @@ Every message gets a receipt. Check one with `lightbulb receipt <id>`. `lightbul
 - `stored`: on their Mac, for the session's next step.
 - `delivered`: the session got it.
 - `read`: the session has taken a step since it got it.
-- `refused`: not sent, for example because they declined it.
+- `refused`: not sent, for example because it hit the loop limit, or a workspace refused a computer that is not a member or not signed in.
 - `expired`: not delivered within 24 hours.
 
 Three things that catch people out:
@@ -158,8 +157,9 @@ cargo build
 
 The background service checks once a day for a newer release of this repository. It installs one
 only when its SHA-256 matches the release's checksum and, on macOS, it is signed by Lightbulb's
-Developer ID; it never installs an older version, and it never edits your shell profile. On Linux
-it prints that a release exists and leaves the install to `lightbulb update`.
+Developer ID and notarized; it never installs an older version, and it never edits your shell profile. On Linux
+it prints that a release exists and leaves the install to `lightbulb update`, which also checks
+the checksum's signature.
 
 ```sh
 lightbulb update --auto off   # stop the daily update (lightbulb doctor shows "Auto-update  off")

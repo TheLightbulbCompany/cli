@@ -9,7 +9,7 @@ Every computer starts on its own: a team of one, with you as the founder. You gr
 ## Roles
 
 Every team is flat. Any member can invite, remove
-another member (not itself), rename the team and set the team's relay. The founder is only the
+another member (not itself, and never the founder, which can only leave), rename the team and set the team's relay. The founder is only the
 computer that started the team.
 
 Only a person at a terminal can run `remove`, `leave` and `relay <url>`. An agent may run

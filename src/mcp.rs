@@ -844,7 +844,7 @@ impl ServerHandler for Server {
     }
 }
 
-const INSTRUCTIONS: &str = "These tools message the other coding sessions (Claude Code, Codex, Cursor, Grok CLI, OpenCode). Use these tools for sessions on this computer and on teammates' computers. Call find_sessions to see them, then send_message to one by its session_id. Every send_message needs a request_id: a new [A-Za-z0-9._-]{1,128} string, reused only to retry that same send. Messages delivered to you show a requestId; pass it as reply_to to answer one. While this computer is signed in to Lightbulb (lightbulb login), the workspace tools also read and post in your workspace's rooms and tasks. The lightbulb-network skill explains holds, invites and etiquette.";
+const INSTRUCTIONS: &str = "These tools message the other coding sessions (Claude Code, Codex, Cursor, Grok CLI, OpenCode). Use these tools for sessions on this computer and on teammates' computers. Call find_sessions to see them, then send_message to one by its session_id. Every send_message needs a request_id: a new [A-Za-z0-9._-]{1,128} string, reused only to retry that same send. Messages delivered to you show a requestId; pass it as reply_to to answer one. While this computer is signed in to Lightbulb (lightbulb login), the workspace tools also read and post in your workspace's rooms and tasks. The lightbulb-network skill explains invites and etiquette.";
 
 #[cfg(test)]
 mod tests {

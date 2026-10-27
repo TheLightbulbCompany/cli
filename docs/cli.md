@@ -1,6 +1,6 @@
 # CLI reference
 
-Every command, with the same options and arguments its `--help` lists (version 0.3.7). Each
+Every command, with the same options and arguments its `--help` lists. Each
 `Usage:` line and `--help` line is the binary's own text; the rest says the same in plain words.
 Run `lightbulb <command> --help` for the full text in your terminal.
 
@@ -320,7 +320,7 @@ lightbulb --version
 
 `--help`: Print the version.
 
-Prints the version, for example `lightbulb 0.3.7`.
+Prints the version, for example `lightbulb 0.6.4`.
 
 ### telemetry
 
