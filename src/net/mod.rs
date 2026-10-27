@@ -48,6 +48,7 @@ const JOIN_WAIT: Duration = Duration::from_secs(600);
 /// How long a join keeps dialing after it rang a parked workspace's doorbell: the microVM's
 /// cold start (~55 s) plus the member's own start.
 const WAKE_WAIT: Duration = Duration::from_secs(150);
+const DIAL_WAIT: Duration = Duration::from_secs(30);
 
 const NOT_MEMBER: u32 = 1;
 /// The close code of a link that another connection from the same member replaced.
@@ -71,6 +72,9 @@ pub struct Knobs {
     /// How long a join keeps dialing after ringing a workspace's doorbell (150 s), or
     /// `LIGHTBULB_CONNECT_DEBUG_WAKE_WAIT_S`.
     pub wake_wait: Duration,
+    /// How long a join keeps dialing while no member has answered (30 s): a computer that has
+    /// just started may not reach anyone on its first pass. `LIGHTBULB_CONNECT_DEBUG_DIAL_WAIT_S`.
+    pub dial_wait: Duration,
     /// The program dialogs run: `/usr/bin/osascript` (none off macOS), or
     /// `LIGHTBULB_CONNECT_DEBUG_OSASCRIPT`.
     pub osascript: PathBuf,
@@ -122,6 +126,9 @@ impl Knobs {
             wake_wait: var("LIGHTBULB_CONNECT_DEBUG_WAKE_WAIT_S")
                 .and_then(|v| v.parse().ok())
                 .map_or(WAKE_WAIT, Duration::from_secs),
+            dial_wait: var("LIGHTBULB_CONNECT_DEBUG_DIAL_WAIT_S")
+                .and_then(|v| v.parse().ok())
+                .map_or(DIAL_WAIT, Duration::from_secs),
             osascript: var("LIGHTBULB_CONNECT_DEBUG_OSASCRIPT")
                 .map_or(OSASCRIPT.into(), Into::into),
             drop_acks: var("LIGHTBULB_CONNECT_DEBUG_DROP_ACKS").is_some_and(|v| v == "1"),
@@ -143,6 +150,7 @@ impl Knobs {
             dialog: None,
             join_wait: JOIN_WAIT,
             wake_wait: WAKE_WAIT,
+            dial_wait: DIAL_WAIT,
             osascript: OSASCRIPT.into(),
             drop_acks: false,
             outbox_s: outbox::TTL_S,

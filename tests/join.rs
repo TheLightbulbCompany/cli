@@ -302,7 +302,11 @@ fn bad_link_and_unreachable_texts() {
     until(10, "A stops", || {
         std::os::unix::net::UnixStream::connect(a.state.path().join("sock")).is_err()
     });
-    b.daemon(false, "", &[]);
+    b.daemon(
+        false,
+        "",
+        &[("LIGHTBULB_CONNECT_DEBUG_DIAL_WAIT_S", "0".into())],
+    );
     let r = join(&b, &t, "bob");
     refused(&r, "unreachable");
     let o = b.detached(&[EXE, "join", &t, "--name", "bob"], "");
@@ -580,8 +584,9 @@ async fn an_agents_invite_is_one_time_and_its_use_raises_a_notice_and_remove_rem
     let cand = identity();
     let _p = Played::send(&a, &cand, &admission::request(&cand, &t, "carol", "mbp")).await;
     let log = || std::fs::read_to_string(dir.path().join("log")).unwrap_or_default();
-    until(30, "the notice names carol", || {
-        log().contains("invited carol into your network.")
+    // It names the inviting session by its agent, not its handle ("Your claude-1 mailbox").
+    until(30, "the notice names the agent and carol", || {
+        log().contains("Your Claude Code invited carol into your network.")
     });
     until(30, "carol is removed again", || members(&a).len() == 1);
 }
