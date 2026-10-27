@@ -20,6 +20,7 @@ mod memsync;
 
 use crate::daemon::{ipc, net_ops, Daemon, TeamState};
 use crate::mail::{self, State};
+use crate::memory;
 use crate::roster::{self, Entry, Roster};
 use crate::sessions::Key;
 use crate::Result;
@@ -27,7 +28,7 @@ use crate::{holds, identity, outbox, relay};
 use frames::Frame;
 use iroh::endpoint::{presets, Connection, VarInt};
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMode, RelayUrl, SecretKey, Watcher};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -261,6 +262,10 @@ struct Link {
     protocol: Protocol,
     /// Its last `hello` said it syncs memory.
     memory: bool,
+    /// The heads last sent here (`MemoryHeads` goes out only when ours differ), and what the
+    /// peer is known to hold: its last heads, plus what we pushed since.
+    heads_sent: Option<BTreeMap<String, u64>>,
+    peer_heads: BTreeMap<String, u64>,
 }
 
 /// What a link's peer said in its last `hello`.
@@ -492,6 +497,8 @@ impl Peers {
             dialer: dialer.to_string(),
             protocol: Protocol::Unknown,
             memory: false,
+            heads_sent: None,
+            peer_heads: BTreeMap::new(),
         };
         live.insert(key.to_string(), link);
         true
@@ -503,13 +510,43 @@ impl Peers {
             .is_some_and(|l| matches!(l.protocol, Protocol::Ok(_)))
     }
 
-    /// Sends `f` on every live link that said `hello` in our protocol with `memory`.
-    fn tell_memory(&self, f: &Frame) {
-        for l in self.live.lock().unwrap().values() {
-            if l.memory && matches!(l.protocol, Protocol::Ok(_)) {
-                let _ = l.tx.send((f.clone(), None));
+    /// The links that said `hello` in our protocol with `memory`.
+    fn memory_links(&self) -> Vec<(String, Connection, Tx, BTreeMap<String, u64>)> {
+        let live = self.live.lock().unwrap();
+        live.iter()
+            .filter(|(_, l)| l.memory && matches!(l.protocol, Protocol::Ok(_)))
+            .map(|(k, l)| {
+                (
+                    k.clone(),
+                    l.conn.clone(),
+                    l.tx.clone(),
+                    l.peer_heads.clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// Sends `ours` as `MemoryHeads` on `key`'s link unless it was the last heads sent there:
+    /// a side says its heads once per change, so two sides never answer each other forever.
+    fn send_heads(&self, key: &str, conn: &Connection, ours: &BTreeMap<String, u64>) {
+        self.with_link(key, conn, |l| {
+            if l.heads_sent.as_ref() != Some(ours) {
+                l.heads_sent = Some(ours.clone());
+                eprintln!("net: sent memory heads to {}", short(key));
+                let heads = ours.clone();
+                let _ = l.tx.send((Frame::MemoryHeads { heads }, None));
             }
-        }
+        });
+    }
+
+    /// Records that `key`'s peer holds `heads` (and `ours` where we pushed or kept back).
+    fn peer_holds(&self, key: &str, conn: &Connection, heads: &BTreeMap<String, u64>) {
+        self.with_link(key, conn, |l| {
+            for (a, n) in heads {
+                let h = l.peer_heads.entry(a.clone()).or_default();
+                *h = (*h).max(*n);
+            }
+        });
     }
 
     /// Whether `key`'s link is still `conn`, said `hello` in our protocol and syncs memory.
@@ -743,9 +780,9 @@ impl Net {
         }
     }
 
-    /// Tells every memory peer our heads each second they have moved (a local `remember`, or a
-    /// page accepted from another peer); a peer behind pages the gap. A new link hears them at its
-    /// `hello`. One cheap query a second; idempotent for the peer.
+    /// Each second our heads have moved (a local `remember`, or a page accepted from another
+    /// peer), tells every memory peer (once per change, `send_heads`) and pushes it what it is
+    /// not known to hold. A new link gets the same at its `hello`.
     async fn memory_loop(self) {
         let d = &self.0.daemon;
         let mut last = None;
@@ -756,15 +793,26 @@ impl Net {
                 _ = self.0.endpoint.closed() => return,
             }
             let dd = d.clone();
-            let Ok(Ok(f)) = tokio::task::spawn_blocking(move || memsync::heads(&dd)).await else {
+            let ours =
+                tokio::task::spawn_blocking(move || memory::heads(&dd.store.lock().unwrap()));
+            let Ok(Ok(ours)) = ours.await else { continue };
+            if last.as_ref() == Some(&ours) {
                 continue;
-            };
-            if last.as_ref() != Some(&f) {
-                if last.is_some() {
-                    d.peers.tell_memory(&f);
-                }
-                last = Some(f);
             }
+            if last.replace(ours.clone()).is_none() {
+                continue; // links up now were told at their `hello`
+            }
+            let dd = d.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                for (key, conn, tx, theirs) in dd.peers.memory_links() {
+                    dd.peers.send_heads(&key, &conn, &ours);
+                    match memsync::send_pages(&dd, &tx, &theirs, memsync::same_person(&dd, &key)) {
+                        Ok(ours) => dd.peers.peer_holds(&key, &conn, &ours),
+                        Err(e) => eprintln!("net: memory pages: {e}"),
+                    }
+                }
+            })
+            .await;
         }
     }
 
@@ -1112,12 +1160,12 @@ impl Net {
         // Outside `team`: ours may need a build (transcripts, git files: off the async
         // threads); storing theirs takes `store`.
         if hello_ok {
-            let (d, tx) = (d.clone(), tx.clone());
+            let (d, tx, key, conn) = (d.clone(), tx.clone(), key.to_string(), conn.clone());
             tokio::task::spawn_blocking(move || {
                 // Before the presence, so a peer without `memory` is proven to get none.
                 if send_memory_heads {
-                    match memsync::heads(&d) {
-                        Ok(f) => drop(tx.send((f, None))),
+                    match memory::heads(&d.store.lock().unwrap()) {
+                        Ok(ours) => d.peers.send_heads(&key, &conn, &ours),
                         Err(e) => eprintln!("net: memory heads: {e}"),
                     }
                 }
@@ -1125,12 +1173,15 @@ impl Net {
             });
         }
         if let Some(theirs) = memory_heads.filter(|_| d.peers.speaks_memory(key, conn)) {
-            let (d, tx, key) = (d.clone(), tx.clone(), key.to_string());
+            let (d, tx, key, conn) = (d.clone(), tx.clone(), key.to_string(), conn.clone());
             tokio::task::spawn_blocking(move || {
-                if let Err(e) =
-                    memsync::send_pages(&d, &tx, &theirs, memsync::same_person(&d, &key))
-                {
-                    eprintln!("net: memory pages: {e}");
+                // No answer with our own heads: they are sent when they change.
+                match memsync::send_pages(&d, &tx, &theirs, memsync::same_person(&d, &key)) {
+                    Ok(ours) => {
+                        d.peers.peer_holds(&key, &conn, &theirs);
+                        d.peers.peer_holds(&key, &conn, &ours);
+                    }
+                    Err(e) => eprintln!("net: memory pages: {e}"),
                 }
             });
         }

@@ -203,3 +203,33 @@ async fn gap_of_300_entries_pages() {
     assert!(mores[..mores.len() - 1].iter().all(|m| *m));
     assert!(sizes.iter().all(|n| *n <= PAGE_BYTES), "{sizes:?}");
 }
+
+/// How many times `env`'s daemon log says it sent `MemoryHeads`.
+fn heads_sent(env: &Env) -> usize {
+    std::fs::read_to_string(env.state.path().join("daemon.log"))
+        .unwrap()
+        .matches("net: sent memory heads")
+        .count()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn me_latest_on_both_sides_does_not_ping_pong() {
+    // Two people, each whose newest entry is `me`: neither head can ever reach the other.
+    let (a, b) = (Env::new(), Env::new());
+    seed_pair(&a, &b);
+    a.sign_in("user_one", None);
+    b.sign_in("user_two", None);
+    remember(&a, op("ta", "team a", Scope::Team));
+    remember(&a, op("ma", "mine a", Scope::Me));
+    remember(&b, op("tb", "team b", Scope::Team));
+    remember(&b, op("mb", "mine b", Scope::Me));
+    common::start_pair(&a, &b, "", &[]);
+    let (ka, kb) = (a.identity().key, b.identity().key);
+    until(10, "team entries cross", || {
+        held(&b, &ka).len() == 1 && held(&a, &kb).len() == 1
+    });
+    std::thread::sleep(Duration::from_secs(3));
+    let (na, nb) = (heads_sent(&a), heads_sent(&b));
+    assert!((1..=3).contains(&na) && (1..=3).contains(&nb), "{na} {nb}");
+    assert_eq!((held(&b, &ka).len(), held(&a, &kb).len()), (1, 1));
+}

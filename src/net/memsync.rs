@@ -31,27 +31,17 @@ pub(super) fn same_person(d: &Daemon, key: &str) -> bool {
     mine.is_some() && mine == theirs
 }
 
-/// Our heads, as a frame.
-pub(super) fn heads(d: &Daemon) -> Result<Frame> {
-    let heads = memory::heads(&d.store.lock().unwrap())?;
-    Ok(Frame::MemoryHeads { heads })
-}
-
-/// Answers a peer's heads: sends `tx` every entry we hold past `theirs`, per author in order, a
-/// page closing before the next entry would take it past `PAGE_BYTES`; and when they hold more
-/// than we do, our heads in return, which is how they learn what to push.
-/// ponytail: at a fresh link both sides' hello heads can make the same push twice (idempotent);
-/// remember what each link was told if a big backlog makes that cost.
+/// Answers a peer's heads, or pushes to it past what it is known to hold: sends `tx` every
+/// entry we hold past `theirs`, per author in order, a page closing before the next entry
+/// would take it past `PAGE_BYTES`. Returns our heads, which `theirs` now covers (what a
+/// `me` filter kept back is not owed again).
 pub(super) fn send_pages(
     d: &Daemon,
     tx: &Tx,
     theirs: &BTreeMap<String, u64>,
     same_person: bool,
-) -> Result<()> {
+) -> Result<BTreeMap<String, u64>> {
     let ours = memory::heads(&d.store.lock().unwrap())?;
-    let behind = theirs
-        .iter()
-        .any(|(a, n)| *n > ours.get(a).copied().unwrap_or(0));
     // `"more":false` is the longer spelling, so this bounds every page's overhead.
     let base = serde_json::to_vec(&Frame::Memory {
         entries: vec![],
@@ -90,10 +80,7 @@ pub(super) fn send_pages(
             }
         }
     }
-    if behind {
-        let _ = tx.send((Frame::MemoryHeads { heads: ours }, None));
-    }
-    Ok(())
+    Ok(ours)
 }
 
 /// Stores the entries of a `memory` frame from `short`; one that does not verify is dropped,
