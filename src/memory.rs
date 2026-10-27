@@ -1,0 +1,434 @@
+//! Team memory: facts a member's agents remember, as signed entries numbered per author
+//! (`seq`). Unlike the roster there is no DAG: an entry stands on its author's signature alone.
+//! `Forget` tombstones an entry (its id stays, its body goes); `facts` and `search` replay what
+//! is held into current, contested and replaced values.
+
+use crate::identity::{canonical, unsigned, verify, Identity};
+use crate::roster::{self, MAX_ENTRY_BYTES};
+use crate::store::Store;
+use crate::Result;
+use data_encoding::HEXLOWER;
+use regex::Regex;
+use rusqlite::{params, OptionalExtension};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::sync::LazyLock;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Kind {
+    Fact,
+    Decision,
+    Lesson,
+    Preference,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Scope {
+    Me,
+    Team,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Source {
+    pub harness: String,
+    pub repo: Option<String>,
+    pub session: Option<String>,
+    pub on_behalf_of: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "t", rename_all = "lowercase")]
+pub enum Op {
+    Remember {
+        subject: String,
+        fact: String,
+        kind: Kind,
+        scope: Scope,
+        when: Option<i64>,
+        source: Source,
+        #[serde(default)]
+        replaces: Vec<String>,
+    },
+    Forget {
+        target: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Entry {
+    pub v: u32,
+    /// Lowercase hex sha256 of `canonical(entry without id and sig)`.
+    pub id: String,
+    pub author: String,
+    pub seq: u64,
+    pub op: Op,
+    pub at: i64,
+    pub sig: String,
+}
+
+impl Entry {
+    fn value(&self) -> Value {
+        serde_json::to_value(self).expect("an entry serializes")
+    }
+
+    fn expected_id(&self) -> String {
+        let mut v = self.value();
+        v["id"] = "".into();
+        HEXLOWER.encode(&Sha256::digest(unsigned(&v)))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Status {
+    Current,
+    /// Two current values for one thing: nobody's entry overwrites anybody's.
+    Contested,
+    Replaced,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Fact {
+    pub id: String,
+    pub subject: String,
+    pub value: String,
+    pub kind: Kind,
+    pub scope: Scope,
+    pub author: String,
+    pub when: i64,
+    pub status: Status,
+    /// What this replaced, oldest first: (entry id, value, stamp).
+    pub history: Vec<(String, String, i64)>,
+}
+
+/// Signs `op` as `id`'s next entry and stores it. `too_long` when it passes `MAX_ENTRY_BYTES`.
+pub fn remember(store: &Store, id: &Identity, op: Op, now: i64) -> Result<Entry> {
+    let tx = store.conn().unchecked_transaction()?;
+    let seq: Option<u64> = tx
+        .query_row(
+            "SELECT seq FROM memory_heads WHERE author = ?1",
+            [&id.key],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let mut e = Entry {
+        v: 1,
+        id: String::new(),
+        author: id.key.clone(),
+        seq: seq.unwrap_or(0) + 1,
+        op,
+        at: now,
+        sig: String::new(),
+    };
+    e.id = e.expected_id();
+    e.sig = id.sign(&e.value());
+    if canonical(&e.value()).len() > MAX_ENTRY_BYTES {
+        return Err("too_long".into());
+    }
+    insert(&tx, &e, now)?;
+    tx.commit()?;
+    Ok(e)
+}
+
+/// Stores `e` once it verifies: `Ok(true)` when stored, `Ok(false)` when already held. Refuses a
+/// bad signature or id, an author the roster has not admitted, and a `Forget` of another
+/// author's entry.
+pub fn accept(store: &Store, e: &Entry, now: i64) -> Result<bool> {
+    if canonical(&e.value()).len() > MAX_ENTRY_BYTES {
+        return Err("memory entry is too large".into());
+    }
+    if !verify(&e.author, &e.value(), &e.sig) || e.id != e.expected_id() {
+        return Err("memory entry has a bad signature".into());
+    }
+    if !roster::replay(&roster::entries(store)?)
+        .members
+        .contains_key(&e.author)
+    {
+        return Err("memory entry is from a non-member".into());
+    }
+    let tx = store.conn().unchecked_transaction()?;
+    let stored = insert(&tx, e, now)?;
+    tx.commit()?;
+    Ok(stored)
+}
+
+/// The row for verified `e`, and the tombstone a `Forget` writes. A row with a NULL `entry` and
+/// `seq` is a tombstone whose body has not arrived: its `author` is the forgetter.
+fn insert(conn: &rusqlite::Connection, e: &Entry, now: i64) -> Result<bool> {
+    let held: Option<(Option<String>, Option<u64>)> = conn
+        .query_row(
+            "SELECT author, seq FROM memory_entries WHERE id = ?1",
+            [&e.id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    match held {
+        // The body of a tombstone: it keeps its id and seq, and drops the text, if the
+        // forgetter was its author (else the forget was not valid and never applied).
+        Some((Some(forgetter), None)) => {
+            let ours = forgetter == e.author;
+            let body = (!ours).then(|| serde_json::to_string(e)).transpose()?;
+            conn.execute(
+                "UPDATE memory_entries SET author = ?2, seq = ?3, entry = ?4, tombstone = ?5
+                 WHERE id = ?1",
+                params![e.id, e.author, e.seq, body, ours],
+            )?;
+            return Ok(true);
+        }
+        Some(_) => return Ok(false),
+        None => {}
+    }
+    if let Op::Forget { target } = &e.op {
+        let row: Option<(Option<String>, Option<String>)> = conn
+            .query_row(
+                "SELECT author, entry FROM memory_entries WHERE id = ?1",
+                [target],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        match row {
+            None => {
+                conn.execute(
+                    "INSERT INTO memory_entries (id, author, received_at, tombstone)
+                     VALUES (?1, ?2, ?3, 1)",
+                    params![target, e.author, now],
+                )?;
+            }
+            Some((author, body)) => {
+                if author.as_deref() != Some(&e.author) {
+                    return Err("only an entry's author can forget it".into());
+                }
+                let is_forget = body
+                    .and_then(|b| serde_json::from_str::<Entry>(&b).ok())
+                    .is_some_and(|t| matches!(t.op, Op::Forget { .. }));
+                if is_forget {
+                    return Err("a forget cannot be forgotten".into());
+                }
+                conn.execute(
+                    "UPDATE memory_entries SET entry = NULL, tombstone = 1 WHERE id = ?1",
+                    [target],
+                )?;
+            }
+        }
+    }
+    conn.execute(
+        "INSERT INTO memory_entries (id, author, seq, entry, received_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![e.id, e.author, e.seq, serde_json::to_string(e)?, now],
+    )?;
+    Ok(true)
+}
+
+/// Each author's highest `seq` held.
+pub fn heads(store: &Store) -> Result<BTreeMap<String, u64>> {
+    let mut stmt = store
+        .conn()
+        .prepare("SELECT author, seq FROM memory_heads")?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Up to `limit` of `author`'s entries after `after`, in order. A tombstoned entry's body is
+/// gone, so it is skipped (its `Forget` is in the stream).
+pub fn since(store: &Store, author: &str, after: u64, limit: usize) -> Result<Vec<Entry>> {
+    let mut stmt = store.conn().prepare(
+        "SELECT entry FROM memory_entries
+         WHERE author = ?1 AND seq > ?2 AND entry IS NOT NULL ORDER BY seq LIMIT ?3",
+    )?;
+    let rows = stmt.query_map(params![author, after, limit], |r| r.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(serde_json::from_str(&row?)?);
+    }
+    Ok(out)
+}
+
+/// A live `remember`, with what replay needs of it.
+struct Live {
+    fact: Fact,
+    repo: Option<String>,
+    replaces: Vec<String>,
+}
+
+/// Every live (not tombstoned) `remember`, with its status. Replaced ones are included.
+fn replay(store: &Store) -> Result<Vec<Live>> {
+    let mut stmt = store
+        .conn()
+        .prepare("SELECT entry FROM memory_entries WHERE tombstone = 0 AND entry IS NOT NULL")?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    let mut live = Vec::new();
+    for row in rows {
+        let e: Entry = serde_json::from_str(&row?)?;
+        if let Op::Remember {
+            subject,
+            fact,
+            kind,
+            scope,
+            when,
+            source,
+            replaces,
+        } = e.op
+        {
+            live.push(Live {
+                fact: Fact {
+                    id: e.id,
+                    subject,
+                    value: fact,
+                    kind,
+                    scope,
+                    author: e.author,
+                    when: when.unwrap_or(e.at),
+                    status: Status::Current,
+                    history: Vec::new(),
+                },
+                repo: source.repo,
+                replaces,
+            });
+        }
+    }
+    live.sort_by(|a, b| (a.fact.when, &a.fact.id).cmp(&(b.fact.when, &b.fact.id)));
+
+    let replaced: HashSet<&str> = live
+        .iter()
+        .flat_map(|l| l.replaces.iter().map(String::as_str))
+        .collect();
+    let by_id: HashMap<&str, usize> = live
+        .iter()
+        .enumerate()
+        .map(|(i, l)| (l.fact.id.as_str(), i))
+        .collect();
+
+    // Unreplaced entries that share a subject, or a replaced target, are one thing with
+    // several current values.
+    let mut group: Vec<usize> = (0..live.len()).collect();
+    fn root(group: &mut [usize], mut i: usize) -> usize {
+        while group[i] != i {
+            group[i] = group[group[i]];
+            i = group[i];
+        }
+        i
+    }
+    let (mut by_key, mut status) = (HashMap::new(), vec![Status::Replaced; live.len()]);
+    for (i, l) in live.iter().enumerate() {
+        if replaced.contains(l.fact.id.as_str()) {
+            continue;
+        }
+        status[i] = Status::Current;
+        let keys = std::iter::once(format!("s:{}", l.fact.subject.trim().to_lowercase()))
+            .chain(l.replaces.iter().map(|t| format!("t:{t}")));
+        for k in keys {
+            let j = *by_key.entry(k).or_insert(i);
+            let (a, b) = (root(&mut group, i), root(&mut group, j));
+            group[a] = b;
+        }
+    }
+    let mut values: HashMap<usize, HashSet<&str>> = HashMap::new();
+    let mut sizes: HashMap<usize, usize> = HashMap::new();
+    for (i, l) in live
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| status[*i] != Status::Replaced)
+    {
+        let r = root(&mut group, i);
+        values.entry(r).or_default().insert(&l.fact.value);
+        *sizes.entry(r).or_default() += 1;
+    }
+    for (i, s) in status.iter_mut().enumerate() {
+        if *s != Status::Replaced {
+            let r = root(&mut group, i);
+            if sizes[&r] > 1 && values[&r].len() > 1 {
+                *s = Status::Contested;
+            }
+        }
+    }
+
+    // History: everything it replaced, transitively, oldest first.
+    let histories: Vec<Vec<(String, String, i64)>> = live
+        .iter()
+        .map(|l| {
+            let (mut seen, mut queue) = (HashSet::new(), VecDeque::from(l.replaces.clone()));
+            while let Some(t) = queue.pop_front() {
+                if let Some(&j) = by_id.get(t.as_str()).filter(|_| seen.insert(t.clone())) {
+                    queue.extend(live[j].replaces.iter().cloned());
+                }
+            }
+            let mut h: Vec<&Live> = seen.iter().map(|t| &live[by_id[t.as_str()]]).collect();
+            h.sort_by(|a, b| (a.fact.when, &a.fact.id).cmp(&(b.fact.when, &b.fact.id)));
+            h.iter()
+                .map(|p| (p.fact.id.clone(), p.fact.value.clone(), p.fact.when))
+                .collect()
+        })
+        .collect();
+    for ((l, s), h) in live.iter_mut().zip(status).zip(histories) {
+        l.fact.status = s;
+        l.fact.history = h;
+    }
+    Ok(live)
+}
+
+/// What the team currently holds, newest first: the current and contested values, with what
+/// each replaced. `repo` keeps entries whose `source.repo` is it.
+pub fn facts(store: &Store, scope: Option<Scope>, repo: Option<&str>) -> Result<Vec<Fact>> {
+    let mut out: Vec<Fact> = replay(store)?
+        .into_iter()
+        .filter(|l| l.fact.status != Status::Replaced)
+        .filter(|l| scope.is_none_or(|s| s == l.fact.scope))
+        .filter(|l| repo.is_none_or(|r| l.repo.as_deref() == Some(r)))
+        .map(|l| l.fact)
+        .collect();
+    out.reverse();
+    Ok(out)
+}
+
+/// The best `limit` matches for `query` (FTS5 `bm25`, subject and fact), as `facts` shows them;
+/// a match that has since been replaced says so. Every word must match.
+pub fn search(store: &Store, query: &str, limit: usize) -> Result<Vec<Fact>> {
+    // Each word quoted, so FTS5 syntax in a query is text.
+    let q = query
+        .split_whitespace()
+        .map(|w| format!("\"{}\"", w.replace('"', "")))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if q.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut stmt = store.conn().prepare(
+        "SELECT m.id FROM memory_fts JOIN memory_entries m ON m.rowid = memory_fts.rowid
+         WHERE memory_fts MATCH ?1 ORDER BY bm25(memory_fts) LIMIT ?2",
+    )?;
+    let ids: Vec<String> = stmt
+        .query_map(params![q, limit], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut all: HashMap<String, Fact> = replay(store)?
+        .into_iter()
+        .map(|l| (l.fact.id.clone(), l.fact))
+        .collect();
+    Ok(ids.iter().filter_map(|id| all.remove(id)).collect())
+}
+
+static SECRETS: LazyLock<Vec<(&'static str, Regex)>> = LazyLock::new(|| {
+    [
+        (
+            "credential",
+            r"(?i)(api[_-]?key|secret|token|password)\s*[:=]\s*\S{8,}",
+        ),
+        ("private_key", r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+        ("aws_key", r"AKIA[0-9A-Z]{16}"),
+        ("api_key", r"sk-[A-Za-z0-9_-]{20,}"),
+        ("url_credentials", r"https?://[^\s/]+:[^\s@]+@"),
+        ("jwt", r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),
+    ]
+    .map(|(n, p)| (n, Regex::new(p).expect("a valid pattern")))
+    .into()
+});
+
+/// The name of the secret pattern `text` matches, if any. Refuse, never scrub.
+pub fn refuse_secret(text: &str) -> Option<&'static str> {
+    SECRETS
+        .iter()
+        .find(|(_, re)| re.is_match(text))
+        .map(|(n, _)| *n)
+}

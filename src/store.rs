@@ -3,7 +3,7 @@ use std::path::Path;
 
 /// Migration `i` takes the db to `user_version` `i + 1`. Forward only; each one only adds
 /// tables or columns, and runs once (in the transaction that moves `user_version`).
-const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8];
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9];
 
 const V1: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
@@ -87,6 +87,34 @@ const V7: &str = "ALTER TABLE messages ADD COLUMN body_sha TEXT;";
 /// Retired (the person links' key -> person map): kept so the schema version still counts.
 const V8: &str =
     "CREATE TABLE IF NOT EXISTS persons (key TEXT PRIMARY KEY, person TEXT, at INTEGER);";
+/// Memory: signed entries numbered per author, with a full-text index over `subject` and `fact`
+/// (`memory`). A `tombstone` row keeps its id and drops its body (`entry` NULL); a row with no
+/// `seq` is a tombstone that arrived before its entry (`author` is then the forgetter's).
+const V9: &str = "
+CREATE TABLE IF NOT EXISTS memory_entries (
+    id TEXT PRIMARY KEY, author TEXT, seq INTEGER, entry TEXT, received_at INTEGER,
+    tombstone INTEGER DEFAULT 0, UNIQUE(author, seq)
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
+    subject, fact, content='memory_entries', content_rowid='rowid'
+);
+CREATE TRIGGER IF NOT EXISTS memory_ai AFTER INSERT ON memory_entries BEGIN
+    INSERT INTO memory_fts(rowid, subject, fact)
+    VALUES (new.rowid, json_extract(new.entry, '$.op.subject'), json_extract(new.entry, '$.op.fact'));
+END;
+CREATE TRIGGER IF NOT EXISTS memory_ad AFTER DELETE ON memory_entries BEGIN
+    INSERT INTO memory_fts(memory_fts, rowid, subject, fact)
+    VALUES ('delete', old.rowid, json_extract(old.entry, '$.op.subject'), json_extract(old.entry, '$.op.fact'));
+END;
+CREATE TRIGGER IF NOT EXISTS memory_au AFTER UPDATE ON memory_entries BEGIN
+    INSERT INTO memory_fts(memory_fts, rowid, subject, fact)
+    VALUES ('delete', old.rowid, json_extract(old.entry, '$.op.subject'), json_extract(old.entry, '$.op.fact'));
+    INSERT INTO memory_fts(rowid, subject, fact)
+    VALUES (new.rowid, json_extract(new.entry, '$.op.subject'), json_extract(new.entry, '$.op.fact'));
+END;
+CREATE VIEW IF NOT EXISTS memory_heads AS
+    SELECT author, MAX(seq) AS seq FROM memory_entries WHERE seq IS NOT NULL GROUP BY author;
+";
 
 /// The digest `messages.body_sha` keeps: hex sha256 of the text.
 pub fn body_sha(text: &str) -> String {
@@ -988,10 +1016,10 @@ mod tests {
         let path = dir.path().join("state.db");
         Connection::open(&path)
             .unwrap()
-            .execute_batch("PRAGMA user_version = 9;")
+            .execute_batch("PRAGMA user_version = 10;")
             .unwrap();
         let err = Store::open(&path).err().unwrap().to_string();
-        assert!(err.contains("State is from a newer version (v9)"), "{err}");
-        assert_eq!(user_version(&path), 9);
+        assert!(err.contains("State is from a newer version (v10)"), "{err}");
+        assert_eq!(user_version(&path), 10);
     }
 }

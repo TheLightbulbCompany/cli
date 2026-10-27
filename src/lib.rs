@@ -19,6 +19,7 @@ pub mod login;
 pub mod mail;
 pub mod mcp;
 pub mod member;
+pub mod memory;
 pub mod net;
 pub mod os;
 pub mod outbox;
