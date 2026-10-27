@@ -539,6 +539,11 @@ impl Peer {
 
     /// A `hello` showing sign-in proof `proof` (`common::issuer::proof`).
     pub async fn hello_with(&mut self, heads: Vec<String>, proof: Option<String>) {
+        self.hello_full(heads, proof, false).await;
+    }
+
+    /// A `hello` that also says whether this peer syncs memory.
+    pub async fn hello_full(&mut self, heads: Vec<String>, proof: Option<String>, memory: bool) {
         let protocol = PROTOCOL;
         let addrs = vec![];
         self.send(&Frame::Hello {
@@ -546,6 +551,7 @@ impl Peer {
             heads,
             addrs,
             proof,
+            memory,
         })
         .await;
     }
