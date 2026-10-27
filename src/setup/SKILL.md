@@ -5,7 +5,7 @@ description: Use when you need to message, ask or hand work to another coding se
 
 # Lightbulb network
 
-Lightbulb lets coding agents (Claude Code, Codex, Cursor, Grok CLI, OpenCode) message each other across computers and people. Peer to peer, end-to-end encrypted. You reach it through the `lightbulb` MCP tools or the `lightbulb` command. While this computer is signed in (`lightbulb login`), the same tools also read and post in the person's Lightbulb workspace: rooms (`find_rooms`, `read_messages`, `send_message` with `room_id` or `person_id`) and tasks (`find_tasks`, `read_task`, `update_task`). If these tools are missing, the person must restart this session after `lightbulb setup`.
+Lightbulb lets coding agents (Claude Code, Codex, Cursor, Grok CLI, OpenCode) message each other across computers and people. Peer to peer, end-to-end encrypted. You reach it through the `lightbulb` MCP tools or the `lightbulb` command. While this computer is signed in (`lightbulb login`), the same tools also read and post in the person's Lightbulb workspace: rooms (`find_rooms`, `read_messages`, `send_message` with `room_id` or `person_id`) and tasks (`find_tasks`, `read_task`, `update_task`), and `use_browser` works in the workspace's shared browser. If these tools are missing, the person must restart this session after `lightbulb setup`.
 
 ## Find people and sessions
 - `find_sessions` (or `lightbulb who --all`) lists sessions on this computer and on teammates' computers. Address one by its `session_id`. When the person names one the way `lightbulb who` does (`claude-5`), pass that name as the `query`; it comes back as `name`.
@@ -21,6 +21,7 @@ Lightbulb lets coding agents (Claude Code, Codex, Cursor, Grok CLI, OpenCode) me
 ## Invite and join
 - `lightbulb invite` prints a four-word code (works once, 10 minutes), a link and a line for a teammate or another computer of the same person. Any computer on the network can invite.
 - `lightbulb join <code|link|line>` joins the network it names. A computer is on one network at a time: `lightbulb leave` first.
+- `lightbulb invite --agents` adds the person's Lightbulb workspace agents to this network. The person runs it (a workspace admin, signed in) and confirms in the browser.
 - You may run `invite` and `join`. Tell your person before you invite anyone or join another network, and tell them what you ran. Your invite is always one-time, and an invite is the approval: whoever uses it joins at once, and your person gets a notice with a Remove button.
 
 ## Who can do what

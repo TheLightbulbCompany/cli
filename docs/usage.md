@@ -43,7 +43,7 @@ Run `lightbulb <command> --help` for the options of each one.
 | `setup --remove` | Take out only what `setup` wrote. Backups are left as they are. |
 | `doctor` | Check the service, the local network, the state folder and each agent, and say how to fix what is not right. |
 | `who` | List the sessions on this computer. `who --all` adds your teammates' sessions. |
-| `invite` | Print a four-word code (works once, for 10 minutes), a `https://thelightbulb.company/j#…` link, and the join command (`lightbulb join '<ticket>'`) that add your other computer or a teammate. The link and line are reusable for 7 days. `--once`: one join, valid 24 hours. `--new`: a new invite; every earlier one from this computer, `--once` ones too, stops working. |
+| `invite` | Print a four-word code (works once, for 10 minutes), a `https://thelightbulb.company/j#…` link, and the join command (`lightbulb join '<ticket>'`) that add your other computer or a teammate. The link and line are reusable for 7 days. `--once`: one join, valid 24 hours. `--new`: a new invite; every earlier one from this computer, `--once` ones too, stops working. `--agents`: add your Lightbulb workspace's agents to this network (a workspace admin, signed in; confirm in the browser). |
 | `join '<ticket>'` | Join the team the invite is for. Takes the four-word code, the `https://thelightbulb.company/j#…` link, the `lightbulb://join/…` link or the bare ticket. The name you go by is your user name; `--name <name>` sets another. The computer must be on its own first. |
 | `approve H1` / `decline H1` | Answer a permission prompt the Lightbulb app filed. |
 | `held` | The permission prompts waiting for your answer. |
@@ -55,11 +55,14 @@ Run `lightbulb <command> --help` for the options of each one.
 | `leave` | Leave the team. This computer is on its own network again. It also works when the background service will not start because `identity.key` no longer matches the team record. |
 | `relay [<url>]` | Show the relays this computer uses, or set one. With nothing set it uses the iroh project's public relays (`default`). It sets the team's relay; `--local` sets only this computer's; `--clear` clears yours and goes back to the default. Relays carry encrypted bytes only. Lightbulb fetches no relay list of its own. |
 | `folder <path> on\|off` | Show or hide the sessions under a folder from your teammates. |
+| `login` | Sign this computer in to Lightbulb (confirm in the browser), so your workspace's agents answer it. |
+| `logout` | Sign this computer out. |
 | `telemetry [on\|off\|status]` | Show or set anonymous usage counts (see the [README](../README.md#usage-counts)). |
 | `version` | Print the version. |
 
-`held`, `approve` and the other commands that decide for you refuse to run from an agent's shell
-(`Run this from your own terminal, not from an agent.`). Only you answer them.
+`held`, `remove`, `leave` and `relay <url>` refuse to run from an agent's shell
+(`Run this from your own terminal, not from an agent.`). An agent may run `invite`, `join`,
+`approve` and `decline`; an answer it gives records its session.
 
 ## Trust
 
@@ -81,9 +84,11 @@ encrypted between the two computers, and their text is not written to the log. A
 text is deleted from `state.db` once nothing waits on it (read, refused or expired); messages to
 your own terminal keep theirs.
 
-Apart from anonymous usage counts (`lightbulb telemetry off`), the engine makes no network call to Lightbulb: no relay list, no sign-in. It talks
-only to your teammates' computers and, when no direct path exists, to the relays. (`update`,
-when you run it, downloads from this project's GitHub releases.)
+Apart from anonymous usage counts (`lightbulb telemetry off`), the engine calls Lightbulb only for
+`login`, renewing a signed-in computer's proof, `invite --agents`, and, while signed in, the live
+connection hosted apps use. Otherwise it talks only to your teammates' computers and, when no
+direct path exists, to the relays. The background service checks this project's GitHub releases
+once a day for an update (`lightbulb update --auto off` stops it), and `update` downloads from them.
 
 To hide sessions, run `lightbulb folder <path> off`. Sessions under that folder disappear
 from your teammates' `who --all` within a few seconds. `who` on your

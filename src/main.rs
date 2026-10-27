@@ -37,6 +37,7 @@ Team:
   logout    Sign this computer out
   folder    Show or hide the sessions in a folder from your teammates: folder <path> on|off
   relay     The relays used when no direct path exists; relay <url> sets yours
+  telemetry Show or set anonymous usage counts: telemetry on|off|status
 
 With the Lightbulb app on this Mac: claude, codex, continue '<link>', share on|off and pair
 

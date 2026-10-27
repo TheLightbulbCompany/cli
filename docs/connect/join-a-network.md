@@ -20,6 +20,7 @@ Or in Terminal, with any of the three:
 
 ```sh
 lightbulb join <four-word code>
+lightbulb join 'https://thelightbulb.company/j#…'
 lightbulb join '<ticket>'
 ```
 

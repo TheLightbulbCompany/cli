@@ -182,16 +182,20 @@ conversations, only the messages sent to them. Hide a folder with `lightbulb fol
 
 Lightbulb sends anonymous usage counts (see "Usage counts" in the README; off with `lightbulb telemetry off`, or `DO_NOT_TRACK=1` / `LIGHTBULB_NO_TELEMETRY=1`, which always win). It sends no crash reports and no message content. The first `setup` sends one `cli_installed` event before it prints the opt-out notice; set one of those variables before installing to send nothing at all.
 
-Apart from those counts, the engine makes no network call to Lightbulb: no relay list, no sign-in. It talks
-only to your teammates' computers and, when no direct path exists, to the relays (the iroh
-project's public relays unless you or your team set one).
+Apart from those counts, the engine calls Lightbulb only for these: `lightbulb login` (a device
+sign-in you confirm in the browser), renewing a signed-in computer's proof, `lightbulb invite
+--agents`, and, while this computer is signed in, one live connection that hosted apps reach your
+sessions through. It fetches no relay list from Lightbulb. Otherwise it talks only to your
+teammates' computers and, when no direct path exists, to the relays (the iroh project's public
+relays unless you or your team set one).
 
 The install script, `npm install`, `lightbulb update` and the daemon's daily update check
 download the release from GitHub. An update checks the tarball's SHA-256 against the `.sha256`
 file of the same GitHub release: that proves the download is intact, with the same trust as
 the install script (whoever controls the release controls both). On macOS an update also
-requires the new binary to be signed with Lightbulb's Developer ID (team `WZX4U3C22Y`); on
-Linux the checksum is the only check. The background daily update never edits your shell
+requires the new binary to be signed with Lightbulb's Developer ID (team `WZX4U3C22Y`) and
+notarized. On Linux, `lightbulb update` also checks the checksum file's Ed25519 signature
+(`.sha256.sig`) against a key built into the binary. The install script checks the SHA-256 only. The background daily update never edits your shell
 profile. Only a command you run at a terminal (`setup`, or `update` there) adds `~/.local/bin`
 to your PATH, once, and never through a symlinked profile.
 
