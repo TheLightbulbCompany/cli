@@ -99,10 +99,39 @@ fn setup_writes_claude_hooks_and_mcp_and_backs_up_once() {
     assert_eq!(c["mcpServers"]["other"], json!({"command": "x"}));
     assert_eq!(c["numStartups"], 3);
 
+    // The hosted MCP, as a claude.ai connector, stays out of Claude Code.
+    let deny = json!({"serverUrl": "https://api.thelightbulb.company/mcp*"});
+    assert_eq!(s["deniedMcpServers"], json!([deny]));
+
     // Idempotent.
     assert!(agent(&setup(h, false), "claude").wrote.is_empty());
     backed_up_once(h, ".claude/settings.json", &settings);
     backed_up_once(h, ".claude.json", &config);
+}
+
+#[test]
+fn setup_denies_the_hosted_connector_once_and_remove_keeps_the_persons_own() {
+    let home = tempfile::tempdir().unwrap();
+    let h = home.path();
+    let mine = json!({"serverName": "claude.ai Slack"});
+    put(
+        h,
+        ".claude/settings.json",
+        &json!({"deniedMcpServers": [mine]}).to_string(),
+    );
+    put(h, ".claude.json", "{}");
+    let ours = json!({"serverUrl": "https://api.thelightbulb.company/mcp*"});
+    setup(h, false);
+    setup(h, false);
+    assert_eq!(
+        json_at(h, ".claude/settings.json")["deniedMcpServers"],
+        json!([mine, ours])
+    );
+    setup(h, true);
+    assert_eq!(
+        json_at(h, ".claude/settings.json")["deniedMcpServers"],
+        json!([mine])
+    );
 }
 
 #[test]
