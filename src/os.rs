@@ -230,20 +230,35 @@ mod imp {
     }
 
     /// `/proc/<pid>/exe`, less the ` (deleted)` Linux adds once the binary was replaced (an
-    /// agent updated mid-session is still that agent). Another uid's process (pid 1, root
-    /// `sshd`/`login`, WSL's `/init`) refuses that link; then its name from `comm`: an agent
-    /// never runs as another uid. A same-uid process that refuses it (it made itself
-    /// non-dumpable) is an error, so a walk through it fails closed.
+    /// agent updated mid-session is still that agent). A process that refuses that link
+    /// (another uid's: pid 1, root `sshd`/`login`, WSL's `/init`; or a same-uid one that is
+    /// non-dumpable: setuid, file capabilities, `PR_SET_DUMPABLE` 0) is named (`by_name`).
+    /// Any other failure (the process is gone) is an error, so a walk through it fails closed.
     pub fn executable(pid: u32) -> Result<PathBuf> {
         match std::fs::read_link(format!("/proc/{pid}/exe")) {
             Ok(p) => Ok(undeleted(p)),
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && other_uid(pid) => {
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
                 let comm = std::fs::read_to_string(format!("/proc/{pid}/comm"))
                     .map_err(|_| format!("no executable path for {pid}"))?;
-                Ok(PathBuf::from(comm.trim_end_matches('\n')))
+                let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+                Ok(by_name(&comm, &cmdline))
             }
             Err(_) => Err(format!("no executable path for {pid}").into()),
         }
+    }
+
+    /// A process's name from `comm` (its exe's file name, at most 15 bytes), or its `argv[0]`
+    /// when that is an agent: `comm` drops the install path `classify` also reads (Claude's
+    /// `.../claude/versions/<v>`, Cursor's `.../cursor-agent/.../node`) and cuts
+    /// `codex-app-server`. `argv[0]` only ever adds an agent, never hides one `comm` names.
+    pub(super) fn by_name(comm: &str, cmdline: &[u8]) -> PathBuf {
+        use std::os::unix::ffi::OsStrExt;
+        let arg0 = cmdline.split(|b| *b == 0).next().unwrap_or_default();
+        let arg0 = PathBuf::from(std::ffi::OsStr::from_bytes(arg0));
+        if crate::agents::caller::classify(&arg0).is_some() {
+            return arg0;
+        }
+        PathBuf::from(comm.trim_end_matches('\n'))
     }
 
     fn undeleted(p: PathBuf) -> PathBuf {
@@ -253,20 +268,6 @@ mod imp {
             Some(b) => std::ffi::OsString::from_vec(b.to_vec()).into(),
             None => p,
         }
-    }
-
-    /// Whether `/proc/<pid>/status` names a uid (real, effective, saved or fs) not ours;
-    /// false when it cannot be read.
-    fn other_uid(pid: u32) -> bool {
-        // SAFETY: getuid takes no arguments and cannot fail.
-        let me = unsafe { libc::getuid() }.to_string();
-        std::fs::read_to_string(format!("/proc/{pid}/status"))
-            .ok()
-            .and_then(|s| {
-                let line = s.lines().find(|l| l.starts_with("Uid:"))?;
-                Some(line[4..].split_whitespace().any(|u| u != me))
-            })
-            .unwrap_or(false)
     }
 
     pub fn peer_pid(fd: std::os::fd::RawFd) -> Result<u32> {
@@ -384,6 +385,40 @@ mod tests {
             started <= now + 2_000 && started.abs_diff(now) < 3_600_000,
             "{started} vs {now}"
         );
+    }
+
+    /// A refused `exe` is named by `comm`, or by `argv[0]` when that is an agent `comm` misses;
+    /// every agent name `classify` matches fits `comm`'s 15 bytes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_refused_exe_is_named() {
+        use crate::agents::caller::classify;
+        let named = |comm: &str, cmdline: &[u8]| classify(&imp::by_name(comm, cmdline));
+        assert_eq!(named("cua-spacesd\n", b"/usr/bin/cua-spacesd\0-d\0"), None);
+        assert_eq!(named("bash\n", b""), None);
+        for (comm, agent) in [
+            ("claude", "claude"),
+            ("codex", "codex"),
+            ("cursor-agent", "cursor"),
+            ("grok", "grok"),
+            ("grok-native", "grok"),
+            ("opencode", "opencode"),
+            ("opencode.exe", "opencode"),
+        ] {
+            assert!(comm.len() <= 15, "{comm}");
+            assert_eq!(
+                named(&format!("{comm}\n"), b"-bash\0"),
+                Some(agent),
+                "{comm}"
+            );
+        }
+        let claude = b"/home/u/.local/share/claude/versions/2.1.307\0";
+        assert_eq!(named("2.1.307\n", claude), Some("claude"));
+        assert_eq!(named("2.1.307\n", b"claude\0-p\0"), Some("claude"));
+        let codex = b"/home/u/.codex/app-server-daemon/bin/codex-app-server\0";
+        assert_eq!(named("codex-app-serve\n", codex), Some("codex"));
+        let cursor = b"/home/u/.local/share/cursor-agent/versions/1/node\0";
+        assert_eq!(named("node\n", cursor), Some("cursor"));
     }
 
     /// An agent whose binary is replaced mid-session keeps its path (Linux says

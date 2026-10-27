@@ -926,24 +926,46 @@ mod tests {
         claude.wait().unwrap();
     }
 
-    /// A same-uid process that made itself non-dumpable hides its `exe`: the walk through it
-    /// fails closed (not a person), never falls back to the name it chose.
+    /// A same-uid process that made itself non-dumpable (`cua-spacesd`) hides its `exe`: it is
+    /// named instead, so its step resolves (not an agent), and the same process installed as
+    /// `claude` is still caught by that name.
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_hidden_same_uid_process_is_not_a_person() {
-        let (mut hidden, pid) = child_of(
-            &std::env::current_exe().unwrap(),
-            &[
-                "--exact",
-                "daemon::net_ops::tests::nondumpable_sleep",
-                "--ignored",
-                "--nocapture",
-            ],
-        );
-        assert!(os::process(pid).is_err());
-        assert!(!no_agent(caller::ancestors_pinned(pid, None)));
+    fn a_hidden_same_uid_process_is_named() {
+        let args = [
+            "--exact",
+            "daemon::net_ops::tests::nondumpable_sleep",
+            "--ignored",
+            "--nocapture",
+        ];
+        let first = |pid| caller::ancestors_pinned(pid, None).next().unwrap();
+        let me = std::env::current_exe().unwrap();
+        let (mut hidden, pid) = child_of(&me, &args);
+        let (p, agent) = first(pid).unwrap();
+        assert!(!agent, "{p:?}");
+        // Root reads the link anyway; anyone else gets the name.
+        if std::fs::read_link(format!("/proc/{pid}/exe")).is_err() {
+            let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap();
+            assert_eq!(p.executable, std::path::Path::new(comm.trim_end()));
+        }
         kill(pid);
         hidden.wait().unwrap();
+
+        // `cp`, not `fs::copy`: a write fd held here races a parallel test's fork (ETXTBSY).
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("claude");
+        assert!(Command::new("cp")
+            .arg(&me)
+            .arg(&agent)
+            .status()
+            .unwrap()
+            .success());
+        let (mut claude, pid) = child_of(&agent, &args);
+        let (p, agent) = first(pid).unwrap();
+        assert!(agent, "{p:?}");
+        assert!(!no_agent(caller::ancestors_pinned(pid, None)));
+        kill(pid);
+        claude.wait().unwrap();
     }
 
     #[cfg(target_os = "linux")]
