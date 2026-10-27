@@ -140,8 +140,7 @@ pub fn remember(store: &Store, id: &Identity, op: Op, now: i64) -> Result<Entry>
 }
 
 /// Stores `e` once it verifies: `Ok(true)` when stored, `Ok(false)` when already held. Refuses a
-/// bad signature or id, an author the roster has not admitted, and a `Forget` of another
-/// author's entry.
+/// bad signature or id and an author the roster has not admitted.
 pub fn accept(store: &Store, e: &Entry, now: i64) -> Result<bool> {
     if canonical(&e.value()).len() > MAX_ENTRY_BYTES {
         return Err("memory entry is too large".into());
@@ -161,70 +160,40 @@ pub fn accept(store: &Store, e: &Entry, now: i64) -> Result<bool> {
     Ok(stored)
 }
 
-/// The row for verified `e`, and the tombstone a `Forget` writes. A row with a NULL `entry` and
-/// `seq` is a tombstone whose body has not arrived: its `author` is the forgetter.
+/// The row for verified `e`; `Ok(false)` when its id is held. A `Forget` is an entry like any
+/// other, and tombstones its target (any member's forget applies): the target's body is dropped
+/// if held, and if it arrives later it is stored without its text.
 fn insert(conn: &rusqlite::Connection, e: &Entry, now: i64) -> Result<bool> {
-    let held: Option<(Option<String>, Option<u64>)> = conn
-        .query_row(
-            "SELECT author, seq FROM memory_entries WHERE id = ?1",
-            [&e.id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?;
-    match held {
-        // The body of a tombstone: it keeps its id and seq, and drops the text, if the
-        // forgetter was its author (else the forget was not valid and never applied).
-        Some((Some(forgetter), None)) => {
-            let ours = forgetter == e.author;
-            let body = (!ours).then(|| serde_json::to_string(e)).transpose()?;
-            conn.execute(
-                "UPDATE memory_entries SET author = ?2, seq = ?3, entry = ?4, tombstone = ?5
-                 WHERE id = ?1",
-                params![e.id, e.author, e.seq, body, ours],
-            )?;
-            return Ok(true);
-        }
-        Some(_) => return Ok(false),
-        None => {}
+    let held = conn
+        .prepare_cached("SELECT 1 FROM memory_entries WHERE id = ?1")?
+        .exists([&e.id])?;
+    if held {
+        return Ok(false);
     }
-    if let Op::Forget { target } = &e.op {
-        let row: Option<(Option<String>, Option<String>)> = conn
-            .query_row(
-                "SELECT author, entry FROM memory_entries WHERE id = ?1",
-                [target],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        match row {
-            None => {
-                conn.execute(
-                    "INSERT INTO memory_entries (id, author, received_at, tombstone)
-                     VALUES (?1, ?2, ?3, 1)",
-                    params![target, e.author, now],
-                )?;
-            }
-            Some((author, body)) => {
-                if author.as_deref() != Some(&e.author) {
-                    return Err("only an entry's author can forget it".into());
-                }
-                let is_forget = body
-                    .and_then(|b| serde_json::from_str::<Entry>(&b).ok())
-                    .is_some_and(|t| matches!(t.op, Op::Forget { .. }));
-                if is_forget {
-                    return Err("a forget cannot be forgotten".into());
-                }
-                conn.execute(
-                    "UPDATE memory_entries SET entry = NULL, tombstone = 1 WHERE id = ?1",
-                    [target],
-                )?;
-            }
-        }
-    }
+    let tombstoned = matches!(e.op, Op::Remember { .. })
+        && conn
+            .prepare_cached("SELECT 1 FROM memory_tombstones WHERE target = ?1")?
+            .exists([&e.id])?;
+    let body = (!tombstoned)
+        .then(|| serde_json::to_string(e))
+        .transpose()?;
     conn.execute(
-        "INSERT INTO memory_entries (id, author, seq, entry, received_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![e.id, e.author, e.seq, serde_json::to_string(e)?, now],
+        "INSERT INTO memory_entries (id, author, seq, entry, received_at, tombstone)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![e.id, e.author, e.seq, body, now, tombstoned],
     )?;
+    if let Op::Forget { target } = &e.op {
+        conn.execute(
+            "INSERT OR IGNORE INTO memory_tombstones (target) VALUES (?1)",
+            [target],
+        )?;
+        // A forget of a forget is accepted and does nothing.
+        conn.execute(
+            "UPDATE memory_entries SET entry = NULL, tombstone = 1
+             WHERE id = ?1 AND json_extract(entry, '$.op.t') = 'remember'",
+            [target],
+        )?;
+    }
     Ok(true)
 }
 

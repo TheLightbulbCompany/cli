@@ -208,18 +208,117 @@ fn remember_refuses_secret_with_reason() {
     assert!(memory::facts(&s, None, None).unwrap().is_empty());
 }
 
+/// `who` admitted to `s`'s roster by founder `a`.
+fn admit(s: &Store, a: &Identity, who: &Identity) {
+    let g = roster::entries(s).unwrap().remove(0);
+    let adm = roster::Entry::signed(
+        a,
+        vec![g.hash()],
+        RosterKind::Admit,
+        json!({"member": who.key, "name": "b", "computer": "mac", "role": "member"}),
+        2,
+    );
+    roster::accept(s, &adm, 10).unwrap();
+}
+
+/// `b`'s first entry: a forget of `target`, made on a store of its own.
+fn forget_by(b: &Identity, target: &str) -> memory::Entry {
+    let (_d, sb) = store();
+    memory::remember(
+        &sb,
+        b,
+        Op::Forget {
+            target: target.into(),
+        },
+        2,
+    )
+    .unwrap()
+}
+
+#[test]
+fn non_author_forget_before_body_wins() {
+    let (a, b) = (identity(), identity());
+    let (_d1, s1) = team(&a);
+    let x = memory::remember(&s1, &a, rem("db", "postgres", &[]), 1).unwrap();
+    let fa = memory::remember(
+        &s1,
+        &a,
+        Op::Forget {
+            target: x.id.clone(),
+        },
+        2,
+    )
+    .unwrap();
+    let fb = forget_by(&b, &x.id);
+
+    let (_d2, s2) = team(&a);
+    admit(&s2, &a, &b);
+    assert!(memory::accept(&s2, &fb, 3).unwrap());
+    assert!(memory::accept(&s2, &fa, 3).unwrap());
+    assert!(memory::accept(&s2, &x, 3).unwrap());
+    assert!(memory::facts(&s2, None, None).unwrap().is_empty());
+    assert!(memory::search(&s2, "postgres", 5).unwrap().is_empty());
+    let h = memory::heads(&s2).unwrap();
+    assert_eq!((h[&a.key], h[&b.key]), (2, 1));
+    assert_eq!(memory::since(&s2, &a.key, 0, 10).unwrap(), vec![fa]);
+    assert_eq!(memory::since(&s2, &b.key, 0, 10).unwrap(), vec![fb]);
+}
+
+#[test]
+fn forget_of_known_entry_by_other_member_applies() {
+    let (a, b) = (identity(), identity());
+    let (_d, s) = team(&a);
+    admit(&s, &a, &b);
+    let x = memory::remember(&s, &a, rem("db", "postgres", &[]), 1).unwrap();
+    assert_eq!(memory::facts(&s, None, None).unwrap().len(), 1);
+    let (_db, sb) = store();
+    let fb = memory::remember(
+        &sb,
+        &b,
+        Op::Forget {
+            target: x.id.clone(),
+        },
+        2,
+    )
+    .unwrap();
+    // A forget of a forget is accepted and changes nothing.
+    let ff = memory::remember(
+        &sb,
+        &b,
+        Op::Forget {
+            target: fb.id.clone(),
+        },
+        3,
+    )
+    .unwrap();
+    assert!(memory::accept(&s, &fb, 3).unwrap());
+    assert!(memory::accept(&s, &ff, 3).unwrap());
+    assert!(memory::facts(&s, None, None).unwrap().is_empty());
+    assert_eq!(memory::since(&s, &b.key, 0, 10).unwrap(), vec![fb, ff]);
+}
+
 #[test]
 fn search_survives_snapshot() {
     let a = identity();
     let (d, s) = team(&a);
-    // A gap in rowids: VACUUM would renumber a table without an explicit rowid.
-    let e = memory::remember(&s, &a, rem("gone", "temp", &[]), 1).unwrap();
-    memory::remember(&s, &a, Op::Forget { target: e.id }, 2).unwrap();
+    memory::remember(&s, &a, rem("gone", "temp", &[]), 1).unwrap();
     memory::remember(&s, &a, rem("database choice", "postgres", &[]), 3).unwrap();
     memory::remember(&s, &a, rem("ci provider", "actions", &[]), 4).unwrap();
+    // A hard delete leaves a gap in the rowids: VACUUM would renumber a table without an
+    // explicit rowid, and the index would point at the wrong rows.
+    rusqlite::Connection::open(d.path().join("state.db"))
+        .unwrap()
+        .execute("DELETE FROM memory_entries WHERE seq = 1", [])
+        .unwrap();
     let copy = d.path().join("copy.db");
     s.snapshot(&copy).unwrap();
     let c = Store::open(&copy).unwrap();
-    assert_eq!(memory::search(&c, "database", 5).unwrap().len(), 1);
-    assert_eq!(memory::search(&c, "provider", 5).unwrap().len(), 1);
+    assert_eq!(
+        memory::search(&c, "database", 5).unwrap()[0].value,
+        "postgres"
+    );
+    assert_eq!(
+        memory::search(&c, "provider", 5).unwrap()[0].value,
+        "actions"
+    );
 }

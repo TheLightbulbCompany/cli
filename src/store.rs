@@ -88,13 +88,15 @@ const V7: &str = "ALTER TABLE messages ADD COLUMN body_sha TEXT;";
 const V8: &str =
     "CREATE TABLE IF NOT EXISTS persons (key TEXT PRIMARY KEY, person TEXT, at INTEGER);";
 /// Memory: signed entries numbered per author, with a full-text index over `subject` and `fact`
-/// (`memory`). `rowid` is explicit so it survives `VACUUM` (the FTS index points at it). A `tombstone` row keeps its id and drops its body (`entry` NULL); a row with no
-/// `seq` is a tombstone that arrived before its entry (`author` is then the forgetter's).
+/// (`memory`). `rowid` is explicit so it survives `VACUUM` (the FTS index points at it). A
+/// tombstoned row keeps its id and seq and drops its body (`entry` NULL); `memory_tombstones`
+/// holds every id a held `Forget` names, so a body that arrives later is stored without its text.
 const V9: &str = "
 CREATE TABLE IF NOT EXISTS memory_entries (
     rowid INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE, author TEXT, seq INTEGER, entry TEXT,
     received_at INTEGER, tombstone INTEGER DEFAULT 0, UNIQUE(author, seq)
 );
+CREATE TABLE IF NOT EXISTS memory_tombstones (target TEXT PRIMARY KEY);
 CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
     subject, fact, content='memory_entries', content_rowid='rowid'
 );
