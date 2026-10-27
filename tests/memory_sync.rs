@@ -2,9 +2,12 @@
 //! the `me` scope and a removed member. Real daemons; a member played by the test where it
 //! needs to see frames.
 
+use lightbulb::daemon::net_ops;
 use lightbulb::memory::{self, Entry, Kind, Op, Scope, Source};
 use lightbulb::net::frames::Frame;
 use lightbulb::net::ALPN;
+use lightbulb::roster;
+use serde_json::json;
 use std::cell::RefCell;
 use std::time::Duration;
 
@@ -56,16 +59,47 @@ async fn team_entry_reaches_the_other_member() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_me_scope_syncs_only_same_person() {
-    // Two computers of two people (a roster's `person_id` is the member key): a `me` entry
-    // stays; the same-person case is `net::memsync`'s unit test.
-    let (a, b) = (Env::new(), Env::new());
-    seed_pair(&a, &b);
-    remember(&a, op("mine", "private", Scope::Me));
-    let team = remember(&a, op("ours", "shared", Scope::Team));
-    common::start_pair(&a, &b, "", &[]);
+    // A and B are signed in as one person, C as another; one team of three.
+    let (a, b, c) = (Env::new(), Env::new(), Env::new());
+    let (ia, ib, ic) = (a.identity(), b.identity(), c.identity());
+    let g = net_ops::genesis(&ia, "prasiddha", "mac", "acme", 1);
+    let ab = common::admit(&ia, &g, &ib, "bob", json!({"computer": "mbp"}));
+    let ac = common::admit(&ia, &ab, &ic, "cy", json!({"computer": "imac"}));
+    for env in [&a, &b, &c] {
+        let store = env.store();
+        for e in [&g, &ab, &ac] {
+            roster::accept(&store, e, 10).unwrap();
+        }
+    }
+    a.sign_in("user_one", None);
+    b.sign_in("user_one", None);
+    c.sign_in("user_two", None);
+    let mine = remember(&a, op("mine", "private", Scope::Me));
+    let ours = remember(&a, op("ours", "shared", Scope::Team));
+    b.daemon(false, "", &[]);
+    c.daemon(false, "", &[]);
+    a.daemon(false, "", &[common::peers(&[&b, &c])]);
+    let ka = ia.key;
+    until(
+        10,
+        "both entries reach B, the other person's computer",
+        || held(&b, &ka) == [mine.clone(), ours.clone()],
+    );
+    until(10, "the team entry reaches C", || !held(&c, &ka).is_empty());
+    // C is connected and caught up: it was sent the team entry only.
+    assert_eq!(held(&c, &ka), [ours]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn entry_written_on_live_link_arrives_without_reconnect() {
+    let (a, b) = common::pair(&[]);
     let ka = a.identity().key;
-    until(10, "the team entry arrives", || !held(&b, &ka).is_empty());
-    assert_eq!(held(&b, &ka), [team]);
+    assert!(held(&b, &ka).is_empty());
+    let e = remember(&a, op("db", "postgres 16", Scope::Team));
+    until(10, "B holds it on the same link", || {
+        held(&b, &ka) == [e.clone()]
+    });
+    assert_eq!(a.status()["peers"]["online"], 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

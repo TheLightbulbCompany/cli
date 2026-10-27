@@ -503,6 +503,15 @@ impl Peers {
             .is_some_and(|l| matches!(l.protocol, Protocol::Ok(_)))
     }
 
+    /// Sends `f` on every live link that said `hello` in our protocol with `memory`.
+    fn tell_memory(&self, f: &Frame) {
+        for l in self.live.lock().unwrap().values() {
+            if l.memory && matches!(l.protocol, Protocol::Ok(_)) {
+                let _ = l.tx.send((f.clone(), None));
+            }
+        }
+    }
+
     /// Whether `key`'s link is still `conn`, said `hello` in our protocol and syncs memory.
     fn speaks_memory(&self, key: &str, conn: &Connection) -> bool {
         current(&mut self.live.lock().unwrap(), key, conn)
@@ -642,6 +651,7 @@ impl Net {
         tokio::spawn(net.clone().keep_up());
         tokio::spawn(net.clone().flush_loop());
         tokio::spawn(net.clone().relay_loop());
+        tokio::spawn(net.clone().memory_loop());
         Ok(net)
     }
 
@@ -729,6 +739,31 @@ impl Net {
             let to_dial = self.refresh(changed);
             for key in to_dial {
                 tokio::spawn(self.clone().dial(key));
+            }
+        }
+    }
+
+    /// Tells every memory peer our heads each second they have moved (a local `remember`, or a
+    /// page accepted from another peer); a peer behind pages the gap. A new link hears them at its
+    /// `hello`. One cheap query a second; idempotent for the peer.
+    async fn memory_loop(self) {
+        let d = &self.0.daemon;
+        let mut last = None;
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {}
+                _ = self.0.endpoint.closed() => return,
+            }
+            let dd = d.clone();
+            let Ok(Ok(f)) = tokio::task::spawn_blocking(move || memsync::heads(&dd)).await else {
+                continue;
+            };
+            if last.as_ref() != Some(&f) {
+                if last.is_some() {
+                    d.peers.tell_memory(&f);
+                }
+                last = Some(f);
             }
         }
     }
@@ -999,7 +1034,6 @@ impl Net {
         let (mut presence, mut envelope, mut answer) = (None, None, None);
         let mut grant = None;
         let (mut send_memory_heads, mut memory_heads, mut memory_entries) = (false, None, None);
-        let same_person = team.roster.person_of(key) == team.roster.person_of(&d.identity.key);
         if let Err(why) = frames::from_peer_ok(&f, peer, d) {
             d.peers.dropped(f.kind());
             eprintln!("net: dropped a {} frame from {short} ({why})", f.kind());
@@ -1091,9 +1125,11 @@ impl Net {
             });
         }
         if let Some(theirs) = memory_heads.filter(|_| d.peers.speaks_memory(key, conn)) {
-            let (d, tx) = (d.clone(), tx.clone());
+            let (d, tx, key) = (d.clone(), tx.clone(), key.to_string());
             tokio::task::spawn_blocking(move || {
-                if let Err(e) = memsync::send_pages(&d, &tx, &theirs, same_person) {
+                if let Err(e) =
+                    memsync::send_pages(&d, &tx, &theirs, memsync::same_person(&d, &key))
+                {
                     eprintln!("net: memory pages: {e}");
                 }
             });

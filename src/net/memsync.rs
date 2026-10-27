@@ -5,6 +5,7 @@ use super::frames::Frame;
 use super::{Tx, PAGE_BYTES, PAGE_ENTRIES};
 use crate::daemon::{ipc, Daemon};
 use crate::memory::{self, Op, Scope};
+use crate::proof;
 use crate::Result;
 use std::collections::BTreeMap;
 
@@ -20,14 +21,27 @@ fn sendable(e: &memory::Entry, same_person: bool) -> bool {
         )
 }
 
+/// Whether member `key` is the same person as this computer: both signed in, and `key`'s
+/// verified `hello` proof names the same `sub` as our own sign-in. Else a `me` entry stays home.
+pub(super) fn same_person(d: &Daemon, key: &str) -> bool {
+    let now = ipc::now() as i64;
+    let sub = |token: &str, k: &str| proof::verify(token, k, now).ok().map(|p| p.sub);
+    let mine = crate::login::stored_proof(&d.dir).and_then(|t| sub(&t, &d.identity.key));
+    let theirs = d.proofs.lock().unwrap().get(key).and_then(|t| sub(t, key));
+    mine.is_some() && mine == theirs
+}
+
 /// Our heads, as a frame.
 pub(super) fn heads(d: &Daemon) -> Result<Frame> {
     let heads = memory::heads(&d.store.lock().unwrap())?;
     Ok(Frame::MemoryHeads { heads })
 }
 
-/// Sends `tx` every entry we hold past `theirs`, per author in order, a page closing before the
-/// next entry would take it past `PAGE_BYTES`.
+/// Answers a peer's heads: sends `tx` every entry we hold past `theirs`, per author in order, a
+/// page closing before the next entry would take it past `PAGE_BYTES`; and when they hold more
+/// than we do, our heads in return, which is how they learn what to push.
+/// ponytail: at a fresh link both sides' hello heads can make the same push twice (idempotent);
+/// remember what each link was told if a big backlog makes that cost.
 pub(super) fn send_pages(
     d: &Daemon,
     tx: &Tx,
@@ -35,6 +49,9 @@ pub(super) fn send_pages(
     same_person: bool,
 ) -> Result<()> {
     let ours = memory::heads(&d.store.lock().unwrap())?;
+    let behind = theirs
+        .iter()
+        .any(|(a, n)| *n > ours.get(a).copied().unwrap_or(0));
     // `"more":false` is the longer spelling, so this bounds every page's overhead.
     let base = serde_json::to_vec(&Frame::Memory {
         entries: vec![],
@@ -44,10 +61,11 @@ pub(super) fn send_pages(
     let page = |entries: Vec<memory::Entry>, more| {
         let _ = tx.send((Frame::Memory { entries, more }, None));
     };
-    for (author, mine) in ours {
-        let mut after = theirs.get(&author).copied().unwrap_or(0);
+    for (author, mine) in &ours {
+        let mine = *mine;
+        let mut after = theirs.get(author).copied().unwrap_or(0);
         while mine > after {
-            let batch = memory::since(&d.store.lock().unwrap(), &author, after, PAGE_ENTRIES)?;
+            let batch = memory::since(&d.store.lock().unwrap(), author, after, PAGE_ENTRIES)?;
             let Some(last) = batch.last().map(|e| e.seq) else {
                 break;
             };
@@ -71,6 +89,9 @@ pub(super) fn send_pages(
                 break;
             }
         }
+    }
+    if behind {
+        let _ = tx.send((Frame::MemoryHeads { heads: ours }, None));
     }
     Ok(())
 }
