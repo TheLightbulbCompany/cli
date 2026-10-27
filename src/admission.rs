@@ -222,13 +222,29 @@ fn open(d: &Daemon, req: &Request) -> Result<(i64, Verdict), &'static str> {
     close(&store, n, v);
     if v.is_ok() {
         if let Some(by) = &by {
-            let who = crate::label::render(&team.roster, &d.identity.key, by);
+            let who = crate::label::render(&team.roster, &d.identity.key, &session_of(&store, by));
             let text = format!("{who} invited {} into your network.", req.name);
             let args = dialog::args("Lightbulb", &text, &["Keep", "Remove"]);
             d.dialogs.show(&format!("AR:{}", req.candidate), args);
         }
     }
     Ok((n, v))
+}
+
+/// The session an agent invite was minted by, as `label::render` reads it: `by` is
+/// `<member>/<handle>` (`claude-8`, kept that way in the roster's "admitted by"), and the
+/// session row with that handle gives its `<member>/<provider>:<id>` key, so the notice says
+/// "Your Claude Code" rather than "Your claude-8 mailbox". `by` itself when no row has it.
+fn session_of(store: &crate::store::Store, by: &str) -> String {
+    let handle = by.split_once('/').map_or(by, |(_, h)| h);
+    store
+        .sessions()
+        .ok()
+        .and_then(|rows| {
+            rows.into_iter()
+                .find(|s| s.handle.as_deref() == Some(handle))
+        })
+        .map_or_else(|| by.to_string(), |s| s.key)
 }
 
 /// `req`'s `join_requests` row, made at `now`.
@@ -480,6 +496,9 @@ pub async fn join(id: u64, body: &Value, d: &Arc<Daemon>) -> Response {
         .filter(|_| d.cloud.is_none())
         .and_then(|w| crate::roster::Wake::parse(&json!({"url": w.url, "token": w.token})));
     let mut until: Option<tokio::time::Instant> = None;
+    // A computer that has just started may reach nobody on its first pass (its relay and paths
+    // are still coming up): while no member has answered, keep dialing for `dial_wait`.
+    let dial_until = tokio::time::Instant::now() + d.peers.knobs().dial_wait;
     loop {
         for m in t.members.iter().filter(|m| *m != me) {
             let Some(mut addr) = d.peers.addr(m) else {
@@ -537,10 +556,15 @@ pub async fn join(id: u64, body: &Value, d: &Arc<Daemon>) -> Response {
                 until = Some(tokio::time::Instant::now() + d.peers.knobs().wake_wait);
             }
         }
-        match until {
-            Some(u) if tokio::time::Instant::now() < u => tokio::time::sleep(WAKE_RETRY).await,
-            _ => break,
+        let now = tokio::time::Instant::now();
+        let keep = match until {
+            Some(u) => now < u,
+            None => last.is_none() && now < dial_until,
+        };
+        if !keep {
+            break;
         }
+        tokio::time::sleep(WAKE_RETRY).await;
     }
     // `wake`: the ticket named a workspace, whose doorbell was rung (the CLI says so).
     let mut r = done("refused", Some(last.unwrap_or(UNREACHABLE)), "", 0);

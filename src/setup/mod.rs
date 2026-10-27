@@ -78,7 +78,7 @@ pub const DEFAULT_SERVER: &str = "lightbulb";
 pub(crate) const OLD_SERVER: &str = "lightbulb-network";
 
 /// The hosted Lightbulb MCP's URL: an entry for it under our name gives way to ours.
-const HOSTED: &str = "https://api.thelightbulb.company/mcp";
+pub(super) const HOSTED: &str = "https://api.thelightbulb.company/mcp";
 
 /// Whether an entry under our name that is not ours gives way to ours: the desktop app's old
 /// server (args `["session-mcp"]`) or the hosted MCP's URL.
