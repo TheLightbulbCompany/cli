@@ -23,7 +23,7 @@ it adds two things:
   | `send_message` | Sends text to a session by its `session_id`, or answers a message with `reply_to`. Returns a receipt. |
   | `message_receipt` | Shows the receipt of a message this session sent. |
   | `check_inbox` | Takes the messages waiting for this session. It can wait up to 600 seconds per call for one to arrive. |
-  | `find_workers` | Lists the sessions that take assignments: this computer's and your teammates'. |
+  | `find_workers` | Lists the agents that take an assignment: for now the always-on agents (workspace agents and connected apps). |
   | `assign` | Hands one job to one session: a brief, a `done_when` line and a deadline (default an hour). Its reply is the result. |
   | `cancel_assignment` | Tells the session working on an assignment to stop. |
 

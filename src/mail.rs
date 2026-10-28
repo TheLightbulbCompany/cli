@@ -581,7 +581,9 @@ pub(crate) fn check_kind(
 ) -> std::result::Result<(), &'static str> {
     let too_long = |v: &Option<String>, max| v.as_ref().is_some_and(|s| s.chars().count() > max);
     match kind {
-        "message" => Ok(()),
+        // No build sends a plain message with terms or a status.
+        "message" if meta.is_empty() => Ok(()),
+        "message" => Err("bad_request"),
         "assign" => match &meta.done_when {
             Some(d)
                 if !d.is_empty()
@@ -2445,6 +2447,30 @@ mod tests {
             101,
         );
         refused_for(r, "policy");
+    }
+
+    #[test]
+    fn a_plain_message_carries_no_meta() {
+        let (_d, s) = setup();
+        let with = |rid: &str, meta: Meta| {
+            prep(
+                &s,
+                "a/codex:1",
+                Some("a/claude:2"),
+                rid,
+                None,
+                "message",
+                meta,
+                100,
+            )
+        };
+        let status = Meta {
+            status: Some("done".into()),
+            ..Default::default()
+        };
+        refused_for(with("r1", status), "bad_request");
+        refused_for(with("r2", terms("x", 10)), "bad_request");
+        assert_eq!(go(with("r3", Meta::default())).kind, "message");
     }
 
     #[test]
