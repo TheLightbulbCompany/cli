@@ -524,6 +524,10 @@ static SECRETS: LazyLock<Vec<(&'static str, Regex)>> = LazyLock::new(|| {
         ("private_key", r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
         ("aws_key", r"AKIA[0-9A-Z]{16}"),
         ("api_key", r"sk-[A-Za-z0-9_-]{20,}"),
+        (
+            "vendor_key",
+            r"\b(?:[sr]k_(?:live|test)_[A-Za-z0-9]{16,}|gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{20,}|xox[abprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{35}|glpat-[A-Za-z0-9_-]{20})",
+        ),
         ("url_credentials", r"https?://[^\s/]+:[^\s@]+@"),
         ("jwt", r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),
     ]
