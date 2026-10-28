@@ -739,3 +739,51 @@ async fn leave_reaches_a_peer_or_warns_after_5s() {
         out(&o)
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_assignment_crosses_the_wire_and_its_result_comes_back() {
+    let (a, b) = pair(&[]);
+    let asker = session(&a, "a1");
+    let worker = format!("{}/claude:w1", b.short());
+    let r = a.ask(
+        json!({"id": 1, "op": "send", "from": asker, "to": worker, "kind": "assign",
+        "text": "fix the build", "done_when": "green", "deadline_s": 300, "request_id": "as1"}),
+    );
+    assert_eq!(r["ok"], true, "{r}");
+    wait_state(&a, &asker, "as1", "stored");
+
+    let m = b.take_one(&worker);
+    assert_eq!(m["kind"], "assign", "{m}");
+    assert_eq!(m["done_when"], "green", "{m}");
+    assert!(
+        m["framed"]
+            .as_str()
+            .unwrap()
+            .starts_with("[Lightbulb assignment from "),
+        "{m}"
+    );
+
+    let r = b.send(&worker, &asker, "all green", "re1", Some("as1"));
+    assert!(r["state"].is_string(), "{r}");
+    let mut got = vec![];
+    until(10, "the result reaches the asker", || {
+        got = a.inbox(&asker);
+        !got.is_empty()
+    });
+    assert_eq!(
+        (got[0]["kind"].as_str(), got[0]["status"].as_str()),
+        (Some("result"), Some("done")),
+        "{:?}",
+        got[0]
+    );
+    let rc = a.receipt(&asker, "as1");
+    assert_eq!(rc["result"]["status"], "done", "{rc}");
+
+    let new = format!("{}/claude:new", b.short());
+    a.ask(
+        json!({"id": 1, "op": "send", "from": asker, "to": new, "kind": "assign",
+        "text": "start fresh", "done_when": "green", "deadline_s": 300, "request_id": "as2"}),
+    );
+    wait_state(&a, &asker, "as2", "refused");
+    assert_eq!(a.receipt(&asker, "as2")["reason"], "no_worker");
+}
