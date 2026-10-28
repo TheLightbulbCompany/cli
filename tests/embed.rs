@@ -504,7 +504,7 @@ async fn a_dropped_instance_shuts_down_before_its_home_is_free() {
     let port = ok(&i, "status", json!({})).await["port"].as_u64().unwrap();
     drop(i); // no shutdown: a panic or a cancelled future
     let mut next = None;
-    for _ in 0..500 {
+    for _ in 0..100 {
         if let Ok(n) = try_start(home.path(), &[], None).await {
             next = Some(n);
             break;
@@ -842,4 +842,117 @@ async fn cloud_import_key_of_forgotten_entry_returns_the_old_id() {
         listed(&i, 0).await["entries"].as_array().unwrap().len(),
         before
     );
+}
+
+/// `memory.share` takes the team lock before the store's, as everything else does: with another
+/// thread locking team then store in a loop, 100 shares finish (the opposite order would
+/// deadlock, ABBA).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn memory_share_takes_the_team_lock_before_the_store() {
+    let home = tempfile::tempdir().unwrap();
+    let i = std::sync::Arc::new(start(home.path(), &[], None).await);
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let other = {
+        let (i, stop) = (i.clone(), stop.clone());
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                i.lock_team_then_store();
+            }
+        })
+    };
+    let shares = async {
+        for _ in 0..100 {
+            let r = call(&i, "memory.share", json!({"entry": "abcdef"})).await;
+            assert_eq!(r["error"], "not_found", "{r}");
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(20), shares)
+        .await
+        .expect("100 shares finish beside a team-then-store locker");
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    other.join().unwrap();
+}
+
+/// `f` again while A's running daemon holds its database (`database is locked`).
+fn busy_retry<T>(mut f: impl FnMut() -> lightbulb::Result<T>) -> T {
+    for _ in 0..50 {
+        if let Ok(v) = f() {
+            return v;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    f().unwrap()
+}
+
+/// A wipe tombstones entries of another author too, and a replica honours the forget.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cloud_forget_author_wipes_a_peers_entry_and_a_replica_honours_it() {
+    let a = computer_a();
+    let home = tempfile::tempdir().unwrap();
+    let i = start(home.path(), &[&a], None).await;
+    join(&i, &a).await;
+    let ka = a.identity().key;
+    let theirs = busy_retry(|| {
+        lightbulb::memory::remember(
+            &a.store(),
+            &a.identity(),
+            lightbulb::memory::Op::Remember {
+                subject: "db".into(),
+                fact: "postgres 16".into(),
+                kind: lightbulb::memory::Kind::Fact,
+                scope: lightbulb::memory::Scope::Team,
+                when: None,
+                source: lightbulb::memory::Source {
+                    harness: "test".into(),
+                    repo: None,
+                    session: None,
+                    on_behalf_of: None,
+                    shared_from: None,
+                },
+                replaces: vec![],
+            },
+            5,
+        )
+    });
+    for _ in 0..100 {
+        let l = listed(&i, 0).await;
+        if l["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["id"] == theirs.id.as_str())
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let r = ok(&i, "memory.forget_author", json!({"author": ka})).await;
+    assert_eq!(r["forgotten"], 1, "{r}");
+    let l = listed(&i, 0).await;
+    assert!(
+        l["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["id"] == theirs.id.as_str() && e["tombstone"] == true),
+        "{l}"
+    );
+    let facts = ok(&i, "memory.recall", json!({"question": ""})).await;
+    assert_eq!(facts["facts"], json!([]), "{facts}");
+    // The forget is signed by the workspace member; A, the author, honours it.
+    let me_key = ok(&i, "identity.get", json!({})).await["member_key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    until(10, "A holds the workspace's forget", || {
+        !lightbulb::memory::since(&a.store(), &me_key, 0, 10)
+            .unwrap()
+            .is_empty()
+    });
+    for f in lightbulb::memory::since(&a.store(), &me_key, 0, 10).unwrap() {
+        busy_retry(|| lightbulb::memory::accept(&a.store(), &f, 10));
+    }
+    assert!(lightbulb::memory::entry(&a.store(), &theirs.id)
+        .unwrap()
+        .is_none());
 }

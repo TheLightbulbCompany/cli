@@ -362,7 +362,7 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
         },
         "memory.remember" => memory_remember(id, body, daemon, instance),
         "memory.recall" => memory_recall(id, body, daemon),
-        // Before the store lock, which `memory_manage` holds: no path holds store then team.
+        // Takes the team lock and no store lock; `memory_manage` reads the team first.
         "memory.team" => memory_team(id, body, daemon, for_a_person()),
         "memory.import" => memory_import(id, body, daemon),
         "memory.forget_author" => memory_forget_author(id, body, daemon),
@@ -554,8 +554,9 @@ fn memory_team(id: u64, body: &Value, daemon: &Arc<Daemon>, person: bool) -> Res
 /// `memory.import {entries: [{subject, fact, kind, scope, when?, source, replaces?}]}` ->
 /// `{ids, refused}`: the cloud member signs each as its own, in order. All are parsed before any
 /// is stored; a refused one (`secret:..`, `too_long`) is `null` in `ids` and `{index, reason}` in
-/// `refused`, and the rest go on. An entry's `key` is stored as its
-/// `source.session`, and one already held from our key answers with its id (idempotent).
+/// `refused`, and the rest go on. An entry's `key` is kept in the `memory_import_keys` side table
+/// (not on the entry: a forgotten one loses its body), and a held key answers with its id
+/// (idempotent).
 fn memory_import(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
     use crate::memory::{self, Op, Source};
     let Some(items) = body["entries"].as_array() else {
@@ -709,6 +710,8 @@ fn memory_manage(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, person: 
         j
     };
     let bad = |c: &str| Response::err(id, c);
+    // Before the store lock: team then store is the order everywhere else.
+    let memory_team = daemon.team.lock().unwrap().config.memory_team;
     let store = daemon.store.lock().unwrap();
     let entry = || match body["entry"].as_str() {
         Some(i) => memory::entry(&store, i)
@@ -756,7 +759,7 @@ fn memory_manage(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, person: 
             Ok(json!({}))
         }
         "memory.share" => {
-            if !daemon.team.lock().unwrap().config.memory_team {
+            if !memory_team {
                 return Err(bad("team_off"));
             }
             let e = entry()?;

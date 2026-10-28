@@ -277,6 +277,14 @@ impl Instance {
         }
     }
 
+    /// Takes the team lock, then the store's, as `relay_set` does (a test of lock order).
+    #[doc(hidden)]
+    pub fn lock_team_then_store(&self) {
+        let _team = self.daemon.team.lock().unwrap();
+        std::thread::sleep(std::time::Duration::from_micros(50));
+        let _store = self.daemon.store.lock().unwrap();
+    }
+
     /// Every event a socket subscriber gets (`message`, `held`, `hold_closed`,
     /// `receipt_changed`, `member_removed`, `stream_*`, …), from now on.
     pub fn events(&self) -> broadcast::Receiver<Value> {
