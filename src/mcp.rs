@@ -664,8 +664,9 @@ impl Server {
         };
         let mut args = Value::Object(props(tool, &args, &[]));
         args["session"] = call.from.0.clone().into();
-        // `recall`'s turns come from this repo's sessions only.
-        if name == "recall" {
+        // `recall`'s turns come from this repo's sessions only; an empty question (every fact,
+        // the hook's view) carries no repo.
+        if name == "recall" && !args["question"].as_str().unwrap_or("").trim().is_empty() {
             let cwd = std::env::current_dir().unwrap_or_default();
             if let (Some(repo), _) = git(&cwd.to_string_lossy()) {
                 args["repo"] = repo.into();
