@@ -271,6 +271,12 @@ fn a_stopword_question_matches_as_a_phrase() {
 fn refuse_secret_matches_the_seven_patterns() {
     for (text, name) in [
         ("password = hunter2hunter2", "credential"),
+        // The keyword may carry suffix segments: AWS_SECRET_ACCESS_KEY, DB_PASSWORD_PROD.
+        (
+            "export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY",
+            "credential",
+        ),
+        ("DB_PASSWORD_PROD: hunter2hunter2", "credential"),
         ("-----BEGIN RSA PRIVATE KEY-----", "private_key"),
         ("AKIAABCDEFGHIJKLMNOP", "aws_key"),
         ("sk-abcdefghijklmnopqrstuv", "api_key"),
@@ -287,6 +293,11 @@ fn refuse_secret_matches_the_seven_patterns() {
     }
     assert_eq!(
         memory::refuse_secret("we use postgres, token bucket limiter"),
+        None
+    );
+    // A word that merely contains the keyword is not a credential.
+    assert_eq!(
+        memory::refuse_secret("secretary: Johnathan Appleseed"),
         None
     );
 }

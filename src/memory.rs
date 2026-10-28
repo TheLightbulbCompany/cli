@@ -780,7 +780,7 @@ static SECRETS: LazyLock<Vec<(&'static str, Regex)>> = LazyLock::new(|| {
     [
         (
             "credential",
-            r"(?i)(api[_-]?key|secret|token|password)\s*[:=]\s*\S{8,}",
+            r"(?i)(api[_-]?key|secret|token|password)(?:[_-][a-z0-9]+)*\s*[:=]\s*\S{8,}",
         ),
         ("private_key", r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
         ("aws_key", r"AKIA[0-9A-Z]{16}"),
