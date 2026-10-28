@@ -970,3 +970,72 @@ fn the_repo_key_carries_the_owner() {
     ));
     assert!(text.contains("ci: github actions"), "{text}");
 }
+
+/// Runs the Claude hook `event` for conversation `A` in `cwd` with `extra` in its payload;
+/// returns stdout. Waits after, so the daemon has written what the hook sent before the next.
+fn claude_step(net: &Net, event: &str, extra: Value, cwd: &std::path::Path) -> String {
+    let me = os::process(std::process::id()).unwrap();
+    let mut payload = extra;
+    payload["session_id"] = json!(A);
+    payload["cwd"] = json!(cwd);
+    let out = net.hook_raw("claude", event, payload.to_string().as_bytes(), Some(&me));
+    std::thread::sleep(Duration::from_millis(50));
+    String::from_utf8(out.stdout).unwrap()
+}
+
+fn tool_call(net: &Net, cwd: &std::path::Path) {
+    let call = json!({"hook_event_name": "PostToolUse", "tool_name": "Bash",
+        "tool_input": {"command": "ls"}});
+    assert_eq!(claude_step(net, "post-tool-use", call, cwd), "");
+}
+
+fn stop(net: &Net, cwd: &std::path::Path) -> String {
+    claude_step(net, "stop", json!({"hook_event_name": "Stop"}), cwd)
+}
+
+fn started(net: &Net) -> tempfile::TempDir {
+    let cwd = tempfile::tempdir().unwrap();
+    let start = json!({"hook_event_name": "SessionStart"});
+    assert_eq!(claude_step(net, "session-start", start, cwd.path()), "");
+    cwd
+}
+
+#[test]
+fn the_first_stop_after_a_tool_call_nudges_once() {
+    let net = Net::new();
+    let cwd = started(&net);
+    tool_call(&net, cwd.path());
+    let out: Value = serde_json::from_str(&stop(&net, cwd.path())).unwrap();
+    assert_eq!(
+        out,
+        json!({"decision": "block", "reason": lightbulb::hook::NUDGE})
+    );
+    tool_call(&net, cwd.path());
+    assert_eq!(stop(&net, cwd.path()), "");
+}
+
+#[test]
+fn a_stop_with_waiting_messages_hands_them_over_and_does_not_nudge() {
+    let net = Net::new();
+    let cwd = started(&net);
+    tool_call(&net, cwd.path());
+    net.send(&net.key("claude", A), "body r1", "r1");
+    let out: Value = serde_json::from_str(&stop(&net, cwd.path())).unwrap();
+    assert_eq!(out, json!({"decision": "block", "reason": frame_of("r1")}));
+}
+
+#[test]
+fn a_session_without_tool_calls_is_not_nudged() {
+    let net = Net::new();
+    let cwd = started(&net);
+    assert_eq!(stop(&net, cwd.path()), "");
+}
+
+#[test]
+fn a_session_that_already_remembered_is_not_nudged() {
+    let net = Net::new();
+    let cwd = started(&net);
+    tool_call(&net, cwd.path());
+    remember_in(&net, &net.key("claude", A), "db", "postgres 16", "me");
+    assert_eq!(stop(&net, cwd.path()), "");
+}

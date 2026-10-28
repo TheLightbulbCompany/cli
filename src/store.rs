@@ -675,6 +675,23 @@ pub struct Untold {
 
 /// Mail between members: the mailbox, what peers sent (`seen_ids`) and the outbox.
 impl Store {
+    /// Whether capture session `id` (session `key`) gets the end-of-turn nudge now: it made a
+    /// tool call, was never nudged, wrote no memory entry and has no mail waiting. A yes marks
+    /// it (`nudged` = `now`), so it never comes twice.
+    /// ponytail: the entry check scans memory_entries' JSON; an index on the source session if
+    /// memory grows past tens of thousands of entries.
+    pub fn nudge(&self, id: &str, key: &str, now: i64) -> rusqlite::Result<bool> {
+        let n = self.conn().execute(
+            "UPDATE capture_sessions SET nudged = ?3 WHERE id = ?1 AND nudged = 0 \
+             AND EXISTS (SELECT 1 FROM capture_tool_calls WHERE session_id = ?1) \
+             AND NOT EXISTS (SELECT 1 FROM memory_entries \
+                 WHERE json_extract(entry, '$.op.source.session') = ?2) \
+             AND NOT EXISTS (SELECT 1 FROM mailbox WHERE to_key = ?2 AND expires_at >= ?3)",
+            params![id, key, now],
+        )?;
+        Ok(n == 1)
+    }
+
     /// `from`'s message `request_id` as stored: `(to, whether its text is `text`)`, the text
     /// compared by its digest once `mail::forget` dropped it.
     pub fn sent_as(

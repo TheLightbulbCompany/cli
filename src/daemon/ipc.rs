@@ -384,7 +384,7 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
             // the hook waits for a capture write.
             let person = op.starts_with("sessions.") && for_a_person();
             let r = capture_op(id, op, body, daemon, person);
-            if op == "capture.turn" {
+            if op == "capture.turn" || op == "capture.stop" {
                 embed_missing(daemon);
             }
             r
@@ -531,7 +531,9 @@ fn memory_remember(
 /// Local capture. The hooks send `capture.session_start {harness, conversation, cwd, repo?,
 /// branch?}`, `capture.tool_call {harness, conversation, tool, args, duration_ms?, ok?}`,
 /// `capture.turn {harness, conversation, role, text}` -> `{stored}`,
-/// `capture.stop {harness, conversation, prompt_tokens?, completion_tokens?}` and
+/// `capture.stop {harness, conversation, prompt_tokens?, completion_tokens?, text?, key?}` ->
+/// `{nudge}` (the reply `text` kept as the assistant's turn; `Store::nudge`, asked only with
+/// `key`) and
 /// `capture.session_end {harness, conversation, prompt_tokens?, completion_tokens?}` -> `{stored}`. A person reads and deletes:
 /// `sessions.list` -> `{sessions}`, `sessions.show {session}` -> `{session, tool_calls}`,
 /// `sessions.forget {session}` -> `{}`, `sessions.export` -> `{sessions: [{..., tool_calls}]}`.
@@ -552,6 +554,11 @@ fn capture_op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, person: boo
         )
     };
     let store = daemon.store.lock().unwrap();
+    // From the file each time: `sessions turns off` reaches a running service.
+    let turn = |store: &crate::store::Store, sid: &str, role: &str, text: &str| {
+        let on = crate::config::Config::load(&daemon.dir).is_ok_and(|c| c.capture_turns);
+        crate::Result::Ok(on && capture::record_turn(store, sid, role, text, now() as i64)?)
+    };
     let r: crate::Result<Value> = (|| match op {
         "capture.session_start" => {
             let (Some(sid), Some(cwd)) = (who(body), body["cwd"].as_str()) else {
@@ -591,10 +598,7 @@ fn capture_op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, person: boo
             else {
                 return Err("bad".into());
             };
-            // From the file each time: `sessions turns off` reaches a running service.
-            let on = crate::config::Config::load(&daemon.dir).is_ok_and(|c| c.capture_turns);
-            let stored = on && capture::record_turn(&store, &sid, role, text, now() as i64)?;
-            Ok(json!({ "stored": stored }))
+            Ok(json!({ "stored": turn(&store, &sid, role, text)? }))
         }
         "capture.stop" => {
             let Some(sid) = who(body) else {
@@ -606,7 +610,16 @@ fn capture_op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, person: boo
                 body["prompt_tokens"].as_i64(),
                 body["completion_tokens"].as_i64(),
             )?;
-            Ok(json!({}))
+            // The reply, if any: a turn that fails never costs the Stop its tokens or nudge.
+            if let Some(text) = body["text"].as_str() {
+                let _ = turn(&store, &sid, "assistant", text);
+            }
+            // `key`: the hook can hand the agent a nudge on this Stop.
+            let nudge = match body["key"].as_str() {
+                Some(key) => store.nudge(&sid, key, now() as i64)?,
+                None => false,
+            };
+            Ok(json!({ "nudge": nudge }))
         }
         "capture.session_end" => {
             let Some(sid) = who(body) else {
