@@ -311,6 +311,10 @@ async fn an_assignment_is_delivered_with_its_fields_and_its_reply_is_its_result(
     assert_eq!(got["messages"].as_array().unwrap().len(), 1);
     assert_eq!(m["kind"], "assign");
     assert_eq!(m["done_when"], "suite green");
+    assert!(m["framed"]
+        .as_str()
+        .unwrap()
+        .starts_with("[Lightbulb assignment from "));
     let at = m["deadline_at"].as_i64().unwrap();
     let t = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -332,6 +336,9 @@ async fn an_assignment_is_delivered_with_its_fields_and_its_reply_is_its_result(
     assert_eq!(m["kind"], "result");
     assert_eq!(m["status"], "done");
     assert_eq!(m["reply_to"], assign_id);
+    let f = m["framed"].as_str().unwrap();
+    assert!(f.starts_with("[Lightbulb result from "), "{f}");
+    assert!(f.contains("\"replyTo\":\"as1\""), "{f}");
 
     let r = call(
         &mut l,
