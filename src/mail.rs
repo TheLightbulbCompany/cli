@@ -231,6 +231,7 @@ fn receipt_text(r: &Value, person: Option<&ForPerson>) -> Option<String> {
                 "request_id_reused" => "that request id was used for another message".into(),
                 "unsupported" => "their computer cannot take it".into(),
                 "no_worker" => "that computer does not take fresh workers yet".into(),
+                "bad_request" => "the assignment's terms were refused".into(),
                 _ => shown("reason").replace('_', " "),
             }
         ),
@@ -1299,6 +1300,21 @@ mod tests {
     fn a_no_worker_refusal_has_a_note() {
         let r = serde_json::json!({"state": "refused", "reason": "no_worker", "person": "aden", "where": "mac"});
         assert_eq!(receipt_note(&r, None).as_deref(), Some("not sent: that computer does not take fresh workers yet (find_workers lists who takes assignments)"));
+    }
+
+    #[test]
+    fn a_bad_request_refusal_names_the_terms() {
+        let p = ForPerson {
+            to: Some("m/codex:b"),
+            rid: "r1",
+            cmd: "lightbulb",
+            check: false,
+        };
+        let r = serde_json::json!({"state": "refused", "reason": "bad_request"});
+        assert_eq!(
+            receipt_note(&r, Some(&p)).as_deref(),
+            Some("Not sent: the assignment's terms were refused.")
+        );
     }
 
     #[test]
