@@ -36,20 +36,20 @@ pub struct ToolCallRow {
     pub ok: bool,
 }
 
-/// Whether `folder` has a component starting with `.` below the home folder.
+/// Whether `folder` is under a dot folder directly in the home folder (`~/.config/...`,
+/// `~/.cache/...`). Only that first folder counts: a repo's own dot folders (`.claude/worktrees`)
+/// are captured, and `lightbulb folder <path> off` is the control for the rest.
 pub fn hidden_folder(folder: &str) -> bool {
     let home = std::env::var("HOME").unwrap_or_default();
     let folder = std::path::Path::new(folder);
     // HOME as given and as the filesystem resolves it (a hook reports its folder resolved).
     let canonical = std::fs::canonicalize(&home).unwrap_or_default();
-    let rest = [home.as_ref(), canonical.as_path()]
+    let first = [home.as_ref(), canonical.as_path()]
         .into_iter()
         .filter(|h: &&std::path::Path| !h.as_os_str().is_empty())
         .find_map(|h| folder.strip_prefix(h).ok())
-        .unwrap_or(folder);
-    rest.components().any(
-        |c| matches!(c, std::path::Component::Normal(n) if n.to_string_lossy().starts_with('.')),
-    )
+        .and_then(|rest| rest.components().next());
+    matches!(first, Some(std::path::Component::Normal(n)) if n.to_string_lossy().starts_with('.'))
 }
 
 /// A session's row, keyed `<harness>:<conversation>`. `Ok(false)` (nothing stored) for a

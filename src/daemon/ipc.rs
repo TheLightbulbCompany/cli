@@ -206,6 +206,9 @@ pub fn inbox_record(v: &Value) -> Value {
         .collect()
 }
 
+/// (tests) Milliseconds the daemon holds each `capture.*` op before doing it; debug builds only.
+const CAPTURE_DELAY_ENV: &str = "LIGHTBULB_CONNECT_DEBUG_CAPTURE_DELAY_MS";
+
 /// One op, from `caller`: every person-only op refuses without a person.
 pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: Caller) -> Response {
     let instance = caller == Caller::Instance;
@@ -367,7 +370,18 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
         | "sessions.list"
         | "sessions.show"
         | "sessions.forget"
-        | "sessions.export" => capture_op(id, op, body, daemon, for_a_person()),
+        | "sessions.export" => {
+            // Debug builds only: a daemon slow to answer capture writes (tests).
+            let slow =
+                crate::cli::test_env(CAPTURE_DELAY_ENV).and_then(|v| v.to_str()?.parse().ok());
+            if let Some(ms) = slow.filter(|_| op.starts_with("capture.")) {
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+            }
+            // Asked only for `sessions.*`: the walk of the peer's process tree is slower than
+            // the hook waits for a capture write.
+            let person = op.starts_with("sessions.") && for_a_person();
+            capture_op(id, op, body, daemon, person)
+        }
         // `person` -> `{}` for a person's terminal, else refused: a command that settles
         // something elsewhere first (`memory approve`) asks before it acts.
         "person" if for_a_person() => Response::ok(id, json!({})),
@@ -576,6 +590,12 @@ fn capture_op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, person: boo
             let Some(sid) = who(body) else {
                 return Err("bad".into());
             };
+            // The hook's one call at the end carries the transcript's totals, when it had any.
+            let tokens = (
+                body["prompt_tokens"].as_i64(),
+                body["completion_tokens"].as_i64(),
+            );
+            capture::set_tokens(&store, &sid, tokens.0, tokens.1)?;
             capture::end_session(&store, &sid, now() as i64)?;
             Ok(json!({}))
         }

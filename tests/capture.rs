@@ -95,12 +95,31 @@ impl Env {
                     "tool_response": {"stdout": "secret output"}}),
             ),
             ("stop", "Stop", json!({"transcript_path": transcript()})),
-            ("session-end", "SessionEnd", json!({})),
+            (
+                "session-end",
+                "SessionEnd",
+                json!({"transcript_path": transcript()}),
+            ),
         ];
         for (arg, event, extra) in steps {
             let o = self.claude_hook(arg, self.payload(event, cwd, extra));
             assert!(o.status.success(), "{}", err(&o));
         }
+    }
+
+    /// The one captured session, once the daemon has written what `done` waits for (capture
+    /// does not wait for the write).
+    fn captured(
+        &self,
+        what: &str,
+        done: impl Fn(&capture::SessionRow) -> bool,
+    ) -> capture::SessionRow {
+        let mut row = None;
+        common::until(10, what, || {
+            row = capture::sessions_since(&self.store(), -1).unwrap().pop();
+            row.as_ref().is_some_and(&done)
+        });
+        row.unwrap()
     }
 
     fn sessions(&self, args: &[&str]) -> Output {
@@ -116,12 +135,10 @@ fn session_rows_follow_hook_lifecycle() {
     e.daemon(false, "", &[]);
     let cwd = e.folder("proj");
     e.run_session(&cwd);
+    let s = &e.captured("the session ends", |s| s.ended.is_some());
     let db = e.store();
-    let rows = capture::sessions_since(&db, -1).unwrap();
-    assert_eq!(rows.len(), 1, "{rows:?}");
-    let s = &rows[0];
+    assert_eq!(capture::sessions_since(&db, -1).unwrap().len(), 1);
     assert_eq!((s.id.as_str(), s.harness.as_str()), ("claude:c1", "claude"));
-    assert!(s.ended.is_some());
     assert_eq!(
         (s.prompt_tokens, s.completion_tokens),
         (Some(120), Some(45))
@@ -147,11 +164,77 @@ fn a_stop_without_usage_leaves_tokens_null() {
     let cwd = e.folder("proj");
     e.claude_hook("session-start", e.payload("SessionStart", &cwd, json!({})));
     e.claude_hook("stop", e.payload("Stop", &cwd, json!({})));
-    let rows = capture::sessions_since(&e.store(), -1).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let s = e.captured("the session", |_| true);
+    assert_eq!((s.prompt_tokens, s.completion_tokens), (None, None));
+}
+
+/// Tokens come from the transcript at SessionEnd only: a Stop, every turn, never reads it.
+#[test]
+fn tokens_are_read_at_session_end_never_at_stop() {
+    let e = Env::new();
+    e.daemon(false, "", &[]);
+    let cwd = e.folder("proj");
+    // A transcript just under the cap: parsing it takes far longer than a hook may.
+    let fixture = std::fs::read_to_string(transcript()).unwrap();
+    let big = e.home.path().join("big.jsonl");
+    let times = capture::TRANSCRIPT_MAX as usize / fixture.len();
+    std::fs::write(&big, fixture.repeat(times)).unwrap();
+    let path = json!({ "transcript_path": big });
+    e.claude_hook("session-start", e.payload("SessionStart", &cwd, json!({})));
+    e.captured("the session starts", |_| true);
+    let t = std::time::Instant::now();
+    let o = e.claude_hook("stop", e.payload("Stop", &cwd, path.clone()));
+    let took = t.elapsed();
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(took < std::time::Duration::from_millis(1000), "{took:?}");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let s = e.captured("the session", |_| true);
+    assert_eq!((s.prompt_tokens, s.completion_tokens), (None, None));
+    // A Stop whose own payload carries usage is still read.
+    let usage = json!({"usage": {"input_tokens": 7, "output_tokens": 3}});
+    e.claude_hook("stop", e.payload("Stop", &cwd, usage));
+    e.captured("usage from the payload", |s| s.prompt_tokens == Some(7));
+    let o = e.claude_hook("session-end", e.payload("SessionEnd", &cwd, path));
+    assert!(o.status.success(), "{}", err(&o));
+    let s = e.captured("tokens at the end", |s| s.ended.is_some());
     assert_eq!(
-        (rows[0].prompt_tokens, rows[0].completion_tokens),
-        (None, None)
+        (s.prompt_tokens, s.completion_tokens),
+        (Some(120), Some(45))
     );
+}
+
+/// A daemon slow to answer a capture write does not hold the hook: it waits about 10 ms, says
+/// so once, and the write still lands.
+#[test]
+fn a_slow_capture_write_does_not_hold_the_hook() {
+    let e = Env::new();
+    let delay = [(
+        "LIGHTBULB_CONNECT_DEBUG_CAPTURE_DELAY_MS",
+        "500".to_string(),
+    )];
+    e.daemon(false, "", &delay);
+    let cwd = e.folder("proj");
+    e.claude_hook("session-start", e.payload("SessionStart", &cwd, json!({})));
+    e.captured("the session starts", |_| true);
+    let post = json!({"tool_name": "Bash", "tool_input": {"command": "ls"}});
+    let t = std::time::Instant::now();
+    let o = e.claude_hook("post-tool-use", e.payload("PostToolUse", &cwd, post));
+    let took = t.elapsed();
+    assert!(o.status.success() && o.stdout.is_empty(), "{}", err(&o));
+    assert!(took < std::time::Duration::from_millis(450), "{took:?}");
+    let log = err(&o);
+    assert_eq!(log.lines().count(), 1, "{log}");
+    assert!(
+        log.starts_with("lightbulb hook claude post-tool-use: capture"),
+        "{log}"
+    );
+    common::until(5, "the tool call is written", || {
+        capture::tool_calls(&e.store(), "claude:c1", true)
+            .unwrap()
+            .len()
+            == 1
+    });
 }
 
 #[test]
@@ -184,7 +267,17 @@ fn test_capture_refuses_secret_in_summary() {
 #[test]
 fn hidden_folder_is_not_captured() {
     let (_d, s) = store();
-    assert!(!capture::start_session(&s, &row(), "/tmp/.secret/proj").unwrap());
+    // Only the first folder below HOME counts: `~/.config` is skipped, a repo's own dot
+    // folders (Claude Code's worktrees) are captured.
+    let home = std::env::var("HOME").unwrap();
+    assert!(capture::hidden_folder(&format!("{home}/.config/x")));
+    assert!(capture::hidden_folder(&format!("{home}/.cache")));
+    assert!(!capture::hidden_folder(&format!(
+        "{home}/code/repo/.claude/worktrees/x"
+    )));
+    assert!(!capture::hidden_folder("/tmp/.secret/proj"));
+    let hidden = format!("{home}/.secret/proj");
+    assert!(!capture::start_session(&s, &row(), &hidden).unwrap());
     // No row, so a tool call from that session is dropped too.
     assert!(!capture::record_tool_call(&s, "a:1", "Bash", "{}", None, true).unwrap());
     assert!(capture::sessions_since(&s, -1).unwrap().is_empty());
@@ -199,7 +292,12 @@ fn hidden_folder_is_not_captured() {
         std::fs::create_dir_all(&cwd).unwrap();
         e.run_session(&cwd);
     }
+    // Capture does not wait for the write: give a wrong one time to land.
+    std::thread::sleep(std::time::Duration::from_millis(300));
     assert!(capture::sessions_since(&e.store(), -1).unwrap().is_empty());
+    // A worktree under a repo's `.claude` folder is captured.
+    e.run_session(&e.folder("code/repo/.claude/worktrees/x"));
+    e.captured("the worktree session", |s| s.ended.is_some());
 }
 
 /// A claude session in `rel` with a message waiting for it, then its PostToolUse hook (the
@@ -233,10 +331,22 @@ fn mail_run(rel: &str, down: bool) -> (Env, Output) {
 #[test]
 fn test_capture_write_failure_is_silent() {
     let (up_env, up) = mail_run("proj", false);
-    assert!(up.status.success() && up.stderr.is_empty(), "{}", err(&up));
+    // Nothing on stderr but, on a loaded machine, capture's one "not waiting" line.
+    assert!(up.status.success(), "{}", err(&up));
+    assert!(
+        err(&up)
+            .lines()
+            .all(|l| l.starts_with("lightbulb hook claude post-tool-use: capture")),
+        "{}",
+        err(&up)
+    );
     assert!(out(&up).contains("hello from a teammate"), "{}", out(&up));
-    let calls = capture::tool_calls(&up_env.store(), "claude:c1", true).unwrap();
-    assert_eq!(calls.len(), 1, "capture worked on the baseline");
+    common::until(5, "capture worked on the baseline", || {
+        capture::tool_calls(&up_env.store(), "claude:c1", true)
+            .unwrap()
+            .len()
+            == 1
+    });
 
     let silent = |o: &Output, what: &str| {
         assert!(o.status.success(), "{what}");
@@ -259,6 +369,7 @@ fn test_capture_write_failure_is_silent() {
     // The daemon is up and its store refuses the session (a hidden folder): no row.
     let (e, refused) = mail_run(".hidden/proj", false);
     silent(&refused, "store refuses");
+    std::thread::sleep(std::time::Duration::from_millis(300));
     assert!(capture::sessions_since(&e.store(), -1).unwrap().is_empty());
     assert!(capture::tool_calls(&e.store(), "claude:c1", true)
         .unwrap()
@@ -312,10 +423,12 @@ fn a_running_session_is_captured_from_its_next_tool_call() {
     let cwd = e.folder("proj");
     let post = json!({"tool_name": "Read", "tool_input": {"file_path": "/x/y.rs"}});
     e.claude_hook("post-tool-use", e.payload("PostToolUse", &cwd, post));
-    let db = e.store();
-    let rows = capture::sessions_since(&db, -1).unwrap();
-    assert_eq!(rows.len(), 1);
-    let calls = capture::tool_calls(&db, "claude:c1", true).unwrap();
+    let mut calls = vec![];
+    common::until(5, "the call is recorded", || {
+        calls = capture::tool_calls(&e.store(), "claude:c1", true).unwrap();
+        !calls.is_empty()
+    });
+    assert_eq!(capture::sessions_since(&e.store(), -1).unwrap().len(), 1);
     assert_eq!(calls[0].summary.as_deref(), Some("Read: /x/y.rs"));
 }
 
@@ -329,6 +442,9 @@ fn an_ambiguous_session_prefix_is_named() {
         p["session_id"] = id.into();
         e.claude_hook("session-start", p);
     }
+    common::until(5, "both sessions start", || {
+        capture::sessions_since(&e.store(), -1).unwrap().len() == 2
+    });
     let o = e.sessions(&["show", "claude:c"]);
     assert!(!o.status.success());
     assert!(
@@ -358,6 +474,7 @@ fn sessions_list_shows_harness_repo_tokens() {
         "No sessions captured yet."
     );
     e.run_session(&cwd);
+    e.captured("the session ends", |s| s.ended.is_some());
 
     let list = out(&e.sessions(&["list"]));
     let header: Vec<&str> = list.lines().next().unwrap().split_whitespace().collect();

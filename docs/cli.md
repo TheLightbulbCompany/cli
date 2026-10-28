@@ -389,11 +389,14 @@ lightbulb sessions upload [off|metadata|full]
 Each agent's hooks tell the background service when a session starts, after each tool call, at
 the end of each turn and when the session ends. It keeps, on this computer only: the session (its
 id, the agent, the computer, the repository and branch, when it started and ended, and the
-tokens, for Claude Code only, summed from its transcript at the end of each turn; the other agents leave them blank), and for each tool call its number, time, tool, duration,
+tokens, for Claude Code only, summed from its transcript once, when the session ends; the other agents leave them blank), and for each tool call its number, time, tool, duration,
 whether it worked, and a summary of at most 200 characters (a command, a path, a pattern). It
 never keeps file contents, diffs, command output or your prompts. A summary that looks like a
 password or key is replaced by `[refused: <what it matched>]`. Sessions under a hidden folder
-(`lightbulb folder <path> off`, or any folder whose name starts with a dot) are not captured. An
+(`lightbulb folder <path> off`, or a folder in your home folder whose name starts with a dot,
+such as `~/.config`) are not captured; a dot folder inside a repository, such as Claude Code's
+`.claude/worktrees`, is. Capture never slows the agent: a write the background service has not
+answered within 10 ms is not waited for (the service still makes it). An
 `<ID>` is the id as `list` prints it, or its first characters. `list`, `show`, `forget` and
 `export` must be run from your own terminal; an agent's shell is refused.
 

@@ -155,7 +155,7 @@ pub fn run(agent: &str, event: &str, stdin: &str) -> Result<Option<String>> {
         daemon::ensure_running()?;
         let mut conn = Conn::open()?;
         let key = crate::sessions::Key::new(&conn.member()?, h.provider, &h.conversation);
-        capture(&mut conn, &h, &payload, &json!({}));
+        capture(&h, &payload, &json!({}));
         let r = match &caller {
             Ok(me) => conn.call("end", json!({ "key": key, "caller": proc_json(me) }))?,
             Err(_) => conn.call("end", json!({ "key": key, "if_gone": true }))?,
@@ -195,7 +195,7 @@ pub fn run(agent: &str, event: &str, stdin: &str) -> Result<Option<String>> {
     if !key.is_string() {
         return Err(format!("register: {r}").into());
     }
-    capture(&mut conn, &h, &payload, &session);
+    capture(&h, &payload, &session);
     // Our OpenCode plugin sends `mail: false` when it could not hand mail over (it has not
     // seen the session's agent and model yet): the mail waits for `check_inbox`.
     if !takes_mail(&h) || (h.provider == "opencode" && payload["mail"] == false) {
@@ -245,21 +245,48 @@ pub fn run(agent: &str, event: &str, stdin: &str) -> Result<Option<String>> {
     Ok(Some(out.to_string()))
 }
 
+/// How long the hook waits for each capture write's answer: capture never slows the agent.
+/// The daemon finishes a write it was not waited for.
+const CAPTURE_WAIT: Duration = Duration::from_millis(10);
+
 /// Tells the daemon what this event adds to the local capture (`capture::*`, written by the
-/// daemon). Any failure is silent: capture never breaks the agent or the mail.
-fn capture(conn: &mut Conn, h: &Hook, payload: &Value, session: &Value) {
+/// daemon), on a connection of its own so a slow write holds nothing behind it. Any failure
+/// is silent: capture never breaks the agent or the mail.
+fn capture(h: &Hook, payload: &Value, session: &Value) {
     // Debug builds only: capture's connection is a dead one, for tests of the failure path.
     #[cfg(debug_assertions)]
-    let mut dead = std::env::var_os(CAPTURE_DOWN_ENV).and_then(|_| {
+    let dead = std::env::var_os(CAPTURE_DOWN_ENV).and_then(|_| {
         let (a, _b) = UnixStream::pair().ok()?;
         Some(Conn {
             stream: BufReader::new(a),
             next: 1,
         })
     });
-    #[cfg(debug_assertions)]
-    let conn = dead.as_mut().unwrap_or(conn);
-    let _ = try_capture(conn, h, payload, session);
+    #[cfg(not(debug_assertions))]
+    let dead = None;
+    if let Some(mut conn) = dead.or_else(|| Conn::open().ok()) {
+        capture_on(&mut conn, h, payload, session);
+    }
+}
+
+/// `try_capture` on `conn`, waiting at most `CAPTURE_WAIT` for each answer. Past it, one line
+/// says so and the rest of this event's capture is skipped; whether that happened.
+fn capture_on(conn: &mut Conn, h: &Hook, payload: &Value, session: &Value) -> bool {
+    if conn.wait_up_to(CAPTURE_WAIT).is_err() {
+        return false;
+    }
+    match try_capture(conn, h, payload, session) {
+        Err(e) if e.to_string() == no_answer(CAPTURE_WAIT) => {
+            eprintln!(
+                "lightbulb hook {} {}: capture took over {} ms; not waiting for it",
+                h.provider,
+                h.event.arg(),
+                CAPTURE_WAIT.as_millis()
+            );
+            true
+        }
+        _ => false,
+    }
 }
 
 /// `body` with the fields of `extra` added; never panics.
@@ -306,19 +333,28 @@ fn try_capture(conn: &mut Conn, h: &Hook, payload: &Value, session: &Value) -> R
             }
         }
         Event::Stop => {
-            // Claude Code's transcript is the one verified source of tokens; other agents'
-            // payloads have none we have confirmed, so theirs stay null.
-            let tokens = (h.provider == "claude")
-                .then_some(h.transcript_path.as_deref())
-                .flatten()
-                .and_then(crate::capture::transcript_tokens);
-            if let Some((i, o)) = tokens {
+            // A Stop fires every turn: it reads only the `usage` its own payload carries, never
+            // the transcript (that is read once, at SessionEnd).
+            let u = &payload["usage"];
+            let (i, o) = (u["input_tokens"].as_i64(), u["output_tokens"].as_i64());
+            if i.is_some() || o.is_some() {
                 let body = json!({ "prompt_tokens": i, "completion_tokens": o });
                 conn.call("capture.stop", with(&who, body))?;
             }
         }
         Event::SessionEnd => {
-            conn.call("capture.session_end", who)?;
+            // Claude Code's transcript is the one verified source of tokens; other agents'
+            // payloads have none we have confirmed, so theirs stay null. One call: a write
+            // not waited for must not cost the end.
+            let tokens = (h.provider == "claude")
+                .then_some(h.transcript_path.as_deref())
+                .flatten()
+                .and_then(crate::capture::transcript_tokens);
+            let body = match tokens {
+                Some((i, o)) => json!({ "prompt_tokens": i, "completion_tokens": o }),
+                None => json!({}),
+            };
+            conn.call("capture.session_end", with(&who, body))?;
         }
         Event::UserPromptSubmit => {}
     }
@@ -478,7 +514,7 @@ mod tests {
                 stream: BufReader::new(a),
                 next: 1,
             };
-            let p = json!({"tool_name": "Bash", "tool_input": {}});
+            let p = json!({"tool_name": "Bash", "tool_input": {}, "usage": {"input_tokens": 1}});
             let h = Hook {
                 transcript_path: Some(format!(
                     "{}/tests/fixtures/hooks/claude-transcript.jsonl",
@@ -487,8 +523,36 @@ mod tests {
                 ..hook("claude", e)
             };
             assert!(try_capture(&mut conn, &h, &p, &json!({})).is_err(), "{e:?}");
-            capture(&mut conn, &h, &p, &json!({}));
+            assert!(!capture_on(&mut conn, &h, &p, &json!({})));
         }
+    }
+
+    #[test]
+    fn a_daemon_slow_to_answer_capture_is_not_waited_for() {
+        let (a, b) = UnixStream::pair().unwrap();
+        // The daemon reads the write and answers it 500 ms later.
+        let held = std::thread::spawn(move || {
+            let mut line = String::new();
+            BufReader::new(&b).read_line(&mut line).unwrap();
+            std::thread::sleep(Duration::from_millis(500));
+            let _ = (&b).write_all(b"{\"ok\":true}\n");
+            line
+        });
+        let mut conn = Conn {
+            stream: BufReader::new(a),
+            next: 1,
+        };
+        let t = std::time::Instant::now();
+        let session = json!({"cwd": "/p"});
+        assert!(capture_on(
+            &mut conn,
+            &hook("claude", Event::SessionStart),
+            &json!({}),
+            &session
+        ));
+        let took = t.elapsed();
+        assert!(took < Duration::from_millis(100), "{took:?}");
+        assert!(held.join().unwrap().contains("capture.session_start"));
     }
 
     fn hook(provider: &'static str, event: Event) -> Hook {
