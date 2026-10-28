@@ -385,3 +385,39 @@ fn sessions_list_shows_harness_repo_tokens() {
         .is_empty());
     assert!(!e.sessions(&["show", "claude:c1"]).status.success());
 }
+
+#[test]
+fn an_oversized_transcript_yields_null_tokens() {
+    let d = tempfile::tempdir().unwrap();
+    let line = std::fs::read_to_string(transcript()).unwrap();
+    assert_eq!(capture::transcript_tokens(&transcript()), Some((120, 45)));
+    // Longer than the cap (a sparse file): no total rather than a partial one.
+    let big = d.path().join("big.jsonl");
+    std::fs::write(&big, &line).unwrap();
+    let f = std::fs::OpenOptions::new().write(true).open(&big).unwrap();
+    f.set_len(capture::TRANSCRIPT_MAX + 1).unwrap();
+    assert_eq!(capture::transcript_tokens(big.to_str().unwrap()), None);
+    // A line that is not UTF-8 ends the read early: no total.
+    let bad = d.path().join("bad.jsonl");
+    let mut bytes = line.into_bytes();
+    bytes.extend_from_slice(b"\xff\xfe\n");
+    std::fs::write(&bad, bytes).unwrap();
+    assert_eq!(capture::transcript_tokens(bad.to_str().unwrap()), None);
+    // Not a regular file.
+    assert_eq!(capture::transcript_tokens("/dev/null"), None);
+}
+
+#[test]
+fn forget_deletes_only_the_matching_session() {
+    let (_d, s) = store();
+    for id in ["a:1", "a:2"] {
+        let mut r = row();
+        r.id = id.into();
+        capture::start_session(&s, &r, "/tmp/p").unwrap();
+        capture::record_tool_call(&s, id, "Bash", "{}", None, true).unwrap();
+    }
+    assert!(capture::forget(&s, "a:1").unwrap());
+    assert!(capture::tool_calls(&s, "a:1", true).unwrap().is_empty());
+    assert_eq!(capture::sessions_since(&s, -1).unwrap().len(), 1);
+    assert_eq!(capture::tool_calls(&s, "a:2", true).unwrap().len(), 1);
+}

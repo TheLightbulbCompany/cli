@@ -240,14 +240,16 @@ pub const TRANSCRIPT_MAX: u64 = 50 * 1024 * 1024;
 /// assistant entries. Claude writes one entry per content block of a reply, each restating that
 /// reply's usage, so a reply (`message.id`) counts once. `None` when there is no usage in it.
 pub fn transcript_tokens(path: &str) -> Option<(i64, i64)> {
-    use std::io::{BufRead, Read};
+    use std::io::BufRead;
     let file = std::fs::File::open(path).ok()?;
+    // A partial sum is worse than none: too big, or not a file, reads as no tokens.
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.len() > TRANSCRIPT_MAX {
+        return None;
+    }
     let mut by_reply = std::collections::HashMap::new();
-    for (n, line) in std::io::BufReader::new(file.take(TRANSCRIPT_MAX))
-        .lines()
-        .map_while(|l| l.ok())
-        .enumerate()
-    {
+    for (n, line) in std::io::BufReader::new(file).lines().enumerate() {
+        let line = line.ok()?;
         let Ok(v) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
