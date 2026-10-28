@@ -1814,6 +1814,34 @@ pub fn doctor() -> Result<i32> {
     }
 }
 
+/// The words `setup` opens with for a person at a terminal who is not signed in.
+const SIGN_IN_OFFER: &str = "Sign in (free): your memory and sessions follow you across computers; the Claude app reaches your agents; the evaluator can read sessions you upload. Or stay local.\n  [Enter] Sign in    [l] Stay local";
+
+/// `setup`'s first screen: the free sign-in, with staying local one key away. Staying local
+/// records that uploads are off. Skipped with nobody at a terminal (an update, the daemon's
+/// refresh) and when this computer is already signed in.
+/// Task 9 hooks in after a successful `login::login()`: ask off | metadata | full.
+fn first_screen() -> Result<()> {
+    use std::io::IsTerminal;
+    let dir = paths::state_dir();
+    let person = std::io::stdin().is_terminal() || test_env(TTY_ENV).is_some();
+    if !person || crate::login::stored_proof(&dir).is_some() {
+        return Ok(());
+    }
+    println!("{SIGN_IN_OFFER}");
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    if !answer.trim().eq_ignore_ascii_case("l") {
+        match crate::login::login() {
+            Ok(0) => return Ok(()),
+            Ok(_) => {}
+            Err(e) => eprintln!("{e}"),
+        }
+        println!("Staying local.");
+    }
+    crate::config::Config::set(&dir, "capture_upload", "off")
+}
+
 /// `setup [--remove]`: wires the installed agents to the canonical binary (or `executable`)
 /// and starts the background service; prints one line per agent, then what to try next. Exits
 /// 1 when an agent ends with hooks but no tools. `--remove` is the off switch: our entries,
@@ -1835,6 +1863,7 @@ pub fn setup(
     }
     let home = home()?;
     if !remove {
+        first_screen()?;
         install_running(&home)?;
     }
     // Wired to the canonical copy, never to wherever this binary was built.

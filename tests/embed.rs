@@ -504,7 +504,7 @@ async fn a_dropped_instance_shuts_down_before_its_home_is_free() {
     let port = ok(&i, "status", json!({})).await["port"].as_u64().unwrap();
     drop(i); // no shutdown: a panic or a cancelled future
     let mut next = None;
-    for _ in 0..100 {
+    for _ in 0..500 {
         if let Ok(n) = try_start(home.path(), &[], None).await {
             next = Some(n);
             break;

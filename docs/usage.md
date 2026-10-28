@@ -38,7 +38,7 @@ Run `lightbulb <command> --help` for the options of each one.
 
 | Command | What it does |
 |---|---|
-| `setup` | Connect Claude Code, Codex, Cursor, Grok CLI and OpenCode here and start the background service. |
+| `setup` | Connect Claude Code, Codex, Cursor, Grok CLI and OpenCode here and start the background service. At a terminal it first offers the free sign-in (your memory and sessions follow you across computers, the Claude app reaches your agents, the evaluator can read sessions you upload); press `l` to stay local. Staying local keeps uploads off (`capture_upload = "off"` in `config.toml`). Already signed in, or run without a terminal, it skips the question. |
 | `update` | Install the latest release over this one and restart the background service. `--version v0.2.3` installs that release instead (0.2.2 or later; an example tag). `--auto on\|off` turns the daily automatic update on or off and installs nothing. |
 | `setup --remove` | Take out only what `setup` wrote. Backups are left as they are. |
 | `doctor` | Check the service, the local network, the state folder and each agent, and say how to fix what is not right. |

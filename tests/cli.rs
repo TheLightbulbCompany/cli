@@ -1388,3 +1388,47 @@ fn Config_on(e: &Env) -> bool {
         .unwrap()
         .memory_team
 }
+
+/// `setup` as a person at a terminal who answers the first screen with `answer`.
+fn setup_answering(e: &Env, answer: &str) -> Output {
+    use std::io::Write;
+    let mut child = e
+        .cmd(&["setup"])
+        .env("LIGHTBULB_CONNECT_DEBUG_TTY", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(answer.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+const SIGN_IN: &str = "Sign in (free): your memory and sessions follow you across computers; the Claude app reaches your agents; the evaluator can read sessions you upload. Or stay local.";
+
+/// The first screen offers the free sign-in before anything is wired, and staying local is one
+/// key (`l`) away.
+#[test]
+fn setup_offers_sign_in_first_with_local_one_key_away() {
+    let e = Env::new();
+    let o = setup_answering(&e, "l\n");
+    assert!(o.status.success(), "{}", err(&o));
+    let text = out(&o);
+    assert!(text.starts_with(SIGN_IN), "{text}");
+    assert!(text.contains("[l] Stay local"), "{text}");
+    assert!(text.contains("Lightbulb is on."), "{text}");
+}
+
+/// Not signing in records that uploads are off.
+#[test]
+fn setup_without_sign_in_sets_upload_off() {
+    let e = Env::new();
+    assert!(setup_answering(&e, "l\n").status.success());
+    let config = std::fs::read_to_string(e.state.path().join("config.toml")).unwrap();
+    assert!(config.contains("capture_upload = \"off\""), "{config}");
+}
