@@ -729,13 +729,14 @@ fn sessions_upload(id: u64, body: &Value, daemon: &Arc<Daemon>, person: bool) ->
     }
 }
 
-/// Embeds what has no vector yet (the turn just stored, and any memory entry) in the
-/// background, taking the store lock only to read and to write: one pass at a time.
-fn embed_missing(daemon: &Arc<Daemon>) {
+/// Embeds what has no vector yet (turns, and memory entries, received ones too) in the
+/// background, taking the store lock only to read and to write. Run after each turn and by the
+/// housekeeping loop every minute; one pass at a time, a kick during a pass is dropped.
+pub(crate) fn embed_missing(daemon: &Arc<Daemon>) {
     static RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     use std::sync::atomic::Ordering::SeqCst;
     if RUNNING.swap(true, SeqCst) {
-        return; // ponytail: a turn stored during a pass waits for the next turn's pass
+        return; // what a pass misses, the next minute's picks up
     }
     let d = daemon.clone();
     tokio::task::spawn_blocking(move || {

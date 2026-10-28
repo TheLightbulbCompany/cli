@@ -285,7 +285,7 @@ pub async fn run(dir: &Path) -> Result<()> {
     tokio::spawn(crate::admission::route(daemon.clone()));
     cli::refresh_setup(dir);
     tokio::spawn(auto_update(daemon.clone(), dir.to_path_buf()));
-    tokio::spawn(prune_turns(daemon.clone()));
+    tokio::spawn(housekeeping(daemon.clone()));
     tokio::spawn(crate::telemetry::run_daily(daemon.clone()));
     // While signed in: the route link for this person's hosted apps.
     tokio::spawn(crate::link::run(daemon.clone()));
@@ -335,15 +335,21 @@ async fn auto_update(daemon: Arc<Daemon>, dir: PathBuf) {
     }
 }
 
-/// Deletes the turns older than `capture_turns_days` at the start and then daily.
-async fn prune_turns(daemon: Arc<Daemon>) {
+/// Housekeeping, from the start: the vector backfill every minute, and the turns older than
+/// `capture_turns_days` deleted once a day.
+async fn housekeeping(daemon: Arc<Daemon>) {
+    let mut pruned: Option<Instant> = None;
     loop {
-        let days = Config::load(&daemon.dir).map_or(90, |c| c.capture_turns_days);
-        let now = ipc::now() as i64;
-        if let Err(e) = crate::capture::prune_turns(&daemon.store.lock().unwrap(), now, days) {
-            eprintln!("prune turns: {e}");
+        ipc::embed_missing(&daemon);
+        if pruned.is_none_or(|t| t.elapsed() >= Duration::from_secs(86_400)) {
+            let days = Config::load(&daemon.dir).map_or(90, |c| c.capture_turns_days);
+            let now = ipc::now() as i64;
+            if let Err(e) = crate::capture::prune_turns(&daemon.store.lock().unwrap(), now, days) {
+                eprintln!("prune turns: {e}");
+            }
+            pruned = Some(Instant::now());
         }
-        tokio::time::sleep(Duration::from_secs(86_400)).await;
+        tokio::time::sleep(Duration::from_secs(60)).await;
     }
 }
 

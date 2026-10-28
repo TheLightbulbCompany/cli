@@ -1,6 +1,8 @@
 //! The local embedding model (`embed_model`). The tests that need the real model download it
 //! themselves and run only with `LIGHTBULB_TEST_MODEL=1` (CI sets it).
-use lightbulb::{embed_model, paths};
+mod common;
+
+use lightbulb::{capture, embed_model, memory, paths};
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -61,4 +63,75 @@ fn cosine_of_identical_vectors_is_one_and_orthogonal_is_zero() {
     let a = [0.3, -1.2, 2.0];
     assert!((embed_model::cosine(&a, &a) - 1.0).abs() < 1e-6);
     assert_eq!(embed_model::cosine(&[1.0, 0.0], &[0.0, 2.0]), 0.0);
+}
+
+/// The daemon's housekeeping fills the vectors missing when it starts: an entry and a turn
+/// stored before the model was installed get one; a refused turn never does.
+#[test]
+#[ignore = "downloads the model; run with LIGHTBULB_TEST_MODEL=1 and --include-ignored"]
+fn the_daemon_embeds_what_has_no_vector_at_start() {
+    if !wants_model() {
+        return;
+    }
+    let _g = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let e = common::Env::new();
+    std::env::set_var(paths::HOME_ENV, e.state.path());
+    // No model yet: nothing is embedded as it is stored.
+    let store = e.store();
+    let op = memory::Op::Remember {
+        subject: "db".into(),
+        fact: "we run postgres 16".into(),
+        kind: memory::Kind::Fact,
+        scope: memory::Scope::Team,
+        when: None,
+        source: memory::Source {
+            harness: "test".into(),
+            repo: None,
+            session: None,
+            on_behalf_of: None,
+            shared_from: None,
+        },
+        replaces: vec![],
+    };
+    memory::remember(&store, &e.identity(), op, 1).unwrap();
+    let row = capture::SessionRow {
+        id: "a:1".into(),
+        harness: "a".into(),
+        computer: "mac".into(),
+        repo: None,
+        branch: None,
+        started: 1,
+        ended: None,
+        prompt_tokens: None,
+        completion_tokens: None,
+    };
+    capture::start_session(&store, &row, "/tmp/proj").unwrap();
+    // Today: the daemon prunes turns older than 90 days as it starts.
+    let now = common::now_s();
+    capture::record_turn(&store, "a:1", "user", "list the files", now).unwrap();
+    capture::record_turn(
+        &store,
+        "a:1",
+        "assistant",
+        "export API_KEY=abcd1234efgh5678",
+        now,
+    )
+    .unwrap();
+    drop(store);
+    let db = e.state.path().join("state.db");
+    let vecs = |sql: &str| common::count(&db, sql);
+    let entry = "SELECT COUNT(*) FROM memory_vec";
+    let turn = |seq: i64| {
+        format!(
+            "SELECT COUNT(*) FROM turns_vec JOIN capture_turns ON turn = capture_turns.rowid \
+             WHERE seq = {seq}"
+        )
+    };
+    assert_eq!((vecs(entry), vecs(&turn(1))), (0, 0));
+    embed_model::install(e.state.path()).unwrap();
+    e.daemon(false, "", &[]);
+    common::until(30, "the start-up pass embeds", || {
+        vecs(entry) == 1 && vecs(&turn(1)) == 1
+    });
+    assert_eq!(vecs(&turn(2)), 0, "a refused turn is never embedded");
 }
