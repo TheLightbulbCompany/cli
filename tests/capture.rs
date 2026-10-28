@@ -716,11 +716,11 @@ fn a_reply_equal_to_the_last_turn_is_recorded_once() {
     assert_eq!(seqs, vec![1, 2, 3]);
 }
 
-/// The Stop's tokens are sent before its turn, so a slow capture never costs them.
-/// `LIGHTBULB_CONNECT_DEBUG_CAPTURE_DELAY_MS` slows every capture op, so here `capture.stop`
-/// itself outlasts the hook's wait and the turn is never sent; the tokens still land.
+/// The Stop's tokens and its reply travel in one `capture.stop`, so an answer that comes too
+/// late for the hook costs neither: `LIGHTBULB_CONNECT_DEBUG_CAPTURE_DELAY_MS` slows every
+/// capture op, here past the hook's wait, and the daemon still records both.
 #[test]
-fn the_stop_sends_its_tokens_before_its_turn() {
+fn a_slow_capture_stop_still_records_its_tokens_and_turn() {
     let e = Env::new();
     let delay = [(
         "LIGHTBULB_CONNECT_DEBUG_CAPTURE_DELAY_MS",
@@ -736,6 +736,12 @@ fn the_stop_sends_its_tokens_before_its_turn() {
     assert!(o.status.success(), "{}", err(&o));
     let s = e.captured("the tokens", |s| s.prompt_tokens.is_some());
     assert_eq!((s.prompt_tokens, s.completion_tokens), (Some(7), Some(3)));
+    let turns = capture::turns(&e.store(), "claude:c1").unwrap();
+    assert_eq!(turns.len(), 1);
+    assert_eq!(
+        (turns[0].role.as_str(), turns[0].text.as_str()),
+        ("assistant", "Done.")
+    );
 }
 
 /// The hook checks the whole prompt for a credential before the 4 KB cut.
