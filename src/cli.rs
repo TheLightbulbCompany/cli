@@ -1375,7 +1375,7 @@ fn parse_version(v: &str) -> Option<(u64, u64, u64)> {
 }
 
 /// `curl -fsSL url` (with `-I`: the headers only); its stdout, or an error naming the URL.
-fn curl(url: &str, head: bool) -> Result<Vec<u8>> {
+pub(crate) fn curl(url: &str, head: bool) -> Result<Vec<u8>> {
     let mut c = Command::new("curl");
     // -q first: ignore ~/.curlrc. Bounded, so a stalled download cannot hang the daemon's daily check.
     c.arg("-q");

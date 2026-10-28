@@ -5,6 +5,8 @@ use std::path::PathBuf;
 /// Overrides the state dir (tests, side-by-side installs).
 pub const HOME_ENV: &str = "LIGHTBULB_CONNECT_HOME";
 pub const SOCKET: &str = "sock";
+/// The local embedding model's folder in the state dir (`embed_model`).
+pub const MODEL: &str = "model";
 
 /// `~/.lightbulb/connect` (or `$LIGHTBULB_CONNECT_HOME`), not created.
 pub fn state_path() -> PathBuf {
