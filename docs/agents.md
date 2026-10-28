@@ -15,14 +15,17 @@ it adds two things:
   `'~/.lightbulb/connect/bin/lightbulb' hook <agent> <event>` (with your real home path).
   Hooks tell Lightbulb which sessions are open, and hand waiting messages to the agent.
 - **A tool server** (an MCP server) named `lightbulb`. Its command is
-  `~/.lightbulb/connect/bin/lightbulb mcp`. It always gives the agent four network tools. While this computer is signed in (`lightbulb login`), it also gives the workspace tools (`find_rooms`, `read_messages`, `find_tasks`, `read_task`, `update_task`, `use_browser`), and `send_message` can post to a room (`room_id`) or a person (`person_id`). The names, descriptions and schemas are `src/mcp/tools.json`; `lightbulb mcp --tools-json` prints it.
+  `~/.lightbulb/connect/bin/lightbulb mcp`. It always gives the agent seven network tools. While this computer is signed in (`lightbulb login`), it also gives the workspace tools (`find_rooms`, `read_messages`, `find_tasks`, `read_task`, `update_task`, `use_browser`), and `send_message` can post to a room (`room_id`) or a person (`person_id`). The names, descriptions and schemas are `src/mcp/tools.json`; `lightbulb mcp --tools-json` prints it.
 
   | Tool | What it does |
   |---|---|
   | `find_sessions` | Lists the sessions you can message: this computer's first, then your teammates'. Takes an optional search text and a limit (default 20). |
   | `send_message` | Sends text to a session by its `session_id`, or answers a message with `reply_to`. Returns a receipt. |
   | `message_receipt` | Shows the receipt of a message this session sent. |
-  | `check_inbox` | Takes the messages waiting for this session. It can wait up to 30 seconds per call for one to arrive. |
+  | `check_inbox` | Takes the messages waiting for this session. It can wait up to 600 seconds per call for one to arrive. |
+  | `find_workers` | Lists the sessions that take assignments: this computer's and your teammates'. |
+  | `assign` | Hands one job to one session: a brief, a `done_when` line and a deadline (default an hour). Its reply is the result. |
+  | `cancel_assignment` | Tells the session working on an assignment to stop. |
 
 Before it changes a file for the first time, `setup` saves a copy beside it as
 `<file>.lightbulb-backup`. It never overwrites a backup. It does not touch other entries in
