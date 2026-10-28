@@ -1173,6 +1173,24 @@ fn remember(e: &Env, subject: &str, fact: &str, scope: &str) -> Value {
     )
 }
 
+/// A fact with no subject would be grouped with every other subjectless one: refused.
+#[test]
+fn remember_refuses_a_blank_subject() {
+    let e = Env::new();
+    assert!(e.run(&["who"]).status.success());
+    for subject in ["", "   "] {
+        let r = remember(&e, subject, "postgres 16", "me");
+        assert_eq!(
+            (r["ok"].clone(), r["reason"].clone()),
+            (json!(false), json!("no_subject")),
+            "{r}"
+        );
+    }
+    assert!(lightbulb::memory::facts(&e.store(), None, None)
+        .unwrap()
+        .is_empty());
+}
+
 #[test]
 fn memory_list_shows_scope_author_and_status() {
     let e = Env::new();

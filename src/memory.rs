@@ -108,9 +108,13 @@ pub struct Fact {
 }
 
 /// Signs `op` as `id`'s next entry and stores it. `too_long` when it passes `MAX_ENTRY_BYTES`;
-/// `secret:<pattern>` when subject or fact looks like a credential (refused, never scrubbed).
+/// `secret:<pattern>` when subject or fact looks like a credential (refused, never scrubbed);
+/// `no_subject` for a blank subject (replay would group it with every other one).
 pub fn remember(store: &Store, id: &Identity, op: Op, now: i64) -> Result<Entry> {
     if let Op::Remember { subject, fact, .. } = &op {
+        if subject.trim().is_empty() {
+            return Err("no_subject".into());
+        }
         if let Some(name) = refuse_secret(subject).or_else(|| refuse_secret(fact)) {
             return Err(format!("secret:{name}").into());
         }

@@ -685,6 +685,16 @@ async fn cloud_import_assigns_sequential_seq() {
     assert_eq!(l["next"], 3);
     let bad = call(&i, "memory.import", json!({"entries": [{"subject": "x"}]})).await;
     assert_eq!(bad["error"], "bad_request", "{bad}");
+    // A blank subject is refused, the rest go on.
+    let r = ok(
+        &i,
+        "memory.import",
+        json!({"entries": [imported(" ", "blank"), imported("d", "four")]}),
+    )
+    .await;
+    assert_eq!(r["ids"][0], Value::Null, "{r}");
+    assert!(r["ids"][1].is_string(), "{r}");
+    assert_eq!(r["refused"], json!([{"index": 0, "reason": "no_subject"}]));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

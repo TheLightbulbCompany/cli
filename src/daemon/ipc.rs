@@ -457,6 +457,9 @@ fn memory_remember(
     let (Ok(scope), Ok(replaces)) = (scope, replaces) else {
         return Response::err(id, BAD_REQUEST);
     };
+    if subject.trim().is_empty() {
+        return refused(id, "no_subject");
+    }
     if scope == Scope::Team && !daemon.team.lock().unwrap().config.memory_team {
         return Response::ok(id, json!({ "stored": false, "refused": "team_off" }));
     }
@@ -723,10 +726,11 @@ fn memory_team(id: u64, body: &Value, daemon: &Arc<Daemon>, person: bool) -> Res
 
 /// `memory.import {entries: [{subject, fact, kind, scope, when?, source, replaces?}]}` ->
 /// `{ids, refused}`: the cloud member signs each as its own, in order. All are parsed before any
-/// is stored; a refused one (`secret:..`, `too_long`) is `null` in `ids` and `{index, reason}` in
-/// `refused`, and the rest go on. An entry's `key` is kept in the `memory_import_keys` side table
-/// (not on the entry: a forgotten one loses its body), and a held key answers with its id
-/// (idempotent).
+/// is stored; a refused one (`secret:..`, `too_long`, `no_subject`) is `null` in `ids` and
+/// `{index, reason}` in `refused`, and the rest go on. An entry's `key` is written on the entry as
+/// its `source.session`, and also kept in the `memory_import_keys` side table, because a
+/// forgotten entry loses its body (and the key with it) while a held key must still answer
+/// with its id (idempotent).
 fn memory_import(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
     use crate::memory::{self, Op, Source};
     let Some(items) = body["entries"].as_array() else {
@@ -806,7 +810,10 @@ fn memory_import(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
             }
             Err(e) => {
                 let reason = e.to_string();
-                if !(reason.starts_with("secret:") || reason == "too_long") {
+                if !(reason.starts_with("secret:")
+                    || reason == "too_long"
+                    || reason == "no_subject")
+                {
                     return Response::err(id, INTERNAL);
                 }
                 ids.push(Value::Null);
