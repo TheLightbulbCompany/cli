@@ -843,8 +843,9 @@ impl Net {
             if expire {
                 expired_at = Some(std::time::Instant::now());
             }
-            if let Err(e) = flush(d, all, expire) {
-                eprintln!("net: outbox: {e}");
+            match flush(d, all, expire) {
+                Ok(wake) => wake.iter().for_each(|k| ipc::stored(d, k, None)),
+                Err(e) => eprintln!("net: outbox: {e}"),
             }
         }
     }
@@ -1309,12 +1310,16 @@ fn receipt_changed(d: &Daemon, id: &str, state: &str, reason: Option<&str>) {
 
 /// One flush (`Net::flush_loop`): with `all`, every queued envelope of an online member,
 /// whatever its backoff; with `expire`, first what waited too long.
-fn flush(d: &Daemon, all: bool, expire: bool) -> Result<()> {
+/// Returns the askers whose assignments just timed out, for the caller to wake (`ipc::stored`
+/// needs the `Arc`).
+fn flush(d: &Daemon, all: bool, expire: bool) -> Result<Vec<Key>> {
     let now = ipc::now();
     let online = d.peers.online();
     let store = d.store.lock().unwrap();
+    let mut wake = vec![];
     if expire {
         mail::expire(&store, now)?;
+        wake = mail::expire_assignments(&store, &d.identity.short, now)?;
         // An instance's delivered-unread mail (`inbox.peek` hands it out until it is read).
         if d.cloud.is_some() {
             mail::expire_delivered(&store, &d.identity.short, now)?;
@@ -1340,7 +1345,7 @@ fn flush(d: &Daemon, all: bool, expire: bool) -> Result<()> {
             outbox::told(&store, &member, &id, &state)?;
         }
     }
-    Ok(())
+    Ok(wake)
 }
 
 /// Rings `who`'s doorbell: `curl -q -g --proto =http,https -fsS -m 10 -X POST -K - <url>`, the bearer token handed on

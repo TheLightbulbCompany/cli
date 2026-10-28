@@ -392,3 +392,109 @@ async fn an_assignment_is_delivered_with_its_fields_and_its_reply_is_its_result(
     assert_eq!(r["receipt"]["reason"], "bad_request");
     call(&mut l, &mut w, json!({"id": 12, "op": "shutdown"})).await;
 }
+
+/// Two registered sessions (codex `a`, claude `b`) with `a`'s assignment `as1` (1 s deadline) to
+/// `b` sent and left to lapse; returns the connection, the keys and the assignment's id.
+async fn lapsed_assignment(
+    dir: &tempfile::TempDir,
+) -> (
+    Lines<BufReader<OwnedReadHalf>>,
+    OwnedWriteHalf,
+    String,
+    String,
+    String,
+) {
+    let claude_home = tempfile::tempdir().unwrap();
+    std::env::set_var("LIGHTBULB_CONNECT_CLAUDE_HOME", claude_home.path());
+    let home = dir.path().to_path_buf();
+    tokio::spawn(async move { daemon::run(&home).await.unwrap() });
+    let (mut l, mut w) = connect(&dir.path().join(paths::SOCKET)).await;
+    let birth = os::process(std::process::id()).unwrap().birth_micros;
+    let mut keys = vec![];
+    for (i, (provider, conv)) in [("codex", "a"), ("claude", "b")].into_iter().enumerate() {
+        let reg = call(
+            &mut l,
+            &mut w,
+            json!({"id": i + 1, "op": "register", "session": {
+            "provider": provider, "conversation": conv, "pid": std::process::id(),
+            "birth_micros": birth, "cwd": "/tmp"}}),
+        )
+        .await;
+        keys.push(reg["key"].as_str().unwrap().to_string());
+    }
+    let (a, b) = (keys[0].clone(), keys[1].clone());
+    let sent = call(
+        &mut l,
+        &mut w,
+        json!({"id": 3, "op": "send", "from": a, "to": b, "kind": "assign",
+        "text": "x", "done_when": "y", "deadline_s": 1, "request_id": "as1"}),
+    )
+    .await;
+    assert_eq!(sent["receipt"]["state"], "stored");
+    let got = call(&mut l, &mut w, json!({"id": 4, "op": "inbox", "key": b})).await;
+    let assign_id = got["messages"][0]["id"].as_str().unwrap().to_string();
+    tokio::time::sleep(std::time::Duration::from_millis(1300)).await;
+    (l, w, a, b, assign_id)
+}
+
+#[tokio::test]
+async fn an_assignment_past_its_deadline_fails_timed_out_in_the_askers_inbox() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut l, mut w, a, b, assign_id) = lapsed_assignment(&dir).await;
+    let got = call(
+        &mut l,
+        &mut w,
+        json!({"id": 5, "op": "inbox", "key": a, "wait_secs": 0}),
+    )
+    .await;
+    let ms = got["messages"].as_array().unwrap();
+    assert_eq!(ms.len(), 1, "{got}");
+    assert_eq!(ms[0]["kind"], "result");
+    assert_eq!(ms[0]["status"], "failed");
+    assert_eq!(ms[0]["reason"], "timed_out");
+    assert_eq!(ms[0]["reply_to"], assign_id);
+    assert_eq!(ms[0]["from"], b);
+    let r = call(
+        &mut l,
+        &mut w,
+        json!({"id": 6, "op": "receipt", "from": a, "request_id": "as1"}),
+    )
+    .await;
+    assert_eq!(r["receipt"]["result"]["status"], "failed");
+}
+
+#[tokio::test]
+async fn a_late_result_after_the_timeout_is_mail_not_a_second_closing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut l, mut w, a, b, assign_id) = lapsed_assignment(&dir).await;
+    let got = call(
+        &mut l,
+        &mut w,
+        json!({"id": 5, "op": "inbox", "key": a, "wait_secs": 0}),
+    )
+    .await;
+    assert_eq!(got["messages"].as_array().unwrap().len(), 1);
+    let sent = call(
+        &mut l,
+        &mut w,
+        json!({"id": 6, "op": "send", "from": b, "text": "done late",
+        "request_id": "late1", "reply_to": "as1"}),
+    )
+    .await;
+    assert_eq!(sent["receipt"]["state"], "stored");
+    let got = call(&mut l, &mut w, json!({"id": 7, "op": "inbox", "key": a})).await;
+    let ms = got["messages"].as_array().unwrap();
+    assert_eq!(ms.len(), 1, "{got}");
+    assert_eq!(ms[0]["kind"], "result");
+    assert_eq!(ms[0]["status"], "done");
+    let r = call(
+        &mut l,
+        &mut w,
+        json!({"id": 8, "op": "receipt", "from": a, "request_id": "as1"}),
+    )
+    .await;
+    assert_eq!(
+        r["receipt"]["result"]["request_id"],
+        format!("timeout-{assign_id}")
+    );
+}

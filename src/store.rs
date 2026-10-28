@@ -542,6 +542,19 @@ impl Store {
             .optional()
     }
 
+    /// Assignments from a key under `prefix` (`<short>/`) whose deadline is at or before `now`
+    /// and that no result replies to, oldest first.
+    pub fn open_assignments_past(&self, prefix: &str, now: i64) -> rusqlite::Result<Vec<Message>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT * FROM messages WHERE kind = 'assign' AND substr(from_key, 1, ?1) = ?2 \
+             AND json_extract(meta, '$.deadline_at') <= ?3 AND NOT EXISTS \
+             (SELECT 1 FROM messages r WHERE r.kind = 'result' AND r.reply_to = messages.id) \
+             ORDER BY rowid",
+        )?;
+        let rows = stmt.query_map(params![prefix.len() as i64, prefix, now], row_message)?;
+        rows.collect()
+    }
+
     pub fn put_message(&self, m: &Message) -> rusqlite::Result<()> {
         self.conn.execute(
             "INSERT INTO messages (id, request_id, from_key, to_key, kind, thread, hops, origin, \
