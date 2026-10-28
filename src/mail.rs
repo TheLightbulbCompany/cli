@@ -568,15 +568,16 @@ pub fn is_new_worker(to: &str) -> bool {
         .is_some_and(|p| sessions::PROVIDERS.contains(&p))
 }
 
-/// The rule for sending `kind` with `meta` as `from`, answering `parent`: `Err(reason)` is the
-/// refusal. An `assign` carries its terms (`done_when`, a deadline; `repo`/`branch` short); a
-/// `result` answers an assignment made to `from`, with a known status; a `cancel` is the
-/// asker's alone.
+/// The rule for sending `kind` with `meta` from `from` to `to`, answering `parent`:
+/// `Err(reason)` is the refusal. An `assign` carries its terms (`done_when`, a deadline;
+/// `repo`/`branch` short); a `result` answers an assignment made to `from`, goes back to its
+/// asker and has a known status; a `cancel` is the asker's alone.
 pub(crate) fn check_kind(
     kind: &str,
     meta: &Meta,
     parent: Option<&Message>,
     from: &str,
+    to: &str,
 ) -> std::result::Result<(), &'static str> {
     let too_long = |v: &Option<String>, max| v.as_ref().is_some_and(|s| s.chars().count() > max);
     match kind {
@@ -594,7 +595,7 @@ pub(crate) fn check_kind(
             _ => Err("bad_request"),
         },
         "result" => {
-            if !parent.is_some_and(|p| answers_assign(p, from)) {
+            if !parent.is_some_and(|p| answers_assign(p, from) && p.from_key == to) {
                 return Err("policy");
             }
             let status = meta.status.as_deref();
@@ -724,13 +725,18 @@ pub fn prepare(
     if is_new_worker(&to.0) {
         return refused("no_worker"); // plan 2 starts a worker here
     }
-    // A plain message answering an assignment addressed to `from` is its result.
+    // A plain message answering an assignment addressed to `from`, sent back to its asker, is
+    // its result.
     let mut kind = kind;
-    if kind == "message" && parent.as_ref().is_some_and(|p| answers_assign(p, &from.0)) {
+    if kind == "message"
+        && parent
+            .as_ref()
+            .is_some_and(|p| answers_assign(p, &from.0) && p.from_key == to.0)
+    {
         kind = "result";
         meta.status.get_or_insert_with(|| "done".into());
     }
-    if let Err(reason) = check_kind(kind, &meta, parent.as_ref(), &from.0) {
+    if let Err(reason) = check_kind(kind, &meta, parent.as_ref(), &from.0, &to.0) {
         return refused(reason);
     }
 
@@ -973,7 +979,7 @@ pub fn receive(
         Some(r) => store.message(r)?,
         None => None,
     };
-    if let Err(reason) = check_kind(kind, meta, parent.as_ref(), from) {
+    if let Err(reason) = check_kind(kind, meta, parent.as_ref(), from, to) {
         return refused(reason);
     }
     if declared.is_some_and(|d| !d.contains(to)) {
@@ -2005,6 +2011,16 @@ mod tests {
         if let Frame::Envelope { reply_to, hops, .. } = &mut env {
             (*reply_to, *hops) = (Some(a.message_id.clone()), a.hops as u32 + 1);
         }
+        // A result to a session other than the asker is refused.
+        let mut third = peer_env("p/claude:9", "m/cursor:2", "r0", "result", done.clone());
+        if let Frame::Envelope { reply_to, hops, .. } = &mut third {
+            (*reply_to, *hops) = (Some(a.message_id.clone()), a.hops as u32 + 1);
+        }
+        let got = receive(&s, &third, &peer, &roster, "m", None, None, 1000).unwrap();
+        assert_eq!(
+            (got.state, got.reason.as_deref()),
+            (State::Refused, Some("policy"))
+        );
         let got = receive(&s, &env, &peer, &roster, "m", None, None, 1000).unwrap();
         assert_eq!(got.state, State::Stored);
         let Frame::Envelope { id, .. } = &env else {
@@ -2391,6 +2407,36 @@ mod tests {
         ));
         assert_eq!(p.kind, "message");
         assert!(p.meta.is_empty());
+    }
+
+    #[test]
+    fn a_reply_to_an_assignment_sent_to_a_third_session_stays_a_message() {
+        let (_d, s) = setup();
+        let aid = assigned(&s, "r1");
+        let p = go(prep(
+            &s,
+            "a/claude:2",
+            Some("a/cursor:3"),
+            "r2",
+            Some(&aid),
+            "message",
+            Meta::default(),
+            101,
+        ));
+        assert_eq!(p.kind, "message");
+        assert!(p.meta.is_empty());
+        // An explicit result may only go back to the asker.
+        let r = prep(
+            &s,
+            "a/claude:2",
+            Some("a/cursor:3"),
+            "r3",
+            Some(&aid),
+            "result",
+            Meta::default(),
+            101,
+        );
+        refused_for(r, "policy");
     }
 
     #[test]
