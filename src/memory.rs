@@ -752,8 +752,10 @@ pub(crate) fn fuse(
 /// A stored vector, or `None` when its blob is not one of this model's.
 pub(crate) fn unblob(blob: &[u8]) -> Option<Vec<f32>> {
     (blob.len() == embed_model::DIM * 4).then(|| {
-        blob.chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        blob.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect()
     })
 }
