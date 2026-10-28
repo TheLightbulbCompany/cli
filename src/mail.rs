@@ -1116,9 +1116,10 @@ pub fn expire_delivered(store: &Store, short: &str, now: u64) -> Result<()> {
 /// Closes member `me`'s unanswered assignments whose deadline (`meta.deadline_at`) is at or
 /// before `now`: each gets a `failed` / `timed_out` result from the assignee to the asker,
 /// stored in the asker's mailbox, one transaction each (the caller holds the store lock); one
-/// that fails is logged by id and skipped. Returns the askers' keys, to wake. A real result arriving later is ordinary mail: `result_of` keeps
+/// that fails is logged by id and skipped. Returns each asker's key and the timeout result's
+/// message id, to wake. A real result arriving later is ordinary mail: `result_of` keeps
 /// naming the oldest, this one.
-pub fn expire_assignments(store: &Store, me: &str, now: u64) -> Result<Vec<Key>> {
+pub fn expire_assignments(store: &Store, me: &str, now: u64) -> Result<Vec<(Key, String)>> {
     let mut askers = vec![];
     for a in store.open_assignments_past(&format!("{me}/"), now as i64)? {
         let at = a.meta.deadline_at.unwrap_or_default();
@@ -1150,7 +1151,7 @@ pub fn expire_assignments(store: &Store, me: &str, now: u64) -> Result<Vec<Key>>
             Ok(tx.commit()?)
         })();
         match stored {
-            Ok(()) => askers.push(Key(a.from_key)),
+            Ok(()) => askers.push((Key(a.from_key), p.message_id)),
             Err(e) => eprintln!("mail: assignment {} not timed out: {e}", a.id),
         }
     }
@@ -1393,8 +1394,15 @@ mod tests {
         squat.request_id = "timeout-a1".into();
         squat.kind = "message".into();
         store.put_message(&squat).unwrap();
-        let keys = expire_assignments(&store, "me", 10).unwrap();
-        assert_eq!(keys, vec![Key("me/y".into())]);
+        let woken = expire_assignments(&store, "me", 10).unwrap();
+        let [(key, id)] = &woken[..] else {
+            panic!("{woken:?}")
+        };
+        assert_eq!(key, &Key("me/y".into()));
+        assert_eq!(
+            store.message(id).unwrap().unwrap().reply_to.as_deref(),
+            Some("a2")
+        );
         assert!(store.result_of("a2").unwrap().is_some());
         assert!(store.result_of("a1").unwrap().is_none());
     }

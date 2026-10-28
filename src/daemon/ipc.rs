@@ -1872,7 +1872,7 @@ async fn inbox(
         let lapsed = mail::expire_assignments(&daemon.store.lock().unwrap(), short, now());
         match lapsed {
             Err(e) => eprintln!("ipc: expire assignments: {e}"),
-            Ok(keys) => keys.iter().for_each(|k| stored(daemon, k, None)),
+            Ok(woken) => woken.iter().for_each(|(k, id)| stored(daemon, k, Some(id))),
         }
         let taken = mail::take(&daemon.store.lock().unwrap(), &key, now());
         match taken {
