@@ -27,7 +27,7 @@ server) and starts the background service (on macOS; off macOS it restarts a dae
 `<file>.lightbulb-backup`. Details: [agents](agents.md).
 
 Setup then downloads the memory model (about 31 MB, once, into the state folder) and prints
-`Memory model installed (NN MB)`. If the download fails or takes more than 5 minutes, it prints
+`Memory model installed (NN MB)`. If the download fails or takes too long, it prints
 `Memory model not installed: <reason> Memory search is keyword-only.` and carries on.
 
 | Option | Meaning |
