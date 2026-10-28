@@ -820,3 +820,23 @@ fn a_failing_memory_recall_still_hands_over_the_mail() {
     ));
     assert_eq!(text, frame_of("r1"));
 }
+
+#[test]
+fn a_session_in_a_subfolder_gets_the_repo_block() {
+    let net = Net::new();
+    let cli = repo_dir("cli");
+    let deep = cli.path().join("src/net");
+    std::fs::create_dir_all(&deep).unwrap();
+    claude_hook(&net, "session-start", "SessionStart", A, cli.path());
+    remember_in(&net, &net.key("claude", A), "ci", "github actions", "team");
+    let text = context(&claude_hook(
+        &net,
+        "session-start",
+        "SessionStart",
+        B,
+        &deep,
+    ));
+    assert!(text.contains("ci: github actions"), "{text}");
+    let repo = |c| net.session(&net.key("claude", c)).unwrap()["repo"].clone();
+    assert_eq!(repo(B), repo(A));
+}
