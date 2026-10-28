@@ -3,6 +3,7 @@
 //! `Forget` tombstones an entry (its id stays, its body goes); `facts` and `search` replay what
 //! is held into current, contested and replaced values.
 
+use crate::embed_model;
 use crate::identity::{canonical, unsigned, verify, Identity};
 use crate::roster::{self, MAX_ENTRY_BYTES};
 use crate::store::Store;
@@ -198,11 +199,15 @@ fn insert(conn: &rusqlite::Connection, e: &Entry, now: i64) -> Result<bool> {
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![e.id, e.author, e.seq, body, now, tombstoned],
     )?;
+    if let (Op::Remember { subject, fact, .. }, false) = (&e.op, tombstoned) {
+        store_vec(conn, &e.id, subject, fact)?;
+    }
     if let Op::Forget { target } = &e.op {
         conn.execute(
             "INSERT OR IGNORE INTO memory_tombstones (target) VALUES (?1)",
             [target],
         )?;
+        conn.execute("DELETE FROM memory_vec WHERE id = ?1", [target])?;
         // A forget of a forget is accepted and does nothing.
         conn.execute(
             "UPDATE memory_entries SET entry = NULL, tombstone = 1
@@ -213,6 +218,67 @@ fn insert(conn: &rusqlite::Connection, e: &Entry, now: i64) -> Result<bool> {
         conn.execute("DELETE FROM memory_last", [])?;
     }
     Ok(true)
+}
+
+/// Embeds `subject: fact` into `memory_vec` for `id`; nothing when no model is installed.
+fn store_vec(conn: &rusqlite::Connection, id: &str, subject: &str, fact: &str) -> Result<()> {
+    if let Some(v) = embed_model::text(&format!("{subject}: {fact}")) {
+        let blob: Vec<u8> = v.iter().flat_map(|f| f.to_le_bytes()).collect();
+        conn.execute(
+            "INSERT OR REPLACE INTO memory_vec (id, v) VALUES (?1, ?2)",
+            params![id, blob],
+        )?;
+    }
+    Ok(())
+}
+
+/// Embeds up to `limit` held, live `remember`s that have no vector; how many it did. A no-op
+/// (0) without a model.
+pub fn embed_missing(store: &Store, limit: usize) -> Result<usize> {
+    if !embed_model::installed() {
+        return Ok(0);
+    }
+    let rows: Vec<(String, String)> = {
+        let mut stmt = store.conn().prepare(
+            "SELECT id, entry FROM memory_entries WHERE tombstone = 0 AND entry IS NOT NULL
+             AND id NOT IN (SELECT id FROM memory_vec) ORDER BY rowid LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    let mut n = 0;
+    for (id, body) in rows {
+        if let Op::Remember { subject, fact, .. } = serde_json::from_str::<Entry>(&body)?.op {
+            store_vec(store.conn(), &id, &subject, &fact)?;
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+/// `(id, vector)` of every embedded entry that is neither tombstoned nor replaced.
+pub fn vectors(store: &Store) -> Result<Vec<(String, Vec<f32>)>> {
+    let current: std::collections::HashSet<String> = replay(store)?
+        .into_iter()
+        .filter(|l| l.fact.status != Status::Replaced)
+        .map(|l| l.fact.id)
+        .collect();
+    let mut stmt = store.conn().prepare("SELECT id, v FROM memory_vec")?;
+    let rows = stmt.query_map([], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, blob) = row?;
+        if current.contains(&id) && blob.len() == embed_model::DIM * 4 {
+            let v = blob
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            out.push((id, v));
+        }
+    }
+    Ok(out)
 }
 
 /// Most of `key`'s entries a restore can lose: a peer's claim past our head by more is hostile

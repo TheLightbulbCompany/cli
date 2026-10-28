@@ -4,7 +4,7 @@ use std::path::Path;
 /// Migration `i` takes the db to `user_version` `i + 1`. Forward only; each one only adds
 /// tables or columns, but V12, which drops and recreates `memory_fts` (stemmed) from the
 /// entries; each runs once (in the transaction that moves `user_version`).
-const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12];
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13];
 
 const V1: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
@@ -116,6 +116,13 @@ INSERT INTO memory_fts(rowid, subject, fact)
     SELECT rowid, json_extract(entry, '$.op.subject'), json_extract(entry, '$.op.fact')
     FROM memory_entries;
 CREATE TABLE IF NOT EXISTS memory_seen (author TEXT PRIMARY KEY, seq INTEGER NOT NULL);
+";
+/// One embedding per held `remember` (`memory_vec`: `DIM` little-endian f32s); absent when no
+/// model was installed then (`memory::embed_missing` fills it in).
+const V13: &str = "
+CREATE TABLE IF NOT EXISTS memory_vec (
+    id TEXT PRIMARY KEY REFERENCES memory_entries(id), v BLOB NOT NULL
+);
 ";
 /// Memory: signed entries numbered per author, with a full-text index over `subject` and `fact`
 /// (`memory`). `rowid` is explicit so it survives `VACUUM` (the FTS index points at it). A
@@ -1074,10 +1081,10 @@ mod tests {
         let path = dir.path().join("state.db");
         Connection::open(&path)
             .unwrap()
-            .execute_batch("PRAGMA user_version = 13;")
+            .execute_batch("PRAGMA user_version = 14;")
             .unwrap();
         let err = Store::open(&path).err().unwrap().to_string();
         assert!(err.contains("State is from a newer version (v13)"), "{err}");
-        assert_eq!(user_version(&path), 13);
+        assert_eq!(user_version(&path), 14);
     }
 }

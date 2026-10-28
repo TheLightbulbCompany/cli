@@ -7,6 +7,7 @@ use lightbulb::identity::Identity;
 use lightbulb::memory::{self, Kind, Op, Scope, Source, Status};
 use lightbulb::roster::{self, Kind as RosterKind};
 use lightbulb::store::Store;
+use lightbulb::{embed_model, paths};
 use serde_json::json;
 
 fn store() -> (tempfile::TempDir, Store) {
@@ -423,4 +424,98 @@ fn search_survives_snapshot() {
         memory::search(&c, "provider", 5).unwrap()[0].value,
         "actions"
     );
+}
+
+// --- vectors ---
+
+static STATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A fresh state dir for `embed_model` (process-wide env, so one test at a time), with the
+/// real model in it when `with_model`; `None` when the model is wanted but not enabled.
+fn vec_env(with_model: bool) -> Option<(std::sync::MutexGuard<'static, ()>, tempfile::TempDir)> {
+    if with_model && std::env::var("LIGHTBULB_TEST_MODEL").as_deref() != Ok("1") {
+        return None;
+    }
+    let g = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var(paths::HOME_ENV, dir.path());
+    if with_model {
+        embed_model::install(dir.path()).unwrap();
+    }
+    Some((g, dir))
+}
+
+#[test]
+#[ignore = "downloads the model; run with LIGHTBULB_TEST_MODEL=1 and --include-ignored"]
+fn remember_stores_a_vector_when_a_model_is_installed() {
+    let Some(_env) = vec_env(true) else { return };
+    let a = identity();
+    let (_d, s) = team(&a);
+    let e = memory::remember(&s, &a, rem("db", "postgres 16", &[]), 5).unwrap();
+    let v = memory::vectors(&s).unwrap();
+    assert_eq!(v.len(), 1);
+    assert_eq!(v[0].0, e.id);
+    assert_eq!(v[0].1, embed_model::text("db: postgres 16").unwrap());
+}
+
+#[test]
+fn remember_stores_no_vector_without_a_model() {
+    let Some(_env) = vec_env(false) else { return };
+    let a = identity();
+    let (_d, s) = team(&a);
+    memory::remember(&s, &a, rem("db", "postgres 16", &[]), 5).unwrap();
+    assert!(memory::vectors(&s).unwrap().is_empty());
+    assert_eq!(memory::embed_missing(&s, 200).unwrap(), 0);
+}
+
+#[test]
+#[ignore = "downloads the model; run with LIGHTBULB_TEST_MODEL=1 and --include-ignored"]
+fn forget_drops_the_vector() {
+    let Some(_env) = vec_env(true) else { return };
+    let a = identity();
+    let (_d, s) = team(&a);
+    let e = memory::remember(&s, &a, rem("db", "postgres 16", &[]), 5).unwrap();
+    let keep = memory::remember(&s, &a, rem("ci", "github actions", &[]), 6).unwrap();
+    memory::remember(
+        &s,
+        &a,
+        Op::Forget {
+            target: e.id.clone(),
+        },
+        7,
+    )
+    .unwrap();
+    let ids: Vec<_> = memory::vectors(&s)
+        .unwrap()
+        .into_iter()
+        .map(|v| v.0)
+        .collect();
+    assert_eq!(ids, vec![keep.id]);
+}
+
+#[test]
+#[ignore = "downloads the model; run with LIGHTBULB_TEST_MODEL=1 and --include-ignored"]
+fn embed_missing_backfills_entries_received_from_peers() {
+    if std::env::var("LIGHTBULB_TEST_MODEL").as_deref() != Ok("1") {
+        return;
+    }
+    let Some(_env) = vec_env(false) else { return };
+    let a = identity();
+    let (_d1, s1) = team(&a);
+    let (_d2, s2) = team(&a);
+    let e1 = memory::remember(&s1, &a, rem("db", "postgres 16", &[]), 5).unwrap();
+    let e2 = memory::remember(&s1, &a, rem("ci", "github actions", &[]), 6).unwrap();
+    // Received with no model installed: no vectors yet.
+    memory::accept(&s2, &e1, 7).unwrap();
+    memory::accept(&s2, &e2, 7).unwrap();
+    assert!(memory::vectors(&s2).unwrap().is_empty());
+    // The model arrives; the backfill honours its limit, then finishes.
+    embed_model::install(std::path::Path::new(
+        &std::env::var(paths::HOME_ENV).unwrap(),
+    ))
+    .unwrap();
+    assert_eq!(memory::embed_missing(&s2, 1).unwrap(), 1);
+    assert_eq!(memory::embed_missing(&s2, 200).unwrap(), 1);
+    assert_eq!(memory::embed_missing(&s2, 200).unwrap(), 0);
+    assert_eq!(memory::vectors(&s2).unwrap().len(), 2);
 }
