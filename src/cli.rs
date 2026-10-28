@@ -2081,7 +2081,7 @@ pub fn doctor() -> Result<i32> {
     let model = if crate::embed_model::installed() {
         "installed"
     } else {
-        "not installed (run lightbulb setup)"
+        "not installed (lightbulb setup downloads it; --no-model keeps it off)"
     };
     // Keyword-only memory still works: a missing model is said, not failed.
     row("Memory model", true, model, "", "");
