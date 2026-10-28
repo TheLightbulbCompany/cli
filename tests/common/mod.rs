@@ -101,6 +101,12 @@ impl Env {
             .env_remove("LIGHTBULB_CONNECT_DEBUG_RELAY_ONLY")
             .envs(env.iter().map(|(k, v)| (k, v)))
             .stdin(Stdio::null());
+        // `pin`: the daemon takes this test process for an agent above its callers, as one the
+        // CLI starts on first use inherits it. Without it an "agent shell" test only passes when
+        // the tests themselves run under an agent.
+        if let Some(pin) = &self.pin {
+            c.env("LIGHTBULB_CONNECT_HOOK_CALLER", pin);
+        }
         if env
             .iter()
             .any(|(k, _)| *k == "LIGHTBULB_CONNECT_DEBUG_OSASCRIPT")
