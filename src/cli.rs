@@ -833,13 +833,23 @@ pub fn sessions(cmd: Sessions) -> Result<i32> {
     if let Sessions::Upload(mode) = &cmd {
         let dir = paths::state_dir();
         let now = match mode {
+            // Through the daemon, which refuses an agent's shell: uploading is a person's choice.
             Some(m) => {
-                crate::upload::set_mode(&dir, m)?;
+                let r = connect()?.call("sessions.upload", json!({ "mode": m }))?;
+                if r["ok"] != true {
+                    return refuse(&r, &[]);
+                }
                 m.clone()
             }
             None => crate::config::Config::load(&dir)?.capture_upload,
         };
         println!("Uploads are {now}. {}", crate::upload::describe(&now));
+        let now_s = crate::daemon::ipc::now() as i64;
+        let signed_out =
+            crate::login::stored_proof(&dir).is_none() || crate::login::ended(&dir, now_s);
+        if now != "off" && signed_out {
+            println!("Nothing is sent until you sign in: lightbulb login");
+        }
         return Ok(0);
     }
     let (op, body) = match &cmd {

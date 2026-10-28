@@ -1465,17 +1465,26 @@ fn draft(id: &str, text: &str) -> Value {
 fn sessions_upload_sets_the_mode_and_says_what_happens() {
     let e = Env::new();
     assert!(out(&e.run(&["sessions", "upload"])).contains("off"));
-    let o = e.run(&["sessions", "upload", "metadata"]);
+    let o = e.person(&["sessions", "upload", "metadata"]);
     assert!(o.status.success(), "{}", err(&o));
     assert!(
         out(&o).contains("without what the tools did"),
         "{}",
         out(&o)
     );
+    // Signed out, it says nothing goes until a sign-in.
+    assert!(
+        out(&o).contains("Nothing is sent until you sign in: lightbulb login"),
+        "{}",
+        out(&o)
+    );
+    e.sign_in("user_1", None);
+    let o = e.person(&["sessions", "upload", "metadata"]);
+    assert!(!out(&o).contains("until you sign in"), "{}", out(&o));
     let config = std::fs::read_to_string(e.state.path().join("config.toml")).unwrap();
     assert!(config.contains("capture_upload = \"metadata\""), "{config}");
     assert!(out(&e.run(&["sessions", "upload"])).contains("metadata"));
-    let o = e.run(&["sessions", "upload", "off"]);
+    let o = e.person(&["sessions", "upload", "off"]);
     assert!(
         out(&o).contains("Nothing leaves this computer"),
         "{}",
@@ -1485,6 +1494,28 @@ fn sessions_upload_sets_the_mode_and_says_what_happens() {
         .run(&["sessions", "upload", "everything"])
         .status
         .success());
+}
+
+/// An agent's shell cannot turn uploads on: the mode is a person's choice.
+#[test]
+fn sessions_upload_from_agent_shell_is_refused() {
+    let mut e = Env::new();
+    let birth = os::process(std::process::id()).unwrap().birth_micros;
+    e.pin = Some(format!("{}:{birth}", std::process::id()));
+    e.daemon(false, "", &[]);
+    let o = e.run(&["sessions", "upload", "full"]);
+    assert!(
+        !o.status.success() && err(&o).contains("from your own terminal"),
+        "{}",
+        err(&o)
+    );
+    let r = e.ask(json!({"id": 1, "op": "sessions.upload", "mode": "full"}));
+    assert_eq!(r["reason"], "not_a_person", "{r}");
+    let config = lightbulb::config::Config::load(e.state.path()).unwrap();
+    assert_eq!(config.capture_upload, "off");
+    assert!(!e.state.path().join("upload.mark").exists());
+    // Reading the mode stays open.
+    assert!(out(&e.run(&["sessions", "upload"])).contains("off"));
 }
 
 #[test]

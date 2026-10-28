@@ -212,12 +212,8 @@ fn an_upload_off_during_the_request_keeps_the_mark_gone() {
         (200, json!({"stored": 2}))
     });
     wait_for(&seen, 1);
-    let mut off = e.base_cmd(std::process::Command::new(common::EXE));
-    assert!(off
-        .args(["sessions", "upload", "off"])
-        .status()
-        .unwrap()
-        .success());
+    let off = common::person(&e, json!({"id": 1, "op": "sessions.upload", "mode": "off"}));
+    assert_eq!(off["ok"], true, "{off}");
     std::thread::sleep(Duration::from_millis(1500));
     assert!(
         !e.state.path().join("upload.mark").exists(),

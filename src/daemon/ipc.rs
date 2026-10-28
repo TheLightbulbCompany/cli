@@ -363,6 +363,7 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
             },
             None => Response::err(id, BAD_REQUEST),
         },
+        "sessions.upload" => sessions_upload(id, body, daemon, for_a_person()),
         "capture.session_start"
         | "capture.tool_call"
         | "capture.stop"
@@ -685,6 +686,23 @@ fn member_names(daemon: &Daemon) -> std::collections::HashMap<String, String> {
         .values()
         .map(|m| (m.key.clone(), m.name.clone()))
         .collect()
+}
+
+/// `sessions.upload {mode}` -> `{}`: a person chooses what is uploaded (`upload::MODES`).
+fn sessions_upload(id: u64, body: &Value, daemon: &Arc<Daemon>, person: bool) -> Response {
+    if !person {
+        return refused(id, "not_a_person");
+    }
+    let Some(mode) = body["mode"]
+        .as_str()
+        .filter(|m| crate::upload::MODES.contains(m))
+    else {
+        return Response::err(id, BAD_REQUEST);
+    };
+    match crate::upload::set_mode(&daemon.dir, mode) {
+        Ok(()) => Response::ok(id, json!({})),
+        Err(_) => Response::err(id, INTERNAL),
+    }
 }
 
 /// `memory.team {on}` -> `{}`: a person turns team memory on or off.

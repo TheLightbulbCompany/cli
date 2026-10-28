@@ -138,6 +138,32 @@ wrote it.
 - **Who can change it.** `memory forget`, `memory share` and `memory team` are refused when run from an agent's shell or tools, like `remove`; `list`, `show`, `last` and `export` are open. An agent still writes entries with `remember`.
 - **The log.** `daemon.log` never holds an entry's text.
 
+## Capture and upload
+
+- **What is captured.** Each agent's hooks tell the background service when a session starts,
+  after each tool call, at the end of each turn and when it ends. It keeps the session (its id,
+  the agent, the computer, the repository and branch, when it started and ended, and token
+  counts, for Claude Code only, read from its transcript once at the end) and for each tool
+  call its number, time, tool, duration, whether it worked, and a summary of at most 200
+  characters (a command, a path, a pattern). Never file contents, diffs, command output or your
+  prompts. A summary that looks like a password or key is stored as `[refused: <what it
+  matched>]`. Sessions under a folder hidden with `lightbulb folder <path> off`, or under a dot
+  folder in your home folder (`~/.config`), are not captured.
+- **Where it lives.** In `state.db` on this computer. Teammates never receive it.
+- **What is uploaded.** Nothing unless you choose. `lightbulb sessions upload off` (the default)
+  sends nothing and makes no request. `metadata` sends each finished session's agent,
+  repository, branch, times and token counts, and for each tool call its number, time, tool,
+  duration and whether it worked, without the summary. `full` adds the summary. Uploads go only
+  while this computer is signed in, only for sessions that finish after you turn them on, and
+  are signed with this computer's identity. Only you can change the mode: `sessions upload
+  <mode>` is refused when run from an agent's shell or tools.
+- **The evaluator.** It reads only sessions you uploaded in `full`, when they arrive, and
+  suggests lessons. A suggestion does nothing until you keep it with `lightbulb memory approve`;
+  `lightbulb memory dismiss` drops it. `metadata` uploads are never read by it.
+- **Deleting.** `lightbulb sessions forget <id>` deletes a session and its tool calls on this
+  computer; it does not delete a copy already uploaded. `lightbulb sessions upload off` stops
+  further uploads and forgets where the last one stopped.
+
 ## Loop limits
 
 Two limits stop agents from messaging each other forever:
@@ -166,7 +192,8 @@ is `0600`):
 |---|---|
 | `identity.key` | This computer's secret key. |
 | `config.toml` | Settings (computer name, relay, `lan`, hidden folders). |
-| `state.db` | SQLite: the roster, sessions, messages, receipts, memory entries, permission prompts and their answers. A message's text is deleted once nothing waits on it (read, refused or expired); messages to your own terminal keep theirs. |
+| `state.db` | SQLite: the roster, sessions, messages, receipts, memory entries, the memory block each session was last handed (`lightbulb memory last`), captured sessions and their tool calls (see "Capture and upload"), permission prompts and their answers. A message's text is deleted once nothing waits on it (read, refused or expired); messages to your own terminal keep theirs. |
+| `upload.mark` | While uploads are on: the time up to which finished sessions were sent. Deleted by `lightbulb sessions upload off`. |
 | `daemon.log` | The log (see above). |
 | `addrs.json` | Teammates' last known network addresses. |
 | `sock`, `daemon.lock` | The service's socket and lock. |
@@ -205,8 +232,12 @@ Lightbulb sends anonymous usage counts (see "Usage counts" in the README; off wi
 
 Apart from those counts, the engine calls Lightbulb only for these: `lightbulb login` (a device
 sign-in you confirm in the browser), renewing a signed-in computer's proof, `lightbulb invite
---agents`, and, while this computer is signed in, one live connection that hosted apps reach your
-sessions through. It fetches no relay list from Lightbulb. Otherwise it talks only to your
+--agents`, while this computer is signed in one live connection that hosted apps reach your
+sessions through, `POST /sessions` (the uploader: every five minutes while signed in and
+uploads are `metadata` or `full`, and only when a session has finished since the last one; never
+while uploads are `off`), and `GET /memory/drafts` with `POST /memory/drafts/<id>/approve` or
+`/dismiss` (only when you run `lightbulb memory drafts`, `approve` or `dismiss`). It fetches no
+relay list from Lightbulb. Otherwise it talks only to your
 teammates' computers and, when no direct path exists, to the relays (the iroh project's public
 relays unless you or your team set one).
 
