@@ -104,6 +104,8 @@ pub fn file_permission(store: &Store, session: &str, prompt: &str, now: i64) -> 
         origin: Some("permission".into()),
         body: prompt.into(),
         sent_at: now,
+        reply_to: None,
+        meta: Default::default(),
     };
     let tx = store.conn().unchecked_transaction()?;
     store.put_message(&m)?;

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 /// tables or columns, but V12, which drops and recreates `memory_fts` (stemmed) from the
 /// entries; each runs once (in the transaction that moves `user_version`).
 const MIGRATIONS: &[&str] = &[
-    V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15,
+    V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15, V16,
 ];
 
 const V1: &str = "
@@ -150,6 +150,15 @@ ALTER TABLE capture_sessions ADD COLUMN nudged INTEGER NOT NULL DEFAULT 0;
 /// Why a held memory entry has no body when it was refused rather than forgotten
 /// (`refused:<pattern>`: a peer's entry that looks like a credential).
 const V15: &str = "ALTER TABLE memory_entries ADD COLUMN reason TEXT;";
+/// An assignment's answer names the message it answers (`reply_to`) and carries the job's
+/// terms (`meta`, JSON, NULL when empty); `stop_guard_at` is when a session's Stop hook last
+/// held it for unanswered work.
+const V16: &str = "
+ALTER TABLE messages ADD COLUMN reply_to TEXT;
+ALTER TABLE messages ADD COLUMN meta TEXT;
+ALTER TABLE sessions ADD COLUMN stop_guard_at INTEGER;
+CREATE INDEX IF NOT EXISTS messages_reply_to ON messages (reply_to);
+";
 /// Memory: signed entries numbered per author, with a full-text index over `subject` and `fact`
 /// (`memory`). `rowid` is explicit so it survives `VACUUM` (the FTS index points at it). A
 /// tombstoned row keeps its id and seq and drops its body (`entry` NULL); `memory_tombstones`
@@ -219,6 +228,9 @@ pub struct Message {
     pub origin: Option<String>,
     pub body: String,
     pub sent_at: i64,
+    /// The message this answers, by id.
+    pub reply_to: Option<String>,
+    pub meta: crate::mail::Meta,
 }
 
 fn row_session(r: &rusqlite::Row) -> rusqlite::Result<Session> {
@@ -253,6 +265,11 @@ pub(crate) fn row_message(r: &rusqlite::Row) -> rusqlite::Result<Message> {
         // `NULL` once `mail::forget` dropped it.
         body: r.get::<_, Option<String>>("body")?.unwrap_or_default(),
         sent_at: r.get("sent_at")?,
+        reply_to: r.get("reply_to")?,
+        meta: r
+            .get::<_, Option<String>>("meta")?
+            .and_then(|j| serde_json::from_str(&j).ok())
+            .unwrap_or_default(),
     })
 }
 
@@ -514,7 +531,8 @@ impl Store {
     pub fn put_message(&self, m: &Message) -> rusqlite::Result<()> {
         self.conn.execute(
             "INSERT INTO messages (id, request_id, from_key, to_key, kind, thread, hops, origin, \
-             body, sent_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             body, sent_at, reply_to, meta) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 m.id,
                 m.request_id,
@@ -525,7 +543,9 @@ impl Store {
                 m.hops,
                 m.origin,
                 m.body,
-                m.sent_at
+                m.sent_at,
+                m.reply_to,
+                (!m.meta.is_empty()).then(|| serde_json::to_string(&m.meta).unwrap_or_default())
             ],
         )?;
         Ok(())
@@ -980,6 +1000,8 @@ mod tests {
             origin: None,
             body: "hello".into(),
             sent_at: 9,
+            reply_to: None,
+            meta: Default::default(),
         };
         store.put_message(&message).unwrap();
         assert_eq!(store.message("m1").unwrap(), Some(message));
@@ -1018,6 +1040,8 @@ mod tests {
             origin: None,
             body: "hello".into(),
             sent_at: 9,
+            reply_to: None,
+            meta: Default::default(),
         };
         Store::open(&path).unwrap();
         let store = Store::open(&path).unwrap();
@@ -1132,10 +1156,58 @@ mod tests {
         let path = dir.path().join("state.db");
         Connection::open(&path)
             .unwrap()
-            .execute_batch("PRAGMA user_version = 16;")
+            .execute_batch("PRAGMA user_version = 17;")
             .unwrap();
         let err = Store::open(&path).err().unwrap().to_string();
-        assert!(err.contains("State is from a newer version (v16)"), "{err}");
-        assert_eq!(user_version(&path), 16);
+        assert!(err.contains("State is from a newer version (v17)"), "{err}");
+        assert_eq!(user_version(&path), 17);
+    }
+
+    #[test]
+    fn a_message_keeps_its_reply_to_and_meta_and_v16_adds_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("state.db")).unwrap();
+        let v: i64 = s
+            .conn()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 16);
+        let meta = crate::mail::Meta {
+            done_when: Some("tests pass".into()),
+            deadline_at: Some(99),
+            ..Default::default()
+        };
+        let m = Message {
+            id: "01A".into(),
+            request_id: "r1".into(),
+            from_key: "a/codex:1".into(),
+            to_key: "a/claude:2".into(),
+            kind: "assign".into(),
+            thread: None,
+            hops: 0,
+            origin: None,
+            body: "do it".into(),
+            sent_at: 1,
+            reply_to: Some("01Z".into()),
+            meta: meta.clone(),
+        };
+        s.put_message(&m).unwrap();
+        let back = s.message("01A").unwrap().unwrap();
+        assert_eq!(back.reply_to.as_deref(), Some("01Z"));
+        assert_eq!(back.meta, meta);
+        let plain = Message {
+            id: "01B".into(),
+            request_id: "r2".into(),
+            reply_to: None,
+            meta: Default::default(),
+            kind: "message".into(),
+            ..m
+        };
+        s.put_message(&plain).unwrap();
+        let raw: Option<String> = s
+            .conn()
+            .query_row("SELECT meta FROM messages WHERE id='01B'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(raw, None, "an empty meta is stored as NULL");
     }
 }
