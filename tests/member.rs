@@ -86,6 +86,7 @@ async fn send_acked(
         body: text.into(),
         files: vec![],
         sent_at: 0,
+        meta: Default::default(),
     })
     .await;
     match p

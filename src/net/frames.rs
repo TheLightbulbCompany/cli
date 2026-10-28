@@ -4,7 +4,7 @@
 use crate::daemon::{ipc, Daemon};
 use crate::doing::TEXT_MAX;
 use crate::frame::Sender;
-use crate::mail::{self, State};
+use crate::mail::{self, Meta, State};
 use crate::memory;
 use crate::roster::{Entry, Member};
 use crate::sessions::Tier;
@@ -16,7 +16,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub const MAX_FRAME: usize = 1 << 20;
 
 /// The reasons a peer may give for `refused`.
-pub const REASONS: [&str; 7] = [
+pub const REASONS: [&str; 8] = [
     "loop",
     "policy",
     "declined",
@@ -24,6 +24,7 @@ pub const REASONS: [&str; 7] = [
     "not_a_member",
     "request_id_reused",
     "unsupported",
+    "no_worker",
 ];
 
 /// A session as a peer publishes it (Task 7).
@@ -141,6 +142,8 @@ pub enum Frame {
         body: String,
         files: Vec<String>,
         sent_at: i64,
+        #[serde(default, skip_serializing_if = "Meta::is_empty")]
+        meta: Meta,
     },
     /// `limit` (`hops` or `rate`) names the limit a `loop` refusal hit; a peer may leave it out.
     Ack {
@@ -325,6 +328,63 @@ pub fn from_peer_ok(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_envelope_without_meta_reads_as_empty_and_one_with_it_round_trips() {
+        let old = r#"{"t":"envelope","id":"01A","request_id":"r","kind":"message","from":"a/codex:1","to":"b/claude:2","reply_to":null,"thread":null,"hops":0,"body":"hi","files":[],"sent_at":1}"#;
+        let f: Frame = serde_json::from_str(old).unwrap();
+        assert!(matches!(&f, Frame::Envelope { meta, .. } if meta.is_empty()));
+        assert!(!serde_json::to_string(&f).unwrap().contains("meta"));
+        let Frame::Envelope { mut meta, .. } = f.clone() else {
+            unreachable!()
+        };
+        meta.done_when = Some("green".into());
+        meta.deadline_at = Some(7);
+        let f = match f {
+            Frame::Envelope {
+                id,
+                request_id,
+                from,
+                to,
+                reply_to,
+                thread,
+                hops,
+                body,
+                files,
+                sent_at,
+                ..
+            } => Frame::Envelope {
+                id,
+                request_id,
+                kind: "assign".into(),
+                from,
+                to,
+                reply_to,
+                thread,
+                hops,
+                body,
+                files,
+                sent_at,
+                meta,
+            },
+            _ => unreachable!(),
+        };
+        let text = serde_json::to_string(&f).unwrap();
+        assert!(
+            text.contains(r#""meta":{"done_when":"green","deadline_at":7}"#),
+            "{text}"
+        );
+        assert_eq!(serde_json::from_str::<Frame>(&text).unwrap(), f);
+    }
+
+    #[test]
+    fn no_worker_is_a_reason_a_peer_may_give() {
+        assert!(REASONS.contains(&"no_worker"));
+        assert_eq!(
+            crate::mail::KINDS,
+            ["message", "assign", "result", "cancel"]
+        );
+    }
 
     #[test]
     fn an_ack_without_a_limit_reads_as_none_and_one_with_it_round_trips() {

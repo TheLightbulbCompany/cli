@@ -279,6 +279,7 @@ async fn a_computer_ignores_app_envelopes_and_decisions_from_the_member() {
         .to_string(),
         files: vec![],
         sent_at: now_s(),
+        meta: Default::default(),
     })
     .await;
     p.send(&Frame::Decision {
