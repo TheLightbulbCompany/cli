@@ -194,6 +194,7 @@ fn receipt_text(r: &Value, person: Option<&ForPerson>) -> Option<String> {
         let (computer, person) = (at("where"), at("person"));
         return Some(match at("state") {
             "refused" if at("reason") == "loop" => limit(),
+            "refused" if at("reason") == "no_worker" => "not sent: that computer does not take fresh workers yet (find_workers lists who takes assignments)".into(),
             "queued" if remote && r["waking"] == true => {
                 format!("queued: {computer} is waking up and gets it in a moment.")
             }
@@ -229,6 +230,7 @@ fn receipt_text(r: &Value, person: Option<&ForPerson>) -> Option<String> {
                 "not_a_member" => NOT_A_MEMBER.into(),
                 "request_id_reused" => "that request id was used for another message".into(),
                 "unsupported" => "their computer cannot take it".into(),
+                "no_worker" => "that computer does not take fresh workers yet".into(),
                 _ => shown("reason").replace('_', " "),
             }
         ),
@@ -1292,6 +1294,12 @@ pub fn expire(store: &Store, now: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_no_worker_refusal_has_a_note() {
+        let r = serde_json::json!({"state": "refused", "reason": "no_worker", "person": "aden", "where": "mac"});
+        assert_eq!(receipt_note(&r, None).as_deref(), Some("not sent: that computer does not take fresh workers yet (find_workers lists who takes assignments)"));
+    }
 
     #[test]
     fn notes_name_the_loop_limit_or_say_a_limit() {
