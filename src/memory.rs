@@ -399,6 +399,34 @@ pub fn entries(store: &Store) -> Result<Vec<Entry>> {
     Ok(out)
 }
 
+/// Up to `limit` rows after rowid `after`, in insertion order, as `(rowid, json)`: the entry with
+/// `seq` set to the rowid, or `{seq, id, author, tombstone: true}` for a row without a body.
+pub fn page_since(store: &Store, after: i64, limit: usize) -> Result<Vec<(i64, Value)>> {
+    let mut stmt = store.conn().prepare(
+        "SELECT rowid, id, author, entry FROM memory_entries WHERE rowid > ?1
+         ORDER BY rowid LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![after, limit], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, Option<String>>(2)?,
+            r.get::<_, Option<String>>(3)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (seq, id, author, body) = row?;
+        let mut v = match body {
+            Some(b) => serde_json::from_str(&b)?,
+            None => serde_json::json!({ "id": id, "author": author, "tombstone": true }),
+        };
+        v["seq"] = seq.into();
+        out.push((seq, v));
+    }
+    Ok(out)
+}
+
 /// The best `limit` matches for `query` (FTS5 `bm25`, subject and fact), as `facts` shows them;
 /// a match that has since been replaced says so. Every word must match.
 pub fn search(store: &Store, query: &str, limit: usize) -> Result<Vec<Fact>> {

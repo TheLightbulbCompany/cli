@@ -622,3 +622,177 @@ async fn a_logout_and_a_new_login_reach_a_connected_workspace_without_a_restart(
     until(10, "stored after login", || a.state(&sa, "r3") == "stored");
     i.shutdown().await;
 }
+
+fn imported(subject: &str, fact: &str) -> Value {
+    json!({"subject": subject, "fact": fact, "kind": "fact", "scope": "team", "when": 5,
+        "source": {"harness": "import", "repo": null, "session": null, "on_behalf_of": "Maya"},
+        "replaces": []})
+}
+
+async fn listed(i: &Instance, since: u64) -> Value {
+    ok(i, "memory.list", json!({ "since_seq": since })).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cloud_remember_signs_as_workspace_with_name_in_source() {
+    let home = tempfile::tempdir().unwrap();
+    let i = start(home.path(), &[], None).await;
+    let key = ok(&i, "identity.get", json!({})).await["member_key"].clone();
+    let r = ok(
+        &i,
+        "memory.remember",
+        json!({"subject": "db", "fact": "we use postgres", "kind": "decision",
+            "scope": "team", "on_behalf_of": "Maya"}),
+    )
+    .await;
+    assert_eq!(r["stored"], true, "{r}");
+    let l = listed(&i, 0).await;
+    let e = &l["entries"][0];
+    assert_eq!(e["id"], r["entry_id"], "{l}");
+    assert_eq!(e["author"], key);
+    assert_eq!(e["op"]["source"]["harness"], "workspace");
+    assert_eq!(e["op"]["source"]["on_behalf_of"], "Maya");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cloud_import_assigns_sequential_seq() {
+    let home = tempfile::tempdir().unwrap();
+    let i = start(home.path(), &[], None).await;
+    let r = ok(
+        &i,
+        "memory.import",
+        json!({"entries": [imported("a", "one"), imported("b", "two"), imported("c", "three")]}),
+    )
+    .await;
+    let ids = r["ids"].as_array().unwrap();
+    assert_eq!(ids.len(), 3, "{r}");
+    let l = listed(&i, 0).await;
+    let got: Vec<(&Value, &Value)> = l["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| (&e["seq"], &e["id"]))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (&json!(1), &ids[0]),
+            (&json!(2), &ids[1]),
+            (&json!(3), &ids[2])
+        ]
+    );
+    assert_eq!(l["entries"][0]["op"]["source"]["harness"], "import");
+    assert_eq!(l["next"], 3);
+    let bad = call(&i, "memory.import", json!({"entries": [{"subject": "x"}]})).await;
+    assert_eq!(bad["error"], "bad_request", "{bad}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cloud_list_since_returns_new_entries() {
+    let home = tempfile::tempdir().unwrap();
+    let i = start(home.path(), &[], None).await;
+    ok(
+        &i,
+        "memory.import",
+        json!({"entries": [imported("a", "one"), imported("b", "two")]}),
+    )
+    .await;
+    let first = listed(&i, 0).await;
+    let next = first["next"].as_u64().unwrap();
+    assert_eq!(listed(&i, next).await["entries"], json!([]));
+    assert_eq!(listed(&i, next).await["next"], next);
+    ok(
+        &i,
+        "memory.import",
+        json!({"entries": [imported("c", "three")]}),
+    )
+    .await;
+    let l = listed(&i, next).await;
+    assert_eq!(l["entries"].as_array().unwrap().len(), 1, "{l}");
+    assert_eq!(l["entries"][0]["op"]["fact"], "three");
+    assert_eq!(l["next"], next + 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cloud_forget_author_tombstones_all() {
+    let home = tempfile::tempdir().unwrap();
+    let i = start(home.path(), &[], None).await;
+    let key = ok(&i, "identity.get", json!({})).await["member_key"].clone();
+    ok(
+        &i,
+        "memory.import",
+        json!({"entries": [imported("a", "one"), imported("b", "two")]}),
+    )
+    .await;
+    let r = ok(&i, "memory.forget_author", json!({"author": key})).await;
+    assert_eq!(r["forgotten"], 2, "{r}");
+    let facts = ok(&i, "memory.recall", json!({"question": ""})).await;
+    assert_eq!(facts["facts"], json!([]), "{facts}");
+    let again = ok(&i, "memory.forget_author", json!({"author": key})).await;
+    assert_eq!(again["forgotten"], 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cloud_list_includes_tombstones_bodyless() {
+    let home = tempfile::tempdir().unwrap();
+    let i = start(home.path(), &[], None).await;
+    let key = ok(&i, "identity.get", json!({})).await["member_key"].clone();
+    let r = ok(
+        &i,
+        "memory.import",
+        json!({"entries": [imported("a", "one")]}),
+    )
+    .await;
+    ok(&i, "memory.forget_author", json!({"author": key})).await;
+    let l = listed(&i, 0).await;
+    assert_eq!(
+        l["entries"][0],
+        json!({"seq": 1, "id": r["ids"][0], "author": key, "tombstone": true}),
+        "{l}"
+    );
+    // The forget itself is returned as stored, naming its target.
+    assert_eq!(l["entries"][1]["op"]["target"], r["ids"][0], "{l}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cloud_ops_are_refused_on_a_socket_daemon() {
+    let a = computer_a();
+    for (op, body) in [
+        ("memory.import", json!({"entries": []})),
+        ("memory.forget_author", json!({"author": "x"})),
+        ("memory.list", json!({"since_seq": 0})),
+    ] {
+        let mut req = body;
+        req["id"] = 1.into();
+        req["op"] = op.into();
+        let r = a.ask(req);
+        assert_eq!(
+            (r["ok"].clone(), r["error"].clone()),
+            (json!(false), json!("unsupported")),
+            "{op}: {r}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cloud_import_is_idempotent_on_key() {
+    let home = tempfile::tempdir().unwrap();
+    let i = start(home.path(), &[], None).await;
+    let mut a = imported("a", "one");
+    a["key"] = "rec1:h1".into();
+    let mut b = imported("b", "two");
+    b["key"] = "rec2:h2".into();
+    let batch = json!({"entries": [a, b, imported("c", "three")]});
+    let first = ok(&i, "memory.import", batch.clone()).await;
+    let again = ok(&i, "memory.import", batch).await;
+    assert_eq!(
+        first["ids"].as_array().unwrap()[..2],
+        again["ids"].as_array().unwrap()[..2],
+        "{first} {again}"
+    );
+    // No key: a second entry, as before.
+    assert_ne!(first["ids"][2], again["ids"][2]);
+    let l = listed(&i, 0).await;
+    assert_eq!(l["entries"].as_array().unwrap().len(), 4, "{l}");
+    assert_eq!(l["entries"][0]["op"]["source"]["session"], "rec1:h1");
+}
