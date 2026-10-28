@@ -453,8 +453,10 @@ fn memory_remember(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
     }
 }
 
-/// `memory.recall {question, budget_chars?}` -> `{page, facts}`: what the team holds that matches
-/// `question` (all of it when empty), as the page an agent reads and as facts.
+/// `memory.recall {question, budget_chars?, repo?, session?}` -> `{page, facts}`: what the team holds
+/// that matches `question` (all of it when empty, or only `repo`'s, team facts first), as the page
+/// an agent reads and as facts. With `repo` and `session` (a session-start hook) the page is kept
+/// for `memory last`.
 fn memory_recall(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
     use crate::memory::{self, Status};
     let Some(q) = body["question"].as_str() else {
@@ -472,7 +474,13 @@ fn memory_recall(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
         .collect();
     let store = daemon.store.lock().unwrap();
     let found = if q.trim().is_empty() {
-        memory::facts(&store, None, None)
+        let repo = body["repo"].as_str();
+        memory::facts(&store, None, repo).map(|mut f| {
+            if repo.is_some() {
+                f.sort_by_key(|f| f.scope != memory::Scope::Team);
+            }
+            f
+        })
     } else {
         memory::search(&store, q, 50)
     };
@@ -481,6 +489,9 @@ fn memory_recall(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
     };
     facts.retain(|f| f.status != Status::Replaced);
     let page = memory::page(&store, &facts, &names, budget);
+    if let (Some(_), Some(session)) = (body["repo"].as_str(), body["session"].as_str()) {
+        let _ = store.set_memory_last(session, &page, now() as i64);
+    }
     Response::ok(
         id,
         json!({ "page": page, "facts": facts.iter().map(fact_json).collect::<Vec<_>>() }),

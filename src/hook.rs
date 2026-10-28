@@ -126,6 +126,9 @@ pub fn output(h: &Hook, text: &str) -> Value {
     }
 }
 
+/// The one line under the memory block.
+const MEMORY_INSTRUCTION: &str = "Call `recall` when a task needs something a teammate may know; call `remember` when you finish a task or are told to remember. Personal unless the person says to share.";
+
 /// Runs one hook; `Ok(Some(stdout))` when there is something for the agent.
 pub fn run(agent: &str, event: &str, stdin: &str) -> Result<Option<String>> {
     crate::telemetry::sync_env_optout(&crate::paths::state_path());
@@ -206,10 +209,25 @@ pub fn run(agent: &str, event: &str, stdin: &str) -> Result<Option<String>> {
     let messages = r["messages"]
         .as_array()
         .ok_or_else(|| format!("{op}: {r}"))?;
-    let framed: Vec<&str> = messages
+    let mut framed: Vec<&str> = messages
         .iter()
         .filter_map(|m| m["framed"].as_str())
         .collect();
+    // At a session's start, after the mail: what the team and the person know of this repo.
+    let block = match (h.event, session["repo"].as_str()) {
+        (Event::SessionStart, Some(repo)) => {
+            let r = conn.call(
+                "memory.recall",
+                json!({ "question": "", "repo": repo, "budget_chars": 1600, "session": key }),
+            )?;
+            r["page"]
+                .as_str()
+                .filter(|p| !p.is_empty())
+                .map(|p| format!("Memory (team and yours):\n{p}\n{MEMORY_INSTRUCTION}"))
+        }
+        _ => None,
+    };
+    framed.extend(block.as_deref());
     if framed.is_empty() {
         return Ok(None);
     }

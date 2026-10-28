@@ -635,3 +635,145 @@ fn a_claude_hook_fired_by_cursor_registers_nothing() {
     assert_eq!(claude_start_as(&net, &other.1), "");
     assert!(net.session(&key).is_some());
 }
+
+/// A folder whose origin is `<name>.git`, so a session started in it has that repo.
+fn repo_dir(name: &str) -> tempfile::TempDir {
+    let d = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(d.path().join(".git")).unwrap();
+    std::fs::write(d.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    std::fs::write(
+        d.path().join(".git/config"),
+        format!("[remote \"origin\"]\n\turl = git@github.com:Org/{name}.git\n"),
+    )
+    .unwrap();
+    d
+}
+
+/// Runs the Claude hook for `conversation` in `cwd`; returns stdout.
+fn claude_hook(
+    net: &Net,
+    event: &str,
+    name: &str,
+    conversation: &str,
+    cwd: &std::path::Path,
+) -> String {
+    let me = os::process(std::process::id()).unwrap();
+    let payload = json!({"session_id": conversation, "cwd": cwd, "hook_event_name": name});
+    let out = net.hook_raw("claude", event, payload.to_string().as_bytes(), Some(&me));
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap()
+}
+
+fn context(out: &str) -> String {
+    let v: Value = serde_json::from_str(out).unwrap();
+    v["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+fn remember_in(net: &Net, session: &str, subject: &str, fact: &str, scope: &str) {
+    let r = net.call(
+        json!({"id": 1, "op": "memory.remember", "subject": subject, "fact": fact,
+        "kind": "decision", "scope": scope, "session": session}),
+    );
+    assert_eq!(r["stored"], true, "{r}");
+}
+
+const A: &str = "00000000-0000-4000-8000-0000000000a1";
+const B: &str = "00000000-0000-4000-8000-0000000000b2";
+const INSTRUCTION: &str = "Call `recall` when a task needs something a teammate may know; call `remember` when you finish a task or are told to remember. Personal unless the person says to share.";
+
+#[test]
+fn session_start_includes_memory_block_for_repo() {
+    let net = Net::new();
+    let (cli, other) = (repo_dir("cli"), repo_dir("other"));
+    assert_eq!(
+        claude_hook(&net, "session-start", "SessionStart", A, cli.path()),
+        ""
+    );
+    let a = net.key("claude", A);
+    remember_in(&net, &a, "db", "postgres 16", "me");
+    remember_in(&net, &a, "ci", "github actions", "team");
+    let text = context(&claude_hook(
+        &net,
+        "session-start",
+        "SessionStart",
+        B,
+        cli.path(),
+    ));
+    let (page, tail) = text.split_once("Memory (team and yours):\n").unwrap();
+    assert_eq!(page, "");
+    assert!(tail.ends_with(&format!("\n{INSTRUCTION}")), "{tail}");
+    assert!(tail.find("ci: github actions").unwrap() < tail.find("db: postgres 16").unwrap());
+    // The block is kept for `memory last`, and another repo gets none.
+    let last = net.dir.path().join("state.db");
+    let conn = rusqlite::Connection::open(last).unwrap();
+    let block: String = conn
+        .query_row(
+            "SELECT block FROM memory_last WHERE session = ?1",
+            [net.key("claude", B)],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(block.contains("ci: github actions"));
+    assert_eq!(
+        claude_hook(
+            &net,
+            "session-start",
+            "SessionStart",
+            "other-1",
+            other.path()
+        ),
+        ""
+    );
+}
+
+#[test]
+fn test_session_block_caps_at_1600_chars() {
+    let net = Net::new();
+    let cli = repo_dir("cli");
+    claude_hook(&net, "session-start", "SessionStart", A, cli.path());
+    let a = net.key("claude", A);
+    for i in 0..60 {
+        remember_in(&net, &a, &format!("topic {i:02}"), &"x".repeat(100), "team");
+    }
+    let text = context(&claude_hook(
+        &net,
+        "session-start",
+        "SessionStart",
+        B,
+        cli.path(),
+    ));
+    let tail = text.split_once("Memory (team and yours):\n").unwrap().1;
+    let page = tail.strip_suffix(&format!("\n{INSTRUCTION}")).unwrap();
+    assert!(page.chars().count() <= 1600, "{}", page.chars().count());
+    assert!(page.chars().count() > 1400);
+    assert!(
+        page.lines()
+            .all(|l| l.starts_with("Current:") || l.starts_with("topic ")),
+        "{page}"
+    );
+    assert!(
+        page.lines().last().unwrap().ends_with(')'),
+        "cut on a line boundary"
+    );
+}
+
+#[test]
+fn user_prompt_submit_never_includes_memory() {
+    let net = Net::new();
+    let cli = repo_dir("cli");
+    claude_hook(&net, "session-start", "SessionStart", A, cli.path());
+    remember_in(&net, &net.key("claude", A), "db", "postgres 16", "team");
+    for (event, name) in [
+        ("user-prompt-submit", "UserPromptSubmit"),
+        ("post-tool-use", "PostToolUse"),
+    ] {
+        assert_eq!(claude_hook(&net, event, name, A, cli.path()), "");
+    }
+}

@@ -3,7 +3,7 @@ use std::path::Path;
 
 /// Migration `i` takes the db to `user_version` `i + 1`. Forward only; each one only adds
 /// tables or columns, and runs once (in the transaction that moves `user_version`).
-const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9];
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10];
 
 const V1: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
@@ -87,6 +87,9 @@ const V7: &str = "ALTER TABLE messages ADD COLUMN body_sha TEXT;";
 /// Retired (the person links' key -> person map): kept so the schema version still counts.
 const V8: &str =
     "CREATE TABLE IF NOT EXISTS persons (key TEXT PRIMARY KEY, person TEXT, at INTEGER);";
+/// The memory block last handed to each session at its start (`lightbulb memory last`).
+const V10: &str =
+    "CREATE TABLE IF NOT EXISTS memory_last (session TEXT PRIMARY KEY, block TEXT, at INTEGER);";
 /// Memory: signed entries numbered per author, with a full-text index over `subject` and `fact`
 /// (`memory`). `rowid` is explicit so it survives `VACUUM` (the FTS index points at it). A
 /// tombstoned row keeps its id and seq and drops its body (`entry` NULL); `memory_tombstones`
@@ -314,6 +317,15 @@ impl Store {
             self.conn
                 .execute("DELETE FROM hidden_sessions WHERE key = ?1", [k])?;
         }
+        Ok(())
+    }
+
+    /// Keeps `block` as the last memory block `session` was handed.
+    pub fn set_memory_last(&self, session: &str, block: &str, at: i64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO memory_last VALUES (?1, ?2, ?3)",
+            params![session, block, at],
+        )?;
         Ok(())
     }
 
@@ -1018,10 +1030,10 @@ mod tests {
         let path = dir.path().join("state.db");
         Connection::open(&path)
             .unwrap()
-            .execute_batch("PRAGMA user_version = 10;")
+            .execute_batch("PRAGMA user_version = 11;")
             .unwrap();
         let err = Store::open(&path).err().unwrap().to_string();
-        assert!(err.contains("State is from a newer version (v10)"), "{err}");
-        assert_eq!(user_version(&path), 10);
+        assert!(err.contains("State is from a newer version (v11)"), "{err}");
+        assert_eq!(user_version(&path), 11);
     }
 }
