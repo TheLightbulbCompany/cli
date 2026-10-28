@@ -117,8 +117,8 @@ pub fn record_tool_call(
     Ok(n == 1)
 }
 
-/// A turn's tokens, added to the session's, when the harness reported them.
-pub fn add_tokens(
+/// The session's token totals, when the harness's transcript gave them (each Stop restates them).
+pub fn set_tokens(
     store: &Store,
     id: &str,
     prompt: Option<i64>,
@@ -128,8 +128,8 @@ pub fn add_tokens(
         return Ok(());
     }
     store.conn().execute(
-        "UPDATE capture_sessions SET prompt_tokens = COALESCE(prompt_tokens, 0) + COALESCE(?2, 0), \
-         completion_tokens = COALESCE(completion_tokens, 0) + COALESCE(?3, 0) WHERE id = ?1",
+        "UPDATE capture_sessions SET prompt_tokens = COALESCE(?2, prompt_tokens), \
+         completion_tokens = COALESCE(?3, completion_tokens) WHERE id = ?1",
         rusqlite::params![id, prompt, completion],
     )?;
     Ok(())
@@ -171,10 +171,11 @@ pub fn sessions_since(store: &Store, after: i64) -> Result<Vec<SessionRow>> {
     Ok(rows)
 }
 
-/// The one session whose id is `id` or starts with it; `None` when none or several do.
+/// The session whose id is `id` or the one that starts with it; `None` when none does, an
+/// `ambiguous` error when several do.
 pub fn find(store: &Store, id: &str) -> Result<Option<SessionRow>> {
     let mut stmt = store.conn().prepare(&format!(
-        "SELECT {COLS} FROM capture_sessions WHERE id = ?1 OR id LIKE ?2 ESCAPE '\\' LIMIT 2"
+        "SELECT {COLS} FROM capture_sessions WHERE id = ?1 OR id LIKE ?2 ESCAPE '\\' ORDER BY id = ?1 DESC LIMIT 2"
     ))?;
     let like = format!(
         "{}%",
@@ -188,7 +189,11 @@ pub fn find(store: &Store, id: &str) -> Result<Option<SessionRow>> {
     if let Some(i) = rows.iter().position(|r| r.id == id) {
         return Ok(Some(rows.swap_remove(i)));
     }
-    Ok((rows.len() == 1).then(|| rows.remove(0)))
+    match rows.len() {
+        0 => Ok(None),
+        1 => Ok(Some(rows.remove(0))),
+        _ => Err("ambiguous".into()),
+    }
 }
 
 /// A session's tool calls in order; summaries only with `with_summaries`.
@@ -226,4 +231,43 @@ pub fn forget(store: &Store, id: &str) -> Result<bool> {
         .conn()
         .execute("DELETE FROM capture_sessions WHERE id = ?1", [id])?
         == 1)
+}
+
+/// Largest transcript read for token totals.
+pub const TRANSCRIPT_MAX: u64 = 50 * 1024 * 1024;
+
+/// `(input, output)` token totals of a Claude Code transcript (JSONL): the `message.usage` of its
+/// assistant entries. Claude writes one entry per content block of a reply, each restating that
+/// reply's usage, so a reply (`message.id`) counts once. `None` when there is no usage in it.
+pub fn transcript_tokens(path: &str) -> Option<(i64, i64)> {
+    use std::io::{BufRead, Read};
+    let file = std::fs::File::open(path).ok()?;
+    let mut by_reply = std::collections::HashMap::new();
+    for (n, line) in std::io::BufReader::new(file.take(TRANSCRIPT_MAX))
+        .lines()
+        .map_while(|l| l.ok())
+        .enumerate()
+    {
+        let Ok(v) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let m = &v["message"];
+        if v["type"] != "assistant" || !m["usage"].is_object() {
+            continue;
+        }
+        let key = m["id"].as_str().map_or(format!("#{n}"), String::from);
+        let u = &m["usage"];
+        by_reply.insert(
+            key,
+            (
+                u["input_tokens"].as_i64().unwrap_or(0),
+                u["output_tokens"].as_i64().unwrap_or(0),
+            ),
+        );
+    }
+    (!by_reply.is_empty()).then(|| {
+        by_reply
+            .values()
+            .fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1))
+    })
 }

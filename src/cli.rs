@@ -678,14 +678,21 @@ pub enum Sessions {
 pub fn sessions(cmd: Sessions) -> Result<i32> {
     let (op, body) = match &cmd {
         Sessions::List => ("sessions.list", json!({})),
-        Sessions::Show(id) => ("sessions.show", json!({ "id": id })),
-        Sessions::Forget(id) => ("sessions.forget", json!({ "id": id })),
+        Sessions::Show(id) => ("sessions.show", json!({ "session": id })),
+        Sessions::Forget(id) => ("sessions.forget", json!({ "session": id })),
         Sessions::Export => ("sessions.export", json!({})),
     };
     let r = connect()?.call(op, body)?;
     if r["ok"] != true {
         let none = "No session starts with that id. `lightbulb sessions list` shows them.";
-        return refuse(&r, &[("not_found", none.to_string())]);
+        let many = "More than one session starts with that id. Give more of it.";
+        return refuse(
+            &r,
+            &[
+                ("not_found", none.to_string()),
+                ("ambiguous", many.to_string()),
+            ],
+        );
     }
     let day = |v: &Value| crate::date::day(v.as_i64().unwrap_or_default());
     let s = |v: &Value| cell(v.as_str().unwrap_or_default());

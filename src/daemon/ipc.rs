@@ -492,8 +492,8 @@ fn memory_remember(id: u64, body: &Value, daemon: &Arc<Daemon>, instance: bool) 
 /// branch?}`, `capture.tool_call {harness, conversation, tool, args, duration_ms?, ok?}`,
 /// `capture.stop {harness, conversation, prompt_tokens?, completion_tokens?}` and
 /// `capture.session_end {harness, conversation}` -> `{stored}`. A person reads and deletes:
-/// `sessions.list` -> `{sessions}`, `sessions.show {id}` -> `{session, tool_calls}`,
-/// `sessions.forget {id}` -> `{}`, `sessions.export` -> `{sessions: [{..., tool_calls}]}`.
+/// `sessions.list` -> `{sessions}`, `sessions.show {session}` -> `{session, tool_calls}`,
+/// `sessions.forget {session}` -> `{}`, `sessions.export` -> `{sessions: [{..., tool_calls}]}`.
 fn capture_op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, person: bool) -> Response {
     use crate::capture;
     let bad = Response::err(id, BAD_REQUEST);
@@ -548,7 +548,7 @@ fn capture_op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, person: boo
             let Some(sid) = who(body) else {
                 return Err("bad".into());
             };
-            capture::add_tokens(
+            capture::set_tokens(
                 &store,
                 &sid,
                 body["prompt_tokens"].as_i64(),
@@ -566,7 +566,8 @@ fn capture_op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, person: boo
         _ if !person => Err("not_a_person".into()),
         "sessions.list" => Ok(json!({ "sessions": capture::sessions_since(&store, -1)? })),
         "sessions.show" | "sessions.forget" => {
-            let Some(s) = capture::find(&store, body["id"].as_str().unwrap_or_default())? else {
+            let Some(s) = capture::find(&store, body["session"].as_str().unwrap_or_default())?
+            else {
                 return Err("not_found".into());
             };
             if op == "sessions.forget" {
@@ -590,6 +591,7 @@ fn capture_op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, person: boo
         Err(e) if e.to_string() == "bad" => bad,
         Err(e) if e.to_string() == "not_a_person" => refused(id, "not_a_person"),
         Err(e) if e.to_string() == "not_found" => Response::err(id, NOT_FOUND),
+        Err(e) if e.to_string() == "ambiguous" => Response::err(id, "ambiguous"),
         Err(_) => Response::err(id, INTERNAL),
     }
 }

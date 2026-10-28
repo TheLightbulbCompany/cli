@@ -58,7 +58,7 @@ Run `lightbulb <command> --help` for the options of each one.
 | `login` | Sign this computer in to Lightbulb (confirm in the browser), so your workspace's agents answer it. |
 | `logout` | Sign this computer out. |
 | `memory list\|show\|forget\|share\|export\|last\|team` | See and control what your agents remember (see "Memory" below). |
-| `sessions list\|show\|forget\|export` | See and delete what was captured of your coding sessions here: the agent, the repository, each tool call and a short summary of it, never file contents or output. |
+| `sessions list\|show\|forget\|export` | See and delete what was captured of your coding sessions here: the agent, the repository, each tool call and a short summary of it, never file contents or output. Tokens are filled for Claude Code only (from its transcript); the other agents leave them blank until their payloads are verified, and OpenCode's tool calls are captured on 1.x only. |
 | `telemetry [on\|off\|status]` | Show or set anonymous usage counts (see the [README](../README.md#usage-counts)). |
 | `version` | Print the version. |
 

@@ -152,6 +152,11 @@ const server = async ({ client, directory }) => {
         }
       } catch {}
     },
+    // Capture reads the tool and its args from the v1.18.32 plugin type
+    // (packages/plugin/src/index.ts): "tool.execute.after"?: (input: { tool: string;
+    // sessionID: string; callID: string; args: any }, output: {...}). OpenCode 2.x's
+    // session.tool.success/failed events (v2.1.4 types.ts) carry no tool name or input, so
+    // 2.x tool calls are not captured until a verified shape exists.
     "tool.execute.after": async (input) => {
       try {
         const id = input?.sessionID
@@ -209,7 +214,7 @@ const setup = async (ctx) => {
         return void (await hook("session-start", id, s.cwd, false))
       case "session.tool.success":
       case "session.tool.failed":
-        return step("post-tool-use", id, s.cwd, say(id), { tool: d.tool ?? d.name, args: d.args ?? d.input })
+        return step("post-tool-use", id, s.cwd, say(id))
       case "session.idle":
         return step("stop", id, s.cwd, say(id))
       case "session.deleted":

@@ -382,7 +382,7 @@ lightbulb sessions export
 Each agent's hooks tell the background service when a session starts, after each tool call, at
 the end of each turn and when the session ends. It keeps, on this computer only: the session (its
 id, the agent, the computer, the repository and branch, when it started and ended, and the
-tokens when the agent reports them), and for each tool call its number, time, tool, duration,
+tokens, for Claude Code only, summed from its transcript at the end of each turn; the other agents leave them blank), and for each tool call its number, time, tool, duration,
 whether it worked, and a summary of at most 200 characters (a command, a path, a pattern). It
 never keeps file contents, diffs, command output or your prompts. A summary that looks like a
 password or key is replaced by `[refused: <what it matched>]`. Sessions under a hidden folder

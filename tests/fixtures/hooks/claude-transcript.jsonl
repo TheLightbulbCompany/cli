@@ -1,0 +1,7 @@
+{"type":"summary","summary":"Listing files","leafUuid":"u0"}
+{"type":"user","uuid":"u1","message":{"role":"user","content":"list the files"}}
+{"type":"assistant","uuid":"a1","message":{"id":"msg_01A","role":"assistant","model":"claude-sonnet-4","content":[{"type":"text","text":"Sure."}],"usage":{"input_tokens":100,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":5}}}
+{"type":"assistant","uuid":"a2","message":{"id":"msg_01A","role":"assistant","model":"claude-sonnet-4","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls"}}],"usage":{"input_tokens":100,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":20}}}
+{"type":"user","uuid":"u2","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"redacted"}]}}
+{"type":"assistant","uuid":"a3","message":{"id":"msg_01B","role":"assistant","model":"claude-sonnet-4","content":[{"type":"text","text":"Done."}],"usage":{"input_tokens":20,"output_tokens":25}}}
+not json, a line cut off by the size cap {"type":"assistant"

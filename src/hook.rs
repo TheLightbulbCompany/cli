@@ -20,6 +20,10 @@ use std::time::Duration;
 #[cfg(debug_assertions)]
 pub const CALLER_ENV: &str = "LIGHTBULB_CONNECT_HOOK_CALLER";
 
+/// Debug builds only: any value makes capture's daemon connection a dead one (tests).
+#[cfg(debug_assertions)]
+pub const CAPTURE_DOWN_ENV: &str = "LIGHTBULB_CONNECT_DEBUG_CAPTURE_DOWN";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
     SessionStart,
@@ -244,42 +248,81 @@ pub fn run(agent: &str, event: &str, stdin: &str) -> Result<Option<String>> {
 /// Tells the daemon what this event adds to the local capture (`capture::*`, written by the
 /// daemon). Any failure is silent: capture never breaks the agent or the mail.
 fn capture(conn: &mut Conn, h: &Hook, payload: &Value, session: &Value) {
+    // Debug builds only: capture's connection is a dead one, for tests of the failure path.
+    #[cfg(debug_assertions)]
+    let mut dead = std::env::var_os(CAPTURE_DOWN_ENV).and_then(|_| {
+        let (a, _b) = UnixStream::pair().ok()?;
+        Some(Conn {
+            stream: BufReader::new(a),
+            next: 1,
+        })
+    });
+    #[cfg(debug_assertions)]
+    let conn = dead.as_mut().unwrap_or(conn);
+    let _ = try_capture(conn, h, payload, session);
+}
+
+/// `body` with the fields of `extra` added; never panics.
+fn with(body: &Value, extra: Value) -> Value {
+    let mut b = body.clone();
+    if let (Some(m), Some(e)) = (b.as_object_mut(), extra.as_object()) {
+        m.extend(e.iter().map(|(k, v)| (k.clone(), v.clone())));
+    }
+    b
+}
+
+fn try_capture(conn: &mut Conn, h: &Hook, payload: &Value, session: &Value) -> Result<()> {
     let who = json!({ "harness": h.provider, "conversation": h.conversation });
-    let with = |extra: Value| {
-        let mut b = who.clone();
-        b.as_object_mut()
-            .unwrap()
-            .extend(extra.as_object().cloned().unwrap_or_default());
-        b
+    let start = |conn: &mut Conn, repo: &Value, branch: &Value| {
+        let body = json!({ "cwd": session["cwd"], "repo": repo, "branch": branch });
+        conn.call("capture.session_start", with(&who, body))
     };
-    let tokens = |keys: [&str; 2]| {
-        let u = &payload["usage"];
-        keys.iter().find_map(|k| u[k].as_i64())
-    };
-    let _ = match h.event {
-        Event::SessionStart => conn.call(
-            "capture.session_start",
-            with(json!({ "cwd": session["cwd"], "repo": session["repo"], "branch": session["branch"] })),
-        ),
-        Event::PostToolUse => {
-            let tool = ["tool_name", "toolName", "tool"].iter().find_map(|k| payload[k].as_str());
-            let Some(tool) = tool else { return };
-            let args = ["tool_input", "args"].iter().map(|k| &payload[k]).find(|a| !a.is_null());
-            conn.call(
-                "capture.tool_call",
-                with(json!({ "tool": tool, "args": args.map(Value::to_string),
-                    "duration_ms": payload["duration"].as_i64(),
-                    "ok": payload["tool_response"]["is_error"] != true })),
-            )
+    match h.event {
+        Event::SessionStart => {
+            start(conn, &session["repo"], &session["branch"])?;
         }
-        Event::Stop => conn.call(
-            "capture.stop",
-            with(json!({ "prompt_tokens": tokens(["input_tokens", "prompt_tokens"]),
-                "completion_tokens": tokens(["output_tokens", "completion_tokens"]) })),
-        ),
-        Event::SessionEnd => conn.call("capture.session_end", who),
-        Event::UserPromptSubmit => return,
-    };
+        Event::PostToolUse => {
+            let tool = ["tool_name", "toolName", "tool"]
+                .iter()
+                .find_map(|k| payload[k].as_str());
+            let Some(tool) = tool else { return Ok(()) };
+            let args = ["tool_input", "args"]
+                .iter()
+                .map(|k| &payload[k])
+                .find(|a| !a.is_null());
+            let call = json!({ "tool": tool, "args": args.map(Value::to_string),
+                "duration_ms": payload["duration"].as_i64(),
+                "ok": payload["tool_response"]["is_error"] != true });
+            let r = conn.call("capture.tool_call", with(&who, call.clone()))?;
+            // A session already running before capture existed has no row: open one now (the
+            // daemon applies the hidden-folder rules), then record the call.
+            if r["stored"] == false {
+                let cwd = session["cwd"].as_str().unwrap_or_default();
+                let (repo, branch) = crate::mcp::git(cwd);
+                let r = start(conn, &repo.into(), &branch.into())?;
+                if r["stored"] == true {
+                    conn.call("capture.tool_call", with(&who, call))?;
+                }
+            }
+        }
+        Event::Stop => {
+            // Claude Code's transcript is the one verified source of tokens; other agents'
+            // payloads have none we have confirmed, so theirs stay null.
+            let tokens = (h.provider == "claude")
+                .then_some(h.transcript_path.as_deref())
+                .flatten()
+                .and_then(crate::capture::transcript_tokens);
+            if let Some((i, o)) = tokens {
+                let body = json!({ "prompt_tokens": i, "completion_tokens": o });
+                conn.call("capture.stop", with(&who, body))?;
+            }
+        }
+        Event::SessionEnd => {
+            conn.call("capture.session_end", who)?;
+        }
+        Event::UserPromptSubmit => {}
+    }
+    Ok(())
 }
 
 /// `hook opencode ack`, payload `{session_id, ids}`: the plugin put those messages into the
@@ -427,16 +470,24 @@ mod tests {
     }
 
     #[test]
-    fn capture_to_a_dead_daemon_is_silent() {
-        let (a, b) = UnixStream::pair().unwrap();
-        drop(b);
-        let mut conn = Conn {
-            stream: BufReader::new(a),
-            next: 1,
-        };
-        for e in EVENTS {
+    fn capture_on_a_dead_connection_errs_and_the_wrapper_swallows_it() {
+        for e in EVENTS.into_iter().filter(|e| *e != Event::UserPromptSubmit) {
+            let (a, b) = UnixStream::pair().unwrap();
+            drop(b);
+            let mut conn = Conn {
+                stream: BufReader::new(a),
+                next: 1,
+            };
             let p = json!({"tool_name": "Bash", "tool_input": {}});
-            capture(&mut conn, &hook("claude", e), &p, &json!({}));
+            let h = Hook {
+                transcript_path: Some(format!(
+                    "{}/tests/fixtures/hooks/claude-transcript.jsonl",
+                    env!("CARGO_MANIFEST_DIR")
+                )),
+                ..hook("claude", e)
+            };
+            assert!(try_capture(&mut conn, &h, &p, &json!({})).is_err(), "{e:?}");
+            capture(&mut conn, &h, &p, &json!({}));
         }
     }
 

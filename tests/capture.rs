@@ -16,6 +16,15 @@ fn store() -> (tempfile::TempDir, lightbulb::store::Store) {
     (d, s)
 }
 
+/// A real-shaped Claude Code transcript: two replies (one written as two entries), 120 tokens in
+/// and 45 out.
+fn transcript() -> String {
+    format!(
+        "{}/tests/fixtures/hooks/claude-transcript.jsonl",
+        env!("CARGO_MANIFEST_DIR")
+    )
+}
+
 fn row() -> capture::SessionRow {
     capture::SessionRow {
         id: "a:1".into(),
@@ -40,10 +49,15 @@ impl Env {
 
     /// `hook claude <arg>` as Claude Code runs it, called as this test process.
     fn claude_hook(&self, arg: &str, payload: Value) -> Output {
+        self.claude_hook_env(arg, payload, &[])
+    }
+
+    fn claude_hook_env(&self, arg: &str, payload: Value, env: &[(&str, &str)]) -> Output {
         let me = os::process(std::process::id()).unwrap();
         let mut child = self
             .base_cmd(Command::new(EXE))
             .args(["hook", "claude", arg])
+            .envs(env.iter().copied())
             .env(
                 "LIGHTBULB_CONNECT_HOOK_CALLER",
                 format!("{}:{}", me.pid, me.birth_micros),
@@ -80,11 +94,7 @@ impl Env {
                 json!({"tool_name": "Bash", "tool_input": {"command": "ls"},
                     "tool_response": {"stdout": "secret output"}}),
             ),
-            (
-                "stop",
-                "Stop",
-                json!({"usage": {"input_tokens": 120, "output_tokens": 45}}),
-            ),
+            ("stop", "Stop", json!({"transcript_path": transcript()})),
             ("session-end", "SessionEnd", json!({})),
         ];
         for (arg, event, extra) in steps {
@@ -192,20 +202,79 @@ fn hidden_folder_is_not_captured() {
     assert!(capture::sessions_since(&e.store(), -1).unwrap().is_empty());
 }
 
+/// A claude session in `rel` with a message waiting for it, then its PostToolUse hook (the
+/// one that hands mail over, and records the tool call), with capture's connection dead when
+/// `down`.
+fn mail_run(rel: &str, down: bool) -> (Env, Output) {
+    let e = Env::new();
+    e.daemon(false, "", &[]);
+    let cwd = e.folder(rel);
+    let o = e.claude_hook("session-start", e.payload("SessionStart", &cwd, json!({})));
+    assert!(o.status.success(), "{}", err(&o));
+    let to = format!("{}/claude:c1", e.short());
+    let r = e.ask(json!({"id": 1, "op": "send", "from": "x/codex:a", "to": to,
+        "text": "hello from a teammate", "request_id": "r1"}));
+    assert_eq!(r["receipt"]["state"], "stored", "{r}");
+    let env: &[(&str, &str)] = if down {
+        &[("LIGHTBULB_CONNECT_DEBUG_CAPTURE_DOWN", "1")]
+    } else {
+        &[]
+    };
+    let post = json!({"tool_name": "Bash", "tool_input": {"command": "ls"}});
+    let o = e.claude_hook_env("post-tool-use", e.payload("PostToolUse", &cwd, post), env);
+    (e, o)
+}
+
+/// What a hook prints must not depend on capture: with its daemon connection dead, or with
+/// the daemon refusing the session, the mail the hook hands over is byte-identical to a run
+/// where capture worked, and nothing but the hook's own error line reaches stderr.
+/// Removing `capture()` from the hook fails the "capture worked" assertions on the baseline
+/// (no tool-call row); the silence assertions below are about what capture must not change.
 #[test]
 fn test_capture_write_failure_is_silent() {
-    // The daemon cannot be reached (its socket path is too long to bind): exit 0, nothing on
-    // stdout.
+    let (up_env, up) = mail_run("proj", false);
+    assert!(up.status.success() && up.stderr.is_empty(), "{}", err(&up));
+    assert!(out(&up).contains("hello from a teammate"), "{}", out(&up));
+    let calls = capture::tool_calls(&up_env.store(), "claude:c1", true).unwrap();
+    assert_eq!(calls.len(), 1, "capture worked on the baseline");
+
+    let silent = |o: &Output, what: &str| {
+        assert!(o.status.success(), "{what}");
+        assert_eq!(o.stdout, up.stdout, "{what}: the hook's output changed");
+        let e = String::from_utf8_lossy(&o.stderr).to_string();
+        assert!(
+            e.lines()
+                .all(|l| l.starts_with("lightbulb hook claude post-tool-use: ")),
+            "{what}: {e}"
+        );
+    };
+
+    // The daemon connection capture uses is dead.
+    let (e, down) = mail_run("proj", true);
+    silent(&down, "daemon down");
+    assert!(capture::tool_calls(&e.store(), "claude:c1", true)
+        .unwrap()
+        .is_empty());
+
+    // The daemon is up and its store refuses the session (a hidden folder): no row.
+    let (e, refused) = mail_run(".hidden/proj", false);
+    silent(&refused, "store refuses");
+    assert!(capture::sessions_since(&e.store(), -1).unwrap().is_empty());
+    assert!(capture::tool_calls(&e.store(), "claude:c1", true)
+        .unwrap()
+        .is_empty());
+
+    // A hook run where not even the daemon can start still exits 0 with nothing on stdout.
     let e = Env::new();
     let long = e.home.path().join("a".repeat(120));
     std::fs::create_dir_all(&long).unwrap();
     let me = os::process(std::process::id()).unwrap();
     for (arg, event) in [
         ("post-tool-use", "PostToolUse"),
-        ("stop", "Stop"),
         ("session-end", "SessionEnd"),
     ] {
         let cwd = e.folder("proj");
+        let p = e.payload(event, &cwd, json!({"tool_name": "Bash"}));
         let mut child = e
             .base_cmd(Command::new(EXE))
             .args(["hook", "claude", arg])
@@ -219,11 +288,6 @@ fn test_capture_write_failure_is_silent() {
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        let p = e.payload(
-            event,
-            &cwd,
-            json!({"tool_name": "Bash", "tool_input": {"command": "ls"}}),
-        );
         child
             .stdin
             .take()
@@ -231,16 +295,50 @@ fn test_capture_write_failure_is_silent() {
             .write_all(p.to_string().as_bytes())
             .unwrap();
         let o = child.wait_with_output().unwrap();
-        assert!(o.status.success(), "{arg}");
-        assert!(o.stdout.is_empty(), "{arg}");
+        assert!(o.status.success() && o.stdout.is_empty(), "{arg}");
     }
-    // A store that refuses (a session the daemon never saw) is not an error either.
-    let (_d, s) = store();
-    assert!(!capture::record_tool_call(&s, "nobody", "Bash", "{}", None, true).unwrap());
-    // Nor is garbage on stdin, with a live daemon.
+    // Garbage on stdin, with a live daemon.
     e.daemon(false, "", &[]);
     let o = e.claude_hook("post-tool-use", json!("not an object"));
     assert!(o.status.success() && o.stdout.is_empty());
+}
+
+/// A session that was running before capture existed has no row; its next tool call opens one,
+/// unless its folder is hidden.
+#[test]
+fn a_running_session_is_captured_from_its_next_tool_call() {
+    let e = Env::new();
+    e.daemon(false, "", &[]);
+    let cwd = e.folder("proj");
+    let post = json!({"tool_name": "Read", "tool_input": {"file_path": "/x/y.rs"}});
+    e.claude_hook("post-tool-use", e.payload("PostToolUse", &cwd, post));
+    let db = e.store();
+    let rows = capture::sessions_since(&db, -1).unwrap();
+    assert_eq!(rows.len(), 1);
+    let calls = capture::tool_calls(&db, "claude:c1", true).unwrap();
+    assert_eq!(calls[0].summary.as_deref(), Some("Read: /x/y.rs"));
+}
+
+#[test]
+fn an_ambiguous_session_prefix_is_named() {
+    let e = Env::new();
+    e.daemon(false, "", &[]);
+    let cwd = e.folder("proj");
+    for id in ["c1", "c2"] {
+        let mut p = e.payload("SessionStart", &cwd, json!({}));
+        p["session_id"] = id.into();
+        e.claude_hook("session-start", p);
+    }
+    let o = e.sessions(&["show", "claude:c"]);
+    assert!(!o.status.success());
+    assert!(
+        err(&o).contains("More than one session starts with that id"),
+        "{}",
+        err(&o)
+    );
+    let none = e.sessions(&["show", "nope"]);
+    assert!(err(&none).contains("No session starts"), "{}", err(&none));
+    assert!(e.sessions(&["show", "claude:c1"]).status.success());
 }
 
 #[test]
