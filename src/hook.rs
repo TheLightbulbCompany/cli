@@ -256,6 +256,18 @@ pub fn run(agent: &str, event: &str, stdin: &str) -> Result<Option<String>> {
         _ => None,
     };
     framed.extend(block.as_deref());
+    // At a Stop, open assignments hold the session once per change (`assignments.guard`).
+    let guard = (h.event == Event::Stop)
+        .then(|| {
+            conn.call(
+                "assignments.guard",
+                json!({ "key": key, "caller": proc_json(&me) }),
+            )
+            .ok()
+            .and_then(|r| r["block"].as_str().map(String::from))
+        })
+        .flatten();
+    framed.extend(guard.as_deref());
     // The nudge never rides along with mail: the daemon checked none waited.
     if framed.is_empty() && nudge {
         framed.push(NUDGE);

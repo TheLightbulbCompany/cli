@@ -555,6 +555,53 @@ impl Store {
         rows.collect()
     }
 
+    /// `(open, latest)` for assignments from `key`: how many have no result and a deadline after
+    /// `now`, and the newest `sent_at` among those and the results that reply to any assignment
+    /// from `key` (0 when none).
+    pub fn open_assignments(&self, key: &str, now: i64) -> rusqlite::Result<(i64, i64)> {
+        let open =
+            "kind = 'assign' AND from_key = ?1 AND json_extract(meta, '$.deadline_at') > ?2 \
+             AND NOT EXISTS (SELECT 1 FROM messages r WHERE r.kind = 'result' \
+             AND r.reply_to = messages.id)";
+        let n = self.conn.query_row(
+            &format!("SELECT COUNT(*) FROM messages WHERE {open}"),
+            params![key, now],
+            |r| r.get(0),
+        )?;
+        let latest = self.conn.query_row(
+            &format!(
+                "SELECT COALESCE(MAX(t), 0) FROM (SELECT sent_at AS t FROM messages WHERE {open} \
+                 UNION ALL SELECT r.sent_at FROM messages r JOIN messages a ON r.reply_to = a.id \
+                 WHERE r.kind = 'result' AND a.kind = 'assign' AND a.from_key = ?1)"
+            ),
+            params![key, now],
+            |r| r.get(0),
+        )?;
+        Ok((n, latest))
+    }
+
+    /// When `key`'s Stop hook last blocked (-1 when never).
+    pub fn stop_guard_at(&self, key: &str) -> rusqlite::Result<i64> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT stop_guard_at FROM sessions WHERE key = ?1",
+                [key],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .optional()?
+            .flatten()
+            .unwrap_or(-1))
+    }
+
+    pub fn set_stop_guard_at(&self, key: &str, now: i64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET stop_guard_at = ?2 WHERE key = ?1",
+            params![key, now],
+        )?;
+        Ok(())
+    }
+
     pub fn put_message(&self, m: &Message) -> rusqlite::Result<()> {
         self.conn.execute(
             "INSERT INTO messages (id, request_id, from_key, to_key, kind, thread, hops, origin, \

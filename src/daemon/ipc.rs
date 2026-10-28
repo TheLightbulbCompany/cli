@@ -403,6 +403,7 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
         "memory.remember" => {
             memory_remember(id, body, daemon, instance, !instance && for_a_person())
         }
+        "assignments.guard" => assignments_guard(id, body, daemon),
         "memory.recall" => memory_recall(id, body, daemon),
         // Takes the team lock and no store lock; `memory_manage` reads the team first.
         "memory.team" => memory_team(id, body, daemon, for_a_person()),
@@ -1177,6 +1178,42 @@ fn owner_process(daemon: &Daemon, key: &str) -> rusqlite::Result<Option<Proc>> {
 
 pub(crate) fn refused(id: u64, reason: &str) -> Response {
     Response::err_with(id, BAD_REQUEST, json!({ "reason": reason }))
+}
+
+/// `assignments.guard {key, caller?}` -> `{block?}`: the Stop hook's question. `block` (what to
+/// tell the session) is set only when `key` has open assignments (no result, deadline ahead)
+/// and something changed since the last block (a new assignment or a result for one); the
+/// answer is given once per change, so a session can end on its second Stop with nothing new.
+/// With `caller`, only the session's own process may ask (as `inbox`).
+fn assignments_guard(id: u64, body: &Value, daemon: &Daemon) -> Response {
+    let (Some(key), Ok(caller)) = (body["key"].as_str(), caller(body)) else {
+        return Response::err(id, BAD_REQUEST);
+    };
+    if let Some(c) = caller {
+        match owner_process(daemon, key) {
+            Ok(Some(owner)) if owner == c => {}
+            Ok(_) => return refused(id, "not_owner"),
+            Err(_) => return Response::err(id, INTERNAL),
+        }
+    }
+    let now = now() as i64;
+    let store = daemon.store.lock().unwrap();
+    let Ok((open, latest)) = store.open_assignments(key, now) else {
+        return Response::err(id, INTERNAL);
+    };
+    let Ok(seen) = store.stop_guard_at(key) else {
+        return Response::err(id, INTERNAL);
+    };
+    if open == 0 || latest <= seen {
+        return Response::ok(id, json!({}));
+    }
+    if store.set_stop_guard_at(key, now).is_err() {
+        return Response::err(id, INTERNAL);
+    }
+    Response::ok(
+        id,
+        json!({ "block": format!("{open} assignment(s) still running: call check_inbox(wait_secs=600) to wait for results, or cancel_assignment the ones you no longer need.") }),
+    )
 }
 
 /// `end {key, caller?, if_gone?}` -> `{ended}`: ends the session row (kept a day, ended);
