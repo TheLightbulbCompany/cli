@@ -348,13 +348,16 @@ lightbulb memory share <ID>
 lightbulb memory export [--json]
 lightbulb memory last
 lightbulb memory team <on|off>
+lightbulb memory drafts
+lightbulb memory approve <ID> [--team]
+lightbulb memory dismiss <ID>
 ```
 
-`--help`: What your agents and your team remember: list, show, forget, share, export.
+`--help`: What your agents and your team remember: list, show, forget, share, export, and the lessons suggested for you: drafts, approve, dismiss.
 
 Agents write memory with the `remember` tool and read it with `recall`. These commands are your
 own view of it. An `<ID>` is the first characters of an entry's id as `list` prints it (six or
-more). `forget`, `share` and `team` must be run from your own terminal; an agent's shell is refused.
+more). `forget`, `share`, `team`, `drafts`, `approve` and `dismiss` must be run from your own terminal; an agent's shell is refused.
 
 | Command | What it does |
 |---|---|
@@ -365,6 +368,9 @@ more). `forget`, `share` and `team` must be run from your own terminal; an agent
 | `export` | Every entry this computer holds, as stored: one JSON object per line, or one array with `--json`. A forgotten entry has no text left to export. |
 | `last` | The memory block the last session was handed at its start, word for word. |
 | `team on\|off` | Whether team memory may be written from this computer (`memory_team` in `config.toml`, on by default). `off` makes `remember` and `share` refuse `team` entries; what is already held stays. |
+| `drafts` | The lessons Lightbulb's evaluator suggests from sessions you uploaded in full (see `sessions upload`): the id, the kind, the first line and how many sessions it came from. Needs `lightbulb login`. |
+| `approve <ID> [--team]` | Keeps a suggested lesson. Signed in on your own, it becomes a `me` entry on this computer, marked as from the cloud evaluator. In a workspace it says `Approved; the workspace will remember it` and the entry arrives through the network; `--team` shares it with the whole workspace. It says so if the draft was settled elsewhere, or refused (a secret, or too long). |
+| `dismiss <ID>` | Throws a suggested lesson away. |
 
 ### sessions
 
@@ -375,9 +381,10 @@ lightbulb sessions list
 lightbulb sessions show <ID>
 lightbulb sessions forget <ID>
 lightbulb sessions export
+lightbulb sessions upload [off|metadata|full]
 ```
 
-`--help`: The sessions captured on this computer: list, show, forget, export.
+`--help`: The sessions captured on this computer: list, show, forget, export, and what is uploaded.
 
 Each agent's hooks tell the background service when a session starts, after each tool call, at
 the end of each turn and when the session ends. It keeps, on this computer only: the session (its
@@ -396,6 +403,7 @@ password or key is replaced by `[refused: <what it matched>]`. Sessions under a 
 | `show <ID>` | One session and its tool calls in order. |
 | `forget <ID>` | Deletes the session and its tool calls. |
 | `export` | Every session with its tool calls, as one JSON array on stdout. |
+| `upload [off\|metadata\|full]` | Choose what, if anything, is sent to Lightbulb (`capture_upload` in `config.toml`). `off` is the default: nothing leaves this computer. `metadata` sends, for each finished session, the agent, repository, branch, times and token counts, and for each tool call its number, time, tool, duration and whether it worked, without the summary. `full` adds the summary. Uploads are signed with this computer's identity, only while it is signed in, only for sessions that finish after you turn them on, and never for a hidden folder. With no mode it says which is set. `lightbulb login` asks once. |
 
 ## Commands the agents and macOS run
 

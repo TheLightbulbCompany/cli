@@ -368,7 +368,13 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
         | "sessions.show"
         | "sessions.forget"
         | "sessions.export" => capture_op(id, op, body, daemon, for_a_person()),
-        "memory.remember" => memory_remember(id, body, daemon, instance),
+        // `person` -> `{}` for a person's terminal, else refused: a command that settles
+        // something elsewhere first (`memory approve`) asks before it acts.
+        "person" if for_a_person() => Response::ok(id, json!({})),
+        "person" => refused(id, "not_a_person"),
+        "memory.remember" => {
+            memory_remember(id, body, daemon, instance, !instance && for_a_person())
+        }
         "memory.recall" => memory_recall(id, body, daemon),
         // Takes the team lock and no store lock; `memory_manage` reads the team first.
         "memory.team" => memory_team(id, body, daemon, for_a_person()),
@@ -410,7 +416,13 @@ fn fact_json(f: &crate::memory::Fact) -> Value {
 /// of `session` (an MCP caller's key) as its source. `neighbours` are the current facts on the
 /// subject from before this one. A secret or an oversize entry is `stored: false` with `refused`.
 /// On an instance (the workspace) the source is `workspace`, on behalf of `on_behalf_of`.
-fn memory_remember(id: u64, body: &Value, daemon: &Arc<Daemon>, instance: bool) -> Response {
+fn memory_remember(
+    id: u64,
+    body: &Value,
+    daemon: &Arc<Daemon>,
+    instance: bool,
+    person: bool,
+) -> Response {
     use crate::memory::{self, Kind, Op, Scope, Source, Status};
     let (Some(subject), Some(fact), Ok(kind)) = (
         body["subject"].as_str(),
@@ -437,7 +449,11 @@ fn memory_remember(id: u64, body: &Value, daemon: &Arc<Daemon>, instance: bool) 
     let found = session
         .as_deref()
         .and_then(|k| live_sessions(daemon).into_iter().find(|s| s.key.0 == k));
-    let source = Source {
+    // A person's terminal names the source itself (`memory approve`: the cloud evaluator).
+    let named = person
+        .then(|| serde_json::from_value::<Source>(body["source"].clone()).ok())
+        .flatten();
+    let source = named.unwrap_or_else(|| Source {
         harness: if instance {
             "workspace".into()
         } else {
@@ -452,7 +468,7 @@ fn memory_remember(id: u64, body: &Value, daemon: &Arc<Daemon>, instance: bool) 
             .filter(|_| instance)
             .map(String::from),
         shared_from: None,
-    };
+    });
     let op = Op::Remember {
         subject: subject.into(),
         fact: fact.into(),

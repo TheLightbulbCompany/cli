@@ -286,6 +286,8 @@ pub async fn run(dir: &Path) -> Result<()> {
     tokio::spawn(crate::telemetry::run_daily(daemon.clone()));
     // While signed in: the route link for this person's hosted apps.
     tokio::spawn(crate::link::run(daemon.clone()));
+    // While signed in and the person chose it: closed sessions go to Lightbulb.
+    tokio::spawn(crate::upload::run(daemon.clone()));
     // SIGTERM (launchd's stop) and SIGINT end it like a `shutdown` op: the socket and the
     // loopback address file (`net::local`) are removed on the way out.
     let d = daemon.clone();

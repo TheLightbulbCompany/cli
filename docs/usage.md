@@ -57,8 +57,8 @@ Run `lightbulb <command> --help` for the options of each one.
 | `folder <path> on\|off` | Show or hide the sessions under a folder from your teammates. |
 | `login` | Sign this computer in to Lightbulb (confirm in the browser), so your workspace's agents answer it. |
 | `logout` | Sign this computer out. |
-| `memory list\|show\|forget\|share\|export\|last\|team` | See and control what your agents remember (see "Memory" below). |
-| `sessions list\|show\|forget\|export` | See and delete what was captured of your coding sessions here: the agent, the repository, each tool call and a short summary of it, never file contents or output. Tokens are filled for Claude Code only (from its transcript); the other agents leave them blank until their payloads are verified, and OpenCode's tool calls are captured on 1.x only. |
+| `memory list\|show\|forget\|share\|export\|last\|team\|drafts\|approve\|dismiss` | See and control what your agents remember (see "Memory" below), and keep or drop the lessons suggested from sessions you uploaded. |
+| `sessions list\|show\|forget\|export\|upload` | See and delete what was captured of your coding sessions here: the agent, the repository, each tool call and a short summary of it, never file contents or output. Tokens are filled for Claude Code only (from its transcript); the other agents leave them blank until their payloads are verified, and OpenCode's tool calls are captured on 1.x only. `sessions upload off\|metadata\|full` chooses what is sent to Lightbulb (off by default). |
 | `telemetry [on\|off\|status]` | Show or set anonymous usage counts (see the [README](../README.md#usage-counts)). |
 | `version` | Print the version. |
 
@@ -87,6 +87,12 @@ block is chosen by repository.
 `lightbulb memory forget <id>` deletes an entry. The delete reaches every computer that comes
 online. A computer that stays offline for good keeps what it held. Secrets are refused, not
 scrubbed (see [security](security.md#memory)).
+
+Signed in, you can send finished sessions to Lightbulb: `lightbulb sessions upload metadata` or
+`full` (`lightbulb login` asks once; the default is `off`, and nothing leaves the computer). Sent in
+full, they let the evaluator suggest lessons: `lightbulb memory drafts` lists them,
+`lightbulb memory approve <id>` keeps one (`--team` for the workspace) and
+`lightbulb memory dismiss <id>` drops it.
 
 ## Trust
 

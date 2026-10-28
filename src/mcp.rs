@@ -458,7 +458,12 @@ fn kind_of(id: &str) -> &'static str {
 /// hex> <label>"` with P the URL's path and query, and `X-Lightbulb-Sig` is this computer's
 /// signature over it (`login::proof`, purpose `tools`). The answer of a 2xx, else the error
 /// result.
-fn rest(method: &str, path: &str, body: Option<&Value>, label: &str) -> Result<Value, Value> {
+pub(crate) fn rest(
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+    label: &str,
+) -> Result<Value, Value> {
     let dir = paths::state_path();
     let Some(proof) = login::stored_proof(&dir) else {
         return Err(json!({"error": "not_signed_in", "hint": "run lightbulb login"}));

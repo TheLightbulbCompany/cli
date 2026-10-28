@@ -706,3 +706,86 @@ pub fn line(sock: &std::path::Path, token: &str, op: &str, body: Value) -> Value
     BufReader::new(s).read_line(&mut answer).unwrap();
     serde_json::from_str(&answer).unwrap_or_else(|_| panic!("{op}: {answer:?}"))
 }
+
+/// A request the stub Lightbulb API (`api_stub`) got.
+#[derive(Clone, Debug)]
+pub struct Req {
+    pub method: String,
+    pub path: String,
+    /// Lowercased header names.
+    pub headers: Vec<(String, String)>,
+    pub body: Value,
+}
+
+impl Req {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        let name = name.to_lowercase();
+        self.headers
+            .iter()
+            .find(|(k, _)| *k == name)
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+pub type Seen = std::sync::Arc<std::sync::Mutex<Vec<Req>>>;
+
+/// A stub Lightbulb API on loopback answering each request with `answer(&req, n)` (`n`: how
+/// many requests to that method and path came before): `(status, json)`. Its base URL (for
+/// `LIGHTBULB_API`) and what it saw.
+pub fn api_stub(answer: impl Fn(&Req, usize) -> (u16, Value) + Send + 'static) -> (String, Seen) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let seen: Seen = Default::default();
+    let log = seen.clone();
+    std::thread::spawn(move || {
+        for s in listener.incoming() {
+            let mut s = s.unwrap();
+            let mut r = BufReader::new(s.try_clone().unwrap());
+            let mut first = String::new();
+            r.read_line(&mut first).unwrap();
+            let mut parts = first.split(' ');
+            let method = parts.next().unwrap_or_default().to_string();
+            let path = parts.next().unwrap_or_default().to_string();
+            let (mut len, mut headers) = (0, vec![]);
+            loop {
+                let mut h = String::new();
+                r.read_line(&mut h).unwrap();
+                if h == "\r\n" {
+                    break;
+                }
+                if let Some((k, v)) = h.trim_end().split_once(':') {
+                    let (k, v) = (k.to_lowercase(), v.trim().to_string());
+                    if k == "content-length" {
+                        len = v.parse().unwrap();
+                    }
+                    headers.push((k, v));
+                }
+            }
+            let mut body = vec![0; len];
+            r.read_exact(&mut body).unwrap();
+            let req = Req {
+                method,
+                path,
+                headers,
+                body: serde_json::from_slice(&body).unwrap_or(Value::Null),
+            };
+            let n = {
+                let mut l = log.lock().unwrap();
+                let n = l
+                    .iter()
+                    .filter(|q| q.method == req.method && q.path == req.path)
+                    .count();
+                l.push(req.clone());
+                n
+            };
+            let (code, v) = answer(&req, n);
+            let text = v.to_string();
+            let _ = write!(
+                s,
+                "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
+                text.len()
+            );
+        }
+    });
+    (base, seen)
+}

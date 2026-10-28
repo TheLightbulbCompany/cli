@@ -266,6 +266,7 @@ pub fn login() -> Result<i32> {
     println!(
         "Your workspace's agents answer it once an admin adds them: lightbulb invite --agents"
     );
+    crate::cli::ask_upload_mode()?;
     Ok(0)
 }
 

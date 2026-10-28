@@ -1442,3 +1442,242 @@ fn setup_eof_stays_local() {
     let config = std::fs::read_to_string(e.state.path().join("config.toml")).unwrap();
     assert!(config.contains("capture_upload = \"off\""), "{config}");
 }
+
+// ---- upload by choice, drafts ----------------------------------------------------------
+
+/// `args` as a person at a terminal (the drafts commands are person-only) against the stub.
+fn with_api(e: &Env, base: &str, args: &[&str]) -> Output {
+    let api = format!("LIGHTBULB_API={base}");
+    let run = "exit(system(@ARGV) >> 8)";
+    let argv: Vec<&str> = ["/usr/bin/env", &api, "/usr/bin/perl", "-e", run, EXE]
+        .into_iter()
+        .chain(args.iter().copied())
+        .collect();
+    e.detached(&argv, "")
+}
+
+fn draft(id: &str, text: &str) -> Value {
+    json!({"id": id, "kind": "lesson", "text": text, "evidence": ["claude:a", "claude:b"],
+        "status": "proposed", "created": "2026-10-27T10:00:00Z"})
+}
+
+#[test]
+fn sessions_upload_sets_the_mode_and_says_what_happens() {
+    let e = Env::new();
+    assert!(out(&e.run(&["sessions", "upload"])).contains("off"));
+    let o = e.run(&["sessions", "upload", "metadata"]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(
+        out(&o).contains("without what the tools did"),
+        "{}",
+        out(&o)
+    );
+    let config = std::fs::read_to_string(e.state.path().join("config.toml")).unwrap();
+    assert!(config.contains("capture_upload = \"metadata\""), "{config}");
+    assert!(out(&e.run(&["sessions", "upload"])).contains("metadata"));
+    let o = e.run(&["sessions", "upload", "off"]);
+    assert!(
+        out(&o).contains("Nothing leaves this computer"),
+        "{}",
+        out(&o)
+    );
+    assert!(!e
+        .run(&["sessions", "upload", "everything"])
+        .status
+        .success());
+}
+
+#[test]
+fn memory_drafts_lists_the_proposed_ones() {
+    let e = Env::new();
+    e.sign_in("user_1", None);
+    let (base, _) = common::api_stub(|r, _| match r.path.as_str() {
+        "/memory/drafts" => (
+            200,
+            json!({"drafts": [draft("abcd1234-0000", "Run cargo fmt first.\nIt saves a round trip.")]}),
+        ),
+        _ => (404, json!({})),
+    });
+    let o = with_api(&e, &base, &["memory", "drafts"]);
+    let text = out(&o);
+    assert!(o.status.success(), "{text}{}", err(&o));
+    assert!(
+        text.contains("abcd1234") && text.contains("lesson"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Run cargo fmt first.") && !text.contains("round trip"),
+        "{text}"
+    );
+    assert!(text.contains('2'), "evidence count: {text}");
+}
+
+#[test]
+fn memory_approve_stores_locally_for_solo_user() {
+    let e = Env::new();
+    e.sign_in("user_1", None);
+    let (base, seen) = common::api_stub(|r, _| match (r.method.as_str(), r.path.as_str()) {
+        ("GET", "/memory/drafts") => (
+            200,
+            json!({"drafts": [draft("abcd1234-0000", "Run cargo fmt first.")]}),
+        ),
+        ("POST", "/memory/drafts/abcd1234-0000/approve") => (
+            200,
+            json!({"subject": "acme/app", "fact": "Run cargo fmt first.", "kind": "lesson", "scope": "me"}),
+        ),
+        _ => (404, json!({})),
+    });
+    let o = with_api(&e, &base, &["memory", "approve", "abcd"]);
+    assert!(o.status.success(), "{}{}", out(&o), err(&o));
+    let approve = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|r| r.method == "POST")
+        .cloned()
+        .unwrap();
+    assert_eq!(approve.body, json!({"scope": null}));
+    // It is a local entry now, from the cloud evaluator, citing the first evidence session.
+    let list = out(&e.run(&["memory", "list"]));
+    assert!(
+        list.contains("Run cargo fmt first.") && list.contains("acme/app"),
+        "{list}"
+    );
+    let id = list
+        .lines()
+        .nth(1)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string();
+    let shown = out(&e.run(&["memory", "show", &id]));
+    assert!(shown.contains("cloud-evaluator"), "{shown}");
+}
+
+#[test]
+fn memory_approve_in_a_workspace_waits_for_the_network() {
+    let e = Env::new();
+    e.sign_in("user_1", None);
+    let (base, seen) = common::api_stub(|r, _| match r.method.as_str() {
+        "GET" => (
+            200,
+            json!({"drafts": [draft("d1", "Use the staging key.")]}),
+        ),
+        _ => (200, json!({"queued": true})),
+    });
+    let o = with_api(&e, &base, &["memory", "approve", "d1", "--team"]);
+    assert_eq!(
+        out(&o).trim(),
+        "Approved; the workspace will remember it",
+        "{}",
+        err(&o)
+    );
+    let post = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|r| r.method == "POST")
+        .cloned()
+        .unwrap();
+    assert_eq!(post.body, json!({"scope": "team"}));
+    assert!(out(&e.run(&["memory", "list"])).contains("Nothing is remembered"));
+}
+
+#[test]
+fn memory_approve_says_why_it_was_refused() {
+    let e = Env::new();
+    e.sign_in("user_1", None);
+    for (code, detail, said) in [
+        (409, "draft already settled", "settled"),
+        (422, "Looks like a secret.", "Looks like a secret."),
+    ] {
+        let (base, _) = common::api_stub(move |r, _| match r.method.as_str() {
+            "GET" => (200, json!({"drafts": [draft("d1", "x")]})),
+            _ => (code, json!({"detail": detail})),
+        });
+        let o = with_api(&e, &base, &["memory", "approve", "d1"]);
+        assert!(!o.status.success());
+        assert!(err(&o).contains(said), "{}", err(&o));
+    }
+}
+
+#[test]
+fn memory_dismiss_settles_the_draft() {
+    let e = Env::new();
+    e.sign_in("user_1", None);
+    let (base, seen) = common::api_stub(|r, _| match r.method.as_str() {
+        "GET" => (200, json!({"drafts": [draft("d1", "x")]})),
+        _ => (204, json!(null)),
+    });
+    let o = with_api(&e, &base, &["memory", "dismiss", "d1"]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(seen
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|r| r.method == "POST" && r.path == "/memory/drafts/d1/dismiss"));
+    let none = with_api(&e, &base, &["memory", "dismiss", "zz"]);
+    assert!(!none.status.success());
+}
+
+/// `lightbulb login` at a terminal asks what to upload, once, and off is the default.
+fn login_answering(e: &Env, answer: &str) -> Output {
+    use std::io::Write;
+    let (base, _) = common::api_stub(|r, n| match r.path.as_str() {
+        "/network/device/challenge" => (200, json!({"challenge": "c"})),
+        "/network/device/start" => (
+            200,
+            json!({"code": "x", "userCode": "ABCD-EFGH", "interval": 1, "expiresIn": 60, "verifyUrl": "http://example.test/auth"}),
+        ),
+        "/network/device/poll" if n == 0 => (
+            200,
+            json!({"status": "approved", "name": "Prasiddha", "proof": "h.p.s", "routeUrl": "wss://example.test/x"}),
+        ),
+        _ => (404, json!({})),
+    });
+    e.identity();
+    let mut child = e
+        .cmd(&["login"])
+        .env("LIGHTBULB_API", base)
+        .env("LIGHTBULB_CONNECT_DEBUG_TTY", "1")
+        .env("LIGHTBULB_CONNECT_NO_BROWSER", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(answer.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+fn upload_mode(e: &Env) -> String {
+    lightbulb::config::Config::load(e.state.path())
+        .unwrap()
+        .capture_upload
+}
+
+#[test]
+fn login_asks_what_to_upload_once() {
+    let e = Env::new();
+    let o = login_answering(&e, "metadata\n");
+    let text = out(&o);
+    assert!(o.status.success(), "{text}{}", err(&o));
+    assert!(text.contains("Nothing leaves this computer"), "{text}");
+    assert!(text.contains("metadata") && text.contains("full"), "{text}");
+    assert_eq!(upload_mode(&e), "metadata");
+}
+
+#[test]
+fn login_upload_question_defaults_to_off() {
+    for answer in ["\n", "", "nonsense\n"] {
+        let e = Env::new();
+        assert!(login_answering(&e, answer).status.success());
+        assert_eq!(upload_mode(&e), "off", "{answer:?}");
+    }
+}

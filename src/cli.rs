@@ -59,7 +59,7 @@ pub fn app_command(args: &[std::ffi::OsString]) -> Result<i32> {
 }
 
 /// A "(tests)" environment override: read in debug builds only, as `net::Knobs::read` does.
-fn test_env(name: &str) -> Option<std::ffi::OsString> {
+pub(crate) fn test_env(name: &str) -> Option<std::ffi::OsString> {
     if cfg!(debug_assertions) {
         std::env::var_os(name)
     } else {
@@ -550,10 +550,19 @@ pub enum Memory {
     Export(bool),
     Last,
     Team(bool),
+    Drafts,
+    Approve(String, bool),
+    Dismiss(String),
 }
 
 /// `memory ...`: a person's view of what is remembered, through the daemon.
 pub fn memory(cmd: Memory) -> Result<i32> {
+    if matches!(
+        cmd,
+        Memory::Drafts | Memory::Approve(..) | Memory::Dismiss(_)
+    ) {
+        return drafts(cmd);
+    }
     let texts = [
         (
             "not_found",
@@ -586,6 +595,7 @@ pub fn memory(cmd: Memory) -> Result<i32> {
             json!({ "session": calling_session(&mut conn) }),
         ),
         Memory::Team(on) => ("memory.team", json!({ "on": on })),
+        Memory::Drafts | Memory::Approve(..) | Memory::Dismiss(_) => unreachable!("handled above"),
     };
     let r = conn.call(op, body)?;
     if r["error"] == "replaced" {
@@ -662,8 +672,147 @@ pub fn memory(cmd: Memory) -> Result<i32> {
             "Team memory is {} on this computer.",
             if on { "on" } else { "off" }
         ),
+        Memory::Drafts | Memory::Approve(..) | Memory::Dismiss(_) => {}
     }
     Ok(0)
+}
+
+/// `memory drafts | approve <id> [--team] | dismiss <id>`: the lessons Lightbulb's evaluator
+/// suggests from sessions you uploaded. A person's terminal only; signed calls to the backend.
+fn drafts(cmd: Memory) -> Result<i32> {
+    use crate::memory::Source;
+    let mut conn = connect()?;
+    if let Err(e) = ask(&mut conn, "person", json!({})) {
+        eprintln!("{e}");
+        return Ok(1);
+    }
+    let call = |method: &str, path: &str, body: Option<Value>| {
+        crate::mcp::rest(method, path, body.as_ref(), "memory").map_err(|e| {
+            match (e["status"].as_u64(), e["error"].as_str()) {
+                (Some(409), _) => "That draft was settled somewhere else already.".to_string(),
+                (_, Some("not_signed_in")) => {
+                    format!(
+                        "Sign in first: lightbulb login ({})",
+                        e["hint"].as_str().unwrap_or("")
+                    )
+                }
+                (_, Some("unreachable")) => {
+                    "Could not reach Lightbulb. Check your connection and try again.".into()
+                }
+                (_, Some(m)) => m.to_string(),
+                _ => "Lightbulb could not do that.".into(),
+            }
+        })
+    };
+    let all = match call("GET", "/memory/drafts", None) {
+        Ok(v) => v["drafts"].as_array().cloned().unwrap_or_default(),
+        Err(e) => {
+            eprintln!("{e}");
+            return Ok(1);
+        }
+    };
+    let (Memory::Approve(prefix, _) | Memory::Dismiss(prefix)) = &cmd else {
+        if all.is_empty() {
+            println!("No suggested lessons are waiting.");
+            return Ok(0);
+        }
+        let mut rows = vec![["Id", "Kind", "Suggestion", "Sessions"]
+            .map(String::from)
+            .to_vec()];
+        for d in &all {
+            let first = d["text"]
+                .as_str()
+                .unwrap_or_default()
+                .lines()
+                .next()
+                .unwrap_or_default();
+            rows.push(vec![
+                cell(d["id"].as_str().unwrap_or_default())
+                    .chars()
+                    .take(8)
+                    .collect(),
+                cell(d["kind"].as_str().unwrap_or_default()),
+                cell(first),
+                d["evidence"].as_array().map_or(0, Vec::len).to_string(),
+            ]);
+        }
+        table(&rows);
+        return Ok(0);
+    };
+    let hits: Vec<&Value> = all
+        .iter()
+        .filter(|d| {
+            !prefix.is_empty()
+                && d["id"]
+                    .as_str()
+                    .is_some_and(|i| i.starts_with(prefix.as_str()))
+        })
+        .collect();
+    let [d] = hits[..] else {
+        let why = if hits.is_empty() {
+            "No suggestion starts with that id. `lightbulb memory drafts` shows them."
+        } else {
+            "More than one suggestion starts with that id. Give more of it."
+        };
+        eprintln!("{why}");
+        return Ok(1);
+    };
+    let path = format!("/memory/drafts/{}", d["id"].as_str().unwrap_or_default());
+    if matches!(cmd, Memory::Dismiss(_)) {
+        return match call("POST", &format!("{path}/dismiss"), None) {
+            Ok(_) => {
+                println!("Dismissed.");
+                Ok(0)
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                Ok(1)
+            }
+        };
+    }
+    let team = matches!(cmd, Memory::Approve(_, true));
+    let r = match call(
+        "POST",
+        &format!("{path}/approve"),
+        Some(json!({ "scope": team.then_some("team") })),
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{e}");
+            return Ok(1);
+        }
+    };
+    let (Some(subject), Some(fact)) = (r["subject"].as_str(), r["fact"].as_str()) else {
+        // In a workspace the entry arrives through the network.
+        println!("Approved; the workspace will remember it");
+        return Ok(0);
+    };
+    let source = Source {
+        harness: "cloud-evaluator".into(),
+        repo: None,
+        session: d["evidence"][0].as_str().map(String::from),
+        on_behalf_of: None,
+        shared_from: None,
+    };
+    let kept = ask(
+        &mut conn,
+        "memory.remember",
+        json!({"subject": subject, "fact": fact, "kind": r["kind"], "scope": r["scope"], "source": source}),
+    )?;
+    if kept["stored"] == true {
+        println!("Approved and remembered on this computer.");
+        return Ok(0);
+    }
+    let why = match kept["refused"].as_str() {
+        Some("team_off") => {
+            "Team memory is off on this computer. Turn it on with `lightbulb memory team on`."
+                .to_string()
+        }
+        Some(r) => format!("It was approved, but this computer refused to store it ({r})."),
+        None => "It was approved, but this computer could not store it.".into(),
+    };
+    eprintln!("{why}");
+    Ok(1)
 }
 
 /// A `sessions` subcommand.
@@ -672,15 +821,29 @@ pub enum Sessions {
     Show(String),
     Forget(String),
     Export,
+    Upload(Option<String>),
 }
 
 /// `sessions ...`: what was captured of your coding sessions on this computer.
 pub fn sessions(cmd: Sessions) -> Result<i32> {
+    if let Sessions::Upload(mode) = &cmd {
+        let dir = paths::state_dir();
+        let now = match mode {
+            Some(m) => {
+                crate::upload::set_mode(&dir, m)?;
+                m.clone()
+            }
+            None => crate::config::Config::load(&dir)?.capture_upload,
+        };
+        println!("Uploads are {now}. {}", crate::upload::describe(&now));
+        return Ok(0);
+    }
     let (op, body) = match &cmd {
         Sessions::List => ("sessions.list", json!({})),
         Sessions::Show(id) => ("sessions.show", json!({ "session": id })),
         Sessions::Forget(id) => ("sessions.forget", json!({ "session": id })),
         Sessions::Export => ("sessions.export", json!({})),
+        Sessions::Upload(_) => unreachable!("handled above"),
     };
     let r = connect()?.call(op, body)?;
     if r["ok"] != true {
@@ -740,6 +903,7 @@ pub fn sessions(cmd: Sessions) -> Result<i32> {
         }
         Sessions::Forget(_) => println!("Forgotten. The session and its tool calls are deleted."),
         Sessions::Export => println!("{}", serde_json::to_string_pretty(&r["sessions"])?),
+        Sessions::Upload(_) => {}
     }
     Ok(0)
 }
@@ -1898,7 +2062,7 @@ const SIGN_IN_OFFER: &str = "Sign in (free): your memory and sessions follow you
 /// `setup`'s first screen: the free sign-in, with staying local one key away. Staying local
 /// records that uploads are off. Skipped with nobody at a terminal (an update, the daemon's
 /// refresh) and when this computer is already signed in.
-/// Task 9 hooks in after a successful `login::login()`: ask off | metadata | full.
+/// (`login::login` asks what to upload once signed in, so this does not.)
 fn first_screen() -> Result<()> {
     use std::io::IsTerminal;
     let dir = paths::state_dir();
@@ -1920,6 +2084,28 @@ fn first_screen() -> Result<()> {
         println!("Staying local.");
     }
     crate::config::Config::set(&dir, "capture_upload", "off")
+}
+
+/// What `lightbulb login` asks right after signing in, to a person at a terminal: what to
+/// upload of the sessions captured here. Enter, end of input and anything unknown are `off`.
+pub fn ask_upload_mode() -> Result<()> {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() && test_env(TTY_ENV).is_none() {
+        return Ok(());
+    }
+    println!(
+        "Send your coding sessions to Lightbulb? The evaluator reads only what you send, and suggests lessons for you to approve.\n  off       Nothing leaves this computer. [default]\n  metadata  The agent, repository, times, token counts and tool names, signed as you; never what the tools did.\n  full      Also a short summary of each tool call (never file contents, diffs, command output or prompts).\nChange it any time: lightbulb sessions upload off|metadata|full\nUpload [off/metadata/full]:"
+    );
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    let mode = answer.trim().to_lowercase();
+    let mode = crate::upload::MODES
+        .iter()
+        .find(|m| **m == mode)
+        .unwrap_or(&"off");
+    crate::upload::set_mode(&paths::state_dir(), mode)?;
+    println!("Uploads are {mode}. {}", crate::upload::describe(mode));
+    Ok(())
 }
 
 /// `setup [--remove]`: wires the installed agents to the canonical binary (or `executable`)

@@ -78,6 +78,16 @@ enum MemoryCommand {
     },
     /// Print the memory block your last session was handed at its start.
     Last,
+    /// Lessons Lightbulb's evaluator suggests from sessions you uploaded, waiting for you.
+    Drafts,
+    /// Keep a suggested lesson (`--team`: for the whole workspace).
+    Approve {
+        id: String,
+        #[arg(long)]
+        team: bool,
+    },
+    /// Throw a suggested lesson away.
+    Dismiss { id: String },
     /// Let agents write team memory (`on`) or not (`off`) from this computer.
     Team {
         #[arg(value_parser = ["on", "off"])]
@@ -95,6 +105,11 @@ enum SessionsCommand {
     Forget { id: String },
     /// Print every captured session with its tool calls as JSON.
     Export,
+    /// Choose what is sent to Lightbulb: off (the default), metadata or full. No mode: say which.
+    Upload {
+        #[arg(value_parser = ["off", "metadata", "full"])]
+        mode: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -388,6 +403,9 @@ fn run() -> lightbulb::Result<()> {
             MemoryCommand::Share { id } => cli::Memory::Share(id),
             MemoryCommand::Export { json } => cli::Memory::Export(json),
             MemoryCommand::Last => cli::Memory::Last,
+            MemoryCommand::Drafts => cli::Memory::Drafts,
+            MemoryCommand::Approve { id, team } => cli::Memory::Approve(id, team),
+            MemoryCommand::Dismiss { id } => cli::Memory::Dismiss(id),
             MemoryCommand::Team { state } => cli::Memory::Team(state == "on"),
         })?),
         Command::Sessions { command } => exit(cli::sessions(match command {
@@ -395,6 +413,7 @@ fn run() -> lightbulb::Result<()> {
             SessionsCommand::Show { id } => cli::Sessions::Show(id),
             SessionsCommand::Forget { id } => cli::Sessions::Forget(id),
             SessionsCommand::Export => cli::Sessions::Export,
+            SessionsCommand::Upload { mode } => cli::Sessions::Upload(mode),
         })?),
         Command::Folder { path, state } => exit(cli::folder(&path, state == "on")?),
         Command::Relay { url, clear, local } => {
