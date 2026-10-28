@@ -109,16 +109,17 @@ pub struct Fact {
 }
 
 /// Signs `op` as `id`'s next entry and stores it. `too_long` when it passes `MAX_ENTRY_BYTES`;
-/// `secret:<pattern>` when subject or fact looks like a credential (refused, never scrubbed);
+/// `secret:<pattern>` when any of its strings looks like a credential (`secret_in`; refused,
+/// never scrubbed);
 /// `no_subject` for a blank subject (replay would group it with every other one).
 pub fn remember(store: &Store, id: &Identity, op: Op, now: i64) -> Result<Entry> {
-    if let Op::Remember { subject, fact, .. } = &op {
+    if let Op::Remember { subject, .. } = &op {
         if subject.trim().is_empty() {
             return Err("no_subject".into());
         }
-        if let Some(name) = refuse_secret(subject).or_else(|| refuse_secret(fact)) {
-            return Err(format!("secret:{name}").into());
-        }
+    }
+    if let Some(name) = secret_in(&op) {
+        return Err(format!("secret:{name}").into());
     }
     // Immediate: a writer takes the reserved lock first, so a second connection waits out the
     // busy timeout instead of SQLite refusing the read-then-write upgrade at once.
@@ -155,6 +156,33 @@ pub fn remember(store: &Store, id: &Identity, op: Op, now: i64) -> Result<Entry>
     Ok(e)
 }
 
+/// The secret pattern any string of a `remember` matches: its subject, fact and every source
+/// field. `remember` and `accept` both check through this, so they check the same fields.
+fn secret_in(op: &Op) -> Option<&'static str> {
+    let Op::Remember {
+        subject,
+        fact,
+        source,
+        ..
+    } = op
+    else {
+        return None;
+    };
+    // Every field named, so a new one does not compile until it is listed here.
+    let Source {
+        harness,
+        repo,
+        session,
+        on_behalf_of,
+        shared_from,
+    } = source;
+    [Some(subject), Some(fact), Some(harness)]
+        .into_iter()
+        .chain([repo, session, on_behalf_of, shared_from].map(Option::as_ref))
+        .flatten()
+        .find_map(|t| refuse_secret(t))
+}
+
 /// Stores `e` once it verifies: `Ok(true)` when stored, `Ok(false)` when already held. Refuses a
 /// bad signature or id and an author the roster has not admitted. A `remember` whose subject or
 /// fact looks like a credential (an older build did not refuse it) is held as a tombstone with
@@ -172,12 +200,7 @@ pub fn accept(store: &Store, e: &Entry, now: i64) -> Result<bool> {
     {
         return Err("memory entry is from a non-member".into());
     }
-    let secret = match &e.op {
-        Op::Remember { subject, fact, .. } => {
-            refuse_secret(subject).or_else(|| refuse_secret(fact))
-        }
-        Op::Forget { .. } => None,
-    };
+    let secret = secret_in(&e.op);
     let tx = Transaction::new_unchecked(store.conn(), TransactionBehavior::Immediate)?;
     let stored = match secret {
         None => insert(&tx, e, now)?,
@@ -532,19 +555,26 @@ fn replay(store: &Store) -> Result<Vec<Live>> {
 }
 
 /// What the team currently holds, newest first: the current and contested values, with what
-/// each replaced. `repo` (`owner/name`) keeps entries whose `source.repo` is it, or is its bare
-/// `name` (what builds before the owner was in the key stored).
+/// each replaced. `repo` keeps entries whose `source.repo` is it (`same_repo`).
 pub fn facts(store: &Store, scope: Option<Scope>, repo: Option<&str>) -> Result<Vec<Fact>> {
-    let bare = repo.and_then(|r| r.rsplit('/').next());
     let mut out: Vec<Fact> = replay(store)?
         .into_iter()
         .filter(|l| l.fact.status != Status::Replaced)
         .filter(|l| scope.is_none_or(|s| s == l.fact.scope))
-        .filter(|l| repo.is_none_or(|r| [Some(r), bare].contains(&l.repo.as_deref())))
+        .filter(|l| repo.is_none_or(|r| l.repo.as_deref().is_some_and(|k| same_repo(k, r))))
         .map(|l| l.fact)
         .collect();
     out.reverse();
     Ok(out)
+}
+
+/// Whether stored repo key `key` is `asked`, ignoring case. When either is a bare `name` (an
+/// entry from a build before the owner was in the key, an origin with no owner, or a name a
+/// person typed), only the names are compared.
+fn same_repo(key: &str, asked: &str) -> bool {
+    let name = |s: &str| s.rsplit('/').next().unwrap_or_default().to_lowercase();
+    key.eq_ignore_ascii_case(asked)
+        || ((!key.contains('/') || !asked.contains('/')) && name(key) == name(asked))
 }
 
 /// The held entry whose id is `id` or the only one that starts with it (six hex digits or more).

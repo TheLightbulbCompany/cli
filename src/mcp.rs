@@ -226,8 +226,7 @@ fn read_capped(p: &Path) -> Option<String> {
     Some(text)
 }
 
-/// Origin's repo as `owner/name` (the URL's last two path segments, or the last alone when
-/// there is one) and the checked-out branch, from the
+/// Origin's repo key (`repo_key`) and the checked-out branch, from the
 /// `.git` of `cwd` or of the nearest folder above it that has one: a directory, or a
 /// `gitdir:` file (a linked worktree; `gitdir` and its `commondir` may point anywhere: only
 /// two names are read out). A symlinked `.git` is not followed. Every read is capped at 64 KiB.
@@ -266,18 +265,36 @@ fn git_in(cwd: &Path) -> Option<(Option<String>, Option<String>)> {
         } else if let Some(url) = line.strip_prefix("url").map(str::trim_start) {
             if origin {
                 if let Some(url) = url.strip_prefix('=') {
-                    let url = url.trim().trim_end_matches('/');
-                    let mut parts = url.trim_end_matches(".git").rsplit(['/', ':']);
-                    repo = match (parts.next(), parts.next()) {
-                        (Some(""), _) => None,
-                        (Some(n), Some(o)) if !o.is_empty() => Some(format!("{o}/{n}")),
-                        (n, _) => n.map(str::to_string),
-                    };
+                    repo = repo_key(url);
                 }
             }
         }
     }
     Some((repo, branch))
+}
+
+/// The repo key of origin `url`: `owner/name`, lowercase (the last two segments of its path),
+/// or the bare `name` when the path has one segment. The host, user and port are not part of
+/// it: `git@host:path`, `scheme://user@host:port/path` and a local path all give the path.
+fn repo_key(url: &str) -> Option<String> {
+    let url = url.trim().to_lowercase();
+    let path = match url.split_once("://") {
+        Some((_, rest)) => rest.split_once('/').map_or("", |(_, p)| p),
+        None => match url.split_once(':') {
+            Some((host, p)) if !host.contains('/') => p,
+            _ => &url,
+        },
+    };
+    let mut segs = path.split('/').filter(|s| !s.is_empty()).rev();
+    let last = segs.next()?;
+    let name = last.strip_suffix(".git").unwrap_or(last);
+    if name.is_empty() {
+        return None;
+    }
+    Some(
+        segs.next()
+            .map_or(name.to_string(), |o| format!("{o}/{name}")),
+    )
 }
 
 /// Receipt `r` with its `note`, when it has one.
@@ -895,7 +912,7 @@ mod tests {
             "[remote \"upstream\"]\n\turl = x/other.git\n[remote \"origin\"]\n\turl = git@github.com:Org/cli.git\n",
         )
         .unwrap();
-        let name = Some("Org/cli".to_string());
+        let name = Some("org/cli".to_string());
         assert_eq!(
             git(main.to_str().unwrap()),
             (name.clone(), Some("init".into()))
@@ -916,6 +933,23 @@ mod tests {
         fs::create_dir_all(&linked).unwrap();
         std::os::unix::fs::symlink(main.join(".git"), linked.join(".git")).unwrap();
         assert_eq!(git(linked.to_str().unwrap()), (None, None));
+    }
+
+    #[test]
+    fn the_repo_key_is_lowercase_owner_and_name() {
+        for (url, key) in [
+            ("https://github.com/acme/api.git", Some("acme/api")),
+            ("https://github.com/acme/api", Some("acme/api")),
+            ("https://github.com/acme/api/", Some("acme/api")),
+            ("git@github.com:acme/api.git", Some("acme/api")),
+            ("ssh://git@host:2222/acme/api.git", Some("acme/api")),
+            ("ssh://host:2222/name", Some("name")),
+            ("git@host:name.git", Some("name")),
+            ("https://GitHub.com/Acme/API.git", Some("acme/api")),
+            ("", None),
+        ] {
+            assert_eq!(repo_key(url).as_deref(), key, "{url}");
+        }
     }
 
     #[test]
