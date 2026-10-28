@@ -528,6 +528,20 @@ impl Store {
         Ok(())
     }
 
+    /// The `request_id` and `status` of the result that answers message `message_id`: the
+    /// oldest one closes an assignment, a later one is just mail. A missing status reads `done`.
+    pub fn result_of(&self, message_id: &str) -> rusqlite::Result<Option<(String, String)>> {
+        self.conn
+            .query_row(
+                "SELECT request_id, COALESCE(json_extract(meta, '$.status'), 'done') \
+                 FROM messages WHERE kind = 'result' AND reply_to = ?1 \
+                 ORDER BY rowid ASC LIMIT 1",
+                [message_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+    }
+
     pub fn put_message(&self, m: &Message) -> rusqlite::Result<()> {
         self.conn.execute(
             "INSERT INTO messages (id, request_id, from_key, to_key, kind, thread, hops, origin, \

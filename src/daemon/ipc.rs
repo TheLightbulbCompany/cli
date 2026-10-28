@@ -184,7 +184,7 @@ const ONLY_ON_AN_INSTANCE: [&str; 2] = ["memory.import", "memory.forget_author"]
 
 /// The fields of an `inbox` record an agent (MCP `check_inbox`) or an instance's caller is
 /// handed.
-pub const INBOX_RECORD: [&str; 11] = [
+pub const INBOX_RECORD: [&str; 17] = [
     "id",
     "request_id",
     "thread",
@@ -196,6 +196,12 @@ pub const INBOX_RECORD: [&str; 11] = [
     "text",
     "framed",
     "sent_at",
+    "kind",
+    "reply_to",
+    "status",
+    "reason",
+    "done_when",
+    "deadline_at",
 ];
 
 /// `v` (an `inbox` record from `records`) cut to `INBOX_RECORD`.
@@ -1382,7 +1388,9 @@ pub fn now() -> u64 {
 /// this member's (`<member>/<name>`), and `to` may be left out
 /// only with `reply_to` (the reply goes to the parent's sender). `to` follows
 /// `sessions::qualify` (a bare name is this member's; anything else, groups included, is
-/// refused with reason `bad_address`). `kind` is `message` (the default) or `unsupported`.
+/// refused with reason `bad_address`). `kind` is one of `mail::KINDS` (`message` by default); an `assign` also takes
+/// `done_when`, `deadline_s` (1..=14 400, default 3 600) and `repo`/`branch`, a `result` its
+/// `status`/`reason`; a bad `deadline_s` is `bad_request`.
 /// Mail for a session here is stored, then pushed into a Claude or Codex session
 /// (`super::deliver`) if its tier is `push`; mail under another member's prefix goes to the
 /// outbox (`queued`, `where` that member's computer), `not_member` for a prefix no member has.
@@ -1411,10 +1419,32 @@ pub(crate) fn send_as(
     ) else {
         return Err(Response::err(id, BAD_REQUEST));
     };
-    match body.get("kind") {
-        None | Some(Value::Null) => {}
-        Some(k) if k == "message" => {}
-        Some(_) => return Err(Response::err(id, UNSUPPORTED)),
+    let kind = match body.get("kind") {
+        None | Some(Value::Null) => "message",
+        Some(k) => match k.as_str().filter(|k| mail::KINDS.contains(k)) {
+            Some(k) => k,
+            None => return Err(Response::err(id, UNSUPPORTED)),
+        },
+    };
+    let text_of = |k: &str| body[k].as_str().map(String::from);
+    let mut meta = mail::Meta {
+        done_when: text_of("done_when"),
+        repo: text_of("repo"),
+        branch: text_of("branch"),
+        status: text_of("status"),
+        reason: text_of("reason"),
+        ..Default::default()
+    };
+    if kind == "assign" {
+        // An integer in 1..=14 400 seconds; anything else is refused, never clamped.
+        let secs = match body.get("deadline_s") {
+            None | Some(Value::Null) => 3_600,
+            Some(v) => match v.as_i64().filter(|n| (1..=14_400).contains(n)) {
+                Some(n) => n,
+                None => return Err(Response::err(id, BAD_REQUEST)),
+            },
+        };
+        meta.deadline_at = Some(now() as i64 + secs);
     }
     let reply_to = body["reply_to"].as_str();
     let to = match body["to"].as_str() {
@@ -1445,8 +1475,8 @@ pub(crate) fn send_as(
         text,
         rid,
         reply_to,
-        "message",
-        mail::Meta::default(),
+        kind,
+        meta,
         now(),
     );
     let mut p = match prepared.map_err(internal)? {
@@ -1639,6 +1669,8 @@ pub(crate) fn records(daemon: &Daemon, messages: &[store::Message]) -> Vec<Value
                 "kind": m.kind, "thread": m.thread, "hops": m.hops, "text": m.body,
                 "sent_at": m.sent_at, "label": who["label"], "person": who["person"],
                 "person_verified": who["person_verified"], "computer": who["computer"],
+                "reply_to": m.reply_to, "status": m.meta.status, "reason": m.meta.reason,
+                "done_when": m.meta.done_when, "deadline_at": m.meta.deadline_at,
                 "framed": frame::framed(label, &m.request_id, &m.body) })
         })
         .collect()

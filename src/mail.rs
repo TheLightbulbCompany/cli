@@ -117,6 +117,13 @@ impl State {
     }
 }
 
+/// The result that answered an assignment: its `request_id` and `status`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResultRef {
+    pub request_id: String,
+    pub status: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Receipt {
     pub request_id: String,
@@ -133,6 +140,9 @@ pub struct Receipt {
     pub to: Option<String>,
     #[serde(skip)]
     pub at: Option<i64>,
+    /// For an assignment, the result that closed it (the oldest reply to it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<ResultRef>,
 }
 
 /// What a terminal's sender is told about a receipt: the address it went `to` (when known), its
@@ -345,7 +355,7 @@ pub fn receipt(store: &Store, from: &Key, request_id: &str) -> Result<Option<Rec
     let row = store
         .conn()
         .query_row(
-            "SELECT r.state, r.reason, r.\"limit\", r.updated_at, m.to_key FROM receipts r \
+            "SELECT r.state, r.reason, r.\"limit\", r.updated_at, m.to_key, m.id FROM receipts r \
              LEFT JOIN messages m ON m.from_key = r.from_key AND m.request_id = r.request_id \
              WHERE r.from_key = ?1 AND r.request_id = ?2",
             [&from.0, request_id],
@@ -356,11 +366,12 @@ pub fn receipt(store: &Store, from: &Key, request_id: &str) -> Result<Option<Rec
                     r.get(2)?,
                     r.get(3)?,
                     r.get::<_, Option<String>>(4)?,
+                    r.get::<_, Option<String>>(5)?,
                 ))
             },
         )
         .optional()?;
-    let Some((state, reason, limit, at, to)) = row else {
+    let Some((state, reason, limit, at, to, id)) = row else {
         return Ok(None);
     };
     let state = State::parse(&state)?;
@@ -372,6 +383,11 @@ pub fn receipt(store: &Store, from: &Key, request_id: &str) -> Result<Option<Rec
         }
         .to_string()
     });
+    let result = match id {
+        Some(id) => store.result_of(&id)?,
+        None => None,
+    }
+    .map(|(request_id, status)| ResultRef { request_id, status });
     Ok(Some(Receipt {
         request_id: request_id.into(),
         state,
@@ -380,6 +396,7 @@ pub fn receipt(store: &Store, from: &Key, request_id: &str) -> Result<Option<Rec
         limit,
         to,
         at,
+        result,
     }))
 }
 
@@ -408,6 +425,7 @@ fn refuse(
         limit: limit.map(Into::into),
         to: None,
         at: Some(now as i64),
+        result: None,
     })
 }
 
@@ -631,6 +649,7 @@ pub fn prepare(
             limit: None,
             to: None,
             at: None,
+            result: None,
         }))
     };
     let refused = |reason: &str| {
