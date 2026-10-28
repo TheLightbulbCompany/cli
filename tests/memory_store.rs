@@ -235,7 +235,8 @@ fn an_older_index_is_rebuilt_stemmed() {
     rusqlite::Connection::open(&path)
         .unwrap()
         .execute_batch(
-            "DROP TABLE memory_fts; DROP TABLE memory_seen;
+            "ALTER TABLE memory_entries DROP COLUMN reason;
+             DROP TABLE memory_fts; DROP TABLE memory_seen;
              CREATE VIRTUAL TABLE memory_fts USING fts5(
                  subject, fact, content='memory_entries', content_rowid='rowid');
              INSERT INTO memory_fts(rowid, subject, fact) SELECT rowid,

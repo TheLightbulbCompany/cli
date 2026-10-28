@@ -156,7 +156,9 @@ pub fn remember(store: &Store, id: &Identity, op: Op, now: i64) -> Result<Entry>
 }
 
 /// Stores `e` once it verifies: `Ok(true)` when stored, `Ok(false)` when already held. Refuses a
-/// bad signature or id and an author the roster has not admitted.
+/// bad signature or id and an author the roster has not admitted. A `remember` whose subject or
+/// fact looks like a credential (an older build did not refuse it) is held as a tombstone with
+/// reason `refused:<pattern>` and never its text: its seq is held, so it is not asked for again.
 pub fn accept(store: &Store, e: &Entry, now: i64) -> Result<bool> {
     if canonical(&e.value()).len() > MAX_ENTRY_BYTES {
         return Err("memory entry is too large".into());
@@ -170,8 +172,24 @@ pub fn accept(store: &Store, e: &Entry, now: i64) -> Result<bool> {
     {
         return Err("memory entry is from a non-member".into());
     }
+    let secret = match &e.op {
+        Op::Remember { subject, fact, .. } => {
+            refuse_secret(subject).or_else(|| refuse_secret(fact))
+        }
+        Op::Forget { .. } => None,
+    };
     let tx = Transaction::new_unchecked(store.conn(), TransactionBehavior::Immediate)?;
-    let stored = insert(&tx, e, now)?;
+    let stored = match secret {
+        None => insert(&tx, e, now)?,
+        Some(name) => {
+            tx.execute(
+                "INSERT OR IGNORE INTO memory_entries
+                 (id, author, seq, entry, received_at, tombstone, reason)
+                 VALUES (?1, ?2, ?3, NULL, ?4, 1, ?5)",
+                params![e.id, e.author, e.seq, now, format!("refused:{name}")],
+            )? == 1
+        }
+    };
     tx.commit()?;
     Ok(stored)
 }
@@ -405,8 +423,12 @@ fn replay(store: &Store) -> Result<Vec<Live>> {
             continue;
         }
         status[i] = Status::Current;
-        let keys = std::iter::once(format!("s:{:?}:{}", l.fact.scope, l.fact.subject.trim().to_lowercase()))
-            .chain(l.replaces.iter().map(|t| format!("t:{t}")));
+        let keys = std::iter::once(format!(
+            "s:{:?}:{}",
+            l.fact.scope,
+            l.fact.subject.trim().to_lowercase()
+        ))
+        .chain(l.replaces.iter().map(|t| format!("t:{t}")));
         for k in keys {
             let j = *by_key.entry(k).or_insert(i);
             let (a, b) = (root(&mut group, i), root(&mut group, j));
