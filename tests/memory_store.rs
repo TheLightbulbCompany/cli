@@ -568,3 +568,39 @@ fn embed_missing_is_not_starved_by_forgets() {
         .collect();
     assert_eq!(ids, vec![e3.id.clone()]);
 }
+
+#[test]
+#[ignore = "downloads the model; run with LIGHTBULB_TEST_MODEL=1 and --include-ignored"]
+fn recall_finds_a_paraphrase_keyword_search_misses() {
+    let Some(_env) = vec_env(true) else { return };
+    let a = identity();
+    let (_d, s) = team(&a);
+    let deploy = memory::remember(
+        &s,
+        &a,
+        rem("deploy window", "Deploys go out Tuesday mornings", &[]),
+        5,
+    )
+    .unwrap();
+    memory::remember(&s, &a, rem("db", "postgres 16", &[]), 6).unwrap();
+    memory::remember(&s, &a, rem("ci", "github actions", &[]), 7).unwrap();
+    let hits = memory::search(&s, "how do we ship releases", 5).unwrap();
+    assert_eq!(hits.first().map(|f| f.id.clone()), Some(deploy.id));
+}
+
+#[test]
+fn recall_without_a_model_is_exactly_the_keyword_ranking() {
+    let Some(_env) = vec_env(false) else { return };
+    let a = identity();
+    let (_d, s) = team(&a);
+    let one = memory::remember(&s, &a, rem("db", "postgres 16 database", &[]), 5).unwrap();
+    let two = memory::remember(&s, &a, rem("database", "database host is db1", &[]), 6).unwrap();
+    memory::remember(&s, &a, rem("ci", "github actions", &[]), 7).unwrap();
+    let ids: Vec<_> = memory::search(&s, "database", 5)
+        .unwrap()
+        .into_iter()
+        .map(|f| f.id)
+        .collect();
+    // bm25 order: the entry that says "database" twice first.
+    assert_eq!(ids, vec![two.id, one.id]);
+}

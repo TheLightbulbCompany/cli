@@ -577,11 +577,40 @@ pub fn search(store: &Store, query: &str, limit: usize) -> Result<Vec<Fact>> {
     let ids: Vec<String> = stmt
         .query_map(params![q, limit], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
+    // With a model, fuse the bm25 order with the cosine order of the query's embedding.
+    let ids = match embed_model::text(query) {
+        Some(qv) => {
+            let mut scored: Vec<(f32, String)> = vectors(store)?
+                .into_iter()
+                .map(|(id, v)| (embed_model::cosine(&qv, &v), id))
+                .collect();
+            scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+            let cos: Vec<String> = scored.into_iter().take(50).map(|s| s.1).collect();
+            rrf(&[ids, cos], limit)
+        }
+        None => ids,
+    };
     let mut all: HashMap<String, Fact> = replay(store)?
         .into_iter()
         .map(|l| (l.fact.id.clone(), l.fact))
         .collect();
     Ok(ids.iter().filter_map(|id| all.remove(id)).collect())
+}
+
+/// Reciprocal rank fusion (k = 60) of ranked id lists, best first, cut to `limit`.
+fn rrf(lists: &[Vec<String>], limit: usize) -> Vec<String> {
+    let mut score: HashMap<&str, f64> = HashMap::new();
+    for list in lists {
+        for (rank, id) in list.iter().enumerate() {
+            *score.entry(id).or_default() += 1.0 / (60.0 + rank as f64 + 1.0);
+        }
+    }
+    let mut out: Vec<_> = score.into_iter().collect();
+    out.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(b.0)));
+    out.into_iter()
+        .take(limit)
+        .map(|(id, _)| id.to_string())
+        .collect()
 }
 
 static SECRETS: LazyLock<Vec<(&'static str, Regex)>> = LazyLock::new(|| {
@@ -709,4 +738,16 @@ pub fn page(
         }
     }
     out.trim_end().to_string()
+}
+
+#[cfg(test)]
+mod rrf_tests {
+    use super::rrf;
+
+    #[test]
+    fn rrf_puts_an_entry_ranked_by_both_arms_first() {
+        let l = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let out = rrf(&[l(&["a", "b", "c"]), l(&["d", "b", "e"])], 3);
+        assert_eq!(out, l(&["b", "a", "d"]));
+    }
 }
