@@ -296,6 +296,98 @@ pub fn turns(store: &Store, session_id: &str) -> Result<Vec<Turn>> {
     Ok(rows)
 }
 
+/// Longest excerpt of a turn `recall` shows, in characters.
+pub const EXCERPT_MAX: usize = 240;
+
+/// A turn that matched a `recall` question: its first `EXCERPT_MAX` characters, each run of
+/// whitespace one space.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TurnHit {
+    pub session: String,
+    pub seq: i64,
+    pub role: String,
+    pub at: i64,
+    pub excerpt: String,
+}
+
+impl TurnHit {
+    /// `<role>, <YYYY-MM-DD UTC>: <excerpt>`, as the page shows it.
+    pub fn line(&self) -> String {
+        let day = crate::date::utc(self.at);
+        format!("{}, {}: {}", self.role, &day[..10], self.excerpt)
+    }
+}
+
+/// The best `limit` of this computer's turns for `query`: bm25 over `turns_fts`, fused with the
+/// cosine order of `turns_vec` when there is a model (`memory::fuse`). With `repo`, only the
+/// turns of sessions in that repo; every turn without one. A refused turn is never a candidate.
+pub fn search_turns(
+    store: &Store,
+    query: &str,
+    repo: Option<&str>,
+    limit: usize,
+) -> Result<Vec<TurnHit>> {
+    use crate::memory::{fts_query, fuse, unblob};
+    let Some(q) = fts_query(query) else {
+        return Ok(Vec::new());
+    };
+    let conn = store.conn();
+    let mut stmt = conn.prepare(
+        "SELECT t.rowid FROM turns_fts JOIN capture_turns t ON t.rowid = turns_fts.rowid
+         JOIN capture_sessions s ON s.id = t.session_id
+         WHERE turns_fts MATCH ?1 AND substr(t.text, 1, length(?2)) != ?2
+         AND (?3 IS NULL OR s.repo = ?3 COLLATE NOCASE)
+         ORDER BY bm25(turns_fts) LIMIT ?4",
+    )?;
+    let ids: Vec<String> = stmt
+        .query_map(rusqlite::params![q, REFUSED, repo, limit], |r| {
+            Ok(r.get::<_, i64>(0)?.to_string())
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let vecs = || -> Result<Vec<(String, Vec<f32>)>> {
+        let mut stmt = conn.prepare(
+            "SELECT v.turn, v.v FROM turns_vec v JOIN capture_turns t ON t.rowid = v.turn
+             JOIN capture_sessions s ON s.id = t.session_id
+             WHERE substr(t.text, 1, length(?1)) != ?1
+             AND (?2 IS NULL OR s.repo = ?2 COLLATE NOCASE)",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![REFUSED, repo], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (turn, blob) = row?;
+            out.extend(unblob(&blob).map(|v| (turn.to_string(), v)));
+        }
+        Ok(out)
+    };
+    let mut out = Vec::new();
+    for id in fuse(ids, query, vecs, limit)? {
+        let hit = conn.query_row(
+            "SELECT session_id, seq, role, text, at FROM capture_turns WHERE rowid = ?1",
+            [&id],
+            |r| {
+                let text: String = r.get(3)?;
+                Ok(TurnHit {
+                    session: r.get(0)?,
+                    seq: r.get(1)?,
+                    role: r.get(2)?,
+                    at: r.get(4)?,
+                    excerpt: text
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                        .chars()
+                        .take(EXCERPT_MAX)
+                        .collect(),
+                })
+            },
+        )?;
+        out.push(hit);
+    }
+    Ok(out)
+}
+
 /// Deletes the turns recorded more than `days` days before `now`; how many.
 pub fn prune_turns(store: &Store, now: i64, days: i64) -> Result<usize> {
     Ok(store.conn().execute(

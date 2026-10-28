@@ -664,6 +664,13 @@ impl Server {
         };
         let mut args = Value::Object(props(tool, &args, &[]));
         args["session"] = call.from.0.clone().into();
+        // `recall`'s turns come from this repo's sessions only.
+        if name == "recall" {
+            let cwd = std::env::current_dir().unwrap_or_default();
+            if let (Some(repo), _) = git(&cwd.to_string_lossy()) {
+                args["repo"] = repo.into();
+            }
+        }
         match ask(&format!("memory.{name}"), args).await {
             Ok(mut r) if r["ok"] == true => {
                 if let Some(o) = r.as_object_mut() {
