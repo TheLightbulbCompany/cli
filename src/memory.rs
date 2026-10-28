@@ -9,7 +9,7 @@ use crate::store::Store;
 use crate::Result;
 use data_encoding::HEXLOWER;
 use regex::Regex;
-use rusqlite::params;
+use rusqlite::{params, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -119,7 +119,9 @@ pub fn remember(store: &Store, id: &Identity, op: Op, now: i64) -> Result<Entry>
             return Err(format!("secret:{name}").into());
         }
     }
-    let tx = store.conn().unchecked_transaction()?;
+    // Immediate: a writer takes the reserved lock first, so a second connection waits out the
+    // busy timeout instead of SQLite refusing the read-then-write upgrade at once.
+    let tx = Transaction::new_unchecked(store.conn(), TransactionBehavior::Immediate)?;
     // Past what we hold and what a peer said it holds of ours (`saw`): a restored state.db
     // never reuses a number peers already hold.
     let seq: Option<u64> = tx.query_row(
@@ -167,7 +169,7 @@ pub fn accept(store: &Store, e: &Entry, now: i64) -> Result<bool> {
     {
         return Err("memory entry is from a non-member".into());
     }
-    let tx = store.conn().unchecked_transaction()?;
+    let tx = Transaction::new_unchecked(store.conn(), TransactionBehavior::Immediate)?;
     let stored = insert(&tx, e, now)?;
     tx.commit()?;
     Ok(stored)
