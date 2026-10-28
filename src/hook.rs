@@ -112,8 +112,6 @@ pub fn normalize(provider: &str, event_arg: &str, payload: &Value) -> Option<Hoo
 pub fn takes_mail(h: &Hook) -> bool {
     match (h.provider, h.event) {
         (_, Event::SessionEnd) => false,
-        // Grok ignores a SessionStart hook's stdout (docs.x.ai/build/features/hooks).
-        ("cursor" | "opencode", Event::SessionStart) => true,
         ("cursor" | "grok" | "opencode", e) => matches!(e, Event::PostToolUse | Event::Stop),
         _ => true,
     }
@@ -200,7 +198,14 @@ pub fn run(agent: &str, event: &str, stdin: &str) -> Result<Option<String>> {
     capture(&h, &payload, &session);
     // Our OpenCode plugin sends `mail: false` when it could not hand mail over (it has not
     // seen the session's agent and model yet): the mail waits for `check_inbox`.
-    if !takes_mail(&h) || (h.provider == "opencode" && payload["mail"] == false) {
+    // Cursor's and OpenCode's start carries the memory block only: Cursor may drop it, and our
+    // OpenCode plugin puts it in the system prompt; their mail waits for a tool call or a stop.
+    // (Grok ignores a SessionStart hook's stdout: docs.x.ai/build/features/hooks.)
+    let block_only = matches!(
+        (h.provider, h.event),
+        ("cursor" | "opencode", Event::SessionStart)
+    );
+    if !(takes_mail(&h) || block_only) || (h.provider == "opencode" && payload["mail"] == false) {
         return Ok(None);
     }
     // OpenCode's plugin is offered the mail and acks it once it is in the session
@@ -210,7 +215,11 @@ pub fn run(agent: &str, event: &str, stdin: &str) -> Result<Option<String>> {
     } else {
         "inbox"
     };
-    let r = conn.call(op, json!({ "key": key, "caller": proc_json(&me) }))?;
+    let r = if block_only {
+        json!({ "messages": [] })
+    } else {
+        conn.call(op, json!({ "key": key, "caller": proc_json(&me) }))?
+    };
     let messages = r["messages"]
         .as_array()
         .ok_or_else(|| format!("{op}: {r}"))?;
@@ -678,10 +687,9 @@ mod tests {
             let tool_or_stop = matches!(e, Event::PostToolUse | Event::Stop);
             assert_eq!(takes_mail(&hook("claude", e)), both);
             assert_eq!(takes_mail(&hook("codex", e)), both);
-            let start = e == Event::SessionStart;
-            assert_eq!(takes_mail(&hook("cursor", e)), tool_or_stop || start);
+            assert_eq!(takes_mail(&hook("cursor", e)), tool_or_stop);
             assert_eq!(takes_mail(&hook("grok", e)), tool_or_stop);
-            assert_eq!(takes_mail(&hook("opencode", e)), tool_or_stop || start);
+            assert_eq!(takes_mail(&hook("opencode", e)), tool_or_stop);
         }
     }
 

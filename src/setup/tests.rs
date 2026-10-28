@@ -474,8 +474,8 @@ fn strip_jsonc_takes_out_comments_and_trailing_commas_only() {
 
 /// Runs `driver` (an ES module; its last argument is the plugin's path) under node with the
 /// generated plugin and a fake `lightbulb` that logs each call and offers mail `m1` when asked
-/// for mail (and, at a session's start, a `block` that carries it). `None` when node is not
-/// installed. Returns what it printed (JSON) and the log.
+/// for mail (at a session's start, a `block` with ids, which the plugin must not ack). `None`
+/// when node is not installed. Returns what it printed (JSON) and the log.
 fn run_plugin(driver: &str) -> Option<(Value, String)> {
     use std::os::unix::fs::PermissionsExt;
     if std::process::Command::new("node")
@@ -704,9 +704,9 @@ console.log(JSON.stringify({ prompts, subscriptions }));
     assert_eq!(text.lines().collect::<Vec<_>>(), want, "{text}");
 }
 
-/// OpenCode 1.x: before each request of a session the plugin adds the text its start hook
-/// offered (mail and the memory block) to the system prompt; the hook runs once per session
-/// and its mail is acked once. A subagent's session, or a request with no session, gets none.
+/// OpenCode 1.x: before each request of a session the plugin adds the block its start hook
+/// offered to the system prompt; the hook runs once per session and nothing is acked (the start
+/// offers no mail). A subagent's session, or a request with no session, gets none.
 #[test]
 fn the_opencode_plugin_adds_the_start_block_to_the_system_prompt() {
     let driver = r#"
@@ -739,13 +739,11 @@ console.log(JSON.stringify(systems));
     let call = |arg: &str, mail: bool| {
         format!("opencode {arg} {{\"session_id\":\"ses_a\",\"cwd\":\"/tmp/proj\",\"mail\":{mail}}}")
     };
-    let ack = r#"opencode ack {"session_id":"ses_a","cwd":"/tmp/proj","mail":false,"ids":["m1"]}"#;
     assert_eq!(
         text.lines().collect::<Vec<_>>(),
         [
             call("session-start", false).as_str(),
-            call("session-start", true).as_str(),
-            ack
+            call("session-start", true).as_str()
         ],
         "{text}"
     );
@@ -796,10 +794,7 @@ console.log(JSON.stringify({ systems, disposed }));
     );
     assert_eq!(
         text.lines().collect::<Vec<_>>(),
-        [
-            r#"opencode session-start {"session_id":"ses_a","cwd":"/tmp/proj","mail":true}"#,
-            r#"opencode ack {"session_id":"ses_a","cwd":"/tmp/proj","mail":false,"ids":["m1"]}"#
-        ],
+        [r#"opencode session-start {"session_id":"ses_a","cwd":"/tmp/proj","mail":true}"#],
         "{text}"
     );
 }

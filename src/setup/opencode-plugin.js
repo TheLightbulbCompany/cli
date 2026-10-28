@@ -5,8 +5,8 @@
 //   EXE hook opencode stop            (the session goes idle)
 //   EXE hook opencode session-end     (the session is deleted)
 // with {session_id, cwd, mail} on stdin, and puts the text a hook offers into the session.
-// Before a session's first request it runs session-start once more with mail, and adds what it
-// offers (mail and the memory block) to the system prompt of each of the session's requests.
+// Before a session's first request it runs session-start once more, with mail: true, and adds
+// what it offers (the memory block only, never mail) to the system prompt of each request.
 // The offer leaves the mail waiting; only once the prompt is in does it run
 //   EXE hook opencode ack             ({session_id, ids} on stdin)
 // so a push that fails is offered again at the next step (a resend may repeat a message,
@@ -78,19 +78,15 @@ const step = async (arg, id, cwd, push, extra) => {
   }
 }
 
-// Session id -> the text its start hook offered, or null: asked for once (a promise, so requests
-// at once share it) and kept, since OpenCode builds the system prompt anew for each request. Its
-// mail is acked as soon as it is offered: the caller adds the text, which cannot fail.
+// Session id -> the block its start hook offered, or null: asked for once (a promise, so requests
+// at once share it) and kept, since OpenCode builds the system prompt anew for each request. The
+// start offers no mail, so there is nothing to ack: mail goes in at a tool call or a stop.
 const starts = new Map()
 const start = (id, cwd) => {
   if (!starts.has(id)) {
     starts.set(
       id,
-      hook("session-start", id, cwd, true).then((offer) => {
-        if (typeof offer?.text !== "string") return null
-        if (Array.isArray(offer.ids) && offer.ids.length) hook("ack", id, cwd, false, { ids: offer.ids })
-        return offer.text
-      }),
+      hook("session-start", id, cwd, true).then((offer) => (typeof offer?.text === "string" ? offer.text : null)),
     )
   }
   return starts.get(id)
