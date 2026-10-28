@@ -6,3 +6,9 @@ useDefault = true
 [[allowlists]]
 description = "public member-key prefixes in the Plan A acceptance record"
 paths = ['''docs/acceptance-plan-a\.md''']
+
+# The secret-refusal tests feed `remember` and capture fake keys (an AKIA… string, api_key=…
+# samples) and assert they are refused; none is a credential.
+[[allowlists]]
+description = "fake keys the memory and capture refusal tests feed in"
+paths = ['''tests/memory_store\.rs''', '''tests/cli\.rs''', '''tests/capture\.rs''']
