@@ -19,6 +19,10 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+      # The real memory model (one download); the other ignored tests are helpers, not run.
+      - run: cargo test --test embed_model -- --include-ignored
+        env:
+          LIGHTBULB_TEST_MODEL: "1"
   gitleaks:
     runs-on: ubuntu-latest
     steps:
