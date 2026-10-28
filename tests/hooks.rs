@@ -103,10 +103,13 @@ impl Net {
             .join("tests/fixtures/hooks")
             .join(format!("{fixture}.json"));
         let out = self.hook_raw(agent, event, &std::fs::read(path).unwrap(), pin);
+        // Nothing on stderr but, on a loaded machine, capture's one "not waiting" line.
+        let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
-            out.stderr.is_empty(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
+            stderr
+                .lines()
+                .all(|l| l.contains(": capture took over 10 ms; not waiting for it")),
+            "{stderr}"
         );
         String::from_utf8(out.stdout).unwrap()
     }
@@ -660,10 +663,12 @@ fn claude_hook(
     let me = os::process(std::process::id()).unwrap();
     let payload = json!({"session_id": conversation, "cwd": cwd, "hook_event_name": name});
     let out = net.hook_raw("claude", event, payload.to_string().as_bytes(), Some(&me));
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        out.stderr.is_empty(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
+        stderr
+            .lines()
+            .all(|l| l.contains(": capture took over 10 ms; not waiting for it")),
+        "{stderr}"
     );
     String::from_utf8(out.stdout).unwrap()
 }

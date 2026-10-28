@@ -525,7 +525,7 @@ fn memory_remember(
 /// Local capture. The hooks send `capture.session_start {harness, conversation, cwd, repo?,
 /// branch?}`, `capture.tool_call {harness, conversation, tool, args, duration_ms?, ok?}`,
 /// `capture.stop {harness, conversation, prompt_tokens?, completion_tokens?}` and
-/// `capture.session_end {harness, conversation}` -> `{stored}`. A person reads and deletes:
+/// `capture.session_end {harness, conversation, prompt_tokens?, completion_tokens?}` -> `{stored}`. A person reads and deletes:
 /// `sessions.list` -> `{sessions}`, `sessions.show {session}` -> `{session, tool_calls}`,
 /// `sessions.forget {session}` -> `{}`, `sessions.export` -> `{sessions: [{..., tool_calls}]}`.
 fn capture_op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, person: bool) -> Response {
