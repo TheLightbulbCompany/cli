@@ -70,6 +70,9 @@ pub struct Daily {
     pub messages_sent: u64,
     pub messages_received: u64,
     pub computers_on_network: u64,
+    /// Sessions handed the end-of-turn nudge, and those of them that then wrote a memory entry.
+    pub memory_nudged: u64,
+    pub memory_written_after_nudge: u64,
     /// Kinds of agent connected (`setup::AGENTS` names; anything else is dropped).
     pub agents: Vec<&'static str>,
 }
@@ -114,6 +117,8 @@ pub fn build(event: &Event, install_id: &str) -> Value {
             p["messages_sent"] = d.messages_sent.into();
             p["messages_received"] = d.messages_received.into();
             p["computers_on_network"] = d.computers_on_network.into();
+            p["memory_nudged"] = d.memory_nudged.into();
+            p["memory_written_after_nudge"] = d.memory_written_after_nudge.into();
             p["agents"] = d
                 .agents
                 .iter()
@@ -329,6 +334,20 @@ fn daily_counts(d: &Daemon, since: i64) -> Daily {
             since,
         ),
         computers_on_network: d.team.lock().unwrap().roster.members.len() as u64,
+        // `nudged` is when the nudge came. A nudged session had written nothing, so any entry
+        // whose source session (`<member>/<id>`) is it came after.
+        memory_nudged: count(
+            d,
+            "SELECT COUNT(*) FROM capture_sessions WHERE nudged > ?1",
+            since,
+        ),
+        memory_written_after_nudge: count(
+            d,
+            "SELECT COUNT(*) FROM capture_sessions s WHERE s.nudged > ?1 AND EXISTS \
+             (SELECT 1 FROM memory_entries WHERE substr(json_extract(entry, \
+             '$.op.source.session'), -length(s.id) - 1) = '/' || s.id)",
+            since,
+        ),
         agents,
     }
 }
@@ -412,6 +431,8 @@ mod tests {
             with(&[
                 "agents",
                 "computers_on_network",
+                "memory_nudged",
+                "memory_written_after_nudge",
                 "messages_received",
                 "messages_sent"
             ])

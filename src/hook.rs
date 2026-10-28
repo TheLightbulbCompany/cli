@@ -108,6 +108,10 @@ pub fn normalize(provider: &str, event_arg: &str, payload: &Value) -> Option<Hoo
     }
 }
 
+/// What a Stop hands the agent once per session, after a tool call, when nothing waits for it
+/// and it has remembered nothing yet (`capture.stop`'s `nudge`).
+pub const NUDGE: &str = "Before you stop: if this session settled a fact, made a decision or learned a lesson worth keeping, call remember for each (subject, fact, kind; replaces when a fact changed). Personal unless the person said to share. Then stop.";
+
 /// Whether this event hands mail to the model.
 pub fn takes_mail(h: &Hook) -> bool {
     match (h.provider, h.event) {
@@ -195,7 +199,6 @@ pub fn run(agent: &str, event: &str, stdin: &str) -> Result<Option<String>> {
     if !key.is_string() {
         return Err(format!("register: {r}").into());
     }
-    capture(&h, &payload, &session);
     // Our OpenCode plugin sends `mail: false` when it could not hand mail over (it has not
     // seen the session's agent and model yet): the mail waits for `check_inbox`.
     // Cursor's and OpenCode's start carries the memory block only: Cursor may drop it, and our
@@ -205,6 +208,13 @@ pub fn run(agent: &str, event: &str, stdin: &str) -> Result<Option<String>> {
         (h.provider, h.event),
         ("cursor" | "opencode", Event::SessionStart)
     );
+    let hands_over = takes_mail(&h) && !(h.provider == "opencode" && payload["mail"] == false);
+    // With the key, a Stop's `capture.stop` also asks whether to nudge (only when this hook
+    // can hand the agent something).
+    if hands_over && h.event == Event::Stop {
+        session["key"] = key.clone();
+    }
+    let nudge = capture(&h, &payload, &session);
     if !(takes_mail(&h) || block_only) || (h.provider == "opencode" && payload["mail"] == false) {
         return Ok(None);
     }
@@ -246,6 +256,10 @@ pub fn run(agent: &str, event: &str, stdin: &str) -> Result<Option<String>> {
         _ => None,
     };
     framed.extend(block.as_deref());
+    // The nudge never rides along with mail: the daemon checked none waited.
+    if framed.is_empty() && nudge {
+        framed.push(NUDGE);
+    }
     if framed.is_empty() {
         return Ok(None);
     }
@@ -262,8 +276,8 @@ const CAPTURE_WAIT: Duration = Duration::from_millis(10);
 
 /// Tells the daemon what this event adds to the local capture (`capture::*`, written by the
 /// daemon), on a connection of its own so a slow write holds nothing behind it. Any failure
-/// is silent: capture never breaks the agent or the mail.
-fn capture(h: &Hook, payload: &Value, session: &Value) {
+/// is silent: capture never breaks the agent or the mail. Whether the daemon said to nudge.
+fn capture(h: &Hook, payload: &Value, session: &Value) -> bool {
     // Debug builds only: capture's connection is a dead one, for tests of the failure path.
     #[cfg(debug_assertions)]
     let dead = std::env::var_os(CAPTURE_DOWN_ENV).and_then(|_| {
@@ -275,18 +289,19 @@ fn capture(h: &Hook, payload: &Value, session: &Value) {
     });
     #[cfg(not(debug_assertions))]
     let dead = None;
-    if let Some(mut conn) = dead.or_else(|| Conn::open().ok()) {
-        capture_on(&mut conn, h, payload, session);
-    }
+    dead.or_else(|| Conn::open().ok())
+        .and_then(|mut conn| capture_on(&mut conn, h, payload, session))
+        .unwrap_or(false)
 }
 
 /// `try_capture` on `conn`, waiting at most `CAPTURE_WAIT` for each answer. Past it, one line
-/// says so and the rest of this event's capture is skipped; whether that happened.
-fn capture_on(conn: &mut Conn, h: &Hook, payload: &Value, session: &Value) -> bool {
+/// says so and the rest of this event's capture is skipped (`None`); else whether to nudge.
+fn capture_on(conn: &mut Conn, h: &Hook, payload: &Value, session: &Value) -> Option<bool> {
     if conn.wait_up_to(CAPTURE_WAIT).is_err() {
-        return false;
+        return Some(false);
     }
     match try_capture(conn, h, payload, session) {
+        Ok(nudge) => Some(nudge),
         Err(e) if e.to_string() == no_answer(CAPTURE_WAIT) => {
             eprintln!(
                 "lightbulb hook {} {}: capture took over {} ms; not waiting for it",
@@ -294,9 +309,9 @@ fn capture_on(conn: &mut Conn, h: &Hook, payload: &Value, session: &Value) -> bo
                 h.event.arg(),
                 CAPTURE_WAIT.as_millis()
             );
-            true
+            None
         }
-        _ => false,
+        Err(_) => Some(false),
     }
 }
 
@@ -331,7 +346,8 @@ fn capped_args(args: &Value) -> String {
     Value::Object(kept).to_string()
 }
 
-fn try_capture(conn: &mut Conn, h: &Hook, payload: &Value, session: &Value) -> Result<()> {
+/// Whether the daemon said to nudge (a Stop sent with the session's `key`).
+fn try_capture(conn: &mut Conn, h: &Hook, payload: &Value, session: &Value) -> Result<bool> {
     let who = json!({ "harness": h.provider, "conversation": h.conversation });
     let start = |conn: &mut Conn, repo: &Value, branch: &Value| {
         let body = json!({ "cwd": session["cwd"], "repo": repo, "branch": branch });
@@ -345,7 +361,7 @@ fn try_capture(conn: &mut Conn, h: &Hook, payload: &Value, session: &Value) -> R
             let tool = ["tool_name", "toolName", "tool"]
                 .iter()
                 .find_map(|k| payload[k].as_str());
-            let Some(tool) = tool else { return Ok(()) };
+            let Some(tool) = tool else { return Ok(false) };
             let args = ["tool_input", "args"]
                 .iter()
                 .map(|k| &payload[k])
@@ -381,13 +397,15 @@ fn try_capture(conn: &mut Conn, h: &Hook, payload: &Value, session: &Value) -> R
                         .flatten()
                         .and_then(crate::capture::last_assistant_text)
                 });
-            // Tokens first: a turn that is slow or fails never costs the Stop its tokens.
-            if i.is_some() || o.is_some() {
-                let body = json!({ "prompt_tokens": i, "completion_tokens": o });
-                conn.call("capture.stop", with(&who, body))?;
-            }
-            if let Some(text) = reply.filter(|t| !t.trim().is_empty()) {
-                let _ = turn(conn, &who, "assistant", &text);
+            // One call for the tokens, the reply and the nudge: the daemon keeps the tokens
+            // whatever happens to the turn.
+            let text = reply
+                .filter(|t| !t.trim().is_empty())
+                .map(|t| turn_text(&t));
+            if i.is_some() || o.is_some() || text.is_some() || session["key"].is_string() {
+                let body = json!({ "prompt_tokens": i, "completion_tokens": o,
+                    "text": text, "key": session["key"] });
+                return Ok(conn.call("capture.stop", with(&who, body))?["nudge"] == true);
             }
         }
         Event::SessionEnd => {
@@ -406,25 +424,21 @@ fn try_capture(conn: &mut Conn, h: &Hook, payload: &Value, session: &Value) -> R
         }
         Event::UserPromptSubmit => {
             if let Some(text) = payload["prompt"].as_str().filter(|t| !t.trim().is_empty()) {
-                let _ = turn(conn, &who, "user", text);
+                let body = json!({ "role": "user", "text": turn_text(text) });
+                let _ = conn.call("capture.turn", with(&who, body));
             }
         }
     }
-    Ok(())
+    Ok(false)
 }
 
-/// One turn to the daemon: `[refused: <pattern>]` when the whole text holds a credential (so
-/// one past the 4 KB cut is still caught), else the text cut to 4 KB.
-fn turn(conn: &mut Conn, who: &Value, role: &str, text: &str) -> Result<()> {
-    let text = match crate::memory::refuse_secret(text) {
+/// A turn as sent to the daemon: `[refused: <pattern>]` when the whole text holds a credential
+/// (so one past the 4 KB cut is still caught), else the text cut to 4 KB.
+fn turn_text(text: &str) -> String {
+    match crate::memory::refuse_secret(text) {
         Some(p) => crate::capture::refused(p),
         None => crate::capture::cut_turn(text).to_string(),
-    };
-    conn.call(
-        "capture.turn",
-        with(who, json!({ "role": role, "text": text })),
-    )?;
-    Ok(())
+    }
 }
 
 /// `hook opencode ack`, payload `{session_id, ids}`: the plugin put those messages into the
@@ -589,7 +603,7 @@ mod tests {
                 ..hook("claude", e)
             };
             assert!(try_capture(&mut conn, &h, &p, &json!({})).is_err(), "{e:?}");
-            assert!(!capture_on(&mut conn, &h, &p, &json!({})));
+            assert_eq!(capture_on(&mut conn, &h, &p, &json!({})), Some(false));
         }
     }
 
@@ -640,12 +654,15 @@ mod tests {
         };
         let t = std::time::Instant::now();
         let session = json!({"cwd": "/p"});
-        assert!(capture_on(
-            &mut conn,
-            &hook("claude", Event::SessionStart),
-            &json!({}),
-            &session
-        ));
+        assert_eq!(
+            capture_on(
+                &mut conn,
+                &hook("claude", Event::SessionStart),
+                &json!({}),
+                &session
+            ),
+            None
+        );
         let took = t.elapsed();
         assert!(took < Duration::from_millis(100), "{took:?}");
         assert!(held.join().unwrap().contains("capture.session_start"));

@@ -84,6 +84,9 @@ start of a session (`lightbulb memory last` shows what the last one got). Grok C
 that block. It ignores what a hook prints at a session's start, so its agents use `recall`. A
 folder with no git origin gets no block, because the block is chosen by repository.
 
+Once per session, at the end of a turn that used a tool, an agent that has remembered nothing yet
+is asked to remember what the session settled; it is not asked while messages wait for it.
+
 `lightbulb memory forget <id>` deletes an entry. The delete reaches every computer that comes
 online. A computer that stays offline for good keeps what it held. Secrets are refused, not
 scrubbed (see [security](security.md#memory)).
