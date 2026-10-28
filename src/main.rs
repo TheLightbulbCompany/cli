@@ -317,6 +317,9 @@ enum Command {
         /// keyword-only.
         #[arg(long)]
         no_model: bool,
+        /// (The automatic setup after an update: keeps the person's model choice.)
+        #[arg(long, hide = true)]
+        refresh: bool,
     },
 }
 
@@ -473,12 +476,13 @@ fn run() -> lightbulb::Result<()> {
             server_name,
             verbose,
             no_model,
+            refresh,
         } => exit(cli::setup(
             remove,
             executable,
             server_name,
             verbose,
-            no_model,
+            (!refresh).then_some(!no_model),
         )?),
         Command::Hook { agent, event } => {
             let mut stdin = String::new();

@@ -110,7 +110,8 @@ scrubbed (see [security](security.md#memory)).
 
 Signed in, you can send finished sessions to Lightbulb: `lightbulb sessions upload metadata` or
 `full` (`lightbulb login` asks once; the default is `off`, and nothing leaves the computer; the one
-request memory makes is setup's download of the memory model, skipped with `setup --no-model`). Sent in
+request memory makes is setup's download of the memory model, skipped with `setup --no-model`, a
+choice kept until you run `lightbulb setup` again without it). Sent in
 full, they let the evaluator suggest lessons: `lightbulb memory drafts` lists them,
 `lightbulb memory approve <id>` keeps one (`--team` for the workspace) and
 `lightbulb memory dismiss <id>` drops it.

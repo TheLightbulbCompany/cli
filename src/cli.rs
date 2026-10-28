@@ -1601,7 +1601,7 @@ pub fn refresh_setup(dir: &Path) {
         return;
     }
     let child = Command::new(canonical(&home))
-        .arg("setup")
+        .args(["setup", "--refresh"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -2167,13 +2167,15 @@ pub fn ask_upload_mode() -> Result<()> {
 /// and starts the background service; prints one line per agent, then what to try next. Exits
 /// 1 when an agent ends with hooks but no tools. `--remove` is the off switch: our entries,
 /// the old version's, the job and the running service go. After the hooks it downloads the
-/// memory model once (`no_model`: not); a failed download is one line, and setup goes on.
+/// memory model once; a failed download is one line, and setup goes on. `model`: the person's
+/// choice (`--no-model` is `Some(false)`), kept in `memory_model`; `None` (the automatic setup
+/// after an update) keeps the choice already made.
 pub fn setup(
     remove: bool,
     executable: Option<PathBuf>,
     server: Option<String>,
     verbose: bool,
-    no_model: bool,
+    model: Option<bool>,
 ) -> Result<i32> {
     if server
         .as_deref()
@@ -2214,8 +2216,16 @@ pub fn setup(
         println!("{}", a.line());
         files(a);
     }
-    if !no_model {
-        match crate::embed_model::install(&paths::state_dir()) {
+    let dir = paths::state_dir();
+    let model = match model {
+        Some(on) => {
+            crate::config::Config::set(&dir, "memory_model", &on.to_string())?;
+            on
+        }
+        None => crate::config::Config::load(&dir).map_or(true, |c| c.memory_model),
+    };
+    if model {
+        match crate::embed_model::install(&dir) {
             Ok(()) => println!(
                 "Memory model installed ({} MB)",
                 crate::embed_model::size_mb()

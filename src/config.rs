@@ -20,7 +20,7 @@ enum Kind {
 }
 
 /// Every setting: the one list `load` and `set` read.
-const KEYS: [(&str, Kind); 12] = [
+const KEYS: [(&str, Kind); 13] = [
     ("computer", Kind::Str(|c| &mut c.computer)),
     (
         "preview_to_workspace",
@@ -39,6 +39,7 @@ const KEYS: [(&str, Kind); 12] = [
         "capture_turns_days",
         Kind::Int(|c| &mut c.capture_turns_days),
     ),
+    ("memory_model", Kind::Bool(|c| &mut c.memory_model)),
 ];
 
 fn kind(key: &str) -> Option<Kind> {
@@ -67,6 +68,9 @@ pub struct Config {
     pub capture_turns: bool,
     /// Days a turn is kept.
     pub capture_turns_days: i64,
+    /// Whether `setup` downloads the memory model: `setup --no-model` sets it off, a plain
+    /// `setup` on; the automatic setup after an update keeps it.
+    pub memory_model: bool,
 }
 
 impl Default for Config {
@@ -84,6 +88,7 @@ impl Default for Config {
             capture_upload: "off".into(),
             capture_turns: true,
             capture_turns_days: 90,
+            memory_model: true,
         }
     }
 }

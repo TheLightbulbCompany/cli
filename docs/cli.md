@@ -36,7 +36,7 @@ Setup then downloads the memory model (about 31 MB, once, into the state folder)
 | `--executable <path>` | The binary the hooks, tool servers and background service run. Default: `~/.lightbulb/connect/bin/lightbulb`, which setup installs from the binary you ran. |
 | `--server-name <name>` | The tool server's name, also used in Cursor's and Grok's allow rules. Default: `lightbulb`. |
 | `--verbose` | Also list the files each agent's setup changed. |
-| `--no-model` | Do not download the memory model. Memory search is keyword-only. |
+| `--no-model` | Do not download the memory model. Memory search is keyword-only. The choice is kept (`memory_model` in `config.toml`), also through the automatic setup after an update, until you run `lightbulb setup` again without it. |
 
 ### doctor
 

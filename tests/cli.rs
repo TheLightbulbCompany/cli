@@ -687,6 +687,49 @@ fn setup_goes_on_without_the_model_and_no_model_skips_it() {
     );
 }
 
+/// `setup --no-model` is kept: the automatic setup after an update (`setup --refresh`) does not
+/// download the model.
+#[cfg(target_os = "macos")]
+#[test]
+fn no_model_survives_a_refresh() {
+    let e = Env::new();
+    assert!(e.run(&["setup", "--no-model"]).status.success());
+    let o = e.run(&["setup", "--refresh"]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(
+        !out(&o).contains("Memory model"),
+        "no download: {}",
+        out(&o)
+    );
+    let config = lightbulb::config::Config::load(e.state.path()).unwrap();
+    assert!(!config.memory_model);
+}
+
+/// A person's plain `setup` turns the model back on, and the refresh then follows that.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_plain_setup_turns_the_model_back_on() {
+    let e = Env::new();
+    assert!(e.run(&["setup", "--no-model"]).status.success());
+    let o = e.run(&["setup"]);
+    assert!(
+        out(&o).contains("Memory model not installed: "),
+        "{}",
+        out(&o)
+    );
+    assert!(
+        lightbulb::config::Config::load(e.state.path())
+            .unwrap()
+            .memory_model
+    );
+    let o = e.run(&["setup", "--refresh"]);
+    assert!(
+        out(&o).contains("Memory model not installed: "),
+        "{}",
+        out(&o)
+    );
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn setup_remove_also_stops_the_daemon_and_removes_the_job() {
