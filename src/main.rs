@@ -308,6 +308,10 @@ enum Command {
         /// Also list the files each agent's setup changed.
         #[arg(long)]
         verbose: bool,
+        /// Skip downloading the local memory model (about 31 MB); memory search stays
+        /// keyword-only.
+        #[arg(long)]
+        no_model: bool,
     },
 }
 
@@ -462,7 +466,14 @@ fn run() -> lightbulb::Result<()> {
             executable,
             server_name,
             verbose,
-        } => exit(cli::setup(remove, executable, server_name, verbose)?),
+            no_model,
+        } => exit(cli::setup(
+            remove,
+            executable,
+            server_name,
+            verbose,
+            no_model,
+        )?),
         Command::Hook { agent, event } => {
             let mut stdin = String::new();
             let ran = std::io::stdin()

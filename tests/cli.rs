@@ -30,6 +30,8 @@ impl Env {
             .env("LIGHTBULB_CONNECT_NO_LAUNCHCTL", "1")
             .env("LIGHTBULB_CONNECT_DEBUG_NO_DEFAULT_RELAYS", "1")
             .env("LIGHTBULB_CONNECT_DEBUG_NO_TELEMETRY", "1")
+            // Never the real model download: a closed port (`embed_model`).
+            .env("LIGHTBULB_CONNECT_DEBUG_MODEL_URL", "http://127.0.0.1:9")
             .env("HOME", self.home.path())
             .env_remove("LIGHTBULB_CONNECT_SESSION")
             .env_remove("LIGHTBULB_CONNECT_HOOK_CALLER");
@@ -663,6 +665,28 @@ fn setup_installs_the_canonical_binary_and_wires_everything_to_it() {
 }
 
 #[cfg(target_os = "macos")]
+#[test]
+fn setup_goes_on_without_the_model_and_no_model_skips_it() {
+    // The download fails (a closed port): one line, setup still succeeds, doctor says so.
+    let e = Env::new();
+    let o = e.run(&["setup"]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(
+        out(&o).contains("Memory model not installed: ") && out(&o).contains("keyword-only"),
+        "{}",
+        out(&o)
+    );
+    let o = e.run(&["setup", "--no-model"]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(!out(&o).contains("Memory model"), "{}", out(&o));
+    assert!(!e.state.path().join("model").exists());
+    let d = out(&e.run(&["doctor"]));
+    assert!(
+        d.contains("Memory model         not installed (run lightbulb setup)"),
+        "{d}"
+    );
+}
+
 #[test]
 fn setup_remove_also_stops_the_daemon_and_removes_the_job() {
     let e = Env::new();

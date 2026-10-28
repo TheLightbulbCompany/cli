@@ -60,6 +60,8 @@ impl Env {
             .env("LIGHTBULB_CONNECT_NO_LAUNCHCTL", "1")
             .env("LIGHTBULB_CONNECT_DEBUG_NO_DEFAULT_RELAYS", "1")
             .env("LIGHTBULB_CONNECT_DEBUG_NO_TELEMETRY", "1")
+            // Never the real model download: a closed port (`embed_model`).
+            .env("LIGHTBULB_CONNECT_DEBUG_MODEL_URL", "http://127.0.0.1:9")
             // Never the real Lightbulb: a closed port unless a test points it at its stub.
             .env("LIGHTBULB_API", "http://127.0.0.1:9")
             .env("HOME", self.home.path())

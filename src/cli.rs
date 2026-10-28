@@ -2044,6 +2044,13 @@ pub fn doctor() -> Result<i32> {
         named.err().unwrap_or_default(),
         &setup,
     );
+    let model = if crate::embed_model::installed() {
+        "installed"
+    } else {
+        "not installed (run lightbulb setup)"
+    };
+    // Keyword-only memory still works: a missing model is said, not failed.
+    row("Memory model", true, model, "", "");
     let on = crate::config::Config::load(&dir).is_ok_and(|c| auto_update_on(&c));
     row("Auto-update", true, if on { "on" } else { "off" }, "", "");
     crate::telemetry::sync_env_optout(&dir);
@@ -2125,12 +2132,14 @@ pub fn ask_upload_mode() -> Result<()> {
 /// `setup [--remove]`: wires the installed agents to the canonical binary (or `executable`)
 /// and starts the background service; prints one line per agent, then what to try next. Exits
 /// 1 when an agent ends with hooks but no tools. `--remove` is the off switch: our entries,
-/// the old version's, the job and the running service go.
+/// the old version's, the job and the running service go. After the hooks it downloads the
+/// memory model once (`no_model`: not); a failed download is one line, and setup goes on.
 pub fn setup(
     remove: bool,
     executable: Option<PathBuf>,
     server: Option<String>,
     verbose: bool,
+    no_model: bool,
 ) -> Result<i32> {
     if server
         .as_deref()
@@ -2170,6 +2179,15 @@ pub fn setup(
     for a in &report.agents {
         println!("{}", a.line());
         files(a);
+    }
+    if !no_model {
+        match crate::embed_model::install(&paths::state_dir()) {
+            Ok(()) => println!(
+                "Memory model installed ({} MB)",
+                crate::embed_model::size_mb()
+            ),
+            Err(e) => println!("Memory model not installed: {e} Memory search is keyword-only."),
+        }
     }
     if cfg!(target_os = "macos") {
         let code = install_job(&home, &executable)?;
