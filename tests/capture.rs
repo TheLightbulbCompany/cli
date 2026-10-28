@@ -569,8 +569,14 @@ fn a_turn_with_a_secret_is_stored_refused_and_not_embedded() {
             (2, "assistant", "[refused: credential]")
         ]
     );
+    // The hook's marker for a credential past the 4 KB cut, stored as it came.
+    assert!(capture::record_turn(&s, "a:1", "user", "[refused: credential]", 12).unwrap());
     let db = d.path().join("state.db");
+    // Storing never embeds (that would hold the store lock); the backfill does, outside it.
+    assert_eq!(turn_vecs(&db, 1), 0, "record_turn never embeds");
+    lightbulb::memory::embed_missing(&s, 200).unwrap();
     assert_eq!(turn_vecs(&db, 2), 0, "a refused turn is never embedded");
+    assert_eq!(turn_vecs(&db, 3), 0, "nor a marker the hook sent");
     let embedded = i64::from(lightbulb::embed_model::installed());
     assert_eq!(turn_vecs(&db, 1), embedded);
     // A long turn is cut to 4 KB at a character boundary.
@@ -667,7 +673,7 @@ fn sessions_show_prints_turns_in_order() {
         (
             "user-prompt-submit",
             "UserPromptSubmit",
-            json!({"prompt": "second\nquestion"}),
+            json!({"prompt": "second\u{7}\nquestion"}),
         ),
     ];
     for (n, (arg, event, extra)) in steps.into_iter().enumerate() {
@@ -708,4 +714,45 @@ fn a_reply_equal_to_the_last_turn_is_recorded_once() {
         .map(|t| t.seq)
         .collect();
     assert_eq!(seqs, vec![1, 2, 3]);
+}
+
+/// A turn that is slow to store (or fails) never costs the Stop its tokens: they go first.
+#[test]
+fn a_slow_turn_never_costs_the_stop_its_tokens() {
+    let e = Env::new();
+    let delay = [(
+        "LIGHTBULB_CONNECT_DEBUG_CAPTURE_DELAY_MS",
+        "500".to_string(),
+    )];
+    e.daemon(false, "", &delay);
+    let cwd = e.folder("proj");
+    e.claude_hook("session-start", e.payload("SessionStart", &cwd, json!({})));
+    e.captured("the session starts", |_| true);
+    let stop = json!({"usage": {"input_tokens": 7, "output_tokens": 3},
+        "last_assistant_message": "Done."});
+    let o = e.claude_hook("stop", e.payload("Stop", &cwd, stop));
+    assert!(o.status.success(), "{}", err(&o));
+    let s = e.captured("the tokens", |s| s.prompt_tokens.is_some());
+    assert_eq!((s.prompt_tokens, s.completion_tokens), (Some(7), Some(3)));
+}
+
+/// The hook checks the whole prompt for a credential before the 4 KB cut.
+#[test]
+fn a_credential_past_the_cut_is_still_refused() {
+    let e = Env::new();
+    e.daemon(false, "", &[]);
+    let cwd = e.folder("proj");
+    e.claude_hook("session-start", e.payload("SessionStart", &cwd, json!({})));
+    e.captured("the session starts", |_| true);
+    let prompt = format!(
+        "{} export API_KEY=abcd1234efgh5678",
+        "x".repeat(capture::TURN_MAX)
+    );
+    let p = e.payload("UserPromptSubmit", &cwd, json!({ "prompt": prompt }));
+    assert!(e.claude_hook("user-prompt-submit", p).status.success());
+    common::until(10, "the turn is written", || {
+        !capture::turns(&e.store(), "claude:c1").unwrap().is_empty()
+    });
+    let turns = capture::turns(&e.store(), "claude:c1").unwrap();
+    assert_eq!(turns[0].text, "[refused: credential]");
 }

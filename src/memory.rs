@@ -251,30 +251,82 @@ fn store_vec(conn: &rusqlite::Connection, id: &str, subject: &str, fact: &str) -
     Ok(true)
 }
 
-/// Embeds up to `limit` held, live `remember`s that have no vector; how many it did. A no-op
-/// (0) without a model.
-pub fn embed_missing(store: &Store, limit: usize) -> Result<usize> {
+/// A row with no vector yet: a memory entry by id, or a turn by rowid.
+enum Missing {
+    Entry(String),
+    Turn(i64),
+}
+
+/// Up to `limit` held, live `remember`s with no vector, then turns with none (a refused turn is
+/// never embedded), each with the text to embed.
+fn missing(store: &Store, limit: usize) -> Result<Vec<(Missing, String)>> {
+    let mut out = vec![];
+    let mut stmt = store.conn().prepare(
+        "SELECT id, entry FROM memory_entries WHERE tombstone = 0 AND entry IS NOT NULL
+         AND json_extract(entry, '$.op.t') = 'remember'
+         AND id NOT IN (SELECT id FROM memory_vec) ORDER BY rowid LIMIT ?1",
+    )?;
+    let rows = stmt.query_map([limit as i64], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (id, body) = row?;
+        if let Op::Remember { subject, fact, .. } = serde_json::from_str::<Entry>(&body)?.op {
+            out.push((Missing::Entry(id), format!("{subject}: {fact}")));
+        }
+    }
+    let mut stmt = store.conn().prepare(
+        "SELECT rowid, text FROM capture_turns WHERE rowid NOT IN (SELECT turn FROM turns_vec)
+         AND substr(text, 1, length(?1)) != ?1 ORDER BY rowid LIMIT ?2",
+    )?;
+    let left = limit.saturating_sub(out.len()) as i64;
+    let rows = stmt.query_map(params![crate::capture::REFUSED, left], |r| {
+        Ok((Missing::Turn(r.get(0)?), r.get(1)?))
+    })?;
+    out.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
+    Ok(out)
+}
+
+/// Writes one vector, unless its row went (forgotten or pruned) while it was embedded.
+fn put_vec(conn: &rusqlite::Connection, row: &Missing, v: &[f32]) -> Result<usize> {
+    let blob: Vec<u8> = v.iter().flat_map(|f| f.to_le_bytes()).collect();
+    Ok(match row {
+        Missing::Entry(id) => conn.execute(
+            "INSERT OR REPLACE INTO memory_vec (id, v) SELECT ?1, ?2 WHERE EXISTS
+             (SELECT 1 FROM memory_entries WHERE id = ?1 AND tombstone = 0 AND entry IS NOT NULL)",
+            params![id, blob],
+        )?,
+        Missing::Turn(rowid) => conn.execute(
+            "INSERT OR IGNORE INTO turns_vec (turn, v) SELECT ?1, ?2 WHERE EXISTS
+             (SELECT 1 FROM capture_turns WHERE rowid = ?1)",
+            params![rowid, blob],
+        )?,
+    })
+}
+
+/// Embeds up to `limit` held, live `remember`s, then turns, that have no vector; how many it
+/// did. A no-op (0) without a model. `lock` gives the store for the read and for each write
+/// only: the embedding (20-100 ms each) runs between, so no other op waits on it.
+pub fn embed_missing_with<'a, S: std::ops::Deref<Target = Store> + 'a>(
+    lock: impl Fn() -> S,
+    limit: usize,
+) -> Result<usize> {
     if !embed_model::installed() {
         return Ok(0);
     }
-    let rows: Vec<(String, String)> = {
-        let mut stmt = store.conn().prepare(
-            "SELECT id, entry FROM memory_entries WHERE tombstone = 0 AND entry IS NOT NULL
-             AND json_extract(entry, '$.op.t') = 'remember'
-             AND id NOT IN (SELECT id FROM memory_vec) ORDER BY rowid LIMIT ?1",
-        )?;
-        let rows = stmt.query_map([limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
-        rows.collect::<rusqlite::Result<_>>()?
-    };
+    let rows = missing(&lock(), limit)?;
     let mut n = 0;
-    for (id, body) in rows {
-        if let Op::Remember { subject, fact, .. } = serde_json::from_str::<Entry>(&body)?.op {
-            if store_vec(store.conn(), &id, &subject, &fact)? {
-                n += 1;
-            }
+    for (row, text) in rows {
+        if let Some(v) = embed_model::text(&text) {
+            n += put_vec(lock().conn(), &row, &v)?;
         }
     }
     Ok(n)
+}
+
+/// `embed_missing_with` on a store this caller holds.
+pub fn embed_missing(store: &Store, limit: usize) -> Result<usize> {
+    embed_missing_with(|| store, limit)
 }
 
 /// `(id, vector)` of every embedded entry that is neither tombstoned nor replaced.

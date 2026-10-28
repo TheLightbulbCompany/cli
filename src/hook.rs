@@ -370,12 +370,13 @@ fn try_capture(conn: &mut Conn, h: &Hook, payload: &Value, session: &Value) -> R
                         .flatten()
                         .and_then(crate::capture::last_assistant_text)
                 });
-            if let Some(text) = reply.filter(|t| !t.trim().is_empty()) {
-                turn(conn, &who, "assistant", &text)?;
-            }
+            // Tokens first: a turn that is slow or fails never costs the Stop its tokens.
             if i.is_some() || o.is_some() {
                 let body = json!({ "prompt_tokens": i, "completion_tokens": o });
                 conn.call("capture.stop", with(&who, body))?;
+            }
+            if let Some(text) = reply.filter(|t| !t.trim().is_empty()) {
+                let _ = turn(conn, &who, "assistant", &text);
             }
         }
         Event::SessionEnd => {
@@ -394,16 +395,20 @@ fn try_capture(conn: &mut Conn, h: &Hook, payload: &Value, session: &Value) -> R
         }
         Event::UserPromptSubmit => {
             if let Some(text) = payload["prompt"].as_str().filter(|t| !t.trim().is_empty()) {
-                turn(conn, &who, "user", text)?;
+                let _ = turn(conn, &who, "user", text);
             }
         }
     }
     Ok(())
 }
 
-/// One turn to the daemon, cut to 4 KB first.
+/// One turn to the daemon: `[refused: <pattern>]` when the whole text holds a credential (so
+/// one past the 4 KB cut is still caught), else the text cut to 4 KB.
 fn turn(conn: &mut Conn, who: &Value, role: &str, text: &str) -> Result<()> {
-    let text = crate::capture::cut_turn(text);
+    let text = match crate::memory::refuse_secret(text) {
+        Some(p) => crate::capture::refused(p),
+        None => crate::capture::cut_turn(text).to_string(),
+    };
     conn.call(
         "capture.turn",
         with(who, json!({ "role": role, "text": text })),

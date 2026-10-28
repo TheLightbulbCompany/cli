@@ -383,7 +383,11 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
             // Asked only for `sessions.*`: the walk of the peer's process tree is slower than
             // the hook waits for a capture write.
             let person = op.starts_with("sessions.") && for_a_person();
-            capture_op(id, op, body, daemon, person)
+            let r = capture_op(id, op, body, daemon, person);
+            if op == "capture.turn" {
+                embed_missing(daemon);
+            }
+            r
         }
         // `person` -> `{}` for a person's terminal, else refused: a command that settles
         // something elsewhere first (`memory approve`) asks before it acts.
@@ -723,6 +727,24 @@ fn sessions_upload(id: u64, body: &Value, daemon: &Arc<Daemon>, person: bool) ->
         Ok(()) => Response::ok(id, json!({})),
         Err(_) => Response::err(id, INTERNAL),
     }
+}
+
+/// Embeds what has no vector yet (the turn just stored, and any memory entry) in the
+/// background, taking the store lock only to read and to write: one pass at a time.
+fn embed_missing(daemon: &Arc<Daemon>) {
+    static RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    use std::sync::atomic::Ordering::SeqCst;
+    if RUNNING.swap(true, SeqCst) {
+        return; // ponytail: a turn stored during a pass waits for the next turn's pass
+    }
+    let d = daemon.clone();
+    tokio::task::spawn_blocking(move || {
+        let lock = || d.store.lock().unwrap();
+        if let Err(e) = crate::memory::embed_missing_with(lock, 200) {
+            eprintln!("embed: {e}");
+        }
+        RUNNING.store(false, SeqCst);
+    });
 }
 
 /// `sessions.turns {on}` -> `{}`: a person keeps or stops keeping their prompts and replies.

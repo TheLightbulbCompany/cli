@@ -92,7 +92,7 @@ pub fn summarize(tool: &str, args_json: &str) -> String {
         None => tool.to_string(),
     };
     match refuse_secret(&text) {
-        Some(p) => format!("[refused: {p}]"),
+        Some(p) => refused(p),
         None => text.chars().take(SUMMARY_MAX).collect(),
     }
 }
@@ -224,6 +224,14 @@ pub fn tool_calls(
     Ok(rows)
 }
 
+/// How a refused summary or turn starts: `[refused: <pattern>]`.
+pub const REFUSED: &str = "[refused: ";
+
+/// What is stored in place of a text that matched the credential pattern `p`.
+pub fn refused(p: &str) -> String {
+    format!("{REFUSED}{p}]")
+}
+
 /// Longest turn kept, in bytes.
 pub const TURN_MAX: usize = 4 * 1024;
 
@@ -245,8 +253,8 @@ pub fn cut_turn(text: &str) -> &str {
 }
 
 /// Appends a prompt (`user`) or a reply (`assistant`) to a session. A turn with a credential in
-/// it is stored as `[refused: <pattern>]` and not embedded; the others are embedded when a model
-/// is installed. `Ok(false)` when the session has no row (never started, or in a hidden folder),
+/// it is stored as `[refused: <pattern>]` and never embedded; the others are embedded later,
+/// outside the store lock, by `memory::embed_missing`. `Ok(false)` when the session has no row (never started, or in a hidden folder),
 /// or when the turn repeats the session's last one (same role and text: a Claude Code Stop reads
 /// the transcript's last reply, which may be the previous turn's when the agent ended on a tool call).
 pub fn record_turn(
@@ -257,8 +265,8 @@ pub fn record_turn(
     now: i64,
 ) -> Result<bool> {
     let text = cut_turn(text);
-    let refused = refuse_secret(text).map(|p| format!("[refused: {p}]"));
-    let stored = refused.as_deref().unwrap_or(text);
+    let marker = refuse_secret(text).map(refused);
+    let stored = marker.as_deref().unwrap_or(text);
     let n = store.conn().execute(
         "INSERT INTO capture_turns (session_id, seq, role, text, at) \
          SELECT ?1, COALESCE((SELECT MAX(seq) FROM capture_turns WHERE session_id = ?1), 0) + 1, \
@@ -267,15 +275,6 @@ pub fn record_turn(
          AND seq = (SELECT MAX(seq) FROM capture_turns WHERE session_id = ?1))",
         rusqlite::params![session_id, role, stored, now],
     )?;
-    if n == 1 && refused.is_none() {
-        if let Some(v) = crate::embed_model::text(text) {
-            let blob: Vec<u8> = v.iter().flat_map(|f| f.to_le_bytes()).collect();
-            store.conn().execute(
-                "INSERT INTO turns_vec (turn, v) VALUES (last_insert_rowid(), ?1)",
-                [blob],
-            )?;
-        }
-    }
     Ok(n == 1)
 }
 

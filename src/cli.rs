@@ -937,8 +937,8 @@ pub fn sessions(cmd: Sessions) -> Result<i32> {
                 println!("{:>4}  {}{ok}", c["seq"], cell(text));
             }
             for t in r["turns"].as_array().into_iter().flatten() {
-                let text = t["text"].as_str().unwrap_or_default().replace('\n', " ");
-                let line = format!("{} {}: {text}", t["seq"], s(&t["role"]));
+                let text = t["text"].as_str().unwrap_or_default();
+                let line = cell(&format!("{} {}: {text}", t["seq"], s(&t["role"])));
                 println!("{}", line.chars().take(200).collect::<String>());
             }
         }
