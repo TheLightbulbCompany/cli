@@ -231,11 +231,12 @@ fn an_older_index_is_rebuilt_stemmed() {
     let s = Store::open(&path).unwrap();
     memory::remember(&s, &a, rem("test runner", "cargo test", &[]), 1).unwrap();
     drop(s);
-    // Back to v11: the index as V9 made it, no `memory_seen`, no V14 column.
+    // Back to v11: the index as V9 made it, no `memory_seen`, no V14 or V15 columns.
     rusqlite::Connection::open(&path)
         .unwrap()
         .execute_batch(
             "ALTER TABLE capture_sessions DROP COLUMN nudged;
+             ALTER TABLE memory_entries DROP COLUMN reason;
              DROP TABLE memory_fts; DROP TABLE memory_seen;
              CREATE VIRTUAL TABLE memory_fts USING fts5(
                  subject, fact, content='memory_entries', content_rowid='rowid');
@@ -611,4 +612,82 @@ fn recall_without_a_model_is_exactly_the_keyword_ranking() {
         .collect();
     // bm25 order: the entry that says "database" twice first.
     assert_eq!(ids, vec![two.id, one.id]);
+}
+
+/// `rem` with `scope` and `kind` set.
+fn rem_as(subject: &str, fact: &str, s: Scope, k: Kind) -> Op {
+    let mut op = rem(subject, fact, &[]);
+    if let Op::Remember { scope, kind, .. } = &mut op {
+        (*scope, *kind) = (s, k);
+    }
+    op
+}
+
+#[test]
+fn a_long_current_section_does_not_hide_lessons() {
+    let a = identity();
+    let (_d, s) = team(&a);
+    memory::remember(&s, &a, rem("short", "x", &[]), 1).unwrap();
+    memory::remember(&s, &a, rem("long", &"y".repeat(300), &[]), 2).unwrap();
+    let lesson = rem_as("tests", "run them twice", Scope::Team, Kind::Lesson);
+    memory::remember(&s, &a, lesson, 3).unwrap();
+    let f = memory::facts(&s, None, None).unwrap();
+    let page = memory::page(&s, &f, &Default::default(), 200);
+    // The long line does not fit and is left out; the line after it and the lessons are kept.
+    assert!(!page.contains("yyy"), "{page}");
+    assert!(page.starts_with("Current:\nshort: x ("), "{page}");
+    assert!(
+        page.contains("\nLessons:\ntests: run them twice ("),
+        "{page}"
+    );
+}
+
+#[test]
+fn a_me_value_does_not_contest_a_team_value() {
+    let a = identity();
+    let (_d, s) = team(&a);
+    let me = |fact| rem_as("editor", fact, Scope::Me, Kind::Fact);
+    let team_op = |fact| rem_as("editor", fact, Scope::Team, Kind::Fact);
+    memory::remember(&s, &a, me("vim"), 1).unwrap();
+    memory::remember(&s, &a, team_op("vscode"), 2).unwrap();
+    let f = memory::facts(&s, None, None).unwrap();
+    assert_eq!(f.len(), 2);
+    assert!(f.iter().all(|x| x.status == Status::Current), "{f:?}");
+    // Two values in each scope: two contested groups, one per scope.
+    memory::remember(&s, &a, me("emacs"), 3).unwrap();
+    memory::remember(&s, &a, team_op("zed"), 4).unwrap();
+    let f = memory::facts(&s, None, None).unwrap();
+    assert!(f.iter().all(|x| x.status == Status::Contested), "{f:?}");
+    let page = memory::page(&s, &f, &Default::default(), 1600);
+    let lines: Vec<&str> = page.lines().collect();
+    assert_eq!(lines.len(), 3, "{page}");
+    assert_eq!(lines[0], "Contested:");
+    for (x, y) in [("zed", "vscode"), ("emacs", "vim")] {
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains(x) && l.contains(y) && l.matches(" vs ").count() == 1),
+            "{page}"
+        );
+    }
+}
+
+#[test]
+fn an_entry_under_a_bare_repo_name_still_reads() {
+    let a = identity();
+    let (_d, s) = team(&a);
+    let mut old = rem("db", "postgres 16", &[]);
+    if let Op::Remember { source, .. } = &mut old {
+        source.repo = Some("app".into());
+    }
+    memory::remember(&s, &a, old, 1).unwrap();
+    memory::remember(&s, &a, rem("ci", "actions", &[]), 2).unwrap();
+    let subjects = |r| -> Vec<String> {
+        let f = memory::facts(&s, None, Some(r)).unwrap();
+        f.into_iter().map(|f| f.subject).collect()
+    };
+    assert_eq!(subjects("acme/app"), ["ci", "db"]);
+    // The bare name has no owner: any owner's `app` reads it.
+    assert_eq!(subjects("other/app"), ["db"]);
+    assert!(subjects("acme/api").is_empty());
 }

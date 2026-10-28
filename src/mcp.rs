@@ -226,22 +226,28 @@ fn read_capped(p: &Path) -> Option<String> {
     Some(text)
 }
 
-/// Origin's repo name (the URL's last path segment) and the checked-out branch, from
-/// `<cwd>/.git`: a directory, or a `gitdir:` file (a linked worktree; `gitdir` and its
-/// `commondir` may point anywhere: only two names are read out). A symlinked `.git` is
-/// not followed. Every read is capped at 64 KiB.
+/// Origin's repo as `owner/name` (the URL's last two path segments, or the last alone when
+/// there is one) and the checked-out branch, from the
+/// `.git` of `cwd` or of the nearest folder above it that has one: a directory, or a
+/// `gitdir:` file (a linked worktree; `gitdir` and its `commondir` may point anywhere: only
+/// two names are read out). A symlinked `.git` is not followed. Every read is capped at 64 KiB.
 pub(crate) fn git(cwd: &str) -> (Option<String>, Option<String>) {
     git_in(Path::new(cwd)).unwrap_or_default()
 }
 
 fn git_in(cwd: &Path) -> Option<(Option<String>, Option<String>)> {
-    let dot = cwd.join(".git");
-    let kind = std::fs::symlink_metadata(&dot).ok()?.file_type();
+    let (root, kind) = cwd.ancestors().find_map(|p| {
+        Some((
+            p,
+            std::fs::symlink_metadata(p.join(".git")).ok()?.file_type(),
+        ))
+    })?;
+    let dot = root.join(".git");
     let dir = if kind.is_dir() {
         dot
     } else if kind.is_file() {
         let d = read_capped(&dot)?;
-        cwd.join(d.trim().strip_prefix("gitdir:")?.trim())
+        root.join(d.trim().strip_prefix("gitdir:")?.trim())
     } else {
         return None;
     };
@@ -260,13 +266,13 @@ fn git_in(cwd: &Path) -> Option<(Option<String>, Option<String>)> {
         } else if let Some(url) = line.strip_prefix("url").map(str::trim_start) {
             if origin {
                 if let Some(url) = url.strip_prefix('=') {
-                    repo = url
-                        .trim()
-                        .trim_end_matches('/')
-                        .rsplit(['/', ':'])
-                        .next()
-                        .map(|n| n.trim_end_matches(".git").to_string())
-                        .filter(|n| !n.is_empty());
+                    let url = url.trim().trim_end_matches('/');
+                    let mut parts = url.trim_end_matches(".git").rsplit(['/', ':']);
+                    repo = match (parts.next(), parts.next()) {
+                        (Some(""), _) => None,
+                        (Some(n), Some(o)) if !o.is_empty() => Some(format!("{o}/{n}")),
+                        (n, _) => n.map(str::to_string),
+                    };
                 }
             }
         }
@@ -889,7 +895,7 @@ mod tests {
             "[remote \"upstream\"]\n\turl = x/other.git\n[remote \"origin\"]\n\turl = git@github.com:Org/cli.git\n",
         )
         .unwrap();
-        let name = Some("cli".to_string());
+        let name = Some("Org/cli".to_string());
         assert_eq!(
             git(main.to_str().unwrap()),
             (name.clone(), Some("init".into()))

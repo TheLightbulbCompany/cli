@@ -156,7 +156,9 @@ pub fn remember(store: &Store, id: &Identity, op: Op, now: i64) -> Result<Entry>
 }
 
 /// Stores `e` once it verifies: `Ok(true)` when stored, `Ok(false)` when already held. Refuses a
-/// bad signature or id and an author the roster has not admitted.
+/// bad signature or id and an author the roster has not admitted. A `remember` whose subject or
+/// fact looks like a credential (an older build did not refuse it) is held as a tombstone with
+/// reason `refused:<pattern>` and never its text: its seq is held, so it is not asked for again.
 pub fn accept(store: &Store, e: &Entry, now: i64) -> Result<bool> {
     if canonical(&e.value()).len() > MAX_ENTRY_BYTES {
         return Err("memory entry is too large".into());
@@ -170,8 +172,24 @@ pub fn accept(store: &Store, e: &Entry, now: i64) -> Result<bool> {
     {
         return Err("memory entry is from a non-member".into());
     }
+    let secret = match &e.op {
+        Op::Remember { subject, fact, .. } => {
+            refuse_secret(subject).or_else(|| refuse_secret(fact))
+        }
+        Op::Forget { .. } => None,
+    };
     let tx = Transaction::new_unchecked(store.conn(), TransactionBehavior::Immediate)?;
-    let stored = insert(&tx, e, now)?;
+    let stored = match secret {
+        None => insert(&tx, e, now)?,
+        Some(name) => {
+            tx.execute(
+                "INSERT OR IGNORE INTO memory_entries
+                 (id, author, seq, entry, received_at, tombstone, reason)
+                 VALUES (?1, ?2, ?3, NULL, ?4, 1, ?5)",
+                params![e.id, e.author, e.seq, now, format!("refused:{name}")],
+            )? == 1
+        }
+    };
     tx.commit()?;
     Ok(stored)
 }
@@ -389,8 +407,8 @@ fn replay(store: &Store) -> Result<Vec<Live>> {
         .map(|(i, l)| (l.fact.id.as_str(), i))
         .collect();
 
-    // Unreplaced entries that share a subject, or a replaced target, are one thing with
-    // several current values.
+    // Unreplaced entries that share a scope and subject, or a replaced target, are one thing
+    // with several current values: a `me` value never contests a `team` one.
     let mut group: Vec<usize> = (0..live.len()).collect();
     fn root(group: &mut [usize], mut i: usize) -> usize {
         while group[i] != i {
@@ -405,8 +423,12 @@ fn replay(store: &Store) -> Result<Vec<Live>> {
             continue;
         }
         status[i] = Status::Current;
-        let keys = std::iter::once(format!("s:{}", l.fact.subject.trim().to_lowercase()))
-            .chain(l.replaces.iter().map(|t| format!("t:{t}")));
+        let keys = std::iter::once(format!(
+            "s:{:?}:{}",
+            l.fact.scope,
+            l.fact.subject.trim().to_lowercase()
+        ))
+        .chain(l.replaces.iter().map(|t| format!("t:{t}")));
         for k in keys {
             let j = *by_key.entry(k).or_insert(i);
             let (a, b) = (root(&mut group, i), root(&mut group, j));
@@ -458,13 +480,15 @@ fn replay(store: &Store) -> Result<Vec<Live>> {
 }
 
 /// What the team currently holds, newest first: the current and contested values, with what
-/// each replaced. `repo` keeps entries whose `source.repo` is it.
+/// each replaced. `repo` (`owner/name`) keeps entries whose `source.repo` is it, or is its bare
+/// `name` (what builds before the owner was in the key stored).
 pub fn facts(store: &Store, scope: Option<Scope>, repo: Option<&str>) -> Result<Vec<Fact>> {
+    let bare = repo.and_then(|r| r.rsplit('/').next());
     let mut out: Vec<Fact> = replay(store)?
         .into_iter()
         .filter(|l| l.fact.status != Status::Replaced)
         .filter(|l| scope.is_none_or(|s| s == l.fact.scope))
-        .filter(|l| repo.is_none_or(|r| l.repo.as_deref() == Some(r)))
+        .filter(|l| repo.is_none_or(|r| [Some(r), bare].contains(&l.repo.as_deref())))
         .map(|l| l.fact)
         .collect();
     out.reverse();
@@ -655,7 +679,7 @@ pub fn refuse_secret(text: &str) -> Option<&'static str> {
 }
 
 /// What an agent reads: `Contested:` lines, then `Current:`, then `Lessons:` (replaced facts
-/// left out), cut on a line boundary at `budget` chars. `names` maps a member key to the name
+/// left out), whole lines only, within `budget` chars. `names` maps a member key to the name
 /// shown (the short key when it is not there).
 /// The heading and the instruction line a session-start block carries around the page.
 pub const BLOCK_HEADING: &str = "Memory (team and yours):";
@@ -700,12 +724,12 @@ pub fn page(
         )
     };
     let (mut contested, mut current, mut lessons) = (Vec::new(), Vec::new(), Vec::new());
-    let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+    let mut groups: Vec<((Scope, String), Vec<String>)> = Vec::new();
     for f in facts {
         match (f.status, f.kind) {
             (Status::Replaced, _) => {}
             (Status::Contested, _) => {
-                let key = f.subject.trim().to_lowercase();
+                let key = (f.scope, f.subject.trim().to_lowercase());
                 match groups.iter_mut().find(|(k, _)| *k == key) {
                     Some((_, v)) => v.push(by(f)),
                     None => groups.push((key, vec![format!("{}: {}", f.subject, by(f))])),
@@ -732,22 +756,25 @@ pub fn page(
         }
     }
     contested.extend(groups.into_iter().map(|(_, v)| v.join(" vs ")));
+    // A line that does not fit is left out and the next one tried, so one long line does not
+    // hide the lines and sections after it. A section's heading comes with its first line kept.
     let mut out = String::new();
-    'sections: for (head, lines) in [
+    for (head, lines) in [
         ("Contested:", contested),
         ("Current:", current),
         ("Lessons:", lessons),
     ] {
-        for (i, l) in lines.iter().enumerate() {
-            let add = if i == 0 {
-                format!("{head}\n{l}\n")
-            } else {
+        let mut headed = false;
+        for l in &lines {
+            let add = if headed {
                 format!("{l}\n")
+            } else {
+                format!("{head}\n{l}\n")
             };
-            if out.chars().count() + add.chars().count() > budget {
-                break 'sections;
+            if out.chars().count() + add.chars().count() <= budget {
+                out += &add;
+                headed = true;
             }
-            out += &add;
         }
     }
     out.trim_end().to_string()

@@ -4,7 +4,9 @@ use std::path::Path;
 /// Migration `i` takes the db to `user_version` `i + 1`. Forward only; each one only adds
 /// tables or columns, but V12, which drops and recreates `memory_fts` (stemmed) from the
 /// entries; each runs once (in the transaction that moves `user_version`).
-const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14];
+const MIGRATIONS: &[&str] = &[
+    V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15,
+];
 
 const V1: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
@@ -145,6 +147,9 @@ END;
 CREATE TABLE IF NOT EXISTS turns_vec (turn INTEGER PRIMARY KEY, v BLOB NOT NULL);
 ALTER TABLE capture_sessions ADD COLUMN nudged INTEGER NOT NULL DEFAULT 0;
 ";
+/// Why a held memory entry has no body when it was refused rather than forgotten
+/// (`refused:<pattern>`: a peer's entry that looks like a credential).
+const V15: &str = "ALTER TABLE memory_entries ADD COLUMN reason TEXT;";
 /// Memory: signed entries numbered per author, with a full-text index over `subject` and `fact`
 /// (`memory`). `rowid` is explicit so it survives `VACUUM` (the FTS index points at it). A
 /// tombstoned row keeps its id and seq and drops its body (`entry` NULL); `memory_tombstones`
@@ -1102,10 +1107,10 @@ mod tests {
         let path = dir.path().join("state.db");
         Connection::open(&path)
             .unwrap()
-            .execute_batch("PRAGMA user_version = 15;")
+            .execute_batch("PRAGMA user_version = 16;")
             .unwrap();
         let err = Store::open(&path).err().unwrap().to_string();
-        assert!(err.contains("State is from a newer version (v15)"), "{err}");
-        assert_eq!(user_version(&path), 15);
+        assert!(err.contains("State is from a newer version (v16)"), "{err}");
+        assert_eq!(user_version(&path), 16);
     }
 }
