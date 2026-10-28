@@ -231,6 +231,9 @@ impl Store {
     /// Opens `path`, migrating it forward; refuses a db written by a newer version.
     pub fn open(path: &Path) -> crate::Result<Store> {
         let conn = Connection::open(path)?;
+        // A second connection (a test, a tool run beside the daemon) waits for the daemon's
+        // write instead of failing with "database is locked".
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let version: usize = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version > MIGRATIONS.len() {
             return Err(format!(
