@@ -519,3 +519,52 @@ fn embed_missing_backfills_entries_received_from_peers() {
     assert_eq!(memory::embed_missing(&s2, 200).unwrap(), 0);
     assert_eq!(memory::vectors(&s2).unwrap().len(), 2);
 }
+
+#[test]
+#[ignore = "downloads the model; run with LIGHTBULB_TEST_MODEL=1 and --include-ignored"]
+fn embed_missing_is_not_starved_by_forgets() {
+    if std::env::var("LIGHTBULB_TEST_MODEL").as_deref() != Ok("1") {
+        return;
+    }
+    let Some(_env) = vec_env(false) else { return };
+    let a = identity();
+    let (_d1, s1) = team(&a);
+    let (_d2, s2) = team(&a);
+    let e1 = memory::remember(&s1, &a, rem("db", "postgres 16", &[]), 5).unwrap();
+    let e2 = memory::remember(&s1, &a, rem("ci", "github actions", &[]), 6).unwrap();
+    let e3 = memory::remember(&s1, &a, rem("editor", "helix", &[]), 7).unwrap();
+    let f1 = memory::remember(
+        &s1,
+        &a,
+        memory::Op::Forget {
+            target: e1.id.clone(),
+        },
+        8,
+    )
+    .unwrap();
+    let f2 = memory::remember(
+        &s1,
+        &a,
+        memory::Op::Forget {
+            target: e2.id.clone(),
+        },
+        9,
+    )
+    .unwrap();
+    // The forgets sit ahead of the live remember by rowid: they must not use up the limit.
+    for e in [&f1, &f2, &e1, &e2, &e3] {
+        memory::accept(&s2, e, 10).unwrap();
+    }
+    embed_model::install(std::path::Path::new(
+        &std::env::var(paths::HOME_ENV).unwrap(),
+    ))
+    .unwrap();
+    assert_eq!(memory::embed_missing(&s2, 1).unwrap(), 1);
+    assert_eq!(memory::embed_missing(&s2, 200).unwrap(), 0);
+    let ids: Vec<String> = memory::vectors(&s2)
+        .unwrap()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(ids, vec![e3.id.clone()]);
+}

@@ -220,16 +220,17 @@ fn insert(conn: &rusqlite::Connection, e: &Entry, now: i64) -> Result<bool> {
     Ok(true)
 }
 
-/// Embeds `subject: fact` into `memory_vec` for `id`; nothing when no model is installed.
-fn store_vec(conn: &rusqlite::Connection, id: &str, subject: &str, fact: &str) -> Result<()> {
-    if let Some(v) = embed_model::text(&format!("{subject}: {fact}")) {
-        let blob: Vec<u8> = v.iter().flat_map(|f| f.to_le_bytes()).collect();
-        conn.execute(
-            "INSERT OR REPLACE INTO memory_vec (id, v) VALUES (?1, ?2)",
-            params![id, blob],
-        )?;
-    }
-    Ok(())
+/// Embeds `subject: fact` into `memory_vec` for `id`; whether it did (false without a model).
+fn store_vec(conn: &rusqlite::Connection, id: &str, subject: &str, fact: &str) -> Result<bool> {
+    let Some(v) = embed_model::text(&format!("{subject}: {fact}")) else {
+        return Ok(false);
+    };
+    let blob: Vec<u8> = v.iter().flat_map(|f| f.to_le_bytes()).collect();
+    conn.execute(
+        "INSERT OR REPLACE INTO memory_vec (id, v) VALUES (?1, ?2)",
+        params![id, blob],
+    )?;
+    Ok(true)
 }
 
 /// Embeds up to `limit` held, live `remember`s that have no vector; how many it did. A no-op
@@ -241,6 +242,7 @@ pub fn embed_missing(store: &Store, limit: usize) -> Result<usize> {
     let rows: Vec<(String, String)> = {
         let mut stmt = store.conn().prepare(
             "SELECT id, entry FROM memory_entries WHERE tombstone = 0 AND entry IS NOT NULL
+             AND json_extract(entry, '$.op.t') = 'remember'
              AND id NOT IN (SELECT id FROM memory_vec) ORDER BY rowid LIMIT ?1",
         )?;
         let rows = stmt.query_map([limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
@@ -249,8 +251,9 @@ pub fn embed_missing(store: &Store, limit: usize) -> Result<usize> {
     let mut n = 0;
     for (id, body) in rows {
         if let Op::Remember { subject, fact, .. } = serde_json::from_str::<Entry>(&body)?.op {
-            store_vec(store.conn(), &id, &subject, &fact)?;
-            n += 1;
+            if store_vec(store.conn(), &id, &subject, &fact)? {
+                n += 1;
+            }
         }
     }
     Ok(n)
