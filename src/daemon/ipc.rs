@@ -552,8 +552,9 @@ fn memory_team(id: u64, body: &Value, daemon: &Arc<Daemon>, person: bool) -> Res
 }
 
 /// `memory.import {entries: [{subject, fact, kind, scope, when?, source, replaces?}]}` ->
-/// `{ids}`: the cloud member signs each as its own, in order. All are parsed before any is stored;
-/// a refused one (`secret:..`, `too_long`) stops the rest. An entry's `key` is stored as its
+/// `{ids, refused}`: the cloud member signs each as its own, in order. All are parsed before any
+/// is stored; a refused one (`secret:..`, `too_long`) is `null` in `ids` and `{index, reason}` in
+/// `refused`, and the rest go on. An entry's `key` is stored as its
 /// `source.session`, and one already held from our key answers with its id (idempotent).
 fn memory_import(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
     use crate::memory::{self, Op, Source};
@@ -592,43 +593,58 @@ fn memory_import(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
         return Response::err(id, BAD_REQUEST);
     };
     let store = daemon.store.lock().unwrap();
-    // A `key` already held from our own key is the same entry again (a replayed batch).
-    let Ok(held) = memory::entries(&store) else {
+    // key -> entry id, kept apart from the entries: a forgotten entry loses its body (and its
+    // key with it), but a replay of its key must still answer with its id.
+    let conn = store.conn();
+    if conn
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS memory_import_keys (key TEXT PRIMARY KEY, id TEXT NOT NULL)",
+        )
+        .is_err()
+    {
         return Response::err(id, INTERNAL);
-    };
-    let mut by_key: std::collections::HashMap<String, String> = held
-        .into_iter()
-        .filter(|e| e.author == daemon.identity.key)
-        .filter_map(|e| match e.op {
-            Op::Remember { source, .. } => Some((source.session?, e.id)),
-            _ => None,
-        })
-        .collect();
-    let mut ids = Vec::new();
-    for (op, key) in ops {
-        if let Some(held) = key.as_ref().and_then(|k| by_key.get(k)) {
-            ids.push(held.clone());
+    }
+    let (mut ids, mut refusals) = (Vec::new(), Vec::new());
+    for (index, (op, key)) in ops.into_iter().enumerate() {
+        let held: Option<String> = key.as_ref().and_then(|k| {
+            conn.query_row(
+                "SELECT id FROM memory_import_keys WHERE key = ?1",
+                [k],
+                |r| r.get(0),
+            )
+            .ok()
+        });
+        if held.is_some() {
+            ids.push(json!(held));
             continue;
         }
         match memory::remember(&store, &daemon.identity, op, now() as i64) {
             Ok(e) => {
                 if let Some(k) = key {
-                    by_key.insert(k, e.id.clone());
+                    if conn
+                        .execute(
+                            "INSERT INTO memory_import_keys (key, id) VALUES (?1, ?2)",
+                            [&k, &e.id],
+                        )
+                        .is_err()
+                    {
+                        return Response::err(id, INTERNAL);
+                    }
                 }
-                ids.push(e.id);
+                ids.push(json!(e.id));
             }
             Err(e) => {
                 let reason = e.to_string();
-                return if reason.starts_with("secret:") || reason == "too_long" {
-                    refused(id, &reason)
-                } else {
-                    Response::err(id, INTERNAL)
-                };
+                if !(reason.starts_with("secret:") || reason == "too_long") {
+                    return Response::err(id, INTERNAL);
+                }
+                ids.push(Value::Null);
+                refusals.push(json!({ "index": index, "reason": reason }));
             }
         }
     }
     daemon.peers.outbox.notify_one();
-    Response::ok(id, json!({ "ids": ids }))
+    Response::ok(id, json!({ "ids": ids, "refused": refusals }))
 }
 
 /// `memory.list {since_seq}` -> `{entries, next}`: up to 200 rows after `since_seq` in insertion

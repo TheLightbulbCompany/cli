@@ -796,3 +796,50 @@ async fn cloud_import_is_idempotent_on_key() {
     assert_eq!(l["entries"].as_array().unwrap().len(), 4, "{l}");
     assert_eq!(l["entries"][0]["op"]["source"]["session"], "rec1:h1");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cloud_import_continues_past_a_refused_entry() {
+    let home = tempfile::tempdir().unwrap();
+    let i = start(home.path(), &[], None).await;
+    let r = ok(
+        &i,
+        "memory.import",
+        json!({"entries": [imported("a", "one"),
+            imported("b", "key is sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789"),
+            imported("c", "three")]}),
+    )
+    .await;
+    assert!(
+        r["ids"][0].is_string() && r["ids"][1].is_null() && r["ids"][2].is_string(),
+        "{r}"
+    );
+    assert_eq!(r["refused"].as_array().unwrap().len(), 1, "{r}");
+    assert_eq!(r["refused"][0]["index"], 1);
+    assert!(
+        r["refused"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("secret:"),
+        "{r}"
+    );
+    assert_eq!(listed(&i, 0).await["entries"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cloud_import_key_of_forgotten_entry_returns_the_old_id() {
+    let home = tempfile::tempdir().unwrap();
+    let i = start(home.path(), &[], None).await;
+    let key = ok(&i, "identity.get", json!({})).await["member_key"].clone();
+    let mut a = imported("a", "one");
+    a["key"] = "rec1:h1".into();
+    let batch = json!({"entries": [a]});
+    let first = ok(&i, "memory.import", batch.clone()).await;
+    ok(&i, "memory.forget_author", json!({"author": key})).await;
+    let before = listed(&i, 0).await["entries"].as_array().unwrap().len();
+    let again = ok(&i, "memory.import", batch).await;
+    assert_eq!(again["ids"], first["ids"], "{again}");
+    assert_eq!(
+        listed(&i, 0).await["entries"].as_array().unwrap().len(),
+        before
+    );
+}
