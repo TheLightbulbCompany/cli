@@ -650,9 +650,12 @@ pub fn prepare(
         Some(r) => {
             let id: Option<String> = conn
                 .query_row(
-                    "SELECT id FROM messages WHERE id = ?1 OR (request_id = ?1 AND to_key = ?2) \
+                    // A cancel names the asker's own assignment by request id; any other
+                    // reply names a message sent to `from`.
+                    "SELECT id FROM messages WHERE id = ?1 OR (request_id = ?1 AND \
+                     CASE WHEN ?3 = 'cancel' THEN from_key ELSE to_key END = ?2) \
                      ORDER BY id = ?1 DESC, rowid DESC LIMIT 1",
-                    params![r, from.0],
+                    params![r, from.0, kind],
                     |x| x.get(0),
                 )
                 .optional()?;
@@ -2173,20 +2176,23 @@ mod tests {
     fn only_the_asker_may_cancel() {
         let (_d, s) = setup();
         let aid = assigned(&s, "r1");
-        let cancel = |from: &str, rid: &str| {
+        let cancel = |from: &str, rid: &str, reply_to: &str| {
             prep(
                 &s,
                 from,
                 None,
                 rid,
-                Some(&aid),
+                Some(reply_to),
                 "cancel",
                 Meta::default(),
                 101,
             )
         };
-        refused_for(cancel("a/claude:2", "r2"), "policy");
-        assert_eq!(go(cancel("a/codex:1", "r3")).kind, "cancel");
+        refused_for(cancel("a/claude:2", "r2", &aid), "policy");
+        // The asker names the assignment by its request id, or by its message id.
+        let p = go(cancel("a/codex:1", "r3", "r1"));
+        assert_eq!((p.kind.as_str(), p.reply_to), ("cancel", Some(aid.clone())));
+        assert_eq!(go(cancel("a/codex:1", "r4", &aid)).kind, "cancel");
     }
 
     #[test]
