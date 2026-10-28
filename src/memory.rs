@@ -458,13 +458,15 @@ fn replay(store: &Store) -> Result<Vec<Live>> {
 }
 
 /// What the team currently holds, newest first: the current and contested values, with what
-/// each replaced. `repo` keeps entries whose `source.repo` is it.
+/// each replaced. `repo` (`owner/name`) keeps entries whose `source.repo` is it, or is its bare
+/// `name` (what builds before the owner was in the key stored).
 pub fn facts(store: &Store, scope: Option<Scope>, repo: Option<&str>) -> Result<Vec<Fact>> {
+    let bare = repo.and_then(|r| r.rsplit('/').next());
     let mut out: Vec<Fact> = replay(store)?
         .into_iter()
         .filter(|l| l.fact.status != Status::Replaced)
         .filter(|l| scope.is_none_or(|s| s == l.fact.scope))
-        .filter(|l| repo.is_none_or(|r| l.repo.as_deref() == Some(r)))
+        .filter(|l| repo.is_none_or(|r| [Some(r), bare].contains(&l.repo.as_deref())))
         .map(|l| l.fact)
         .collect();
     out.reverse();

@@ -203,7 +203,7 @@ fn the_hook_reports_the_folders_repo_and_branch() {
     let s = &d["sessions"][0];
     assert_eq!(
         (&s["repo"], &s["branch"]),
-        (&json!("engine"), &json!("main")),
+        (&json!("acme/engine"), &json!("main")),
         "{d}"
     );
 }

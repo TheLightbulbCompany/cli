@@ -821,6 +821,17 @@ fn a_failing_memory_recall_still_hands_over_the_mail() {
     assert_eq!(text, frame_of("r1"));
 }
 
+/// A folder whose origin is `url`.
+fn repo_at(url: &str) -> tempfile::TempDir {
+    let d = repo_dir("x");
+    std::fs::write(
+        d.path().join(".git/config"),
+        format!("[remote \"origin\"]\n\turl = {url}\n"),
+    )
+    .unwrap();
+    d
+}
+
 #[test]
 fn a_session_in_a_subfolder_gets_the_repo_block() {
     let net = Net::new();
@@ -839,4 +850,34 @@ fn a_session_in_a_subfolder_gets_the_repo_block() {
     assert!(text.contains("ci: github actions"), "{text}");
     let repo = |c| net.session(&net.key("claude", c)).unwrap()["repo"].clone();
     assert_eq!(repo(B), repo(A));
+}
+
+#[test]
+fn the_repo_key_carries_the_owner() {
+    let net = Net::new();
+    let ours = repo_at("git@github.com:acme/api.git");
+    let theirs = repo_at("https://github.com/other/api");
+    let ours_https = repo_at("https://github.com/acme/api.git");
+    claude_hook(&net, "session-start", "SessionStart", A, ours.path());
+    assert_eq!(
+        net.session(&net.key("claude", A)).unwrap()["repo"],
+        "acme/api"
+    );
+    remember_in(&net, &net.key("claude", A), "ci", "github actions", "team");
+    // Another owner's `api` gets no block; the same repo cloned over https does.
+    let other = claude_hook(&net, "session-start", "SessionStart", B, theirs.path());
+    assert_eq!(other, "");
+    assert_eq!(
+        net.session(&net.key("claude", B)).unwrap()["repo"],
+        "other/api"
+    );
+    let c = "00000000-0000-4000-8000-0000000000c3";
+    let text = context(&claude_hook(
+        &net,
+        "session-start",
+        "SessionStart",
+        c,
+        ours_https.path(),
+    ));
+    assert!(text.contains("ci: github actions"), "{text}");
 }

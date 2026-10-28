@@ -481,7 +481,7 @@ fn sessions_list_shows_harness_repo_tokens() {
     assert_eq!(header, ["Id", "Agent", "Repo", "Started", "In", "Out"]);
     let row = list.lines().nth(1).unwrap();
     assert!(
-        row.contains("claude:c1") && row.contains("claude  app "),
+        row.contains("claude:c1") && row.contains("claude  acme/app "),
         "{row}"
     );
     assert!(row.ends_with("120  45"), "{row}");

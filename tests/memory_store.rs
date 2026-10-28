@@ -611,3 +611,23 @@ fn recall_without_a_model_is_exactly_the_keyword_ranking() {
     // bm25 order: the entry that says "database" twice first.
     assert_eq!(ids, vec![two.id, one.id]);
 }
+
+#[test]
+fn an_entry_under_a_bare_repo_name_still_reads() {
+    let a = identity();
+    let (_d, s) = team(&a);
+    let mut old = rem("db", "postgres 16", &[]);
+    if let Op::Remember { source, .. } = &mut old {
+        source.repo = Some("app".into());
+    }
+    memory::remember(&s, &a, old, 1).unwrap();
+    memory::remember(&s, &a, rem("ci", "actions", &[]), 2).unwrap();
+    let subjects = |r| -> Vec<String> {
+        let f = memory::facts(&s, None, Some(r)).unwrap();
+        f.into_iter().map(|f| f.subject).collect()
+    };
+    assert_eq!(subjects("acme/app"), ["ci", "db"]);
+    // The bare name has no owner: any owner's `app` reads it.
+    assert_eq!(subjects("other/app"), ["db"]);
+    assert!(subjects("acme/api").is_empty());
+}
