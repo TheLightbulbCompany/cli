@@ -1084,7 +1084,7 @@ mod tests {
             .execute_batch("PRAGMA user_version = 14;")
             .unwrap();
         let err = Store::open(&path).err().unwrap().to_string();
-        assert!(err.contains("State is from a newer version (v13)"), "{err}");
+        assert!(err.contains("State is from a newer version (v14)"), "{err}");
         assert_eq!(user_version(&path), 14);
     }
 }
