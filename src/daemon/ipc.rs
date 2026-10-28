@@ -489,12 +489,17 @@ fn memory_recall(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
     };
     facts.retain(|f| f.status != Status::Replaced);
     let page = memory::page(&store, &facts, &names, budget);
-    if let (Some(_), Some(session)) = (body["repo"].as_str(), body["session"].as_str()) {
-        let _ = store.set_memory_last(session, &page, now() as i64);
+    let block = memory::block(&page);
+    if let (Some(_), Some(session), false) = (
+        body["repo"].as_str(),
+        body["session"].as_str(),
+        block.is_empty(),
+    ) {
+        let _ = store.set_memory_last(session, &block, now() as i64);
     }
     Response::ok(
         id,
-        json!({ "page": page, "facts": facts.iter().map(fact_json).collect::<Vec<_>>() }),
+        json!({ "page": page, "block": block, "facts": facts.iter().map(fact_json).collect::<Vec<_>>() }),
     )
 }
 

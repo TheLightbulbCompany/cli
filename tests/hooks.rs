@@ -720,7 +720,12 @@ fn session_start_includes_memory_block_for_repo() {
             |r| r.get(0),
         )
         .unwrap();
-    assert!(block.contains("ci: github actions"));
+    assert_eq!(
+        block,
+        text.split_once("Memory (team and yours):")
+            .map(|(_, t)| format!("Memory (team and yours):{t}"))
+            .unwrap()
+    );
     assert_eq!(
         claude_hook(
             &net,
@@ -776,4 +781,31 @@ fn user_prompt_submit_never_includes_memory() {
     ] {
         assert_eq!(claude_hook(&net, event, name, A, cli.path()), "");
     }
+}
+
+#[test]
+fn a_failing_memory_recall_still_hands_over_the_mail() {
+    let net = Net::new();
+    let cli = repo_dir("cli");
+    claude_hook(&net, "session-start", "SessionStart", A, cli.path());
+    remember_in(&net, &net.key("claude", A), "db", "postgres 16", "team");
+    // Break the memory store under the running daemon: recall answers an error.
+    rusqlite::Connection::open(net.dir.path().join("state.db"))
+        .unwrap()
+        .execute_batch("DROP TRIGGER memory_ad; DROP TRIGGER memory_ai; DROP TABLE memory_entries;")
+        .unwrap();
+    assert_eq!(
+        net.call(json!({"id": 1, "op": "memory.recall", "question": ""}))["ok"],
+        false
+    );
+    net.send(&net.key("claude", B), "body r1", "r1");
+    // claude_hook asserts stderr is empty.
+    let text = context(&claude_hook(
+        &net,
+        "session-start",
+        "SessionStart",
+        B,
+        cli.path(),
+    ));
+    assert_eq!(text, frame_of("r1"));
 }

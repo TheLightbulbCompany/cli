@@ -411,6 +411,18 @@ pub fn refuse_secret(text: &str) -> Option<&'static str> {
 /// What an agent reads: `Contested:` lines, then `Current:`, then `Lessons:` (replaced facts
 /// left out), cut on a line boundary at `budget` chars. `names` maps a member key to the name
 /// shown (the short key when it is not there).
+/// The heading and the instruction line a session-start block carries around the page.
+pub const BLOCK_HEADING: &str = "Memory (team and yours):";
+pub const BLOCK_INSTRUCTION: &str = "Call `recall` when a task needs something a teammate may know; call `remember` when you finish a task or are told to remember. Personal unless the person says to share.";
+
+/// What a session is handed at its start; empty when there is no page.
+pub fn block(page: &str) -> String {
+    if page.is_empty() {
+        return String::new();
+    }
+    format!("{BLOCK_HEADING}\n{page}\n{BLOCK_INSTRUCTION}")
+}
+
 pub fn page(
     store: &Store,
     facts: &[Fact],
