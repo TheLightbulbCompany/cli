@@ -76,7 +76,7 @@ fn setup_writes_claude_hooks_and_mcp_and_backs_up_once() {
         [
             h.join(".claude/settings.json"),
             h.join(".claude.json"),
-            h.join(".claude/skills/lightbulb-network/SKILL.md")
+            h.join(".claude/skills/lightbulb/SKILL.md")
         ]
     );
 
@@ -149,7 +149,7 @@ fn setup_writes_codex_hooks_and_mcp_and_backs_up_once() {
         [
             h.join(".codex/hooks.json"),
             h.join(".codex/config.toml"),
-            h.join(".codex/skills/lightbulb-network/SKILL.md")
+            h.join(".codex/skills/lightbulb/SKILL.md")
         ]
     );
     let doc = json_at(h, ".codex/hooks.json");
@@ -1008,7 +1008,7 @@ fn codex_says_it_trusted_the_hooks() {
     let r = setup(home.path(), false);
     assert_eq!(
         agent(&r, "codex").line(),
-        "Codex: connected (hooks + tools); skill lightbulb-network. Its hook prompt was answered for you."
+        "Codex: connected (hooks + tools); skill lightbulb. Its hook prompt was answered for you."
     );
     // Said once: a second run has nothing new to trust.
     assert_eq!(
@@ -1093,19 +1093,22 @@ fn the_skill_is_installed_for_claude_and_codex_and_removed_with_setup() {
     for dir in [".claude", ".codex", ".cursor", ".grok", ".config/opencode"] {
         fs::create_dir_all(h.join(dir)).unwrap();
     }
+    // A skill an older build installed under its old name goes.
+    put(h, ".claude/skills/lightbulb-network/SKILL.md", "old");
     setup(h, false);
     assert!(!h.join(".config/opencode/skills").exists());
-    let rel = ".claude/skills/lightbulb-network/SKILL.md";
+    assert!(!h.join(".claude/skills/lightbulb-network").exists());
+    let rel = ".claude/skills/lightbulb/SKILL.md";
     let skill = get(h, rel);
-    assert!(skill.starts_with("---\nname: lightbulb-network\ndescription: "));
-    assert_eq!(get(h, ".codex/skills/lightbulb-network/SKILL.md"), skill);
+    assert!(skill.starts_with("---\nname: lightbulb\ndescription: "));
+    assert_eq!(get(h, ".codex/skills/lightbulb/SKILL.md"), skill);
     assert!(!h.join(".cursor/skills").exists() && !h.join(".grok/skills").exists());
     // A second run changes nothing; another tool's skills are left alone.
     put(h, ".claude/skills/other/SKILL.md", "mine");
     assert!(setup(h, false).agents[0].notes.is_empty());
     setup(h, true);
-    assert!(!h.join(".claude/skills/lightbulb-network").exists());
-    assert!(!h.join(".codex/skills/lightbulb-network").exists());
+    assert!(!h.join(".claude/skills/lightbulb").exists());
+    assert!(!h.join(".codex/skills/lightbulb").exists());
     assert_eq!(get(h, ".claude/skills/other/SKILL.md"), "mine");
 }
 

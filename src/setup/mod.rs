@@ -221,10 +221,18 @@ pub fn summary(connected: &[&str], cmd: &str) -> String {
 /// The agent skill that teaches the tool, installed for agents with a skills folder.
 const SKILL: &str = include_str!("SKILL.md");
 /// Where it lives under an agent's home folder (`~/.claude`, `~/.codex`).
-const SKILL_FILE: &str = "skills/lightbulb-network/SKILL.md";
+const SKILL_FILE: &str = "skills/lightbulb/SKILL.md";
+/// Where builds before the rename put it; removed whenever setup runs.
+const OLD_SKILL_FILE: &str = "skills/lightbulb-network/SKILL.md";
 
 /// Installs the skill under `agent_dir` (or, `remove`, deletes it and its folder when empty).
+/// A skill left by an older build under its old name goes either way.
 pub(crate) fn skill(ctx: &Ctx, agent_dir: &Path, r: &mut AgentReport) -> Result<()> {
+    let old = agent_dir.join(OLD_SKILL_FILE);
+    if fs::remove_file(&old).is_ok() {
+        r.wrote.push(old.clone());
+        let _ = fs::remove_dir(old.parent().unwrap()); // only if empty
+    }
     let file = agent_dir.join(SKILL_FILE);
     if ctx.remove {
         if fs::remove_file(&file).is_ok() {
@@ -237,7 +245,7 @@ pub(crate) fn skill(ctx: &Ctx, agent_dir: &Path, r: &mut AgentReport) -> Result<
         return Ok(());
     }
     write(&file, SKILL, false, r)?;
-    r.notes.push("skill lightbulb-network".into());
+    r.notes.push("skill lightbulb".into());
     Ok(())
 }
 

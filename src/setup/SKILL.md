@@ -1,5 +1,5 @@
 ---
-name: lightbulb-network
+name: lightbulb
 description: Use when you need to message, ask or hand work to another coding session (on this computer or a teammate's), read a reply, or invite or join a Lightbulb network.
 ---
 
