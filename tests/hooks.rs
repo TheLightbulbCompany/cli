@@ -1022,6 +1022,12 @@ fn a_stop_with_waiting_messages_hands_them_over_and_does_not_nudge() {
     net.send(&net.key("claude", A), "body r1", "r1");
     let out: Value = serde_json::from_str(&stop(&net, cwd.path())).unwrap();
     assert_eq!(out, json!({"decision": "block", "reason": frame_of("r1")}));
+    // The mail's Stop did not use up the nudge: the next one, with nothing waiting, has it.
+    let out: Value = serde_json::from_str(&stop(&net, cwd.path())).unwrap();
+    assert_eq!(
+        out,
+        json!({"decision": "block", "reason": lightbulb::hook::NUDGE})
+    );
 }
 
 #[test]

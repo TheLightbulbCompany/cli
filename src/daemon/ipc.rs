@@ -384,7 +384,8 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
             // the hook waits for a capture write.
             let person = op.starts_with("sessions.") && for_a_person();
             let r = capture_op(id, op, body, daemon, person);
-            if op == "capture.turn" || op == "capture.stop" {
+            // A Stop kicks it only when it carried a reply to embed.
+            if op == "capture.turn" || (op == "capture.stop" && body["text"].is_string()) {
                 embed_missing(daemon);
             }
             r
