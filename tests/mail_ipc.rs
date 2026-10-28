@@ -262,3 +262,105 @@ async fn a_peer_hanging_up_as_mail_arrives_never_loses_the_message() {
     }
     call(&mut l, &mut w, json!({"id": 4, "op": "shutdown"})).await;
 }
+
+#[tokio::test]
+async fn an_assignment_is_delivered_with_its_fields_and_its_reply_is_its_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let claude_home = tempfile::tempdir().unwrap();
+    std::env::set_var("LIGHTBULB_CONNECT_CLAUDE_HOME", claude_home.path());
+    let home = dir.path().to_path_buf();
+    tokio::spawn(async move { daemon::run(&home).await.unwrap() });
+    let sock = dir.path().join(paths::SOCKET);
+    let (mut l, mut w) = connect(&sock).await;
+    let birth = os::process(std::process::id()).unwrap().birth_micros;
+    let mut keys = vec![];
+    for (i, (provider, conv)) in [("codex", "a"), ("claude", "b")].into_iter().enumerate() {
+        let reg = call(
+            &mut l,
+            &mut w,
+            json!({"id": i + 1, "op": "register", "session": {
+            "provider": provider, "conversation": conv, "pid": std::process::id(),
+            "birth_micros": birth, "cwd": "/tmp"}}),
+        )
+        .await;
+        keys.push(reg["key"].as_str().unwrap().to_string());
+    }
+    let (a, b) = (keys[0].clone(), keys[1].clone());
+    let assign = |rid: &str, extra: Value| {
+        let mut m = json!({"id": 10, "op": "send", "from": a, "to": b, "kind": "assign",
+            "text": "x", "request_id": rid, "done_when": "y"});
+        for (k, v) in extra.as_object().unwrap() {
+            m[k] = v.clone();
+        }
+        m
+    };
+
+    let sent = call(
+        &mut l,
+        &mut w,
+        json!({"id": 3, "op": "send", "from": a, "to": b, "kind": "assign",
+        "text": "run the tests", "done_when": "suite green", "deadline_s": 120,
+        "request_id": "as1"}),
+    )
+    .await;
+    assert_eq!(sent["ok"], true);
+    assert_eq!(sent["receipt"]["state"], "stored");
+
+    let got = call(&mut l, &mut w, json!({"id": 4, "op": "inbox", "key": b})).await;
+    let m = &got["messages"][0];
+    assert_eq!(got["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(m["kind"], "assign");
+    assert_eq!(m["done_when"], "suite green");
+    let at = m["deadline_at"].as_i64().unwrap();
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    assert!((at - (t + 120)).abs() <= 5, "deadline_at {at} vs {t}");
+    let assign_id = m["id"].as_str().unwrap().to_string();
+
+    let sent = call(
+        &mut l,
+        &mut w,
+        json!({"id": 5, "op": "send", "from": b, "text": "all green",
+        "request_id": "re1", "reply_to": "as1"}),
+    )
+    .await;
+    assert_eq!(sent["receipt"]["state"], "stored");
+    let got = call(&mut l, &mut w, json!({"id": 6, "op": "inbox", "key": a})).await;
+    let m = &got["messages"][0];
+    assert_eq!(m["kind"], "result");
+    assert_eq!(m["status"], "done");
+    assert_eq!(m["reply_to"], assign_id);
+
+    let r = call(
+        &mut l,
+        &mut w,
+        json!({"id": 7, "op": "receipt", "from": a, "request_id": "as1"}),
+    )
+    .await;
+    assert_eq!(
+        r["receipt"]["result"],
+        json!({"request_id": "re1", "status": "done"})
+    );
+
+    for (rid, extra) in [
+        ("as2", json!({"deadline_s": 20000})),
+        ("as4", json!({"deadline_s": 0})),
+        ("as5", json!({"deadline_s": "soon"})),
+    ] {
+        let r = call(&mut l, &mut w, assign(rid, extra)).await;
+        assert_eq!(r["ok"], false, "{rid}");
+        assert_eq!(r["error"], "bad_request", "{rid}");
+    }
+    let r = call(
+        &mut l,
+        &mut w,
+        json!({"id": 11, "op": "send", "from": a, "to": b, "kind": "assign",
+        "text": "x", "request_id": "as3"}),
+    )
+    .await;
+    assert_eq!(r["receipt"]["state"], "refused");
+    assert_eq!(r["receipt"]["reason"], "bad_request");
+    call(&mut l, &mut w, json!({"id": 12, "op": "shutdown"})).await;
+}
