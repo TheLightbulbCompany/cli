@@ -273,6 +273,9 @@ pub fn run(agent: &str, event: &str, stdin: &str) -> Result<Option<String>> {
 /// How long the hook waits for each capture write's answer: capture never slows the agent.
 /// The daemon finishes a write it was not waited for.
 const CAPTURE_WAIT: Duration = Duration::from_millis(10);
+/// The one longer wait: a Stop's `capture.stop` that carries the session's `key` asks whether
+/// to nudge, and that answer is what the hook hands the agent.
+const NUDGE_WAIT: Duration = Duration::from_millis(250);
 
 /// Tells the daemon what this event adds to the local capture (`capture::*`, written by the
 /// daemon), on a connection of its own so a slow write holds nothing behind it. Any failure
@@ -294,20 +297,26 @@ fn capture(h: &Hook, payload: &Value, session: &Value) -> bool {
         .unwrap_or(false)
 }
 
-/// `try_capture` on `conn`, waiting at most `CAPTURE_WAIT` for each answer. Past it, one line
-/// says so and the rest of this event's capture is skipped (`None`); else whether to nudge.
+/// `try_capture` on `conn`, waiting at most `CAPTURE_WAIT` for each answer (`NUDGE_WAIT` for a
+/// Stop that asks whether to nudge). Past it, one line says so and the rest of this event's
+/// capture is skipped (`None`); else whether to nudge.
 fn capture_on(conn: &mut Conn, h: &Hook, payload: &Value, session: &Value) -> Option<bool> {
-    if conn.wait_up_to(CAPTURE_WAIT).is_err() {
+    let wait = if h.event == Event::Stop && session["key"].is_string() {
+        NUDGE_WAIT
+    } else {
+        CAPTURE_WAIT
+    };
+    if conn.wait_up_to(wait).is_err() {
         return Some(false);
     }
     match try_capture(conn, h, payload, session) {
         Ok(nudge) => Some(nudge),
-        Err(e) if e.to_string() == no_answer(CAPTURE_WAIT) => {
+        Err(e) if e.to_string() == no_answer(wait) => {
             eprintln!(
                 "lightbulb hook {} {}: capture took over {} ms; not waiting for it",
                 h.provider,
                 h.event.arg(),
-                CAPTURE_WAIT.as_millis()
+                wait.as_millis()
             );
             None
         }

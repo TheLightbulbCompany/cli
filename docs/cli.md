@@ -403,7 +403,7 @@ password or key is replaced by `[refused: <what it matched>]`. Sessions under a 
 (`lightbulb folder <path> off`, or a folder in your home folder whose name starts with a dot,
 such as `~/.config`) are not captured; a dot folder inside a repository, such as Claude Code's
 `.claude/worktrees`, is. Capture never slows the agent: a write the background service has not
-answered within 10 ms is not waited for (the service still makes it). An
+answered within 10 ms (250 ms for the end-of-turn answer that decides the nudge) is not waited for (the service still makes it). An
 `<ID>` is the id as `list` prints it, or its first characters. `list`, `show`, `forget` and
 `export` must be run from your own terminal; an agent's shell is refused.
 

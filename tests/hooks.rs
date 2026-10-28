@@ -21,10 +21,16 @@ struct Net {
 
 impl Net {
     fn new() -> Net {
+        Net::with_env(&[])
+    }
+
+    /// A daemon with `env` set too.
+    fn with_env(env: &[(&str, &str)]) -> Net {
         let dir = tempfile::tempdir().unwrap();
         let claude = tempfile::tempdir().unwrap();
         let daemon = Command::new(EXE)
             .arg("daemon")
+            .envs(env.iter().copied())
             .env("LIGHTBULB_CONNECT_DEBUG_NO_DEFAULT_RELAYS", "1")
             .env("LIGHTBULB_CONNECT_DEBUG_NO_TELEMETRY", "1")
             .env(paths::HOME_ENV, dir.path())
@@ -1051,23 +1057,26 @@ fn opencode_session_start_includes_the_memory_block() {
 }
 
 /// Runs the Claude hook `event` for conversation `A` in `cwd` with `extra` in its payload;
-/// returns stdout. Waits after, so the daemon has written what the hook sent before the next.
+/// returns stdout.
 fn claude_step(net: &Net, event: &str, extra: Value, cwd: &std::path::Path) -> String {
     let me = os::process(std::process::id()).unwrap();
     let mut payload = extra;
     payload["session_id"] = json!(A);
     payload["cwd"] = json!(cwd);
     let out = net.hook_raw("claude", event, payload.to_string().as_bytes(), Some(&me));
-    std::thread::sleep(Duration::from_millis(50));
     String::from_utf8(out.stdout).unwrap()
 }
 
+/// A tool call, then a wait: its hook waits 10 ms only, so the daemon has written it before the
+/// next step.
 fn tool_call(net: &Net, cwd: &std::path::Path) {
     let call = json!({"hook_event_name": "PostToolUse", "tool_name": "Bash",
         "tool_input": {"command": "ls"}});
     assert_eq!(claude_step(net, "post-tool-use", call, cwd), "");
+    std::thread::sleep(Duration::from_millis(50));
 }
 
+/// A Stop: its hook waits for the nudge answer, so no wait after.
 fn stop(net: &Net, cwd: &std::path::Path) -> String {
     claude_step(net, "stop", json!({"hook_event_name": "Stop"}), cwd)
 }
@@ -1076,6 +1085,7 @@ fn started(net: &Net) -> tempfile::TempDir {
     let cwd = tempfile::tempdir().unwrap();
     let start = json!({"hook_event_name": "SessionStart"});
     assert_eq!(claude_step(net, "session-start", start, cwd.path()), "");
+    std::thread::sleep(Duration::from_millis(50));
     cwd
 }
 
@@ -1123,4 +1133,27 @@ fn a_session_that_already_remembered_is_not_nudged() {
     tool_call(&net, cwd.path());
     remember_in(&net, &net.key("claude", A), "db", "postgres 16", "me");
     assert_eq!(stop(&net, cwd.path()), "");
+}
+
+/// A Stop that asks whether to nudge waits up to 250 ms for that answer, longer than the 10 ms
+/// every other capture call gets: a daemon 100 ms slow (`LIGHTBULB_CONNECT_DEBUG_CAPTURE_DELAY_MS`
+/// slows every capture op) still nudges, and the Stop's tokens are recorded.
+#[test]
+fn a_late_stop_answer_still_nudges() {
+    let net = Net::with_env(&[("LIGHTBULB_CONNECT_DEBUG_CAPTURE_DELAY_MS", "100")]);
+    let cwd = started(&net);
+    tool_call(&net, cwd.path());
+    let stop = json!({"hook_event_name": "Stop",
+        "usage": {"input_tokens": 7, "output_tokens": 3}});
+    let out: Value = serde_json::from_str(&claude_step(&net, "stop", stop, cwd.path())).unwrap();
+    assert_eq!(
+        out,
+        json!({"decision": "block", "reason": lightbulb::hook::NUDGE})
+    );
+    let db = lightbulb::store::Store::open(&net.dir.path().join("state.db")).unwrap();
+    let s = lightbulb::capture::sessions_since(&db, -1)
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!((s.prompt_tokens, s.completion_tokens), (Some(7), Some(3)));
 }
