@@ -682,7 +682,7 @@ fn setup_goes_on_without_the_model_and_no_model_skips_it() {
     assert!(!e.state.path().join("model").exists());
     let d = out(&e.run(&["doctor"]));
     assert!(
-        d.contains("Memory model         not installed (run lightbulb setup)"),
+        d.contains("Memory model         not installed (lightbulb setup downloads it; --no-model keeps it off)"),
         "{d}"
     );
 }
