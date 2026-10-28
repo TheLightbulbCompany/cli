@@ -1438,7 +1438,17 @@ pub(crate) fn send_as(
     let team = daemon.team.lock().unwrap();
     let store = daemon.store.lock().unwrap();
     let internal = |_| Response::err(id, INTERNAL);
-    let prepared = mail::prepare(&store, &from, to.as_ref(), text, rid, reply_to, now());
+    let prepared = mail::prepare(
+        &store,
+        &from,
+        to.as_ref(),
+        text,
+        rid,
+        reply_to,
+        "message",
+        mail::Meta::default(),
+        now(),
+    );
     let mut p = match prepared.map_err(internal)? {
         mail::Prep::Go(p) => p,
         mail::Prep::Done(r) => return Ok((from, r)),

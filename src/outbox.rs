@@ -152,7 +152,18 @@ mod tests {
 
     fn queue(s: &Store, now: u64) -> String {
         let (from, to) = (Key("a/codex:1".into()), Key("b/codex:2".into()));
-        let Prep::Go(p) = mail::prepare(s, &from, Some(&to), "hi", "r1", None, now).unwrap() else {
+        let Prep::Go(p) = mail::prepare(
+            s,
+            &from,
+            Some(&to),
+            "hi",
+            "r1",
+            None,
+            "message",
+            mail::Meta::default(),
+            now,
+        )
+        .unwrap() else {
             panic!("refused");
         };
         let id = p.message_id.clone();

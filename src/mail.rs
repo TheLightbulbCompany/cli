@@ -448,6 +448,7 @@ pub struct Prepared {
     pub thread: String,
     pub hops: i64,
     pub kind: String,
+    pub meta: Meta,
     pub sent_at: i64,
 }
 
@@ -484,7 +485,7 @@ impl From<&Prepared> for Message {
             body: p.text.clone(),
             sent_at: p.sent_at,
             reply_to: p.reply_to.clone(),
-            meta: Default::default(),
+            meta: p.meta.clone(),
         }
     }
 }
@@ -504,7 +505,7 @@ impl From<&Prepared> for Frame {
             body: p.text.clone(),
             files: vec![],
             sent_at: p.sent_at,
-            meta: Default::default(),
+            meta: p.meta.clone(),
         }
     }
 }
@@ -534,6 +535,67 @@ pub(crate) fn expires_for(to: &str, sent_at: i64) -> i64 {
     }
 }
 
+/// Whether `m` is an assignment addressed to `to`.
+fn answers_assign(m: &Message, to: &str) -> bool {
+    m.kind == "assign" && m.to_key == to
+}
+
+/// Whether `to` is `<member>/<provider>:new`: a request for a fresh worker session.
+pub fn is_new_worker(to: &str) -> bool {
+    sessions::split_addr(to)
+        .and_then(|(_, rest)| rest.strip_suffix(":new"))
+        .is_some_and(|p| sessions::PROVIDERS.contains(&p))
+}
+
+/// The rule for sending `kind` with `meta` as `from`, answering `parent`: `Err(reason)` is the
+/// refusal. An `assign` carries its terms (`done_when`, a deadline; `repo`/`branch` short); a
+/// `result` answers an assignment made to `from`, with a known status; a `cancel` is the
+/// asker's alone.
+pub(crate) fn check_kind(
+    kind: &str,
+    meta: &Meta,
+    parent: Option<&Message>,
+    from: &str,
+) -> std::result::Result<(), &'static str> {
+    let too_long = |v: &Option<String>, max| v.as_ref().is_some_and(|s| s.chars().count() > max);
+    match kind {
+        "message" => Ok(()),
+        "assign" => match &meta.done_when {
+            Some(d)
+                if !d.is_empty()
+                    && !too_long(&meta.done_when, 4_096)
+                    && meta.deadline_at.is_some()
+                    && !too_long(&meta.repo, 256)
+                    && !too_long(&meta.branch, 256) =>
+            {
+                Ok(())
+            }
+            _ => Err("bad_request"),
+        },
+        "result" => {
+            if !parent.is_some_and(|p| answers_assign(p, from)) {
+                return Err("policy");
+            }
+            let status = meta.status.as_deref();
+            let ok = matches!(status, None | Some("done" | "failed" | "cancelled"))
+                && match meta.reason.as_deref() {
+                    None => true,
+                    Some(r) => {
+                        status == Some("failed") && ["timed_out", "stopped", "error"].contains(&r)
+                    }
+                };
+            if ok {
+                Ok(())
+            } else {
+                Err("bad_request")
+            }
+        }
+        "cancel" if parent.is_some_and(|p| p.kind == "assign" && p.from_key == from) => Ok(()),
+        "cancel" => Err("policy"),
+        _ => Err("unsupported"),
+    }
+}
+
 /// Decides `from`'s message `request_id` before anything is stored: `Done` with the receipt
 /// when it is refused or already sent. With no `to`, it goes to the sender of the `reply_to`
 /// message (refused `no_recipient`, nothing stored, when that is unknown). Thread and hops:
@@ -547,6 +609,7 @@ pub(crate) fn expires_for(to: &str, sent_at: i64) -> i64 {
 /// stored). Retrying a `request_id` that was accepted returns its receipt; one that was
 /// refused (`loop`, `too_long`) is refused again, whatever text comes with the retry, because a
 /// refusal stores no `to`/`text`. Clients mint a new `request_id` after any refusal.
+#[allow(clippy::too_many_arguments)]
 pub fn prepare(
     store: &Store,
     from: &Key,
@@ -554,6 +617,8 @@ pub fn prepare(
     text: &str,
     request_id: &str,
     reply_to: Option<&str>,
+    kind: &str,
+    mut meta: Meta,
     now: u64,
 ) -> Result<Prep> {
     let conn = store.conn();
@@ -581,21 +646,27 @@ pub fn prepare(
         return unstored("bad_request_id"); // nothing safe to key a receipt on
     }
     // The message this answers: a message id, or a request id `from` received.
-    let parent: Option<(String, Option<String>, i64, String)> = match reply_to {
-        Some(r) => conn
-            .query_row(
-                "SELECT id, thread, hops, from_key FROM messages WHERE id = ?1 OR (request_id = ?1 AND to_key = ?2) \
-                 ORDER BY id = ?1 DESC, rowid DESC LIMIT 1",
-                params![r, from.0],
-                |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?, x.get(3)?)),
-            )
-            .optional()?,
+    let parent: Option<Message> = match reply_to {
+        Some(r) => {
+            let id: Option<String> = conn
+                .query_row(
+                    "SELECT id FROM messages WHERE id = ?1 OR (request_id = ?1 AND to_key = ?2) \
+                     ORDER BY id = ?1 DESC, rowid DESC LIMIT 1",
+                    params![r, from.0],
+                    |x| x.get(0),
+                )
+                .optional()?;
+            match id {
+                Some(id) => store.message(&id)?,
+                None => None,
+            }
+        }
         None => None,
     };
     // No recipient named: the reply goes to whoever sent the parent.
     let to = match (to, &parent) {
         (Some(t), _) => t.clone(),
-        (None, Some((_, _, _, sender))) => Key(sender.clone()),
+        (None, Some(p)) => Key(p.from_key.clone()),
         // Not persisted: a later message may make this reply_to known.
         (None, None) => return unstored("no_recipient"),
     };
@@ -623,9 +694,22 @@ pub fn prepare(
         return looped(RATE);
     }
 
+    if is_new_worker(&to.0) {
+        return refused("no_worker"); // plan 2 starts a worker here
+    }
+    // A plain message answering an assignment addressed to `from` is its result.
+    let mut kind = kind;
+    if kind == "message" && parent.as_ref().is_some_and(|p| answers_assign(p, &from.0)) {
+        kind = "result";
+        meta.status.get_or_insert_with(|| "done".into());
+    }
+    if let Err(reason) = check_kind(kind, &meta, parent.as_ref(), &from.0) {
+        return refused(reason);
+    }
+
     let id = ulid::Ulid::generate().to_string();
     let (thread, hops) = match &parent {
-        Some((pid, thread, hops, _)) => (thread.clone().unwrap_or(pid.clone()), hops + 1),
+        Some(p) => (p.thread.clone().unwrap_or(p.id.clone()), p.hops + 1),
         None => {
             // The trigger: the newest message delivered to `from` in the window. Hops carry on
             // from it even when the work is forwarded to a third session.
@@ -633,7 +717,8 @@ pub fn prepare(
                 .query_row(
                     &format!(
                         "SELECT m.id, m.thread, m.hops, m.from_key FROM messages m {MSG_RECEIPT} \
-                         WHERE m.to_key = ?1 AND r.state IN ('delivered', 'read') AND r.updated_at > ?2 \
+                         WHERE m.to_key = ?1 AND m.kind NOT IN ('result', 'cancel') \
+                         AND r.state IN ('delivered', 'read') AND r.updated_at > ?2 \
                          ORDER BY r.updated_at DESC, m.rowid DESC LIMIT 1"
                     ),
                     params![from.0, since],
@@ -660,10 +745,11 @@ pub fn prepare(
         to,
         text: text.into(),
         request_id: request_id.into(),
-        reply_to: parent.map(|(pid, ..)| pid),
+        reply_to: parent.map(|p| p.id),
         thread,
         hops,
-        kind: "message".into(),
+        kind: kind.into(),
+        meta,
         sent_at: now as i64,
     }))
 }
@@ -750,7 +836,17 @@ pub fn send(
     reply_to: Option<&str>,
     now: u64,
 ) -> Result<Receipt> {
-    match prepare(store, from, to, text, request_id, reply_to, now)? {
+    match prepare(
+        store,
+        from,
+        to,
+        text,
+        request_id,
+        reply_to,
+        "message",
+        Meta::default(),
+        now,
+    )? {
         Prep::Go(p) => store_local(store, &p),
         Prep::Done(r) => Ok(r),
     }
@@ -874,6 +970,7 @@ pub fn receive(
         thread: thread.clone().unwrap_or_else(|| id.clone()),
         hops,
         kind: kind.clone(),
+        meta: Meta::default(), // task 4 reads the envelope's meta
         sent_at: now as i64,
     };
     let tx = store.conn().unchecked_transaction()?;
@@ -1912,5 +2009,268 @@ mod tests {
             note(serde_json::json!({"state": "stored", "reason": "approved by m/claude-1"})),
             "Sent. It waits until that session is back. Approved by m/claude-1."
         );
+    }
+
+    fn terms(done_when: &str, deadline: i64) -> Meta {
+        Meta {
+            done_when: Some(done_when.into()),
+            deadline_at: Some(deadline),
+            ..Default::default()
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prep(
+        s: &Store,
+        from: &str,
+        to: Option<&str>,
+        rid: &str,
+        reply_to: Option<&str>,
+        kind: &str,
+        meta: Meta,
+        now: u64,
+    ) -> Prep {
+        let to = to.map(k);
+        prepare(
+            s,
+            &k(from),
+            to.as_ref(),
+            "t",
+            rid,
+            reply_to,
+            kind,
+            meta,
+            now,
+        )
+        .unwrap()
+    }
+
+    fn go(p: Prep) -> Prepared {
+        match p {
+            Prep::Go(p) => p,
+            Prep::Done(r) => panic!("refused: {r:?}"),
+        }
+    }
+
+    fn refused_for(p: Prep, reason: &str) {
+        match p {
+            Prep::Done(r) => assert_eq!(
+                (r.state, r.reason.as_deref()),
+                (State::Refused, Some(reason))
+            ),
+            Prep::Go(p) => panic!("expected {reason}, got {p:?}"),
+        }
+    }
+
+    /// Stores an assign a/codex:1 -> a/claude:2 as request `rid`; returns its message id.
+    fn assigned(s: &Store, rid: &str) -> String {
+        let p = go(prep(
+            s,
+            "a/codex:1",
+            Some("a/claude:2"),
+            rid,
+            None,
+            "assign",
+            terms("tests pass", 10),
+            100,
+        ));
+        store_local(s, &p).unwrap();
+        p.message_id
+    }
+
+    #[test]
+    fn an_assign_needs_done_when_and_a_deadline() {
+        let (_d, s) = setup();
+        let bare = prep(
+            &s,
+            "a/codex:1",
+            Some("a/claude:2"),
+            "r1",
+            None,
+            "assign",
+            Meta::default(),
+            100,
+        );
+        refused_for(bare, "bad_request");
+        let p = go(prep(
+            &s,
+            "a/codex:1",
+            Some("a/claude:2"),
+            "r2",
+            None,
+            "assign",
+            terms("x", 10),
+            100,
+        ));
+        assert_eq!(p.kind, "assign");
+        assert_eq!(p.meta.deadline_at, Some(10));
+    }
+
+    #[test]
+    fn a_reply_to_an_assignment_is_its_result_marked_done() {
+        let (_d, s) = setup();
+        let aid = assigned(&s, "r1");
+        let p = go(prep(
+            &s,
+            "a/claude:2",
+            None,
+            "r2",
+            Some("r1"),
+            "message",
+            Meta::default(),
+            101,
+        ));
+        assert_eq!(p.kind, "result");
+        assert_eq!(p.meta.status.as_deref(), Some("done"));
+        assert_eq!(p.hops, 1);
+        assert_eq!(p.reply_to, Some(aid));
+    }
+
+    #[test]
+    fn a_reply_to_someone_elses_assignment_stays_a_message() {
+        let (_d, s) = setup();
+        let aid = assigned(&s, "r1");
+        let p = go(prep(
+            &s,
+            "a/cursor:3",
+            Some("a/codex:1"),
+            "r2",
+            Some(&aid),
+            "message",
+            Meta::default(),
+            101,
+        ));
+        assert_eq!(p.kind, "message");
+        assert!(p.meta.is_empty());
+    }
+
+    #[test]
+    fn a_result_with_a_bad_status_is_refused() {
+        let (_d, s) = setup();
+        assigned(&s, "r1");
+        let with = |rid: &str, status: &str, reason: Option<&str>| {
+            prep(
+                &s,
+                "a/claude:2",
+                None,
+                rid,
+                Some("r1"),
+                "result",
+                Meta {
+                    status: Some(status.into()),
+                    reason: reason.map(Into::into),
+                    ..Default::default()
+                },
+                101,
+            )
+        };
+        refused_for(with("r2", "maybe", None), "bad_request");
+        refused_for(with("r3", "failed", Some("bored")), "bad_request");
+        assert_eq!(go(with("r4", "failed", Some("timed_out"))).kind, "result");
+    }
+
+    #[test]
+    fn only_the_asker_may_cancel() {
+        let (_d, s) = setup();
+        let aid = assigned(&s, "r1");
+        let cancel = |from: &str, rid: &str| {
+            prep(
+                &s,
+                from,
+                None,
+                rid,
+                Some(&aid),
+                "cancel",
+                Meta::default(),
+                101,
+            )
+        };
+        refused_for(cancel("a/claude:2", "r2"), "policy");
+        assert_eq!(go(cancel("a/codex:1", "r3")).kind, "cancel");
+    }
+
+    #[test]
+    fn a_new_worker_address_is_refused_no_worker_in_plan_one() {
+        let (_d, s) = setup();
+        let p = prep(
+            &s,
+            "a/claude:2",
+            Some("a/codex:new"),
+            "r1",
+            None,
+            "assign",
+            terms("x", 10),
+            100,
+        );
+        refused_for(p, "no_worker");
+        assert!(is_new_worker("a/codex:new"));
+        assert!(!is_new_worker("a/codex:1"));
+        assert!(!is_new_worker("a/other:new"));
+    }
+
+    #[test]
+    fn results_and_cancels_are_not_hop_triggers() {
+        let (_d, s) = setup();
+        let a = go(prep(
+            &s,
+            "a/codex:1",
+            Some("a/claude:2"),
+            "r1",
+            None,
+            "assign",
+            terms("x", 10),
+            100,
+        ));
+        assert_eq!(a.hops, 0);
+        store_local(&s, &a).unwrap();
+        let res = go(prep(
+            &s,
+            "a/claude:2",
+            None,
+            "r2",
+            Some("r1"),
+            "result",
+            Meta::default(),
+            101,
+        ));
+        assert_eq!(res.hops, 1);
+        store_local(&s, &res).unwrap();
+        take(&s, &k("a/codex:1"), 102).unwrap();
+        let next = go(prep(
+            &s,
+            "a/codex:1",
+            Some("a/claude:2"),
+            "r3",
+            None,
+            "assign",
+            terms("y", 10),
+            103,
+        ));
+        assert_eq!(next.hops, 0);
+        // Control: a plain message delivered to codex is a trigger.
+        let (_d2, s2) = setup();
+        let m = go(prep(
+            &s2,
+            "a/claude:2",
+            Some("a/codex:1"),
+            "q1",
+            None,
+            "message",
+            Meta::default(),
+            100,
+        ));
+        store_local(&s2, &m).unwrap();
+        take(&s2, &k("a/codex:1"), 101).unwrap();
+        let after = go(prep(
+            &s2,
+            "a/codex:1",
+            Some("a/claude:2"),
+            "q2",
+            None,
+            "message",
+            Meta::default(),
+            102,
+        ));
+        assert_eq!(after.hops, 1);
     }
 }
