@@ -408,6 +408,29 @@ fn refuse(
     })
 }
 
+/// The terms of an assignment and its result, stored with the message as JSON.
+#[derive(Default, Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Meta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub done_when: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl Meta {
+    pub fn is_empty(&self) -> bool {
+        *self == Meta::default()
+    }
+}
+
 /// A message decided and ready to store: here (`send`, `receive`) or in the outbox
 /// (`outbox::enqueue`).
 #[derive(Debug, Clone, PartialEq)]
@@ -457,6 +480,8 @@ impl From<&Prepared> for Message {
             origin: Some("local".into()),
             body: p.text.clone(),
             sent_at: p.sent_at,
+            reply_to: p.reply_to.clone(),
+            meta: Default::default(),
         }
     }
 }
