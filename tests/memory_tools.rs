@@ -156,7 +156,7 @@ fn turns(e: &common::Env, turns: &[(&str, &str)]) {
 fn recall_returns_an_excerpt_from_a_turn() {
     let e = daemon();
     let long = format!(
-        "rotate the staging deploy keys\nwith the vault script {}",
+        "rotate the staging deploy keys \r\n  with the vault script {}",
         "é".repeat(300)
     );
     turns(&e, &[("user", "nothing to see here"), ("assistant", &long)]);
@@ -203,4 +203,31 @@ fn a_refused_turn_is_never_returned() {
     let r = recall(&e, "refused credential", None);
     assert_eq!(r["turns"], json!([]), "{r}");
     assert!(!r["page"].as_str().unwrap().contains("refused"), "{r}");
+}
+
+#[test]
+fn turns_from_another_repo_are_not_recalled() {
+    let e = daemon();
+    for (c, repo) in [("c1", "acme/one"), ("c2", "acme/two")] {
+        let start = json!({"id": 3, "op": "capture.session_start", "harness": "claude",
+            "conversation": c, "cwd": format!("/tmp/{c}"), "repo": repo});
+        assert_eq!(e.ask(start)["stored"], true);
+        let r = e.ask(json!({"id": 4, "op": "capture.turn", "harness": "claude",
+            "conversation": c, "role": "user", "text": format!("deploy {repo} today")}));
+        assert_eq!(r["stored"], true, "{r}");
+    }
+    let r =
+        e.ask(json!({"id": 2, "op": "memory.recall", "question": "deploy", "repo": "acme/one"}));
+    let t = r["turns"].as_array().unwrap();
+    assert_eq!(t.len(), 1, "{r}");
+    assert_eq!(t[0]["session"], "claude:c1");
+    assert!(!r["page"].as_str().unwrap().contains("acme/two"), "{r}");
+    // A caller with no repo searches every turn on this computer.
+    assert_eq!(
+        recall(&e, "deploy", None)["turns"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
 }

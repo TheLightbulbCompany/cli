@@ -299,7 +299,8 @@ pub fn turns(store: &Store, session_id: &str) -> Result<Vec<Turn>> {
 /// Longest excerpt of a turn `recall` shows, in characters.
 pub const EXCERPT_MAX: usize = 240;
 
-/// A turn that matched a `recall` question: its first `EXCERPT_MAX` characters, one line.
+/// A turn that matched a `recall` question: its first `EXCERPT_MAX` characters, each run of
+/// whitespace one space.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TurnHit {
     pub session: String,
@@ -318,9 +319,14 @@ impl TurnHit {
 }
 
 /// The best `limit` of this computer's turns for `query`: bm25 over `turns_fts`, fused with the
-/// cosine order of `turns_vec` when there is a model (`memory::fuse`). A refused turn is never
-/// a candidate.
-pub fn search_turns(store: &Store, query: &str, limit: usize) -> Result<Vec<TurnHit>> {
+/// cosine order of `turns_vec` when there is a model (`memory::fuse`). With `repo`, only the
+/// turns of sessions in that repo; every turn without one. A refused turn is never a candidate.
+pub fn search_turns(
+    store: &Store,
+    query: &str,
+    repo: Option<&str>,
+    limit: usize,
+) -> Result<Vec<TurnHit>> {
     use crate::memory::{fts_query, fuse, unblob};
     let Some(q) = fts_query(query) else {
         return Ok(Vec::new());
@@ -328,20 +334,24 @@ pub fn search_turns(store: &Store, query: &str, limit: usize) -> Result<Vec<Turn
     let conn = store.conn();
     let mut stmt = conn.prepare(
         "SELECT t.rowid FROM turns_fts JOIN capture_turns t ON t.rowid = turns_fts.rowid
+         JOIN capture_sessions s ON s.id = t.session_id
          WHERE turns_fts MATCH ?1 AND substr(t.text, 1, length(?2)) != ?2
-         ORDER BY bm25(turns_fts) LIMIT ?3",
+         AND (?3 IS NULL OR s.repo = ?3 COLLATE NOCASE)
+         ORDER BY bm25(turns_fts) LIMIT ?4",
     )?;
     let ids: Vec<String> = stmt
-        .query_map(rusqlite::params![q, REFUSED, limit], |r| {
+        .query_map(rusqlite::params![q, REFUSED, repo, limit], |r| {
             Ok(r.get::<_, i64>(0)?.to_string())
         })?
         .collect::<rusqlite::Result<_>>()?;
     let vecs = || -> Result<Vec<(String, Vec<f32>)>> {
         let mut stmt = conn.prepare(
             "SELECT v.turn, v.v FROM turns_vec v JOIN capture_turns t ON t.rowid = v.turn
-             WHERE substr(t.text, 1, length(?1)) != ?1",
+             JOIN capture_sessions s ON s.id = t.session_id
+             WHERE substr(t.text, 1, length(?1)) != ?1
+             AND (?2 IS NULL OR s.repo = ?2 COLLATE NOCASE)",
         )?;
-        let rows = stmt.query_map([REFUSED], |r| {
+        let rows = stmt.query_map(rusqlite::params![REFUSED, repo], |r| {
             Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
         })?;
         let mut out = Vec::new();
@@ -364,7 +374,9 @@ pub fn search_turns(store: &Store, query: &str, limit: usize) -> Result<Vec<Turn
                     role: r.get(2)?,
                     at: r.get(4)?,
                     excerpt: text
-                        .replace(['\r', '\n'], " ")
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
                         .chars()
                         .take(EXCERPT_MAX)
                         .collect(),
