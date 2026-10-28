@@ -3,6 +3,7 @@
 //! that needs to hand-build frames plays one member itself over its own endpoint (`Peer`).
 
 use lightbulb::identity::Identity;
+use lightbulb::mail::MAX_HOPS;
 use lightbulb::net::frames::Frame;
 use lightbulb::roster::{self, Entry};
 use serde_json::json;
@@ -466,7 +467,7 @@ async fn ack_from_a_third_member_is_ignored() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn fourth_hop_and_thirteenth_send_are_refused_loop() {
+async fn hop_limit_and_thirteenth_send_are_refused_loop() {
     let (a, b) = (Env::new(), Env::new());
     let [_, admitted] = seed_pair(&a, &b);
     let c = identity();
@@ -474,12 +475,12 @@ async fn fourth_hop_and_thirteenth_send_are_refused_loop() {
     admit(&b, &a.identity(), &admitted, &c);
     common::start_pair(&a, &b, "", &[]);
 
-    // With reply_to: hops 0, 1, 2, 3 go; the fourth agent reply is refused.
+    // With reply_to: hops 0 to MAX_HOPS - 1 go; the reply at MAX_HOPS is refused.
     let (sa, sb) = (session(&a, "a1"), session(&b, "b1"));
     a.send(&sa, &sb, "h0", "h0", None);
     let ends = [(&b, &sb, &sa), (&a, &sa, &sb)];
     let mut first = String::new(); // A's first message, by id
-    for hop in 1..=4 {
+    for hop in 1..=MAX_HOPS as usize {
         let (me, at, there) = ends[(hop - 1) % 2];
         let m = me.take_one(at);
         assert_eq!(m["hops"], hop - 1);
@@ -494,7 +495,7 @@ async fn fourth_hop_and_thirteenth_send_are_refused_loop() {
             &rid,
             Some(m["request_id"].as_str().unwrap()),
         );
-        if hop < 4 {
+        if hop < MAX_HOPS as usize {
             wait_state(me, at, &rid, "stored");
         } else {
             assert_eq!(
@@ -505,19 +506,19 @@ async fn fourth_hop_and_thirteenth_send_are_refused_loop() {
     }
 
     // A forward chain without reply_to, through new sessions each time.
-    let chain: Vec<(&Env, String)> = (0..6)
+    let chain: Vec<(&Env, String)> = (0..MAX_HOPS as usize + 2)
         .map(|i| {
             let e = if i % 2 == 0 { &a } else { &b };
             (e, session(e, &format!("f{i}")))
         })
         .collect();
     chain[0].0.send(&chain[0].1, &chain[1].1, "go", "f0", None);
-    for i in 1..=4 {
+    for i in 1..=MAX_HOPS as usize {
         let (me, at) = (chain[i].0, &chain[i].1);
         assert_eq!(me.take_one(at)["hops"], i - 1);
         let rid = format!("f{i}");
         let r = me.send(at, &chain[i + 1].1, "pass it on", &rid, None);
-        if i < 4 {
+        if i < MAX_HOPS as usize {
             wait_state(me, at, &rid, "stored");
         } else {
             assert_eq!(r["reason"], "loop", "{r}");
@@ -534,7 +535,7 @@ async fn fourth_hop_and_thirteenth_send_are_refused_loop() {
     }
     assert_eq!(a.send(&s1, &s2, "x", "t12", None)["reason"], "loop");
 
-    // The recipient's own checks, against a member the test plays: hops 4, and the
+    // The recipient's own checks, against a member the test plays: hops at MAX_HOPS, and the
     // thirteenth from one person, whatever session it comes from.
     let ep = endpoint(&c).await;
     let mut p = Peer::dial(&ep, &a).await;
@@ -543,7 +544,7 @@ async fn fourth_hop_and_thirteenth_send_are_refused_loop() {
     let id = ulid();
     let mut f = envelope(&id, "deep", &format!("{}/codex:d", c.short), &to, "x");
     if let Frame::Envelope { hops, .. } = &mut f {
-        *hops = 4;
+        *hops = MAX_HOPS as u32;
     }
     p.send(&f).await;
     assert_eq!(p.ack(&id).await, ("refused".into(), Some("loop".into())));

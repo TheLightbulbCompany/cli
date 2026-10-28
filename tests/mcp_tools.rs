@@ -2,6 +2,7 @@
 //! The calling agent is pinned with LIGHTBULB_CONNECT_HOOK_CALLER (debug builds only),
 //! since the test runner is not an agent.
 
+use lightbulb::mail::MAX_HOPS;
 use lightbulb::{os, paths};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Lines, Write};
@@ -881,20 +882,27 @@ fn loop_refusals_name_their_limit_here_and_on_a_teammate() {
     let x = format!("{}/codex:x", a.short());
     let mut m = mcp_on(&a, &me());
 
-    // Here: the fourth agent reply in a chain.
+    // Here: the agent reply past MAX_HOPS in a chain.
     a.send(&mine, &x, "x", "h0", None);
-    a.send(&x, &mine, "x", "h1", Some("h0"));
-    a.send(&mine, &x, "x", "h2", Some("h1"));
-    a.send(&x, &mine, "x", "h3", Some("h2"));
+    for i in 1..MAX_HOPS {
+        let (from, to) = if i % 2 == 1 { (&x, &mine) } else { (&mine, &x) };
+        a.send(
+            from,
+            to,
+            "x",
+            &format!("h{i}"),
+            Some(&format!("h{}", i - 1)),
+        );
+    }
     let v = m
         .tool(
             "send_message",
-            json!({"request_id": "h4", "text": "x", "reply_to": "h3"}),
+            json!({"request_id": format!("h{MAX_HOPS}"), "text": "x", "reply_to": format!("h{}", MAX_HOPS - 1)}),
         )
         .json();
     assert_eq!(v["limit"], "hops", "{v}");
     assert_eq!(
-        v["note"], "paused after 3 agent replies; a person must speak",
+        v["note"], "paused after 19 agent replies; a person must speak",
         "{v}"
     );
 

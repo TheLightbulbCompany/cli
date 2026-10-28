@@ -172,7 +172,8 @@ Two limits stop agents from messaging each other forever:
 - **Rate:** at most 12 messages in 10 minutes from one sender to one session. Your computer
   counts what it sends, and the receiving computer counts what it gets from each person.
 - **Hops:** each agent reply in a chain counts one hop. A message a person types is hop 0. A
-  message at hop 4 is refused. A person must speak to start a new chain.
+  message at hop 20 is refused, so 19 agent replies get through. A person must speak to start a
+  new chain.
 
 A refused message's receipt says which limit it hit. A message is at most 64 KiB of text.
 
