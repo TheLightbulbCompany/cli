@@ -153,6 +153,26 @@ struct InboxArgs {
     wait_secs: u32,
 }
 
+/// The rows of a directory listing that are always-on agents: online, at a name address
+/// (`<member>/<name>`, never a terminal or a coding session), each marked `always_on`.
+fn always_on(short: &str, sessions: Vec<Value>) -> Vec<Value> {
+    (sessions.into_iter())
+        .filter(|s| {
+            s["online"] == true
+                && s["session_id"].as_str().is_some_and(|id| {
+                    matches!(
+                        crate::frame::Sender::of(short, id),
+                        crate::frame::Sender::Name(_)
+                    )
+                })
+        })
+        .map(|mut s| {
+            s["always_on"] = true.into();
+            s
+        })
+        .collect()
+}
+
 /// The calling session, resolved, and every live session as the daemon sees them.
 struct Call {
     me: Process,
@@ -825,22 +845,10 @@ impl Server {
             Ok(r) => r,
             Err(e) => return fail(internal(e)),
         };
-        let found: Vec<Value> = (r["sessions"].as_array().into_iter().flatten())
-            .filter(|s| {
-                s["online"] == true
-                    && s["session_id"].as_str().is_some_and(|id| {
-                        matches!(
-                            crate::frame::Sender::of(&short, id),
-                            crate::frame::Sender::Name(_)
-                        )
-                    })
-            })
-            .cloned()
-            .map(|mut s| {
-                s["always_on"] = true.into();
-                s
-            })
-            .collect();
+        let found = always_on(
+            &short,
+            r["sessions"].as_array().cloned().unwrap_or_default(),
+        );
         let total = found.len();
         let sessions: Vec<Value> = found.into_iter().take(a.limit as usize).collect();
         Self::done(&call, json!({ "sessions": sessions, "total": total })).await
@@ -1004,6 +1012,20 @@ const INSTRUCTIONS: &str = "These tools message the other coding sessions (Claud
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn always_on_keeps_online_name_rows_only() {
+        let rows = vec![
+            json!({"session_id": "abc/friday", "online": true}),
+            json!({"session_id": "abc/claude:1", "online": true}),
+            json!({"session_id": "abc/sleepy", "online": false}),
+            json!({"session_id": "abc/terminal", "online": true}),
+        ];
+        assert_eq!(
+            always_on("abc", rows),
+            vec![json!({"session_id": "abc/friday", "online": true, "always_on": true})]
+        );
+    }
 
     #[test]
     fn git_reads_origin_repo_and_branch_also_from_a_linked_worktree() {
