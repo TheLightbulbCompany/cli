@@ -1,6 +1,7 @@
 pub mod admission;
 pub mod agents;
 pub mod app_send;
+pub mod capture;
 pub mod cli;
 pub mod code;
 pub mod config;
@@ -19,6 +20,7 @@ pub mod login;
 pub mod mail;
 pub mod mcp;
 pub mod member;
+pub mod memory;
 pub mod net;
 pub mod os;
 pub mod outbox;
@@ -33,5 +35,6 @@ pub mod store;
 pub mod streams;
 pub mod telemetry;
 pub mod ticket;
+pub mod upload;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;

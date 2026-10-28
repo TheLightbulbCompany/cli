@@ -101,6 +101,12 @@ impl Env {
             .env_remove("LIGHTBULB_CONNECT_DEBUG_RELAY_ONLY")
             .envs(env.iter().map(|(k, v)| (k, v)))
             .stdin(Stdio::null());
+        // `pin`: the daemon takes this test process for an agent above its callers, as one the
+        // CLI starts on first use inherits it. Without it an "agent shell" test only passes when
+        // the tests themselves run under an agent.
+        if let Some(pin) = &self.pin {
+            c.env("LIGHTBULB_CONNECT_HOOK_CALLER", pin);
+        }
         if env
             .iter()
             .any(|(k, _)| *k == "LIGHTBULB_CONNECT_DEBUG_OSASCRIPT")
@@ -539,6 +545,11 @@ impl Peer {
 
     /// A `hello` showing sign-in proof `proof` (`common::issuer::proof`).
     pub async fn hello_with(&mut self, heads: Vec<String>, proof: Option<String>) {
+        self.hello_full(heads, proof, false).await;
+    }
+
+    /// A `hello` that also says whether this peer syncs memory.
+    pub async fn hello_full(&mut self, heads: Vec<String>, proof: Option<String>, memory: bool) {
         let protocol = PROTOCOL;
         let addrs = vec![];
         self.send(&Frame::Hello {
@@ -546,6 +557,7 @@ impl Peer {
             heads,
             addrs,
             proof,
+            memory,
         })
         .await;
     }
@@ -699,4 +711,90 @@ pub fn line(sock: &std::path::Path, token: &str, op: &str, body: Value) -> Value
     let mut answer = String::new();
     BufReader::new(s).read_line(&mut answer).unwrap();
     serde_json::from_str(&answer).unwrap_or_else(|_| panic!("{op}: {answer:?}"))
+}
+
+/// A request the stub Lightbulb API (`api_stub`) got.
+#[derive(Clone, Debug)]
+pub struct Req {
+    pub method: String,
+    pub path: String,
+    /// Lowercased header names.
+    pub headers: Vec<(String, String)>,
+    pub body: Value,
+    /// The body as sent.
+    pub raw: String,
+}
+
+impl Req {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        let name = name.to_lowercase();
+        self.headers
+            .iter()
+            .find(|(k, _)| *k == name)
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+pub type Seen = std::sync::Arc<std::sync::Mutex<Vec<Req>>>;
+
+/// A stub Lightbulb API on loopback answering each request with `answer(&req, n)` (`n`: how
+/// many requests to that method and path came before): `(status, json)`. Its base URL (for
+/// `LIGHTBULB_API`) and what it saw.
+pub fn api_stub(answer: impl Fn(&Req, usize) -> (u16, Value) + Send + 'static) -> (String, Seen) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let seen: Seen = Default::default();
+    let log = seen.clone();
+    std::thread::spawn(move || {
+        for s in listener.incoming() {
+            let mut s = s.unwrap();
+            let mut r = BufReader::new(s.try_clone().unwrap());
+            let mut first = String::new();
+            r.read_line(&mut first).unwrap();
+            let mut parts = first.split(' ');
+            let method = parts.next().unwrap_or_default().to_string();
+            let path = parts.next().unwrap_or_default().to_string();
+            let (mut len, mut headers) = (0, vec![]);
+            loop {
+                let mut h = String::new();
+                r.read_line(&mut h).unwrap();
+                if h == "\r\n" {
+                    break;
+                }
+                if let Some((k, v)) = h.trim_end().split_once(':') {
+                    let (k, v) = (k.to_lowercase(), v.trim().to_string());
+                    if k == "content-length" {
+                        len = v.parse().unwrap();
+                    }
+                    headers.push((k, v));
+                }
+            }
+            let mut body = vec![0; len];
+            r.read_exact(&mut body).unwrap();
+            let req = Req {
+                method,
+                path,
+                headers,
+                body: serde_json::from_slice(&body).unwrap_or(Value::Null),
+                raw: String::from_utf8_lossy(&body).into_owned(),
+            };
+            let n = {
+                let mut l = log.lock().unwrap();
+                let n = l
+                    .iter()
+                    .filter(|q| q.method == req.method && q.path == req.path)
+                    .count();
+                l.push(req.clone());
+                n
+            };
+            let (code, v) = answer(&req, n);
+            let text = v.to_string();
+            let _ = write!(
+                s,
+                "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
+                text.len()
+            );
+        }
+    });
+    (base, seen)
 }

@@ -16,9 +16,11 @@
 //! each `hello` and every second.
 
 pub mod frames;
+mod memsync;
 
 use crate::daemon::{ipc, net_ops, Daemon, TeamState};
 use crate::mail::{self, State};
+use crate::memory;
 use crate::roster::{self, Entry, Roster};
 use crate::sessions::Key;
 use crate::Result;
@@ -26,12 +28,16 @@ use crate::{holds, identity, outbox, relay};
 use frames::Frame;
 use iroh::endpoint::{presets, Connection, VarInt};
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMode, RelayUrl, SecretKey, Watcher};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, Notify};
+
+/// Whether a peer's out-of-range memory head for our key was logged (`memory::saw`).
+static ABSURD_HEAD: AtomicBool = AtomicBool::new(false);
 
 pub const ALPN: &[u8] = b"lightbulb/1";
 pub const JOIN_ALPN: &[u8] = b"lightbulb/join/1";
@@ -258,6 +264,12 @@ struct Link {
     /// The member key that dialed this connection.
     dialer: String,
     protocol: Protocol,
+    /// Its last `hello` said it syncs memory.
+    memory: bool,
+    /// The heads last sent here (`MemoryHeads` goes out only when ours differ), and what the
+    /// peer is known to hold: its last heads, plus what we pushed since.
+    heads_sent: Option<BTreeMap<String, u64>>,
+    peer_heads: BTreeMap<String, u64>,
 }
 
 /// What a link's peer said in its last `hello`.
@@ -488,6 +500,9 @@ impl Peers {
             tx: tx.clone(),
             dialer: dialer.to_string(),
             protocol: Protocol::Unknown,
+            memory: false,
+            heads_sent: None,
+            peer_heads: BTreeMap::new(),
         };
         live.insert(key.to_string(), link);
         true
@@ -497,6 +512,51 @@ impl Peers {
     fn speaks_ours(&self, key: &str, conn: &Connection) -> bool {
         current(&mut self.live.lock().unwrap(), key, conn)
             .is_some_and(|l| matches!(l.protocol, Protocol::Ok(_)))
+    }
+
+    /// The links that said `hello` in our protocol with `memory`.
+    fn memory_links(&self) -> Vec<(String, Connection, Tx, BTreeMap<String, u64>)> {
+        let live = self.live.lock().unwrap();
+        live.iter()
+            .filter(|(_, l)| l.memory && matches!(l.protocol, Protocol::Ok(_)))
+            .map(|(k, l)| {
+                (
+                    k.clone(),
+                    l.conn.clone(),
+                    l.tx.clone(),
+                    l.peer_heads.clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// Sends `ours` as `MemoryHeads` on `key`'s link unless it was the last heads sent there:
+    /// a side says its heads once per change, so two sides never answer each other forever.
+    fn send_heads(&self, key: &str, conn: &Connection, ours: &BTreeMap<String, u64>) {
+        self.with_link(key, conn, |l| {
+            if l.heads_sent.as_ref() != Some(ours) {
+                l.heads_sent = Some(ours.clone());
+                eprintln!("net: sent memory heads to {}", short(key));
+                let heads = ours.clone();
+                let _ = l.tx.send((Frame::MemoryHeads { heads }, None));
+            }
+        });
+    }
+
+    /// Records that `key`'s peer holds `heads` (and `ours` where we pushed or kept back).
+    fn peer_holds(&self, key: &str, conn: &Connection, heads: &BTreeMap<String, u64>) {
+        self.with_link(key, conn, |l| {
+            for (a, n) in heads {
+                let h = l.peer_heads.entry(a.clone()).or_default();
+                *h = (*h).max(*n);
+            }
+        });
+    }
+
+    /// Whether `key`'s link is still `conn`, said `hello` in our protocol and syncs memory.
+    fn speaks_memory(&self, key: &str, conn: &Connection) -> bool {
+        current(&mut self.live.lock().unwrap(), key, conn)
+            .is_some_and(|l| l.memory && matches!(l.protocol, Protocol::Ok(_)))
     }
 
     /// Runs `f` on `key`'s link if it is still `conn`.
@@ -632,6 +692,7 @@ impl Net {
         tokio::spawn(net.clone().keep_up());
         tokio::spawn(net.clone().flush_loop());
         tokio::spawn(net.clone().relay_loop());
+        tokio::spawn(net.clone().memory_loop());
         Ok(net)
     }
 
@@ -720,6 +781,42 @@ impl Net {
             for key in to_dial {
                 tokio::spawn(self.clone().dial(key));
             }
+        }
+    }
+
+    /// Each second our heads have moved (a local `remember`, or a page accepted from another
+    /// peer), tells every memory peer (once per change, `send_heads`) and pushes it what it is
+    /// not known to hold. A new link gets the same at its `hello`.
+    async fn memory_loop(self) {
+        let d = &self.0.daemon;
+        let mut last = None;
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {}
+                _ = self.0.endpoint.closed() => return,
+            }
+            let dd = d.clone();
+            let ours =
+                tokio::task::spawn_blocking(move || memory::heads(&dd.store.lock().unwrap()));
+            let Ok(Ok(ours)) = ours.await else { continue };
+            if last.as_ref() == Some(&ours) {
+                continue;
+            }
+            if last.replace(ours.clone()).is_none() {
+                continue; // links up now were told at their `hello`
+            }
+            let dd = d.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                for (key, conn, tx, theirs) in dd.peers.memory_links() {
+                    dd.peers.send_heads(&key, &conn, &ours);
+                    match memsync::send_pages(&dd, &tx, &theirs, memsync::same_person(&dd, &key)) {
+                        Ok(ours) => dd.peers.peer_holds(&key, &conn, &ours),
+                        Err(e) => eprintln!("net: memory pages: {e}"),
+                    }
+                }
+            })
+            .await;
         }
     }
 
@@ -988,6 +1085,7 @@ impl Net {
         let mut hello_ok = false;
         let (mut presence, mut envelope, mut answer) = (None, None, None);
         let mut grant = None;
+        let (mut send_memory_heads, mut memory_heads, mut memory_entries) = (false, None, None);
         if let Err(why) = frames::from_peer_ok(&f, peer, d) {
             d.peers.dropped(f.kind());
             eprintln!("net: dropped a {} frame from {short} ({why})", f.kind());
@@ -996,6 +1094,7 @@ impl Net {
             heads,
             addrs,
             proof,
+            memory,
         } = f
         {
             // Its person, as Lightbulb signed it (`proof::admitted` verifies it when it counts).
@@ -1017,10 +1116,17 @@ impl Net {
                 return false;
             }
             push_delta(tx, &team.roster, &heads, &mut HashMap::new(), false);
-            d.peers
-                .with_link(key, conn, |l| l.protocol = Protocol::Ok(heads));
+            d.peers.with_link(key, conn, |l| {
+                l.protocol = Protocol::Ok(heads);
+                l.memory = memory;
+            });
             d.peers.connected.notify_waiters();
             hello_ok = true;
+            send_memory_heads = memory;
+        } else if let Frame::MemoryHeads { heads } = f {
+            memory_heads = Some(heads);
+        } else if let Frame::Memory { entries, .. } = f {
+            memory_entries = Some(entries);
         } else if let Frame::Roster { entries, more } = f {
             sync.page.extend(entries);
             // A sync is applied once, at its last page (or when it alone would overflow).
@@ -1058,10 +1164,48 @@ impl Net {
         // Outside `team`: ours may need a build (transcripts, git files: off the async
         // threads); storing theirs takes `store`.
         if hello_ok {
-            let (d, tx) = (d.clone(), tx.clone());
+            let (d, tx, key, conn) = (d.clone(), tx.clone(), key.to_string(), conn.clone());
             tokio::task::spawn_blocking(move || {
+                // Before the presence, so a peer without `memory` is proven to get none.
+                if send_memory_heads {
+                    match memory::heads(&d.store.lock().unwrap()) {
+                        Ok(ours) => d.peers.send_heads(&key, &conn, &ours),
+                        Err(e) => eprintln!("net: memory heads: {e}"),
+                    }
+                }
                 let _ = tx.send((crate::presence::for_hello(&d), None));
             });
+        }
+        if let Some(theirs) = memory_heads.filter(|_| d.peers.speaks_memory(key, conn)) {
+            let (d, tx, key, conn) = (d.clone(), tx.clone(), key.to_string(), conn.clone());
+            tokio::task::spawn_blocking(move || {
+                // What the peer holds of ours numbers our next entry (`memory::saw`).
+                if let Some(&n) = theirs.get(&d.identity.key) {
+                    match memory::saw(&d.store.lock().unwrap(), &d.identity.key, n) {
+                        Ok(true) => {}
+                        // Said once per daemon: a peer repeats its heads.
+                        Ok(false) if !ABSURD_HEAD.swap(true, Ordering::Relaxed) => {
+                            eprintln!(
+                                "net: ignored a peer's memory head for our key ({n}): out of range"
+                            );
+                        }
+                        Ok(false) => {}
+                        Err(e) => eprintln!("net: memory seen: {e}"),
+                    }
+                }
+                // No answer with our own heads: they are sent when they change.
+                match memsync::send_pages(&d, &tx, &theirs, memsync::same_person(&d, &key)) {
+                    Ok(ours) => {
+                        d.peers.peer_holds(&key, &conn, &theirs);
+                        d.peers.peer_holds(&key, &conn, &ours);
+                    }
+                    Err(e) => eprintln!("net: memory pages: {e}"),
+                }
+            });
+        }
+        if let Some(entries) = memory_entries.filter(|_| d.peers.speaks_memory(key, conn)) {
+            let (d, short) = (d.clone(), short.clone());
+            tokio::task::spawn_blocking(move || memsync::store(&d, &short, &entries));
         }
         if let Some(p) = presence.filter(|_| d.peers.speaks_ours(key, conn)) {
             let first = !std::mem::replace(&mut sync.presence_stored, true);
@@ -1290,6 +1434,7 @@ fn hello(r: &Roster, protocol: u32, addrs: Vec<String>, proof: Option<String>) -
         heads: r.heads.clone(),
         addrs,
         proof,
+        memory: true,
     }
 }
 

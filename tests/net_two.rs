@@ -348,6 +348,7 @@ async fn older_protocol_is_reported_not_served() {
         heads: vec![],
         addrs: vec![],
         proof: None,
+        memory: false,
     })
     .await;
     assert!(matches!(p.recv().await, Frame::Hello { .. }));

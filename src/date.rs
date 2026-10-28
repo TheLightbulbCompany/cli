@@ -20,14 +20,28 @@ pub fn utc(secs: i64) -> String {
     )
 }
 
+/// `t` broken down in local time; `None` when there is none to be had (an out-of-range time).
+fn local_tm(t: i64) -> Option<libc::tm> {
+    // SAFETY: `tm` is plain data, and `localtime_r` writes only the one we pass it.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let ok = !unsafe { libc::localtime_r(&(t as libc::time_t), &mut tm) }.is_null();
+    ok.then_some(tm)
+}
+
+/// `secs` as local `D Mon` (`15 Sep`); the UTC date when there is no local time.
+pub fn day(secs: i64) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    match local_tm(secs) {
+        Some(t) => format!("{} {}", t.tm_mday, MONTHS[t.tm_mon.clamp(0, 11) as usize]),
+        None => utc(secs)[..10].to_string(),
+    }
+}
+
 /// `secs` in local time: `HH:MM`, after the date (`YYYY-MM-DD HH:MM`) when it is not today.
 pub fn local_time(secs: i64) -> String {
-    let tm = |t: i64| {
-        // SAFETY: `tm` is plain data, and `localtime_r` writes only the one we pass it.
-        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-        let ok = !unsafe { libc::localtime_r(&(t as libc::time_t), &mut tm) }.is_null();
-        ok.then_some(tm)
-    };
+    let tm = local_tm;
     // No local time to be had (an out-of-range time): UTC says it truthfully.
     let (Some(t), Some(today)) = (tm(secs), tm(crate::daemon::ipc::now() as i64)) else {
         return utc(secs);

@@ -178,6 +178,10 @@ impl Caller {
 /// are its `EmbedOpts`, it asks no one (`ui.claim`), and it stops by `Instance::shutdown`.
 const NOT_ON_AN_INSTANCE: [&str; 3] = ["reload", "ui.claim", "shutdown"];
 
+/// What only an instance does: the workspace's memory ops on its cloud member. `memory.list`
+/// is one of them when it carries `since_seq` (without, it is the person's `memory list`).
+const ONLY_ON_AN_INSTANCE: [&str; 2] = ["memory.import", "memory.forget_author"];
+
 /// The fields of an `inbox` record an agent (MCP `check_inbox`) or an instance's caller is
 /// handed.
 pub const INBOX_RECORD: [&str; 11] = [
@@ -202,10 +206,17 @@ pub fn inbox_record(v: &Value) -> Value {
         .collect()
 }
 
+/// (tests) Milliseconds the daemon holds each `capture.*` op before doing it; debug builds only.
+const CAPTURE_DELAY_ENV: &str = "LIGHTBULB_CONNECT_DEBUG_CAPTURE_DELAY_MS";
+
 /// One op, from `caller`: every person-only op refuses without a person.
 pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: Caller) -> Response {
     let instance = caller == Caller::Instance;
     if instance && NOT_ON_AN_INSTANCE.contains(&op) {
+        return Response::err(id, UNSUPPORTED);
+    }
+    let cloud_list = op == "memory.list" && body.get("since_seq").is_some();
+    if !instance && (ONLY_ON_AN_INSTANCE.contains(&op) || cloud_list) {
         return Response::err(id, UNSUPPORTED);
     }
     // Admitted for an instance's caller; for a socket, a person only (asked only when needed:
@@ -352,6 +363,41 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
             },
             None => Response::err(id, BAD_REQUEST),
         },
+        "sessions.upload" => sessions_upload(id, body, daemon, for_a_person()),
+        "capture.session_start"
+        | "capture.tool_call"
+        | "capture.stop"
+        | "capture.session_end"
+        | "sessions.list"
+        | "sessions.show"
+        | "sessions.forget"
+        | "sessions.export" => {
+            // Debug builds only: a daemon slow to answer capture writes (tests).
+            let slow =
+                crate::cli::test_env(CAPTURE_DELAY_ENV).and_then(|v| v.to_str()?.parse().ok());
+            if let Some(ms) = slow.filter(|_| op.starts_with("capture.")) {
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+            }
+            // Asked only for `sessions.*`: the walk of the peer's process tree is slower than
+            // the hook waits for a capture write.
+            let person = op.starts_with("sessions.") && for_a_person();
+            capture_op(id, op, body, daemon, person)
+        }
+        // `person` -> `{}` for a person's terminal, else refused: a command that settles
+        // something elsewhere first (`memory approve`) asks before it acts.
+        "person" if for_a_person() => Response::ok(id, json!({})),
+        "person" => refused(id, "not_a_person"),
+        "memory.remember" => {
+            memory_remember(id, body, daemon, instance, !instance && for_a_person())
+        }
+        "memory.recall" => memory_recall(id, body, daemon),
+        // Takes the team lock and no store lock; `memory_manage` reads the team first.
+        "memory.team" => memory_team(id, body, daemon, for_a_person()),
+        "memory.import" => memory_import(id, body, daemon),
+        "memory.forget_author" => memory_forget_author(id, body, daemon),
+        "memory.list" if cloud_list => memory_list_since(id, body, daemon),
+        "memory.list" | "memory.show" | "memory.forget" | "memory.share" | "memory.last"
+        | "memory.export" => memory_manage(id, op, body, daemon, for_a_person()),
         "team.leave" => super::net_ops::leave(id, daemon, for_a_person()).await,
         "holds" | "hold.get" | "hold.answer" | "hold.file" => {
             crate::holds::op(id, op, body, daemon, caller)
@@ -368,6 +414,591 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
             r
         }
         op => super::net_ops::handle(id, op, body, daemon, caller),
+    }
+}
+
+fn fact_json(f: &crate::memory::Fact) -> Value {
+    json!({
+        "id": f.id, "subject": f.subject, "value": f.value, "kind": f.kind, "scope": f.scope,
+        "author": f.author, "when": f.when,
+        "status": format!("{:?}", f.status).to_lowercase(),
+        "history": f.history.iter().map(|(id, v, w)| json!({"id": id, "value": v, "when": w})).collect::<Vec<_>>(),
+    })
+}
+
+/// `memory.remember {subject, fact, kind, scope?, replaces?, when?, session?}` ->
+/// `{stored, entry_id?, neighbours, refused?}`: stores a signed entry, with the harness and repo
+/// of `session` (an MCP caller's key) as its source. `neighbours` are the current facts on the
+/// subject from before this one. A secret or an oversize entry is `stored: false` with `refused`.
+/// On an instance (the workspace) the source is `workspace`, on behalf of `on_behalf_of`.
+fn memory_remember(
+    id: u64,
+    body: &Value,
+    daemon: &Arc<Daemon>,
+    instance: bool,
+    person: bool,
+) -> Response {
+    use crate::memory::{self, Kind, Op, Scope, Source, Status};
+    let (Some(subject), Some(fact), Ok(kind)) = (
+        body["subject"].as_str(),
+        body["fact"].as_str(),
+        serde_json::from_value::<Kind>(body["kind"].clone()),
+    ) else {
+        return Response::err(id, BAD_REQUEST);
+    };
+    let scope = match body.get("scope") {
+        None | Some(Value::Null) => Ok(Scope::Me),
+        Some(v) => serde_json::from_value(v.clone()),
+    };
+    let replaces: Result<Vec<String>, _> = match body.get("replaces") {
+        None | Some(Value::Null) => Ok(vec![]),
+        Some(v) => serde_json::from_value(v.clone()),
+    };
+    let (Ok(scope), Ok(replaces)) = (scope, replaces) else {
+        return Response::err(id, BAD_REQUEST);
+    };
+    if subject.trim().is_empty() {
+        return refused(id, "no_subject");
+    }
+    if scope == Scope::Team && !daemon.team.lock().unwrap().config.memory_team {
+        return Response::ok(id, json!({ "stored": false, "refused": "team_off" }));
+    }
+    let session = body["session"].as_str().map(String::from);
+    let found = session
+        .as_deref()
+        .and_then(|k| live_sessions(daemon).into_iter().find(|s| s.key.0 == k));
+    // A person's terminal names the source itself (`memory approve`: the cloud evaluator).
+    let named = person
+        .then(|| serde_json::from_value::<Source>(body["source"].clone()).ok())
+        .flatten();
+    let source = named.unwrap_or_else(|| Source {
+        harness: if instance {
+            "workspace".into()
+        } else {
+            found
+                .as_ref()
+                .map_or("unknown".into(), |s| crate::frame::agent_name(&s.provider))
+        },
+        repo: found.and_then(|s| s.repo),
+        session,
+        on_behalf_of: body["on_behalf_of"]
+            .as_str()
+            .filter(|_| instance)
+            .map(String::from),
+        shared_from: None,
+    });
+    let op = Op::Remember {
+        subject: subject.into(),
+        fact: fact.into(),
+        kind,
+        scope,
+        when: body["when"].as_i64(),
+        source,
+        replaces,
+    };
+    let store = daemon.store.lock().unwrap();
+    let neighbours: Vec<Value> = memory::search(&store, subject, 5)
+        .unwrap_or_default()
+        .iter()
+        .filter(|f| f.status != Status::Replaced)
+        .map(fact_json)
+        .collect();
+    match memory::remember(&store, &daemon.identity, op, now() as i64) {
+        Ok(e) => Response::ok(
+            id,
+            json!({ "stored": true, "entry_id": e.id, "neighbours": neighbours }),
+        ),
+        Err(e) => {
+            let reason = e.to_string();
+            if reason.starts_with("secret:") || reason == "too_long" {
+                Response::ok(
+                    id,
+                    json!({ "stored": false, "refused": reason, "neighbours": neighbours }),
+                )
+            } else {
+                Response::err(id, INTERNAL)
+            }
+        }
+    }
+}
+
+/// Local capture. The hooks send `capture.session_start {harness, conversation, cwd, repo?,
+/// branch?}`, `capture.tool_call {harness, conversation, tool, args, duration_ms?, ok?}`,
+/// `capture.stop {harness, conversation, prompt_tokens?, completion_tokens?}` and
+/// `capture.session_end {harness, conversation, prompt_tokens?, completion_tokens?}` -> `{stored}`. A person reads and deletes:
+/// `sessions.list` -> `{sessions}`, `sessions.show {session}` -> `{session, tool_calls}`,
+/// `sessions.forget {session}` -> `{}`, `sessions.export` -> `{sessions: [{..., tool_calls}]}`.
+fn capture_op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, person: bool) -> Response {
+    use crate::capture;
+    let bad = Response::err(id, BAD_REQUEST);
+    let who = |b: &Value| match (b["harness"].as_str(), b["conversation"].as_str()) {
+        (Some(h), Some(c)) if !h.is_empty() && !c.is_empty() => Some(format!("{h}:{c}")),
+        _ => None,
+    };
+    // Team before store, never the other way round.
+    let (computer, hidden) = {
+        let t = daemon.team.lock().unwrap();
+        let cwd = body["cwd"].as_str();
+        (
+            t.config.computer.clone(),
+            cwd.is_some_and(|c| presence::hidden(&t.off, c)),
+        )
+    };
+    let store = daemon.store.lock().unwrap();
+    let r: crate::Result<Value> = (|| match op {
+        "capture.session_start" => {
+            let (Some(sid), Some(cwd)) = (who(body), body["cwd"].as_str()) else {
+                return Err("bad".into());
+            };
+            let row = capture::SessionRow {
+                id: sid,
+                harness: body["harness"].as_str().unwrap_or_default().into(),
+                computer,
+                repo: body["repo"].as_str().map(String::from),
+                branch: body["branch"].as_str().map(String::from),
+                started: now() as i64,
+                ended: None,
+                prompt_tokens: None,
+                completion_tokens: None,
+            };
+            let stored = !hidden && capture::start_session(&store, &row, cwd)?;
+            Ok(json!({ "stored": stored }))
+        }
+        "capture.tool_call" => {
+            let (Some(sid), Some(tool)) = (who(body), body["tool"].as_str()) else {
+                return Err("bad".into());
+            };
+            let stored = capture::record_tool_call(
+                &store,
+                &sid,
+                tool,
+                body["args"].as_str().unwrap_or_default(),
+                body["duration_ms"].as_i64(),
+                body["ok"].as_bool().unwrap_or(true),
+            )?;
+            Ok(json!({ "stored": stored }))
+        }
+        "capture.stop" => {
+            let Some(sid) = who(body) else {
+                return Err("bad".into());
+            };
+            capture::set_tokens(
+                &store,
+                &sid,
+                body["prompt_tokens"].as_i64(),
+                body["completion_tokens"].as_i64(),
+            )?;
+            Ok(json!({}))
+        }
+        "capture.session_end" => {
+            let Some(sid) = who(body) else {
+                return Err("bad".into());
+            };
+            // The hook's one call at the end carries the transcript's totals, when it had any.
+            let tokens = (
+                body["prompt_tokens"].as_i64(),
+                body["completion_tokens"].as_i64(),
+            );
+            capture::set_tokens(&store, &sid, tokens.0, tokens.1)?;
+            capture::end_session(&store, &sid, now() as i64)?;
+            Ok(json!({}))
+        }
+        _ if !person => Err("not_a_person".into()),
+        "sessions.list" => Ok(json!({ "sessions": capture::sessions_since(&store, -1)? })),
+        "sessions.show" | "sessions.forget" => {
+            let Some(s) = capture::find(&store, body["session"].as_str().unwrap_or_default())?
+            else {
+                return Err("not_found".into());
+            };
+            if op == "sessions.forget" {
+                capture::forget(&store, &s.id)?;
+                return Ok(json!({}));
+            }
+            Ok(json!({ "session": s, "tool_calls": capture::tool_calls(&store, &s.id, true)? }))
+        }
+        _ => {
+            let mut all = vec![];
+            for s in capture::sessions_since(&store, -1)? {
+                let mut j = serde_json::to_value(&s)?;
+                j["tool_calls"] = serde_json::to_value(capture::tool_calls(&store, &s.id, true)?)?;
+                all.push(j);
+            }
+            Ok(json!({ "sessions": all }))
+        }
+    })();
+    match r {
+        Ok(v) => Response::ok(id, v),
+        Err(e) if e.to_string() == "bad" => bad,
+        Err(e) if e.to_string() == "not_a_person" => refused(id, "not_a_person"),
+        Err(e) if e.to_string() == "not_found" => Response::err(id, NOT_FOUND),
+        Err(e) if e.to_string() == "ambiguous" => Response::err(id, "ambiguous"),
+        Err(_) => Response::err(id, INTERNAL),
+    }
+}
+
+/// `memory.recall {question, budget_chars?, repo?, session?}` -> `{page, facts}`: what the team holds
+/// that matches `question` (all of it when empty, or only `repo`'s, team facts first), as the page
+/// an agent reads and as facts. With `repo` and `session` (a session-start hook) the page is kept
+/// for `memory last`.
+fn memory_recall(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
+    use crate::memory::{self, Status};
+    let Some(q) = body["question"].as_str() else {
+        return Response::err(id, BAD_REQUEST);
+    };
+    let budget = body["budget_chars"].as_u64().map_or(1_600, |b| b as usize);
+    let names = member_names(daemon);
+    let store = daemon.store.lock().unwrap();
+    let found = if q.trim().is_empty() {
+        let repo = body["repo"].as_str();
+        memory::facts(&store, None, repo).map(|mut f| {
+            if repo.is_some() {
+                f.sort_by_key(|f| f.scope != memory::Scope::Team);
+            }
+            f
+        })
+    } else {
+        memory::search(&store, q, 50)
+    };
+    let Ok(mut facts) = found else {
+        return Response::err(id, INTERNAL);
+    };
+    facts.retain(|f| f.status != Status::Replaced);
+    let page = memory::page(&store, &facts, &names, budget);
+    let block = memory::block(&page);
+    if let (Some(_), Some(session), false) = (
+        body["repo"].as_str(),
+        body["session"].as_str(),
+        block.is_empty(),
+    ) {
+        let _ = store.set_memory_last(session, &block, now() as i64);
+    }
+    Response::ok(
+        id,
+        json!({ "page": page, "block": block, "facts": facts.iter().map(fact_json).collect::<Vec<_>>() }),
+    )
+}
+
+/// Member key -> the name shown for it.
+fn member_names(daemon: &Daemon) -> std::collections::HashMap<String, String> {
+    daemon
+        .team
+        .lock()
+        .unwrap()
+        .roster
+        .members
+        .values()
+        .map(|m| (m.key.clone(), m.name.clone()))
+        .collect()
+}
+
+/// `sessions.upload {mode}` -> `{}`: a person chooses what is uploaded (`upload::MODES`).
+fn sessions_upload(id: u64, body: &Value, daemon: &Arc<Daemon>, person: bool) -> Response {
+    if !person {
+        return refused(id, "not_a_person");
+    }
+    let Some(mode) = body["mode"]
+        .as_str()
+        .filter(|m| crate::upload::MODES.contains(m))
+    else {
+        return Response::err(id, BAD_REQUEST);
+    };
+    match crate::upload::set_mode(&daemon.dir, mode) {
+        Ok(()) => Response::ok(id, json!({})),
+        Err(_) => Response::err(id, INTERNAL),
+    }
+}
+
+/// `memory.team {on}` -> `{}`: a person turns team memory on or off.
+fn memory_team(id: u64, body: &Value, daemon: &Arc<Daemon>, person: bool) -> Response {
+    if !person {
+        return refused(id, "not_a_person");
+    }
+    let Some(on) = body["on"].as_bool() else {
+        return Response::err(id, BAD_REQUEST);
+    };
+    match crate::config::Config::set(&daemon.dir, "memory_team", &on.to_string())
+        .and_then(|_| super::net_ops::reload(daemon))
+    {
+        Ok(_) => Response::ok(id, json!({})),
+        Err(_) => Response::err(id, INTERNAL),
+    }
+}
+
+/// `memory.import {entries: [{subject, fact, kind, scope, when?, source, replaces?}]}` ->
+/// `{ids, refused}`: the cloud member signs each as its own, in order. All are parsed before any
+/// is stored; a refused one (`secret:..`, `too_long`, `no_subject`) is `null` in `ids` and
+/// `{index, reason}` in `refused`, and the rest go on. An entry's `key` is written on the entry as
+/// its `source.session`, and also kept in the `memory_import_keys` side table, because a
+/// forgotten entry loses its body (and the key with it) while a held key must still answer
+/// with its id (idempotent).
+fn memory_import(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
+    use crate::memory::{self, Op, Source};
+    let Some(items) = body["entries"].as_array() else {
+        return Response::err(id, BAD_REQUEST);
+    };
+    let ops: Option<Vec<(Op, Option<String>)>> = items
+        .iter()
+        .map(|e| {
+            let s = &e["source"];
+            let key = e["key"].as_str().map(String::from);
+            let op = Op::Remember {
+                subject: e["subject"].as_str()?.into(),
+                fact: e["fact"].as_str()?.into(),
+                kind: serde_json::from_value(e["kind"].clone()).ok()?,
+                scope: serde_json::from_value(e["scope"].clone()).ok()?,
+                when: e["when"].as_i64(),
+                source: Source {
+                    harness: s["harness"].as_str()?.into(),
+                    repo: s["repo"].as_str().map(String::from),
+                    session: key
+                        .clone()
+                        .or_else(|| s["session"].as_str().map(String::from)),
+                    on_behalf_of: s["on_behalf_of"].as_str().map(String::from),
+                    shared_from: None,
+                },
+                replaces: match e.get("replaces") {
+                    None | Some(Value::Null) => vec![],
+                    Some(v) => serde_json::from_value(v.clone()).ok()?,
+                },
+            };
+            Some((op, key))
+        })
+        .collect();
+    let Some(ops) = ops else {
+        return Response::err(id, BAD_REQUEST);
+    };
+    let store = daemon.store.lock().unwrap();
+    // key -> entry id, kept apart from the entries: a forgotten entry loses its body (and its
+    // key with it), but a replay of its key must still answer with its id.
+    let conn = store.conn();
+    if conn
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS memory_import_keys (key TEXT PRIMARY KEY, id TEXT NOT NULL)",
+        )
+        .is_err()
+    {
+        return Response::err(id, INTERNAL);
+    }
+    let (mut ids, mut refusals) = (Vec::new(), Vec::new());
+    for (index, (op, key)) in ops.into_iter().enumerate() {
+        let held: Option<String> = key.as_ref().and_then(|k| {
+            conn.query_row(
+                "SELECT id FROM memory_import_keys WHERE key = ?1",
+                [k],
+                |r| r.get(0),
+            )
+            .ok()
+        });
+        if held.is_some() {
+            ids.push(json!(held));
+            continue;
+        }
+        match memory::remember(&store, &daemon.identity, op, now() as i64) {
+            Ok(e) => {
+                if let Some(k) = key {
+                    if conn
+                        .execute(
+                            "INSERT INTO memory_import_keys (key, id) VALUES (?1, ?2)",
+                            [&k, &e.id],
+                        )
+                        .is_err()
+                    {
+                        return Response::err(id, INTERNAL);
+                    }
+                }
+                ids.push(json!(e.id));
+            }
+            Err(e) => {
+                let reason = e.to_string();
+                if !(reason.starts_with("secret:")
+                    || reason == "too_long"
+                    || reason == "no_subject")
+                {
+                    return Response::err(id, INTERNAL);
+                }
+                ids.push(Value::Null);
+                refusals.push(json!({ "index": index, "reason": reason }));
+            }
+        }
+    }
+    daemon.peers.outbox.notify_one();
+    Response::ok(id, json!({ "ids": ids, "refused": refusals }))
+}
+
+/// `memory.list {since_seq}` -> `{entries, next}`: up to 200 rows after `since_seq` in insertion
+/// order, each stored entry as `memory.export` shows it with `seq` the row's number; a tombstoned
+/// row is `{seq, id, author, tombstone: true}`.
+fn memory_list_since(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
+    let Some(since) = body["since_seq"].as_i64() else {
+        return Response::err(id, BAD_REQUEST);
+    };
+    match crate::memory::page_since(&daemon.store.lock().unwrap(), since, 200) {
+        Ok(rows) => {
+            let next = rows.last().map_or(since, |(seq, _)| *seq);
+            let entries: Vec<Value> = rows.into_iter().map(|(_, v)| v).collect();
+            Response::ok(id, json!({ "entries": entries, "next": next }))
+        }
+        Err(_) => Response::err(id, INTERNAL),
+    }
+}
+
+/// `memory.forget_author {author}` -> `{forgotten}`: a `Forget` for every entry held from
+/// `author` (a member wipe).
+fn memory_forget_author(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
+    use crate::memory::{self, Op};
+    let Some(author) = body["author"].as_str() else {
+        return Response::err(id, BAD_REQUEST);
+    };
+    let store = daemon.store.lock().unwrap();
+    let Ok(held) = memory::entries(&store) else {
+        return Response::err(id, INTERNAL);
+    };
+    let mut forgotten = 0;
+    for e in held
+        .into_iter()
+        .filter(|e| e.author == author && matches!(e.op, Op::Remember { .. }))
+    {
+        let op = Op::Forget { target: e.id };
+        if memory::remember(&store, &daemon.identity, op, now() as i64).is_err() {
+            return Response::err(id, INTERNAL);
+        }
+        forgotten += 1;
+    }
+    daemon.peers.outbox.notify_one();
+    Response::ok(id, json!({ "forgotten": forgotten }))
+}
+
+/// The `memory.*` ops a person manages memory with: `list {scope?, repo?}` -> `{facts}`;
+/// `show {entry}` -> `{fact, source}`; `forget {entry}` -> `{}`; `share {entry}` -> `{entry_id}`;
+/// `last {session?}` -> `{block}`; `export` -> `{entries}`. `entry` is an entry id or its first
+/// six or more digits. Authors are member names where the roster knows them.
+fn memory_manage(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, person: bool) -> Response {
+    use crate::memory::{self, Op, Scope};
+    let names = member_names(daemon);
+    let who = |k: &str| {
+        names
+            .get(k)
+            .cloned()
+            .unwrap_or_else(|| k.chars().take(12).collect())
+    };
+    let shown = |f: &memory::Fact| {
+        let mut j = fact_json(f);
+        j["author"] = who(&f.author).into();
+        j
+    };
+    let bad = |c: &str| Response::err(id, c);
+    // Before the store lock: team then store is the order everywhere else.
+    let memory_team = daemon.team.lock().unwrap().config.memory_team;
+    let store = daemon.store.lock().unwrap();
+    let entry = || match body["entry"].as_str() {
+        Some(i) => memory::entry(&store, i)
+            .map_err(|_| bad(INTERNAL))
+            .and_then(|e| e.ok_or_else(|| bad(NOT_FOUND))),
+        None => Err(bad(BAD_REQUEST)),
+    };
+    if !person && matches!(op, "memory.forget" | "memory.share") {
+        return refused(id, "not_a_person");
+    }
+    let r: Result<Value, Response> = (|| match op {
+        "memory.list" => {
+            let scope = match body["scope"].as_str() {
+                None => None,
+                Some("me") => Some(Scope::Me),
+                Some("team") => Some(Scope::Team),
+                Some(_) => return Err(bad(BAD_REQUEST)),
+            };
+            let f =
+                memory::facts(&store, scope, body["repo"].as_str()).map_err(|_| bad(INTERNAL))?;
+            Ok(json!({ "facts": f.iter().map(&shown).collect::<Vec<_>>() }))
+        }
+        "memory.show" => {
+            let e = entry()?;
+            let f = memory::fact(&store, &e.id)
+                .map_err(|_| bad(INTERNAL))?
+                .ok_or_else(|| bad(NOT_FOUND))?;
+            let Op::Remember { source, .. } = e.op else {
+                return Err(bad(NOT_FOUND));
+            };
+            let mut fact = shown(&f);
+            fact["history"] = f
+                .history
+                .iter()
+                .map(|(i, v, w)| json!({"id": i, "value": v, "when": w}))
+                .collect();
+            Ok(json!({ "fact": fact, "source": source }))
+        }
+        "memory.forget" => {
+            let e = entry()?;
+            let op = Op::Forget { target: e.id };
+            memory::remember(&store, &daemon.identity, op, now() as i64)
+                .map_err(|_| bad(INTERNAL))?;
+            daemon.peers.outbox.notify_one();
+            Ok(json!({}))
+        }
+        "memory.share" => {
+            if !memory_team {
+                return Err(bad("team_off"));
+            }
+            let e = entry()?;
+            let Op::Remember {
+                subject,
+                fact,
+                kind,
+                scope: Scope::Me,
+                mut source,
+                ..
+            } = e.op
+            else {
+                return Err(bad("not_mine"));
+            };
+            if e.author != daemon.identity.key {
+                return Err(bad("not_mine"));
+            }
+            let current = memory::fact(&store, &e.id)
+                .map_err(|_| bad(INTERNAL))?
+                .ok_or_else(|| bad(NOT_FOUND))?;
+            if current.status == memory::Status::Replaced {
+                let newer = memory::facts(&store, None, None)
+                    .map_err(|_| bad(INTERNAL))?
+                    .into_iter()
+                    .find(|f| f.history.iter().any(|(h, _, _)| *h == e.id));
+                return Err(Response::err_with(
+                    id,
+                    "replaced",
+                    json!({ "current": newer.map(|f| f.id) }),
+                ));
+            }
+            let shared = memory::entries(&store).map_err(|_| bad(INTERNAL))?;
+            if shared.iter().any(|x| {
+                matches!(&x.op, Op::Remember { source, .. } if source.shared_from.as_deref() == Some(&e.id))
+            }) {
+                return Err(bad("already_shared"));
+            }
+            source.shared_from = Some(e.id);
+            let op = Op::Remember {
+                subject,
+                fact,
+                kind,
+                scope: Scope::Team,
+                when: None,
+                source,
+                replaces: vec![],
+            };
+            let n = memory::remember(&store, &daemon.identity, op, now() as i64)
+                .map_err(|_| bad(INTERNAL))?;
+            Ok(json!({ "entry_id": n.id }))
+        }
+        "memory.last" => {
+            let b = store
+                .memory_last(body["session"].as_str())
+                .map_err(|_| bad(INTERNAL))?;
+            Ok(json!({ "block": b.unwrap_or_default() }))
+        }
+        _ => Ok(json!({ "entries": memory::entries(&store).map_err(|_| bad(INTERNAL))? })),
+    })();
+    match r {
+        Ok(b) => Response::ok(id, b),
+        Err(r) => r,
     }
 }
 

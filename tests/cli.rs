@@ -1165,3 +1165,627 @@ fn update_auto_off_and_on_set_the_daily_update() {
     let o = e.cmd(&["update", "--auto", "maybe"]).output().unwrap();
     assert!(!o.status.success());
 }
+
+fn remember(e: &Env, subject: &str, fact: &str, scope: &str) -> Value {
+    e.ask(
+        json!({"id": 1, "op": "memory.remember", "subject": subject, "fact": fact,
+        "kind": "decision", "scope": scope}),
+    )
+}
+
+/// A fact with no subject would be grouped with every other subjectless one: refused.
+#[test]
+fn remember_refuses_a_blank_subject() {
+    let e = Env::new();
+    assert!(e.run(&["who"]).status.success());
+    for subject in ["", "   "] {
+        let r = remember(&e, subject, "postgres 16", "me");
+        assert_eq!(
+            (r["ok"].clone(), r["reason"].clone()),
+            (json!(false), json!("no_subject")),
+            "{r}"
+        );
+    }
+    assert!(lightbulb::memory::facts(&e.store(), None, None)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn memory_list_shows_scope_author_and_status() {
+    let e = Env::new();
+    assert!(e.run(&["who"]).status.success());
+    assert_eq!(
+        out(&e.run(&["memory", "list"])).trim(),
+        "Nothing is remembered yet."
+    );
+    remember(&e, "db", "postgres 16", "team");
+    remember(&e, "editor", "vim", "me");
+    let first = remember(&e, "port", "8080", "team");
+    let table = out(&e.run(&["memory", "list"]));
+    let cols: Vec<&str> = table.lines().next().unwrap().split_whitespace().collect();
+    assert_eq!(cols, ["Id", "Scope", "By", "Status", "Subject", "Value"]);
+    let db = table.lines().find(|l| l.contains("postgres 16")).unwrap();
+    assert!(db.contains("team") && db.contains("current"), "{db}");
+    assert!(
+        table.lines().any(|l| l.contains("vim") && l.contains("me")),
+        "{table}"
+    );
+    // A second value for the same subject makes both contested.
+    remember(&e, "port", "9090", "me");
+    let table = out(&e.run(&["memory", "list"]));
+    assert_eq!(table.matches("contested").count(), 2, "{table}");
+    let only_me = out(&e.run(&["memory", "list", "--me"]));
+    assert!(
+        only_me.contains("vim") && !only_me.contains("postgres"),
+        "{only_me}"
+    );
+    let only_team = out(&e.run(&["memory", "list", "--team"]));
+    assert!(
+        only_team.contains("postgres") && !only_team.contains("vim"),
+        "{only_team}"
+    );
+    // show and forget by id prefix
+    let id = first["entry_id"].as_str().unwrap();
+    let shown = out(&e.run(&["memory", "show", &id[..8]]));
+    assert!(
+        shown.contains("port: 8080") && shown.contains(id),
+        "{shown}"
+    );
+    assert!(e.person(&["memory", "forget", &id[..8]]).status.success());
+    assert!(!out(&e.run(&["memory", "list"])).contains("8080"));
+    let missing = e.run(&["memory", "show", "abcdef"]);
+    assert!(!missing.status.success() && err(&missing).contains("No entry starts with that id"));
+}
+
+#[test]
+fn memory_share_creates_team_entry() {
+    let e = Env::new();
+    assert!(e.run(&["who"]).status.success());
+    let mine = remember(&e, "editor", "vim", "me");
+    let id = mine["entry_id"].as_str().unwrap();
+    assert!(e.person(&["memory", "share", &id[..10]]).status.success());
+    let facts = lightbulb::memory::facts(&e.store(), None, None).unwrap();
+    assert_eq!(facts.len(), 2, "{facts:?}");
+    let team = facts
+        .iter()
+        .find(|f| f.scope == lightbulb::memory::Scope::Team)
+        .unwrap();
+    assert_eq!(
+        (team.subject.as_str(), team.value.as_str()),
+        ("editor", "vim")
+    );
+    let shown = out(&e.run(&["memory", "show", &team.id]));
+    assert!(
+        shown.contains(&format!("Shared  from your entry {id}")),
+        "{shown}"
+    );
+    // The team entry is not one to share again.
+    let again = e.person(&["memory", "share", &team.id]);
+    assert!(!again.status.success() && err(&again).contains("Only an entry of yours"));
+}
+
+#[test]
+fn memory_team_off_refuses_team_scope() {
+    let e = Env::new();
+    assert!(e.run(&["who"]).status.success());
+    let mine = remember(&e, "editor", "vim", "me");
+    let id = mine["entry_id"].as_str().unwrap().to_string();
+    let o = out(&e.person(&["memory", "team", "off"]));
+    assert!(o.contains("off"), "{o}");
+    let r = remember(&e, "db", "postgres 16", "team");
+    assert_eq!(
+        (r["stored"].clone(), r["refused"].clone()),
+        (json!(false), json!("team_off"))
+    );
+    assert_eq!(remember(&e, "db", "postgres 16", "me")["stored"], true);
+    let share = e.person(&["memory", "share", &id]);
+    assert!(!share.status.success() && err(&share).contains("Team memory is off"));
+    assert!(e.person(&["memory", "team", "on"]).status.success());
+    assert_eq!(remember(&e, "db", "postgres 16", "team")["stored"], true);
+}
+
+#[test]
+fn memory_last_prints_block() {
+    let e = Env::new();
+    assert!(e.run(&["who"]).status.success());
+    assert!(out(&e.run(&["memory", "last"])).contains("No session has been handed"));
+    let store = e.store();
+    store
+        .set_memory_last("s1", "Memory (team and yours):\nCurrent:\nold", 1)
+        .unwrap();
+    store
+        .set_memory_last(
+            "s2",
+            "Memory (team and yours):\nCurrent:\ndb: postgres 16",
+            2,
+        )
+        .unwrap();
+    let o = out(&e.run(&["memory", "last"]));
+    assert_eq!(o, "Memory (team and yours):\nCurrent:\ndb: postgres 16\n");
+    let x = out(&e.run(&["memory", "export"]));
+    assert_eq!(x, "");
+    remember(&e, "db", "postgres 16", "me");
+    let j: Value = serde_json::from_str(&out(&e.run(&["memory", "export", "--json"]))).unwrap();
+    assert_eq!(j[0]["op"]["fact"], "postgres 16");
+}
+
+/// A forgotten fact is not left word for word in the last block handed out.
+#[test]
+fn memory_forget_clears_the_last_block() {
+    let e = Env::new();
+    assert!(e.run(&["who"]).status.success());
+    let id = remember(&e, "db", "postgres 16", "me")["entry_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for s in ["s1", "s2"] {
+        e.store()
+            .set_memory_last(s, "Memory (team and yours):\nCurrent:\ndb: postgres 16", 1)
+            .unwrap();
+    }
+    let o = e.person(&["memory", "forget", &id]);
+    assert!(o.status.success(), "{}", err(&o));
+    let last = out(&e.run(&["memory", "last"]));
+    assert!(!last.contains("postgres"), "{last}");
+    assert!(
+        last.contains("No session has been handed a memory block yet"),
+        "{last}"
+    );
+}
+
+#[test]
+fn memory_show_plain_team_entry_has_no_shared_line() {
+    let e = Env::new();
+    assert!(e.run(&["who"]).status.success());
+    let team = remember(&e, "db", "postgres 16", "team");
+    let shown = out(&e.run(&["memory", "show", team["entry_id"].as_str().unwrap()]));
+    assert!(
+        shown.contains("db: postgres 16") && !shown.contains("Shared"),
+        "{shown}"
+    );
+}
+
+#[test]
+fn memory_share_refuses_replaced_entry() {
+    let e = Env::new();
+    assert!(e.run(&["who"]).status.success());
+    let old = remember(&e, "port", "8080", "me");
+    let old = old["entry_id"].as_str().unwrap();
+    let new = e.ask(
+        json!({"id": 1, "op": "memory.remember", "subject": "port", "fact": "9090",
+        "kind": "fact", "scope": "me", "replaces": [old]}),
+    );
+    let o = e.person(&["memory", "share", old]);
+    let msg = err(&o);
+    assert!(!o.status.success() && msg.contains("was replaced"), "{msg}");
+    assert!(msg.contains(new["entry_id"].as_str().unwrap()), "{msg}");
+    assert_eq!(
+        lightbulb::memory::facts(&e.store(), Some(lightbulb::memory::Scope::Team), None)
+            .unwrap()
+            .len(),
+        0
+    );
+}
+
+#[test]
+fn memory_share_twice_is_refused() {
+    let e = Env::new();
+    assert!(e.run(&["who"]).status.success());
+    let id = remember(&e, "editor", "vim", "me")["entry_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(e.person(&["memory", "share", &id]).status.success());
+    let again = e.person(&["memory", "share", &id]);
+    assert!(
+        !again.status.success() && err(&again).contains("already shared"),
+        "{}",
+        err(&again)
+    );
+    assert_eq!(
+        lightbulb::memory::facts(&e.store(), Some(lightbulb::memory::Scope::Team), None)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn memory_share_from_agent_shell_is_refused() {
+    let mut e = Env::new();
+    let birth = os::process(std::process::id()).unwrap().birth_micros;
+    e.pin = Some(format!("{}:{birth}", std::process::id()));
+    e.daemon(false, "", &[]);
+    let id = remember(&e, "editor", "vim", "me")["entry_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for args in [
+        vec!["memory", "share", &id],
+        vec!["memory", "forget", &id],
+        vec!["memory", "team", "off"],
+    ] {
+        let o = e.run(&args);
+        assert!(
+            !o.status.success() && err(&o).contains("from your own terminal"),
+            "{args:?}: {}",
+            err(&o)
+        );
+    }
+    assert_eq!(
+        lightbulb::memory::facts(&e.store(), None, None)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(Config_on(&e));
+    // Reading stays open.
+    assert!(out(&e.run(&["memory", "list"])).contains("vim"));
+}
+
+#[allow(non_snake_case)]
+fn Config_on(e: &Env) -> bool {
+    lightbulb::config::Config::load(e.state.path())
+        .unwrap()
+        .memory_team
+}
+
+/// `setup` as a person at a terminal who answers the first screen with `answer`.
+fn setup_answering(e: &Env, answer: &str) -> Output {
+    use std::io::Write;
+    let mut child = e
+        .cmd(&["setup"])
+        .env("LIGHTBULB_CONNECT_DEBUG_TTY", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(answer.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+const SIGN_IN: &str = "Sign in (free): your memory and sessions follow you across computers; the Claude app reaches your agents; the evaluator can read sessions you upload. Or stay local.";
+
+/// The first screen offers the free sign-in before anything is wired, and staying local is one
+/// key (`l`) away.
+#[test]
+fn setup_offers_sign_in_first_with_local_one_key_away() {
+    let e = Env::new();
+    let o = setup_answering(&e, "l\n");
+    assert!(o.status.success(), "{}", err(&o));
+    let text = out(&o);
+    assert!(text.starts_with(SIGN_IN), "{text}");
+    assert!(text.contains("[l] Stay local"), "{text}");
+    assert!(text.contains("Lightbulb is on."), "{text}");
+}
+
+/// Not signing in records that uploads are off.
+#[test]
+fn setup_without_sign_in_sets_upload_off() {
+    let e = Env::new();
+    assert!(setup_answering(&e, "l\n").status.success());
+    let config = std::fs::read_to_string(e.state.path().join("config.toml")).unwrap();
+    assert!(config.contains("capture_upload = \"off\""), "{config}");
+}
+
+/// End of input at the first screen is not a yes: the computer stays local.
+#[test]
+fn setup_eof_stays_local() {
+    let e = Env::new();
+    let o = setup_answering(&e, "");
+    assert!(o.status.success(), "{}", err(&o));
+    let config = std::fs::read_to_string(e.state.path().join("config.toml")).unwrap();
+    assert!(config.contains("capture_upload = \"off\""), "{config}");
+}
+
+// ---- upload by choice, drafts ----------------------------------------------------------
+
+/// `args` as a person at a terminal (the drafts commands are person-only) against the stub.
+fn with_api(e: &Env, base: &str, args: &[&str]) -> Output {
+    let api = format!("LIGHTBULB_API={base}");
+    let run = "exit(system(@ARGV) >> 8)";
+    let argv: Vec<&str> = ["/usr/bin/env", &api, "/usr/bin/perl", "-e", run, EXE]
+        .into_iter()
+        .chain(args.iter().copied())
+        .collect();
+    e.detached(&argv, "")
+}
+
+fn draft(id: &str, text: &str) -> Value {
+    json!({"id": id, "kind": "lesson", "text": text, "evidence": ["claude:a", "claude:b"],
+        "status": "proposed", "created": "2026-10-27T10:00:00Z"})
+}
+
+#[test]
+fn sessions_upload_sets_the_mode_and_says_what_happens() {
+    let e = Env::new();
+    assert!(out(&e.run(&["sessions", "upload"])).contains("off"));
+    let o = e.person(&["sessions", "upload", "metadata"]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(
+        out(&o).contains("without what the tools did"),
+        "{}",
+        out(&o)
+    );
+    // Signed out, it says nothing goes until a sign-in.
+    assert!(
+        out(&o).contains("Nothing is sent until you sign in: lightbulb login"),
+        "{}",
+        out(&o)
+    );
+    e.sign_in("user_1", None);
+    let o = e.person(&["sessions", "upload", "metadata"]);
+    assert!(!out(&o).contains("until you sign in"), "{}", out(&o));
+    let config = std::fs::read_to_string(e.state.path().join("config.toml")).unwrap();
+    assert!(config.contains("capture_upload = \"metadata\""), "{config}");
+    assert!(out(&e.run(&["sessions", "upload"])).contains("metadata"));
+    let o = e.person(&["sessions", "upload", "off"]);
+    assert!(
+        out(&o).contains("Nothing leaves this computer"),
+        "{}",
+        out(&o)
+    );
+    assert!(!e
+        .run(&["sessions", "upload", "everything"])
+        .status
+        .success());
+}
+
+/// An agent's shell cannot turn uploads on: the mode is a person's choice.
+#[test]
+fn sessions_upload_from_agent_shell_is_refused() {
+    let mut e = Env::new();
+    let birth = os::process(std::process::id()).unwrap().birth_micros;
+    e.pin = Some(format!("{}:{birth}", std::process::id()));
+    e.daemon(false, "", &[]);
+    let o = e.run(&["sessions", "upload", "full"]);
+    assert!(
+        !o.status.success() && err(&o).contains("from your own terminal"),
+        "{}",
+        err(&o)
+    );
+    let r = e.ask(json!({"id": 1, "op": "sessions.upload", "mode": "full"}));
+    assert_eq!(r["reason"], "not_a_person", "{r}");
+    let config = lightbulb::config::Config::load(e.state.path()).unwrap();
+    assert_eq!(config.capture_upload, "off");
+    assert!(!e.state.path().join("upload.mark").exists());
+    // Reading the mode stays open.
+    assert!(out(&e.run(&["sessions", "upload"])).contains("off"));
+}
+
+#[test]
+fn memory_drafts_lists_the_proposed_ones() {
+    let e = Env::new();
+    e.sign_in("user_1", None);
+    let (base, _) = common::api_stub(|r, _| match r.path.as_str() {
+        "/memory/drafts" => (
+            200,
+            json!({"drafts": [draft("abcd1234-0000", "Run cargo fmt first.\nIt saves a round trip.")]}),
+        ),
+        _ => (404, json!({})),
+    });
+    let o = with_api(&e, &base, &["memory", "drafts"]);
+    let text = out(&o);
+    assert!(o.status.success(), "{text}{}", err(&o));
+    assert!(
+        text.contains("abcd1234") && text.contains("lesson"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Run cargo fmt first.") && !text.contains("round trip"),
+        "{text}"
+    );
+    assert!(text.contains('2'), "evidence count: {text}");
+}
+
+#[test]
+fn memory_approve_stores_locally_for_solo_user() {
+    let e = Env::new();
+    e.sign_in("user_1", None);
+    let (base, seen) = common::api_stub(|r, _| match (r.method.as_str(), r.path.as_str()) {
+        ("GET", "/memory/drafts") => (
+            200,
+            json!({"drafts": [draft("abcd1234-0000", "Run cargo fmt first.")]}),
+        ),
+        ("POST", "/memory/drafts/abcd1234-0000/approve") => (
+            200,
+            json!({"subject": "acme/app", "fact": "Run cargo fmt first.", "kind": "lesson", "scope": "me"}),
+        ),
+        _ => (404, json!({})),
+    });
+    let o = with_api(&e, &base, &["memory", "approve", "abcd"]);
+    assert!(o.status.success(), "{}{}", out(&o), err(&o));
+    let approve = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|r| r.method == "POST")
+        .cloned()
+        .unwrap();
+    assert_eq!(approve.body, json!({"scope": null}));
+    // It is a local entry now, from the cloud evaluator, citing the first evidence session.
+    let list = out(&e.run(&["memory", "list"]));
+    assert!(
+        list.contains("Run cargo fmt first.") && list.contains("acme/app"),
+        "{list}"
+    );
+    let id = list
+        .lines()
+        .nth(1)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string();
+    let shown = out(&e.run(&["memory", "show", &id]));
+    assert!(shown.contains("cloud-evaluator"), "{shown}");
+}
+
+#[test]
+fn memory_approve_in_a_workspace_waits_for_the_network() {
+    let e = Env::new();
+    e.sign_in("user_1", None);
+    let (base, seen) = common::api_stub(|r, _| match r.method.as_str() {
+        "GET" => (
+            200,
+            json!({"drafts": [draft("d1", "Use the staging key.")]}),
+        ),
+        _ => (200, json!({"queued": true})),
+    });
+    let o = with_api(&e, &base, &["memory", "approve", "d1", "--team"]);
+    assert_eq!(
+        out(&o).trim(),
+        "Approved; the workspace will remember it",
+        "{}",
+        err(&o)
+    );
+    let post = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|r| r.method == "POST")
+        .cloned()
+        .unwrap();
+    assert_eq!(post.body, json!({"scope": "team"}));
+    assert!(out(&e.run(&["memory", "list"])).contains("Nothing is remembered"));
+}
+
+#[test]
+fn memory_approve_says_why_it_was_refused() {
+    let e = Env::new();
+    e.sign_in("user_1", None);
+    for (code, detail, said) in [
+        (409, "draft already settled", "settled"),
+        (422, "Looks like a secret.", "Looks like a secret."),
+    ] {
+        let (base, _) = common::api_stub(move |r, _| match r.method.as_str() {
+            "GET" => (200, json!({"drafts": [draft("d1", "x")]})),
+            _ => (code, json!({"detail": detail})),
+        });
+        let o = with_api(&e, &base, &["memory", "approve", "d1"]);
+        assert!(!o.status.success());
+        assert!(err(&o).contains(said), "{}", err(&o));
+    }
+}
+
+#[test]
+fn memory_dismiss_settles_the_draft() {
+    let e = Env::new();
+    e.sign_in("user_1", None);
+    let (base, seen) = common::api_stub(|r, _| match r.method.as_str() {
+        "GET" => (200, json!({"drafts": [draft("d1", "x")]})),
+        _ => (204, json!(null)),
+    });
+    let o = with_api(&e, &base, &["memory", "dismiss", "d1"]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(seen
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|r| r.method == "POST" && r.path == "/memory/drafts/d1/dismiss"));
+    let none = with_api(&e, &base, &["memory", "dismiss", "zz"]);
+    assert!(!none.status.success());
+}
+
+/// `lightbulb login` at a terminal asks what to upload, once, and off is the default.
+fn login_answering(e: &Env, answer: &str) -> Output {
+    use std::io::Write;
+    let (base, _) = common::api_stub(|r, n| match r.path.as_str() {
+        "/network/device/challenge" => (200, json!({"challenge": "c"})),
+        "/network/device/start" => (
+            200,
+            json!({"code": "x", "userCode": "ABCD-EFGH", "interval": 1, "expiresIn": 60, "verifyUrl": "http://example.test/auth"}),
+        ),
+        "/network/device/poll" if n == 0 => (
+            200,
+            json!({"status": "approved", "name": "Prasiddha", "proof": "h.p.s", "routeUrl": "wss://example.test/x"}),
+        ),
+        _ => (404, json!({})),
+    });
+    e.identity();
+    let mut child = e
+        .cmd(&["login"])
+        .env("LIGHTBULB_API", base)
+        .env("LIGHTBULB_CONNECT_DEBUG_TTY", "1")
+        .env("LIGHTBULB_CONNECT_NO_BROWSER", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(answer.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+fn upload_mode(e: &Env) -> String {
+    lightbulb::config::Config::load(e.state.path())
+        .unwrap()
+        .capture_upload
+}
+
+#[test]
+fn login_asks_what_to_upload_once() {
+    let e = Env::new();
+    let o = login_answering(&e, "metadata\n");
+    let text = out(&o);
+    assert!(o.status.success(), "{text}{}", err(&o));
+    assert!(text.contains("Nothing leaves this computer"), "{text}");
+    assert!(text.contains("metadata") && text.contains("full"), "{text}");
+    assert_eq!(upload_mode(&e), "metadata");
+}
+
+#[test]
+fn login_upload_question_defaults_to_off() {
+    for answer in ["\n", "", "nonsense\n"] {
+        let e = Env::new();
+        assert!(login_answering(&e, answer).status.success());
+        assert_eq!(upload_mode(&e), "off", "{answer:?}");
+    }
+}
+
+#[test]
+fn memory_approve_team_with_team_memory_off_calls_no_server() {
+    let e = Env::new();
+    e.sign_in("user_1", None);
+    assert!(e.person(&["memory", "team", "off"]).status.success());
+    let (base, seen) = common::api_stub(|_, _| (200, json!({"drafts": [draft("d1", "x")]})));
+    let o = with_api(&e, &base, &["memory", "approve", "d1", "--team"]);
+    assert!(!o.status.success());
+    assert!(err(&o).contains("lightbulb memory team on"), "{}", err(&o));
+    assert!(seen.lock().unwrap().is_empty(), "no request was made");
+}
+
+#[test]
+fn memory_approve_prints_the_lesson_when_the_local_store_refuses() {
+    let e = Env::new();
+    e.sign_in("user_1", None);
+    let fact = "Set api_key=abcdefgh12345 before running.";
+    let (base, _) = common::api_stub(move |r, _| match r.method.as_str() {
+        "GET" => (200, json!({"drafts": [draft("d1", fact)]})),
+        _ => (
+            200,
+            json!({"subject": "acme/app", "fact": fact, "kind": "lesson", "scope": "me"}),
+        ),
+    });
+    let o = with_api(&e, &base, &["memory", "approve", "d1"]);
+    assert!(!o.status.success());
+    let text = err(&o);
+    assert!(
+        text.contains("not stored locally: secret:") && text.contains("the lesson is:"),
+        "{text}"
+    );
+    assert!(text.contains(fact), "{text}");
+    assert!(!text.contains("memory team on"), "no retry hint: {text}");
+}

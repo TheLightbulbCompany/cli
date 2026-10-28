@@ -5,10 +5,12 @@ use crate::daemon::{ipc, Daemon};
 use crate::doing::TEXT_MAX;
 use crate::frame::Sender;
 use crate::mail::{self, State};
+use crate::memory;
 use crate::roster::{Entry, Member};
 use crate::sessions::Tier;
 use crate::{presence, sessions, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const MAX_FRAME: usize = 1 << 20;
@@ -104,9 +106,20 @@ pub enum Frame {
         /// workspace member admits it by. Absent from older builds.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         proof: Option<String>,
+        /// The sender syncs shared memory (`MemoryHeads`, `Memory`). Absent from older builds.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        memory: bool,
     },
     /// Each entry carries its own `sig`.
     Roster { entries: Vec<Entry>, more: bool },
+    /// Per memory author, the highest `seq` the sender holds. Only sent to a peer whose `hello`
+    /// said `memory`: this enum has no unknown-variant tolerance, so an old build would stop reading.
+    MemoryHeads { heads: BTreeMap<String, u64> },
+    /// A page of memory entries, each carrying its own `sig`. Same capability gate.
+    Memory {
+        entries: Vec<memory::Entry>,
+        more: bool,
+    },
     Presence {
         member: String,
         /// Unix milliseconds at send: a receiver ignores one no newer than the last it stored.
@@ -209,6 +222,8 @@ impl Frame {
         match self {
             Frame::Hello { .. } => "hello",
             Frame::Roster { .. } => "roster",
+            Frame::MemoryHeads { .. } => "memory_heads",
+            Frame::Memory { .. } => "memory",
             Frame::Presence { .. } => "presence",
             Frame::Envelope { .. } => "envelope",
             Frame::Ack { .. } => "ack",
@@ -260,6 +275,8 @@ pub fn from_peer_ok(
     match f {
         // Its `addrs` are a hint, checked where they are kept (`parse_addrs`).
         Frame::Hello { .. } | Frame::Roster { .. } | Frame::Envelope { .. } => Ok(()),
+        // Entries are checked by `memory::accept`; a member may send them.
+        Frame::MemoryHeads { .. } | Frame::Memory { .. } => Ok(()),
         Frame::Ack {
             state,
             reason,
@@ -341,6 +358,7 @@ mod tests {
             heads: vec!["h".into()],
             addrs: vec!["127.0.0.1:1".into()],
             proof: None,
+            memory: true,
         };
         write(&mut a, &hello).await.unwrap();
         assert_eq!(read(&mut b).await.unwrap(), hello);

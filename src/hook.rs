@@ -20,6 +20,10 @@ use std::time::Duration;
 #[cfg(debug_assertions)]
 pub const CALLER_ENV: &str = "LIGHTBULB_CONNECT_HOOK_CALLER";
 
+/// Debug builds only: any value makes capture's daemon connection a dead one (tests).
+#[cfg(debug_assertions)]
+pub const CAPTURE_DOWN_ENV: &str = "LIGHTBULB_CONNECT_DEBUG_CAPTURE_DOWN";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
     SessionStart,
@@ -151,6 +155,7 @@ pub fn run(agent: &str, event: &str, stdin: &str) -> Result<Option<String>> {
         daemon::ensure_running()?;
         let mut conn = Conn::open()?;
         let key = crate::sessions::Key::new(&conn.member()?, h.provider, &h.conversation);
+        capture(&h, &payload, &json!({}));
         let r = match &caller {
             Ok(me) => conn.call("end", json!({ "key": key, "caller": proc_json(me) }))?,
             Err(_) => conn.call("end", json!({ "key": key, "if_gone": true }))?,
@@ -190,6 +195,7 @@ pub fn run(agent: &str, event: &str, stdin: &str) -> Result<Option<String>> {
     if !key.is_string() {
         return Err(format!("register: {r}").into());
     }
+    capture(&h, &payload, &session);
     // Our OpenCode plugin sends `mail: false` when it could not hand mail over (it has not
     // seen the session's agent and model yet): the mail waits for `check_inbox`.
     if !takes_mail(&h) || (h.provider == "opencode" && payload["mail"] == false) {
@@ -206,10 +212,29 @@ pub fn run(agent: &str, event: &str, stdin: &str) -> Result<Option<String>> {
     let messages = r["messages"]
         .as_array()
         .ok_or_else(|| format!("{op}: {r}"))?;
-    let framed: Vec<&str> = messages
+    let mut framed: Vec<&str> = messages
         .iter()
         .filter_map(|m| m["framed"].as_str())
         .collect();
+    // At a session's start, after the mail: what the team and the person know of this repo.
+    let block = match (h.event, session["repo"].as_str()) {
+        (Event::SessionStart, Some(repo)) => {
+            // Any failure is "no block": the mail is still handed over.
+            conn.call(
+                "memory.recall",
+                json!({ "question": "", "repo": repo, "budget_chars": 1600, "session": key }),
+            )
+            .ok()
+            .and_then(|r| {
+                r["block"]
+                    .as_str()
+                    .filter(|b| !b.is_empty())
+                    .map(String::from)
+            })
+        }
+        _ => None,
+    };
+    framed.extend(block.as_deref());
     if framed.is_empty() {
         return Ok(None);
     }
@@ -218,6 +243,144 @@ pub fn run(agent: &str, event: &str, stdin: &str) -> Result<Option<String>> {
         out["ids"] = messages.iter().map(|m| m["id"].clone()).collect();
     }
     Ok(Some(out.to_string()))
+}
+
+/// How long the hook waits for each capture write's answer: capture never slows the agent.
+/// The daemon finishes a write it was not waited for.
+const CAPTURE_WAIT: Duration = Duration::from_millis(10);
+
+/// Tells the daemon what this event adds to the local capture (`capture::*`, written by the
+/// daemon), on a connection of its own so a slow write holds nothing behind it. Any failure
+/// is silent: capture never breaks the agent or the mail.
+fn capture(h: &Hook, payload: &Value, session: &Value) {
+    // Debug builds only: capture's connection is a dead one, for tests of the failure path.
+    #[cfg(debug_assertions)]
+    let dead = std::env::var_os(CAPTURE_DOWN_ENV).and_then(|_| {
+        let (a, _b) = UnixStream::pair().ok()?;
+        Some(Conn {
+            stream: BufReader::new(a),
+            next: 1,
+        })
+    });
+    #[cfg(not(debug_assertions))]
+    let dead = None;
+    if let Some(mut conn) = dead.or_else(|| Conn::open().ok()) {
+        capture_on(&mut conn, h, payload, session);
+    }
+}
+
+/// `try_capture` on `conn`, waiting at most `CAPTURE_WAIT` for each answer. Past it, one line
+/// says so and the rest of this event's capture is skipped; whether that happened.
+fn capture_on(conn: &mut Conn, h: &Hook, payload: &Value, session: &Value) -> bool {
+    if conn.wait_up_to(CAPTURE_WAIT).is_err() {
+        return false;
+    }
+    match try_capture(conn, h, payload, session) {
+        Err(e) if e.to_string() == no_answer(CAPTURE_WAIT) => {
+            eprintln!(
+                "lightbulb hook {} {}: capture took over {} ms; not waiting for it",
+                h.provider,
+                h.event.arg(),
+                CAPTURE_WAIT.as_millis()
+            );
+            true
+        }
+        _ => false,
+    }
+}
+
+/// `body` with the fields of `extra` added; never panics.
+fn with(body: &Value, extra: Value) -> Value {
+    let mut b = body.clone();
+    if let (Some(m), Some(e)) = (b.as_object_mut(), extra.as_object()) {
+        m.extend(e.iter().map(|(k, v)| (k.clone(), v.clone())));
+    }
+    b
+}
+
+/// Most bytes of a tool's input sent to the daemon, which keeps 200 characters of one field.
+const ARGS_MAX: usize = 4 * 1024;
+
+/// A tool input as sent for its summary: its top-level text fields (the only ones a summary
+/// reads), each cut to 256 characters, kept while the whole stays within `ARGS_MAX`. A
+/// multi-megabyte Write never makes the request outlast the hook's wait.
+fn capped_args(args: &Value) -> String {
+    let mut kept = serde_json::Map::new();
+    let mut size = 2;
+    for (k, v) in args.as_object().into_iter().flatten() {
+        let Some(text) = v.as_str() else { continue };
+        let text: String = text.chars().take(256).collect();
+        let n = json!({ k: text }).to_string().len();
+        if size + n > ARGS_MAX {
+            break;
+        }
+        size += n;
+        kept.insert(k.clone(), text.into());
+    }
+    Value::Object(kept).to_string()
+}
+
+fn try_capture(conn: &mut Conn, h: &Hook, payload: &Value, session: &Value) -> Result<()> {
+    let who = json!({ "harness": h.provider, "conversation": h.conversation });
+    let start = |conn: &mut Conn, repo: &Value, branch: &Value| {
+        let body = json!({ "cwd": session["cwd"], "repo": repo, "branch": branch });
+        conn.call("capture.session_start", with(&who, body))
+    };
+    match h.event {
+        Event::SessionStart => {
+            start(conn, &session["repo"], &session["branch"])?;
+        }
+        Event::PostToolUse => {
+            let tool = ["tool_name", "toolName", "tool"]
+                .iter()
+                .find_map(|k| payload[k].as_str());
+            let Some(tool) = tool else { return Ok(()) };
+            let args = ["tool_input", "args"]
+                .iter()
+                .map(|k| &payload[k])
+                .find(|a| !a.is_null());
+            let call = json!({ "tool": tool, "args": args.map(capped_args),
+                "duration_ms": payload["duration"].as_i64(),
+                "ok": payload["tool_response"]["is_error"] != true });
+            let r = conn.call("capture.tool_call", with(&who, call.clone()))?;
+            // A session already running before capture existed has no row: open one now (the
+            // daemon applies the hidden-folder rules), then record the call.
+            if r["stored"] == false {
+                let cwd = session["cwd"].as_str().unwrap_or_default();
+                let (repo, branch) = crate::mcp::git(cwd);
+                let r = start(conn, &repo.into(), &branch.into())?;
+                if r["stored"] == true {
+                    conn.call("capture.tool_call", with(&who, call))?;
+                }
+            }
+        }
+        Event::Stop => {
+            // A Stop fires every turn: it reads only the `usage` its own payload carries, never
+            // the transcript (that is read once, at SessionEnd).
+            let u = &payload["usage"];
+            let (i, o) = (u["input_tokens"].as_i64(), u["output_tokens"].as_i64());
+            if i.is_some() || o.is_some() {
+                let body = json!({ "prompt_tokens": i, "completion_tokens": o });
+                conn.call("capture.stop", with(&who, body))?;
+            }
+        }
+        Event::SessionEnd => {
+            // Claude Code's transcript is the one verified source of tokens; other agents'
+            // payloads have none we have confirmed, so theirs stay null. One call: a write
+            // not waited for must not cost the end.
+            let tokens = (h.provider == "claude")
+                .then_some(h.transcript_path.as_deref())
+                .flatten()
+                .and_then(crate::capture::transcript_tokens);
+            let body = match tokens {
+                Some((i, o)) => json!({ "prompt_tokens": i, "completion_tokens": o }),
+                None => json!({}),
+            };
+            conn.call("capture.session_end", with(&who, body))?;
+        }
+        Event::UserPromptSubmit => {}
+    }
+    Ok(())
 }
 
 /// `hook opencode ack`, payload `{session_id, ids}`: the plugin put those messages into the
@@ -362,6 +525,86 @@ mod tests {
         conn.wait_up_to(Duration::from_secs(1)).unwrap();
         let e = conn.call("ping", json!({})).unwrap_err().to_string();
         assert_eq!(e, "The background service did not answer in 1 s. If macOS is asking whether lightbulb may read a folder, click Allow, then try again.");
+    }
+
+    #[test]
+    fn capture_on_a_dead_connection_errs_and_the_wrapper_swallows_it() {
+        for e in EVENTS.into_iter().filter(|e| *e != Event::UserPromptSubmit) {
+            let (a, b) = UnixStream::pair().unwrap();
+            drop(b);
+            let mut conn = Conn {
+                stream: BufReader::new(a),
+                next: 1,
+            };
+            let p = json!({"tool_name": "Bash", "tool_input": {}, "usage": {"input_tokens": 1}});
+            let h = Hook {
+                transcript_path: Some(format!(
+                    "{}/tests/fixtures/hooks/claude-transcript.jsonl",
+                    env!("CARGO_MANIFEST_DIR")
+                )),
+                ..hook("claude", e)
+            };
+            assert!(try_capture(&mut conn, &h, &p, &json!({})).is_err(), "{e:?}");
+            assert!(!capture_on(&mut conn, &h, &p, &json!({})));
+        }
+    }
+
+    #[test]
+    fn a_huge_tool_input_is_cut_before_it_is_sent() {
+        let (a, b) = UnixStream::pair().unwrap();
+        let sent = std::thread::spawn(move || {
+            let mut line = String::new();
+            BufReader::new(&b).read_line(&mut line).unwrap();
+            let _ = (&b).write_all(b"{\"ok\":true,\"stored\":true}\n");
+            line
+        });
+        let mut conn = Conn {
+            stream: BufReader::new(a),
+            next: 1,
+        };
+        let p = json!({"tool_name": "Write", "tool_input": {"file_path": "/x/y.rs",
+            "content": "x".repeat(2 * 1024 * 1024)}});
+        try_capture(
+            &mut conn,
+            &hook("claude", Event::PostToolUse),
+            &p,
+            &json!({}),
+        )
+        .unwrap();
+        let line = sent.join().unwrap();
+        assert!(line.len() < 8 * 1024, "{}", line.len());
+        // What the summary needs is still there.
+        let v: Value = serde_json::from_str(&line).unwrap();
+        let args: Value = serde_json::from_str(v["args"].as_str().unwrap()).unwrap();
+        assert_eq!(args["file_path"], "/x/y.rs");
+    }
+
+    #[test]
+    fn a_daemon_slow_to_answer_capture_is_not_waited_for() {
+        let (a, b) = UnixStream::pair().unwrap();
+        // The daemon reads the write and answers it 500 ms later.
+        let held = std::thread::spawn(move || {
+            let mut line = String::new();
+            BufReader::new(&b).read_line(&mut line).unwrap();
+            std::thread::sleep(Duration::from_millis(500));
+            let _ = (&b).write_all(b"{\"ok\":true}\n");
+            line
+        });
+        let mut conn = Conn {
+            stream: BufReader::new(a),
+            next: 1,
+        };
+        let t = std::time::Instant::now();
+        let session = json!({"cwd": "/p"});
+        assert!(capture_on(
+            &mut conn,
+            &hook("claude", Event::SessionStart),
+            &json!({}),
+            &session
+        ));
+        let took = t.elapsed();
+        assert!(took < Duration::from_millis(100), "{took:?}");
+        assert!(held.join().unwrap().contains("capture.session_start"));
     }
 
     fn hook(provider: &'static str, event: Event) -> Hook {

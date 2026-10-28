@@ -38,7 +38,7 @@ Run `lightbulb <command> --help` for the options of each one.
 
 | Command | What it does |
 |---|---|
-| `setup` | Connect Claude Code, Codex, Cursor, Grok CLI and OpenCode here and start the background service. |
+| `setup` | Connect Claude Code, Codex, Cursor, Grok CLI and OpenCode here and start the background service. At a terminal it first offers the free sign-in (your memory and sessions follow you across computers, the Claude app reaches your agents, the evaluator can read sessions you upload); press `l` to stay local. Staying local keeps uploads off (`capture_upload = "off"` in `config.toml`). Already signed in, or run without a terminal, it skips the question. |
 | `update` | Install the latest release over this one and restart the background service. `--version v0.2.3` installs that release instead (0.2.2 or later; an example tag). `--auto on\|off` turns the daily automatic update on or off and installs nothing. |
 | `setup --remove` | Take out only what `setup` wrote. Backups are left as they are. |
 | `doctor` | Check the service, the local network, the state folder and each agent, and say how to fix what is not right. |
@@ -57,12 +57,42 @@ Run `lightbulb <command> --help` for the options of each one.
 | `folder <path> on\|off` | Show or hide the sessions under a folder from your teammates. |
 | `login` | Sign this computer in to Lightbulb (confirm in the browser), so your workspace's agents answer it. |
 | `logout` | Sign this computer out. |
+| `memory list\|show\|forget\|share\|export\|last\|team\|drafts\|approve\|dismiss` | See and control what your agents remember (see "Memory" below), and keep or drop the lessons suggested from sessions you uploaded. |
+| `sessions list\|show\|forget\|export\|upload` | See and delete what was captured of your coding sessions here: the agent, the repository, each tool call and a short summary of it, never file contents or output. Dot folders in your home folder (`~/.config`) are skipped; a repository's own (`.claude/worktrees`) are captured. Tokens are filled for Claude Code only (from its transcript, when the session ends); the other agents leave them blank until their payloads are verified, and OpenCode's tool calls are captured on 1.x only. `sessions upload off\|metadata\|full` chooses what is sent to Lightbulb (off by default). |
 | `telemetry [on\|off\|status]` | Show or set anonymous usage counts (see the [README](../README.md#usage-counts)). |
 | `version` | Print the version. |
 
 `held`, `remove`, `leave` and `relay <url>` refuse to run from an agent's shell
 (`Run this from your own terminal, not from an agent.`). An agent may run `invite`, `join`,
 `approve` and `decline`; an answer it gives records its session.
+
+## Memory
+
+Your agents can remember things (a decision, a lesson, a preference) with the `remember` tool and
+look them up with `recall`. Each entry is `me` or `team`.
+
+- `team` entries go to every member of the team.
+- `me` entries go only to your own signed-in computers. If this computer is not signed in, a `me`
+  entry stays on this computer.
+
+An agent writes `me` unless you tell it to share. `lightbulb memory list` shows everything, who
+wrote it and whether two people disagree. `lightbulb memory share <id>` turns one of yours into a
+team entry; `lightbulb memory team off` stops team entries from this computer.
+
+Claude Code and Codex are handed what is remembered for the repository at the start of a session
+(`lightbulb memory last` shows what the last one got). Cursor, Grok CLI and OpenCode do not get
+that block; their agents use `recall`. A folder with no git origin gets no block, because the
+block is chosen by repository.
+
+`lightbulb memory forget <id>` deletes an entry. The delete reaches every computer that comes
+online. A computer that stays offline for good keeps what it held. Secrets are refused, not
+scrubbed (see [security](security.md#memory)).
+
+Signed in, you can send finished sessions to Lightbulb: `lightbulb sessions upload metadata` or
+`full` (`lightbulb login` asks once; the default is `off`, and nothing leaves the computer). Sent in
+full, they let the evaluator suggest lessons: `lightbulb memory drafts` lists them,
+`lightbulb memory approve <id>` keeps one (`--team` for the workspace) and
+`lightbulb memory dismiss <id>` drops it.
 
 ## Trust
 

@@ -54,6 +54,34 @@
     }
   },
   {
+    "name": "recall",
+    "scope": "network",
+    "description": "Call when a task starts or you need something a teammate may know",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "question": {"type": "string"}
+      },
+      "required": ["question"]
+    }
+  },
+  {
+    "name": "remember",
+    "scope": "network",
+    "description": "Returns what is already known on the subject; call again with `replaces` if yours is a change. Personal unless the person says to share",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "subject": {"type": "string"},
+        "fact": {"type": "string"},
+        "kind": {"type": "string", "enum": ["fact", "decision", "lesson", "preference"]},
+        "scope": {"type": "string", "enum": ["me", "team"], "default": "me"},
+        "replaces": {"type": "array", "items": {"type": "string"}}
+      },
+      "required": ["subject", "fact", "kind"]
+    }
+  },
+  {
     "name": "find_rooms",
     "scope": "workspace",
     "description": "Find channels and existing DMs that the signed-in person may read.",

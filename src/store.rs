@@ -2,8 +2,9 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
 /// Migration `i` takes the db to `user_version` `i + 1`. Forward only; each one only adds
-/// tables or columns, and runs once (in the transaction that moves `user_version`).
-const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8];
+/// tables or columns, but V12, which drops and recreates `memory_fts` (stemmed) from the
+/// entries; each runs once (in the transaction that moves `user_version`).
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12];
 
 const V1: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
@@ -87,6 +88,65 @@ const V7: &str = "ALTER TABLE messages ADD COLUMN body_sha TEXT;";
 /// Retired (the person links' key -> person map): kept so the schema version still counts.
 const V8: &str =
     "CREATE TABLE IF NOT EXISTS persons (key TEXT PRIMARY KEY, person TEXT, at INTEGER);";
+/// The memory block last handed to each session at its start (`lightbulb memory last`).
+const V10: &str =
+    "CREATE TABLE IF NOT EXISTS memory_last (session TEXT PRIMARY KEY, block TEXT, at INTEGER);";
+/// Local capture (`capture`): a coding session and its tool calls. `summary` is at most 200
+/// characters, or `[refused: <pattern>]`.
+const V11: &str = "
+CREATE TABLE IF NOT EXISTS capture_sessions (
+    id TEXT PRIMARY KEY, harness TEXT NOT NULL, computer TEXT NOT NULL, repo TEXT, branch TEXT,
+    started INTEGER NOT NULL, ended INTEGER, prompt_tokens INTEGER, completion_tokens INTEGER
+);
+CREATE TABLE IF NOT EXISTS capture_tool_calls (
+    session_id TEXT NOT NULL, seq INTEGER NOT NULL, at INTEGER NOT NULL, tool TEXT NOT NULL,
+    summary TEXT, duration_ms INTEGER, ok INTEGER NOT NULL, PRIMARY KEY (session_id, seq)
+);
+";
+/// Memory search stems words (`porter`: tests/test, deploys/deploy), so the index is rebuilt
+/// from the entries as the triggers write it; V9's triggers stay. `memory_seen`: the highest
+/// seq a peer has reported holding for one of our own keys, so an entry written after a
+/// restored `state.db` never reuses a number peers already hold.
+const V12: &str = "
+DROP TABLE IF EXISTS memory_fts;
+CREATE VIRTUAL TABLE memory_fts USING fts5(
+    subject, fact, content='memory_entries', content_rowid='rowid', tokenize='porter unicode61'
+);
+INSERT INTO memory_fts(rowid, subject, fact)
+    SELECT rowid, json_extract(entry, '$.op.subject'), json_extract(entry, '$.op.fact')
+    FROM memory_entries;
+CREATE TABLE IF NOT EXISTS memory_seen (author TEXT PRIMARY KEY, seq INTEGER NOT NULL);
+";
+/// Memory: signed entries numbered per author, with a full-text index over `subject` and `fact`
+/// (`memory`). `rowid` is explicit so it survives `VACUUM` (the FTS index points at it). A
+/// tombstoned row keeps its id and seq and drops its body (`entry` NULL); `memory_tombstones`
+/// holds every id a held `Forget` names, so a body that arrives later is stored without its text.
+const V9: &str = "
+CREATE TABLE IF NOT EXISTS memory_entries (
+    rowid INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE, author TEXT, seq INTEGER, entry TEXT,
+    received_at INTEGER, tombstone INTEGER DEFAULT 0, UNIQUE(author, seq)
+);
+CREATE TABLE IF NOT EXISTS memory_tombstones (target TEXT PRIMARY KEY);
+CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
+    subject, fact, content='memory_entries', content_rowid='rowid'
+);
+CREATE TRIGGER IF NOT EXISTS memory_ai AFTER INSERT ON memory_entries BEGIN
+    INSERT INTO memory_fts(rowid, subject, fact)
+    VALUES (new.rowid, json_extract(new.entry, '$.op.subject'), json_extract(new.entry, '$.op.fact'));
+END;
+CREATE TRIGGER IF NOT EXISTS memory_ad AFTER DELETE ON memory_entries BEGIN
+    INSERT INTO memory_fts(memory_fts, rowid, subject, fact)
+    VALUES ('delete', old.rowid, json_extract(old.entry, '$.op.subject'), json_extract(old.entry, '$.op.fact'));
+END;
+CREATE TRIGGER IF NOT EXISTS memory_au AFTER UPDATE ON memory_entries BEGIN
+    INSERT INTO memory_fts(memory_fts, rowid, subject, fact)
+    VALUES ('delete', old.rowid, json_extract(old.entry, '$.op.subject'), json_extract(old.entry, '$.op.fact'));
+    INSERT INTO memory_fts(rowid, subject, fact)
+    VALUES (new.rowid, json_extract(new.entry, '$.op.subject'), json_extract(new.entry, '$.op.fact'));
+END;
+CREATE VIEW IF NOT EXISTS memory_heads AS
+    SELECT author, MAX(seq) AS seq FROM memory_entries WHERE seq IS NOT NULL GROUP BY author;
+";
 
 /// The digest `messages.body_sha` keeps: hex sha256 of the text.
 pub fn body_sha(text: &str) -> String {
@@ -171,6 +231,9 @@ impl Store {
     /// Opens `path`, migrating it forward; refuses a db written by a newer version.
     pub fn open(path: &Path) -> crate::Result<Store> {
         let conn = Connection::open(path)?;
+        // A second connection (a test, a tool run beside the daemon) waits for the daemon's
+        // write instead of failing with "database is locked".
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let version: usize = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version > MIGRATIONS.len() {
             return Err(format!(
@@ -285,6 +348,29 @@ impl Store {
                 .execute("DELETE FROM hidden_sessions WHERE key = ?1", [k])?;
         }
         Ok(())
+    }
+
+    /// Keeps `block` as the last memory block `session` was handed.
+    pub fn set_memory_last(&self, session: &str, block: &str, at: i64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO memory_last VALUES (?1, ?2, ?3)",
+            params![session, block, at],
+        )?;
+        Ok(())
+    }
+
+    /// The block `session` was last handed, else the most recent one any session was.
+    pub fn memory_last(&self, session: Option<&str>) -> rusqlite::Result<Option<String>> {
+        use rusqlite::OptionalExtension;
+        self.conn
+            .query_row(
+                "SELECT block FROM memory_last WHERE session = ?1
+                 UNION ALL SELECT block FROM (SELECT block FROM memory_last ORDER BY at DESC LIMIT 1)
+                 LIMIT 1",
+                [session],
+                |r| r.get(0),
+            )
+            .optional()
     }
 
     /// The keys `set_hidden` marked.
@@ -988,10 +1074,10 @@ mod tests {
         let path = dir.path().join("state.db");
         Connection::open(&path)
             .unwrap()
-            .execute_batch("PRAGMA user_version = 9;")
+            .execute_batch("PRAGMA user_version = 13;")
             .unwrap();
         let err = Store::open(&path).err().unwrap().to_string();
-        assert!(err.contains("State is from a newer version (v9)"), "{err}");
-        assert_eq!(user_version(&path), 9);
+        assert!(err.contains("State is from a newer version (v13)"), "{err}");
+        assert_eq!(user_version(&path), 13);
     }
 }

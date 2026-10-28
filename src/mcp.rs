@@ -458,7 +458,12 @@ fn kind_of(id: &str) -> &'static str {
 /// hex> <label>"` with P the URL's path and query, and `X-Lightbulb-Sig` is this computer's
 /// signature over it (`login::proof`, purpose `tools`). The answer of a 2xx, else the error
 /// result.
-fn rest(method: &str, path: &str, body: Option<&Value>, label: &str) -> Result<Value, Value> {
+pub(crate) fn rest(
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+    label: &str,
+) -> Result<Value, Value> {
     let dir = paths::state_path();
     let Some(proof) = login::stored_proof(&dir) else {
         return Err(json!({"error": "not_signed_in", "hint": "run lightbulb login"}));
@@ -530,6 +535,7 @@ impl Server {
                 Ok(a) => self.send_message(call, a).await,
                 Err(e) => e,
             },
+            "recall" | "remember" => self.memory(call, name, args).await,
             "message_receipt" => match parse(args) {
                 Ok(a) => self.message_receipt(call, a).await,
                 Err(e) => e,
@@ -624,6 +630,27 @@ impl Server {
         match Self::signed(call, method, path, body).await {
             Ok(v) => Self::done(call, v).await,
             Err(e) => e,
+        }
+    }
+
+    /// `recall` and `remember`: the daemon's `memory.*` ops, `remember` as this session.
+    async fn memory(&self, call: Call, name: &str, args: Value) -> CallToolResult {
+        // Only what the tool declares: `when` and the page budget are the daemon's.
+        let Some(tool) = spec().iter().find(|t| t["name"] == name) else {
+            return code("unknown_tool");
+        };
+        let mut args = Value::Object(props(tool, &args, &[]));
+        args["session"] = call.from.0.clone().into();
+        match ask(&format!("memory.{name}"), args).await {
+            Ok(mut r) if r["ok"] == true => {
+                if let Some(o) = r.as_object_mut() {
+                    o.remove("id");
+                    o.remove("ok");
+                }
+                Self::done(&call, r).await
+            }
+            Ok(r) => code(r["error"].as_str().unwrap_or("internal")),
+            Err(e) => fail(internal(e)),
         }
     }
 

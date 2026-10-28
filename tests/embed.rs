@@ -622,3 +622,347 @@ async fn a_logout_and_a_new_login_reach_a_connected_workspace_without_a_restart(
     until(10, "stored after login", || a.state(&sa, "r3") == "stored");
     i.shutdown().await;
 }
+
+fn imported(subject: &str, fact: &str) -> Value {
+    json!({"subject": subject, "fact": fact, "kind": "fact", "scope": "team", "when": 5,
+        "source": {"harness": "import", "repo": null, "session": null, "on_behalf_of": "Maya"},
+        "replaces": []})
+}
+
+async fn listed(i: &Instance, since: u64) -> Value {
+    ok(i, "memory.list", json!({ "since_seq": since })).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cloud_remember_signs_as_workspace_with_name_in_source() {
+    let home = tempfile::tempdir().unwrap();
+    let i = start(home.path(), &[], None).await;
+    let key = ok(&i, "identity.get", json!({})).await["member_key"].clone();
+    let r = ok(
+        &i,
+        "memory.remember",
+        json!({"subject": "db", "fact": "we use postgres", "kind": "decision",
+            "scope": "team", "on_behalf_of": "Maya"}),
+    )
+    .await;
+    assert_eq!(r["stored"], true, "{r}");
+    let l = listed(&i, 0).await;
+    let e = &l["entries"][0];
+    assert_eq!(e["id"], r["entry_id"], "{l}");
+    assert_eq!(e["author"], key);
+    assert_eq!(e["op"]["source"]["harness"], "workspace");
+    assert_eq!(e["op"]["source"]["on_behalf_of"], "Maya");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cloud_import_assigns_sequential_seq() {
+    let home = tempfile::tempdir().unwrap();
+    let i = start(home.path(), &[], None).await;
+    let r = ok(
+        &i,
+        "memory.import",
+        json!({"entries": [imported("a", "one"), imported("b", "two"), imported("c", "three")]}),
+    )
+    .await;
+    let ids = r["ids"].as_array().unwrap();
+    assert_eq!(ids.len(), 3, "{r}");
+    let l = listed(&i, 0).await;
+    let got: Vec<(&Value, &Value)> = l["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| (&e["seq"], &e["id"]))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (&json!(1), &ids[0]),
+            (&json!(2), &ids[1]),
+            (&json!(3), &ids[2])
+        ]
+    );
+    assert_eq!(l["entries"][0]["op"]["source"]["harness"], "import");
+    assert_eq!(l["next"], 3);
+    let bad = call(&i, "memory.import", json!({"entries": [{"subject": "x"}]})).await;
+    assert_eq!(bad["error"], "bad_request", "{bad}");
+    // A blank subject is refused, the rest go on.
+    let r = ok(
+        &i,
+        "memory.import",
+        json!({"entries": [imported(" ", "blank"), imported("d", "four")]}),
+    )
+    .await;
+    assert_eq!(r["ids"][0], Value::Null, "{r}");
+    assert!(r["ids"][1].is_string(), "{r}");
+    assert_eq!(r["refused"], json!([{"index": 0, "reason": "no_subject"}]));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cloud_list_since_returns_new_entries() {
+    let home = tempfile::tempdir().unwrap();
+    let i = start(home.path(), &[], None).await;
+    ok(
+        &i,
+        "memory.import",
+        json!({"entries": [imported("a", "one"), imported("b", "two")]}),
+    )
+    .await;
+    let first = listed(&i, 0).await;
+    let next = first["next"].as_u64().unwrap();
+    assert_eq!(listed(&i, next).await["entries"], json!([]));
+    assert_eq!(listed(&i, next).await["next"], next);
+    ok(
+        &i,
+        "memory.import",
+        json!({"entries": [imported("c", "three")]}),
+    )
+    .await;
+    let l = listed(&i, next).await;
+    assert_eq!(l["entries"].as_array().unwrap().len(), 1, "{l}");
+    assert_eq!(l["entries"][0]["op"]["fact"], "three");
+    assert_eq!(l["next"], next + 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cloud_forget_author_tombstones_all() {
+    let home = tempfile::tempdir().unwrap();
+    let i = start(home.path(), &[], None).await;
+    let key = ok(&i, "identity.get", json!({})).await["member_key"].clone();
+    ok(
+        &i,
+        "memory.import",
+        json!({"entries": [imported("a", "one"), imported("b", "two")]}),
+    )
+    .await;
+    let r = ok(&i, "memory.forget_author", json!({"author": key})).await;
+    assert_eq!(r["forgotten"], 2, "{r}");
+    let facts = ok(&i, "memory.recall", json!({"question": ""})).await;
+    assert_eq!(facts["facts"], json!([]), "{facts}");
+    let again = ok(&i, "memory.forget_author", json!({"author": key})).await;
+    assert_eq!(again["forgotten"], 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cloud_list_includes_tombstones_bodyless() {
+    let home = tempfile::tempdir().unwrap();
+    let i = start(home.path(), &[], None).await;
+    let key = ok(&i, "identity.get", json!({})).await["member_key"].clone();
+    let r = ok(
+        &i,
+        "memory.import",
+        json!({"entries": [imported("a", "one")]}),
+    )
+    .await;
+    ok(&i, "memory.forget_author", json!({"author": key})).await;
+    let l = listed(&i, 0).await;
+    assert_eq!(
+        l["entries"][0],
+        json!({"seq": 1, "id": r["ids"][0], "author": key, "tombstone": true}),
+        "{l}"
+    );
+    // The forget itself is returned as stored, naming its target.
+    assert_eq!(l["entries"][1]["op"]["target"], r["ids"][0], "{l}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cloud_ops_are_refused_on_a_socket_daemon() {
+    let a = computer_a();
+    for (op, body) in [
+        ("memory.import", json!({"entries": []})),
+        ("memory.forget_author", json!({"author": "x"})),
+        ("memory.list", json!({"since_seq": 0})),
+    ] {
+        let mut req = body;
+        req["id"] = 1.into();
+        req["op"] = op.into();
+        let r = a.ask(req);
+        assert_eq!(
+            (r["ok"].clone(), r["error"].clone()),
+            (json!(false), json!("unsupported")),
+            "{op}: {r}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cloud_import_is_idempotent_on_key() {
+    let home = tempfile::tempdir().unwrap();
+    let i = start(home.path(), &[], None).await;
+    let mut a = imported("a", "one");
+    a["key"] = "rec1:h1".into();
+    let mut b = imported("b", "two");
+    b["key"] = "rec2:h2".into();
+    let batch = json!({"entries": [a, b, imported("c", "three")]});
+    let first = ok(&i, "memory.import", batch.clone()).await;
+    let again = ok(&i, "memory.import", batch).await;
+    assert_eq!(
+        first["ids"].as_array().unwrap()[..2],
+        again["ids"].as_array().unwrap()[..2],
+        "{first} {again}"
+    );
+    // No key: a second entry, as before.
+    assert_ne!(first["ids"][2], again["ids"][2]);
+    let l = listed(&i, 0).await;
+    assert_eq!(l["entries"].as_array().unwrap().len(), 4, "{l}");
+    assert_eq!(l["entries"][0]["op"]["source"]["session"], "rec1:h1");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cloud_import_continues_past_a_refused_entry() {
+    let home = tempfile::tempdir().unwrap();
+    let i = start(home.path(), &[], None).await;
+    let r = ok(
+        &i,
+        "memory.import",
+        json!({"entries": [imported("a", "one"),
+            imported("b", "key is sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789"),
+            imported("c", "three")]}),
+    )
+    .await;
+    assert!(
+        r["ids"][0].is_string() && r["ids"][1].is_null() && r["ids"][2].is_string(),
+        "{r}"
+    );
+    assert_eq!(r["refused"].as_array().unwrap().len(), 1, "{r}");
+    assert_eq!(r["refused"][0]["index"], 1);
+    assert!(
+        r["refused"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("secret:"),
+        "{r}"
+    );
+    assert_eq!(listed(&i, 0).await["entries"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cloud_import_key_of_forgotten_entry_returns_the_old_id() {
+    let home = tempfile::tempdir().unwrap();
+    let i = start(home.path(), &[], None).await;
+    let key = ok(&i, "identity.get", json!({})).await["member_key"].clone();
+    let mut a = imported("a", "one");
+    a["key"] = "rec1:h1".into();
+    let batch = json!({"entries": [a]});
+    let first = ok(&i, "memory.import", batch.clone()).await;
+    ok(&i, "memory.forget_author", json!({"author": key})).await;
+    let before = listed(&i, 0).await["entries"].as_array().unwrap().len();
+    let again = ok(&i, "memory.import", batch).await;
+    assert_eq!(again["ids"], first["ids"], "{again}");
+    assert_eq!(
+        listed(&i, 0).await["entries"].as_array().unwrap().len(),
+        before
+    );
+}
+
+/// `memory.share` takes the team lock before the store's, as everything else does: with another
+/// thread locking team then store in a loop, 100 shares finish (the opposite order would
+/// deadlock, ABBA).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn memory_share_takes_the_team_lock_before_the_store() {
+    let home = tempfile::tempdir().unwrap();
+    let i = std::sync::Arc::new(start(home.path(), &[], None).await);
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let other = {
+        let (i, stop) = (i.clone(), stop.clone());
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                i.lock_team_then_store();
+            }
+        })
+    };
+    let shares = async {
+        for _ in 0..100 {
+            let r = call(&i, "memory.share", json!({"entry": "abcdef"})).await;
+            assert_eq!(r["error"], "not_found", "{r}");
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(20), shares)
+        .await
+        .expect("100 shares finish beside a team-then-store locker");
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    other.join().unwrap();
+}
+
+/// `f` again while A's running daemon holds its database (`database is locked`).
+fn busy_retry<T>(mut f: impl FnMut() -> lightbulb::Result<T>) -> T {
+    for _ in 0..50 {
+        if let Ok(v) = f() {
+            return v;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    f().unwrap()
+}
+
+/// A wipe tombstones entries of another author too, and a replica honours the forget.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cloud_forget_author_wipes_a_peers_entry_and_a_replica_honours_it() {
+    let a = computer_a();
+    let home = tempfile::tempdir().unwrap();
+    let i = start(home.path(), &[&a], None).await;
+    join(&i, &a).await;
+    let ka = a.identity().key;
+    let theirs = busy_retry(|| {
+        lightbulb::memory::remember(
+            &a.store(),
+            &a.identity(),
+            lightbulb::memory::Op::Remember {
+                subject: "db".into(),
+                fact: "postgres 16".into(),
+                kind: lightbulb::memory::Kind::Fact,
+                scope: lightbulb::memory::Scope::Team,
+                when: None,
+                source: lightbulb::memory::Source {
+                    harness: "test".into(),
+                    repo: None,
+                    session: None,
+                    on_behalf_of: None,
+                    shared_from: None,
+                },
+                replaces: vec![],
+            },
+            5,
+        )
+    });
+    for _ in 0..100 {
+        let l = listed(&i, 0).await;
+        if l["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["id"] == theirs.id.as_str())
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let r = ok(&i, "memory.forget_author", json!({"author": ka})).await;
+    assert_eq!(r["forgotten"], 1, "{r}");
+    let l = listed(&i, 0).await;
+    assert!(
+        l["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["id"] == theirs.id.as_str() && e["tombstone"] == true),
+        "{l}"
+    );
+    let facts = ok(&i, "memory.recall", json!({"question": ""})).await;
+    assert_eq!(facts["facts"], json!([]), "{facts}");
+    // The forget is signed by the workspace member; A, the author, honours it.
+    let me_key = ok(&i, "identity.get", json!({})).await["member_key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    until(10, "A holds the workspace's forget", || {
+        !lightbulb::memory::since(&a.store(), &me_key, 0, 10)
+            .unwrap()
+            .is_empty()
+    });
+    for f in lightbulb::memory::since(&a.store(), &me_key, 0, 10).unwrap() {
+        busy_retry(|| lightbulb::memory::accept(&a.store(), &f, 10));
+    }
+    assert!(lightbulb::memory::entry(&a.store(), &theirs.id)
+        .unwrap()
+        .is_none());
+}

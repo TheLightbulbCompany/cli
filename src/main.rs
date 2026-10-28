@@ -52,6 +52,67 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum MemoryCommand {
+    /// What is remembered now: scope, who, status, subject and value.
+    List {
+        /// Only what is shared with the team.
+        #[arg(long, conflicts_with = "me")]
+        team: bool,
+        /// Only what is yours alone.
+        #[arg(long)]
+        me: bool,
+        /// Only what was remembered in this repository (its git origin).
+        #[arg(long)]
+        repo: Option<String>,
+    },
+    /// One entry in full: its value, who wrote it, where from, and what it replaced.
+    Show { id: String },
+    /// Delete an entry on every computer that holds it.
+    Forget { id: String },
+    /// Copy one of your own entries to the team; the original stays yours.
+    Share { id: String },
+    /// Print every entry this computer holds, one JSON object per line (`--json`: one array).
+    Export {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print the memory block your last session was handed at its start.
+    Last,
+    /// Lessons Lightbulb's evaluator suggests from sessions you uploaded, waiting for you.
+    Drafts,
+    /// Keep a suggested lesson (`--team`: for the whole workspace).
+    Approve {
+        id: String,
+        #[arg(long)]
+        team: bool,
+    },
+    /// Throw a suggested lesson away.
+    Dismiss { id: String },
+    /// Let agents write team memory (`on`) or not (`off`) from this computer.
+    Team {
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum SessionsCommand {
+    /// Your coding sessions captured on this computer: agent, repo, tool calls and tokens.
+    List,
+    /// One session with its tool calls (a tool and a short summary, never file contents).
+    Show { id: String },
+    /// Delete a session and its tool calls.
+    Forget { id: String },
+    /// Print every captured session with its tool calls as JSON.
+    Export,
+    /// Choose what is sent to Lightbulb: off (the default), metadata or full. No mode: say which.
+    Upload {
+        #[arg(value_parser = ["off", "metadata", "full"])]
+        mode: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum Command {
     /// Print the version.
     Version,
@@ -164,6 +225,16 @@ enum Command {
     Telemetry {
         #[arg(value_parser = ["on", "off", "status"])]
         state: Option<String>,
+    },
+    /// What your agents and your team remember: list, show, forget, share, export.
+    Memory {
+        #[command(subcommand)]
+        command: MemoryCommand,
+    },
+    /// The sessions captured on this computer: list, show, forget, export.
+    Sessions {
+        #[command(subcommand)]
+        command: SessionsCommand,
     },
     /// Show (`on`) or hide (`off`) the sessions under a folder from your teammates.
     Folder {
@@ -325,6 +396,25 @@ fn run() -> lightbulb::Result<()> {
             &lightbulb::paths::state_dir(),
             state.as_deref().filter(|s| *s != "status"),
         )?),
+        Command::Memory { command } => exit(cli::memory(match command {
+            MemoryCommand::List { team, me, repo } => cli::Memory::List { team, me, repo },
+            MemoryCommand::Show { id } => cli::Memory::Show(id),
+            MemoryCommand::Forget { id } => cli::Memory::Forget(id),
+            MemoryCommand::Share { id } => cli::Memory::Share(id),
+            MemoryCommand::Export { json } => cli::Memory::Export(json),
+            MemoryCommand::Last => cli::Memory::Last,
+            MemoryCommand::Drafts => cli::Memory::Drafts,
+            MemoryCommand::Approve { id, team } => cli::Memory::Approve(id, team),
+            MemoryCommand::Dismiss { id } => cli::Memory::Dismiss(id),
+            MemoryCommand::Team { state } => cli::Memory::Team(state == "on"),
+        })?),
+        Command::Sessions { command } => exit(cli::sessions(match command {
+            SessionsCommand::List => cli::Sessions::List,
+            SessionsCommand::Show { id } => cli::Sessions::Show(id),
+            SessionsCommand::Forget { id } => cli::Sessions::Forget(id),
+            SessionsCommand::Export => cli::Sessions::Export,
+            SessionsCommand::Upload { mode } => cli::Sessions::Upload(mode),
+        })?),
         Command::Folder { path, state } => exit(cli::folder(&path, state == "on")?),
         Command::Relay { url, clear, local } => {
             exit(cli::relay(clear.then(String::new).or(url), local)?)

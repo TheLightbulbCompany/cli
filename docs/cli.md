@@ -336,6 +336,78 @@ Prints `Usage counts  on` or `Usage counts  off (…reason…)`. `off` and `on` 
 `config.toml`. `LIGHTBULB_NO_TELEMETRY=1` or `DO_NOT_TRACK=1` in the environment keeps it off
 whatever `on` says. What is counted: [README](../README.md#usage-counts).
 
+### memory
+
+When you use it: to see, share or delete what your agents have remembered, on your computer or your team's.
+
+```
+lightbulb memory list [--team | --me] [--repo <ORIGIN>]
+lightbulb memory show <ID>
+lightbulb memory forget <ID>
+lightbulb memory share <ID>
+lightbulb memory export [--json]
+lightbulb memory last
+lightbulb memory team <on|off>
+lightbulb memory drafts
+lightbulb memory approve <ID> [--team]
+lightbulb memory dismiss <ID>
+```
+
+`--help`: What your agents and your team remember: list, show, forget, share, export, and the lessons suggested for you: drafts, approve, dismiss.
+
+Agents write memory with the `remember` tool and read it with `recall`. These commands are your
+own view of it. An `<ID>` is the first characters of an entry's id as `list` prints it (six or
+more). `forget`, `share`, `team`, `drafts`, `approve` and `dismiss` must be run from your own terminal; an agent's shell is refused.
+
+| Command | What it does |
+|---|---|
+| `list` | What is remembered now: the id, whether it is `team` or `me`, who wrote it, its status (`current`, or `contested` when two people hold different values for one subject), the subject and the value. `--team` or `--me` keeps one scope; `--repo` keeps entries made in one git origin. |
+| `show <ID>` | One entry in full: its value, its author, the agent and repository it came from, and the values it replaced. |
+| `forget <ID>` | Deletes the entry. The delete goes to every computer that holds it, as each comes online. |
+| `share <ID>` | Copies one of your `me` entries to the team as a new `team` entry. The `me` entry stays. It refuses an entry that is not your own `me` entry, one that was replaced, one you already shared, and any entry when `memory team` is `off`. |
+| `export` | Every entry this computer holds, as stored: one JSON object per line, or one array with `--json`. A forgotten entry has no text left to export. |
+| `last` | The memory block the last session was handed at its start, word for word. Any `forget` clears it (`No session has been handed a memory block yet.`) until the next session starts. |
+| `team on\|off` | Whether team memory may be written from this computer (`memory_team` in `config.toml`, on by default). `off` makes `remember` and `share` refuse `team` entries; what is already held stays. |
+| `drafts` | The lessons Lightbulb's evaluator suggests from sessions you uploaded in full (see `sessions upload`): the id, the kind, the first line and how many sessions it came from. Needs `lightbulb login`. |
+| `approve <ID> [--team]` | Keeps a suggested lesson. Signed in on your own, it becomes a `me` entry on this computer (a `team` entry with `--team`), marked as from the cloud evaluator. In a workspace it says `Approved; the workspace will remember it` and the entry arrives through the network; `--team` shares it with the whole workspace. It says so if the draft was settled elsewhere, or refused (a secret, or too long). |
+| `dismiss <ID>` | Throws a suggested lesson away. |
+
+### sessions
+
+When you use it: to see, read, export or delete what Lightbulb captured of your coding sessions on this computer.
+
+```
+lightbulb sessions list
+lightbulb sessions show <ID>
+lightbulb sessions forget <ID>
+lightbulb sessions export
+lightbulb sessions upload [off|metadata|full]
+```
+
+`--help`: The sessions captured on this computer: list, show, forget, export, and what is uploaded.
+
+Each agent's hooks tell the background service when a session starts, after each tool call, at
+the end of each turn and when the session ends. It keeps, on this computer only: the session (its
+id, the agent, the computer, the repository and branch, when it started and ended, and the
+tokens, for Claude Code only, summed from its transcript once, when the session ends; the other agents leave them blank), and for each tool call its number, time, tool, duration,
+whether it worked, and a summary of at most 200 characters (a command, a path, a pattern). It
+never keeps file contents, diffs, command output or your prompts. A summary that looks like a
+password or key is replaced by `[refused: <what it matched>]`. Sessions under a hidden folder
+(`lightbulb folder <path> off`, or a folder in your home folder whose name starts with a dot,
+such as `~/.config`) are not captured; a dot folder inside a repository, such as Claude Code's
+`.claude/worktrees`, is. Capture never slows the agent: a write the background service has not
+answered within 10 ms is not waited for (the service still makes it). An
+`<ID>` is the id as `list` prints it, or its first characters. `list`, `show`, `forget` and
+`export` must be run from your own terminal; an agent's shell is refused.
+
+| Command | What it does |
+|---|---|
+| `list` | The id, the agent, the repository, the day it started and the tokens in and out (`-` where the agent did not report them). |
+| `show <ID>` | One session and its tool calls in order. |
+| `forget <ID>` | Deletes the session and its tool calls. |
+| `export` | Every session with its tool calls, as one JSON array on stdout. |
+| `upload [off\|metadata\|full]` | Choose what, if anything, is sent to Lightbulb (`capture_upload` in `config.toml`). `off` is the default: nothing leaves this computer. `metadata` sends, for each finished session, the agent, repository, branch, times and token counts, and for each tool call its number, time, tool, duration and whether it worked, without the summary. `full` adds the summary. Uploads are signed with this computer's identity, only while it is signed in, only for sessions that finish after you turn them on, and never for a hidden folder; signed out, it says nothing is sent until `lightbulb login`. Setting a mode must be run from your own terminal (an agent's shell is refused); with no mode it says which is set, from anywhere. `lightbulb login` asks once. |
+
 ## Commands the agents and macOS run
 
 `hook`, `mcp` and `daemon` are not for typing. The agents run `lightbulb hook <agent> <event>`

@@ -277,6 +277,8 @@ pub async fn run(dir: &Path) -> Result<()> {
         Err(e) if e.kind() != ErrorKind::NotFound => return Err(e.into()),
         _ => {}
     }
+    // The secret patterns compile now, not inside the first capture write the hook waits for.
+    crate::memory::refuse_secret("");
     let listener = UnixListener::bind(&sock)?;
     // Briefly wider than 0600 after bind; the 0700 state dir closes that window.
     fs::set_permissions(&sock, Permissions::from_mode(0o600))?;
@@ -286,6 +288,8 @@ pub async fn run(dir: &Path) -> Result<()> {
     tokio::spawn(crate::telemetry::run_daily(daemon.clone()));
     // While signed in: the route link for this person's hosted apps.
     tokio::spawn(crate::link::run(daemon.clone()));
+    // While signed in and the person chose it: closed sessions go to Lightbulb.
+    tokio::spawn(crate::upload::run(daemon.clone()));
     // SIGTERM (launchd's stop) and SIGINT end it like a `shutdown` op: the socket and the
     // loopback address file (`net::local`) are removed on the way out.
     let d = daemon.clone();
