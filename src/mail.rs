@@ -858,11 +858,13 @@ pub fn send(
 }
 
 /// What member `peer`'s envelope `env` becomes on this computer (member prefix `me`), checked
-/// in this order: a `from` outside `peer`'s prefix is dropped unanswered (`Err`); a `kind` other than
-/// `message` (the `app_*` kinds never reach here: `net::receive` drops them), any `files`, a body over `MAX_TEXT`, or a malformed id, `thread` or `request_id`
+/// in this order: a `from` outside `peer`'s prefix is dropped unanswered (`Err`); a `kind` outside `KINDS` (`message`, `assign`, `result`, `cancel`; the `app_*` kinds never reach here: `net::receive` drops them), any `files`, a body over `MAX_TEXT`, or a malformed id, `thread` or `request_id`
 /// is `unsupported`; a `to` that is not one address is `policy`, one under another prefix
-/// `not_member`; an envelope seen before gets the state it has now and is not delivered again;
-/// a `request_id` reused with another text or recipient is `request_id_reused`; `hops` at
+/// `not_member`; a `to` of the form `<member>/<provider>:new` is `no_worker` (this build starts
+/// no workers); an envelope seen before gets the state it has now and is not delivered again;
+/// a `request_id` reused with another text or recipient is `request_id_reused`; a kind whose
+/// rules fail (`check_kind`, with `reply_to` resolved to the stored message) is refused with
+/// its reason; `hops` at
 /// `MAX_HOPS` or more, or below one past a message of ours it answers (`hops_ok`), or the
 /// `LOOP_LIMIT`th send in `LOOP_WINDOW_S` from one member to `to`, is `loop`; then
 /// stored for `to` with origin `net:<peer short>`, timed by its arrival (`now`), and
@@ -893,6 +895,7 @@ pub fn receive(
         hops,
         body,
         files,
+        meta,
         ..
     } = env
     else {
@@ -905,7 +908,7 @@ pub fn receive(
     if !address(from) || sessions::member_of(from) != Some(peer.short.as_str()) {
         return Err("an envelope from outside its member's prefix".into());
     }
-    if kind != "message"
+    if !KINDS.contains(&kind.as_str())
         || !files.is_empty()
         || body.len() > MAX_TEXT
         || !sessions::word(request_id, MAX_REQUEST_ID)
@@ -919,6 +922,10 @@ pub fn receive(
     }
     if sessions::member_of(to) != Some(me) {
         return refused("not_member");
+    }
+    // This build starts no workers: a request for a fresh session cannot be met.
+    if is_new_worker(to) {
+        return refused("no_worker");
     }
     if let Some((state, reason)) = store.seen_state(&peer.key, id)? {
         return Ok(Answer {
@@ -938,6 +945,14 @@ pub fn receive(
             limit: r.limit,
             ..Answer::is(r.state)
         });
+    }
+    // `reply_to` is a message id on the wire.
+    let parent = match reply_to {
+        Some(r) => store.message(r)?,
+        None => None,
+    };
+    if let Err(reason) = check_kind(kind, meta, parent.as_ref(), from) {
+        return refused(reason);
     }
     if declared.is_some_and(|d| !d.contains(to)) {
         return refused("policy");
@@ -975,7 +990,7 @@ pub fn receive(
         thread: thread.clone().unwrap_or_else(|| id.clone()),
         hops,
         kind: kind.clone(),
-        meta: Meta::default(), // task 4 reads the envelope's meta
+        meta: meta.clone(),
         sent_at: now as i64,
     };
     let tx = store.conn().unchecked_transaction()?;
@@ -1796,6 +1811,114 @@ mod tests {
             meta: Default::default(),
         };
         (peer, roster, env)
+    }
+
+    fn peer_env(from: &str, to: &str, rid: &str, kind: &str, meta: Meta) -> Frame {
+        let (_, _, mut env) = peer_mail(to, rid);
+        if let Frame::Envelope {
+            from: f,
+            kind: k,
+            meta: m,
+            ..
+        } = &mut env
+        {
+            (*f, *k, *m) = (from.into(), kind.into(), meta);
+        }
+        env
+    }
+
+    #[test]
+    fn a_peers_assign_is_stored_with_its_meta_and_a_new_address_is_no_worker() {
+        let (_d, s) = setup();
+        let (peer, roster, _) = peer_mail("m/claude:2", "x");
+        let meta = terms("green", 1060);
+        let env = peer_env("p/codex:a", "m/claude:2", "r1", "assign", meta);
+        let got = receive(&s, &env, &peer, &roster, "m", None, None, 1000).unwrap();
+        assert_eq!(
+            got,
+            Answer {
+                fresh: true,
+                ..Answer::is(State::Stored)
+            }
+        );
+        let Frame::Envelope { id, .. } = &env else {
+            unreachable!()
+        };
+        let stored = s.message(id).unwrap().unwrap();
+        assert_eq!(stored.meta.done_when.as_deref(), Some("green"));
+        assert_eq!(stored.kind, "assign");
+        let env = peer_env(
+            "p/codex:a",
+            "m/claude:new",
+            "r2",
+            "assign",
+            terms("green", 1060),
+        );
+        let got = receive(&s, &env, &peer, &roster, "m", None, None, 1000).unwrap();
+        assert_eq!(
+            (got.state, got.reason.as_deref()),
+            (State::Refused, Some("no_worker"))
+        );
+    }
+
+    #[test]
+    fn a_peers_result_must_answer_an_assign_sent_to_it() {
+        let (_d, s) = setup();
+        let (peer, roster, _) = peer_mail("m/codex:1", "x");
+        let a = go(prep(
+            &s,
+            "m/codex:1",
+            Some("p/claude:9"),
+            "a1",
+            None,
+            "assign",
+            terms("green", 1060),
+            900,
+        ));
+        store_local(&s, &a).unwrap();
+        let done = Meta {
+            status: Some("done".into()),
+            ..Default::default()
+        };
+        let mut env = peer_env("p/claude:9", "m/codex:1", "r1", "result", done.clone());
+        if let Frame::Envelope { reply_to, hops, .. } = &mut env {
+            (*reply_to, *hops) = (Some(a.message_id.clone()), a.hops as u32 + 1);
+        }
+        let got = receive(&s, &env, &peer, &roster, "m", None, None, 1000).unwrap();
+        assert_eq!(got.state, State::Stored);
+        let Frame::Envelope { id, .. } = &env else {
+            unreachable!()
+        };
+        let stored = s.message(id).unwrap().unwrap();
+        assert_eq!(stored.meta.status.as_deref(), Some("done"));
+        assert!(stored.hops >= 1);
+        // A result to a plain message is not an answer to an assignment.
+        let plain = peer_env("p/claude:9", "m/codex:1", "r2", "message", Meta::default());
+        receive(&s, &plain, &peer, &roster, "m", None, None, 1000).unwrap();
+        let Frame::Envelope { id: plain_id, .. } = &plain else {
+            unreachable!()
+        };
+        let mut env = peer_env("p/claude:9", "m/codex:1", "r3", "result", done);
+        if let Frame::Envelope { reply_to, hops, .. } = &mut env {
+            (*reply_to, *hops) = (Some(plain_id.clone()), 1);
+        }
+        let got = receive(&s, &env, &peer, &roster, "m", None, None, 1000).unwrap();
+        assert_eq!(
+            (got.state, got.reason.as_deref()),
+            (State::Refused, Some("policy"))
+        );
+    }
+
+    #[test]
+    fn a_peers_unknown_kind_is_unsupported() {
+        let (_d, s) = setup();
+        let (peer, roster, _) = peer_mail("m/codex:c", "x");
+        let env = peer_env("p/codex:a", "m/codex:c", "r1", "poke", Meta::default());
+        let got = receive(&s, &env, &peer, &roster, "m", None, None, 1000).unwrap();
+        assert_eq!(
+            (got.state, got.reason.as_deref()),
+            (State::Refused, Some("unsupported"))
+        );
     }
 
     #[test]
