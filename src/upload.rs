@@ -64,15 +64,6 @@ pub async fn run(d: Arc<Daemon>) {
     }
 }
 
-/// The wire form of an id: the server keeps it as a key, `[A-Za-z0-9._-]` only.
-fn wire_id(id: &str) -> String {
-    let ok = |c: char| c.is_ascii_alphanumeric() || "._-".contains(c);
-    id.chars()
-        .map(|c| if ok(c) { c } else { '_' })
-        .take(128)
-        .collect()
-}
-
 fn iso(secs: i64) -> String {
     format!(
         "{}:{:02}Z",
@@ -83,7 +74,7 @@ fn iso(secs: i64) -> String {
 
 fn session_json(s: &SessionRow) -> Value {
     json!({
-        "id": wire_id(&s.id), "harness": s.harness, "computer": s.computer,
+        "id": s.id, "harness": s.harness, "computer": s.computer,
         "repo": s.repo.clone().unwrap_or_default(), "branch": s.branch.clone().unwrap_or_default(),
         "started": iso(s.started), "ended": s.ended.map(iso),
         "prompt_tokens": s.prompt_tokens.unwrap_or(0), "completion_tokens": s.completion_tokens.unwrap_or(0),
@@ -92,7 +83,7 @@ fn session_json(s: &SessionRow) -> Value {
 
 fn call_json(c: &ToolCallRow, full: bool) -> Value {
     let mut v = json!({
-        "session_id": wire_id(&c.session_id), "seq": c.seq, "at": iso(c.at), "tool": c.tool,
+        "session_id": c.session_id, "seq": c.seq, "at": iso(c.at), "tool": c.tool,
         "duration_ms": c.duration_ms.unwrap_or(0), "ok": c.ok,
     });
     if full {
@@ -158,11 +149,19 @@ fn tick(d: &Daemon) -> Result<()> {
         "tool_calls": calls.iter().map(|c| call_json(c, full)).collect::<Vec<_>>(),
     });
     mcp::rest("POST", "/sessions", Some(&body), "upload").map_err(|e| {
-        format!(
-            "could not upload ({}); retrying",
-            e["error"].as_str().unwrap_or("failed")
-        )
+        if e["status"] == 401 {
+            "Lightbulb did not accept this sign-in; sign in again (`lightbulb login`)".to_string()
+        } else {
+            format!(
+                "could not upload ({}); retrying",
+                e["error"].as_str().unwrap_or("failed")
+            )
+        }
     })?;
-    std::fs::write(mark, next.max(after).to_string())?;
+    // `sessions upload off` during the request wins: it removed the mark and must keep it so.
+    let still_on = Config::load(&d.dir).is_ok_and(|c| c.capture_upload != "off");
+    if still_on && mark.exists() {
+        std::fs::write(mark, next.max(after).to_string())?;
+    }
     Ok(())
 }

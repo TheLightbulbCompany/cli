@@ -120,7 +120,7 @@ fn upload_metadata_omits_summaries() {
         .iter()
         .map(|s| s["id"].as_str().unwrap())
         .collect();
-    assert_eq!(ids, ["claude_a", "claude_b"], "closed sessions only");
+    assert_eq!(ids, ["claude:a", "claude:b"], "closed sessions only");
     assert_eq!(body["sessions"][0]["prompt_tokens"], 10);
     let calls = body["tool_calls"].as_array().unwrap();
     assert_eq!(calls.len(), 1);
@@ -170,6 +170,13 @@ fn uploader_signs_batches() {
     .unwrap();
     let parts: Vec<&str> = challenge.split(' ').collect();
     assert_eq!((parts[1], parts[2]), ("POST", "/sessions"), "{challenge}");
+    assert_eq!(parts[4], "upload", "{challenge}");
+    use sha2::{Digest, Sha256};
+    let hash: String = Sha256::digest(req.raw.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(parts[3], hash, "the challenge binds the body sent");
     let id = e.identity();
     let signed = lightbulb::login::proof(&id, "tools", &challenge, None);
     assert!(lightbulb::identity::verify(
@@ -196,4 +203,25 @@ fn nothing_uploads_when_signed_out() {
     );
     std::thread::sleep(Duration::from_millis(800));
     assert!(seen.lock().unwrap().is_empty());
+}
+
+#[test]
+fn an_upload_off_during_the_request_keeps_the_mark_gone() {
+    let (e, seen) = run("metadata", |_, _| {
+        std::thread::sleep(Duration::from_millis(700)); // in flight while the person turns it off
+        (200, json!({"stored": 2}))
+    });
+    wait_for(&seen, 1);
+    let mut off = e.base_cmd(std::process::Command::new(common::EXE));
+    assert!(off
+        .args(["sessions", "upload", "off"])
+        .status()
+        .unwrap()
+        .success());
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(
+        !e.state.path().join("upload.mark").exists(),
+        "off wins over the answer"
+    );
+    assert_eq!(uploads(&seen).len(), 1);
 }

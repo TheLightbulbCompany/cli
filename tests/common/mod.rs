@@ -715,6 +715,8 @@ pub struct Req {
     /// Lowercased header names.
     pub headers: Vec<(String, String)>,
     pub body: Value,
+    /// The body as sent.
+    pub raw: String,
 }
 
 impl Req {
@@ -768,6 +770,7 @@ pub fn api_stub(answer: impl Fn(&Req, usize) -> (u16, Value) + Send + 'static) -
                 path,
                 headers,
                 body: serde_json::from_slice(&body).unwrap_or(Value::Null),
+                raw: String::from_utf8_lossy(&body).into_owned(),
             };
             let n = {
                 let mut l = log.lock().unwrap();

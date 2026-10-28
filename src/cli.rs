@@ -686,6 +686,16 @@ fn drafts(cmd: Memory) -> Result<i32> {
         eprintln!("{e}");
         return Ok(1);
     }
+    // Before anything is settled on the server: a `team` entry cannot be stored here while
+    // team memory is off, and a retry would find the draft already approved.
+    if matches!(cmd, Memory::Approve(_, true))
+        && !crate::config::Config::load(&paths::state_dir())?.memory_team
+    {
+        eprintln!(
+            "Team memory is off on this computer. Turn it on with `lightbulb memory team on`, then approve again."
+        );
+        return Ok(1);
+    }
     let call = |method: &str, path: &str, body: Option<Value>| {
         crate::mcp::rest(method, path, body.as_ref(), "memory").map_err(|e| {
             match (e["status"].as_u64(), e["error"].as_str()) {
@@ -803,15 +813,9 @@ fn drafts(cmd: Memory) -> Result<i32> {
         println!("Approved and remembered on this computer.");
         return Ok(0);
     }
-    let why = match kept["refused"].as_str() {
-        Some("team_off") => {
-            "Team memory is off on this computer. Turn it on with `lightbulb memory team on`."
-                .to_string()
-        }
-        Some(r) => format!("It was approved, but this computer refused to store it ({r})."),
-        None => "It was approved, but this computer could not store it.".into(),
-    };
-    eprintln!("{why}");
+    // The draft is approved on the server now: print the lesson so nothing is lost.
+    let reason = kept["refused"].as_str().unwrap_or("it could not be stored");
+    eprintln!("Approved, but not stored locally: {reason}; the lesson is:\n{fact}");
     Ok(1)
 }
 

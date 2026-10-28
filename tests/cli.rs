@@ -1681,3 +1681,38 @@ fn login_upload_question_defaults_to_off() {
         assert_eq!(upload_mode(&e), "off", "{answer:?}");
     }
 }
+
+#[test]
+fn memory_approve_team_with_team_memory_off_calls_no_server() {
+    let e = Env::new();
+    e.sign_in("user_1", None);
+    assert!(e.person(&["memory", "team", "off"]).status.success());
+    let (base, seen) = common::api_stub(|_, _| (200, json!({"drafts": [draft("d1", "x")]})));
+    let o = with_api(&e, &base, &["memory", "approve", "d1", "--team"]);
+    assert!(!o.status.success());
+    assert!(err(&o).contains("lightbulb memory team on"), "{}", err(&o));
+    assert!(seen.lock().unwrap().is_empty(), "no request was made");
+}
+
+#[test]
+fn memory_approve_prints_the_lesson_when_the_local_store_refuses() {
+    let e = Env::new();
+    e.sign_in("user_1", None);
+    let fact = "Set api_key=abcdefgh12345 before running.";
+    let (base, _) = common::api_stub(move |r, _| match r.method.as_str() {
+        "GET" => (200, json!({"drafts": [draft("d1", fact)]})),
+        _ => (
+            200,
+            json!({"subject": "acme/app", "fact": fact, "kind": "lesson", "scope": "me"}),
+        ),
+    });
+    let o = with_api(&e, &base, &["memory", "approve", "d1"]);
+    assert!(!o.status.success());
+    let text = err(&o);
+    assert!(
+        text.contains("not stored locally: secret:") && text.contains("the lesson is:"),
+        "{text}"
+    );
+    assert!(text.contains(fact), "{text}");
+    assert!(!text.contains("memory team on"), "no retry hint: {text}");
+}
