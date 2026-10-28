@@ -349,13 +349,11 @@ fn capped_args(args: &Value) -> String {
 /// Whether the daemon said to nudge (a Stop sent with the session's `key`).
 fn try_capture(conn: &mut Conn, h: &Hook, payload: &Value, session: &Value) -> Result<bool> {
     let who = json!({ "harness": h.provider, "conversation": h.conversation });
-    let start = |conn: &mut Conn, repo: &Value, branch: &Value| {
-        let body = json!({ "cwd": session["cwd"], "repo": repo, "branch": branch });
-        conn.call("capture.session_start", with(&who, body))
-    };
     match h.event {
         Event::SessionStart => {
-            start(conn, &session["repo"], &session["branch"])?;
+            let body = json!({ "cwd": session["cwd"], "repo": session["repo"],
+                "branch": session["branch"] });
+            conn.call("capture.session_start", with(&who, body))?;
         }
         Event::PostToolUse => {
             let tool = ["tool_name", "toolName", "tool"]
@@ -366,20 +364,16 @@ fn try_capture(conn: &mut Conn, h: &Hook, payload: &Value, session: &Value) -> R
                 .iter()
                 .map(|k| &payload[k])
                 .find(|a| !a.is_null());
+            // With the folder, repo and branch: a session already running before capture
+            // existed has no row, and the daemon opens it from this one request (applying the
+            // hidden-folder rules), so no second call waits on the first answer. The git
+            // lookup is a few small file reads.
+            let (repo, branch) = crate::mcp::git(session["cwd"].as_str().unwrap_or_default());
             let call = json!({ "tool": tool, "args": args.map(capped_args),
                 "duration_ms": payload["duration"].as_i64(),
-                "ok": payload["tool_response"]["is_error"] != true });
-            let r = conn.call("capture.tool_call", with(&who, call.clone()))?;
-            // A session already running before capture existed has no row: open one now (the
-            // daemon applies the hidden-folder rules), then record the call.
-            if r["stored"] == false {
-                let cwd = session["cwd"].as_str().unwrap_or_default();
-                let (repo, branch) = crate::mcp::git(cwd);
-                let r = start(conn, &repo.into(), &branch.into())?;
-                if r["stored"] == true {
-                    conn.call("capture.tool_call", with(&who, call))?;
-                }
-            }
+                "ok": payload["tool_response"]["is_error"] != true,
+                "cwd": session["cwd"], "repo": repo, "branch": branch });
+            conn.call("capture.tool_call", with(&who, call))?;
         }
         Event::Stop => {
             // A Stop fires every turn: it reads only the `usage` its own payload carries, never

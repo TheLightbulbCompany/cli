@@ -529,8 +529,24 @@ fn memory_remember(
     }
 }
 
+/// `{tool, args, duration_ms?, ok?}` recorded for session `sid`; whether it was.
+fn tool_call(store: &crate::store::Store, sid: &str, b: &Value) -> crate::Result<bool> {
+    let Some(tool) = b["tool"].as_str() else {
+        return Err("bad".into());
+    };
+    crate::capture::record_tool_call(
+        store,
+        sid,
+        tool,
+        b["args"].as_str().unwrap_or_default(),
+        b["duration_ms"].as_i64(),
+        b["ok"].as_bool().unwrap_or(true),
+    )
+}
+
 /// Local capture. The hooks send `capture.session_start {harness, conversation, cwd, repo?,
-/// branch?}`, `capture.tool_call {harness, conversation, tool, args, duration_ms?, ok?}`,
+/// branch?}`, `capture.tool_call {harness, conversation, tool, args, duration_ms?, ok?, cwd?,
+/// repo?, branch?}` (which opens a session that has no row),
 /// `capture.turn {harness, conversation, role, text}` -> `{stored}`,
 /// `capture.stop {harness, conversation, prompt_tokens?, completion_tokens?, text?, key?}` ->
 /// `{nudge}` (the reply `text` kept as the assistant's turn; `Store::nudge`, asked only with
@@ -560,37 +576,41 @@ fn capture_op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, person: boo
         let on = crate::config::Config::load(&daemon.dir).is_ok_and(|c| c.capture_turns);
         crate::Result::Ok(on && capture::record_turn(store, sid, role, text, now() as i64)?)
     };
+    // Opens session `sid` from `body`'s cwd, repo and branch; whether it was (a cwd, not in
+    // a hidden folder, and new).
+    let start = |sid: &str| -> crate::Result<bool> {
+        let Some(cwd) = body["cwd"].as_str() else {
+            return Ok(false);
+        };
+        let row = capture::SessionRow {
+            id: sid.into(),
+            harness: body["harness"].as_str().unwrap_or_default().into(),
+            computer: computer.clone(),
+            repo: body["repo"].as_str().map(String::from),
+            branch: body["branch"].as_str().map(String::from),
+            started: now() as i64,
+            ended: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+        };
+        Ok(!hidden && capture::start_session(&store, &row, cwd)?)
+    };
     let r: crate::Result<Value> = (|| match op {
         "capture.session_start" => {
-            let (Some(sid), Some(cwd)) = (who(body), body["cwd"].as_str()) else {
+            let (Some(sid), Some(_)) = (who(body), body["cwd"].as_str()) else {
                 return Err("bad".into());
             };
-            let row = capture::SessionRow {
-                id: sid,
-                harness: body["harness"].as_str().unwrap_or_default().into(),
-                computer,
-                repo: body["repo"].as_str().map(String::from),
-                branch: body["branch"].as_str().map(String::from),
-                started: now() as i64,
-                ended: None,
-                prompt_tokens: None,
-                completion_tokens: None,
-            };
-            let stored = !hidden && capture::start_session(&store, &row, cwd)?;
-            Ok(json!({ "stored": stored }))
+            Ok(json!({ "stored": start(&sid)? }))
         }
         "capture.tool_call" => {
-            let (Some(sid), Some(tool)) = (who(body), body["tool"].as_str()) else {
+            let Some(sid) = who(body) else {
                 return Err("bad".into());
             };
-            let stored = capture::record_tool_call(
-                &store,
-                &sid,
-                tool,
-                body["args"].as_str().unwrap_or_default(),
-                body["duration_ms"].as_i64(),
-                body["ok"].as_bool().unwrap_or(true),
-            )?;
+            // A session running before capture existed has no row: this call (which carries
+            // `cwd`, `repo` and `branch`) opens it, in the one request, so a hook that has
+            // stopped waiting never loses the call.
+            let stored =
+                tool_call(&store, &sid, body)? || (start(&sid)? && tool_call(&store, &sid, body)?);
             Ok(json!({ "stored": stored }))
         }
         "capture.turn" => {

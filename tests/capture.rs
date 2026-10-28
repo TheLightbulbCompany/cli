@@ -758,3 +758,27 @@ fn a_credential_past_the_cut_is_still_refused() {
     let turns = capture::turns(&e.store(), "claude:c1").unwrap();
     assert_eq!(turns[0].text, "[refused: credential]");
 }
+
+/// A running session's first tool call opens its row and is recorded in one request: an answer
+/// that comes too late for the hook (`LIGHTBULB_CONNECT_DEBUG_CAPTURE_DELAY_MS` slows every
+/// capture op) never loses it.
+#[test]
+fn a_running_sessions_first_tool_call_survives_a_slow_answer() {
+    let e = Env::new();
+    let delay = [(
+        "LIGHTBULB_CONNECT_DEBUG_CAPTURE_DELAY_MS",
+        "500".to_string(),
+    )];
+    e.daemon(false, "", &delay);
+    let cwd = e.folder("proj");
+    let post = json!({"tool_name": "Read", "tool_input": {"file_path": "/x/y.rs"}});
+    let o = e.claude_hook("post-tool-use", e.payload("PostToolUse", &cwd, post));
+    assert!(o.status.success(), "{}", err(&o));
+    let mut calls = vec![];
+    common::until(10, "the call is recorded", || {
+        calls = capture::tool_calls(&e.store(), "claude:c1", true).unwrap();
+        !calls.is_empty()
+    });
+    assert_eq!(capture::sessions_since(&e.store(), -1).unwrap().len(), 1);
+    assert_eq!(calls[0].summary.as_deref(), Some("Read: /x/y.rs"));
+}
