@@ -22,7 +22,7 @@ pub const HELD_S: u64 = 604_800;
 pub const MAX_TEXT: usize = 65_536;
 pub const MAX_REQUEST_ID: usize = 128;
 /// A message `MAX_HOPS` agent replies deep is refused `loop`: a person must speak.
-pub const MAX_HOPS: i64 = 4;
+pub const MAX_HOPS: i64 = 20;
 /// What `receive` decided.
 #[derive(Debug, PartialEq)]
 pub struct Answer {
@@ -1095,7 +1095,7 @@ mod tests {
         };
         assert_eq!(
             r(Some("hops")),
-            "paused after 3 agent replies; a person must speak"
+            "paused after 19 agent replies; a person must speak"
         );
         assert_eq!(
             r(Some("rate")),
@@ -1548,11 +1548,11 @@ mod tests {
     }
 
     #[test]
-    fn the_fourth_agent_reply_is_refused_as_hops() {
+    fn the_reply_past_max_hops_is_refused_as_hops() {
         let (_d, s) = setup();
         send(&s, &k("a"), Some(&k("b")), "x", "r0", None, 1).unwrap();
         let mut r = None;
-        for i in 1..=4 {
+        for i in 1..=MAX_HOPS {
             let (from, to) = if i % 2 == 1 { ("b", "a") } else { ("a", "b") };
             let parent = format!("r{}", i - 1);
             let rid = format!("r{i}");
