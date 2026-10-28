@@ -57,12 +57,35 @@ Run `lightbulb <command> --help` for the options of each one.
 | `folder <path> on\|off` | Show or hide the sessions under a folder from your teammates. |
 | `login` | Sign this computer in to Lightbulb (confirm in the browser), so your workspace's agents answer it. |
 | `logout` | Sign this computer out. |
+| `memory list\|show\|forget\|share\|export\|last\|team` | See and control what your agents remember (see "Memory" below). |
 | `telemetry [on\|off\|status]` | Show or set anonymous usage counts (see the [README](../README.md#usage-counts)). |
 | `version` | Print the version. |
 
 `held`, `remove`, `leave` and `relay <url>` refuse to run from an agent's shell
 (`Run this from your own terminal, not from an agent.`). An agent may run `invite`, `join`,
 `approve` and `decline`; an answer it gives records its session.
+
+## Memory
+
+Your agents can remember things (a decision, a lesson, a preference) with the `remember` tool and
+look them up with `recall`. Each entry is `me` or `team`.
+
+- `team` entries go to every member of the team.
+- `me` entries go only to your own signed-in computers. If this computer is not signed in, a `me`
+  entry stays on this computer.
+
+An agent writes `me` unless you tell it to share. `lightbulb memory list` shows everything, who
+wrote it and whether two people disagree. `lightbulb memory share <id>` turns one of yours into a
+team entry; `lightbulb memory team off` stops team entries from this computer.
+
+Claude Code and Codex are handed what is remembered for the repository at the start of a session
+(`lightbulb memory last` shows what the last one got). Cursor, Grok CLI and OpenCode do not get
+that block; their agents use `recall`. A folder with no git origin gets no block, because the
+block is chosen by repository.
+
+`lightbulb memory forget <id>` deletes an entry. The delete reaches every computer that comes
+online. A computer that stays offline for good keeps what it held. Secrets are refused, not
+scrubbed (see [security](security.md#memory)).
 
 ## Trust
 

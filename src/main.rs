@@ -52,6 +52,40 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum MemoryCommand {
+    /// What is remembered now: scope, who, status, subject and value.
+    List {
+        /// Only what is shared with the team.
+        #[arg(long, conflicts_with = "me")]
+        team: bool,
+        /// Only what is yours alone.
+        #[arg(long)]
+        me: bool,
+        /// Only what was remembered in this repository (its git origin).
+        #[arg(long)]
+        repo: Option<String>,
+    },
+    /// One entry in full: its value, who wrote it, where from, and what it replaced.
+    Show { id: String },
+    /// Delete an entry on every computer that holds it.
+    Forget { id: String },
+    /// Copy one of your own entries to the team; the original stays yours.
+    Share { id: String },
+    /// Print every entry this computer holds, one JSON object per line (`--json`: one array).
+    Export {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print the memory block your last session was handed at its start.
+    Last,
+    /// Let agents write team memory (`on`) or not (`off`) from this computer.
+    Team {
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum Command {
     /// Print the version.
     Version,
@@ -164,6 +198,11 @@ enum Command {
     Telemetry {
         #[arg(value_parser = ["on", "off", "status"])]
         state: Option<String>,
+    },
+    /// What your agents and your team remember: list, show, forget, share, export.
+    Memory {
+        #[command(subcommand)]
+        command: MemoryCommand,
     },
     /// Show (`on`) or hide (`off`) the sessions under a folder from your teammates.
     Folder {
@@ -325,6 +364,15 @@ fn run() -> lightbulb::Result<()> {
             &lightbulb::paths::state_dir(),
             state.as_deref().filter(|s| *s != "status"),
         )?),
+        Command::Memory { command } => exit(cli::memory(match command {
+            MemoryCommand::List { team, me, repo } => cli::Memory::List { team, me, repo },
+            MemoryCommand::Show { id } => cli::Memory::Show(id),
+            MemoryCommand::Forget { id } => cli::Memory::Forget(id),
+            MemoryCommand::Share { id } => cli::Memory::Share(id),
+            MemoryCommand::Export { json } => cli::Memory::Export(json),
+            MemoryCommand::Last => cli::Memory::Last,
+            MemoryCommand::Team { state } => cli::Memory::Team(state == "on"),
+        })?),
         Command::Folder { path, state } => exit(cli::folder(&path, state == "on")?),
         Command::Relay { url, clear, local } => {
             exit(cli::relay(clear.then(String::new).or(url), local)?)

@@ -117,6 +117,26 @@ change the relay: a command run from an agent's shell or tools is refused. It do
 program that you run yourself as your own user. The one prompt left is an agent's permission
 request that the Lightbulb app files (`lightbulb held`, `approve H<n>`).
 
+## Memory
+
+What your agents remember is stored in `state.db` as entries, each signed by the computer that
+wrote it.
+
+- **What syncs where.** `team` entries go to every member of the team. `me` entries go only to
+  your own signed-in computers; without a sign-in a `me` entry stays on this computer.
+  `lightbulb memory team off` stops this computer writing `team` entries.
+- **Secrets are refused, not scrubbed.** `remember` rejects an entry that looks like an API key,
+  a token, a private key, or a credential in a URL (`https://user:password@host`), and stores
+  nothing. It does not try to remove the secret and keep the rest. The check is a pattern match,
+  so it will miss some and flag some. Do not rely on it to catch everything.
+- **`forget`.** It deletes the entry's text on this computer and sends the delete to every other
+  computer, which applies it when it comes online. Any member's `forget` applies, not only the
+  author's. A computer that never comes online again keeps what it held, and so does anyone who
+  copied it before. The entry's id stays as a marker.
+- **No block without an origin.** A session is handed the memory for its repository, found from
+  the git origin. A folder with no git origin gets no block; its agent can still call `recall`.
+- **The log.** `daemon.log` never holds an entry's text.
+
 ## Loop limits
 
 Two limits stop agents from messaging each other forever:
@@ -145,7 +165,7 @@ is `0600`):
 |---|---|
 | `identity.key` | This computer's secret key. |
 | `config.toml` | Settings (computer name, relay, `lan`, hidden folders). |
-| `state.db` | SQLite: the roster, sessions, messages, receipts, permission prompts and their answers. A message's text is deleted once nothing waits on it (read, refused or expired); messages to your own terminal keep theirs. |
+| `state.db` | SQLite: the roster, sessions, messages, receipts, memory entries, permission prompts and their answers. A message's text is deleted once nothing waits on it (read, refused or expired); messages to your own terminal keep theirs. |
 | `daemon.log` | The log (see above). |
 | `addrs.json` | Teammates' last known network addresses. |
 | `sock`, `daemon.lock` | The service's socket and lock. |

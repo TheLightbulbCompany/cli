@@ -329,6 +329,20 @@ impl Store {
         Ok(())
     }
 
+    /// The block `session` was last handed, else the most recent one any session was.
+    pub fn memory_last(&self, session: Option<&str>) -> rusqlite::Result<Option<String>> {
+        use rusqlite::OptionalExtension;
+        self.conn
+            .query_row(
+                "SELECT block FROM memory_last WHERE session = ?1
+                 UNION ALL SELECT block FROM (SELECT block FROM memory_last ORDER BY at DESC LIMIT 1)
+                 LIMIT 1",
+                [session],
+                |r| r.get(0),
+            )
+            .optional()
+    }
+
     /// The keys `set_hidden` marked.
     pub fn hidden_keys(&self) -> rusqlite::Result<std::collections::HashSet<String>> {
         let mut stmt = self.conn.prepare("SELECT key FROM hidden_sessions")?;

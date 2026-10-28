@@ -19,7 +19,7 @@ enum Kind {
 }
 
 /// Every setting: the one list `load` and `set` read.
-const KEYS: [(&str, Kind); 8] = [
+const KEYS: [(&str, Kind); 9] = [
     ("computer", Kind::Str(|c| &mut c.computer)),
     (
         "preview_to_workspace",
@@ -31,6 +31,7 @@ const KEYS: [(&str, Kind); 8] = [
     ("folders_off", Kind::Paths(|c| &mut c.folders_off)),
     ("auto_update", Kind::Bool(|c| &mut c.auto_update)),
     ("telemetry", Kind::Bool(|c| &mut c.telemetry)),
+    ("memory_team", Kind::Bool(|c| &mut c.memory_team)),
 ];
 
 fn kind(key: &str) -> Option<Kind> {
@@ -49,6 +50,8 @@ pub struct Config {
     pub auto_update: bool,
     /// Anonymous usage counts (`telemetry`).
     pub telemetry: bool,
+    /// `remember` and `memory share` may write `team` entries (`memory team on|off`).
+    pub memory_team: bool,
 }
 
 impl Default for Config {
@@ -62,6 +65,7 @@ impl Default for Config {
             folders_off: vec![],
             auto_update: true,
             telemetry: true,
+            memory_team: true,
         }
     }
 }

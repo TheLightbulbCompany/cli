@@ -1165,3 +1165,129 @@ fn update_auto_off_and_on_set_the_daily_update() {
     let o = e.cmd(&["update", "--auto", "maybe"]).output().unwrap();
     assert!(!o.status.success());
 }
+
+fn remember(e: &Env, subject: &str, fact: &str, scope: &str) -> Value {
+    e.ask(
+        json!({"id": 1, "op": "memory.remember", "subject": subject, "fact": fact,
+        "kind": "decision", "scope": scope}),
+    )
+}
+
+#[test]
+fn memory_list_shows_scope_author_and_status() {
+    let e = Env::new();
+    assert!(e.run(&["who"]).status.success());
+    assert_eq!(
+        out(&e.run(&["memory", "list"])).trim(),
+        "Nothing is remembered yet."
+    );
+    remember(&e, "db", "postgres 16", "team");
+    remember(&e, "editor", "vim", "me");
+    let first = remember(&e, "port", "8080", "team");
+    let table = out(&e.run(&["memory", "list"]));
+    let cols: Vec<&str> = table.lines().next().unwrap().split_whitespace().collect();
+    assert_eq!(cols, ["Id", "Scope", "By", "Status", "Subject", "Value"]);
+    let db = table.lines().find(|l| l.contains("postgres 16")).unwrap();
+    assert!(db.contains("team") && db.contains("current"), "{db}");
+    assert!(
+        table.lines().any(|l| l.contains("vim") && l.contains("me")),
+        "{table}"
+    );
+    // A second value for the same subject makes both contested.
+    remember(&e, "port", "9090", "me");
+    let table = out(&e.run(&["memory", "list"]));
+    assert_eq!(table.matches("contested").count(), 2, "{table}");
+    let only_me = out(&e.run(&["memory", "list", "--me"]));
+    assert!(
+        only_me.contains("vim") && !only_me.contains("postgres"),
+        "{only_me}"
+    );
+    let only_team = out(&e.run(&["memory", "list", "--team"]));
+    assert!(
+        only_team.contains("postgres") && !only_team.contains("vim"),
+        "{only_team}"
+    );
+    // show and forget by id prefix
+    let id = first["entry_id"].as_str().unwrap();
+    let shown = out(&e.run(&["memory", "show", &id[..8]]));
+    assert!(
+        shown.contains("port: 8080") && shown.contains(id),
+        "{shown}"
+    );
+    assert!(e.run(&["memory", "forget", &id[..8]]).status.success());
+    assert!(!out(&e.run(&["memory", "list"])).contains("8080"));
+    let missing = e.run(&["memory", "show", "abcdef"]);
+    assert!(!missing.status.success() && err(&missing).contains("No entry starts with that id"));
+}
+
+#[test]
+fn memory_share_creates_team_entry() {
+    let e = Env::new();
+    assert!(e.run(&["who"]).status.success());
+    let mine = remember(&e, "editor", "vim", "me");
+    let id = mine["entry_id"].as_str().unwrap();
+    assert!(e.run(&["memory", "share", &id[..10]]).status.success());
+    let facts = lightbulb::memory::facts(&e.store(), None, None).unwrap();
+    assert_eq!(facts.len(), 2, "{facts:?}");
+    let team = facts
+        .iter()
+        .find(|f| f.scope == lightbulb::memory::Scope::Team)
+        .unwrap();
+    assert_eq!(
+        (team.subject.as_str(), team.value.as_str()),
+        ("editor", "vim")
+    );
+    let shown = out(&e.run(&["memory", "show", &team.id]));
+    assert!(
+        shown.contains(&format!("Shared  from your entry {id}")),
+        "{shown}"
+    );
+    // The team entry is not one to share again.
+    let again = e.run(&["memory", "share", &team.id]);
+    assert!(!again.status.success() && err(&again).contains("Only an entry of yours"));
+}
+
+#[test]
+fn memory_team_off_refuses_team_scope() {
+    let e = Env::new();
+    assert!(e.run(&["who"]).status.success());
+    let mine = remember(&e, "editor", "vim", "me");
+    let id = mine["entry_id"].as_str().unwrap().to_string();
+    let o = out(&e.run(&["memory", "team", "off"]));
+    assert!(o.contains("off"), "{o}");
+    let r = remember(&e, "db", "postgres 16", "team");
+    assert_eq!(
+        (r["stored"].clone(), r["refused"].clone()),
+        (json!(false), json!("team_off"))
+    );
+    assert_eq!(remember(&e, "db", "postgres 16", "me")["stored"], true);
+    let share = e.run(&["memory", "share", &id]);
+    assert!(!share.status.success() && err(&share).contains("Team memory is off"));
+    assert!(e.run(&["memory", "team", "on"]).status.success());
+    assert_eq!(remember(&e, "db", "postgres 16", "team")["stored"], true);
+}
+
+#[test]
+fn memory_last_prints_block() {
+    let e = Env::new();
+    assert!(e.run(&["who"]).status.success());
+    assert!(out(&e.run(&["memory", "last"])).contains("No session has been handed"));
+    let store = e.store();
+    store
+        .set_memory_last("s1", "Memory (team and yours):\nCurrent:\nold", 1)
+        .unwrap();
+    store
+        .set_memory_last(
+            "s2",
+            "Memory (team and yours):\nCurrent:\ndb: postgres 16",
+            2,
+        )
+        .unwrap();
+    let o = out(&e.run(&["memory", "last"]));
+    assert_eq!(o, "Memory (team and yours):\nCurrent:\ndb: postgres 16\n");
+    let x = out(&e.run(&["memory", "export"]));
+    assert_eq!(x, "");
+    remember(&e, "db", "postgres 16", "me");
+    let j: Value = serde_json::from_str(&out(&e.run(&["memory", "export", "--json"]))).unwrap();
+    assert_eq!(j[0]["op"]["fact"], "postgres 16");
+}

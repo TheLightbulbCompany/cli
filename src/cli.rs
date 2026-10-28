@@ -537,6 +537,137 @@ pub fn folder(path: &str, on: bool) -> Result<i32> {
     Ok(0)
 }
 
+/// A `memory` subcommand.
+pub enum Memory {
+    List {
+        team: bool,
+        me: bool,
+        repo: Option<String>,
+    },
+    Show(String),
+    Forget(String),
+    Share(String),
+    Export(bool),
+    Last,
+    Team(bool),
+}
+
+/// `memory ...`: a person's view of what is remembered, through the daemon.
+pub fn memory(cmd: Memory) -> Result<i32> {
+    let texts = [
+        (
+            "not_found",
+            "No entry starts with that id. `lightbulb memory list` shows them.".to_string(),
+        ),
+        (
+            "team_off",
+            "Team memory is off on this computer. Turn it on with `lightbulb memory team on`."
+                .to_string(),
+        ),
+        (
+            "not_mine",
+            "Only an entry of yours that is not shared yet can be shared.".to_string(),
+        ),
+    ];
+    let day = |v: &Value| crate::date::day(v.as_i64().unwrap_or_default());
+    let s = |v: &Value| cell(v.as_str().unwrap_or_default());
+    let mut conn = if let Memory::Team(on) = &cmd {
+        let dir = paths::state_dir();
+        crate::config::Config::set(&dir, "memory_team", &on.to_string())?;
+        let mut conn = connect()?;
+        ask(&mut conn, "reload", json!({}))?;
+        println!(
+            "Team memory is {} on this computer.",
+            if *on { "on" } else { "off" }
+        );
+        return Ok(0);
+    } else {
+        connect()?
+    };
+    let (op, body) = match &cmd {
+        Memory::List { team, me, repo } => (
+            "memory.list",
+            json!({ "scope": team.then_some("team").or(me.then_some("me")), "repo": repo }),
+        ),
+        Memory::Show(id) => ("memory.show", json!({ "entry": id })),
+        Memory::Forget(id) => ("memory.forget", json!({ "entry": id })),
+        Memory::Share(id) => ("memory.share", json!({ "entry": id })),
+        Memory::Export(_) => ("memory.export", json!({})),
+        Memory::Last => (
+            "memory.last",
+            json!({ "session": calling_session(&mut conn) }),
+        ),
+        Memory::Team(_) => unreachable!(),
+    };
+    let r = conn.call(op, body)?;
+    if r["ok"] != true {
+        return refuse(&r, &texts);
+    }
+    match cmd {
+        Memory::List { .. } => {
+            let facts = r["facts"].as_array().cloned().unwrap_or_default();
+            if facts.is_empty() {
+                println!("Nothing is remembered yet.");
+                return Ok(0);
+            }
+            let mut rows = vec![["Id", "Scope", "By", "Status", "Subject", "Value"]
+                .map(String::from)
+                .to_vec()];
+            for f in &facts {
+                let id: String = s(&f["id"]).chars().take(8).collect();
+                rows.push(vec![
+                    id,
+                    s(&f["scope"]),
+                    s(&f["author"]),
+                    s(&f["status"]),
+                    s(&f["subject"]),
+                    s(&f["value"]),
+                ]);
+            }
+            table(&rows);
+        }
+        Memory::Show(_) => {
+            let (f, src) = (&r["fact"], &r["source"]);
+            println!("{}: {}", s(&f["subject"]), s(&f["value"]));
+            println!("Id      {}", s(&f["id"]));
+            println!(
+                "Scope   {} ({}, {})",
+                s(&f["scope"]),
+                s(&f["kind"]),
+                s(&f["status"])
+            );
+            println!("By      {} on {}", s(&f["author"]), day(&f["when"]));
+            println!(
+                "From    {} in {}",
+                s(&src["harness"]),
+                src["repo"].as_str().map_or("no repository".into(), cell)
+            );
+            if let Some(from) = src["session"].as_str().filter(|_| f["scope"] == "team") {
+                println!("Shared  from your entry {}", cell(from));
+            }
+            for h in f["history"].as_array().into_iter().flatten() {
+                println!("Was     {} ({})", s(&h["value"]), day(&h["when"]));
+            }
+        }
+        Memory::Forget(_) => println!("Forgotten. Every computer that comes online drops it."),
+        Memory::Share(_) => println!("Shared with the team. Your own entry stays."),
+        Memory::Export(as_json) => {
+            let entries = r["entries"].as_array().cloned().unwrap_or_default();
+            if as_json {
+                println!("{}", serde_json::to_string_pretty(&entries)?);
+            } else {
+                entries.iter().for_each(|e| println!("{e}"));
+            }
+        }
+        Memory::Last => match r["block"].as_str().filter(|b| !b.is_empty()) {
+            Some(b) => println!("{b}"),
+            None => println!("No session has been handed a memory block yet."),
+        },
+        Memory::Team(_) => {}
+    }
+    Ok(0)
+}
+
 // ---- team -------------------------------------------------------------------------------
 
 /// Prints the text `texts` maps `r`'s error code to (else `refusal`'s); returns the exit code 1.

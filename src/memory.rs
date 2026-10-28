@@ -358,6 +358,44 @@ pub fn facts(store: &Store, scope: Option<Scope>, repo: Option<&str>) -> Result<
     Ok(out)
 }
 
+/// The held entry whose id is `id` or the only one that starts with it (six hex digits or more).
+pub fn entry(store: &Store, id: &str) -> Result<Option<Entry>> {
+    if id.len() < 6 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Ok(None);
+    }
+    let mut stmt = store.conn().prepare(
+        "SELECT entry FROM memory_entries WHERE id LIKE ?1 || '%' AND entry IS NOT NULL LIMIT 2",
+    )?;
+    let rows: Vec<String> = stmt
+        .query_map([id.to_lowercase()], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    match rows.as_slice() {
+        [one] => Ok(Some(serde_json::from_str(one)?)),
+        _ => Ok(None),
+    }
+}
+
+/// The fact with entry id `id`, whatever its status (a replaced one included).
+pub fn fact(store: &Store, id: &str) -> Result<Option<Fact>> {
+    Ok(replay(store)?
+        .into_iter()
+        .map(|l| l.fact)
+        .find(|f| f.id == id))
+}
+
+/// Every held entry that still has its body.
+pub fn entries(store: &Store) -> Result<Vec<Entry>> {
+    let mut stmt = store.conn().prepare(
+        "SELECT entry FROM memory_entries WHERE entry IS NOT NULL ORDER BY received_at, id",
+    )?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(serde_json::from_str(&row?)?);
+    }
+    Ok(out)
+}
+
 /// The best `limit` matches for `query` (FTS5 `bm25`, subject and fact), as `facts` shows them;
 /// a match that has since been replaced says so. Every word must match.
 pub fn search(store: &Store, query: &str, limit: usize) -> Result<Vec<Fact>> {

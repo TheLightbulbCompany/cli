@@ -354,6 +354,8 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
         },
         "memory.remember" => memory_remember(id, body, daemon),
         "memory.recall" => memory_recall(id, body, daemon),
+        "memory.list" | "memory.show" | "memory.forget" | "memory.share" | "memory.last"
+        | "memory.export" => memory_manage(id, op, body, daemon),
         "team.leave" => super::net_ops::leave(id, daemon, for_a_person()).await,
         "holds" | "hold.get" | "hold.answer" | "hold.file" => {
             crate::holds::op(id, op, body, daemon, caller)
@@ -406,6 +408,9 @@ fn memory_remember(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
     let (Ok(scope), Ok(replaces)) = (scope, replaces) else {
         return Response::err(id, BAD_REQUEST);
     };
+    if scope == Scope::Team && !daemon.team.lock().unwrap().config.memory_team {
+        return Response::ok(id, json!({ "stored": false, "refused": "team_off" }));
+    }
     let session = body["session"].as_str().map(String::from);
     let found = session
         .as_deref()
@@ -463,15 +468,7 @@ fn memory_recall(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
         return Response::err(id, BAD_REQUEST);
     };
     let budget = body["budget_chars"].as_u64().map_or(1_600, |b| b as usize);
-    let names: std::collections::HashMap<String, String> = daemon
-        .team
-        .lock()
-        .unwrap()
-        .roster
-        .members
-        .values()
-        .map(|m| (m.key.clone(), m.name.clone()))
-        .collect();
+    let names = member_names(daemon);
     let store = daemon.store.lock().unwrap();
     let found = if q.trim().is_empty() {
         let repo = body["repo"].as_str();
@@ -501,6 +498,125 @@ fn memory_recall(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
         id,
         json!({ "page": page, "block": block, "facts": facts.iter().map(fact_json).collect::<Vec<_>>() }),
     )
+}
+
+/// Member key -> the name shown for it.
+fn member_names(daemon: &Daemon) -> std::collections::HashMap<String, String> {
+    daemon
+        .team
+        .lock()
+        .unwrap()
+        .roster
+        .members
+        .values()
+        .map(|m| (m.key.clone(), m.name.clone()))
+        .collect()
+}
+
+/// The `memory.*` ops a person manages memory with: `list {scope?, repo?}` -> `{facts}`;
+/// `show {entry}` -> `{fact, source}`; `forget {entry}` -> `{}`; `share {entry}` -> `{entry_id}`;
+/// `last {session?}` -> `{block}`; `export` -> `{entries}`. `entry` is an entry id or its first
+/// six or more digits. Authors are member names where the roster knows them.
+fn memory_manage(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>) -> Response {
+    use crate::memory::{self, Op, Scope};
+    let names = member_names(daemon);
+    let who = |k: &str| {
+        names
+            .get(k)
+            .cloned()
+            .unwrap_or_else(|| k.chars().take(12).collect())
+    };
+    let shown = |f: &memory::Fact| {
+        let mut j = fact_json(f);
+        j["author"] = who(&f.author).into();
+        j
+    };
+    let store = daemon.store.lock().unwrap();
+    let entry = || match body["entry"].as_str() {
+        Some(i) => memory::entry(&store, i)
+            .map_err(|_| INTERNAL)
+            .and_then(|e| e.ok_or(NOT_FOUND)),
+        None => Err(BAD_REQUEST),
+    };
+    let r: Result<Value, &str> = (|| match op {
+        "memory.list" => {
+            let scope = match body["scope"].as_str() {
+                None => None,
+                Some("me") => Some(Scope::Me),
+                Some("team") => Some(Scope::Team),
+                Some(_) => return Err(BAD_REQUEST),
+            };
+            let f = memory::facts(&store, scope, body["repo"].as_str()).map_err(|_| INTERNAL)?;
+            Ok(json!({ "facts": f.iter().map(&shown).collect::<Vec<_>>() }))
+        }
+        "memory.show" => {
+            let e = entry()?;
+            let f = memory::fact(&store, &e.id)
+                .map_err(|_| INTERNAL)?
+                .ok_or(NOT_FOUND)?;
+            let Op::Remember { source, .. } = e.op else {
+                return Err(NOT_FOUND);
+            };
+            let mut fact = shown(&f);
+            fact["history"] = f
+                .history
+                .iter()
+                .map(|(i, v, w)| json!({"id": i, "value": v, "when": w}))
+                .collect();
+            Ok(json!({ "fact": fact, "source": source }))
+        }
+        "memory.forget" => {
+            let e = entry()?;
+            let op = Op::Forget { target: e.id };
+            memory::remember(&store, &daemon.identity, op, now() as i64).map_err(|_| INTERNAL)?;
+            daemon.peers.outbox.notify_one();
+            Ok(json!({}))
+        }
+        "memory.share" => {
+            if !daemon.team.lock().unwrap().config.memory_team {
+                return Err("team_off");
+            }
+            let e = entry()?;
+            let Op::Remember {
+                subject,
+                fact,
+                kind,
+                scope: Scope::Me,
+                mut source,
+                ..
+            } = e.op
+            else {
+                return Err("not_mine");
+            };
+            if e.author != daemon.identity.key {
+                return Err("not_mine");
+            }
+            source.session = Some(e.id);
+            let op = Op::Remember {
+                subject,
+                fact,
+                kind,
+                scope: Scope::Team,
+                when: None,
+                source,
+                replaces: vec![],
+            };
+            let n = memory::remember(&store, &daemon.identity, op, now() as i64)
+                .map_err(|_| INTERNAL)?;
+            Ok(json!({ "entry_id": n.id }))
+        }
+        "memory.last" => {
+            let b = store
+                .memory_last(body["session"].as_str())
+                .map_err(|_| INTERNAL)?;
+            Ok(json!({ "block": b.unwrap_or_default() }))
+        }
+        _ => Ok(json!({ "entries": memory::entries(&store).map_err(|_| INTERNAL)? })),
+    })();
+    match r {
+        Ok(b) => Response::ok(id, b),
+        Err(code) => Response::err(id, code),
+    }
 }
 
 /// A process as `(pid, birth_micros)`.
