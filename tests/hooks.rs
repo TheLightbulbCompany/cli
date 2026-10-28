@@ -1157,3 +1157,49 @@ fn a_late_stop_answer_still_nudges() {
         .unwrap();
     assert_eq!((s.prompt_tokens, s.completion_tokens), (Some(7), Some(3)));
 }
+
+#[test]
+fn stop_blocks_once_while_an_assignment_is_open_and_again_when_its_result_lands() {
+    let net = Net::new();
+    let me = os::process(std::process::id()).unwrap();
+    let conv = "00000000-0000-4000-8000-0000000000c1";
+    let c1 = register(&net, conv, me.pid, me.birth_micros);
+    assert_eq!(c1, net.key("claude", conv));
+    let x = register(&net, "target", me.pid, me.birth_micros);
+    let r = net.call(
+        json!({"id": 1, "op": "send", "from": c1, "to": x, "kind": "assign",
+        "text": "do it", "done_when": "done", "deadline_s": 600, "request_id": "as1"}),
+    );
+    assert_eq!(r["receipt"]["state"], "stored", "{r}");
+
+    let out: Value = serde_json::from_str(&net.hook("claude", "stop", "claude-stop")).unwrap();
+    assert_eq!(out["decision"], "block");
+    assert!(out["reason"]
+        .as_str()
+        .unwrap()
+        .contains("1 assignment(s) still running"));
+    assert_eq!(net.hook("claude", "stop", "claude-stop"), "");
+
+    let r = net.call(
+        json!({"id": 1, "op": "send", "from": x, "to": c1, "text": "done",
+        "reply_to": "as1", "request_id": "re1"}),
+    );
+    assert_eq!(r["receipt"]["state"], "stored", "{r}");
+    let out: Value = serde_json::from_str(&net.hook("claude", "stop", "claude-stop")).unwrap();
+    assert_eq!(out["decision"], "block");
+    assert!(out["reason"].as_str().unwrap().contains("done"));
+    assert_eq!(net.hook("claude", "stop", "claude-stop"), "");
+}
+
+#[test]
+fn stop_never_blocks_without_open_assignments() {
+    let net = Net::new();
+    let me = os::process(std::process::id()).unwrap();
+    register(
+        &net,
+        "00000000-0000-4000-8000-0000000000c1",
+        me.pid,
+        me.birth_micros,
+    );
+    assert_eq!(net.hook("claude", "stop", "claude-stop"), "");
+}
