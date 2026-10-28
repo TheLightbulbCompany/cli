@@ -970,3 +970,82 @@ fn the_repo_key_carries_the_owner() {
     ));
     assert!(text.contains("ci: github actions"), "{text}");
 }
+
+/// Runs `agent`'s hook with `payload` on stdin, called as the agent; returns stdout.
+fn agent_hook(net: &Net, agent: &str, event: &str, payload: Value) -> String {
+    let me = os::process(std::process::id()).unwrap();
+    let out = net.hook_raw(agent, event, payload.to_string().as_bytes(), Some(&me));
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// Cursor adds a sessionStart hook's `additional_context` to the conversation's initial
+/// context (cursor.com/docs/hooks), so a Cursor session starts with the repo's block. The start
+/// carries the block only: waiting mail is not marked delivered there, and the stop hands it over.
+#[test]
+fn cursor_session_start_includes_the_memory_block() {
+    let net = Net::new();
+    let cli = repo_dir("cli");
+    claude_hook(&net, "session-start", "SessionStart", A, cli.path());
+    remember_in(&net, &net.key("claude", A), "ci", "github actions", "team");
+    let conv = "5c1e0000-0000-4000-8000-0000000000e2";
+    let cursor = |event: &str| {
+        agent_hook(
+            &net,
+            "cursor",
+            event,
+            json!({"conversation_id": conv, "session_id": conv, "workspace_roots": [cli.path()],
+                "hook_event_name": event}),
+        )
+    };
+    let block = |out: &str| -> String {
+        let out: Value = serde_json::from_str(out).unwrap();
+        out["additional_context"].as_str().unwrap().to_string()
+    };
+    let first = block(&cursor("session-start"));
+    net.send(&net.key("cursor", conv), "body r1", "r1");
+    // Started again (resumed) with the mail waiting: the same block, and no mail.
+    let text = block(&cursor("session-start"));
+    assert_eq!(text, first);
+    assert!(text.starts_with("Memory (team and yours):\n"), "{text}");
+    assert!(text.contains("ci: github actions"), "{text}");
+    assert!(text.ends_with(INSTRUCTION), "{text}");
+    assert_eq!(net.receipt("r1"), "stored");
+    let out: Value = serde_json::from_str(&cursor("stop")).unwrap();
+    assert_eq!(out, json!({"followup_message": frame_of("r1")}));
+    assert_eq!(net.receipt("r1"), "delivered");
+}
+
+/// Our OpenCode plugin asks the start hook for the block before the session's first request and
+/// adds it to the system prompt: the start offers the block only, and the mail waits for a tool
+/// call or a stop, which offer it as before.
+#[test]
+fn opencode_session_start_includes_the_memory_block() {
+    let net = Net::new();
+    let cli = repo_dir("cli");
+    claude_hook(&net, "session-start", "SessionStart", A, cli.path());
+    remember_in(&net, &net.key("claude", A), "ci", "github actions", "team");
+    let conv = "ses_0a1b2c3d4e5fOpEnCoDe0003";
+    let run = |event: &str, mail: bool| {
+        agent_hook(
+            &net,
+            "opencode",
+            event,
+            json!({"session_id": conv, "cwd": cli.path(), "mail": mail}),
+        )
+    };
+    // At session.created the plugin asks for no mail: it registers, and nothing is offered.
+    assert_eq!(run("session-start", false), "");
+    let key = net.key("opencode", conv);
+    net.send(&key, "body r1", "r1");
+    let out: Value = serde_json::from_str(&run("session-start", true)).unwrap();
+    let text = out["text"].as_str().unwrap();
+    let block = text.strip_prefix("Memory (team and yours):\n").unwrap();
+    assert!(block.contains("ci: github actions"), "{block}");
+    assert!(block.ends_with(INSTRUCTION), "{block}");
+    assert!(!text.contains("body r1"), "{text}");
+    assert_eq!(out["ids"], json!([]), "{out}");
+    assert_eq!(net.receipt("r1"), "stored");
+    let out: Value = serde_json::from_str(&run("post-tool-use", true)).unwrap();
+    assert_eq!(out["text"], frame_of("r1"));
+    assert_eq!(out["ids"].as_array().map(Vec::len), Some(1), "{out}");
+}

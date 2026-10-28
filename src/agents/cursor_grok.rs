@@ -1,6 +1,17 @@
 //! Cursor's, Grok's and OpenCode's hook payloads and replies, written from their own
-//! documentation (cursor.com/docs/agent/hooks; the Grok CLI manual) and payloads captured live.
+//! documentation (cursor.com/docs/hooks; the Grok CLI manual) and payloads captured live.
 //! OpenCode has no command hooks: our plugin (`setup/opencode.rs`) builds its payload.
+//!
+//! Which of them can put the memory block in front of the model at a session's start:
+//! - Cursor can: a `sessionStart` hook's `additional_context` is "added to the conversation's
+//!   initial system context" (https://cursor.com/docs/hooks). To test live: a forum report
+//!   (forum.cursor.com/t/157141) says the context did not reach the Agent window there.
+//! - Grok CLI cannot: "For passive events, stdout is ignored" and SessionStart is passive; no
+//!   context field is documented (https://docs.x.ai/build/features/hooks). Its agents use
+//!   `recall`.
+//! - OpenCode can, through our plugin: an event's output reaches no model, so the plugin adds
+//!   the block the start hook offers to the system prompt, by `experimental.chat.system.transform` on
+//!   1.x and `ctx.session.hook("context")` on 2.x (the URLs are in `setup/opencode-plugin.js`).
 
 use crate::hook::{Event, Hook};
 use serde_json::{json, Value};
@@ -51,8 +62,10 @@ pub fn normalize_opencode(event: Event, p: &Value) -> Option<Hook> {
     })
 }
 
-/// Cursor reads `followup_message` from stop and `additional_context` from postToolUse.
-/// (Grok reads Claude's shapes for its two mail events.)
+/// Cursor reads `followup_message` from stop and `additional_context` from sessionStart and
+/// postToolUse. Grok is sent Claude's shapes for its two mail events (`hook::output`); its docs
+/// make only PreToolUse blocking and say a passive event's stdout is ignored, so that Grok reads
+/// them is not documented.
 pub fn cursor_output(event: Event, text: &str) -> Value {
     match event {
         Event::Stop => json!({ "followup_message": text }),
