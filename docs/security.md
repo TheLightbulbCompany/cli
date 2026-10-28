@@ -128,7 +128,11 @@ wrote it.
 - **Secrets are refused, not scrubbed.** `remember` rejects an entry that looks like an API key,
   a token, a private key, or a credential in a URL (`https://user:password@host`), and stores
   nothing. It does not try to remove the secret and keep the rest. The check is a pattern match,
-  so it will miss some and flag some. Do not rely on it to catch everything.
+  so it will miss some and flag some. Do not rely on it to catch everything. An entry from
+  another computer that matches is refused when it arrives: this computer keeps a marker in its place, never the text.
+- **Vectors stay here.** With the memory model installed, each entry and each of your prompts
+  and replies gets a vector, made and kept on this computer only. Vectors are never sent to
+  teammates or to Lightbulb, so computers on an older build keep syncing entries as before.
 - **`forget`.** It deletes the entry's text on this computer, clears the memory blocks kept for
   `lightbulb memory last` (the next session start makes a new one), and sends the delete to every other
   computer, which applies it when it comes online. Any member's `forget` applies, not only the
@@ -150,7 +154,9 @@ wrote it.
   It also records your prompts and the agent's replies, each cut to 4 KB, on your computer only;
   they are never uploaded, in any mode, and are deleted after 90 days (`capture_turns_days`).
   `lightbulb sessions turns off` stops it, from your own terminal only. A summary, prompt or
-  reply that looks like a password or key is stored as `[refused: <what it matched>]`. Sessions under a folder hidden with `lightbulb folder <path> off`, or under a dot
+  reply that looks like a password or key is stored as `[refused: <what it matched>]` and is
+  never given a vector. An agent's `recall` can show short excerpts of your prompts and replies
+  from the same repository ([usage](usage.md#memory)). Sessions under a folder hidden with `lightbulb folder <path> off`, or under a dot
   folder in your home folder (`~/.config`), are not captured.
 - **Where it lives.** In `state.db` on this computer. Teammates never receive it.
 - **What is uploaded.** Nothing unless you choose. `lightbulb sessions upload off` (the default)
@@ -163,7 +169,7 @@ wrote it.
 - **The evaluator.** It reads only sessions you uploaded in `full`, when they arrive, and
   suggests lessons. A suggestion does nothing until you keep it with `lightbulb memory approve`;
   `lightbulb memory dismiss` drops it. `metadata` uploads are never read by it.
-- **Deleting.** `lightbulb sessions forget <id>` deletes a session and its tool calls on this
+- **Deleting.** `lightbulb sessions forget <id>` deletes a session, its tool calls and its prompts and replies on this
   computer; it does not delete a copy already uploaded. `lightbulb sessions upload off` stops
   further uploads and forgets where the last one stopped.
 
@@ -196,7 +202,8 @@ is `0600`):
 |---|---|
 | `identity.key` | This computer's secret key. |
 | `config.toml` | Settings (computer name, relay, `lan`, hidden folders). |
-| `state.db` | SQLite: the roster, sessions, messages, receipts, memory entries, the memory block each session was last handed (`lightbulb memory last`), captured sessions and their tool calls (see "Capture and upload"), permission prompts and their answers. A message's text is deleted once nothing waits on it (read, refused or expired); messages to your own terminal keep theirs. |
+| `state.db` | SQLite: the roster, sessions, messages, receipts, memory entries, the memory block each session was last handed (`lightbulb memory last`), captured sessions, their tool calls and your prompts and replies (see "Capture and upload"), the vectors for memory search, permission prompts and their answers. A message's text is deleted once nothing waits on it (read, refused or expired); messages to your own terminal keep theirs. |
+| `model/` | The memory model, if setup downloaded it. |
 | `upload.mark` | While uploads are on: the time up to which finished sessions were sent. Deleted by `lightbulb sessions upload off`. |
 | `daemon.log` | The log (see above). |
 | `addrs.json` | Teammates' last known network addresses. |
@@ -212,6 +219,7 @@ How long things last:
 | A permission prompt with no answer | 10 minutes (sooner if its session has ended) |
 | A one-time invite / a reusable invite | 24 hours / 7 days |
 | Answered join requests | kept 30 days |
+| A prompt or reply | 90 days (`capture_turns_days`) |
 
 A message's text is deleted from `state.db` once nothing waits on it (read, refused or
 expired); its row stays for receipts, loop limits and request-id replay. Messages to your own
@@ -244,6 +252,9 @@ while uploads are `off`), and `GET /memory/drafts` with `POST /memory/drafts/<id
 relay list from Lightbulb. Otherwise it talks only to your
 teammates' computers and, when no direct path exists, to the relays (the iroh project's public
 relays unless you or your team set one).
+
+`lightbulb setup` downloads the memory model once from Hugging Face (`huggingface.co`, one pinned
+revision, each file checked by SHA-256); `setup --no-model` skips it.
 
 The install script, `npm install`, `lightbulb update` and the daemon's daily update check
 download the release from GitHub. An update checks the tarball's SHA-256 against the `.sha256`

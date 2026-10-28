@@ -366,7 +366,7 @@ more). `forget`, `share`, `team`, `drafts`, `approve` and `dismiss` must be run 
 
 | Command | What it does |
 |---|---|
-| `list` | What is remembered now: the id, whether it is `team` or `me`, who wrote it, its status (`current`, or `contested` when two people hold different values for one subject), the subject and the value. `--team` or `--me` keeps one scope; `--repo` keeps entries made in one git origin. |
+| `list` | What is remembered now: the id, whether it is `team` or `me`, who wrote it, its status (`current`, or `contested` when two people hold different values for one subject), the subject and the value. `--team` or `--me` keeps one scope; `--repo` keeps entries made in one repository: `owner/name`, or a bare name, which matches it under any owner. |
 | `show <ID>` | One entry in full: its value, its author, the agent and repository it came from, and the values it replaced. |
 | `forget <ID>` | Deletes the entry. The delete goes to every computer that holds it, as each comes online. |
 | `share <ID>` | Copies one of your `me` entries to the team as a new `team` entry. The `me` entry stays. It refuses an entry that is not your own `me` entry, one that was replaced, one you already shared, and any entry when `memory team` is `off`. |
@@ -412,7 +412,7 @@ answered within 10 ms is not waited for (the service still makes it). An
 | `list` | The id, the agent, the repository, the day it started and the tokens in and out (`-` where the agent did not report them). |
 | `show <ID>` | One session, its tool calls in order, then its prompts and replies in order. |
 | `forget <ID>` | Deletes the session, its tool calls and its prompts and replies. |
-| `export` | Every session with its tool calls, as one JSON array on stdout. |
+| `export` | Every session with its tool calls, as one JSON array on stdout. Prompts and replies are left out. |
 | `upload [off\|metadata\|full]` | Choose what, if anything, is sent to Lightbulb (`capture_upload` in `config.toml`). `off` is the default: nothing leaves this computer. (The one request memory makes is setup's download of the memory model; `setup --no-model` skips it.) `metadata` sends, for each finished session, the agent, repository, branch, times and token counts, and for each tool call its number, time, tool, duration and whether it worked, without the summary. `full` adds the summary. Uploads are signed with this computer's identity, only while it is signed in, only for sessions that finish after you turn them on, and never for a hidden folder; signed out, it says nothing is sent until `lightbulb login`. Setting a mode must be run from your own terminal (an agent's shell is refused); with no mode it says which is set, from anywhere. `lightbulb login` asks once. |
 | `turns [on\|off]` | Records your prompts and replies on your computer only; never uploaded, in any mode (`capture_turns` in `config.toml`, on by default). Each is cut to 4 KB and deleted after 90 days (`capture_turns_days`). `sessions turns off` stops it; setting it must be run from your own terminal (an agent's shell is refused); with no state it says which is set. |
 
