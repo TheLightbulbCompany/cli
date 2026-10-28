@@ -1452,3 +1452,44 @@ fn tools_json_lists_remember_and_recall() {
         json!(["subject", "fact", "kind"])
     );
 }
+
+#[test]
+fn remember_through_mcp_stamps_the_session_and_ignores_undeclared_args() {
+    let e = common::Env::new();
+    e.daemon(false, &common::computer("mac"), &[]);
+    let r = e.ask(
+        json!({"id": 1, "op": "register", "session": {"provider": "claude", "conversation": "c1",
+        "pid": me().pid, "birth_micros": me().birth_micros, "cwd": "/tmp", "repo": "engine"}}),
+    );
+    let key = r["key"].as_str().unwrap().to_string();
+    let mut m = mcp_on(&e, &me());
+    // `when` and `budget_chars` are not in the schema: a model cannot backdate or widen a page.
+    let v = m
+        .tool(
+            "remember",
+            json!({"subject": "db", "fact": "postgres 16", "kind": "fact", "when": 1, "budget_chars": 3}),
+        )
+        .json();
+    assert_eq!(v["stored"], true, "{v}");
+    assert!(v.get("ok").is_none() && v.get("id").is_none(), "{v}");
+    let held = lightbulb::memory::since(&e.store(), &e.identity().key, 0, 10).unwrap();
+    let lightbulb::memory::Op::Remember { when, source, .. } = &held[0].op else {
+        panic!("{held:?}")
+    };
+    assert_eq!(*when, None);
+    assert_eq!(
+        (
+            source.harness.as_str(),
+            source.repo.as_deref(),
+            source.session.as_deref()
+        ),
+        ("Claude Code", Some("engine"), Some(key.as_str()))
+    );
+    let page = m
+        .tool("recall", json!({"question": "db", "budget_chars": 3}))
+        .json();
+    assert!(
+        page["page"].as_str().unwrap().contains("db: postgres 16"),
+        "{page}"
+    );
+}

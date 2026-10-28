@@ -408,17 +408,6 @@ pub fn refuse_secret(text: &str) -> Option<&'static str> {
         .map(|(n, _)| *n)
 }
 
-/// `D Mon` in the local timezone.
-fn day(t: i64) -> String {
-    const MONTHS: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
-    let t = t as libc::time_t;
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    unsafe { libc::localtime_r(&t, &mut tm) };
-    format!("{} {}", tm.tm_mday, MONTHS[tm.tm_mon.clamp(0, 11) as usize])
-}
-
 /// What an agent reads: `Contested:` lines, then `Current:`, then `Lessons:` (replaced facts
 /// left out), cut on a line boundary at `budget` chars. `names` maps a member key to the name
 /// shown (the short key when it is not there).
@@ -444,7 +433,14 @@ pub fn page(
             )
             .map_or_else(|_| "?".into(), |k| who(&k))
     };
-    let by = |f: &Fact| format!("{} ({}, {})", f.value, who(&f.author), day(f.when));
+    let by = |f: &Fact| {
+        format!(
+            "{} ({}, {})",
+            f.value,
+            who(&f.author),
+            crate::date::day(f.when)
+        )
+    };
     let (mut contested, mut current, mut lessons) = (Vec::new(), Vec::new(), Vec::new());
     let mut groups: Vec<(String, Vec<String>)> = Vec::new();
     for f in facts {
@@ -459,14 +455,14 @@ pub fn page(
             }
             (_, kind) => {
                 let was = f.history.last().map_or(String::new(), |(id, v, when)| {
-                    format!("; was {v}, {}, {}", author_of(id), day(*when))
+                    format!("; was {v}, {}, {}", author_of(id), crate::date::day(*when))
                 });
                 let line = format!(
                     "{}: {} ({}, {}{was})",
                     f.subject,
                     f.value,
                     who(&f.author),
-                    day(f.when)
+                    crate::date::day(f.when)
                 );
                 if kind == Kind::Lesson {
                     &mut lessons

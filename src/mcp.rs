@@ -629,10 +629,12 @@ impl Server {
     }
 
     /// `recall` and `remember`: the daemon's `memory.*` ops, `remember` as this session.
-    async fn memory(&self, call: Call, name: &str, mut args: Value) -> CallToolResult {
-        if !args.is_object() {
-            return code("bad_request");
-        }
+    async fn memory(&self, call: Call, name: &str, args: Value) -> CallToolResult {
+        // Only what the tool declares: `when` and the page budget are the daemon's.
+        let Some(tool) = spec().iter().find(|t| t["name"] == name) else {
+            return code("unknown_tool");
+        };
+        let mut args = Value::Object(props(tool, &args, &[]));
         args["session"] = call.from.0.clone().into();
         match ask(&format!("memory.{name}"), args).await {
             Ok(mut r) if r["ok"] == true => {
