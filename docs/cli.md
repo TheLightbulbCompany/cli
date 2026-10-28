@@ -26,12 +26,17 @@ Connects Claude Code, Codex, Cursor, Grok CLI and OpenCode here (their hooks and
 server) and starts the background service (on macOS; off macOS it restarts a daemon that runs an older version). Each file is backed up once as
 `<file>.lightbulb-backup`. Details: [agents](agents.md).
 
+Setup then downloads the memory model (about 31 MB, once, into the state folder) and prints
+`Memory model installed (NN MB)`. If the download fails or takes more than 5 minutes, it prints
+`Memory model not installed: <reason> Memory search is keyword-only.` and carries on.
+
 | Option | Meaning |
 |---|---|
 | `--remove` | Take out only what setup wrote, and stop the background service. Backups are left as they are. |
 | `--executable <path>` | The binary the hooks, tool servers and background service run. Default: `~/.lightbulb/connect/bin/lightbulb`, which setup installs from the binary you ran. |
 | `--server-name <name>` | The tool server's name, also used in Cursor's and Grok's allow rules. Default: `lightbulb`. |
 | `--verbose` | Also list the files each agent's setup changed. |
+| `--no-model` | Do not download the memory model. Memory search is keyword-only. |
 
 ### doctor
 
@@ -44,7 +49,7 @@ lightbulb doctor
 `--help`: Check the daemon, state permissions, agent wiring, alias and launchd job.
 
 Checks the background service, the relay, the local network (macOS only), the login item (macOS
-only), the state folder, each agent, the `lightbulb` command, auto-update and usage counts, and
+only), the state folder, each agent, the `lightbulb` command, the memory model, auto-update and usage counts, and
 prints the fix for the first thing that is wrong.
 Exits 1 when something is wrong. Every line: [troubleshooting](troubleshooting.md).
 
@@ -406,7 +411,7 @@ answered within 10 ms is not waited for (the service still makes it). An
 | `show <ID>` | One session and its tool calls in order. |
 | `forget <ID>` | Deletes the session and its tool calls. |
 | `export` | Every session with its tool calls, as one JSON array on stdout. |
-| `upload [off\|metadata\|full]` | Choose what, if anything, is sent to Lightbulb (`capture_upload` in `config.toml`). `off` is the default: nothing leaves this computer. `metadata` sends, for each finished session, the agent, repository, branch, times and token counts, and for each tool call its number, time, tool, duration and whether it worked, without the summary. `full` adds the summary. Uploads are signed with this computer's identity, only while it is signed in, only for sessions that finish after you turn them on, and never for a hidden folder; signed out, it says nothing is sent until `lightbulb login`. Setting a mode must be run from your own terminal (an agent's shell is refused); with no mode it says which is set, from anywhere. `lightbulb login` asks once. |
+| `upload [off\|metadata\|full]` | Choose what, if anything, is sent to Lightbulb (`capture_upload` in `config.toml`). `off` is the default: nothing leaves this computer. (The one request memory makes is setup's download of the memory model; `setup --no-model` skips it.) `metadata` sends, for each finished session, the agent, repository, branch, times and token counts, and for each tool call its number, time, tool, duration and whether it worked, without the summary. `full` adds the summary. Uploads are signed with this computer's identity, only while it is signed in, only for sessions that finish after you turn them on, and never for a hidden folder; signed out, it says nothing is sent until `lightbulb login`. Setting a mode must be run from your own terminal (an agent's shell is refused); with no mode it says which is set, from anywhere. `lightbulb login` asks once. |
 
 ## Commands the agents and macOS run
 
