@@ -1236,8 +1236,8 @@ fn memory_list_shows_scope_author_and_status() {
         table.lines().any(|l| l.contains("vim") && l.contains("me")),
         "{table}"
     );
-    // A second value for the same subject makes both contested.
-    remember(&e, "port", "9090", "me");
+    // A second value for the same subject in the same scope makes both contested.
+    remember(&e, "port", "9090", "team");
     let table = out(&e.run(&["memory", "list"]));
     assert_eq!(table.matches("contested").count(), 2, "{table}");
     let only_me = out(&e.run(&["memory", "list", "--me"]));

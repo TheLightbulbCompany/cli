@@ -389,8 +389,8 @@ fn replay(store: &Store) -> Result<Vec<Live>> {
         .map(|(i, l)| (l.fact.id.as_str(), i))
         .collect();
 
-    // Unreplaced entries that share a subject, or a replaced target, are one thing with
-    // several current values.
+    // Unreplaced entries that share a scope and subject, or a replaced target, are one thing
+    // with several current values: a `me` value never contests a `team` one.
     let mut group: Vec<usize> = (0..live.len()).collect();
     fn root(group: &mut [usize], mut i: usize) -> usize {
         while group[i] != i {
@@ -405,7 +405,7 @@ fn replay(store: &Store) -> Result<Vec<Live>> {
             continue;
         }
         status[i] = Status::Current;
-        let keys = std::iter::once(format!("s:{}", l.fact.subject.trim().to_lowercase()))
+        let keys = std::iter::once(format!("s:{:?}:{}", l.fact.scope, l.fact.subject.trim().to_lowercase()))
             .chain(l.replaces.iter().map(|t| format!("t:{t}")));
         for k in keys {
             let j = *by_key.entry(k).or_insert(i);
@@ -702,12 +702,12 @@ pub fn page(
         )
     };
     let (mut contested, mut current, mut lessons) = (Vec::new(), Vec::new(), Vec::new());
-    let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+    let mut groups: Vec<((Scope, String), Vec<String>)> = Vec::new();
     for f in facts {
         match (f.status, f.kind) {
             (Status::Replaced, _) => {}
             (Status::Contested, _) => {
-                let key = f.subject.trim().to_lowercase();
+                let key = (f.scope, f.subject.trim().to_lowercase());
                 match groups.iter_mut().find(|(k, _)| *k == key) {
                     Some((_, v)) => v.push(by(f)),
                     None => groups.push((key, vec![format!("{}: {}", f.subject, by(f))])),

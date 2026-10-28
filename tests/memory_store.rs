@@ -641,6 +641,36 @@ fn a_long_current_section_does_not_hide_lessons() {
 }
 
 #[test]
+fn a_me_value_does_not_contest_a_team_value() {
+    let a = identity();
+    let (_d, s) = team(&a);
+    let me = |fact| rem_as("editor", fact, Scope::Me, Kind::Fact);
+    let team_op = |fact| rem_as("editor", fact, Scope::Team, Kind::Fact);
+    memory::remember(&s, &a, me("vim"), 1).unwrap();
+    memory::remember(&s, &a, team_op("vscode"), 2).unwrap();
+    let f = memory::facts(&s, None, None).unwrap();
+    assert_eq!(f.len(), 2);
+    assert!(f.iter().all(|x| x.status == Status::Current), "{f:?}");
+    // Two values in each scope: two contested groups, one per scope.
+    memory::remember(&s, &a, me("emacs"), 3).unwrap();
+    memory::remember(&s, &a, team_op("zed"), 4).unwrap();
+    let f = memory::facts(&s, None, None).unwrap();
+    assert!(f.iter().all(|x| x.status == Status::Contested), "{f:?}");
+    let page = memory::page(&s, &f, &Default::default(), 1600);
+    let lines: Vec<&str> = page.lines().collect();
+    assert_eq!(lines.len(), 3, "{page}");
+    assert_eq!(lines[0], "Contested:");
+    for (x, y) in [("zed", "vscode"), ("emacs", "vim")] {
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains(x) && l.contains(y) && l.matches(" vs ").count() == 1),
+            "{page}"
+        );
+    }
+}
+
+#[test]
 fn an_entry_under_a_bare_repo_name_still_reads() {
     let a = identity();
     let (_d, s) = team(&a);
