@@ -1124,7 +1124,7 @@ fn tools_list_matches_tools_json() {
     let got: Vec<Value> = m.tools().iter().map(shape).collect();
     let want: Vec<Value> = spec().iter().map(shape).collect();
     assert_eq!(got, want);
-    assert_eq!(names(&got).len(), 12);
+    assert_eq!(names(&got).len(), 15);
 }
 
 #[test]
@@ -1151,7 +1151,7 @@ fn workspace_tools_hidden_until_signed_in() {
         .filter(|t| t["scope"] == "network")
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(network.len(), 6);
+    assert_eq!(network.len(), 9);
     let mut m = mcp_on(&e, &me());
     assert_eq!(names(&m.tools()), network);
     let out = m.tool("find_rooms", json!({}));
@@ -1165,7 +1165,7 @@ fn workspace_tools_hidden_until_signed_in() {
 
     // Signing in shows them to the same server; an ended sign-in hides them again.
     e.sign_in("user_1", None);
-    assert_eq!(m.tools().len(), 12);
+    assert_eq!(m.tools().len(), 15);
     let old = common::now_s() - 40 * 86_400;
     let proof = common::issuer::proof(&e.identity().key, "user_1", old);
     let login = json!({"proof": proof, "name": "user_1"});
@@ -1347,17 +1347,17 @@ fn the_tool_list_changes_when_the_sign_in_does() {
             .count()
     };
     let wait = || std::thread::sleep(Duration::from_millis(800));
-    assert_eq!(m.tools().len(), 6);
+    assert_eq!(m.tools().len(), 9);
     // A login with no request after it: the timer tells the client.
     e.sign_in("user_1", None);
     wait();
-    assert_eq!(m.tools().len(), 12);
+    assert_eq!(m.tools().len(), 15);
     assert_eq!(changes(&mut m), 1);
     // A logout: told once, by the next call at the latest.
     std::fs::remove_file(e.state.path().join("login.json")).unwrap();
     assert!(!m.tool("find_sessions", json!({})).error);
     assert_eq!(changes(&mut m), 1);
-    assert_eq!(m.tools().len(), 6);
+    assert_eq!(m.tools().len(), 9);
     // A sign-in that ends.
     e.sign_in("user_1", None);
     wait();
@@ -1368,7 +1368,7 @@ fn the_tool_list_changes_when_the_sign_in_does() {
     let login = json!({"proof": proof, "name": "user_1"});
     std::fs::write(e.state.path().join("login.json"), login.to_string()).unwrap();
     wait();
-    assert_eq!(m.tools().len(), 6);
+    assert_eq!(m.tools().len(), 9);
     assert_eq!(changes(&mut m), 1);
     // Nothing changed: nothing said.
     wait();
@@ -1541,4 +1541,82 @@ fn a_question_recall_through_mcp_is_one_page() {
         start.get("block").is_some() && start.get("facts").is_some(),
         "{start}"
     );
+}
+
+#[test]
+fn the_three_assignment_tools_are_listed_and_assign_round_trips() {
+    let net = Net::new();
+    let codex = Other::new();
+    net.register("claude", "c1", &me());
+    let t = net.register("codex", "t1", &codex.1);
+    let mut m = net.mcp(&me());
+
+    let listed = m.rpc("tools/list", json!({}));
+    let tools = listed["result"]["tools"].as_array().unwrap();
+    for n in ["find_workers", "assign", "cancel_assignment"] {
+        assert!(tools.iter().any(|x| x["name"] == n), "{n} not listed");
+    }
+    let send = tools.iter().find(|x| x["name"] == "send_message").unwrap();
+    assert!(!send["inputSchema"]["properties"]["status"].is_null());
+
+    let out = m.tool(
+        "assign",
+        json!({"request_id": "as1", "to": t, "brief": "run tests", "done_when": "green"}),
+    );
+    assert!(!out.error, "{}", out.text);
+    assert_eq!(out.json()["state"], "stored");
+    let r = net.call(json!({"id": 1, "op": "inbox", "key": t}));
+    assert_eq!(r["messages"][0]["kind"], "assign", "{r}");
+
+    let r = net.call(json!({"id": 1, "op": "send", "from": t, "reply_to": "as1",
+        "request_id": "res1", "text": "green", "kind": "result", "status": "failed",
+        "reason": "error"}));
+    assert_eq!(r["receipt"]["state"], "stored", "{r}");
+    let out = m.tool("check_inbox", json!({"wait_secs": 1}));
+    let msgs = out.json()["messages"].clone();
+    assert_eq!(msgs.as_array().unwrap().len(), 1, "{msgs}");
+    assert_eq!(msgs[0]["kind"], "result");
+    assert_eq!(msgs[0]["status"], "failed");
+    let out = m.tool("message_receipt", json!({"request_id": "as1"}));
+    assert_eq!(out.json()["result"]["status"], "failed", "{}", out.text);
+
+    let out = m.tool(
+        "cancel_assignment",
+        json!({"assignment": "as1", "request_id": "c1"}),
+    );
+    assert_eq!(out.json()["state"], "stored", "{}", out.text);
+    let r = net.call(json!({"id": 1, "op": "inbox", "key": t}));
+    assert_eq!(r["messages"][0]["kind"], "cancel", "{r}");
+
+    let out = m.tool(
+        "assign",
+        json!({"request_id": "as2", "to": t, "brief": "b", "done_when": "d", "deadline_s": 99999}),
+    );
+    assert!(out.error);
+    assert_eq!(out.json()["error"], "bad_request");
+}
+
+#[test]
+fn find_workers_lists_always_on_sessions_only() {
+    let net = Net::new();
+    let codex = Other::new();
+    net.register("claude", "c1", &me());
+    let t = net.register("codex", "t1", &codex.1);
+    let short = net.call(json!({"id": 1, "op": "status"}))["member_key_short"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    net.call(json!({"id": 1, "op": "inbox", "key": format!("{short}/friday"), "wait_secs": 0}));
+    let mut m = net.mcp(&me());
+
+    // `directory` does not list a name row, so no worker is online here; the registered
+    // coding session T is filtered out all the same.
+    let v = m.tool("find_workers", json!({})).json();
+    let sessions = v["sessions"].as_array().unwrap();
+    assert!(sessions.iter().all(|s| s["always_on"] == true), "{v}");
+    assert!(
+        sessions.iter().all(|s| s["session_id"] != t.as_str()),
+        "{v}"
+    );
+    assert_eq!(v["total"], 0, "{v}");
 }
