@@ -344,7 +344,28 @@ async fn an_assignment_is_delivered_with_its_fields_and_its_reply_is_its_result(
         json!({"request_id": "re1", "status": "done"})
     );
 
+    let r = call(&mut l, &mut w, assign("as6", json!({}))).await;
+    assert_eq!(r["receipt"]["state"], "stored");
+    let got = call(&mut l, &mut w, json!({"id": 13, "op": "inbox", "key": b})).await;
+    let m = got["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["request_id"] == "as6")
+        .unwrap();
+    let at = m["deadline_at"].as_i64().unwrap();
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    assert!(
+        (at - (t + 3600)).abs() <= 5,
+        "default deadline_at {at} vs {t}"
+    );
+
     for (rid, extra) in [
+        ("as7", json!({"deadline_s": 60.0})),
+        ("as8", json!({"deadline_s": -5})),
         ("as2", json!({"deadline_s": 20000})),
         ("as4", json!({"deadline_s": 0})),
         ("as5", json!({"deadline_s": "soon"})),
