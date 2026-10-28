@@ -69,10 +69,14 @@ Run `lightbulb <command> --help` for the options of each one.
 ## Memory
 
 Your agents can remember things (a decision, a lesson, a preference) with the `remember` tool and
-look them up with `recall`. Each entry is `me` or `team`. Under `Turns:`, `recall` also shows up
-to five short excerpts from this computer's own session turns that match the question; the block
-handed over at a session's start never includes them, and a turn refused for a secret is never
-shown.
+look them up with `recall`. Each entry is `me` or `team`. `recall` finds entries by words and by
+meaning, using the small model setup downloads ([connect](connect/index.md)); without the model it
+finds them by words alone, with no error and no slowdown.
+
+Under `Turns:`, `recall` also shows up to five short excerpts from your own prompts and the agents'
+replies in this repository on this computer (see `lightbulb sessions turns` in [cli](cli.md#sessions));
+a folder with no git origin gets excerpts from every repository. The block handed over at a
+session's start never includes them, and a turn refused for a secret is never shown.
 
 - `team` entries go to every member of the team.
 - `me` entries go only to your own signed-in computers. If this computer is not signed in, a `me`
@@ -83,12 +87,22 @@ wrote it and whether two people disagree. `lightbulb memory share <id>` turns on
 team entry; `lightbulb memory team off` stops team entries from this computer.
 
 Claude Code, Codex, Cursor and OpenCode are handed what is remembered for the repository at the
-start of a session (`lightbulb memory last` shows what the last one got). Grok CLI does not get
-that block. It ignores what a hook prints at a session's start, so its agents use `recall`. A
-folder with no git origin gets no block, because the block is chosen by repository.
+start of a session (`lightbulb memory last` shows what the last one got). Cursor and OpenCode get
+the block only at the start; a message waiting for them comes with the next tool call or the end
+of the turn. Grok CLI does not get that block. It ignores what a hook prints at a session's start,
+so its agents use `recall`.
 
-Once per session, at the end of a turn that used a tool, an agent that has remembered nothing yet
-is asked to remember what the session settled; it is not asked while messages wait for it.
+The block is chosen by repository: `owner/name` from the git origin, in lowercase, so
+`git@github.com:Acme/API.git` is `acme/api`. A subfolder uses the nearest `.git` above it. An
+origin with no owner gives the bare name, and `lightbulb memory list --repo api` also finds
+`acme/api`. A folder with no git origin gets no block.
+
+Once per session, at the end of a turn that used a tool, an agent that has remembered nothing in
+that session is handed this, unless messages are waiting for it:
+
+> Before you stop: if this session settled a fact, made a decision or learned a lesson worth
+> keeping, call remember for each (subject, fact, kind; replaces when a fact changed). Personal
+> unless the person said to share. Then stop.
 
 `lightbulb memory forget <id>` deletes an entry. The delete reaches every computer that comes
 online. A computer that stays offline for good keeps what it held. Secrets are refused, not

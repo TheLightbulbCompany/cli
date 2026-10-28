@@ -185,7 +185,7 @@ Lightbulb sends anonymous usage counts so the project can see adoption. Each eve
 - `cli_updated` (`from`, `to`): `setup` after the version changed.
 - `network_joined` (`via`: code, link or line).
 - `invite_created` (`via`).
-- `cli_daily`, at most once a day: messages sent and received, computers on the network, and which agents (claude, codex, cursor, grok, opencode) are connected.
+- `cli_daily`, at most once a day: messages sent and received, computers on the network, which agents (claude, codex, cursor, grok, opencode) are connected, how many sessions were asked at the end of a turn to remember what they learned (`memory_nudged`), and how many of those then remembered something (`memory_written_after_nudge`).
 
 The only identifier is a random ID made on first use and kept in the state folder (`install-id`); it is not derived from your key or computer name. Never sent: message text, names, person ids, keys, tickets, codes, folder paths, team ids. Sending runs in the background with a 3 second limit and failures are dropped. PostHog sees your IP address (HTTPS reveals it) but is told to discard it (geoip disabled).
 
