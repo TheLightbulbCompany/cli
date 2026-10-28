@@ -157,6 +157,53 @@ async fn codex_push_runs_codex_queue_with_the_thread_id() {
     );
 }
 
+/// An assignment is pushed with its own header: its done_when and deadline, and how to answer.
+#[tokio::test]
+async fn codex_push_frames_an_assignment_as_one() {
+    let exe = fake_codex(".codex/packages/app-server-daemon/releases/assign/bin");
+    let bin = exe.parent().unwrap();
+    let (_dir, mut c, to) = start("t4", &exe).await;
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    };
+    let before = now();
+    let sent = call(
+        &mut c,
+        json!({"id": 3, "op": "send", "from": "x/claude:a", "to": to, "kind": "assign",
+        "text": "run the tests", "done_when": "tests pass", "deadline_s": 600,
+        "request_id": "as1"}),
+    )
+    .await;
+    let after = now();
+    assert_eq!(sent["receipt"]["state"], "stored", "{sent}");
+    calls(bin, 1).await;
+    let got = argv(bin, 1);
+    let want = (before..=after).map(|t| {
+        let meta = lightbulb::mail::Meta {
+            done_when: Some("tests pass".into()),
+            deadline_at: Some(t + 600),
+            ..Default::default()
+        };
+        let framed = frame::framed_kind(
+            "assign",
+            "Your Claude Code",
+            "as1",
+            None,
+            &meta,
+            "run the tests",
+        );
+        expected_argv("t4", &framed)
+    });
+    assert!(
+        want.into_iter().any(|w| w == got),
+        "{:?}",
+        String::from_utf8_lossy(&got[4])
+    );
+}
+
 #[tokio::test]
 async fn a_codex_thread_outside_the_daemon_is_next_step_and_never_pushed() {
     let exe = fake_codex("elsewhere/bin");

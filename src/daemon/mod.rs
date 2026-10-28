@@ -209,11 +209,29 @@ pub async fn deliver(daemon: Arc<Daemon>, to: Key) {
     loop {
         // One message per hold, so an `inbox` waits for at most one push.
         let _held = lock.lock().await;
-        let next = mail::waiting(&daemon.store.lock().unwrap(), &to, ipc::now());
-        let Some(m) = next.ok().and_then(|w| w.into_iter().next()) else {
+        // The mail and the request id of the message it answers, under one store lock.
+        let next = {
+            let store = daemon.store.lock().unwrap();
+            mail::waiting(&store, &to, ipc::now())
+                .ok()
+                .and_then(|w| w.into_iter().next())
+                .map(|m| {
+                    let parent = m.reply_to.as_deref();
+                    let parent = parent.and_then(|id| store.message(id).ok().flatten());
+                    (parent.map(|p| p.request_id), m)
+                })
+        };
+        let Some((parent_rid, m)) = next else {
             return;
         };
-        let framed = frame::framed(&ipc::sender_label(&daemon, &m), &m.request_id, &m.body);
+        let framed = frame::framed_kind(
+            &m.kind,
+            &ipc::sender_label(&daemon, &m),
+            &m.request_id,
+            parent_rid.as_deref(),
+            &m.meta,
+            &m.body,
+        );
         let pushed = match session.provider.as_str() {
             "claude" => claude::push(&session, &framed).await,
             _ => codex::push(&session, &framed).await,
