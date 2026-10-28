@@ -11,4 +11,4 @@ paths = ['''docs/acceptance-plan-a\.md''']
 # samples) and assert they are refused; none is a credential.
 [[allowlists]]
 description = "fake keys the memory and capture refusal tests feed in"
-paths = ['''tests/memory_store\.rs''', '''tests/memory_sync\.rs''', '''tests/cli\.rs''', '''tests/capture\.rs''', '''tests/embed_model\.rs''']
+paths = ['''tests/memory_store\.rs''', '''tests/memory_sync\.rs''', '''tests/cli\.rs''', '''tests/capture\.rs''', '''tests/embed_model\.rs''', '''tests/memory_tools\.rs''']
