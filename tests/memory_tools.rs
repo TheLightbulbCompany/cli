@@ -177,6 +177,39 @@ fn recall_returns_an_excerpt_from_a_turn() {
     );
 }
 
+/// `sessions turns off` also hides the turns already stored from recall; they stay for
+/// `sessions show` and `sessions forget`, and come back when turns are on again.
+#[test]
+fn turns_off_hides_stored_turns_from_recall() {
+    let e = daemon();
+    turns(&e, &[("user", "rotate the staging deploy keys")]);
+    assert_eq!(
+        recall(&e, "deploy keys", None)["turns"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    lightbulb::config::Config::set(e.state.path(), "capture_turns", "false").unwrap();
+    let r = recall(&e, "deploy keys", None);
+    assert_eq!(r["turns"], json!([]), "{r}");
+    assert!(!r["page"].as_str().unwrap().contains("rotate"), "{r}");
+    assert_eq!(
+        lightbulb::capture::turns(&e.store(), "claude:c1")
+            .unwrap()
+            .len(),
+        1
+    );
+    lightbulb::config::Config::set(e.state.path(), "capture_turns", "true").unwrap();
+    assert_eq!(
+        recall(&e, "deploy keys", None)["turns"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
 #[test]
 fn the_start_block_has_no_turns() {
     let e = daemon();

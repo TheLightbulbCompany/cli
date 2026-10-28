@@ -703,6 +703,9 @@ fn memory_recall(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
     };
     let budget = body["budget_chars"].as_u64().map_or(1_600, |b| b as usize);
     let names = member_names(daemon);
+    // From the file, before the lock: `sessions turns off` also stops recall using the turns
+    // already stored (they stay for `sessions show` and `sessions forget`).
+    let turns_on = crate::config::Config::load(&daemon.dir).is_ok_and(|c| c.capture_turns);
     let store = daemon.store.lock().unwrap();
     let found = if q.trim().is_empty() {
         let repo = body["repo"].as_str();
@@ -720,7 +723,7 @@ fn memory_recall(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
     };
     facts.retain(|f| f.status != Status::Replaced);
     // The session-start block (an empty question) never carries turns.
-    let turns = if q.trim().is_empty() {
+    let turns = if q.trim().is_empty() || !turns_on {
         Ok(Vec::new())
     } else {
         crate::capture::search_turns(&store, q, body["repo"].as_str(), 5)

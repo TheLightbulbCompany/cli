@@ -153,7 +153,8 @@ wrote it.
   characters (a command, a path, a pattern). Never file contents, diffs or command output.
   It also records your prompts and the agent's replies, each cut to 4 KB, on your computer only;
   they are never uploaded, in any mode, and are deleted after 90 days (`capture_turns_days`).
-  `lightbulb sessions turns off` stops it, from your own terminal only. A summary, prompt or
+  `lightbulb sessions turns off` stops it, from your own terminal only, and `recall` stops using
+  the turns already stored; `lightbulb sessions forget <ID>` deletes them. A summary, prompt or
   reply that looks like a password or key is stored as `[refused: <what it matched>]` and is
   never given a vector. An agent's `recall` can show short excerpts of your prompts and replies
   from the same repository ([usage](usage.md#memory)). Sessions under a folder hidden with `lightbulb folder <path> off`, or under a dot
