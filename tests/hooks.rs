@@ -820,3 +820,92 @@ fn a_failing_memory_recall_still_hands_over_the_mail() {
     ));
     assert_eq!(text, frame_of("r1"));
 }
+
+/// The prompt comes from UserPromptSubmit; the reply from Stop: the last assistant message of
+/// a Claude Code transcript, and what a Codex Stop payload carries.
+#[test]
+fn a_prompt_and_a_reply_are_recorded_as_turns() {
+    let net = Net::new();
+    let cwd = tempfile::tempdir().unwrap();
+    let me = os::process(std::process::id()).unwrap();
+    let transcript = format!(
+        "{}/tests/fixtures/hooks/claude-transcript.jsonl",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let codex = "0199aaaa-0000-7000-8000-0000000000d1";
+    let steps = [
+        (
+            "claude",
+            "session-start",
+            A,
+            json!({"hook_event_name": "SessionStart"}),
+        ),
+        (
+            "claude",
+            "user-prompt-submit",
+            A,
+            json!({"hook_event_name": "UserPromptSubmit", "prompt": "list the files"}),
+        ),
+        (
+            "claude",
+            "stop",
+            A,
+            json!({"hook_event_name": "Stop", "transcript_path": transcript}),
+        ),
+        (
+            "codex",
+            "session-start",
+            codex,
+            json!({"hook_event_name": "SessionStart"}),
+        ),
+        (
+            "codex",
+            "user-prompt-submit",
+            codex,
+            json!({"hook_event_name": "UserPromptSubmit", "prompt": "fix the build"}),
+        ),
+        (
+            "codex",
+            "stop",
+            codex,
+            json!({"hook_event_name": "Stop", "last_assistant_message": "Fixed it."}),
+        ),
+    ];
+    for (agent, event, conv, mut payload) in steps {
+        payload["session_id"] = json!(conv);
+        payload["cwd"] = json!(cwd.path());
+        net.hook_raw(agent, event, payload.to_string().as_bytes(), Some(&me));
+        // In order: the daemon writes each turn before the next hook runs.
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let turns = |id: &str| -> Vec<(String, String)> {
+        let db = lightbulb::store::Store::open(&net.dir.path().join("state.db")).unwrap();
+        lightbulb::capture::turns(&db, id)
+            .unwrap()
+            .into_iter()
+            .map(|t| (t.role, t.text))
+            .collect()
+    };
+    let pair = |r: &str, t: &str| (r.to_string(), t.to_string());
+    let want = [
+        (
+            format!("claude:{A}"),
+            vec![pair("user", "list the files"), pair("assistant", "Done.")],
+        ),
+        (
+            format!("codex:{codex}"),
+            vec![
+                pair("user", "fix the build"),
+                pair("assistant", "Fixed it."),
+            ],
+        ),
+    ];
+    for (id, turns_want) in want {
+        let end = std::time::Instant::now() + Duration::from_secs(10);
+        while turns(&id).len() < 2 {
+            assert!(std::time::Instant::now() < end, "{id}: {:?}", turns(&id));
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(turns(&id), turns_want, "{id}");
+    }
+}

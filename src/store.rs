@@ -4,7 +4,7 @@ use std::path::Path;
 /// Migration `i` takes the db to `user_version` `i + 1`. Forward only; each one only adds
 /// tables or columns, but V12, which drops and recreates `memory_fts` (stemmed) from the
 /// entries; each runs once (in the transaction that moves `user_version`).
-const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13];
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14];
 
 const V1: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
@@ -123,6 +123,27 @@ const V13: &str = "
 CREATE TABLE IF NOT EXISTS memory_vec (
     id TEXT PRIMARY KEY REFERENCES memory_entries(id), v BLOB NOT NULL
 );
+";
+/// The session's own turns (`capture::record_turn`), on this computer only: the text, a
+/// full-text index over it, and one embedding per turn when a model was installed. `nudged`
+/// marks a session the end-of-session nudge has already looked at.
+const V14: &str = "
+CREATE TABLE IF NOT EXISTS capture_turns (
+    rowid INTEGER PRIMARY KEY, session_id TEXT NOT NULL, seq INTEGER NOT NULL, role TEXT NOT NULL,
+    text TEXT NOT NULL, at INTEGER NOT NULL, UNIQUE (session_id, seq)
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS turns_fts USING fts5(
+    text, content='capture_turns', content_rowid='rowid', tokenize='porter unicode61'
+);
+CREATE TRIGGER IF NOT EXISTS turns_ai AFTER INSERT ON capture_turns BEGIN
+    INSERT INTO turns_fts(rowid, text) VALUES (new.rowid, new.text);
+END;
+CREATE TRIGGER IF NOT EXISTS turns_ad AFTER DELETE ON capture_turns BEGIN
+    INSERT INTO turns_fts(turns_fts, rowid, text) VALUES ('delete', old.rowid, old.text);
+    DELETE FROM turns_vec WHERE turn = old.rowid;
+END;
+CREATE TABLE IF NOT EXISTS turns_vec (turn INTEGER PRIMARY KEY, v BLOB NOT NULL);
+ALTER TABLE capture_sessions ADD COLUMN nudged INTEGER NOT NULL DEFAULT 0;
 ";
 /// Memory: signed entries numbered per author, with a full-text index over `subject` and `fact`
 /// (`memory`). `rowid` is explicit so it survives `VACUUM` (the FTS index points at it). A
@@ -1081,10 +1102,10 @@ mod tests {
         let path = dir.path().join("state.db");
         Connection::open(&path)
             .unwrap()
-            .execute_batch("PRAGMA user_version = 14;")
+            .execute_batch("PRAGMA user_version = 15;")
             .unwrap();
         let err = Store::open(&path).err().unwrap().to_string();
-        assert!(err.contains("State is from a newer version (v14)"), "{err}");
-        assert_eq!(user_version(&path), 14);
+        assert!(err.contains("State is from a newer version (v15)"), "{err}");
+        assert_eq!(user_version(&path), 15);
     }
 }

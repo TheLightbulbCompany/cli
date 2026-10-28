@@ -221,3 +221,44 @@ fn an_upload_off_during_the_request_keeps_the_mark_gone() {
     );
     assert_eq!(uploads(&seen).len(), 1);
 }
+
+/// Turns stay on this computer: a `full` upload carries the sessions and tool calls, never
+/// a prompt or a reply.
+#[test]
+fn full_upload_never_sends_turns() {
+    let e = Env::new();
+    e.sign_in("user_1", None);
+    let store = e.store();
+    let s = closed("claude:a", 100, 200);
+    capture::start_session(
+        &store,
+        &SessionRow {
+            ended: None,
+            ..s.clone()
+        },
+        "/work",
+    )
+    .unwrap();
+    capture::record_turn(&store, "claude:a", "user", "my private prompt", 150).unwrap();
+    capture::record_turn(&store, "claude:a", "assistant", "the private reply", 160).unwrap();
+    capture::end_session(&store, "claude:a", 200).unwrap();
+    assert_eq!(capture::turns(&store, "claude:a").unwrap().len(), 2);
+    drop(store);
+    std::fs::write(e.state.path().join("upload.mark"), "0").unwrap();
+    let (base, seen) = api_stub(stored);
+    e.daemon(
+        false,
+        "capture_upload = \"full\"\n",
+        &[
+            ("LIGHTBULB_API", base),
+            ("LIGHTBULB_CONNECT_DEBUG_UPLOAD_MS", EVERY_MS.into()),
+        ],
+    );
+    wait_for(&seen, 1);
+    let req = &uploads(&seen)[0];
+    assert_eq!(req.body["mode"], "full");
+    assert_eq!(req.body["sessions"][0]["id"], "claude:a");
+    for text in ["my private prompt", "the private reply", "turns"] {
+        assert!(!req.raw.contains(text), "{text} in {}", req.raw);
+    }
+}

@@ -1814,3 +1814,37 @@ fn memory_approve_prints_the_lesson_when_the_local_store_refuses() {
     assert!(text.contains(fact), "{text}");
     assert!(!text.contains("memory team on"), "no retry hint: {text}");
 }
+
+/// What is kept of your prompts and replies is a person's choice: an agent's shell cannot turn
+/// it off or on; a person can.
+#[test]
+fn sessions_turns_is_person_only() {
+    let mut e = Env::new();
+    let birth = os::process(std::process::id()).unwrap().birth_micros;
+    e.pin = Some(format!("{}:{birth}", std::process::id()));
+    e.daemon(false, "", &[]);
+    let o = e.run(&["sessions", "turns", "off"]);
+    assert!(
+        !o.status.success() && err(&o).contains("from your own terminal"),
+        "{}",
+        err(&o)
+    );
+    let r = e.ask(json!({"id": 1, "op": "sessions.turns", "on": false}));
+    assert_eq!(r["reason"], "not_a_person", "{r}");
+    assert!(
+        lightbulb::config::Config::load(e.state.path())
+            .unwrap()
+            .capture_turns
+    );
+    // Reading stays open.
+    assert!(out(&e.run(&["sessions", "turns"])).contains("kept on this computer only"));
+    // A person turns it off.
+    let r = common::person(&e, json!({"id": 1, "op": "sessions.turns", "on": false}));
+    assert_eq!(r["ok"], true, "{r}");
+    assert!(
+        !lightbulb::config::Config::load(e.state.path())
+            .unwrap()
+            .capture_turns
+    );
+    assert!(out(&e.run(&["sessions", "turns"])).contains("not kept"));
+}

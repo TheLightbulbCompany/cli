@@ -364,8 +364,10 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
             None => Response::err(id, BAD_REQUEST),
         },
         "sessions.upload" => sessions_upload(id, body, daemon, for_a_person()),
+        "sessions.turns" => sessions_turns(id, body, daemon, for_a_person()),
         "capture.session_start"
         | "capture.tool_call"
+        | "capture.turn"
         | "capture.stop"
         | "capture.session_end"
         | "sessions.list"
@@ -524,6 +526,7 @@ fn memory_remember(
 
 /// Local capture. The hooks send `capture.session_start {harness, conversation, cwd, repo?,
 /// branch?}`, `capture.tool_call {harness, conversation, tool, args, duration_ms?, ok?}`,
+/// `capture.turn {harness, conversation, role, text}` -> `{stored}`,
 /// `capture.stop {harness, conversation, prompt_tokens?, completion_tokens?}` and
 /// `capture.session_end {harness, conversation, prompt_tokens?, completion_tokens?}` -> `{stored}`. A person reads and deletes:
 /// `sessions.list` -> `{sessions}`, `sessions.show {session}` -> `{session, tool_calls}`,
@@ -578,6 +581,17 @@ fn capture_op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, person: boo
             )?;
             Ok(json!({ "stored": stored }))
         }
+        "capture.turn" => {
+            let (Some(sid), Some(role), Some(text)) =
+                (who(body), body["role"].as_str(), body["text"].as_str())
+            else {
+                return Err("bad".into());
+            };
+            // From the file each time: `sessions turns off` reaches a running service.
+            let on = crate::config::Config::load(&daemon.dir).is_ok_and(|c| c.capture_turns);
+            let stored = on && capture::record_turn(&store, &sid, role, text, now() as i64)?;
+            Ok(json!({ "stored": stored }))
+        }
         "capture.stop" => {
             let Some(sid) = who(body) else {
                 return Err("bad".into());
@@ -614,7 +628,10 @@ fn capture_op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, person: boo
                 capture::forget(&store, &s.id)?;
                 return Ok(json!({}));
             }
-            Ok(json!({ "session": s, "tool_calls": capture::tool_calls(&store, &s.id, true)? }))
+            Ok(
+                json!({ "session": s, "tool_calls": capture::tool_calls(&store, &s.id, true)?,
+                "turns": capture::turns(&store, &s.id)? }),
+            )
         }
         _ => {
             let mut all = vec![];
@@ -703,6 +720,20 @@ fn sessions_upload(id: u64, body: &Value, daemon: &Arc<Daemon>, person: bool) ->
         return Response::err(id, BAD_REQUEST);
     };
     match crate::upload::set_mode(&daemon.dir, mode) {
+        Ok(()) => Response::ok(id, json!({})),
+        Err(_) => Response::err(id, INTERNAL),
+    }
+}
+
+/// `sessions.turns {on}` -> `{}`: a person keeps or stops keeping their prompts and replies.
+fn sessions_turns(id: u64, body: &Value, daemon: &Arc<Daemon>, person: bool) -> Response {
+    if !person {
+        return refused(id, "not_a_person");
+    }
+    let Some(on) = body["on"].as_bool() else {
+        return Response::err(id, BAD_REQUEST);
+    };
+    match crate::config::Config::set(&daemon.dir, "capture_turns", &on.to_string()) {
         Ok(()) => Response::ok(id, json!({})),
         Err(_) => Response::err(id, INTERNAL),
     }

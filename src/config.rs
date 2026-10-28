@@ -14,12 +14,13 @@ pub const FILE: &str = "config.toml";
 enum Kind {
     Str(fn(&mut Config) -> &mut String),
     Bool(fn(&mut Config) -> &mut bool),
+    Int(fn(&mut Config) -> &mut i64),
     OptStr(fn(&mut Config) -> &mut Option<String>),
     Paths(fn(&mut Config) -> &mut Vec<PathBuf>),
 }
 
 /// Every setting: the one list `load` and `set` read.
-const KEYS: [(&str, Kind); 10] = [
+const KEYS: [(&str, Kind); 12] = [
     ("computer", Kind::Str(|c| &mut c.computer)),
     (
         "preview_to_workspace",
@@ -33,6 +34,11 @@ const KEYS: [(&str, Kind); 10] = [
     ("telemetry", Kind::Bool(|c| &mut c.telemetry)),
     ("memory_team", Kind::Bool(|c| &mut c.memory_team)),
     ("capture_upload", Kind::Str(|c| &mut c.capture_upload)),
+    ("capture_turns", Kind::Bool(|c| &mut c.capture_turns)),
+    (
+        "capture_turns_days",
+        Kind::Int(|c| &mut c.capture_turns_days),
+    ),
 ];
 
 fn kind(key: &str) -> Option<Kind> {
@@ -56,6 +62,11 @@ pub struct Config {
     /// What of this computer's sessions goes to the account: `off` (the default), and, once
     /// signed in, the modes the sign-in asks for.
     pub capture_upload: String,
+    /// Your prompts and the agent's replies are kept on this computer (`sessions turns on|off`);
+    /// never uploaded.
+    pub capture_turns: bool,
+    /// Days a turn is kept.
+    pub capture_turns_days: i64,
 }
 
 impl Default for Config {
@@ -71,6 +82,8 @@ impl Default for Config {
             telemetry: true,
             memory_team: true,
             capture_upload: "off".into(),
+            capture_turns: true,
+            capture_turns_days: 90,
         }
     }
 }
@@ -88,7 +101,7 @@ impl Config {
         let kind = kind(key).ok_or_else(|| format!("{FILE}: no setting {key}"))?;
         let v: toml_edit::Value = match kind {
             Kind::Str(_) | Kind::OptStr(_) => value.into(),
-            Kind::Bool(_) | Kind::Paths(_) => value
+            Kind::Bool(_) | Kind::Int(_) | Kind::Paths(_) => value
                 .parse()
                 .map_err(|_| format!("{FILE}: {key} has the wrong type"))?,
         };
@@ -135,6 +148,7 @@ fn from_doc(doc: &DocumentMut) -> Result<Config> {
             Kind::Str(f) => *f(&mut c) = text()?,
             Kind::OptStr(f) => *f(&mut c) = Some(text()?),
             Kind::Bool(f) => *f(&mut c) = item.as_bool().ok_or_else(bad)?,
+            Kind::Int(f) => *f(&mut c) = item.as_integer().ok_or_else(bad)?,
             Kind::Paths(f) => {
                 *f(&mut c) = item
                     .as_array()

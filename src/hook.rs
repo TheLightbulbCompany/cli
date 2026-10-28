@@ -359,6 +359,20 @@ fn try_capture(conn: &mut Conn, h: &Hook, payload: &Value, session: &Value) -> R
             // the transcript (that is read once, at SessionEnd).
             let u = &payload["usage"];
             let (i, o) = (u["input_tokens"].as_i64(), u["output_tokens"].as_i64());
+            // The reply: what the payload carries (Codex), else the last assistant message at the
+            // end of a Claude Code transcript. Cursor, Grok and OpenCode send no text.
+            let reply = payload["last_assistant_message"]
+                .as_str()
+                .map(String::from)
+                .or_else(|| {
+                    (h.provider == "claude")
+                        .then_some(h.transcript_path.as_deref())
+                        .flatten()
+                        .and_then(crate::capture::last_assistant_text)
+                });
+            if let Some(text) = reply.filter(|t| !t.trim().is_empty()) {
+                turn(conn, &who, "assistant", &text)?;
+            }
             if i.is_some() || o.is_some() {
                 let body = json!({ "prompt_tokens": i, "completion_tokens": o });
                 conn.call("capture.stop", with(&who, body))?;
@@ -378,8 +392,22 @@ fn try_capture(conn: &mut Conn, h: &Hook, payload: &Value, session: &Value) -> R
             };
             conn.call("capture.session_end", with(&who, body))?;
         }
-        Event::UserPromptSubmit => {}
+        Event::UserPromptSubmit => {
+            if let Some(text) = payload["prompt"].as_str().filter(|t| !t.trim().is_empty()) {
+                turn(conn, &who, "user", text)?;
+            }
+        }
     }
+    Ok(())
+}
+
+/// One turn to the daemon, cut to 4 KB first.
+fn turn(conn: &mut Conn, who: &Value, role: &str, text: &str) -> Result<()> {
+    let text = crate::capture::cut_turn(text);
+    conn.call(
+        "capture.turn",
+        with(who, json!({ "role": role, "text": text })),
+    )?;
     Ok(())
 }
 

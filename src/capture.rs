@@ -2,6 +2,8 @@
 //! writer) from the harness hooks. A session is a row; a tool call is a row with a short
 //! summary (a command, a path, a pattern), never file contents, diffs, output or prompts.
 //! A summary that looks like a credential is stored as `[refused: <pattern>]`.
+//! The session's own turns (your prompts and the agent's replies) are kept too, on this
+//! computer only: never uploaded (`upload.rs` does not read them).
 
 use crate::memory::refuse_secret;
 use crate::store::Store;
@@ -222,8 +224,124 @@ pub fn tool_calls(
     Ok(rows)
 }
 
+/// Longest turn kept, in bytes.
+pub const TURN_MAX: usize = 4 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Turn {
+    pub seq: i64,
+    pub role: String,
+    pub text: String,
+    pub at: i64,
+}
+
+/// `text` cut to `TURN_MAX` bytes at a character boundary.
+pub fn cut_turn(text: &str) -> &str {
+    let mut n = text.len().min(TURN_MAX);
+    while !text.is_char_boundary(n) {
+        n -= 1;
+    }
+    &text[..n]
+}
+
+/// Appends a prompt (`user`) or a reply (`assistant`) to a session. A turn with a credential in
+/// it is stored as `[refused: <pattern>]` and not embedded; the others are embedded when a model
+/// is installed. `Ok(false)` when the session has no row (never started, or in a hidden folder).
+pub fn record_turn(
+    store: &Store,
+    session_id: &str,
+    role: &str,
+    text: &str,
+    now: i64,
+) -> Result<bool> {
+    let text = cut_turn(text);
+    let refused = refuse_secret(text).map(|p| format!("[refused: {p}]"));
+    let stored = refused.as_deref().unwrap_or(text);
+    let n = store.conn().execute(
+        "INSERT INTO capture_turns (session_id, seq, role, text, at) \
+         SELECT ?1, COALESCE((SELECT MAX(seq) FROM capture_turns WHERE session_id = ?1), 0) + 1, \
+         ?2, ?3, ?4 WHERE EXISTS (SELECT 1 FROM capture_sessions WHERE id = ?1)",
+        rusqlite::params![session_id, role, stored, now],
+    )?;
+    if n == 1 && refused.is_none() {
+        if let Some(v) = crate::embed_model::text(text) {
+            let blob: Vec<u8> = v.iter().flat_map(|f| f.to_le_bytes()).collect();
+            store.conn().execute(
+                "INSERT INTO turns_vec (turn, v) VALUES (last_insert_rowid(), ?1)",
+                [blob],
+            )?;
+        }
+    }
+    Ok(n == 1)
+}
+
+/// A session's turns in order.
+pub fn turns(store: &Store, session_id: &str) -> Result<Vec<Turn>> {
+    let mut stmt = store.conn().prepare(
+        "SELECT seq, role, text, at FROM capture_turns WHERE session_id = ?1 ORDER BY seq",
+    )?;
+    let rows = stmt
+        .query_map([session_id], |r| {
+            Ok(Turn {
+                seq: r.get(0)?,
+                role: r.get(1)?,
+                text: r.get(2)?,
+                at: r.get(3)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
+}
+
+/// Deletes the turns recorded more than `days` days before `now`; how many.
+pub fn prune_turns(store: &Store, now: i64, days: i64) -> Result<usize> {
+    Ok(store.conn().execute(
+        "DELETE FROM capture_turns WHERE at < ?1",
+        [now.saturating_sub(days.saturating_mul(86_400))],
+    )?)
+}
+
+/// The text of the last assistant message in a Claude Code transcript, read from its last
+/// 256 KB (a Stop fires every turn; the whole file is never read). `None` when there is none.
+pub fn last_assistant_text(path: &str) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    const TAIL: u64 = 256 * 1024;
+    let mut file = std::fs::File::open(path).ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let from = meta.len().saturating_sub(TAIL);
+    file.seek(SeekFrom::Start(from)).ok()?;
+    let mut buf = vec![];
+    file.take(TAIL).read_to_end(&mut buf).ok()?;
+    let tail = String::from_utf8_lossy(&buf);
+    // A cut tail starts mid-line.
+    let lines: Vec<&str> = tail.lines().skip(usize::from(from > 0)).collect();
+    lines.into_iter().rev().find_map(|line| {
+        let v: Value = serde_json::from_str(line).ok()?;
+        if v["type"] != "assistant" {
+            return None;
+        }
+        let c = &v["message"]["content"];
+        let text = match c.as_str() {
+            Some(t) => t.to_string(),
+            None => c
+                .as_array()?
+                .iter()
+                .filter_map(|b| b["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        };
+        (!text.trim().is_empty()).then_some(text)
+    })
+}
+
 /// Deletes a session and its tool calls; whether it existed.
 pub fn forget(store: &Store, id: &str) -> Result<bool> {
+    store
+        .conn()
+        .execute("DELETE FROM capture_turns WHERE session_id = ?1", [id])?;
     store
         .conn()
         .execute("DELETE FROM capture_tool_calls WHERE session_id = ?1", [id])?;

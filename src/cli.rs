@@ -826,6 +826,8 @@ pub enum Sessions {
     Forget(String),
     Export,
     Upload(Option<String>),
+    /// `Some(on)` sets whether turns are kept; `None` says which.
+    Turns(Option<bool>),
 }
 
 /// `sessions ...`: what was captured of your coding sessions on this computer.
@@ -852,12 +854,32 @@ pub fn sessions(cmd: Sessions) -> Result<i32> {
         }
         return Ok(0);
     }
+    if let Sessions::Turns(on) = cmd {
+        let dir = paths::state_dir();
+        if let Some(on) = on {
+            // Through the daemon, which refuses an agent's shell: what is kept is a person's choice.
+            let r = connect()?.call("sessions.turns", json!({ "on": on }))?;
+            if r["ok"] != true {
+                return refuse(&r, &[]);
+            }
+        }
+        let on = crate::config::Config::load(&dir)?.capture_turns;
+        println!(
+            "{}",
+            if on {
+                "Your prompts and the agent's replies are kept on this computer only, never uploaded. Turn off: lightbulb sessions turns off"
+            } else {
+                "Your prompts and the agent's replies are not kept. Turn on: lightbulb sessions turns on"
+            }
+        );
+        return Ok(0);
+    }
     let (op, body) = match &cmd {
         Sessions::List => ("sessions.list", json!({})),
         Sessions::Show(id) => ("sessions.show", json!({ "session": id })),
         Sessions::Forget(id) => ("sessions.forget", json!({ "session": id })),
         Sessions::Export => ("sessions.export", json!({})),
-        Sessions::Upload(_) => unreachable!("handled above"),
+        Sessions::Upload(_) | Sessions::Turns(_) => unreachable!("handled above"),
     };
     let r = connect()?.call(op, body)?;
     if r["ok"] != true {
@@ -914,10 +936,15 @@ pub fn sessions(cmd: Sessions) -> Result<i32> {
                     .unwrap_or(c["tool"].as_str().unwrap_or_default());
                 println!("{:>4}  {}{ok}", c["seq"], cell(text));
             }
+            for t in r["turns"].as_array().into_iter().flatten() {
+                let text = t["text"].as_str().unwrap_or_default().replace('\n', " ");
+                let line = format!("{} {}: {text}", t["seq"], s(&t["role"]));
+                println!("{}", line.chars().take(200).collect::<String>());
+            }
         }
         Sessions::Forget(_) => println!("Forgotten. The session and its tool calls are deleted."),
         Sessions::Export => println!("{}", serde_json::to_string_pretty(&r["sessions"])?),
-        Sessions::Upload(_) => {}
+        Sessions::Upload(_) | Sessions::Turns(_) => {}
     }
     Ok(0)
 }

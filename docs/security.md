@@ -146,9 +146,11 @@ wrote it.
   the agent, the computer, the repository and branch, when it started and ended, and token
   counts, for Claude Code only, read from its transcript once at the end) and for each tool
   call its number, time, tool, duration, whether it worked, and a summary of at most 200
-  characters (a command, a path, a pattern). Never file contents, diffs, command output or your
-  prompts. A summary that looks like a password or key is stored as `[refused: <what it
-  matched>]`. Sessions under a folder hidden with `lightbulb folder <path> off`, or under a dot
+  characters (a command, a path, a pattern). Never file contents, diffs or command output.
+  It also records your prompts and the agent's replies, each cut to 4 KB, on your computer only;
+  they are never uploaded, in any mode, and are deleted after 90 days (`capture_turns_days`).
+  `lightbulb sessions turns off` stops it, from your own terminal only. A summary, prompt or
+  reply that looks like a password or key is stored as `[refused: <what it matched>]`. Sessions under a folder hidden with `lightbulb folder <path> off`, or under a dot
   folder in your home folder (`~/.config`), are not captured.
 - **Where it lives.** In `state.db` on this computer. Teammates never receive it.
 - **What is uploaded.** Nothing unless you choose. `lightbulb sessions upload off` (the default)

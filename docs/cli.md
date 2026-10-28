@@ -387,6 +387,7 @@ lightbulb sessions show <ID>
 lightbulb sessions forget <ID>
 lightbulb sessions export
 lightbulb sessions upload [off|metadata|full]
+lightbulb sessions turns [on|off]
 ```
 
 `--help`: The sessions captured on this computer: list, show, forget, export, and what is uploaded.
@@ -396,7 +397,8 @@ the end of each turn and when the session ends. It keeps, on this computer only:
 id, the agent, the computer, the repository and branch, when it started and ended, and the
 tokens, for Claude Code only, summed from its transcript once, when the session ends; the other agents leave them blank), and for each tool call its number, time, tool, duration,
 whether it worked, and a summary of at most 200 characters (a command, a path, a pattern). It
-never keeps file contents, diffs, command output or your prompts. A summary that looks like a
+never keeps file contents, diffs or command output. It also records your prompts and the
+agent's replies on your computer only (see `turns`). A summary, prompt or reply that looks like a
 password or key is replaced by `[refused: <what it matched>]`. Sessions under a hidden folder
 (`lightbulb folder <path> off`, or a folder in your home folder whose name starts with a dot,
 such as `~/.config`) are not captured; a dot folder inside a repository, such as Claude Code's
@@ -408,10 +410,11 @@ answered within 10 ms is not waited for (the service still makes it). An
 | Command | What it does |
 |---|---|
 | `list` | The id, the agent, the repository, the day it started and the tokens in and out (`-` where the agent did not report them). |
-| `show <ID>` | One session and its tool calls in order. |
-| `forget <ID>` | Deletes the session and its tool calls. |
+| `show <ID>` | One session, its tool calls in order, then its prompts and replies in order. |
+| `forget <ID>` | Deletes the session, its tool calls and its prompts and replies. |
 | `export` | Every session with its tool calls, as one JSON array on stdout. |
 | `upload [off\|metadata\|full]` | Choose what, if anything, is sent to Lightbulb (`capture_upload` in `config.toml`). `off` is the default: nothing leaves this computer. (The one request memory makes is setup's download of the memory model; `setup --no-model` skips it.) `metadata` sends, for each finished session, the agent, repository, branch, times and token counts, and for each tool call its number, time, tool, duration and whether it worked, without the summary. `full` adds the summary. Uploads are signed with this computer's identity, only while it is signed in, only for sessions that finish after you turn them on, and never for a hidden folder; signed out, it says nothing is sent until `lightbulb login`. Setting a mode must be run from your own terminal (an agent's shell is refused); with no mode it says which is set, from anywhere. `lightbulb login` asks once. |
+| `turns [on\|off]` | Records your prompts and replies on your computer only; never uploaded, in any mode (`capture_turns` in `config.toml`, on by default). Each is cut to 4 KB and deleted after 90 days (`capture_turns_days`). `sessions turns off` stops it; setting it must be run from your own terminal (an agent's shell is refused); with no state it says which is set. |
 
 ## Commands the agents and macOS run
 
