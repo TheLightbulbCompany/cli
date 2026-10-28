@@ -669,6 +669,8 @@ pub fn prepare(
     // No recipient named: the reply goes to whoever sent the parent.
     let to = match (to, &parent) {
         (Some(t), _) => t.clone(),
+        // A cancel goes to the assignment's target, not back to its asker.
+        (None, Some(p)) if kind == "cancel" => Key(p.to_key.clone()),
         (None, Some(p)) => Key(p.from_key.clone()),
         // Not persisted: a later message may make this reply_to known.
         (None, None) => return unstored("no_recipient"),
@@ -2192,7 +2194,9 @@ mod tests {
         // The asker names the assignment by its request id, or by its message id.
         let p = go(cancel("a/codex:1", "r3", "r1"));
         assert_eq!((p.kind.as_str(), p.reply_to), ("cancel", Some(aid.clone())));
-        assert_eq!(go(cancel("a/codex:1", "r4", &aid)).kind, "cancel");
+        assert_eq!(p.to, k("a/claude:2"));
+        let p = go(cancel("a/codex:1", "r4", &aid));
+        assert_eq!((p.kind.as_str(), p.to), ("cancel", k("a/claude:2")));
     }
 
     #[test]
