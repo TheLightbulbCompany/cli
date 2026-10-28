@@ -657,7 +657,7 @@ pub fn refuse_secret(text: &str) -> Option<&'static str> {
 }
 
 /// What an agent reads: `Contested:` lines, then `Current:`, then `Lessons:` (replaced facts
-/// left out), cut on a line boundary at `budget` chars. `names` maps a member key to the name
+/// left out), whole lines only, within `budget` chars. `names` maps a member key to the name
 /// shown (the short key when it is not there).
 /// The heading and the instruction line a session-start block carries around the page.
 pub const BLOCK_HEADING: &str = "Memory (team and yours):";
@@ -734,22 +734,25 @@ pub fn page(
         }
     }
     contested.extend(groups.into_iter().map(|(_, v)| v.join(" vs ")));
+    // A line that does not fit is left out and the next one tried, so one long line does not
+    // hide the lines and sections after it. A section's heading comes with its first line kept.
     let mut out = String::new();
-    'sections: for (head, lines) in [
+    for (head, lines) in [
         ("Contested:", contested),
         ("Current:", current),
         ("Lessons:", lessons),
     ] {
-        for (i, l) in lines.iter().enumerate() {
-            let add = if i == 0 {
-                format!("{head}\n{l}\n")
-            } else {
+        let mut headed = false;
+        for l in &lines {
+            let add = if headed {
                 format!("{l}\n")
+            } else {
+                format!("{head}\n{l}\n")
             };
-            if out.chars().count() + add.chars().count() > budget {
-                break 'sections;
+            if out.chars().count() + add.chars().count() <= budget {
+                out += &add;
+                headed = true;
             }
-            out += &add;
         }
     }
     out.trim_end().to_string()

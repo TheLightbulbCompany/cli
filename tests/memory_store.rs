@@ -612,6 +612,34 @@ fn recall_without_a_model_is_exactly_the_keyword_ranking() {
     assert_eq!(ids, vec![two.id, one.id]);
 }
 
+/// `rem` with `scope` and `kind` set.
+fn rem_as(subject: &str, fact: &str, s: Scope, k: Kind) -> Op {
+    let mut op = rem(subject, fact, &[]);
+    if let Op::Remember { scope, kind, .. } = &mut op {
+        (*scope, *kind) = (s, k);
+    }
+    op
+}
+
+#[test]
+fn a_long_current_section_does_not_hide_lessons() {
+    let a = identity();
+    let (_d, s) = team(&a);
+    memory::remember(&s, &a, rem("short", "x", &[]), 1).unwrap();
+    memory::remember(&s, &a, rem("long", &"y".repeat(300), &[]), 2).unwrap();
+    let lesson = rem_as("tests", "run them twice", Scope::Team, Kind::Lesson);
+    memory::remember(&s, &a, lesson, 3).unwrap();
+    let f = memory::facts(&s, None, None).unwrap();
+    let page = memory::page(&s, &f, &Default::default(), 200);
+    // The long line does not fit and is left out; the line after it and the lessons are kept.
+    assert!(!page.contains("yyy"), "{page}");
+    assert!(page.starts_with("Current:\nshort: x ("), "{page}");
+    assert!(
+        page.contains("\nLessons:\ntests: run them twice ("),
+        "{page}"
+    );
+}
+
 #[test]
 fn an_entry_under_a_bare_repo_name_still_reads() {
     let a = identity();
