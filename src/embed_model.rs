@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 /// The model's dimension (potion-base-8M).
 pub const DIM: usize = 256;
@@ -81,14 +82,26 @@ pub fn install(dir: &Path) -> Result<()> {
     let tmp = dir.join(format!("{}.tmp-{}", paths::MODEL, std::process::id()));
     let _ = fs::remove_dir_all(&tmp);
     fs::create_dir_all(&tmp)?;
+    // Each file gets 120 s and the whole install 300 s, so a slow network cannot hold setup up.
+    let deadline = Instant::now() + Duration::from_secs(300);
     let fetched = FILES.iter().try_for_each(|(f, sum)| -> Result<()> {
-        let bytes = crate::cli::curl(&format!("{base}/{f}"), false)?;
+        let left = deadline.saturating_duration_since(Instant::now()).as_secs();
+        if left == 0 {
+            return Err("the download took too long.".into());
+        }
+        let bytes = crate::cli::curl_for(&format!("{base}/{f}"), false, left.min(120))?;
         if format!("{:x}", Sha256::digest(&bytes)) != *sum {
             return Err(format!("{f} did not match its checksum").into());
         }
         Ok(fs::write(tmp.join(f), bytes)?)
     });
-    let result = fetched.and_then(|()| Ok(fs::rename(&tmp, &dest)?));
+    let result = fetched.and_then(|()| {
+        // A partial model/ left by an older run would block the rename.
+        if !done() {
+            let _ = fs::remove_dir_all(&dest);
+        }
+        Ok(fs::rename(&tmp, &dest)?)
+    });
     let _ = fs::remove_dir_all(&tmp);
     // Another setup may have renamed its copy in first.
     result.or_else(|e| if done() { Ok(()) } else { Err(e) })

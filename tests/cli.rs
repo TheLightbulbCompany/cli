@@ -687,6 +687,7 @@ fn setup_goes_on_without_the_model_and_no_model_skips_it() {
     );
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn setup_remove_also_stops_the_daemon_and_removes_the_job() {
     let e = Env::new();

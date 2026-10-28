@@ -1376,10 +1376,15 @@ fn parse_version(v: &str) -> Option<(u64, u64, u64)> {
 
 /// `curl -fsSL url` (with `-I`: the headers only); its stdout, or an error naming the URL.
 pub(crate) fn curl(url: &str, head: bool) -> Result<Vec<u8>> {
+    curl_for(url, head, 600)
+}
+
+/// `curl` that gives up after `secs` seconds.
+pub(crate) fn curl_for(url: &str, head: bool, secs: u64) -> Result<Vec<u8>> {
     let mut c = Command::new("curl");
     // -q first: ignore ~/.curlrc. Bounded, so a stalled download cannot hang the daemon's daily check.
     c.arg("-q");
-    c.args(["--connect-timeout", "30", "--max-time", "600"]);
+    c.args(["--connect-timeout", "30", "--max-time", &secs.to_string()]);
     c.arg(if head { "-fsSI" } else { "-fsSL" }).arg(url);
     let out = c.output().map_err(|e| format!("curl: {e}"))?;
     if !out.status.success() {
