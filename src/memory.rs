@@ -344,7 +344,7 @@ fn put_vec(conn: &rusqlite::Connection, row: &Missing, v: &[f32]) -> Result<usiz
 
 /// Embeds up to `limit` held, live `remember`s, then turns, that have no vector; how many it
 /// did. A no-op (0) without a model. `lock` gives the store for the read and for each write
-/// only: the embedding (20-100 ms each) runs between, so no other op waits on it.
+/// only: the embedding runs between, so no other op waits on it.
 pub fn embed_missing_with<'a, S: std::ops::Deref<Target = Store> + 'a>(
     lock: impl Fn() -> S,
     limit: usize,
@@ -355,7 +355,8 @@ pub fn embed_missing_with<'a, S: std::ops::Deref<Target = Store> + 'a>(
     let rows = missing(&lock(), limit)?;
     let mut n = 0;
     for (row, text) in rows {
-        // Installed but not loading: no row would embed this pass; the next one tries again.
+        // Installed but not loading: no row would embed this pass, and the load is not tried
+        // again until the service restarts (`embed_model::text` keeps the failure).
         let Some(v) = embed_model::text(&text) else {
             eprintln!("embed: the model did not load; stopping this pass");
             break;

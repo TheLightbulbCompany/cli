@@ -2219,7 +2219,10 @@ pub fn setup(
     let dir = paths::state_dir();
     let model = match model {
         Some(on) => {
-            crate::config::Config::set(&dir, "memory_model", &on.to_string())?;
+            // A config.toml that will not take the key is a line, not a failed setup.
+            if let Err(e) = crate::config::Config::set(&dir, "memory_model", &on.to_string()) {
+                eprintln!("setup: the model choice was not kept: {e}");
+            }
             on
         }
         None => crate::config::Config::load(&dir).map_or(true, |c| c.memory_model),
