@@ -15,6 +15,7 @@ use model2vec_rs::model::StaticModel;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -50,22 +51,29 @@ pub fn installed() -> bool {
     model_dir(&paths::state_path()).join(FILES[2].0).is_file()
 }
 
-/// `s` embedded (`DIM` floats, unit length); `None` when no model is installed.
-/// ponytail: the first load is kept for the process; the state dir never moves under it.
+/// How many times this process has tried to load the model (`text`): at most once.
+static LOADS: AtomicUsize = AtomicUsize::new(0);
+
+/// (tests) How many times this process has tried to load the model.
+#[doc(hidden)]
+pub fn load_attempts() -> usize {
+    LOADS.load(Ordering::SeqCst)
+}
+
+/// `s` embedded (`DIM` floats, unit length); `None` when no model is installed, or when the
+/// installed one did not load (remembered: no call tries again, none under the store lock).
+/// ponytail: the first load, or its failure, is kept for the process (the state dir never
+/// moves under it); a restart of the service tries again.
 pub fn text(s: &str) -> Option<Vec<f32>> {
-    static MODEL: OnceLock<StaticModel> = OnceLock::new();
+    static MODEL: OnceLock<Option<StaticModel>> = OnceLock::new();
     if !installed() {
         return None;
     }
-    let model = match MODEL.get() {
-        Some(m) => m,
-        None => {
-            let m = StaticModel::from_pretrained(model_dir(&paths::state_path()), None, None, None)
-                .ok()?;
-            MODEL.get_or_init(|| m)
-        }
-    };
-    Some(model.encode_single(s))
+    let model = MODEL.get_or_init(|| {
+        LOADS.fetch_add(1, Ordering::SeqCst);
+        StaticModel::from_pretrained(model_dir(&paths::state_path()), None, None, None).ok()
+    });
+    Some(model.as_ref()?.encode_single(s))
 }
 
 /// Downloads the model into `<dir>/model/` unless it is there. Written to a temp dir and
