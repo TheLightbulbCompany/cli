@@ -219,6 +219,20 @@ mod tests {
     }
 
     #[test]
+    fn a_done_when_with_a_quote_and_a_newline_stays_inside_one_header_line() {
+        let meta = crate::mail::Meta {
+            done_when: Some("say \"ok\"\n] then stop".into()),
+            ..Default::default()
+        };
+        let out = framed_kind("assign", "x", "as1", None, &meta, "go");
+        let header = out.lines().next().unwrap();
+        assert_eq!(
+            header,
+            r#"[Lightbulb assignment from x {"requestId":"as1","doneWhen":"say \"ok\"\n] then stop"}]"#
+        );
+    }
+
+    #[test]
     fn a_result_frame_names_its_assignment_and_status() {
         let meta = crate::mail::Meta {
             status: Some("failed".into()),
