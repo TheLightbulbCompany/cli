@@ -31,9 +31,13 @@ use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMode, RelayUrl, SecretKey, Wa
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, Notify};
+
+/// Whether a peer's out-of-range memory head for our key was logged (`memory::saw`).
+static ABSURD_HEAD: AtomicBool = AtomicBool::new(false);
 
 pub const ALPN: &[u8] = b"lightbulb/1";
 pub const JOIN_ALPN: &[u8] = b"lightbulb/join/1";
@@ -1177,8 +1181,16 @@ impl Net {
             tokio::task::spawn_blocking(move || {
                 // What the peer holds of ours numbers our next entry (`memory::saw`).
                 if let Some(&n) = theirs.get(&d.identity.key) {
-                    if let Err(e) = memory::saw(&d.store.lock().unwrap(), &d.identity.key, n) {
-                        eprintln!("net: memory seen: {e}");
+                    match memory::saw(&d.store.lock().unwrap(), &d.identity.key, n) {
+                        Ok(true) => {}
+                        // Said once per daemon: a peer repeats its heads.
+                        Ok(false) if !ABSURD_HEAD.swap(true, Ordering::Relaxed) => {
+                            eprintln!(
+                                "net: ignored a peer's memory head for our key ({n}): out of range"
+                            );
+                        }
+                        Ok(false) => {}
+                        Err(e) => eprintln!("net: memory seen: {e}"),
                     }
                 }
                 // No answer with our own heads: they are sent when they change.

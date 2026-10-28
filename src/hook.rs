@@ -298,6 +298,28 @@ fn with(body: &Value, extra: Value) -> Value {
     b
 }
 
+/// Most bytes of a tool's input sent to the daemon, which keeps 200 characters of one field.
+const ARGS_MAX: usize = 4 * 1024;
+
+/// A tool input as sent for its summary: its top-level text fields (the only ones a summary
+/// reads), each cut to 256 characters, kept while the whole stays within `ARGS_MAX`. A
+/// multi-megabyte Write never makes the request outlast the hook's wait.
+fn capped_args(args: &Value) -> String {
+    let mut kept = serde_json::Map::new();
+    let mut size = 2;
+    for (k, v) in args.as_object().into_iter().flatten() {
+        let Some(text) = v.as_str() else { continue };
+        let text: String = text.chars().take(256).collect();
+        let n = json!({ k: text }).to_string().len();
+        if size + n > ARGS_MAX {
+            break;
+        }
+        size += n;
+        kept.insert(k.clone(), text.into());
+    }
+    Value::Object(kept).to_string()
+}
+
 fn try_capture(conn: &mut Conn, h: &Hook, payload: &Value, session: &Value) -> Result<()> {
     let who = json!({ "harness": h.provider, "conversation": h.conversation });
     let start = |conn: &mut Conn, repo: &Value, branch: &Value| {
@@ -317,7 +339,7 @@ fn try_capture(conn: &mut Conn, h: &Hook, payload: &Value, session: &Value) -> R
                 .iter()
                 .map(|k| &payload[k])
                 .find(|a| !a.is_null());
-            let call = json!({ "tool": tool, "args": args.map(Value::to_string),
+            let call = json!({ "tool": tool, "args": args.map(capped_args),
                 "duration_ms": payload["duration"].as_i64(),
                 "ok": payload["tool_response"]["is_error"] != true });
             let r = conn.call("capture.tool_call", with(&who, call.clone()))?;
@@ -525,6 +547,36 @@ mod tests {
             assert!(try_capture(&mut conn, &h, &p, &json!({})).is_err(), "{e:?}");
             assert!(!capture_on(&mut conn, &h, &p, &json!({})));
         }
+    }
+
+    #[test]
+    fn a_huge_tool_input_is_cut_before_it_is_sent() {
+        let (a, b) = UnixStream::pair().unwrap();
+        let sent = std::thread::spawn(move || {
+            let mut line = String::new();
+            BufReader::new(&b).read_line(&mut line).unwrap();
+            let _ = (&b).write_all(b"{\"ok\":true,\"stored\":true}\n");
+            line
+        });
+        let mut conn = Conn {
+            stream: BufReader::new(a),
+            next: 1,
+        };
+        let p = json!({"tool_name": "Write", "tool_input": {"file_path": "/x/y.rs",
+            "content": "x".repeat(2 * 1024 * 1024)}});
+        try_capture(
+            &mut conn,
+            &hook("claude", Event::PostToolUse),
+            &p,
+            &json!({}),
+        )
+        .unwrap();
+        let line = sent.join().unwrap();
+        assert!(line.len() < 8 * 1024, "{}", line.len());
+        // What the summary needs is still there.
+        let v: Value = serde_json::from_str(&line).unwrap();
+        let args: Value = serde_json::from_str(v["args"].as_str().unwrap()).unwrap();
+        assert_eq!(args["file_path"], "/x/y.rs");
     }
 
     #[test]

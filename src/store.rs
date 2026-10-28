@@ -2,7 +2,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
 /// Migration `i` takes the db to `user_version` `i + 1`. Forward only; each one only adds
-/// tables or columns, and runs once (in the transaction that moves `user_version`).
+/// tables or columns, but V12, which drops and recreates `memory_fts` (stemmed) from the
+/// entries; each runs once (in the transaction that moves `user_version`).
 const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12];
 
 const V1: &str = "

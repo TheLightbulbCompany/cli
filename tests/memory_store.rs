@@ -194,6 +194,29 @@ fn search_matches_natural_questions() {
     assert_eq!(memory::search(&s, r#"cargo" OR "x*"#, 5).unwrap().len(), 1);
 }
 
+/// A peer's claim of how far it holds our entries numbers our next one only when plausible: a
+/// restore loses at most a million; anything past that is ignored, never stored.
+#[test]
+fn an_absurd_seen_head_is_ignored() {
+    let a = identity();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let s = Store::open(&path).unwrap();
+    let next = |s: &Store, n: i64| memory::remember(s, &a, rem(&format!("s{n}"), "x", &[]), n);
+    assert_eq!(next(&s, 1).unwrap().seq, 1);
+    assert!(!memory::saw(&s, &a.key, i64::MAX as u64).unwrap());
+    assert!(!memory::saw(&s, &a.key, 1 + 10_000_000).unwrap());
+    assert_eq!(next(&s, 2).unwrap().seq, 2, "numbered from the local head");
+    assert!(memory::saw(&s, &a.key, 2 + 5).unwrap());
+    assert_eq!(next(&s, 3).unwrap().seq, 8, "a plausible claim is honoured");
+    // A value already past the range (an older build stored it) refuses, never panics.
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute("UPDATE memory_seen SET seq = ?1", [i64::MAX])
+        .unwrap();
+    assert!(next(&s, 4).is_err());
+}
+
 /// A state.db from before stemming gets its index rebuilt stemmed, entries kept.
 #[test]
 fn an_older_index_is_rebuilt_stemmed() {

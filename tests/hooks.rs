@@ -635,7 +635,13 @@ fn a_claude_hook_fired_by_cursor_registers_nothing() {
     let _ = cursor.wait();
     // The same hook from a plain process registers the Claude session.
     let other = Other::new();
-    assert_eq!(claude_start_as(&net, &other.1), "");
+    // Nothing on stderr but, on a loaded machine, capture's one "not waiting" line.
+    let err = claude_start_as(&net, &other.1);
+    assert!(
+        err.lines()
+            .all(|l| l.contains(": capture took over 10 ms; not waiting for it")),
+        "{err}"
+    );
     assert!(net.session(&key).is_some());
 }
 

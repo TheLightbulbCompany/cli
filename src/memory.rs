@@ -132,7 +132,12 @@ pub fn remember(store: &Store, id: &Identity, op: Op, now: i64) -> Result<Entry>
         v: 1,
         id: String::new(),
         author: id.key.clone(),
-        seq: seq.unwrap_or(0) + 1,
+        // A stored number past the range (never from `saw`) refuses, never panics or wraps.
+        seq: seq
+            .unwrap_or(0)
+            .checked_add(1)
+            .filter(|n| *n <= i64::MAX as u64)
+            .ok_or("memory seq out of range")?,
         op,
         at: now,
         sig: String::new(),
@@ -208,15 +213,28 @@ fn insert(conn: &rusqlite::Connection, e: &Entry, now: i64) -> Result<bool> {
     Ok(true)
 }
 
+/// Most of `key`'s entries a restore can lose: a peer's claim past our head by more is hostile
+/// or corrupt.
+const MAX_LOST: u64 = 1_000_000;
+
 /// A peer holds `key`'s entries up to `seq` (its `MemoryHeads`): kept, so our next entry is
-/// numbered past it.
-pub fn saw(store: &Store, key: &str, seq: u64) -> Result<()> {
+/// numbered past it. `Ok(false)`, nothing kept, for a claim past `MAX_LOST` beyond what we hold
+/// or anywhere near `i64::MAX` (it would stop every later entry being numbered).
+pub fn saw(store: &Store, key: &str, seq: u64) -> Result<bool> {
+    let ours: Option<u64> = store.conn().query_row(
+        "SELECT MAX(seq) FROM memory_entries WHERE author = ?1",
+        [key],
+        |r| r.get(0),
+    )?;
+    if seq >= i64::MAX as u64 / 2 || seq > ours.unwrap_or(0) + MAX_LOST {
+        return Ok(false);
+    }
     store.conn().execute(
         "INSERT INTO memory_seen (author, seq) VALUES (?1, ?2)
          ON CONFLICT(author) DO UPDATE SET seq = MAX(seq, excluded.seq)",
         params![key, seq],
     )?;
-    Ok(())
+    Ok(true)
 }
 
 /// Each author's highest `seq` held.
