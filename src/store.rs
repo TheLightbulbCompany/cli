@@ -4,7 +4,9 @@ use std::path::Path;
 /// Migration `i` takes the db to `user_version` `i + 1`. Forward only; each one only adds
 /// tables or columns, but V12, which drops and recreates `memory_fts` (stemmed) from the
 /// entries; each runs once (in the transaction that moves `user_version`).
-const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12];
+const MIGRATIONS: &[&str] = &[
+    V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15,
+];
 
 const V1: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
@@ -117,6 +119,37 @@ INSERT INTO memory_fts(rowid, subject, fact)
     FROM memory_entries;
 CREATE TABLE IF NOT EXISTS memory_seen (author TEXT PRIMARY KEY, seq INTEGER NOT NULL);
 ";
+/// One embedding per held `remember` (`memory_vec`: `DIM` little-endian f32s); absent when no
+/// model was installed then (`memory::embed_missing` fills it in).
+const V13: &str = "
+CREATE TABLE IF NOT EXISTS memory_vec (
+    id TEXT PRIMARY KEY REFERENCES memory_entries(id), v BLOB NOT NULL
+);
+";
+/// The session's own turns (`capture::record_turn`), on this computer only: the text, a
+/// full-text index over it, and one embedding per turn when a model was installed. `nudged`
+/// marks a session the end-of-session nudge has already looked at.
+const V14: &str = "
+CREATE TABLE IF NOT EXISTS capture_turns (
+    rowid INTEGER PRIMARY KEY, session_id TEXT NOT NULL, seq INTEGER NOT NULL, role TEXT NOT NULL,
+    text TEXT NOT NULL, at INTEGER NOT NULL, UNIQUE (session_id, seq)
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS turns_fts USING fts5(
+    text, content='capture_turns', content_rowid='rowid', tokenize='porter unicode61'
+);
+CREATE TRIGGER IF NOT EXISTS turns_ai AFTER INSERT ON capture_turns BEGIN
+    INSERT INTO turns_fts(rowid, text) VALUES (new.rowid, new.text);
+END;
+CREATE TRIGGER IF NOT EXISTS turns_ad AFTER DELETE ON capture_turns BEGIN
+    INSERT INTO turns_fts(turns_fts, rowid, text) VALUES ('delete', old.rowid, old.text);
+    DELETE FROM turns_vec WHERE turn = old.rowid;
+END;
+CREATE TABLE IF NOT EXISTS turns_vec (turn INTEGER PRIMARY KEY, v BLOB NOT NULL);
+ALTER TABLE capture_sessions ADD COLUMN nudged INTEGER NOT NULL DEFAULT 0;
+";
+/// Why a held memory entry has no body when it was refused rather than forgotten
+/// (`refused:<pattern>`: a peer's entry that looks like a credential).
+const V15: &str = "ALTER TABLE memory_entries ADD COLUMN reason TEXT;";
 /// Memory: signed entries numbered per author, with a full-text index over `subject` and `fact`
 /// (`memory`). `rowid` is explicit so it survives `VACUUM` (the FTS index points at it). A
 /// tombstoned row keeps its id and seq and drops its body (`entry` NULL); `memory_tombstones`
@@ -642,6 +675,23 @@ pub struct Untold {
 
 /// Mail between members: the mailbox, what peers sent (`seen_ids`) and the outbox.
 impl Store {
+    /// Whether capture session `id` (session `key`) gets the end-of-turn nudge now: it made a
+    /// tool call, was never nudged, wrote no memory entry and has no mail waiting. A yes marks
+    /// it (`nudged` = `now`), so it never comes twice.
+    /// ponytail: the entry check scans memory_entries' JSON; an index on the source session if
+    /// memory grows past tens of thousands of entries.
+    pub fn nudge(&self, id: &str, key: &str, now: i64) -> rusqlite::Result<bool> {
+        let n = self.conn().execute(
+            "UPDATE capture_sessions SET nudged = ?3 WHERE id = ?1 AND nudged = 0 \
+             AND EXISTS (SELECT 1 FROM capture_tool_calls WHERE session_id = ?1) \
+             AND NOT EXISTS (SELECT 1 FROM memory_entries \
+                 WHERE json_extract(entry, '$.op.source.session') = ?2) \
+             AND NOT EXISTS (SELECT 1 FROM mailbox WHERE to_key = ?2 AND expires_at >= ?3)",
+            params![id, key, now],
+        )?;
+        Ok(n == 1)
+    }
+
     /// `from`'s message `request_id` as stored: `(to, whether its text is `text`)`, the text
     /// compared by its digest once `mail::forget` dropped it.
     pub fn sent_as(
@@ -1074,10 +1124,10 @@ mod tests {
         let path = dir.path().join("state.db");
         Connection::open(&path)
             .unwrap()
-            .execute_batch("PRAGMA user_version = 13;")
+            .execute_batch("PRAGMA user_version = 16;")
             .unwrap();
         let err = Store::open(&path).err().unwrap().to_string();
-        assert!(err.contains("State is from a newer version (v13)"), "{err}");
-        assert_eq!(user_version(&path), 13);
+        assert!(err.contains("State is from a newer version (v16)"), "{err}");
+        assert_eq!(user_version(&path), 16);
     }
 }

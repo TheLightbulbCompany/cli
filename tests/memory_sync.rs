@@ -273,3 +273,81 @@ async fn a_restored_node_numbers_past_what_peers_hold() {
     );
     assert_eq!(held(&b, &ka).len(), 4);
 }
+
+/// An entry with a credential in it, signed by `env` as its first: what an older build, which
+/// did not refuse it on `remember`, could send.
+fn with_secret(env: &Env) -> Entry {
+    signed_first(
+        env,
+        op("deploy", "export API_KEY=abcd1234efgh5678", Scope::Team),
+    )
+}
+
+/// `op` signed by `env` as its first entry, unchecked.
+fn signed_first(env: &Env, op: Op) -> Entry {
+    use data_encoding::HEXLOWER;
+    use sha2::{Digest, Sha256};
+    let id = env.identity();
+    let mut e = Entry {
+        v: 1,
+        id: String::new(),
+        author: id.key.clone(),
+        seq: 1,
+        op,
+        at: 5,
+        sig: String::new(),
+    };
+    let mut v = serde_json::to_value(&e).unwrap();
+    v.as_object_mut().unwrap().remove("sig");
+    e.id = HEXLOWER.encode(&Sha256::digest(lightbulb::identity::canonical(&v)));
+    e.sig = id.sign(&serde_json::to_value(&e).unwrap());
+    e
+}
+
+#[test]
+fn an_entry_from_a_peer_with_a_secret_is_refused_on_accept() {
+    let (a, b) = (Env::new(), Env::new());
+    seed_pair(&a, &b);
+    let e = with_secret(&a);
+    let kb = b.state.path().join("state.db");
+    // Stored as a tombstone: its seq is held, its text is not, and the reason is kept.
+    assert!(memory::accept(&b.store(), &e, 10).unwrap());
+    assert!(!memory::accept(&b.store(), &e, 10).unwrap(), "already held");
+    assert_eq!(memory::heads(&b.store()).unwrap()[&e.author], 1);
+    assert!(held(&b, &e.author).is_empty());
+    assert!(memory::facts(&b.store(), None, None).unwrap().is_empty());
+    let (body, tomb, reason): (Option<String>, i64, Option<String>) =
+        rusqlite::Connection::open(kb)
+            .unwrap()
+            .query_row(
+                "SELECT entry, tombstone, reason FROM memory_entries WHERE id = ?1",
+                [&e.id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+    assert_eq!(
+        (body, tomb, reason.as_deref()),
+        (None, 1, Some("refused:credential"))
+    );
+    // The author's next entry, numbered past it, is stored after it.
+    assert!(memory::accept(&a.store(), &e, 10).unwrap());
+    let next = remember(&a, op("ci", "github actions", Scope::Team));
+    assert!(memory::accept(&b.store(), &next, 10).unwrap());
+}
+
+#[test]
+fn an_entry_with_a_secret_only_in_its_source_is_refused_on_accept() {
+    let (a, b) = (Env::new(), Env::new());
+    seed_pair(&a, &b);
+    let mut o = op("deploy", "fridays", Scope::Team);
+    if let Op::Remember { source, .. } = &mut o {
+        source.session = Some("export API_KEY=abcd1234efgh5678".into());
+    }
+    // `remember` refuses it, and `accept` holds a peer's copy as a tombstone.
+    let err = memory::remember(&a.store(), &a.identity(), o.clone(), 5).unwrap_err();
+    assert!(err.to_string().contains("secret:credential"), "{err}");
+    let e = signed_first(&a, o);
+    assert!(memory::accept(&b.store(), &e, 10).unwrap());
+    assert!(held(&b, &e.author).is_empty());
+    assert_eq!(memory::heads(&b.store()).unwrap()[&e.author], 1);
+}

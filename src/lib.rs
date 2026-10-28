@@ -10,6 +10,7 @@ pub mod date;
 pub mod dialog;
 pub mod doing;
 pub mod embed;
+pub mod embed_model;
 pub mod frame;
 pub mod holds;
 pub mod hook;

@@ -30,6 +30,8 @@ impl Env {
             .env("LIGHTBULB_CONNECT_NO_LAUNCHCTL", "1")
             .env("LIGHTBULB_CONNECT_DEBUG_NO_DEFAULT_RELAYS", "1")
             .env("LIGHTBULB_CONNECT_DEBUG_NO_TELEMETRY", "1")
+            // Never the real model download: a closed port (`embed_model`).
+            .env("LIGHTBULB_CONNECT_DEBUG_MODEL_URL", "http://127.0.0.1:9")
             .env("HOME", self.home.path())
             .env_remove("LIGHTBULB_CONNECT_SESSION")
             .env_remove("LIGHTBULB_CONNECT_HOOK_CALLER");
@@ -201,7 +203,7 @@ fn the_hook_reports_the_folders_repo_and_branch() {
     let s = &d["sessions"][0];
     assert_eq!(
         (&s["repo"], &s["branch"]),
-        (&json!("engine"), &json!("main")),
+        (&json!("acme/engine"), &json!("main")),
         "{d}"
     );
 }
@@ -660,6 +662,72 @@ fn setup_installs_the_canonical_binary_and_wires_everything_to_it() {
             "<string>{canon_s}</string><string>daemon</string>"
         )));
     }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn setup_goes_on_without_the_model_and_no_model_skips_it() {
+    // The download fails (a closed port): one line, setup still succeeds, doctor says so.
+    let e = Env::new();
+    let o = e.run(&["setup"]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(
+        out(&o).contains("Memory model not installed: ") && out(&o).contains("keyword-only"),
+        "{}",
+        out(&o)
+    );
+    let o = e.run(&["setup", "--no-model"]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(!out(&o).contains("Memory model"), "{}", out(&o));
+    assert!(!e.state.path().join("model").exists());
+    let d = out(&e.run(&["doctor"]));
+    assert!(
+        d.contains("Memory model         not installed (run lightbulb setup)"),
+        "{d}"
+    );
+}
+
+/// `setup --no-model` is kept: the automatic setup after an update (`setup --refresh`) does not
+/// download the model.
+#[cfg(target_os = "macos")]
+#[test]
+fn no_model_survives_a_refresh() {
+    let e = Env::new();
+    assert!(e.run(&["setup", "--no-model"]).status.success());
+    let o = e.run(&["setup", "--refresh"]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(
+        !out(&o).contains("Memory model"),
+        "no download: {}",
+        out(&o)
+    );
+    let config = lightbulb::config::Config::load(e.state.path()).unwrap();
+    assert!(!config.memory_model);
+}
+
+/// A person's plain `setup` turns the model back on, and the refresh then follows that.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_plain_setup_turns_the_model_back_on() {
+    let e = Env::new();
+    assert!(e.run(&["setup", "--no-model"]).status.success());
+    let o = e.run(&["setup"]);
+    assert!(
+        out(&o).contains("Memory model not installed: "),
+        "{}",
+        out(&o)
+    );
+    assert!(
+        lightbulb::config::Config::load(e.state.path())
+            .unwrap()
+            .memory_model
+    );
+    let o = e.run(&["setup", "--refresh"]);
+    assert!(
+        out(&o).contains("Memory model not installed: "),
+        "{}",
+        out(&o)
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -1211,8 +1279,8 @@ fn memory_list_shows_scope_author_and_status() {
         table.lines().any(|l| l.contains("vim") && l.contains("me")),
         "{table}"
     );
-    // A second value for the same subject makes both contested.
-    remember(&e, "port", "9090", "me");
+    // A second value for the same subject in the same scope makes both contested.
+    remember(&e, "port", "9090", "team");
     let table = out(&e.run(&["memory", "list"]));
     assert_eq!(table.matches("contested").count(), 2, "{table}");
     let only_me = out(&e.run(&["memory", "list", "--me"]));
@@ -1788,4 +1856,70 @@ fn memory_approve_prints_the_lesson_when_the_local_store_refuses() {
     );
     assert!(text.contains(fact), "{text}");
     assert!(!text.contains("memory team on"), "no retry hint: {text}");
+}
+
+/// What is kept of your prompts and replies is a person's choice: an agent's shell cannot turn
+/// it off or on; a person can.
+#[test]
+fn sessions_turns_is_person_only() {
+    let mut e = Env::new();
+    let birth = os::process(std::process::id()).unwrap().birth_micros;
+    e.pin = Some(format!("{}:{birth}", std::process::id()));
+    e.daemon(false, "", &[]);
+    let o = e.run(&["sessions", "turns", "off"]);
+    assert!(
+        !o.status.success() && err(&o).contains("from your own terminal"),
+        "{}",
+        err(&o)
+    );
+    let r = e.ask(json!({"id": 1, "op": "sessions.turns", "on": false}));
+    assert_eq!(r["reason"], "not_a_person", "{r}");
+    assert!(
+        lightbulb::config::Config::load(e.state.path())
+            .unwrap()
+            .capture_turns
+    );
+    // Reading stays open.
+    assert!(out(&e.run(&["sessions", "turns"])).contains("kept on this computer only"));
+    // A person turns it off.
+    let r = common::person(&e, json!({"id": 1, "op": "sessions.turns", "on": false}));
+    assert_eq!(r["ok"], true, "{r}");
+    assert!(
+        !lightbulb::config::Config::load(e.state.path())
+            .unwrap()
+            .capture_turns
+    );
+    assert!(out(&e.run(&["sessions", "turns"])).contains("not kept"));
+}
+
+#[test]
+fn memory_list_repo_takes_a_bare_name() {
+    use lightbulb::memory::{self, Kind, Op, Scope, Source};
+    let e = Env::new();
+    assert!(e.run(&["who"]).status.success());
+    for (repo, subject) in [("acme/api", "db"), ("acme/web", "ci")] {
+        let op = Op::Remember {
+            subject: subject.into(),
+            fact: "x".into(),
+            kind: Kind::Fact,
+            scope: Scope::Team,
+            when: None,
+            source: Source {
+                harness: "test".into(),
+                repo: Some(repo.into()),
+                session: None,
+                on_behalf_of: None,
+                shared_from: None,
+            },
+            replaces: vec![],
+        };
+        memory::remember(&e.store(), &e.identity(), op, 5).unwrap();
+    }
+    for repo in ["api", "acme/api"] {
+        let table = out(&e.run(&["memory", "list", "--repo", repo]));
+        assert!(
+            table.lines().any(|l| l.contains(" db ")) && !table.contains(" ci "),
+            "{repo}: {table}"
+        );
+    }
 }

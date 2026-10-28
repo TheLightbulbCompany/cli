@@ -21,10 +21,16 @@ struct Net {
 
 impl Net {
     fn new() -> Net {
+        Net::with_env(&[])
+    }
+
+    /// A daemon with `env` set too.
+    fn with_env(env: &[(&str, &str)]) -> Net {
         let dir = tempfile::tempdir().unwrap();
         let claude = tempfile::tempdir().unwrap();
         let daemon = Command::new(EXE)
             .arg("daemon")
+            .envs(env.iter().copied())
             .env("LIGHTBULB_CONNECT_DEBUG_NO_DEFAULT_RELAYS", "1")
             .env("LIGHTBULB_CONNECT_DEBUG_NO_TELEMETRY", "1")
             .env(paths::HOME_ENV, dir.path())
@@ -819,4 +825,335 @@ fn a_failing_memory_recall_still_hands_over_the_mail() {
         cli.path(),
     ));
     assert_eq!(text, frame_of("r1"));
+}
+
+/// The prompt comes from UserPromptSubmit; the reply from Stop: the last assistant message of
+/// a Claude Code transcript, and what a Codex Stop payload carries.
+#[test]
+fn a_prompt_and_a_reply_are_recorded_as_turns() {
+    let net = Net::new();
+    let cwd = tempfile::tempdir().unwrap();
+    let me = os::process(std::process::id()).unwrap();
+    let transcript = format!(
+        "{}/tests/fixtures/hooks/claude-transcript.jsonl",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let codex = "0199aaaa-0000-7000-8000-0000000000d1";
+    let steps = [
+        (
+            "claude",
+            "session-start",
+            A,
+            json!({"hook_event_name": "SessionStart"}),
+        ),
+        (
+            "claude",
+            "user-prompt-submit",
+            A,
+            json!({"hook_event_name": "UserPromptSubmit", "prompt": "list the files"}),
+        ),
+        (
+            "claude",
+            "stop",
+            A,
+            json!({"hook_event_name": "Stop", "transcript_path": transcript}),
+        ),
+        (
+            "codex",
+            "session-start",
+            codex,
+            json!({"hook_event_name": "SessionStart"}),
+        ),
+        (
+            "codex",
+            "user-prompt-submit",
+            codex,
+            json!({"hook_event_name": "UserPromptSubmit", "prompt": "fix the build"}),
+        ),
+        (
+            "codex",
+            "stop",
+            codex,
+            json!({"hook_event_name": "Stop", "last_assistant_message": "Fixed it."}),
+        ),
+    ];
+    for (agent, event, conv, mut payload) in steps {
+        payload["session_id"] = json!(conv);
+        payload["cwd"] = json!(cwd.path());
+        net.hook_raw(agent, event, payload.to_string().as_bytes(), Some(&me));
+        // In order: the daemon writes each turn before the next hook runs.
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let turns = |id: &str| -> Vec<(String, String)> {
+        let db = lightbulb::store::Store::open(&net.dir.path().join("state.db")).unwrap();
+        lightbulb::capture::turns(&db, id)
+            .unwrap()
+            .into_iter()
+            .map(|t| (t.role, t.text))
+            .collect()
+    };
+    let pair = |r: &str, t: &str| (r.to_string(), t.to_string());
+    let want = [
+        (
+            format!("claude:{A}"),
+            vec![pair("user", "list the files"), pair("assistant", "Done.")],
+        ),
+        (
+            format!("codex:{codex}"),
+            vec![
+                pair("user", "fix the build"),
+                pair("assistant", "Fixed it."),
+            ],
+        ),
+    ];
+    for (id, turns_want) in want {
+        let end = std::time::Instant::now() + Duration::from_secs(10);
+        while turns(&id).len() < 2 {
+            assert!(std::time::Instant::now() < end, "{id}: {:?}", turns(&id));
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(turns(&id), turns_want, "{id}");
+    }
+}
+
+/// A folder whose origin is `url`.
+fn repo_at(url: &str) -> tempfile::TempDir {
+    let d = repo_dir("x");
+    std::fs::write(
+        d.path().join(".git/config"),
+        format!("[remote \"origin\"]\n\turl = {url}\n"),
+    )
+    .unwrap();
+    d
+}
+
+#[test]
+fn a_session_in_a_subfolder_gets_the_repo_block() {
+    let net = Net::new();
+    let cli = repo_dir("cli");
+    let deep = cli.path().join("src/net");
+    std::fs::create_dir_all(&deep).unwrap();
+    claude_hook(&net, "session-start", "SessionStart", A, cli.path());
+    remember_in(&net, &net.key("claude", A), "ci", "github actions", "team");
+    let text = context(&claude_hook(
+        &net,
+        "session-start",
+        "SessionStart",
+        B,
+        &deep,
+    ));
+    assert!(text.contains("ci: github actions"), "{text}");
+    let repo = |c| net.session(&net.key("claude", c)).unwrap()["repo"].clone();
+    assert_eq!(repo(B), repo(A));
+}
+
+#[test]
+fn the_repo_key_carries_the_owner() {
+    let net = Net::new();
+    let ours = repo_at("git@github.com:acme/api.git");
+    let theirs = repo_at("https://github.com/other/api");
+    let ours_https = repo_at("https://github.com/acme/api.git");
+    claude_hook(&net, "session-start", "SessionStart", A, ours.path());
+    assert_eq!(
+        net.session(&net.key("claude", A)).unwrap()["repo"],
+        "acme/api"
+    );
+    remember_in(&net, &net.key("claude", A), "ci", "github actions", "team");
+    // Another owner's `api` gets no block; the same repo cloned over https does.
+    let other = claude_hook(&net, "session-start", "SessionStart", B, theirs.path());
+    assert_eq!(other, "");
+    assert_eq!(
+        net.session(&net.key("claude", B)).unwrap()["repo"],
+        "other/api"
+    );
+    let c = "00000000-0000-4000-8000-0000000000c3";
+    let text = context(&claude_hook(
+        &net,
+        "session-start",
+        "SessionStart",
+        c,
+        ours_https.path(),
+    ));
+    assert!(text.contains("ci: github actions"), "{text}");
+}
+
+/// Runs `agent`'s hook with `payload` on stdin, called as the agent; returns stdout.
+fn agent_hook(net: &Net, agent: &str, event: &str, payload: Value) -> String {
+    let me = os::process(std::process::id()).unwrap();
+    let out = net.hook_raw(agent, event, payload.to_string().as_bytes(), Some(&me));
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// Cursor adds a sessionStart hook's `additional_context` to the conversation's initial
+/// context (cursor.com/docs/hooks), so a Cursor session starts with the repo's block. The start
+/// carries the block only: waiting mail is not marked delivered there, and the stop hands it over.
+#[test]
+fn cursor_session_start_includes_the_memory_block() {
+    let net = Net::new();
+    let cli = repo_dir("cli");
+    claude_hook(&net, "session-start", "SessionStart", A, cli.path());
+    remember_in(&net, &net.key("claude", A), "ci", "github actions", "team");
+    let conv = "5c1e0000-0000-4000-8000-0000000000e2";
+    let cursor = |event: &str| {
+        agent_hook(
+            &net,
+            "cursor",
+            event,
+            json!({"conversation_id": conv, "session_id": conv, "workspace_roots": [cli.path()],
+                "hook_event_name": event}),
+        )
+    };
+    let block = |out: &str| -> String {
+        let out: Value = serde_json::from_str(out).unwrap();
+        out["additional_context"].as_str().unwrap().to_string()
+    };
+    let first = block(&cursor("session-start"));
+    net.send(&net.key("cursor", conv), "body r1", "r1");
+    // Started again (resumed) with the mail waiting: the same block, and no mail.
+    let text = block(&cursor("session-start"));
+    assert_eq!(text, first);
+    assert!(text.starts_with("Memory (team and yours):\n"), "{text}");
+    assert!(text.contains("ci: github actions"), "{text}");
+    assert!(text.ends_with(INSTRUCTION), "{text}");
+    assert_eq!(net.receipt("r1"), "stored");
+    let out: Value = serde_json::from_str(&cursor("stop")).unwrap();
+    assert_eq!(out, json!({"followup_message": frame_of("r1")}));
+    assert_eq!(net.receipt("r1"), "delivered");
+}
+
+/// Our OpenCode plugin asks the start hook for the block before the session's first request and
+/// adds it to the system prompt: the start offers the block only, and the mail waits for a tool
+/// call or a stop, which offer it as before.
+#[test]
+fn opencode_session_start_includes_the_memory_block() {
+    let net = Net::new();
+    let cli = repo_dir("cli");
+    claude_hook(&net, "session-start", "SessionStart", A, cli.path());
+    remember_in(&net, &net.key("claude", A), "ci", "github actions", "team");
+    let conv = "ses_0a1b2c3d4e5fOpEnCoDe0003";
+    let run = |event: &str, mail: bool| {
+        agent_hook(
+            &net,
+            "opencode",
+            event,
+            json!({"session_id": conv, "cwd": cli.path(), "mail": mail}),
+        )
+    };
+    // At session.created the plugin asks for no mail: it registers, and nothing is offered.
+    assert_eq!(run("session-start", false), "");
+    let key = net.key("opencode", conv);
+    net.send(&key, "body r1", "r1");
+    let out: Value = serde_json::from_str(&run("session-start", true)).unwrap();
+    let text = out["text"].as_str().unwrap();
+    let block = text.strip_prefix("Memory (team and yours):\n").unwrap();
+    assert!(block.contains("ci: github actions"), "{block}");
+    assert!(block.ends_with(INSTRUCTION), "{block}");
+    assert!(!text.contains("body r1"), "{text}");
+    assert_eq!(out["ids"], json!([]), "{out}");
+    assert_eq!(net.receipt("r1"), "stored");
+    let out: Value = serde_json::from_str(&run("post-tool-use", true)).unwrap();
+    assert_eq!(out["text"], frame_of("r1"));
+    assert_eq!(out["ids"].as_array().map(Vec::len), Some(1), "{out}");
+}
+
+/// Runs the Claude hook `event` for conversation `A` in `cwd` with `extra` in its payload;
+/// returns stdout.
+fn claude_step(net: &Net, event: &str, extra: Value, cwd: &std::path::Path) -> String {
+    let me = os::process(std::process::id()).unwrap();
+    let mut payload = extra;
+    payload["session_id"] = json!(A);
+    payload["cwd"] = json!(cwd);
+    let out = net.hook_raw("claude", event, payload.to_string().as_bytes(), Some(&me));
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// A tool call, then a wait: its hook waits 10 ms only, so the daemon has written it before the
+/// next step.
+fn tool_call(net: &Net, cwd: &std::path::Path) {
+    let call = json!({"hook_event_name": "PostToolUse", "tool_name": "Bash",
+        "tool_input": {"command": "ls"}});
+    assert_eq!(claude_step(net, "post-tool-use", call, cwd), "");
+    std::thread::sleep(Duration::from_millis(50));
+}
+
+/// A Stop: its hook waits for the nudge answer, so no wait after.
+fn stop(net: &Net, cwd: &std::path::Path) -> String {
+    claude_step(net, "stop", json!({"hook_event_name": "Stop"}), cwd)
+}
+
+fn started(net: &Net) -> tempfile::TempDir {
+    let cwd = tempfile::tempdir().unwrap();
+    let start = json!({"hook_event_name": "SessionStart"});
+    assert_eq!(claude_step(net, "session-start", start, cwd.path()), "");
+    std::thread::sleep(Duration::from_millis(50));
+    cwd
+}
+
+#[test]
+fn the_first_stop_after_a_tool_call_nudges_once() {
+    let net = Net::new();
+    let cwd = started(&net);
+    tool_call(&net, cwd.path());
+    let out: Value = serde_json::from_str(&stop(&net, cwd.path())).unwrap();
+    assert_eq!(
+        out,
+        json!({"decision": "block", "reason": lightbulb::hook::NUDGE})
+    );
+    tool_call(&net, cwd.path());
+    assert_eq!(stop(&net, cwd.path()), "");
+}
+
+#[test]
+fn a_stop_with_waiting_messages_hands_them_over_and_does_not_nudge() {
+    let net = Net::new();
+    let cwd = started(&net);
+    tool_call(&net, cwd.path());
+    net.send(&net.key("claude", A), "body r1", "r1");
+    let out: Value = serde_json::from_str(&stop(&net, cwd.path())).unwrap();
+    assert_eq!(out, json!({"decision": "block", "reason": frame_of("r1")}));
+    // The mail's Stop did not use up the nudge: the next one, with nothing waiting, has it.
+    let out: Value = serde_json::from_str(&stop(&net, cwd.path())).unwrap();
+    assert_eq!(
+        out,
+        json!({"decision": "block", "reason": lightbulb::hook::NUDGE})
+    );
+}
+
+#[test]
+fn a_session_without_tool_calls_is_not_nudged() {
+    let net = Net::new();
+    let cwd = started(&net);
+    assert_eq!(stop(&net, cwd.path()), "");
+}
+
+#[test]
+fn a_session_that_already_remembered_is_not_nudged() {
+    let net = Net::new();
+    let cwd = started(&net);
+    tool_call(&net, cwd.path());
+    remember_in(&net, &net.key("claude", A), "db", "postgres 16", "me");
+    assert_eq!(stop(&net, cwd.path()), "");
+}
+
+/// A Stop that asks whether to nudge waits up to 250 ms for that answer, longer than the 10 ms
+/// every other capture call gets: a daemon 100 ms slow (`LIGHTBULB_CONNECT_DEBUG_CAPTURE_DELAY_MS`
+/// slows every capture op) still nudges, and the Stop's tokens are recorded.
+#[test]
+fn a_late_stop_answer_still_nudges() {
+    let net = Net::with_env(&[("LIGHTBULB_CONNECT_DEBUG_CAPTURE_DELAY_MS", "100")]);
+    let cwd = started(&net);
+    tool_call(&net, cwd.path());
+    let stop = json!({"hook_event_name": "Stop",
+        "usage": {"input_tokens": 7, "output_tokens": 3}});
+    let out: Value = serde_json::from_str(&claude_step(&net, "stop", stop, cwd.path())).unwrap();
+    assert_eq!(
+        out,
+        json!({"decision": "block", "reason": lightbulb::hook::NUDGE})
+    );
+    let db = lightbulb::store::Store::open(&net.dir.path().join("state.db")).unwrap();
+    let s = lightbulb::capture::sessions_since(&db, -1)
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!((s.prompt_tokens, s.completion_tokens), (Some(7), Some(3)));
 }

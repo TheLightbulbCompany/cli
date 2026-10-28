@@ -7,6 +7,7 @@ use lightbulb::identity::Identity;
 use lightbulb::memory::{self, Kind, Op, Scope, Source, Status};
 use lightbulb::roster::{self, Kind as RosterKind};
 use lightbulb::store::Store;
+use lightbulb::{embed_model, paths};
 use serde_json::json;
 
 fn store() -> (tempfile::TempDir, Store) {
@@ -125,6 +126,7 @@ fn two_replaces_of_same_target_are_contested() {
 
 #[test]
 fn test_tombstone_before_entry_wins() {
+    let Some(_env) = vec_env(false) else { return }; // no model: the keyword path
     let a = identity();
     let (_d1, s1) = team(&a);
     let e = memory::remember(&s1, &a, rem("db", "postgres", &[]), 1).unwrap();
@@ -152,6 +154,7 @@ fn test_tombstone_before_entry_wins() {
 
 #[test]
 fn search_finds_by_subject_and_fact() {
+    let Some(_env) = vec_env(false) else { return }; // no model: the keyword path
     let a = identity();
     let (_d, s) = team(&a);
     memory::remember(&s, &a, rem("database choice", "we run postgres 16", &[]), 1).unwrap();
@@ -167,6 +170,7 @@ fn search_finds_by_subject_and_fact() {
 /// Agents ask questions: any word of one may match (stemmed, prefix), stopwords aside.
 #[test]
 fn search_matches_natural_questions() {
+    let Some(_env) = vec_env(false) else { return }; // no model: the keyword path
     let a = identity();
     let (_d, s) = team(&a);
     let fact = "Run the suite with cargo test --workspace before pushing";
@@ -220,17 +224,20 @@ fn an_absurd_seen_head_is_ignored() {
 /// A state.db from before stemming gets its index rebuilt stemmed, entries kept.
 #[test]
 fn an_older_index_is_rebuilt_stemmed() {
+    let Some(_env) = vec_env(false) else { return }; // no model: the keyword path
     let a = identity();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
     let s = Store::open(&path).unwrap();
     memory::remember(&s, &a, rem("test runner", "cargo test", &[]), 1).unwrap();
     drop(s);
-    // Back to v11: the index as V9 made it, no `memory_seen`.
+    // Back to v11: the index as V9 made it, no `memory_seen`, no V14 or V15 columns.
     rusqlite::Connection::open(&path)
         .unwrap()
         .execute_batch(
-            "DROP TABLE memory_fts; DROP TABLE memory_seen;
+            "ALTER TABLE capture_sessions DROP COLUMN nudged;
+             ALTER TABLE memory_entries DROP COLUMN reason;
+             DROP TABLE memory_fts; DROP TABLE memory_seen;
              CREATE VIRTUAL TABLE memory_fts USING fts5(
                  subject, fact, content='memory_entries', content_rowid='rowid');
              INSERT INTO memory_fts(rowid, subject, fact) SELECT rowid,
@@ -249,6 +256,7 @@ fn an_older_index_is_rebuilt_stemmed() {
 /// A question of stopwords only is matched as the whole phrase.
 #[test]
 fn a_stopword_question_matches_as_a_phrase() {
+    let Some(_env) = vec_env(false) else { return }; // no model: the keyword path
     let a = identity();
     let (_d, s) = team(&a);
     memory::remember(&s, &a, rem("motto", "what we do is ship", &[]), 1).unwrap();
@@ -339,6 +347,7 @@ fn forget_by(b: &Identity, target: &str) -> memory::Entry {
 
 #[test]
 fn non_author_forget_before_body_wins() {
+    let Some(_env) = vec_env(false) else { return }; // no model: the keyword path
     let (a, b) = (identity(), identity());
     let (_d1, s1) = team(&a);
     let x = memory::remember(&s1, &a, rem("db", "postgres", &[]), 1).unwrap();
@@ -401,6 +410,7 @@ fn forget_of_known_entry_by_other_member_applies() {
 
 #[test]
 fn search_survives_snapshot() {
+    let Some(_env) = vec_env(false) else { return }; // no model: the keyword path
     let a = identity();
     let (d, s) = team(&a);
     memory::remember(&s, &a, rem("gone", "temp", &[]), 1).unwrap();
@@ -423,4 +433,261 @@ fn search_survives_snapshot() {
         memory::search(&c, "provider", 5).unwrap()[0].value,
         "actions"
     );
+}
+
+// --- vectors ---
+
+static STATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A fresh state dir for `embed_model` (process-wide env, so one test at a time), with the
+/// real model in it when `with_model`; `None` when the model is wanted but not enabled.
+fn vec_env(with_model: bool) -> Option<(std::sync::MutexGuard<'static, ()>, tempfile::TempDir)> {
+    if with_model && std::env::var("LIGHTBULB_TEST_MODEL").as_deref() != Ok("1") {
+        return None;
+    }
+    let g = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var(paths::HOME_ENV, dir.path());
+    if with_model {
+        embed_model::install(dir.path()).unwrap();
+    }
+    Some((g, dir))
+}
+
+#[test]
+#[ignore = "downloads the model; run with LIGHTBULB_TEST_MODEL=1 and --include-ignored"]
+fn remember_stores_a_vector_when_a_model_is_installed() {
+    let Some(_env) = vec_env(true) else { return };
+    let a = identity();
+    let (_d, s) = team(&a);
+    let e = memory::remember(&s, &a, rem("db", "postgres 16", &[]), 5).unwrap();
+    let v = memory::vectors(&s).unwrap();
+    assert_eq!(v.len(), 1);
+    assert_eq!(v[0].0, e.id);
+    assert_eq!(v[0].1, embed_model::text("db: postgres 16").unwrap());
+}
+
+#[test]
+fn remember_stores_no_vector_without_a_model() {
+    let Some(_env) = vec_env(false) else { return };
+    let a = identity();
+    let (_d, s) = team(&a);
+    memory::remember(&s, &a, rem("db", "postgres 16", &[]), 5).unwrap();
+    assert!(memory::vectors(&s).unwrap().is_empty());
+    assert_eq!(memory::embed_missing(&s, 200).unwrap(), 0);
+}
+
+#[test]
+#[ignore = "downloads the model; run with LIGHTBULB_TEST_MODEL=1 and --include-ignored"]
+fn forget_drops_the_vector() {
+    let Some(_env) = vec_env(true) else { return };
+    let a = identity();
+    let (_d, s) = team(&a);
+    let e = memory::remember(&s, &a, rem("db", "postgres 16", &[]), 5).unwrap();
+    let keep = memory::remember(&s, &a, rem("ci", "github actions", &[]), 6).unwrap();
+    memory::remember(
+        &s,
+        &a,
+        Op::Forget {
+            target: e.id.clone(),
+        },
+        7,
+    )
+    .unwrap();
+    let ids: Vec<_> = memory::vectors(&s)
+        .unwrap()
+        .into_iter()
+        .map(|v| v.0)
+        .collect();
+    assert_eq!(ids, vec![keep.id]);
+}
+
+#[test]
+#[ignore = "downloads the model; run with LIGHTBULB_TEST_MODEL=1 and --include-ignored"]
+fn embed_missing_backfills_entries_received_from_peers() {
+    if std::env::var("LIGHTBULB_TEST_MODEL").as_deref() != Ok("1") {
+        return;
+    }
+    let Some(_env) = vec_env(false) else { return };
+    let a = identity();
+    let (_d1, s1) = team(&a);
+    let (_d2, s2) = team(&a);
+    let e1 = memory::remember(&s1, &a, rem("db", "postgres 16", &[]), 5).unwrap();
+    let e2 = memory::remember(&s1, &a, rem("ci", "github actions", &[]), 6).unwrap();
+    // Received with no model installed: no vectors yet.
+    memory::accept(&s2, &e1, 7).unwrap();
+    memory::accept(&s2, &e2, 7).unwrap();
+    assert!(memory::vectors(&s2).unwrap().is_empty());
+    // The model arrives; the backfill honours its limit, then finishes.
+    embed_model::install(std::path::Path::new(
+        &std::env::var(paths::HOME_ENV).unwrap(),
+    ))
+    .unwrap();
+    assert_eq!(memory::embed_missing(&s2, 1).unwrap(), 1);
+    assert_eq!(memory::embed_missing(&s2, 200).unwrap(), 1);
+    assert_eq!(memory::embed_missing(&s2, 200).unwrap(), 0);
+    assert_eq!(memory::vectors(&s2).unwrap().len(), 2);
+}
+
+#[test]
+#[ignore = "downloads the model; run with LIGHTBULB_TEST_MODEL=1 and --include-ignored"]
+fn embed_missing_is_not_starved_by_forgets() {
+    if std::env::var("LIGHTBULB_TEST_MODEL").as_deref() != Ok("1") {
+        return;
+    }
+    let Some(_env) = vec_env(false) else { return };
+    let a = identity();
+    let (_d1, s1) = team(&a);
+    let (_d2, s2) = team(&a);
+    let e1 = memory::remember(&s1, &a, rem("db", "postgres 16", &[]), 5).unwrap();
+    let e2 = memory::remember(&s1, &a, rem("ci", "github actions", &[]), 6).unwrap();
+    let e3 = memory::remember(&s1, &a, rem("editor", "helix", &[]), 7).unwrap();
+    let f1 = memory::remember(
+        &s1,
+        &a,
+        memory::Op::Forget {
+            target: e1.id.clone(),
+        },
+        8,
+    )
+    .unwrap();
+    let f2 = memory::remember(
+        &s1,
+        &a,
+        memory::Op::Forget {
+            target: e2.id.clone(),
+        },
+        9,
+    )
+    .unwrap();
+    // The forgets sit ahead of the live remember by rowid: they must not use up the limit.
+    for e in [&f1, &f2, &e1, &e2, &e3] {
+        memory::accept(&s2, e, 10).unwrap();
+    }
+    embed_model::install(std::path::Path::new(
+        &std::env::var(paths::HOME_ENV).unwrap(),
+    ))
+    .unwrap();
+    assert_eq!(memory::embed_missing(&s2, 1).unwrap(), 1);
+    assert_eq!(memory::embed_missing(&s2, 200).unwrap(), 0);
+    let ids: Vec<String> = memory::vectors(&s2)
+        .unwrap()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(ids, vec![e3.id.clone()]);
+}
+
+#[test]
+#[ignore = "downloads the model; run with LIGHTBULB_TEST_MODEL=1 and --include-ignored"]
+fn recall_finds_a_paraphrase_keyword_search_misses() {
+    let Some(_env) = vec_env(true) else { return };
+    let a = identity();
+    let (_d, s) = team(&a);
+    let deploy = memory::remember(
+        &s,
+        &a,
+        rem("deploy window", "Deploys go out Tuesday mornings", &[]),
+        5,
+    )
+    .unwrap();
+    memory::remember(&s, &a, rem("db", "postgres 16", &[]), 6).unwrap();
+    memory::remember(&s, &a, rem("ci", "github actions", &[]), 7).unwrap();
+    let hits = memory::search(&s, "how do we ship releases", 5).unwrap();
+    assert_eq!(hits.first().map(|f| f.id.clone()), Some(deploy.id));
+}
+
+#[test]
+fn recall_without_a_model_is_exactly_the_keyword_ranking() {
+    let Some(_env) = vec_env(false) else { return };
+    let a = identity();
+    let (_d, s) = team(&a);
+    let one = memory::remember(&s, &a, rem("db", "postgres 16 database", &[]), 5).unwrap();
+    let two = memory::remember(&s, &a, rem("database", "database host is db1", &[]), 6).unwrap();
+    memory::remember(&s, &a, rem("ci", "github actions", &[]), 7).unwrap();
+    let ids: Vec<_> = memory::search(&s, "database", 5)
+        .unwrap()
+        .into_iter()
+        .map(|f| f.id)
+        .collect();
+    // bm25 order: the entry that says "database" twice first.
+    assert_eq!(ids, vec![two.id, one.id]);
+}
+
+/// `rem` with `scope` and `kind` set.
+fn rem_as(subject: &str, fact: &str, s: Scope, k: Kind) -> Op {
+    let mut op = rem(subject, fact, &[]);
+    if let Op::Remember { scope, kind, .. } = &mut op {
+        (*scope, *kind) = (s, k);
+    }
+    op
+}
+
+#[test]
+fn a_long_current_section_does_not_hide_lessons() {
+    let a = identity();
+    let (_d, s) = team(&a);
+    memory::remember(&s, &a, rem("short", "x", &[]), 1).unwrap();
+    memory::remember(&s, &a, rem("long", &"y".repeat(300), &[]), 2).unwrap();
+    let lesson = rem_as("tests", "run them twice", Scope::Team, Kind::Lesson);
+    memory::remember(&s, &a, lesson, 3).unwrap();
+    let f = memory::facts(&s, None, None).unwrap();
+    let page = memory::page(&s, &f, &[], &Default::default(), 200);
+    // The long line does not fit and is left out; the line after it and the lessons are kept.
+    assert!(!page.contains("yyy"), "{page}");
+    assert!(page.starts_with("Current:\nshort: x ("), "{page}");
+    assert!(
+        page.contains("\nLessons:\ntests: run them twice ("),
+        "{page}"
+    );
+}
+
+#[test]
+fn a_me_value_does_not_contest_a_team_value() {
+    let a = identity();
+    let (_d, s) = team(&a);
+    let me = |fact| rem_as("editor", fact, Scope::Me, Kind::Fact);
+    let team_op = |fact| rem_as("editor", fact, Scope::Team, Kind::Fact);
+    memory::remember(&s, &a, me("vim"), 1).unwrap();
+    memory::remember(&s, &a, team_op("vscode"), 2).unwrap();
+    let f = memory::facts(&s, None, None).unwrap();
+    assert_eq!(f.len(), 2);
+    assert!(f.iter().all(|x| x.status == Status::Current), "{f:?}");
+    // Two values in each scope: two contested groups, one per scope.
+    memory::remember(&s, &a, me("emacs"), 3).unwrap();
+    memory::remember(&s, &a, team_op("zed"), 4).unwrap();
+    let f = memory::facts(&s, None, None).unwrap();
+    assert!(f.iter().all(|x| x.status == Status::Contested), "{f:?}");
+    let page = memory::page(&s, &f, &[], &Default::default(), 1600);
+    let lines: Vec<&str> = page.lines().collect();
+    assert_eq!(lines.len(), 3, "{page}");
+    assert_eq!(lines[0], "Contested:");
+    for (x, y) in [("zed", "vscode"), ("emacs", "vim")] {
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains(x) && l.contains(y) && l.matches(" vs ").count() == 1),
+            "{page}"
+        );
+    }
+}
+
+#[test]
+fn an_entry_under_a_bare_repo_name_still_reads() {
+    let a = identity();
+    let (_d, s) = team(&a);
+    let mut old = rem("db", "postgres 16", &[]);
+    if let Op::Remember { source, .. } = &mut old {
+        source.repo = Some("app".into());
+    }
+    memory::remember(&s, &a, old, 1).unwrap();
+    memory::remember(&s, &a, rem("ci", "actions", &[]), 2).unwrap();
+    let subjects = |r| -> Vec<String> {
+        let f = memory::facts(&s, None, Some(r)).unwrap();
+        f.into_iter().map(|f| f.subject).collect()
+    };
+    assert_eq!(subjects("acme/app"), ["ci", "db"]);
+    // The bare name has no owner: any owner's `app` reads it.
+    assert_eq!(subjects("other/app"), ["db"]);
+    assert!(subjects("acme/api").is_empty());
 }

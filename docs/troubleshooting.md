@@ -81,6 +81,12 @@ your PATH`, a real file (not a link) is there. Setup leaves it alone. Add
 These lines are never red. They show `on` or `off`. Change them with `lightbulb update --auto on|off`
 and `lightbulb telemetry on|off`.
 
+### `Memory model`
+
+This line is never red. `installed` means memory search uses the local model. `not installed (run
+lightbulb setup)` means memory search is keyword-only: run `lightbulb setup` to download the model
+(about 31 MB).
+
 ### `Relay`
 
 This line is never red. It shows the relay in use: `default` (the iroh project's public relays),

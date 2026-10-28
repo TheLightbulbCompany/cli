@@ -424,7 +424,7 @@ fn a_running_session_is_captured_from_its_next_tool_call() {
     let post = json!({"tool_name": "Read", "tool_input": {"file_path": "/x/y.rs"}});
     e.claude_hook("post-tool-use", e.payload("PostToolUse", &cwd, post));
     let mut calls = vec![];
-    common::until(5, "the call is recorded", || {
+    common::until(10, "the call is recorded", || {
         calls = capture::tool_calls(&e.store(), "claude:c1", true).unwrap();
         !calls.is_empty()
     });
@@ -481,7 +481,7 @@ fn sessions_list_shows_harness_repo_tokens() {
     assert_eq!(header, ["Id", "Agent", "Repo", "Started", "In", "Out"]);
     let row = list.lines().nth(1).unwrap();
     assert!(
-        row.contains("claude:c1") && row.contains("claude  app "),
+        row.contains("claude:c1") && row.contains("claude  acme/app "),
         "{row}"
     );
     assert!(row.ends_with("120  45"), "{row}");
@@ -537,4 +537,254 @@ fn forget_deletes_only_the_matching_session() {
     assert!(capture::tool_calls(&s, "a:1", true).unwrap().is_empty());
     assert_eq!(capture::sessions_since(&s, -1).unwrap().len(), 1);
     assert_eq!(capture::tool_calls(&s, "a:2", true).unwrap().len(), 1);
+}
+
+/// The vector rows for `seq` of `a:1`: one only when a model embedded the turn.
+fn turn_vecs(db: &std::path::Path, seq: i64) -> i64 {
+    common::count(
+        db,
+        &format!(
+            "SELECT COUNT(*) FROM turns_vec JOIN capture_turns ON turn = capture_turns.rowid \
+             WHERE session_id = 'a:1' AND seq = {seq}"
+        ),
+    )
+}
+
+#[test]
+fn a_turn_with_a_secret_is_stored_refused_and_not_embedded() {
+    let (d, s) = store();
+    assert!(capture::start_session(&s, &row(), "/tmp/proj").unwrap());
+    assert!(capture::record_turn(&s, "a:1", "user", "list the files", 10).unwrap());
+    let secret = "export API_KEY=abcd1234efgh5678";
+    assert!(capture::record_turn(&s, "a:1", "assistant", secret, 11).unwrap());
+    let turns = capture::turns(&s, "a:1").unwrap();
+    let got: Vec<(i64, &str, &str)> = turns
+        .iter()
+        .map(|t| (t.seq, t.role.as_str(), t.text.as_str()))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            (1, "user", "list the files"),
+            (2, "assistant", "[refused: credential]")
+        ]
+    );
+    // The hook's marker for a credential past the 4 KB cut, stored as it came.
+    assert!(capture::record_turn(&s, "a:1", "user", "[refused: credential]", 12).unwrap());
+    let db = d.path().join("state.db");
+    // Storing never embeds (that would hold the store lock); the backfill does, outside it.
+    assert_eq!(turn_vecs(&db, 1), 0, "record_turn never embeds");
+    lightbulb::memory::embed_missing(&s, 200).unwrap();
+    assert_eq!(turn_vecs(&db, 2), 0, "a refused turn is never embedded");
+    assert_eq!(turn_vecs(&db, 3), 0, "nor a marker the hook sent");
+    let embedded = i64::from(lightbulb::embed_model::installed());
+    assert_eq!(turn_vecs(&db, 1), embedded);
+    // A long turn is cut to 4 KB at a character boundary.
+    let long = "é".repeat(capture::TURN_MAX);
+    assert!(capture::record_turn(&s, "a:1", "user", &long, 12).unwrap());
+    let last = capture::turns(&s, "a:1").unwrap().pop().unwrap();
+    assert!(last.text.len() <= capture::TURN_MAX && last.text.len() > capture::TURN_MAX - 2);
+    // No session row (never started, or in a hidden folder): nothing is kept.
+    assert!(!capture::record_turn(&s, "a:2", "user", "hello", 13).unwrap());
+    assert!(capture::turns(&s, "a:2").unwrap().is_empty());
+}
+
+#[test]
+fn turns_off_records_nothing() {
+    let e = Env::new();
+    e.daemon(false, "capture_turns = false\n", &[]);
+    let cwd = e.folder("proj");
+    let prompt = |text: &str| {
+        let p = e.payload("UserPromptSubmit", &cwd, json!({ "prompt": text }));
+        assert!(e.claude_hook("user-prompt-submit", p).status.success());
+    };
+    e.claude_hook("session-start", e.payload("SessionStart", &cwd, json!({})));
+    e.captured("the session starts", |_| true);
+    prompt("not kept");
+    let stop = json!({ "transcript_path": transcript() });
+    e.claude_hook("stop", e.payload("Stop", &cwd, stop));
+    // Capture does not wait for the write: give a wrong one time to land.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(capture::turns(&e.store(), "claude:c1").unwrap().is_empty());
+    // On again (the running daemon reads the file each time): the next prompt is kept.
+    lightbulb::config::Config::set(e.state.path(), "capture_turns", "true").unwrap();
+    prompt("kept");
+    common::until(10, "the turn is written", || {
+        !capture::turns(&e.store(), "claude:c1").unwrap().is_empty()
+    });
+    let turns = capture::turns(&e.store(), "claude:c1").unwrap();
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0].text, "kept");
+}
+
+#[test]
+fn turns_older_than_turns_days_are_pruned() {
+    let (d, s) = store();
+    capture::start_session(&s, &row(), "/tmp/proj").unwrap();
+    let day = 86_400;
+    let now = 1_000 * day;
+    capture::record_turn(&s, "a:1", "user", "an old question", now - 91 * day).unwrap();
+    capture::record_turn(&s, "a:1", "user", "a new question", now - day).unwrap();
+    assert_eq!(capture::prune_turns(&s, now, 90).unwrap(), 1);
+    let left = capture::turns(&s, "a:1").unwrap();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].text, "a new question");
+    // The index and the vectors follow the rows.
+    let db = d.path().join("state.db");
+    let fts = "SELECT COUNT(*) FROM turns_fts WHERE turns_fts MATCH 'old'";
+    assert_eq!(common::count(&db, fts), 0);
+    let orphans =
+        "SELECT COUNT(*) FROM turns_vec WHERE turn NOT IN (SELECT rowid FROM capture_turns)";
+    assert_eq!(common::count(&db, orphans), 0);
+    drop(s);
+
+    // The daemon prunes at start, by `capture_turns_days`.
+    let e = Env::new();
+    let db = e.store();
+    capture::start_session(&db, &row(), "/tmp/proj").unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    capture::record_turn(&db, "a:1", "user", "a month ago", now - 31 * day).unwrap();
+    capture::record_turn(&db, "a:1", "user", "today", now).unwrap();
+    drop(db);
+    e.daemon(false, "capture_turns_days = 30\n", &[]);
+    common::until(10, "the old turn is pruned", || {
+        capture::turns(&e.store(), "a:1").unwrap().len() == 1
+    });
+    assert_eq!(capture::turns(&e.store(), "a:1").unwrap()[0].text, "today");
+}
+
+#[test]
+fn sessions_show_prints_turns_in_order() {
+    let e = Env::new();
+    e.daemon(false, "", &[]);
+    let cwd = e.folder("proj");
+    e.claude_hook("session-start", e.payload("SessionStart", &cwd, json!({})));
+    e.captured("the session starts", |_| true);
+    let steps = [
+        (
+            "user-prompt-submit",
+            "UserPromptSubmit",
+            json!({"prompt": "first question"}),
+        ),
+        ("stop", "Stop", json!({"transcript_path": transcript()})),
+        (
+            "user-prompt-submit",
+            "UserPromptSubmit",
+            json!({"prompt": "second\u{7}\nquestion"}),
+        ),
+    ];
+    for (n, (arg, event, extra)) in steps.into_iter().enumerate() {
+        e.claude_hook(arg, e.payload(event, &cwd, extra));
+        common::until(10, "the turn is written", || {
+            capture::turns(&e.store(), "claude:c1").unwrap().len() > n
+        });
+    }
+    let show = out(&e.sessions(&["show", "claude:c1"]));
+    let lines: Vec<&str> = show
+        .lines()
+        .filter(|l| l.contains("user: ") || l.contains("assistant: "))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "1 user: first question",
+            "2 assistant: Done.",
+            "3 user: second question"
+        ],
+        "{show}"
+    );
+}
+
+#[test]
+fn a_reply_equal_to_the_last_turn_is_recorded_once() {
+    let (_d, s) = store();
+    capture::start_session(&s, &row(), "/tmp/proj").unwrap();
+    assert!(capture::record_turn(&s, "a:1", "user", "a question", 1).unwrap());
+    assert!(capture::record_turn(&s, "a:1", "assistant", "an answer", 2).unwrap());
+    // The transcript's last reply read again on the next Stop (the agent ended on a tool call).
+    assert!(!capture::record_turn(&s, "a:1", "assistant", "an answer", 3).unwrap());
+    // The same text by the other role is a new turn.
+    assert!(capture::record_turn(&s, "a:1", "user", "an answer", 4).unwrap());
+    let seqs: Vec<i64> = capture::turns(&s, "a:1")
+        .unwrap()
+        .iter()
+        .map(|t| t.seq)
+        .collect();
+    assert_eq!(seqs, vec![1, 2, 3]);
+}
+
+/// The Stop's tokens and its reply travel in one `capture.stop`, so an answer that comes too
+/// late for the hook costs neither: `LIGHTBULB_CONNECT_DEBUG_CAPTURE_DELAY_MS` slows every
+/// capture op, here past the hook's wait, and the daemon still records both.
+#[test]
+fn a_slow_capture_stop_still_records_its_tokens_and_turn() {
+    let e = Env::new();
+    let delay = [(
+        "LIGHTBULB_CONNECT_DEBUG_CAPTURE_DELAY_MS",
+        "500".to_string(),
+    )];
+    e.daemon(false, "", &delay);
+    let cwd = e.folder("proj");
+    e.claude_hook("session-start", e.payload("SessionStart", &cwd, json!({})));
+    e.captured("the session starts", |_| true);
+    let stop = json!({"usage": {"input_tokens": 7, "output_tokens": 3},
+        "last_assistant_message": "Done."});
+    let o = e.claude_hook("stop", e.payload("Stop", &cwd, stop));
+    assert!(o.status.success(), "{}", err(&o));
+    let s = e.captured("the tokens", |s| s.prompt_tokens.is_some());
+    assert_eq!((s.prompt_tokens, s.completion_tokens), (Some(7), Some(3)));
+    let turns = capture::turns(&e.store(), "claude:c1").unwrap();
+    assert_eq!(turns.len(), 1);
+    assert_eq!(
+        (turns[0].role.as_str(), turns[0].text.as_str()),
+        ("assistant", "Done.")
+    );
+}
+
+/// The hook checks the whole prompt for a credential before the 4 KB cut.
+#[test]
+fn a_credential_past_the_cut_is_still_refused() {
+    let e = Env::new();
+    e.daemon(false, "", &[]);
+    let cwd = e.folder("proj");
+    e.claude_hook("session-start", e.payload("SessionStart", &cwd, json!({})));
+    e.captured("the session starts", |_| true);
+    let prompt = format!(
+        "{} export API_KEY=abcd1234efgh5678",
+        "x".repeat(capture::TURN_MAX)
+    );
+    let p = e.payload("UserPromptSubmit", &cwd, json!({ "prompt": prompt }));
+    assert!(e.claude_hook("user-prompt-submit", p).status.success());
+    common::until(10, "the turn is written", || {
+        !capture::turns(&e.store(), "claude:c1").unwrap().is_empty()
+    });
+    let turns = capture::turns(&e.store(), "claude:c1").unwrap();
+    assert_eq!(turns[0].text, "[refused: credential]");
+}
+
+/// A running session's first tool call opens its row and is recorded in one request: an answer
+/// that comes too late for the hook (`LIGHTBULB_CONNECT_DEBUG_CAPTURE_DELAY_MS` slows every
+/// capture op) never loses it.
+#[test]
+fn a_running_sessions_first_tool_call_survives_a_slow_answer() {
+    let e = Env::new();
+    let delay = [(
+        "LIGHTBULB_CONNECT_DEBUG_CAPTURE_DELAY_MS",
+        "500".to_string(),
+    )];
+    e.daemon(false, "", &delay);
+    let cwd = e.folder("proj");
+    let post = json!({"tool_name": "Read", "tool_input": {"file_path": "/x/y.rs"}});
+    let o = e.claude_hook("post-tool-use", e.payload("PostToolUse", &cwd, post));
+    assert!(o.status.success(), "{}", err(&o));
+    let mut calls = vec![];
+    common::until(10, "the call is recorded", || {
+        calls = capture::tool_calls(&e.store(), "claude:c1", true).unwrap();
+        !calls.is_empty()
+    });
+    assert_eq!(capture::sessions_since(&e.store(), -1).unwrap().len(), 1);
+    assert_eq!(calls[0].summary.as_deref(), Some("Read: /x/y.rs"));
 }

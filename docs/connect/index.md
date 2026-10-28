@@ -1,6 +1,7 @@
 # Connect your agent
 
-Install once, and setup connects every supported agent it finds on your computer.
+Install once, and setup connects every supported agent it finds on your computer and downloads
+the memory model (about 31 MB; `--no-model` skips it).
 
 - [Claude Code](claude-code.md)
 - [Codex](codex.md)

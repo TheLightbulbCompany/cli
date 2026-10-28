@@ -474,7 +474,8 @@ fn strip_jsonc_takes_out_comments_and_trailing_commas_only() {
 
 /// Runs `driver` (an ES module; its last argument is the plugin's path) under node with the
 /// generated plugin and a fake `lightbulb` that logs each call and offers mail `m1` when asked
-/// for mail. `None` when node is not installed. Returns what it printed (JSON) and the log.
+/// for mail (at a session's start, a `block` with ids, which the plugin must not ack). `None`
+/// when node is not installed. Returns what it printed (JSON) and the log.
 fn run_plugin(driver: &str) -> Option<(Value, String)> {
     use std::os::unix::fs::PermissionsExt;
     if std::process::Command::new("node")
@@ -494,7 +495,7 @@ fn run_plugin(driver: &str) -> Option<(Value, String)> {
     fs::write(
         &exe,
         format!(
-            "#!/bin/sh\nin=$(cat)\nprintf '%s %s %s\\n' \"$2\" \"$3\" \"$in\" >> '{log}'\ncase \"$3:$in\" in post-tool-use:*'\"mail\":true'*|stop:*'\"mail\":true'*) echo '{{\"text\":\"mail\",\"ids\":[\"m1\"]}}';; esac\n",
+            "#!/bin/sh\nin=$(cat)\nprintf '%s %s %s\\n' \"$2\" \"$3\" \"$in\" >> '{log}'\ncase \"$3:$in\" in post-tool-use:*'\"mail\":true'*|stop:*'\"mail\":true'*) echo '{{\"text\":\"mail\",\"ids\":[\"m1\"]}}';; session-start:*'\"mail\":true'*) echo '{{\"text\":\"block\",\"ids\":[\"m1\"]}}';; esac\n",
             log = log.display()
         ),
     )
@@ -701,6 +702,101 @@ console.log(JSON.stringify({ prompts, subscriptions }));
         call("session-end", "ses_a", "/tmp/proj", false),
     ];
     assert_eq!(text.lines().collect::<Vec<_>>(), want, "{text}");
+}
+
+/// OpenCode 1.x: before each request of a session the plugin adds the block its start hook
+/// offered to the system prompt; the hook runs once per session and nothing is acked (the start
+/// offers no mail). A subagent's session, or a request with no session, gets none.
+#[test]
+fn the_opencode_plugin_adds_the_start_block_to_the_system_prompt() {
+    let driver = r#"
+const { default: plugin } = await import("file://" + process.argv.at(-1));
+const client = { session: {
+  get: async ({ path }) => ({ data: { id: path.id, parentID: path.id === "child2" ? "p" : undefined } }),
+  prompt: async () => ({ data: {} }),
+} };
+const h = await plugin.server({ client, directory: "/tmp/proj" });
+const transform = async (sessionID) => {
+  const output = { system: ["base"] };
+  await h["experimental.chat.system.transform"]({ sessionID, model: {} }, output);
+  return output.system;
+};
+await h.event({ event: { type: "session.created", properties: { info: { id: "ses_a" } } } });
+const systems = [];
+// Two requests at once share the one start hook.
+systems.push(...(await Promise.all([transform("ses_a"), transform("ses_a")])));
+systems.push(await transform("ses_a"));
+systems.push(await transform("child2"));
+systems.push(await transform(undefined));
+await new Promise((r) => setTimeout(r, 300));
+console.log(JSON.stringify(systems));
+"#;
+    let Some((systems, text)) = run_plugin(driver) else {
+        return;
+    };
+    let with = json!(["base", "block"]);
+    assert_eq!(systems, json!([with, with, with, ["base"], ["base"]]));
+    let call = |arg: &str, mail: bool| {
+        format!("opencode {arg} {{\"session_id\":\"ses_a\",\"cwd\":\"/tmp/proj\",\"mail\":{mail}}}")
+    };
+    assert_eq!(
+        text.lines().collect::<Vec<_>>(),
+        [
+            call("session-start", false).as_str(),
+            call("session-start", true).as_str()
+        ],
+        "{text}"
+    );
+}
+
+/// OpenCode 2.x: the same through `ctx.session.hook("context")`, which runs before each of a
+/// session's requests with its system parts; the registration is disposed at cleanup.
+#[test]
+fn the_opencode_plugin_adds_the_start_block_under_opencode_2() {
+    let driver = r#"
+const { default: plugin } = await import("file://" + process.argv.at(-1));
+const hooks = {};
+let disposed = 0;
+const ctx = {
+  location: { directory: "/tmp/fallback" },
+  session: {
+    get: async ({ sessionID }) => ({ id: sessionID, parentID: sessionID === "child2" ? "p" : undefined,
+      location: { directory: "/tmp/proj" } }),
+    prompt: async () => ({ id: "msg_1" }),
+    hook: async (name, callback) => {
+      hooks[name] = callback;
+      return { dispose: async () => void disposed++ };
+    },
+  },
+  event: { subscribe: ({ signal }) => ({ [Symbol.asyncIterator]: () => ({
+    next: () => new Promise((r) => signal.addEventListener("abort", () => r({ done: true }), { once: true })),
+    return: () => Promise.resolve({ done: true }),
+  }) }) },
+};
+const cleanup = await plugin.setup(ctx);
+const context = async (sessionID) => {
+  const event = { sessionID, agent: "build", model: {}, system: [{ type: "text", text: "base" }],
+    messages: [], options: {}, tools: {} };
+  await hooks.context(event);
+  return event.system.map((p) => p.text);
+};
+const systems = [await context("ses_a"), await context("ses_a"), await context("child2")];
+await new Promise((r) => setTimeout(r, 300));
+await cleanup();
+console.log(JSON.stringify({ systems, disposed }));
+"#;
+    let Some((out, text)) = run_plugin(driver) else {
+        return;
+    };
+    assert_eq!(
+        out,
+        json!({"systems": [["base", "block"], ["base", "block"], ["base"]], "disposed": 1})
+    );
+    assert_eq!(
+        text.lines().collect::<Vec<_>>(),
+        [r#"opencode session-start {"session_id":"ses_a","cwd":"/tmp/proj","mail":true}"#],
+        "{text}"
+    );
 }
 
 #[test]

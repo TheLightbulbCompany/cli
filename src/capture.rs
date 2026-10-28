@@ -1,7 +1,9 @@
 //! Local capture of coding sessions and their tool calls, written by the daemon (the one
 //! writer) from the harness hooks. A session is a row; a tool call is a row with a short
-//! summary (a command, a path, a pattern), never file contents, diffs, output or prompts.
+//! summary (a command, a path, a pattern), never file contents, diffs or output.
 //! A summary that looks like a credential is stored as `[refused: <pattern>]`.
+//! The session's own turns (your prompts and the agent's replies) are kept too, on this
+//! computer only: never uploaded (`upload.rs` does not read them).
 
 use crate::memory::refuse_secret;
 use crate::store::Store;
@@ -90,7 +92,7 @@ pub fn summarize(tool: &str, args_json: &str) -> String {
         None => tool.to_string(),
     };
     match refuse_secret(&text) {
-        Some(p) => format!("[refused: {p}]"),
+        Some(p) => refused(p),
         None => text.chars().take(SUMMARY_MAX).collect(),
     }
 }
@@ -222,8 +224,219 @@ pub fn tool_calls(
     Ok(rows)
 }
 
+/// How a refused summary or turn starts: `[refused: <pattern>]`.
+pub const REFUSED: &str = "[refused: ";
+
+/// What is stored in place of a text that matched the credential pattern `p`.
+pub fn refused(p: &str) -> String {
+    format!("{REFUSED}{p}]")
+}
+
+/// Longest turn kept, in bytes.
+pub const TURN_MAX: usize = 4 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Turn {
+    pub seq: i64,
+    pub role: String,
+    pub text: String,
+    pub at: i64,
+}
+
+/// `text` cut to `TURN_MAX` bytes at a character boundary.
+pub fn cut_turn(text: &str) -> &str {
+    let mut n = text.len().min(TURN_MAX);
+    while !text.is_char_boundary(n) {
+        n -= 1;
+    }
+    &text[..n]
+}
+
+/// Appends a prompt (`user`) or a reply (`assistant`) to a session. A turn with a credential in
+/// it is stored as `[refused: <pattern>]` and never embedded; the others are embedded later,
+/// outside the store lock, by `memory::embed_missing`. `Ok(false)` when the session has no row (never started, or in a hidden folder),
+/// or when the turn repeats the session's last one (same role and text: a Claude Code Stop reads
+/// the transcript's last reply, which may be the previous turn's when the agent ended on a tool call).
+pub fn record_turn(
+    store: &Store,
+    session_id: &str,
+    role: &str,
+    text: &str,
+    now: i64,
+) -> Result<bool> {
+    let text = cut_turn(text);
+    let marker = refuse_secret(text).map(refused);
+    let stored = marker.as_deref().unwrap_or(text);
+    let n = store.conn().execute(
+        "INSERT INTO capture_turns (session_id, seq, role, text, at) \
+         SELECT ?1, COALESCE((SELECT MAX(seq) FROM capture_turns WHERE session_id = ?1), 0) + 1, \
+         ?2, ?3, ?4 WHERE EXISTS (SELECT 1 FROM capture_sessions WHERE id = ?1) \
+         AND NOT EXISTS (SELECT 1 FROM capture_turns WHERE session_id = ?1 AND role = ?2 AND text = ?3 \
+         AND seq = (SELECT MAX(seq) FROM capture_turns WHERE session_id = ?1))",
+        rusqlite::params![session_id, role, stored, now],
+    )?;
+    Ok(n == 1)
+}
+
+/// A session's turns in order.
+pub fn turns(store: &Store, session_id: &str) -> Result<Vec<Turn>> {
+    let mut stmt = store.conn().prepare(
+        "SELECT seq, role, text, at FROM capture_turns WHERE session_id = ?1 ORDER BY seq",
+    )?;
+    let rows = stmt
+        .query_map([session_id], |r| {
+            Ok(Turn {
+                seq: r.get(0)?,
+                role: r.get(1)?,
+                text: r.get(2)?,
+                at: r.get(3)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
+}
+
+/// Longest excerpt of a turn `recall` shows, in characters.
+pub const EXCERPT_MAX: usize = 240;
+
+/// A turn that matched a `recall` question: its first `EXCERPT_MAX` characters, each run of
+/// whitespace one space.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TurnHit {
+    pub session: String,
+    pub seq: i64,
+    pub role: String,
+    pub at: i64,
+    pub excerpt: String,
+}
+
+impl TurnHit {
+    /// `<role>, <YYYY-MM-DD UTC>: <excerpt>`, as the page shows it.
+    pub fn line(&self) -> String {
+        let day = crate::date::utc(self.at);
+        format!("{}, {}: {}", self.role, &day[..10], self.excerpt)
+    }
+}
+
+/// The best `limit` of this computer's turns for `query`: bm25 over `turns_fts`, fused with the
+/// cosine order of `turns_vec` when there is a model (`memory::fuse`). With `repo`, only the
+/// turns of sessions in that repo; every turn without one. A refused turn is never a candidate.
+pub fn search_turns(
+    store: &Store,
+    query: &str,
+    repo: Option<&str>,
+    limit: usize,
+) -> Result<Vec<TurnHit>> {
+    use crate::memory::{fts_query, fuse, unblob};
+    let Some(q) = fts_query(query) else {
+        return Ok(Vec::new());
+    };
+    let conn = store.conn();
+    let mut stmt = conn.prepare(
+        "SELECT t.rowid FROM turns_fts JOIN capture_turns t ON t.rowid = turns_fts.rowid
+         JOIN capture_sessions s ON s.id = t.session_id
+         WHERE turns_fts MATCH ?1 AND substr(t.text, 1, length(?2)) != ?2
+         AND (?3 IS NULL OR s.repo = ?3 COLLATE NOCASE)
+         ORDER BY bm25(turns_fts) LIMIT ?4",
+    )?;
+    let ids: Vec<String> = stmt
+        .query_map(rusqlite::params![q, REFUSED, repo, limit], |r| {
+            Ok(r.get::<_, i64>(0)?.to_string())
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let vecs = || -> Result<Vec<(String, Vec<f32>)>> {
+        let mut stmt = conn.prepare(
+            "SELECT v.turn, v.v FROM turns_vec v JOIN capture_turns t ON t.rowid = v.turn
+             JOIN capture_sessions s ON s.id = t.session_id
+             WHERE substr(t.text, 1, length(?1)) != ?1
+             AND (?2 IS NULL OR s.repo = ?2 COLLATE NOCASE)",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![REFUSED, repo], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (turn, blob) = row?;
+            out.extend(unblob(&blob).map(|v| (turn.to_string(), v)));
+        }
+        Ok(out)
+    };
+    let mut out = Vec::new();
+    for id in fuse(ids, query, vecs, limit)? {
+        let hit = conn.query_row(
+            "SELECT session_id, seq, role, text, at FROM capture_turns WHERE rowid = ?1",
+            [&id],
+            |r| {
+                let text: String = r.get(3)?;
+                Ok(TurnHit {
+                    session: r.get(0)?,
+                    seq: r.get(1)?,
+                    role: r.get(2)?,
+                    at: r.get(4)?,
+                    excerpt: text
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                        .chars()
+                        .take(EXCERPT_MAX)
+                        .collect(),
+                })
+            },
+        )?;
+        out.push(hit);
+    }
+    Ok(out)
+}
+
+/// Deletes the turns recorded more than `days` days before `now`; how many.
+pub fn prune_turns(store: &Store, now: i64, days: i64) -> Result<usize> {
+    Ok(store.conn().execute(
+        "DELETE FROM capture_turns WHERE at < ?1",
+        [now.saturating_sub(days.saturating_mul(86_400))],
+    )?)
+}
+
+/// The text of the last assistant message in a Claude Code transcript, read from its last
+/// 256 KB (a Stop fires every turn; the whole file is never read). `None` when there is none.
+pub fn last_assistant_text(path: &str) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    const TAIL: u64 = 256 * 1024;
+    let mut file = std::fs::File::open(path).ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let from = meta.len().saturating_sub(TAIL);
+    file.seek(SeekFrom::Start(from)).ok()?;
+    let mut buf = vec![];
+    file.take(TAIL).read_to_end(&mut buf).ok()?;
+    let tail = String::from_utf8_lossy(&buf);
+    // A cut tail starts mid-line.
+    let lines: Vec<&str> = tail.lines().skip(usize::from(from > 0)).collect();
+    lines.into_iter().rev().find_map(|line| {
+        let v: Value = serde_json::from_str(line).ok()?;
+        if v["type"] != "assistant" {
+            return None;
+        }
+        let c = &v["message"]["content"];
+        let text = match c.as_str() {
+            Some(t) => t.to_string(),
+            None => c
+                .as_array()?
+                .iter()
+                .filter_map(|b| b["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        };
+        (!text.trim().is_empty()).then_some(text)
+    })
+}
+
 /// Deletes a session and its tool calls; whether it existed.
 pub fn forget(store: &Store, id: &str) -> Result<bool> {
+    store
+        .conn()
+        .execute("DELETE FROM capture_turns WHERE session_id = ?1", [id])?;
     store
         .conn()
         .execute("DELETE FROM capture_tool_calls WHERE session_id = ?1", [id])?;

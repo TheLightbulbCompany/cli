@@ -826,6 +826,8 @@ pub enum Sessions {
     Forget(String),
     Export,
     Upload(Option<String>),
+    /// `Some(on)` sets whether turns are kept; `None` says which.
+    Turns(Option<bool>),
 }
 
 /// `sessions ...`: what was captured of your coding sessions on this computer.
@@ -852,12 +854,32 @@ pub fn sessions(cmd: Sessions) -> Result<i32> {
         }
         return Ok(0);
     }
+    if let Sessions::Turns(on) = cmd {
+        let dir = paths::state_dir();
+        if let Some(on) = on {
+            // Through the daemon, which refuses an agent's shell: what is kept is a person's choice.
+            let r = connect()?.call("sessions.turns", json!({ "on": on }))?;
+            if r["ok"] != true {
+                return refuse(&r, &[]);
+            }
+        }
+        let on = crate::config::Config::load(&dir)?.capture_turns;
+        println!(
+            "{}",
+            if on {
+                "Your prompts and the agent's replies are kept on this computer only, never uploaded. Turn off: lightbulb sessions turns off"
+            } else {
+                "Your prompts and the agent's replies are not kept. Turn on: lightbulb sessions turns on"
+            }
+        );
+        return Ok(0);
+    }
     let (op, body) = match &cmd {
         Sessions::List => ("sessions.list", json!({})),
         Sessions::Show(id) => ("sessions.show", json!({ "session": id })),
         Sessions::Forget(id) => ("sessions.forget", json!({ "session": id })),
         Sessions::Export => ("sessions.export", json!({})),
-        Sessions::Upload(_) => unreachable!("handled above"),
+        Sessions::Upload(_) | Sessions::Turns(_) => unreachable!("handled above"),
     };
     let r = connect()?.call(op, body)?;
     if r["ok"] != true {
@@ -914,10 +936,17 @@ pub fn sessions(cmd: Sessions) -> Result<i32> {
                     .unwrap_or(c["tool"].as_str().unwrap_or_default());
                 println!("{:>4}  {}{ok}", c["seq"], cell(text));
             }
+            for t in r["turns"].as_array().into_iter().flatten() {
+                let text = t["text"].as_str().unwrap_or_default();
+                let line = cell(&format!("{} {}: {text}", t["seq"], s(&t["role"])));
+                println!("{}", line.chars().take(200).collect::<String>());
+            }
         }
-        Sessions::Forget(_) => println!("Forgotten. The session and its tool calls are deleted."),
+        Sessions::Forget(_) => {
+            println!("Forgotten. The session, its tool calls and its turns are deleted.")
+        }
         Sessions::Export => println!("{}", serde_json::to_string_pretty(&r["sessions"])?),
-        Sessions::Upload(_) => {}
+        Sessions::Upload(_) | Sessions::Turns(_) => {}
     }
     Ok(0)
 }
@@ -1375,11 +1404,16 @@ fn parse_version(v: &str) -> Option<(u64, u64, u64)> {
 }
 
 /// `curl -fsSL url` (with `-I`: the headers only); its stdout, or an error naming the URL.
-fn curl(url: &str, head: bool) -> Result<Vec<u8>> {
+pub(crate) fn curl(url: &str, head: bool) -> Result<Vec<u8>> {
+    curl_for(url, head, 600)
+}
+
+/// `curl` that gives up after `secs` seconds.
+pub(crate) fn curl_for(url: &str, head: bool, secs: u64) -> Result<Vec<u8>> {
     let mut c = Command::new("curl");
     // -q first: ignore ~/.curlrc. Bounded, so a stalled download cannot hang the daemon's daily check.
     c.arg("-q");
-    c.args(["--connect-timeout", "30", "--max-time", "600"]);
+    c.args(["--connect-timeout", "30", "--max-time", &secs.to_string()]);
     c.arg(if head { "-fsSI" } else { "-fsSL" }).arg(url);
     let out = c.output().map_err(|e| format!("curl: {e}"))?;
     if !out.status.success() {
@@ -1567,7 +1601,7 @@ pub fn refresh_setup(dir: &Path) {
         return;
     }
     let child = Command::new(canonical(&home))
-        .arg("setup")
+        .args(["setup", "--refresh"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -2044,6 +2078,13 @@ pub fn doctor() -> Result<i32> {
         named.err().unwrap_or_default(),
         &setup,
     );
+    let model = if crate::embed_model::installed() {
+        "installed"
+    } else {
+        "not installed (run lightbulb setup)"
+    };
+    // Keyword-only memory still works: a missing model is said, not failed.
+    row("Memory model", true, model, "", "");
     let on = crate::config::Config::load(&dir).is_ok_and(|c| auto_update_on(&c));
     row("Auto-update", true, if on { "on" } else { "off" }, "", "");
     crate::telemetry::sync_env_optout(&dir);
@@ -2125,12 +2166,16 @@ pub fn ask_upload_mode() -> Result<()> {
 /// `setup [--remove]`: wires the installed agents to the canonical binary (or `executable`)
 /// and starts the background service; prints one line per agent, then what to try next. Exits
 /// 1 when an agent ends with hooks but no tools. `--remove` is the off switch: our entries,
-/// the old version's, the job and the running service go.
+/// the old version's, the job and the running service go. After the hooks it downloads the
+/// memory model once; a failed download is one line, and setup goes on. `model`: the person's
+/// choice (`--no-model` is `Some(false)`), kept in `memory_model`; `None` (the automatic setup
+/// after an update) keeps the choice already made.
 pub fn setup(
     remove: bool,
     executable: Option<PathBuf>,
     server: Option<String>,
     verbose: bool,
+    model: Option<bool>,
 ) -> Result<i32> {
     if server
         .as_deref()
@@ -2170,6 +2215,26 @@ pub fn setup(
     for a in &report.agents {
         println!("{}", a.line());
         files(a);
+    }
+    let dir = paths::state_dir();
+    let model = match model {
+        Some(on) => {
+            // A config.toml that will not take the key is a line, not a failed setup.
+            if let Err(e) = crate::config::Config::set(&dir, "memory_model", &on.to_string()) {
+                eprintln!("setup: the model choice was not kept: {e}");
+            }
+            on
+        }
+        None => crate::config::Config::load(&dir).map_or(true, |c| c.memory_model),
+    };
+    if model {
+        match crate::embed_model::install(&dir) {
+            Ok(()) => println!(
+                "Memory model installed ({} MB)",
+                crate::embed_model::size_mb()
+            ),
+            Err(e) => println!("Memory model not installed: {e} Memory search is keyword-only."),
+        }
     }
     if cfg!(target_os = "macos") {
         let code = install_job(&home, &executable)?;

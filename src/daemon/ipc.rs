@@ -364,8 +364,10 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
             None => Response::err(id, BAD_REQUEST),
         },
         "sessions.upload" => sessions_upload(id, body, daemon, for_a_person()),
+        "sessions.turns" => sessions_turns(id, body, daemon, for_a_person()),
         "capture.session_start"
         | "capture.tool_call"
+        | "capture.turn"
         | "capture.stop"
         | "capture.session_end"
         | "sessions.list"
@@ -381,7 +383,12 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
             // Asked only for `sessions.*`: the walk of the peer's process tree is slower than
             // the hook waits for a capture write.
             let person = op.starts_with("sessions.") && for_a_person();
-            capture_op(id, op, body, daemon, person)
+            let r = capture_op(id, op, body, daemon, person);
+            // A Stop kicks it only when it carried a reply to embed.
+            if op == "capture.turn" || (op == "capture.stop" && body["text"].is_string()) {
+                embed_missing(daemon);
+            }
+            r
         }
         // `person` -> `{}` for a person's terminal, else refused: a command that settles
         // something elsewhere first (`memory approve`) asks before it acts.
@@ -522,9 +529,28 @@ fn memory_remember(
     }
 }
 
+/// `{tool, args, duration_ms?, ok?}` recorded for session `sid`; whether it was.
+fn tool_call(store: &crate::store::Store, sid: &str, b: &Value) -> crate::Result<bool> {
+    let Some(tool) = b["tool"].as_str() else {
+        return Err("bad".into());
+    };
+    crate::capture::record_tool_call(
+        store,
+        sid,
+        tool,
+        b["args"].as_str().unwrap_or_default(),
+        b["duration_ms"].as_i64(),
+        b["ok"].as_bool().unwrap_or(true),
+    )
+}
+
 /// Local capture. The hooks send `capture.session_start {harness, conversation, cwd, repo?,
-/// branch?}`, `capture.tool_call {harness, conversation, tool, args, duration_ms?, ok?}`,
-/// `capture.stop {harness, conversation, prompt_tokens?, completion_tokens?}` and
+/// branch?}`, `capture.tool_call {harness, conversation, tool, args, duration_ms?, ok?, cwd?,
+/// repo?, branch?}` (which opens a session that has no row),
+/// `capture.turn {harness, conversation, role, text}` -> `{stored}`,
+/// `capture.stop {harness, conversation, prompt_tokens?, completion_tokens?, text?, key?}` ->
+/// `{nudge}` (the reply `text` kept as the assistant's turn; `Store::nudge`, asked only with
+/// `key`) and
 /// `capture.session_end {harness, conversation, prompt_tokens?, completion_tokens?}` -> `{stored}`. A person reads and deletes:
 /// `sessions.list` -> `{sessions}`, `sessions.show {session}` -> `{session, tool_calls}`,
 /// `sessions.forget {session}` -> `{}`, `sessions.export` -> `{sessions: [{..., tool_calls}]}`.
@@ -545,38 +571,55 @@ fn capture_op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, person: boo
         )
     };
     let store = daemon.store.lock().unwrap();
+    // From the file each time: `sessions turns off` reaches a running service.
+    let turn = |store: &crate::store::Store, sid: &str, role: &str, text: &str| {
+        let on = crate::config::Config::load(&daemon.dir).is_ok_and(|c| c.capture_turns);
+        crate::Result::Ok(on && capture::record_turn(store, sid, role, text, now() as i64)?)
+    };
+    // Opens session `sid` from `body`'s cwd, repo and branch; whether it was (a cwd, not in
+    // a hidden folder, and new).
+    let start = |sid: &str| -> crate::Result<bool> {
+        let Some(cwd) = body["cwd"].as_str() else {
+            return Ok(false);
+        };
+        let row = capture::SessionRow {
+            id: sid.into(),
+            harness: body["harness"].as_str().unwrap_or_default().into(),
+            computer: computer.clone(),
+            repo: body["repo"].as_str().map(String::from),
+            branch: body["branch"].as_str().map(String::from),
+            started: now() as i64,
+            ended: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+        };
+        Ok(!hidden && capture::start_session(&store, &row, cwd)?)
+    };
     let r: crate::Result<Value> = (|| match op {
         "capture.session_start" => {
-            let (Some(sid), Some(cwd)) = (who(body), body["cwd"].as_str()) else {
+            let (Some(sid), Some(_)) = (who(body), body["cwd"].as_str()) else {
                 return Err("bad".into());
             };
-            let row = capture::SessionRow {
-                id: sid,
-                harness: body["harness"].as_str().unwrap_or_default().into(),
-                computer,
-                repo: body["repo"].as_str().map(String::from),
-                branch: body["branch"].as_str().map(String::from),
-                started: now() as i64,
-                ended: None,
-                prompt_tokens: None,
-                completion_tokens: None,
-            };
-            let stored = !hidden && capture::start_session(&store, &row, cwd)?;
-            Ok(json!({ "stored": stored }))
+            Ok(json!({ "stored": start(&sid)? }))
         }
         "capture.tool_call" => {
-            let (Some(sid), Some(tool)) = (who(body), body["tool"].as_str()) else {
+            let Some(sid) = who(body) else {
                 return Err("bad".into());
             };
-            let stored = capture::record_tool_call(
-                &store,
-                &sid,
-                tool,
-                body["args"].as_str().unwrap_or_default(),
-                body["duration_ms"].as_i64(),
-                body["ok"].as_bool().unwrap_or(true),
-            )?;
+            // A session running before capture existed has no row: this call (which carries
+            // `cwd`, `repo` and `branch`) opens it, in the one request, so a hook that has
+            // stopped waiting never loses the call.
+            let stored =
+                tool_call(&store, &sid, body)? || (start(&sid)? && tool_call(&store, &sid, body)?);
             Ok(json!({ "stored": stored }))
+        }
+        "capture.turn" => {
+            let (Some(sid), Some(role), Some(text)) =
+                (who(body), body["role"].as_str(), body["text"].as_str())
+            else {
+                return Err("bad".into());
+            };
+            Ok(json!({ "stored": turn(&store, &sid, role, text)? }))
         }
         "capture.stop" => {
             let Some(sid) = who(body) else {
@@ -588,7 +631,16 @@ fn capture_op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, person: boo
                 body["prompt_tokens"].as_i64(),
                 body["completion_tokens"].as_i64(),
             )?;
-            Ok(json!({}))
+            // The reply, if any: a turn that fails never costs the Stop its tokens or nudge.
+            if let Some(text) = body["text"].as_str() {
+                let _ = turn(&store, &sid, "assistant", text);
+            }
+            // `key`: the hook can hand the agent a nudge on this Stop.
+            let nudge = match body["key"].as_str() {
+                Some(key) => store.nudge(&sid, key, now() as i64)?,
+                None => false,
+            };
+            Ok(json!({ "nudge": nudge }))
         }
         "capture.session_end" => {
             let Some(sid) = who(body) else {
@@ -614,7 +666,10 @@ fn capture_op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, person: boo
                 capture::forget(&store, &s.id)?;
                 return Ok(json!({}));
             }
-            Ok(json!({ "session": s, "tool_calls": capture::tool_calls(&store, &s.id, true)? }))
+            Ok(
+                json!({ "session": s, "tool_calls": capture::tool_calls(&store, &s.id, true)?,
+                "turns": capture::turns(&store, &s.id)? }),
+            )
         }
         _ => {
             let mut all = vec![];
@@ -636,9 +691,10 @@ fn capture_op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, person: boo
     }
 }
 
-/// `memory.recall {question, budget_chars?, repo?, session?}` -> `{page, facts}`: what the team holds
-/// that matches `question` (all of it when empty, or only `repo`'s, team facts first), as the page
-/// an agent reads and as facts. With `repo` and `session` (a session-start hook) the page is kept
+/// `memory.recall {question, budget_chars?, repo?, session?}` -> `{page, facts, turns}`: what the
+/// team holds that matches `question` (all of it when empty, or only `repo`'s, team facts first),
+/// as the page an agent reads and as facts, and up to 5 of this computer's own turns that match a
+/// question (never for an empty one), only `repo`'s when it is given. With `repo` and `session` (a session-start hook) the page is kept
 /// for `memory last`.
 fn memory_recall(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
     use crate::memory::{self, Status};
@@ -647,6 +703,9 @@ fn memory_recall(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
     };
     let budget = body["budget_chars"].as_u64().map_or(1_600, |b| b as usize);
     let names = member_names(daemon);
+    // From the file, before the lock: `sessions turns off` also stops recall using the turns
+    // already stored (they stay for `sessions show` and `sessions forget`).
+    let turns_on = crate::config::Config::load(&daemon.dir).is_ok_and(|c| c.capture_turns);
     let store = daemon.store.lock().unwrap();
     let found = if q.trim().is_empty() {
         let repo = body["repo"].as_str();
@@ -663,18 +722,29 @@ fn memory_recall(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
         return Response::err(id, INTERNAL);
     };
     facts.retain(|f| f.status != Status::Replaced);
-    let page = memory::page(&store, &facts, &names, budget);
+    // The session-start block (an empty question) never carries turns.
+    let turns = if q.trim().is_empty() || !turns_on {
+        Ok(Vec::new())
+    } else {
+        crate::capture::search_turns(&store, q, body["repo"].as_str(), 5)
+    };
+    let Ok(turns) = turns else {
+        return Response::err(id, INTERNAL);
+    };
+    let page = memory::page(&store, &facts, &turns, &names, budget);
     let block = memory::block(&page);
-    if let (Some(_), Some(session), false) = (
+    // Only the start block is kept: an agent's `recall` carries its repo and session too.
+    if let (Some(_), Some(session), false, true) = (
         body["repo"].as_str(),
         body["session"].as_str(),
         block.is_empty(),
+        q.trim().is_empty(),
     ) {
         let _ = store.set_memory_last(session, &block, now() as i64);
     }
     Response::ok(
         id,
-        json!({ "page": page, "block": block, "facts": facts.iter().map(fact_json).collect::<Vec<_>>() }),
+        json!({ "page": page, "block": block, "facts": facts.iter().map(fact_json).collect::<Vec<_>>(), "turns": turns }),
     )
 }
 
@@ -703,6 +773,46 @@ fn sessions_upload(id: u64, body: &Value, daemon: &Arc<Daemon>, person: bool) ->
         return Response::err(id, BAD_REQUEST);
     };
     match crate::upload::set_mode(&daemon.dir, mode) {
+        Ok(()) => Response::ok(id, json!({})),
+        Err(_) => Response::err(id, INTERNAL),
+    }
+}
+
+/// Embeds what has no vector yet (turns, and memory entries, received ones too) in the
+/// background, taking the store lock only to read and to write. Run after each turn and by the
+/// housekeeping loop every minute; one pass at a time, a kick during a pass is dropped.
+pub(crate) fn embed_missing(daemon: &Arc<Daemon>) {
+    static RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    use std::sync::atomic::Ordering::SeqCst;
+    if RUNNING.swap(true, SeqCst) {
+        return; // what a pass misses, the next minute's picks up
+    }
+    /// Clears `RUNNING` however the pass ends, a panic included.
+    struct Done;
+    impl Drop for Done {
+        fn drop(&mut self) {
+            RUNNING.store(false, SeqCst);
+        }
+    }
+    let d = daemon.clone();
+    tokio::task::spawn_blocking(move || {
+        let _done = Done;
+        let lock = || d.store.lock().unwrap();
+        if let Err(e) = crate::memory::embed_missing_with(lock, 200) {
+            eprintln!("embed: {e}");
+        }
+    });
+}
+
+/// `sessions.turns {on}` -> `{}`: a person keeps or stops keeping their prompts and replies.
+fn sessions_turns(id: u64, body: &Value, daemon: &Arc<Daemon>, person: bool) -> Response {
+    if !person {
+        return refused(id, "not_a_person");
+    }
+    let Some(on) = body["on"].as_bool() else {
+        return Response::err(id, BAD_REQUEST);
+    };
+    match crate::config::Config::set(&daemon.dir, "capture_turns", &on.to_string()) {
         Ok(()) => Response::ok(id, json!({})),
         Err(_) => Response::err(id, INTERNAL),
     }

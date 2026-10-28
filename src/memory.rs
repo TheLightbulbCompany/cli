@@ -3,6 +3,7 @@
 //! `Forget` tombstones an entry (its id stays, its body goes); `facts` and `search` replay what
 //! is held into current, contested and replaced values.
 
+use crate::embed_model;
 use crate::identity::{canonical, unsigned, verify, Identity};
 use crate::roster::{self, MAX_ENTRY_BYTES};
 use crate::store::Store;
@@ -108,16 +109,17 @@ pub struct Fact {
 }
 
 /// Signs `op` as `id`'s next entry and stores it. `too_long` when it passes `MAX_ENTRY_BYTES`;
-/// `secret:<pattern>` when subject or fact looks like a credential (refused, never scrubbed);
+/// `secret:<pattern>` when any of its strings looks like a credential (`secret_in`; refused,
+/// never scrubbed);
 /// `no_subject` for a blank subject (replay would group it with every other one).
 pub fn remember(store: &Store, id: &Identity, op: Op, now: i64) -> Result<Entry> {
-    if let Op::Remember { subject, fact, .. } = &op {
+    if let Op::Remember { subject, .. } = &op {
         if subject.trim().is_empty() {
             return Err("no_subject".into());
         }
-        if let Some(name) = refuse_secret(subject).or_else(|| refuse_secret(fact)) {
-            return Err(format!("secret:{name}").into());
-        }
+    }
+    if let Some(name) = secret_in(&op) {
+        return Err(format!("secret:{name}").into());
     }
     // Immediate: a writer takes the reserved lock first, so a second connection waits out the
     // busy timeout instead of SQLite refusing the read-then-write upgrade at once.
@@ -154,8 +156,37 @@ pub fn remember(store: &Store, id: &Identity, op: Op, now: i64) -> Result<Entry>
     Ok(e)
 }
 
+/// The secret pattern any string of a `remember` matches: its subject, fact and every source
+/// field. `remember` and `accept` both check through this, so they check the same fields.
+fn secret_in(op: &Op) -> Option<&'static str> {
+    let Op::Remember {
+        subject,
+        fact,
+        source,
+        ..
+    } = op
+    else {
+        return None;
+    };
+    // Every field named, so a new one does not compile until it is listed here.
+    let Source {
+        harness,
+        repo,
+        session,
+        on_behalf_of,
+        shared_from,
+    } = source;
+    [Some(subject), Some(fact), Some(harness)]
+        .into_iter()
+        .chain([repo, session, on_behalf_of, shared_from].map(Option::as_ref))
+        .flatten()
+        .find_map(|t| refuse_secret(t))
+}
+
 /// Stores `e` once it verifies: `Ok(true)` when stored, `Ok(false)` when already held. Refuses a
-/// bad signature or id and an author the roster has not admitted.
+/// bad signature or id and an author the roster has not admitted. A `remember` whose subject or
+/// fact looks like a credential (an older build did not refuse it) is held as a tombstone with
+/// reason `refused:<pattern>` and never its text: its seq is held, so it is not asked for again.
 pub fn accept(store: &Store, e: &Entry, now: i64) -> Result<bool> {
     if canonical(&e.value()).len() > MAX_ENTRY_BYTES {
         return Err("memory entry is too large".into());
@@ -169,8 +200,19 @@ pub fn accept(store: &Store, e: &Entry, now: i64) -> Result<bool> {
     {
         return Err("memory entry is from a non-member".into());
     }
+    let secret = secret_in(&e.op);
     let tx = Transaction::new_unchecked(store.conn(), TransactionBehavior::Immediate)?;
-    let stored = insert(&tx, e, now)?;
+    let stored = match secret {
+        None => insert(&tx, e, now)?,
+        Some(name) => {
+            tx.execute(
+                "INSERT OR IGNORE INTO memory_entries
+                 (id, author, seq, entry, received_at, tombstone, reason)
+                 VALUES (?1, ?2, ?3, NULL, ?4, 1, ?5)",
+                params![e.id, e.author, e.seq, now, format!("refused:{name}")],
+            )? == 1
+        }
+    };
     tx.commit()?;
     Ok(stored)
 }
@@ -198,11 +240,15 @@ fn insert(conn: &rusqlite::Connection, e: &Entry, now: i64) -> Result<bool> {
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![e.id, e.author, e.seq, body, now, tombstoned],
     )?;
+    if let (Op::Remember { subject, fact, .. }, false) = (&e.op, tombstoned) {
+        store_vec(conn, &e.id, subject, fact)?;
+    }
     if let Op::Forget { target } = &e.op {
         conn.execute(
             "INSERT OR IGNORE INTO memory_tombstones (target) VALUES (?1)",
             [target],
         )?;
+        conn.execute("DELETE FROM memory_vec WHERE id = ?1", [target])?;
         // A forget of a forget is accepted and does nothing.
         conn.execute(
             "UPDATE memory_entries SET entry = NULL, tombstone = 1
@@ -213,6 +259,142 @@ fn insert(conn: &rusqlite::Connection, e: &Entry, now: i64) -> Result<bool> {
         conn.execute("DELETE FROM memory_last", [])?;
     }
     Ok(true)
+}
+
+/// Embeds `subject: fact` into `memory_vec` for `id`; whether it did (false without a model).
+fn store_vec(conn: &rusqlite::Connection, id: &str, subject: &str, fact: &str) -> Result<bool> {
+    let Some(v) = embed_model::text(&format!("{subject}: {fact}")) else {
+        return Ok(false);
+    };
+    let blob: Vec<u8> = v.iter().flat_map(|f| f.to_le_bytes()).collect();
+    conn.execute(
+        "INSERT OR REPLACE INTO memory_vec (id, v) VALUES (?1, ?2)",
+        params![id, blob],
+    )?;
+    Ok(true)
+}
+
+/// A row with no vector yet: a memory entry by id, or a turn by rowid.
+enum Missing {
+    Entry(String),
+    Turn(i64),
+}
+
+/// Up to `limit` held, live `remember`s with no vector, then turns with none (a refused turn is
+/// never embedded), each with the text to embed. A body that does not parse as an entry is
+/// logged and given an empty vector (which `vectors` ignores), so it is not picked again.
+fn missing(store: &Store, limit: usize) -> Result<Vec<(Missing, String)>> {
+    let mut out = vec![];
+    let mut stmt = store.conn().prepare(
+        "SELECT id, entry FROM memory_entries WHERE tombstone = 0 AND entry IS NOT NULL
+         AND json_extract(entry, '$.op.t') = 'remember'
+         AND id NOT IN (SELECT id FROM memory_vec) ORDER BY rowid LIMIT ?1",
+    )?;
+    let rows = stmt.query_map([limit as i64], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
+    let mut bad = vec![];
+    for row in rows {
+        let (id, body) = row?;
+        match serde_json::from_str::<Entry>(&body).map(|e| e.op) {
+            Ok(Op::Remember { subject, fact, .. }) => {
+                out.push((Missing::Entry(id), format!("{subject}: {fact}")))
+            }
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("embed: entry {id} is not readable ({e}); skipped");
+                bad.push(id);
+            }
+        }
+    }
+    for id in bad {
+        store.conn().execute(
+            "INSERT OR IGNORE INTO memory_vec (id, v) VALUES (?1, X'')",
+            [id],
+        )?;
+    }
+    let mut stmt = store.conn().prepare(
+        "SELECT rowid, text FROM capture_turns WHERE rowid NOT IN (SELECT turn FROM turns_vec)
+         AND substr(text, 1, length(?1)) != ?1 ORDER BY rowid LIMIT ?2",
+    )?;
+    let left = limit.saturating_sub(out.len()) as i64;
+    let rows = stmt.query_map(params![crate::capture::REFUSED, left], |r| {
+        Ok((Missing::Turn(r.get(0)?), r.get(1)?))
+    })?;
+    out.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
+    Ok(out)
+}
+
+/// Writes one vector, unless its row went (forgotten or pruned) while it was embedded.
+fn put_vec(conn: &rusqlite::Connection, row: &Missing, v: &[f32]) -> Result<usize> {
+    let blob: Vec<u8> = v.iter().flat_map(|f| f.to_le_bytes()).collect();
+    Ok(match row {
+        Missing::Entry(id) => conn.execute(
+            "INSERT OR REPLACE INTO memory_vec (id, v) SELECT ?1, ?2 WHERE EXISTS
+             (SELECT 1 FROM memory_entries WHERE id = ?1 AND tombstone = 0 AND entry IS NOT NULL)",
+            params![id, blob],
+        )?,
+        Missing::Turn(rowid) => conn.execute(
+            "INSERT OR IGNORE INTO turns_vec (turn, v) SELECT ?1, ?2 WHERE EXISTS
+             (SELECT 1 FROM capture_turns WHERE rowid = ?1)",
+            params![rowid, blob],
+        )?,
+    })
+}
+
+/// Embeds up to `limit` held, live `remember`s, then turns, that have no vector; how many it
+/// did. A no-op (0) without a model. `lock` gives the store for the read and for each write
+/// only: the embedding runs between, so no other op waits on it.
+pub fn embed_missing_with<'a, S: std::ops::Deref<Target = Store> + 'a>(
+    lock: impl Fn() -> S,
+    limit: usize,
+) -> Result<usize> {
+    if !embed_model::installed() {
+        return Ok(0);
+    }
+    let rows = missing(&lock(), limit)?;
+    let mut n = 0;
+    for (row, text) in rows {
+        // Installed but not loading: no row would embed this pass, and the load is not tried
+        // again until the service restarts (`embed_model::text` keeps the failure).
+        let Some(v) = embed_model::text(&text) else {
+            eprintln!("embed: the model did not load; stopping this pass");
+            break;
+        };
+        match put_vec(lock().conn(), &row, &v) {
+            Ok(k) => n += k,
+            Err(e) => eprintln!("embed: a vector was not stored ({e}); skipped"),
+        }
+    }
+    Ok(n)
+}
+
+/// `embed_missing_with` on a store this caller holds.
+pub fn embed_missing(store: &Store, limit: usize) -> Result<usize> {
+    embed_missing_with(|| store, limit)
+}
+
+/// `(id, vector)` of every embedded entry that is neither tombstoned nor replaced.
+pub fn vectors(store: &Store) -> Result<Vec<(String, Vec<f32>)>> {
+    let current: std::collections::HashSet<String> = replay(store)?
+        .into_iter()
+        .filter(|l| l.fact.status != Status::Replaced)
+        .map(|l| l.fact.id)
+        .collect();
+    let mut stmt = store
+        .conn()
+        .prepare("SELECT id, v FROM memory_vec ORDER BY id")?;
+    let rows = stmt.query_map([], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, blob) = row?;
+        if let Some(v) = unblob(&blob).filter(|_| current.contains(&id)) {
+            out.push((id, v));
+        }
+    }
+    Ok(out)
 }
 
 /// Most of `key`'s entries a restore can lose: a peer's claim past our head by more is hostile
@@ -318,8 +500,8 @@ fn replay(store: &Store) -> Result<Vec<Live>> {
         .map(|(i, l)| (l.fact.id.as_str(), i))
         .collect();
 
-    // Unreplaced entries that share a subject, or a replaced target, are one thing with
-    // several current values.
+    // Unreplaced entries that share a scope and subject, or a replaced target, are one thing
+    // with several current values: a `me` value never contests a `team` one.
     let mut group: Vec<usize> = (0..live.len()).collect();
     fn root(group: &mut [usize], mut i: usize) -> usize {
         while group[i] != i {
@@ -334,8 +516,12 @@ fn replay(store: &Store) -> Result<Vec<Live>> {
             continue;
         }
         status[i] = Status::Current;
-        let keys = std::iter::once(format!("s:{}", l.fact.subject.trim().to_lowercase()))
-            .chain(l.replaces.iter().map(|t| format!("t:{t}")));
+        let keys = std::iter::once(format!(
+            "s:{:?}:{}",
+            l.fact.scope,
+            l.fact.subject.trim().to_lowercase()
+        ))
+        .chain(l.replaces.iter().map(|t| format!("t:{t}")));
         for k in keys {
             let j = *by_key.entry(k).or_insert(i);
             let (a, b) = (root(&mut group, i), root(&mut group, j));
@@ -387,17 +573,26 @@ fn replay(store: &Store) -> Result<Vec<Live>> {
 }
 
 /// What the team currently holds, newest first: the current and contested values, with what
-/// each replaced. `repo` keeps entries whose `source.repo` is it.
+/// each replaced. `repo` keeps entries whose `source.repo` is it (`same_repo`).
 pub fn facts(store: &Store, scope: Option<Scope>, repo: Option<&str>) -> Result<Vec<Fact>> {
     let mut out: Vec<Fact> = replay(store)?
         .into_iter()
         .filter(|l| l.fact.status != Status::Replaced)
         .filter(|l| scope.is_none_or(|s| s == l.fact.scope))
-        .filter(|l| repo.is_none_or(|r| l.repo.as_deref() == Some(r)))
+        .filter(|l| repo.is_none_or(|r| l.repo.as_deref().is_some_and(|k| same_repo(k, r))))
         .map(|l| l.fact)
         .collect();
     out.reverse();
     Ok(out)
+}
+
+/// Whether stored repo key `key` is `asked`, ignoring case. When either is a bare `name` (an
+/// entry from a build before the owner was in the key, an origin with no owner, or a name a
+/// person typed), only the names are compared.
+fn same_repo(key: &str, asked: &str) -> bool {
+    let name = |s: &str| s.rsplit('/').next().unwrap_or_default().to_lowercase();
+    key.eq_ignore_ascii_case(asked)
+        || ((!key.contains('/') || !asked.contains('/')) && name(key) == name(asked))
 }
 
 /// The held entry whose id is `id` or the only one that starts with it (six hex digits or more).
@@ -477,13 +672,40 @@ const STOPWORDS: [&str; 37] = [
 /// shows them; a match that has since been replaced says so. Any word but a stopword may match,
 /// a word of 3 or more characters as a prefix too; a query of stopwords only is matched as the
 /// whole phrase.
+/// The least cosine a vector match counts at (`ponytail:` one constant for the current model;
+/// tune on real recalls, per-model when the model changes).
+const COSINE_FLOOR: f32 = 0.25;
+
 pub fn search(store: &Store, query: &str, limit: usize) -> Result<Vec<Fact>> {
-    // Each word quoted (its own quotes dropped), so FTS5 syntax in a query is text.
+    let Some(q) = fts_query(query) else {
+        return Ok(Vec::new());
+    };
+    let mut stmt = store.conn().prepare(
+        "SELECT m.id FROM memory_fts JOIN memory_entries m ON m.rowid = memory_fts.rowid
+         WHERE memory_fts MATCH ?1 ORDER BY bm25(memory_fts) LIMIT ?2",
+    )?;
+    let ids: Vec<String> = stmt
+        .query_map(params![q, limit], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let ids = fuse(ids, query, || vectors(store), limit)?;
+    let mut all: HashMap<String, Fact> = replay(store)?
+        .into_iter()
+        .map(|l| (l.fact.id.clone(), l.fact))
+        .collect();
+    Ok(ids.iter().filter_map(|id| all.remove(id)).collect())
+}
+
+/// `query` as an FTS5 match: each word quoted (its own quotes dropped, so FTS5 syntax in a
+/// query is text). `None` for a query with no words.
+pub(crate) fn fts_query(query: &str) -> Option<String> {
     let words: Vec<String> = query
         .split_whitespace()
         .map(|w| w.replace('"', ""))
         .filter(|w| !w.is_empty())
         .collect();
+    if words.is_empty() {
+        return None;
+    }
     let q = words
         .iter()
         .filter(|w| !STOPWORDS.contains(&w.to_lowercase().as_str()))
@@ -493,26 +715,65 @@ pub fn search(store: &Store, query: &str, limit: usize) -> Result<Vec<Fact>> {
         })
         .collect::<Vec<_>>()
         .join(" OR ");
-    if words.is_empty() {
-        return Ok(Vec::new());
-    }
-    let q = if q.is_empty() {
+    Some(if q.is_empty() {
         format!("\"{}\"", words.join(" "))
     } else {
         q
+    })
+}
+
+/// The bm25 order `ids`, fused with the cosine order of `query`'s embedding over `vecs` when
+/// there is a model; `ids` as they are without one (`vecs` is then never read).
+pub(crate) fn fuse(
+    ids: Vec<String>,
+    query: &str,
+    vecs: impl FnOnce() -> Result<Vec<(String, Vec<f32>)>>,
+    limit: usize,
+) -> Result<Vec<String>> {
+    let Some(qv) = embed_model::text(query) else {
+        return Ok(ids);
     };
-    let mut stmt = store.conn().prepare(
-        "SELECT m.id FROM memory_fts JOIN memory_entries m ON m.rowid = memory_fts.rowid
-         WHERE memory_fts MATCH ?1 ORDER BY bm25(memory_fts) LIMIT ?2",
-    )?;
-    let ids: Vec<String> = stmt
-        .query_map(params![q, limit], |r| r.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    let mut all: HashMap<String, Fact> = replay(store)?
+    let mut scored: Vec<(f32, String)> = vecs()?
         .into_iter()
-        .map(|l| (l.fact.id.clone(), l.fact))
+        .map(|(id, v)| (embed_model::cosine(&qv, &v), id))
         .collect();
-    Ok(ids.iter().filter_map(|id| all.remove(id)).collect())
+    scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+    // Below the floor a candidate shares no meaning with the question: without it a
+    // short or nonsense question fills the page with whatever is nearest.
+    let cos: Vec<String> = scored
+        .into_iter()
+        .filter(|s| s.0 >= COSINE_FLOOR)
+        .take(50)
+        .map(|s| s.1)
+        .collect();
+    Ok(rrf(&[ids, cos], limit))
+}
+
+/// A stored vector, or `None` when its blob is not one of this model's.
+pub(crate) fn unblob(blob: &[u8]) -> Option<Vec<f32>> {
+    (blob.len() == embed_model::DIM * 4).then(|| {
+        blob.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect()
+    })
+}
+
+/// Reciprocal rank fusion (k = 60) of ranked id lists, best first, cut to `limit`.
+fn rrf(lists: &[Vec<String>], limit: usize) -> Vec<String> {
+    let mut score: HashMap<&str, f64> = HashMap::new();
+    for list in lists {
+        for (rank, id) in list.iter().enumerate() {
+            *score.entry(id).or_default() += 1.0 / (60.0 + rank as f64 + 1.0);
+        }
+    }
+    let mut out: Vec<_> = score.into_iter().collect();
+    out.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(b.0)));
+    out.into_iter()
+        .take(limit)
+        .map(|(id, _)| id.to_string())
+        .collect()
 }
 
 static SECRETS: LazyLock<Vec<(&'static str, Regex)>> = LazyLock::new(|| {
@@ -544,7 +805,8 @@ pub fn refuse_secret(text: &str) -> Option<&'static str> {
 }
 
 /// What an agent reads: `Contested:` lines, then `Current:`, then `Lessons:` (replaced facts
-/// left out), cut on a line boundary at `budget` chars. `names` maps a member key to the name
+/// left out), then `Turns:` (excerpts of this computer's own session turns), whole lines only,
+/// within `budget` chars. `names` maps a member key to the name
 /// shown (the short key when it is not there).
 /// The heading and the instruction line a session-start block carries around the page.
 pub const BLOCK_HEADING: &str = "Memory (team and yours):";
@@ -561,6 +823,7 @@ pub fn block(page: &str) -> String {
 pub fn page(
     store: &Store,
     facts: &[Fact],
+    turns: &[crate::capture::TurnHit],
     names: &HashMap<String, String>,
     budget: usize,
 ) -> String {
@@ -589,12 +852,12 @@ pub fn page(
         )
     };
     let (mut contested, mut current, mut lessons) = (Vec::new(), Vec::new(), Vec::new());
-    let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+    let mut groups: Vec<((Scope, String), Vec<String>)> = Vec::new();
     for f in facts {
         match (f.status, f.kind) {
             (Status::Replaced, _) => {}
             (Status::Contested, _) => {
-                let key = f.subject.trim().to_lowercase();
+                let key = (f.scope, f.subject.trim().to_lowercase());
                 match groups.iter_mut().find(|(k, _)| *k == key) {
                     Some((_, v)) => v.push(by(f)),
                     None => groups.push((key, vec![format!("{}: {}", f.subject, by(f))])),
@@ -621,23 +884,39 @@ pub fn page(
         }
     }
     contested.extend(groups.into_iter().map(|(_, v)| v.join(" vs ")));
+    // A line that does not fit is left out and the next one tried, so one long line does not
+    // hide the lines and sections after it. A section's heading comes with its first line kept.
     let mut out = String::new();
-    'sections: for (head, lines) in [
+    for (head, lines) in [
         ("Contested:", contested),
         ("Current:", current),
         ("Lessons:", lessons),
+        ("Turns:", turns.iter().map(|t| t.line()).collect()),
     ] {
-        for (i, l) in lines.iter().enumerate() {
-            let add = if i == 0 {
-                format!("{head}\n{l}\n")
-            } else {
+        let mut headed = false;
+        for l in &lines {
+            let add = if headed {
                 format!("{l}\n")
+            } else {
+                format!("{head}\n{l}\n")
             };
-            if out.chars().count() + add.chars().count() > budget {
-                break 'sections;
+            if out.chars().count() + add.chars().count() <= budget {
+                out += &add;
+                headed = true;
             }
-            out += &add;
         }
     }
     out.trim_end().to_string()
+}
+
+#[cfg(test)]
+mod rrf_tests {
+    use super::rrf;
+
+    #[test]
+    fn rrf_puts_an_entry_ranked_by_both_arms_first() {
+        let l = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let out = rrf(&[l(&["a", "b", "c"]), l(&["d", "b", "e"])], 3);
+        assert_eq!(out, l(&["b", "a", "d"]));
+    }
 }

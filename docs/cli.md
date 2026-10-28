@@ -26,12 +26,17 @@ Connects Claude Code, Codex, Cursor, Grok CLI and OpenCode here (their hooks and
 server) and starts the background service (on macOS; off macOS it restarts a daemon that runs an older version). Each file is backed up once as
 `<file>.lightbulb-backup`. Details: [agents](agents.md).
 
+Setup then downloads the memory model (about 31 MB, once, into the state folder) and prints
+`Memory model installed (NN MB)`. If the download fails or takes too long, it prints
+`Memory model not installed: <reason> Memory search is keyword-only.` and carries on.
+
 | Option | Meaning |
 |---|---|
 | `--remove` | Take out only what setup wrote, and stop the background service. Backups are left as they are. |
 | `--executable <path>` | The binary the hooks, tool servers and background service run. Default: `~/.lightbulb/connect/bin/lightbulb`, which setup installs from the binary you ran. |
 | `--server-name <name>` | The tool server's name, also used in Cursor's and Grok's allow rules. Default: `lightbulb`. |
 | `--verbose` | Also list the files each agent's setup changed. |
+| `--no-model` | Do not download the memory model. Memory search is keyword-only. The choice is kept (`memory_model` in `config.toml`), also through the automatic setup after an update, until you run `lightbulb setup` again without it. |
 
 ### doctor
 
@@ -44,7 +49,7 @@ lightbulb doctor
 `--help`: Check the daemon, state permissions, agent wiring, alias and launchd job.
 
 Checks the background service, the relay, the local network (macOS only), the login item (macOS
-only), the state folder, each agent, the `lightbulb` command, auto-update and usage counts, and
+only), the state folder, each agent, the `lightbulb` command, the memory model, auto-update and usage counts, and
 prints the fix for the first thing that is wrong.
 Exits 1 when something is wrong. Every line: [troubleshooting](troubleshooting.md).
 
@@ -361,7 +366,7 @@ more). `forget`, `share`, `team`, `drafts`, `approve` and `dismiss` must be run 
 
 | Command | What it does |
 |---|---|
-| `list` | What is remembered now: the id, whether it is `team` or `me`, who wrote it, its status (`current`, or `contested` when two people hold different values for one subject), the subject and the value. `--team` or `--me` keeps one scope; `--repo` keeps entries made in one git origin. |
+| `list` | What is remembered now: the id, whether it is `team` or `me`, who wrote it, its status (`current`, or `contested` when two people hold different values for one subject), the subject and the value. `--team` or `--me` keeps one scope; `--repo` keeps entries made in one repository: `owner/name`, or a bare name, which matches it under any owner. |
 | `show <ID>` | One entry in full: its value, its author, the agent and repository it came from, and the values it replaced. |
 | `forget <ID>` | Deletes the entry. The delete goes to every computer that holds it, as each comes online. |
 | `share <ID>` | Copies one of your `me` entries to the team as a new `team` entry. The `me` entry stays. It refuses an entry that is not your own `me` entry, one that was replaced, one you already shared, and any entry when `memory team` is `off`. |
@@ -382,6 +387,7 @@ lightbulb sessions show <ID>
 lightbulb sessions forget <ID>
 lightbulb sessions export
 lightbulb sessions upload [off|metadata|full]
+lightbulb sessions turns [on|off]
 ```
 
 `--help`: The sessions captured on this computer: list, show, forget, export, and what is uploaded.
@@ -391,22 +397,24 @@ the end of each turn and when the session ends. It keeps, on this computer only:
 id, the agent, the computer, the repository and branch, when it started and ended, and the
 tokens, for Claude Code only, summed from its transcript once, when the session ends; the other agents leave them blank), and for each tool call its number, time, tool, duration,
 whether it worked, and a summary of at most 200 characters (a command, a path, a pattern). It
-never keeps file contents, diffs, command output or your prompts. A summary that looks like a
+never keeps file contents, diffs or command output. It also records your prompts and the
+agent's replies on your computer only (see `turns`). A summary, prompt or reply that looks like a
 password or key is replaced by `[refused: <what it matched>]`. Sessions under a hidden folder
 (`lightbulb folder <path> off`, or a folder in your home folder whose name starts with a dot,
 such as `~/.config`) are not captured; a dot folder inside a repository, such as Claude Code's
 `.claude/worktrees`, is. Capture never slows the agent: a write the background service has not
-answered within 10 ms is not waited for (the service still makes it). An
+answered within 10 ms (250 ms for the end-of-turn answer that decides the nudge) is not waited for (the service still makes it). An
 `<ID>` is the id as `list` prints it, or its first characters. `list`, `show`, `forget` and
 `export` must be run from your own terminal; an agent's shell is refused.
 
 | Command | What it does |
 |---|---|
 | `list` | The id, the agent, the repository, the day it started and the tokens in and out (`-` where the agent did not report them). |
-| `show <ID>` | One session and its tool calls in order. |
-| `forget <ID>` | Deletes the session and its tool calls. |
-| `export` | Every session with its tool calls, as one JSON array on stdout. |
-| `upload [off\|metadata\|full]` | Choose what, if anything, is sent to Lightbulb (`capture_upload` in `config.toml`). `off` is the default: nothing leaves this computer. `metadata` sends, for each finished session, the agent, repository, branch, times and token counts, and for each tool call its number, time, tool, duration and whether it worked, without the summary. `full` adds the summary. Uploads are signed with this computer's identity, only while it is signed in, only for sessions that finish after you turn them on, and never for a hidden folder; signed out, it says nothing is sent until `lightbulb login`. Setting a mode must be run from your own terminal (an agent's shell is refused); with no mode it says which is set, from anywhere. `lightbulb login` asks once. |
+| `show <ID>` | One session, its tool calls in order, then its prompts and replies in order. |
+| `forget <ID>` | Deletes the session, its tool calls and its prompts and replies. |
+| `export` | Every session with its tool calls, as one JSON array on stdout. Prompts and replies are left out. |
+| `upload [off\|metadata\|full]` | Choose what, if anything, is sent to Lightbulb (`capture_upload` in `config.toml`). `off` is the default: nothing leaves this computer. (The one request memory makes is setup's download of the memory model; `setup --no-model` skips it.) `metadata` sends, for each finished session, the agent, repository, branch, times and token counts, and for each tool call its number, time, tool, duration and whether it worked, without the summary. `full` adds the summary. Uploads are signed with this computer's identity, only while it is signed in, only for sessions that finish after you turn them on, and never for a hidden folder; signed out, it says nothing is sent until `lightbulb login`. Setting a mode must be run from your own terminal (an agent's shell is refused); with no mode it says which is set, from anywhere. `lightbulb login` asks once. |
+| `turns [on\|off]` | Records your prompts and replies on your computer only; never uploaded, in any mode (`capture_turns` in `config.toml`, on by default). Each is cut to 4 KB and deleted after 90 days (`capture_turns_days`). `sessions turns off` stops it, and `recall` stops using the turns already stored (they stay until you delete them with `sessions forget <ID>`); setting it must be run from your own terminal (an agent's shell is refused); with no state it says which is set. |
 
 ## Commands the agents and macOS run
 

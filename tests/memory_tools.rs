@@ -139,3 +139,128 @@ fn recall_page_puts_contested_first_and_respects_budget() {
     assert_eq!(cut, format!("Contested:\n{first_line}"));
     assert_eq!(recall(&e, "", Some(3))["page"], "");
 }
+
+/// Starts session `claude:c1` in a folder and records `turns` (role, text) on it.
+fn turns(e: &common::Env, turns: &[(&str, &str)]) {
+    let start = json!({"id": 3, "op": "capture.session_start", "harness": "claude",
+        "conversation": "c1", "cwd": "/tmp/proj"});
+    assert_eq!(e.ask(start)["stored"], true);
+    for (role, text) in turns {
+        let r = e.ask(json!({"id": 4, "op": "capture.turn", "harness": "claude",
+            "conversation": "c1", "role": role, "text": text}));
+        assert_eq!(r["stored"], true, "{r}");
+    }
+}
+
+#[test]
+fn recall_returns_an_excerpt_from_a_turn() {
+    let e = daemon();
+    let long = format!(
+        "rotate the staging deploy keys \r\n  with the vault script {}",
+        "é".repeat(300)
+    );
+    turns(&e, &[("user", "nothing to see here"), ("assistant", &long)]);
+    let r = recall(&e, "rotate deploy keys", None);
+    let t = r["turns"].as_array().unwrap();
+    assert_eq!(t.len(), 1, "{r}");
+    assert_eq!(t[0]["session"], "claude:c1");
+    assert_eq!(t[0]["seq"], 2);
+    assert_eq!(t[0]["role"], "assistant");
+    let excerpt = t[0]["excerpt"].as_str().unwrap();
+    assert!(excerpt.starts_with("rotate the staging deploy keys with the vault"));
+    assert_eq!(excerpt.chars().count(), 240);
+    let day = &lightbulb::date::utc(t[0]["at"].as_i64().unwrap())[..10];
+    let page = r["page"].as_str().unwrap();
+    assert!(
+        page.contains(&format!("Turns:\nassistant, {day}: {excerpt}")),
+        "{page}"
+    );
+}
+
+/// `sessions turns off` also hides the turns already stored from recall; they stay for
+/// `sessions show` and `sessions forget`, and come back when turns are on again.
+#[test]
+fn turns_off_hides_stored_turns_from_recall() {
+    let e = daemon();
+    turns(&e, &[("user", "rotate the staging deploy keys")]);
+    assert_eq!(
+        recall(&e, "deploy keys", None)["turns"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    lightbulb::config::Config::set(e.state.path(), "capture_turns", "false").unwrap();
+    let r = recall(&e, "deploy keys", None);
+    assert_eq!(r["turns"], json!([]), "{r}");
+    assert!(!r["page"].as_str().unwrap().contains("rotate"), "{r}");
+    assert_eq!(
+        lightbulb::capture::turns(&e.store(), "claude:c1")
+            .unwrap()
+            .len(),
+        1
+    );
+    lightbulb::config::Config::set(e.state.path(), "capture_turns", "true").unwrap();
+    assert_eq!(
+        recall(&e, "deploy keys", None)["turns"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn the_start_block_has_no_turns() {
+    let e = daemon();
+    remember(&e, "deploy", "the vault script", "fact", json!({}));
+    turns(&e, &[("user", "the deploy uses the vault script")]);
+    let r = e.ask(json!({"id": 2, "op": "memory.recall", "question": "",
+        "repo": "github.com/acme/proj", "session": "claude:c1"}));
+    assert_eq!(r["turns"], json!([]), "{r}");
+    assert!(!r["block"].as_str().unwrap().contains("Turns:"), "{r}");
+    // Without a repo too: an empty question lists the facts, never turns.
+    let r = recall(&e, "", None);
+    assert_eq!(r["turns"], json!([]), "{r}");
+    let page = r["page"].as_str().unwrap();
+    assert!(
+        page.contains("deploy: the vault script") && !page.contains("Turns:"),
+        "{page}"
+    );
+}
+
+#[test]
+fn a_refused_turn_is_never_returned() {
+    let e = daemon();
+    turns(&e, &[("user", "export API_KEY=abcd1234efgh5678")]);
+    let r = recall(&e, "refused credential", None);
+    assert_eq!(r["turns"], json!([]), "{r}");
+    assert!(!r["page"].as_str().unwrap().contains("refused"), "{r}");
+}
+
+#[test]
+fn turns_from_another_repo_are_not_recalled() {
+    let e = daemon();
+    for (c, repo) in [("c1", "acme/one"), ("c2", "acme/two")] {
+        let start = json!({"id": 3, "op": "capture.session_start", "harness": "claude",
+            "conversation": c, "cwd": format!("/tmp/{c}"), "repo": repo});
+        assert_eq!(e.ask(start)["stored"], true);
+        let r = e.ask(json!({"id": 4, "op": "capture.turn", "harness": "claude",
+            "conversation": c, "role": "user", "text": format!("deploy {repo} today")}));
+        assert_eq!(r["stored"], true, "{r}");
+    }
+    let r =
+        e.ask(json!({"id": 2, "op": "memory.recall", "question": "deploy", "repo": "acme/one"}));
+    let t = r["turns"].as_array().unwrap();
+    assert_eq!(t.len(), 1, "{r}");
+    assert_eq!(t[0]["session"], "claude:c1");
+    assert!(!r["page"].as_str().unwrap().contains("acme/two"), "{r}");
+    // A caller with no repo searches every turn on this computer.
+    assert_eq!(
+        recall(&e, "deploy", None)["turns"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+}

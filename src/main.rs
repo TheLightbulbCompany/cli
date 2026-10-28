@@ -105,6 +105,11 @@ enum SessionsCommand {
     Forget { id: String },
     /// Print every captured session with its tool calls as JSON.
     Export,
+    /// Keep your prompts and the agent's replies on this computer (on, the default) or not (off). No state: say which.
+    Turns {
+        #[arg(value_parser = ["on", "off"])]
+        state: Option<String>,
+    },
     /// Choose what is sent to Lightbulb: off (the default), metadata or full. No mode: say which.
     Upload {
         #[arg(value_parser = ["off", "metadata", "full"])]
@@ -231,7 +236,7 @@ enum Command {
         #[command(subcommand)]
         command: MemoryCommand,
     },
-    /// The sessions captured on this computer: list, show, forget, export.
+    /// The sessions captured on this computer: list, show, forget, export, turns.
     Sessions {
         #[command(subcommand)]
         command: SessionsCommand,
@@ -308,6 +313,13 @@ enum Command {
         /// Also list the files each agent's setup changed.
         #[arg(long)]
         verbose: bool,
+        /// Skip downloading the local memory model (about 31 MB); memory search stays
+        /// keyword-only.
+        #[arg(long)]
+        no_model: bool,
+        /// (The automatic setup after an update: keeps the person's model choice.)
+        #[arg(long, hide = true)]
+        refresh: bool,
     },
 }
 
@@ -413,6 +425,7 @@ fn run() -> lightbulb::Result<()> {
             SessionsCommand::Show { id } => cli::Sessions::Show(id),
             SessionsCommand::Forget { id } => cli::Sessions::Forget(id),
             SessionsCommand::Export => cli::Sessions::Export,
+            SessionsCommand::Turns { state } => cli::Sessions::Turns(state.map(|s| s == "on")),
             SessionsCommand::Upload { mode } => cli::Sessions::Upload(mode),
         })?),
         Command::Folder { path, state } => exit(cli::folder(&path, state == "on")?),
@@ -462,7 +475,15 @@ fn run() -> lightbulb::Result<()> {
             executable,
             server_name,
             verbose,
-        } => exit(cli::setup(remove, executable, server_name, verbose)?),
+            no_model,
+            refresh,
+        } => exit(cli::setup(
+            remove,
+            executable,
+            server_name,
+            verbose,
+            (!refresh).then_some(!no_model),
+        )?),
         Command::Hook { agent, event } => {
             let mut stdin = String::new();
             let ran = std::io::stdin()
