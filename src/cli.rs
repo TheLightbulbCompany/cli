@@ -942,7 +942,9 @@ pub fn sessions(cmd: Sessions) -> Result<i32> {
                 println!("{}", line.chars().take(200).collect::<String>());
             }
         }
-        Sessions::Forget(_) => println!("Forgotten. The session and its tool calls are deleted."),
+        Sessions::Forget(_) => {
+            println!("Forgotten. The session, its tool calls and its turns are deleted.")
+        }
         Sessions::Export => println!("{}", serde_json::to_string_pretty(&r["sessions"])?),
         Sessions::Upload(_) | Sessions::Turns(_) => {}
     }

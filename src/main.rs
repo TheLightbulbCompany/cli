@@ -236,7 +236,7 @@ enum Command {
         #[command(subcommand)]
         command: MemoryCommand,
     },
-    /// The sessions captured on this computer: list, show, forget, export.
+    /// The sessions captured on this computer: list, show, forget, export, turns.
     Sessions {
         #[command(subcommand)]
         command: SessionsCommand,

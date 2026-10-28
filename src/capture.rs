@@ -1,6 +1,6 @@
 //! Local capture of coding sessions and their tool calls, written by the daemon (the one
 //! writer) from the harness hooks. A session is a row; a tool call is a row with a short
-//! summary (a command, a path, a pattern), never file contents, diffs, output or prompts.
+//! summary (a command, a path, a pattern), never file contents, diffs or output.
 //! A summary that looks like a credential is stored as `[refused: <pattern>]`.
 //! The session's own turns (your prompts and the agent's replies) are kept too, on this
 //! computer only: never uploaded (`upload.rs` does not read them).
@@ -246,7 +246,9 @@ pub fn cut_turn(text: &str) -> &str {
 
 /// Appends a prompt (`user`) or a reply (`assistant`) to a session. A turn with a credential in
 /// it is stored as `[refused: <pattern>]` and not embedded; the others are embedded when a model
-/// is installed. `Ok(false)` when the session has no row (never started, or in a hidden folder).
+/// is installed. `Ok(false)` when the session has no row (never started, or in a hidden folder),
+/// or when the turn repeats the session's last one (same role and text: a Claude Code Stop reads
+/// the transcript's last reply, which may be the previous turn's when the agent ended on a tool call).
 pub fn record_turn(
     store: &Store,
     session_id: &str,
@@ -260,7 +262,9 @@ pub fn record_turn(
     let n = store.conn().execute(
         "INSERT INTO capture_turns (session_id, seq, role, text, at) \
          SELECT ?1, COALESCE((SELECT MAX(seq) FROM capture_turns WHERE session_id = ?1), 0) + 1, \
-         ?2, ?3, ?4 WHERE EXISTS (SELECT 1 FROM capture_sessions WHERE id = ?1)",
+         ?2, ?3, ?4 WHERE EXISTS (SELECT 1 FROM capture_sessions WHERE id = ?1) \
+         AND NOT EXISTS (SELECT 1 FROM capture_turns WHERE session_id = ?1 AND role = ?2 AND text = ?3 \
+         AND seq = (SELECT MAX(seq) FROM capture_turns WHERE session_id = ?1))",
         rusqlite::params![session_id, role, stored, now],
     )?;
     if n == 1 && refused.is_none() {

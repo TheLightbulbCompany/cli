@@ -691,3 +691,21 @@ fn sessions_show_prints_turns_in_order() {
         "{show}"
     );
 }
+
+#[test]
+fn a_reply_equal_to_the_last_turn_is_recorded_once() {
+    let (_d, s) = store();
+    capture::start_session(&s, &row(), "/tmp/proj").unwrap();
+    assert!(capture::record_turn(&s, "a:1", "user", "a question", 1).unwrap());
+    assert!(capture::record_turn(&s, "a:1", "assistant", "an answer", 2).unwrap());
+    // The transcript's last reply read again on the next Stop (the agent ended on a tool call).
+    assert!(!capture::record_turn(&s, "a:1", "assistant", "an answer", 3).unwrap());
+    // The same text by the other role is a new turn.
+    assert!(capture::record_turn(&s, "a:1", "user", "an answer", 4).unwrap());
+    let seqs: Vec<i64> = capture::turns(&s, "a:1")
+        .unwrap()
+        .iter()
+        .map(|t| t.seq)
+        .collect();
+    assert_eq!(seqs, vec![1, 2, 3]);
+}
