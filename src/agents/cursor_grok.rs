@@ -1,6 +1,11 @@
 //! Cursor's, Grok's and OpenCode's hook payloads and replies, written from their own
 //! documentation (cursor.com/docs/agent/hooks; the Grok CLI manual) and payloads captured live.
 //! OpenCode has no command hooks: our plugin (`setup/opencode.rs`) builds its payload.
+//!
+//! Which of them can put the memory block in front of the model at a session's start:
+//! - Cursor can: a `sessionStart` hook's `additional_context` is "added to the conversation's
+//!   initial system context" (https://cursor.com/docs/hooks). To test live: a forum report
+//!   (forum.cursor.com/t/157141) says the context did not reach the Agent window there.
 
 use crate::hook::{Event, Hook};
 use serde_json::{json, Value};

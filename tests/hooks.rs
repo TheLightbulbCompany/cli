@@ -970,3 +970,33 @@ fn the_repo_key_carries_the_owner() {
     ));
     assert!(text.contains("ci: github actions"), "{text}");
 }
+
+/// Runs `agent`'s hook with `payload` on stdin, called as the agent; returns stdout.
+fn agent_hook(net: &Net, agent: &str, event: &str, payload: Value) -> String {
+    let me = os::process(std::process::id()).unwrap();
+    let out = net.hook_raw(agent, event, payload.to_string().as_bytes(), Some(&me));
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// Cursor adds a sessionStart hook's `additional_context` to the conversation's initial
+/// context (cursor.com/docs/hooks), so a Cursor session starts with the repo's block.
+#[test]
+fn cursor_session_start_includes_the_memory_block() {
+    let net = Net::new();
+    let cli = repo_dir("cli");
+    claude_hook(&net, "session-start", "SessionStart", A, cli.path());
+    remember_in(&net, &net.key("claude", A), "ci", "github actions", "team");
+    let conv = "5c1e0000-0000-4000-8000-0000000000e2";
+    let out = agent_hook(
+        &net,
+        "cursor",
+        "session-start",
+        json!({"conversation_id": conv, "session_id": conv, "workspace_roots": [cli.path()],
+            "hook_event_name": "sessionStart"}),
+    );
+    let out: Value = serde_json::from_str(&out).unwrap();
+    let text = out["additional_context"].as_str().unwrap();
+    assert!(text.starts_with("Memory (team and yours):\n"), "{text}");
+    assert!(text.contains("ci: github actions"), "{text}");
+    assert!(text.ends_with(INSTRUCTION), "{text}");
+}

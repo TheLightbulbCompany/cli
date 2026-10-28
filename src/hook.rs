@@ -112,6 +112,8 @@ pub fn normalize(provider: &str, event_arg: &str, payload: &Value) -> Option<Hoo
 pub fn takes_mail(h: &Hook) -> bool {
     match (h.provider, h.event) {
         (_, Event::SessionEnd) => false,
+        // Grok ignores a SessionStart hook's stdout (docs.x.ai/build/features/hooks).
+        ("cursor", Event::SessionStart) => true,
         ("cursor" | "grok" | "opencode", e) => matches!(e, Event::PostToolUse | Event::Stop),
         _ => true,
     }
@@ -676,7 +678,8 @@ mod tests {
             let tool_or_stop = matches!(e, Event::PostToolUse | Event::Stop);
             assert_eq!(takes_mail(&hook("claude", e)), both);
             assert_eq!(takes_mail(&hook("codex", e)), both);
-            assert_eq!(takes_mail(&hook("cursor", e)), tool_or_stop);
+            let start = e == Event::SessionStart;
+            assert_eq!(takes_mail(&hook("cursor", e)), tool_or_stop || start);
             assert_eq!(takes_mail(&hook("grok", e)), tool_or_stop);
             assert_eq!(takes_mail(&hook("opencode", e)), tool_or_stop);
         }
