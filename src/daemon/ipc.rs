@@ -1757,7 +1757,7 @@ async fn peek_or_ack(id: u64, op: &str, body: &Value, daemon: &Daemon) -> Respon
 async fn inbox(
     id: u64,
     body: &Value,
-    daemon: &Daemon,
+    daemon: &Arc<Daemon>,
     peer: &mut Lines<BufReader<OwnedReadHalf>>,
 ) -> Response {
     let (Some(key), Ok(caller)) = (body["key"].as_str().map(|k| Key(k.into())), caller(body))
@@ -1830,6 +1830,12 @@ async fn inbox(
                 },
                 () = std::future::ready(()) => {}
             }
+        }
+        // The asker's own lapsed assignments close here, so a waiting asker needs no tick.
+        let lapsed = mail::expire_assignments(&daemon.store.lock().unwrap(), short, now());
+        match lapsed {
+            Err(_) => return Response::err(id, INTERNAL),
+            Ok(keys) => keys.iter().for_each(|k| stored(daemon, k, None)),
         }
         let taken = mail::take(&daemon.store.lock().unwrap(), &key, now());
         match taken {

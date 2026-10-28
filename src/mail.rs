@@ -1104,6 +1104,44 @@ pub fn expire_delivered(store: &Store, short: &str, now: u64) -> Result<()> {
     Ok(())
 }
 
+/// Closes member `me`'s unanswered assignments whose deadline (`meta.deadline_at`) is at or
+/// before `now`: each gets a `failed` / `timed_out` result from the assignee to the asker,
+/// stored in the asker's mailbox in one transaction (the caller holds the store lock). Returns
+/// the askers' keys, to wake. A real result arriving later is ordinary mail: `result_of` keeps
+/// naming the oldest, this one.
+pub fn expire_assignments(store: &Store, me: &str, now: u64) -> Result<Vec<Key>> {
+    let tx = store.conn().unchecked_transaction()?;
+    let mut askers = vec![];
+    for a in store.open_assignments_past(&format!("{me}/"), now as i64)? {
+        let at = a.meta.deadline_at.unwrap_or_default();
+        let p = Prepared {
+            message_id: ulid::Ulid::generate().to_string(),
+            from: Key(a.to_key.clone()),
+            to: Key(a.from_key.clone()),
+            text: format!(
+                "deadline passed: no result from {} by {}",
+                a.to_key,
+                crate::date::local_time(at)
+            ),
+            request_id: format!("timeout-{}", a.id),
+            reply_to: Some(a.id.clone()),
+            thread: a.thread.clone().unwrap_or_else(|| a.id.clone()),
+            hops: a.hops + 1,
+            kind: "result".into(),
+            meta: Meta {
+                status: Some("failed".into()),
+                reason: Some("timed_out".into()),
+                ..Meta::default()
+            },
+            sent_at: now as i64,
+        };
+        record(store, &p, Origin::Local, false)?;
+        askers.push(Key(a.from_key));
+    }
+    tx.commit()?;
+    Ok(askers)
+}
+
 /// The ids of `delivered_unread`'s messages for which `bound` (on `r.updated_at`, the delivery
 /// time, against `?3` = `at`) holds, oldest first.
 fn delivered_ids(store: &Store, short: &str, bound: &str, at: i64) -> Result<Vec<String>> {
