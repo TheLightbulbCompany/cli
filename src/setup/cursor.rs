@@ -1,7 +1,7 @@
 //! Cursor: hooks in `~/.cursor/hooks.json` (`{version: 1, hooks: {<event>: [{command,
 //! timeout, matcher?}]}}`), the MCP server in `~/.cursor/mcp.json`, and the allow rule in
 //! `~/.cursor/cli-config.json`'s `permissions.allow` (created when missing).
-//! Written from those files' formats, cursor.com/docs/agent/hooks and the allow-list syntax
+//! Written from those files' formats, cursor.com/docs/hooks and the allow-list syntax
 //! `Mcp(server:tool)` (either part may be `*`) in cursor.com/docs/cli/reference/permissions.
 
 use super::{edit_json, set_json_rule, set_json_server, AgentReport, Ctx, Owner, OLD_SERVER};

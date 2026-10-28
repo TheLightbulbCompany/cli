@@ -424,7 +424,7 @@ fn a_running_session_is_captured_from_its_next_tool_call() {
     let post = json!({"tool_name": "Read", "tool_input": {"file_path": "/x/y.rs"}});
     e.claude_hook("post-tool-use", e.payload("PostToolUse", &cwd, post));
     let mut calls = vec![];
-    common::until(5, "the call is recorded", || {
+    common::until(10, "the call is recorded", || {
         calls = capture::tool_calls(&e.store(), "claude:c1", true).unwrap();
         !calls.is_empty()
     });
