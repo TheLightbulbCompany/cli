@@ -436,6 +436,20 @@ async fn app_mail_is_never_hop_zero() {
     assert_eq!(linked::hops(&e, "r1"), 1);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hosted_assignment_over_the_route_link_is_never_hop_zero() {
+    let e = Env::new();
+    let mut link = linked::link(&e).await;
+    let q = common::session(&e, "q1");
+    link.app(
+        "app.send",
+        json!({"to": q, "kind": "assign", "text": "do x", "done_when": "x done",
+        "deadline_s": 300, "request_id": "ha2"}),
+    )
+    .await;
+    assert_eq!(linked::hops(&e, "ha2"), 1);
+}
+
 /// Registers `<short>/codex:<conv>` on `e`, this test process standing in for its agent.
 fn register(e: &Env, conv: &str) -> String {
     let me = lightbulb::os::process(std::process::id()).unwrap();
@@ -468,6 +482,7 @@ async fn a_hosted_app_assigns_and_reads_the_result() {
     body["text"] = json!("do x");
     body["done_when"] = json!("x done");
     body["deadline_s"] = json!(300);
+    let sent = now_s();
     let r = ok(&i, "app.send", body).await;
     assert!(
         ["queued", "stored"].contains(&r["state"].as_str().unwrap()),
@@ -480,6 +495,9 @@ async fn a_hosted_app_assigns_and_reads_the_result() {
     .await;
     let m = w.b.take_one(&codex);
     assert_eq!(m["kind"], "assign", "{m}");
+    assert_eq!(m["done_when"], "x done", "{m}");
+    let due = m["deadline_at"].as_i64().unwrap();
+    assert!((due - (sent + 300)).abs() <= 5, "{m}");
     assert!(
         m["framed"]
             .as_str()
