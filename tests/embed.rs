@@ -336,6 +336,7 @@ fn envelope(id: &str, rid: &str, from: &str, to: &str) -> Frame {
         body: "hi".into(),
         files: vec![],
         sent_at: 0,
+        meta: Default::default(),
     }
 }
 

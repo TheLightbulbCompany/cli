@@ -30,6 +30,7 @@ fn envelope(id: &str, rid: &str, from: &str, to: &str, body: &str) -> Frame {
         body: body.into(),
         files: vec![],
         sent_at: 0,
+        meta: Default::default(),
     }
 }
 

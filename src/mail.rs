@@ -9,6 +9,9 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// The kinds an envelope may carry.
+pub const KINDS: [&str; 4] = ["message", "assign", "result", "cancel"];
+
 pub const LOOP_LIMIT: u32 = 12;
 /// Half-open: a send counts while `sent_at > now - LOOP_WINDOW_S`, so one sent at T stops counting at T + 600.
 pub const LOOP_WINDOW_S: u64 = 600;
@@ -501,6 +504,7 @@ impl From<&Prepared> for Frame {
             body: p.text.clone(),
             files: vec![],
             sent_at: p.sent_at,
+            meta: Default::default(),
         }
     }
 }
@@ -1687,6 +1691,7 @@ mod tests {
             body: "x".into(),
             files: vec![],
             sent_at: 0,
+            meta: Default::default(),
         };
         (peer, roster, env)
     }
