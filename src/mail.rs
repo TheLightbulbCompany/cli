@@ -1106,11 +1106,10 @@ pub fn expire_delivered(store: &Store, short: &str, now: u64) -> Result<()> {
 
 /// Closes member `me`'s unanswered assignments whose deadline (`meta.deadline_at`) is at or
 /// before `now`: each gets a `failed` / `timed_out` result from the assignee to the asker,
-/// stored in the asker's mailbox in one transaction (the caller holds the store lock). Returns
-/// the askers' keys, to wake. A real result arriving later is ordinary mail: `result_of` keeps
+/// stored in the asker's mailbox, one transaction each (the caller holds the store lock); one
+/// that fails is logged by id and skipped. Returns the askers' keys, to wake. A real result arriving later is ordinary mail: `result_of` keeps
 /// naming the oldest, this one.
 pub fn expire_assignments(store: &Store, me: &str, now: u64) -> Result<Vec<Key>> {
-    let tx = store.conn().unchecked_transaction()?;
     let mut askers = vec![];
     for a in store.open_assignments_past(&format!("{me}/"), now as i64)? {
         let at = a.meta.deadline_at.unwrap_or_default();
@@ -1135,10 +1134,17 @@ pub fn expire_assignments(store: &Store, me: &str, now: u64) -> Result<Vec<Key>>
             },
             sent_at: now as i64,
         };
-        record(store, &p, Origin::Local, false)?;
-        askers.push(Key(a.from_key));
+        // One transaction each: an assignment that cannot be closed never stops the others.
+        let stored = (|| -> Result<()> {
+            let tx = store.conn().unchecked_transaction()?;
+            record(store, &p, Origin::Local, false)?;
+            Ok(tx.commit()?)
+        })();
+        match stored {
+            Ok(()) => askers.push(Key(a.from_key)),
+            Err(e) => eprintln!("mail: assignment {} not timed out: {e}", a.id),
+        }
     }
-    tx.commit()?;
     Ok(askers)
 }
 
@@ -1327,6 +1333,40 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("state.db")).unwrap();
         (dir, store)
+    }
+
+    #[test]
+    fn one_bad_assignment_never_stops_the_expiry_of_the_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("state.db")).unwrap();
+        let assign = |id: &str, from: &str| Message {
+            id: id.into(),
+            request_id: format!("r-{id}"),
+            from_key: from.into(),
+            to_key: "w/b".into(),
+            kind: "assign".into(),
+            thread: None,
+            hops: 0,
+            origin: None,
+            body: "x".into(),
+            sent_at: 1,
+            reply_to: None,
+            meta: Meta {
+                deadline_at: Some(5),
+                ..Meta::default()
+            },
+        };
+        store.put_message(&assign("a1", "me/x")).unwrap();
+        store.put_message(&assign("a2", "me/y")).unwrap();
+        // Takes the first timeout's (from_key, request_id) so its store trips UNIQUE.
+        let mut squat = assign("squat", "w/b");
+        squat.request_id = "timeout-a1".into();
+        squat.kind = "message".into();
+        store.put_message(&squat).unwrap();
+        let keys = expire_assignments(&store, "me", 10).unwrap();
+        assert_eq!(keys, vec![Key("me/y".into())]);
+        assert!(store.result_of("a2").unwrap().is_some());
+        assert!(store.result_of("a1").unwrap().is_none());
     }
 
     /// A registered session; `alive` picks this process's real birth time, else a wrong one.

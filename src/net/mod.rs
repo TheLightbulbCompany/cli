@@ -1319,7 +1319,10 @@ fn flush(d: &Daemon, all: bool, expire: bool) -> Result<Vec<Key>> {
     let mut wake = vec![];
     if expire {
         mail::expire(&store, now)?;
-        wake = mail::expire_assignments(&store, &d.identity.short, now)?;
+        match mail::expire_assignments(&store, &d.identity.short, now) {
+            Ok(keys) => wake = keys,
+            Err(e) => eprintln!("net: expire assignments: {e}"),
+        }
         // An instance's delivered-unread mail (`inbox.peek` hands it out until it is read).
         if d.cloud.is_some() {
             mail::expire_delivered(&store, &d.identity.short, now)?;

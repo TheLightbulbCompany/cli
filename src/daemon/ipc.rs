@@ -1819,7 +1819,7 @@ async fn inbox(
         // The asker's own lapsed assignments close here, so a waiting asker needs no tick.
         let lapsed = mail::expire_assignments(&daemon.store.lock().unwrap(), short, now());
         match lapsed {
-            Err(_) => return Response::err(id, INTERNAL),
+            Err(e) => eprintln!("ipc: expire assignments: {e}"),
             Ok(keys) => keys.iter().for_each(|k| stored(daemon, k, None)),
         }
         let taken = mail::take(&daemon.store.lock().unwrap(), &key, now());
