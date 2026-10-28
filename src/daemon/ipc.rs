@@ -1647,6 +1647,16 @@ pub(crate) fn records(daemon: &Daemon, messages: &[store::Message]) -> Vec<Value
     let declared = presence::declared_agents(daemon);
     // A hosted app's session here (`link`): named as the app, never as this computer's person.
     let apps = crate::link::apps(daemon);
+    // Parents' request ids (a header's `replyTo`). Every caller has dropped the store lock, and
+    // this one is taken and released before `team`, the order everywhere else.
+    let parents: HashMap<&str, String> = {
+        let store = daemon.store.lock().unwrap();
+        messages
+            .iter()
+            .filter_map(|m| m.reply_to.as_deref())
+            .filter_map(|id| Some((id, store.message(id).ok()??.request_id)))
+            .collect()
+    };
     let team = daemon.team.lock().unwrap();
     let mut senders: HashMap<String, Value> = HashMap::new();
     messages
@@ -1686,7 +1696,9 @@ pub(crate) fn records(daemon: &Daemon, messages: &[store::Message]) -> Vec<Value
                 "person_verified": who["person_verified"], "computer": who["computer"],
                 "reply_to": m.reply_to, "status": m.meta.status, "reason": m.meta.reason,
                 "done_when": m.meta.done_when, "deadline_at": m.meta.deadline_at,
-                "framed": frame::framed(label, &m.request_id, &m.body) })
+                "framed": frame::framed_kind(&m.kind, label, &m.request_id,
+                    m.reply_to.as_deref().and_then(|id| parents.get(id)).map(String::as_str),
+                    &m.meta, &m.body) })
         })
         .collect()
 }
