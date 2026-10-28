@@ -260,12 +260,18 @@ fn a_stopword_question_matches_as_a_phrase() {
 }
 
 #[test]
-fn refuse_secret_matches_the_six_patterns() {
+fn refuse_secret_matches_the_seven_patterns() {
     for (text, name) in [
         ("password = hunter2hunter2", "credential"),
         ("-----BEGIN RSA PRIVATE KEY-----", "private_key"),
         ("AKIAABCDEFGHIJKLMNOP", "aws_key"),
         ("sk-abcdefghijklmnopqrstuv", "api_key"),
+        (
+            "export STRIPE_KEY=sk_live_51HqX2abcdefghijklmnop",
+            "vendor_key",
+        ),
+        ("ghp_abcdefghijklmnopqrstuvwxyz0123456789", "vendor_key"),
+        ("xoxb-1234567890-abcdefghij", "vendor_key"),
         ("https://bob:pw123@example.com/x", "url_credentials"),
         ("eyJhbGciOiJIUzI1.eyJzdWIiOiIxMjM0NTY", "jwt"),
     ] {
