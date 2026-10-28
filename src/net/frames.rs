@@ -16,7 +16,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub const MAX_FRAME: usize = 1 << 20;
 
 /// The reasons a peer may give for `refused`.
-pub const REASONS: [&str; 8] = [
+pub const REASONS: [&str; 9] = [
     "loop",
     "policy",
     "declined",
@@ -25,6 +25,7 @@ pub const REASONS: [&str; 8] = [
     "request_id_reused",
     "unsupported",
     "no_worker",
+    "bad_request",
 ];
 
 /// A session as a peer publishes it (Task 7).
@@ -380,6 +381,8 @@ mod tests {
     #[test]
     fn no_worker_is_a_reason_a_peer_may_give() {
         assert!(REASONS.contains(&"no_worker"));
+        // `check_kind` refuses an assignment's bad terms on receipt too.
+        assert!(REASONS.contains(&"bad_request"));
         assert_eq!(
             crate::mail::KINDS,
             ["message", "assign", "result", "cancel"]
