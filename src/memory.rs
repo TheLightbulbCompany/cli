@@ -407,3 +407,94 @@ pub fn refuse_secret(text: &str) -> Option<&'static str> {
         .find(|(_, re)| re.is_match(text))
         .map(|(n, _)| *n)
 }
+
+/// `D Mon` in the local timezone.
+fn day(t: i64) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let t = t as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe { libc::localtime_r(&t, &mut tm) };
+    format!("{} {}", tm.tm_mday, MONTHS[tm.tm_mon.clamp(0, 11) as usize])
+}
+
+/// What an agent reads: `Contested:` lines, then `Current:`, then `Lessons:` (replaced facts
+/// left out), cut on a line boundary at `budget` chars. `names` maps a member key to the name
+/// shown (the short key when it is not there).
+pub fn page(
+    store: &Store,
+    facts: &[Fact],
+    names: &HashMap<String, String>,
+    budget: usize,
+) -> String {
+    let who = |key: &str| {
+        names
+            .get(key)
+            .cloned()
+            .unwrap_or_else(|| key.chars().take(12).collect())
+    };
+    let author_of = |id: &str| -> String {
+        store
+            .conn()
+            .query_row(
+                "SELECT author FROM memory_entries WHERE id = ?1",
+                [id],
+                |r| r.get::<_, String>(0),
+            )
+            .map_or_else(|_| "?".into(), |k| who(&k))
+    };
+    let by = |f: &Fact| format!("{} ({}, {})", f.value, who(&f.author), day(f.when));
+    let (mut contested, mut current, mut lessons) = (Vec::new(), Vec::new(), Vec::new());
+    let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+    for f in facts {
+        match (f.status, f.kind) {
+            (Status::Replaced, _) => {}
+            (Status::Contested, _) => {
+                let key = f.subject.trim().to_lowercase();
+                match groups.iter_mut().find(|(k, _)| *k == key) {
+                    Some((_, v)) => v.push(by(f)),
+                    None => groups.push((key, vec![format!("{}: {}", f.subject, by(f))])),
+                }
+            }
+            (_, kind) => {
+                let was = f.history.last().map_or(String::new(), |(id, v, when)| {
+                    format!("; was {v}, {}, {}", author_of(id), day(*when))
+                });
+                let line = format!(
+                    "{}: {} ({}, {}{was})",
+                    f.subject,
+                    f.value,
+                    who(&f.author),
+                    day(f.when)
+                );
+                if kind == Kind::Lesson {
+                    &mut lessons
+                } else {
+                    &mut current
+                }
+                .push(line);
+            }
+        }
+    }
+    contested.extend(groups.into_iter().map(|(_, v)| v.join(" vs ")));
+    let mut out = String::new();
+    'sections: for (head, lines) in [
+        ("Contested:", contested),
+        ("Current:", current),
+        ("Lessons:", lessons),
+    ] {
+        for (i, l) in lines.iter().enumerate() {
+            let add = if i == 0 {
+                format!("{head}\n{l}\n")
+            } else {
+                format!("{l}\n")
+            };
+            if out.chars().count() + add.chars().count() > budget {
+                break 'sections;
+            }
+            out += &add;
+        }
+    }
+    out.trim_end().to_string()
+}

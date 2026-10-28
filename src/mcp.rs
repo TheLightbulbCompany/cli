@@ -530,6 +530,7 @@ impl Server {
                 Ok(a) => self.send_message(call, a).await,
                 Err(e) => e,
             },
+            "recall" | "remember" => self.memory(call, name, args).await,
             "message_receipt" => match parse(args) {
                 Ok(a) => self.message_receipt(call, a).await,
                 Err(e) => e,
@@ -624,6 +625,25 @@ impl Server {
         match Self::signed(call, method, path, body).await {
             Ok(v) => Self::done(call, v).await,
             Err(e) => e,
+        }
+    }
+
+    /// `recall` and `remember`: the daemon's `memory.*` ops, `remember` as this session.
+    async fn memory(&self, call: Call, name: &str, mut args: Value) -> CallToolResult {
+        if !args.is_object() {
+            return code("bad_request");
+        }
+        args["session"] = call.from.0.clone().into();
+        match ask(&format!("memory.{name}"), args).await {
+            Ok(mut r) if r["ok"] == true => {
+                if let Some(o) = r.as_object_mut() {
+                    o.remove("id");
+                    o.remove("ok");
+                }
+                Self::done(&call, r).await
+            }
+            Ok(r) => code(r["error"].as_str().unwrap_or("internal")),
+            Err(e) => fail(internal(e)),
         }
     }
 

@@ -1,0 +1,141 @@
+//! `memory.remember` and `memory.recall` through a real daemon's socket.
+
+use serde_json::{json, Value};
+
+mod common;
+
+fn remember(e: &common::Env, subject: &str, fact: &str, kind: &str, extra: Value) -> Value {
+    let mut body =
+        json!({"id": 1, "op": "memory.remember", "subject": subject, "fact": fact, "kind": kind});
+    for (k, v) in extra.as_object().unwrap() {
+        body[k] = v.clone();
+    }
+    e.ask(body)
+}
+
+fn recall(e: &common::Env, question: &str, budget: Option<u64>) -> Value {
+    e.ask(json!({"id": 2, "op": "memory.recall", "question": question, "budget_chars": budget}))
+}
+
+fn daemon() -> common::Env {
+    let e = common::Env::new();
+    e.daemon(false, "", &[]);
+    e
+}
+
+#[test]
+fn test_remember_conflict_without_replaces_is_contested() {
+    let e = daemon();
+    let first = remember(
+        &e,
+        "launch date",
+        "3 March",
+        "fact",
+        json!({"when": 1_700_000_000}),
+    );
+    assert_eq!(first["ok"], true);
+    assert_eq!(first["stored"], true);
+    assert_eq!(first["neighbours"], json!([]));
+    let second = remember(
+        &e,
+        "launch date",
+        "10 March",
+        "fact",
+        json!({"when": 1_700_100_000}),
+    );
+    assert_eq!(second["stored"], true);
+    let n = second["neighbours"].as_array().unwrap();
+    assert_eq!(n.len(), 1);
+    assert_eq!(n[0]["value"], "3 March");
+    assert_eq!(n[0]["id"], first["entry_id"]);
+
+    let r = recall(&e, "launch date", None);
+    let page = r["page"].as_str().unwrap();
+    assert!(page.starts_with("Contested:\nlaunch date: "), "{page}");
+    assert!(
+        page.contains("3 March (") && page.contains(") vs 10 March ("),
+        "{page}"
+    );
+    assert!(!page.contains("Current:"), "{page}");
+    assert!(r["facts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|f| f["status"] == "contested"));
+
+    // A second call that replaces the first settles it, with the old value as history.
+    let third = remember(
+        &e,
+        "launch date",
+        "10 March",
+        "fact",
+        json!({"when": 1_700_200_000, "replaces": [first["entry_id"], second["entry_id"]]}),
+    );
+    assert_eq!(third["stored"], true);
+    let page = recall(&e, "launch date", None)["page"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        page.starts_with("Current:\nlaunch date: 10 March ("),
+        "{page}"
+    );
+    assert!(page.contains("; was 10 March, "), "{page}");
+}
+
+#[test]
+fn remember_refuses_secret_with_reason() {
+    let e = daemon();
+    let r = remember(
+        &e,
+        "deploy",
+        "key -----BEGIN RSA PRIVATE KEY----- abc",
+        "fact",
+        json!({}),
+    );
+    assert_eq!(r["ok"], true);
+    assert_eq!(r["stored"], false);
+    assert_eq!(r["refused"], "secret:private_key");
+    assert_eq!(recall(&e, "", None)["facts"], json!([]));
+    let r = remember(&e, "notes", &"x".repeat(20_000), "fact", json!({}));
+    assert_eq!(r["refused"], "too_long");
+    assert_eq!(r["stored"], false);
+    // The text never reaches the daemon log.
+    let log = std::fs::read_to_string(e.state.path().join("daemon.log")).unwrap();
+    assert!(!log.contains("PRIVATE KEY"));
+}
+
+#[test]
+fn recall_page_puts_contested_first_and_respects_budget() {
+    let e = daemon();
+    remember(&e, "alpha", "one", "fact", json!({}));
+    remember(&e, "beta", "two", "lesson", json!({"scope": "team"}));
+    for (v, when) in [("red", 1_700_000_000), ("blue", 1_700_100_000)] {
+        remember(&e, "colour", v, "preference", json!({"when": when}));
+    }
+    let page = recall(&e, "", None)["page"].as_str().unwrap().to_string();
+    let (c, cur, l) = (
+        page.find("Contested:"),
+        page.find("Current:"),
+        page.find("Lessons:"),
+    );
+    assert!(c < cur && cur < l && c == Some(0), "{page}");
+    assert!(
+        page.contains("colour: blue (") && page.contains(") vs red ("),
+        "{page}"
+    );
+    assert!(
+        page.contains("alpha: one (") && page.contains("beta: two ("),
+        "{page}"
+    );
+
+    // Cut on a line boundary: room for the contested line only.
+    let first_line = page.lines().nth(1).unwrap();
+    let budget = "Contested:\n".len() + first_line.len() + 1;
+    let cut = recall(&e, "", Some(budget as u64))["page"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(cut, format!("Contested:\n{first_line}"));
+    assert_eq!(recall(&e, "", Some(3))["page"], "");
+}

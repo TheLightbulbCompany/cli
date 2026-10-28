@@ -352,6 +352,8 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
             },
             None => Response::err(id, BAD_REQUEST),
         },
+        "memory.remember" => memory_remember(id, body, daemon),
+        "memory.recall" => memory_recall(id, body, daemon),
         "team.leave" => super::net_ops::leave(id, daemon, for_a_person()).await,
         "holds" | "hold.get" | "hold.answer" | "hold.file" => {
             crate::holds::op(id, op, body, daemon, caller)
@@ -369,6 +371,120 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
         }
         op => super::net_ops::handle(id, op, body, daemon, caller),
     }
+}
+
+fn fact_json(f: &crate::memory::Fact) -> Value {
+    json!({
+        "id": f.id, "subject": f.subject, "value": f.value, "kind": f.kind, "scope": f.scope,
+        "author": f.author, "when": f.when,
+        "status": format!("{:?}", f.status).to_lowercase(),
+        "history": f.history.iter().map(|(id, v, w)| json!({"id": id, "value": v, "when": w})).collect::<Vec<_>>(),
+    })
+}
+
+/// `memory.remember {subject, fact, kind, scope?, replaces?, when?, session?}` ->
+/// `{stored, entry_id?, neighbours, refused?}`: stores a signed entry, with the harness and repo
+/// of `session` (an MCP caller's key) as its source. `neighbours` are the current facts on the
+/// subject from before this one. A secret or an oversize entry is `stored: false` with `refused`.
+fn memory_remember(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
+    use crate::memory::{self, Kind, Op, Scope, Source, Status};
+    let (Some(subject), Some(fact), Ok(kind)) = (
+        body["subject"].as_str(),
+        body["fact"].as_str(),
+        serde_json::from_value::<Kind>(body["kind"].clone()),
+    ) else {
+        return Response::err(id, BAD_REQUEST);
+    };
+    let scope = match body.get("scope") {
+        None | Some(Value::Null) => Ok(Scope::Me),
+        Some(v) => serde_json::from_value(v.clone()),
+    };
+    let replaces: Result<Vec<String>, _> = match body.get("replaces") {
+        None | Some(Value::Null) => Ok(vec![]),
+        Some(v) => serde_json::from_value(v.clone()),
+    };
+    let (Ok(scope), Ok(replaces)) = (scope, replaces) else {
+        return Response::err(id, BAD_REQUEST);
+    };
+    let session = body["session"].as_str().map(String::from);
+    let found = session
+        .as_deref()
+        .and_then(|k| live_sessions(daemon).into_iter().find(|s| s.key.0 == k));
+    let source = Source {
+        harness: found
+            .as_ref()
+            .map_or("unknown".into(), |s| crate::frame::agent_name(&s.provider)),
+        repo: found.and_then(|s| s.repo),
+        session,
+        on_behalf_of: None,
+    };
+    let op = Op::Remember {
+        subject: subject.into(),
+        fact: fact.into(),
+        kind,
+        scope,
+        when: body["when"].as_i64(),
+        source,
+        replaces,
+    };
+    let store = daemon.store.lock().unwrap();
+    let neighbours: Vec<Value> = memory::search(&store, subject, 5)
+        .unwrap_or_default()
+        .iter()
+        .filter(|f| f.status != Status::Replaced)
+        .map(fact_json)
+        .collect();
+    match memory::remember(&store, &daemon.identity, op, now() as i64) {
+        Ok(e) => Response::ok(
+            id,
+            json!({ "stored": true, "entry_id": e.id, "neighbours": neighbours }),
+        ),
+        Err(e) => {
+            let reason = e.to_string();
+            if reason.starts_with("secret:") || reason == "too_long" {
+                Response::ok(
+                    id,
+                    json!({ "stored": false, "refused": reason, "neighbours": neighbours }),
+                )
+            } else {
+                Response::err(id, INTERNAL)
+            }
+        }
+    }
+}
+
+/// `memory.recall {question, budget_chars?}` -> `{page, facts}`: what the team holds that matches
+/// `question` (all of it when empty), as the page an agent reads and as facts.
+fn memory_recall(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
+    use crate::memory::{self, Status};
+    let Some(q) = body["question"].as_str() else {
+        return Response::err(id, BAD_REQUEST);
+    };
+    let budget = body["budget_chars"].as_u64().map_or(1_600, |b| b as usize);
+    let names: std::collections::HashMap<String, String> = daemon
+        .team
+        .lock()
+        .unwrap()
+        .roster
+        .members
+        .values()
+        .map(|m| (m.key.clone(), m.name.clone()))
+        .collect();
+    let store = daemon.store.lock().unwrap();
+    let found = if q.trim().is_empty() {
+        memory::facts(&store, None, None)
+    } else {
+        memory::search(&store, q, 50)
+    };
+    let Ok(mut facts) = found else {
+        return Response::err(id, INTERNAL);
+    };
+    facts.retain(|f| f.status != Status::Replaced);
+    let page = memory::page(&store, &facts, &names, budget);
+    Response::ok(
+        id,
+        json!({ "page": page, "facts": facts.iter().map(fact_json).collect::<Vec<_>>() }),
+    )
 }
 
 /// A process as `(pid, birth_micros)`.

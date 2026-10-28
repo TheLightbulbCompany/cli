@@ -1116,7 +1116,7 @@ fn tools_list_matches_tools_json() {
     let got: Vec<Value> = m.tools().iter().map(shape).collect();
     let want: Vec<Value> = spec().iter().map(shape).collect();
     assert_eq!(got, want);
-    assert_eq!(names(&got).len(), 10);
+    assert_eq!(names(&got).len(), 12);
 }
 
 #[test]
@@ -1143,7 +1143,7 @@ fn workspace_tools_hidden_until_signed_in() {
         .filter(|t| t["scope"] == "network")
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(network.len(), 4);
+    assert_eq!(network.len(), 6);
     let mut m = mcp_on(&e, &me());
     assert_eq!(names(&m.tools()), network);
     let out = m.tool("find_rooms", json!({}));
@@ -1157,7 +1157,7 @@ fn workspace_tools_hidden_until_signed_in() {
 
     // Signing in shows them to the same server; an ended sign-in hides them again.
     e.sign_in("user_1", None);
-    assert_eq!(m.tools().len(), 10);
+    assert_eq!(m.tools().len(), 12);
     let old = common::now_s() - 40 * 86_400;
     let proof = common::issuer::proof(&e.identity().key, "user_1", old);
     let login = json!({"proof": proof, "name": "user_1"});
@@ -1339,17 +1339,17 @@ fn the_tool_list_changes_when_the_sign_in_does() {
             .count()
     };
     let wait = || std::thread::sleep(Duration::from_millis(800));
-    assert_eq!(m.tools().len(), 4);
+    assert_eq!(m.tools().len(), 6);
     // A login with no request after it: the timer tells the client.
     e.sign_in("user_1", None);
     wait();
-    assert_eq!(m.tools().len(), 10);
+    assert_eq!(m.tools().len(), 12);
     assert_eq!(changes(&mut m), 1);
     // A logout: told once, by the next call at the latest.
     std::fs::remove_file(e.state.path().join("login.json")).unwrap();
     assert!(!m.tool("find_sessions", json!({})).error);
     assert_eq!(changes(&mut m), 1);
-    assert_eq!(m.tools().len(), 4);
+    assert_eq!(m.tools().len(), 6);
     // A sign-in that ends.
     e.sign_in("user_1", None);
     wait();
@@ -1360,7 +1360,7 @@ fn the_tool_list_changes_when_the_sign_in_does() {
     let login = json!({"proof": proof, "name": "user_1"});
     std::fs::write(e.state.path().join("login.json"), login.to_string()).unwrap();
     wait();
-    assert_eq!(m.tools().len(), 4);
+    assert_eq!(m.tools().len(), 6);
     assert_eq!(changes(&mut m), 1);
     // Nothing changed: nothing said.
     wait();
@@ -1422,4 +1422,33 @@ fn an_identity_that_cannot_load_is_named_not_internal() {
         out.text
     );
     assert!(seen.lock().unwrap().is_empty());
+}
+
+#[test]
+fn tools_json_lists_remember_and_recall() {
+    let tool = |n: &str| spec().iter().find(|t| t["name"] == n).unwrap().clone();
+    let (recall, remember) = (tool("recall"), tool("remember"));
+    assert_eq!(recall["scope"], "network");
+    assert_eq!(remember["scope"], "network");
+    assert_eq!(
+        recall["description"],
+        "Call when a task starts or you need something a teammate may know"
+    );
+    assert_eq!(
+        remember["description"],
+        "Returns what is already known on the subject; call again with `replaces` if yours is a change. Personal unless the person says to share"
+    );
+    assert_eq!(recall["inputSchema"]["required"], json!(["question"]));
+    let p = &remember["inputSchema"]["properties"];
+    assert_eq!(
+        p["kind"]["enum"],
+        json!(["fact", "decision", "lesson", "preference"])
+    );
+    assert_eq!(p["scope"]["enum"], json!(["me", "team"]));
+    assert_eq!(p["scope"]["default"], "me");
+    assert_eq!(p["replaces"]["type"], "array");
+    assert_eq!(
+        remember["inputSchema"]["required"],
+        json!(["subject", "fact", "kind"])
+    );
 }
