@@ -66,7 +66,8 @@ fn cosine_of_identical_vectors_is_one_and_orthogonal_is_zero() {
 }
 
 /// The daemon's housekeeping fills the vectors missing when it starts: an entry and a turn
-/// stored before the model was installed get one; a refused turn never does.
+/// stored before the model was installed get one; a refused turn never does; an entry body this
+/// build cannot read is skipped once and does not stop the rows after it.
 #[test]
 #[ignore = "downloads the model; run with LIGHTBULB_TEST_MODEL=1 and --include-ignored"]
 fn the_daemon_embeds_what_has_no_vector_at_start() {
@@ -93,6 +94,17 @@ fn the_daemon_embeds_what_has_no_vector_at_start() {
         },
         replaces: vec![],
     };
+    // An entry this build cannot read (JSON, but not an entry), before the good one.
+    drop(store);
+    rusqlite::Connection::open(e.state.path().join("state.db"))
+        .unwrap()
+        .execute(
+            "INSERT INTO memory_entries (id, author, seq, entry, received_at)
+             VALUES ('bad', 'x', 1, '{\"op\": {\"t\": \"remember\"}}', 1)",
+            [],
+        )
+        .unwrap();
+    let store = e.store();
     memory::remember(&store, &e.identity(), op, 1).unwrap();
     let row = capture::SessionRow {
         id: "a:1".into(),
@@ -108,7 +120,7 @@ fn the_daemon_embeds_what_has_no_vector_at_start() {
     capture::start_session(&store, &row, "/tmp/proj").unwrap();
     // Today: the daemon prunes turns older than 90 days as it starts.
     let now = common::now_s();
-    capture::record_turn(&store, "a:1", "user", "list the files", now).unwrap();
+    // The refused turn first: a pass that reaches the clean turn has passed it.
     capture::record_turn(
         &store,
         "a:1",
@@ -117,21 +129,28 @@ fn the_daemon_embeds_what_has_no_vector_at_start() {
         now,
     )
     .unwrap();
+    capture::record_turn(&store, "a:1", "user", "list the files", now).unwrap();
     drop(store);
     let db = e.state.path().join("state.db");
     let vecs = |sql: &str| common::count(&db, sql);
-    let entry = "SELECT COUNT(*) FROM memory_vec";
+    let entry = "SELECT COUNT(*) FROM memory_vec WHERE length(v) > 0";
+    let skipped = "SELECT COUNT(*) FROM memory_vec WHERE id = 'bad' AND length(v) = 0";
     let turn = |seq: i64| {
         format!(
             "SELECT COUNT(*) FROM turns_vec JOIN capture_turns ON turn = capture_turns.rowid \
              WHERE seq = {seq}"
         )
     };
-    assert_eq!((vecs(entry), vecs(&turn(1))), (0, 0));
+    assert_eq!((vecs(entry), vecs(&turn(2))), (0, 0));
     embed_model::install(e.state.path()).unwrap();
     e.daemon(false, "", &[]);
     common::until(30, "the start-up pass embeds", || {
-        vecs(entry) == 1 && vecs(&turn(1)) == 1
+        vecs(entry) == 1 && vecs(&turn(2)) == 1
     });
-    assert_eq!(vecs(&turn(2)), 0, "a refused turn is never embedded");
+    assert_eq!(vecs(&turn(1)), 0, "a refused turn is never embedded");
+    assert_eq!(
+        vecs(skipped),
+        1,
+        "the unreadable entry is marked, never picked again"
+    );
 }

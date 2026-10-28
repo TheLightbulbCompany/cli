@@ -716,9 +716,11 @@ fn a_reply_equal_to_the_last_turn_is_recorded_once() {
     assert_eq!(seqs, vec![1, 2, 3]);
 }
 
-/// A turn that is slow to store (or fails) never costs the Stop its tokens: they go first.
+/// The Stop's tokens are sent before its turn, so a slow capture never costs them.
+/// `LIGHTBULB_CONNECT_DEBUG_CAPTURE_DELAY_MS` slows every capture op, so here `capture.stop`
+/// itself outlasts the hook's wait and the turn is never sent; the tokens still land.
 #[test]
-fn a_slow_turn_never_costs_the_stop_its_tokens() {
+fn the_stop_sends_its_tokens_before_its_turn() {
     let e = Env::new();
     let delay = [(
         "LIGHTBULB_CONNECT_DEBUG_CAPTURE_DELAY_MS",

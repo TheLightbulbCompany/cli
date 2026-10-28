@@ -281,7 +281,8 @@ enum Missing {
 }
 
 /// Up to `limit` held, live `remember`s with no vector, then turns with none (a refused turn is
-/// never embedded), each with the text to embed.
+/// never embedded), each with the text to embed. A body that does not parse as an entry is
+/// logged and given an empty vector (which `vectors` ignores), so it is not picked again.
 fn missing(store: &Store, limit: usize) -> Result<Vec<(Missing, String)>> {
     let mut out = vec![];
     let mut stmt = store.conn().prepare(
@@ -292,11 +293,25 @@ fn missing(store: &Store, limit: usize) -> Result<Vec<(Missing, String)>> {
     let rows = stmt.query_map([limit as i64], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
     })?;
+    let mut bad = vec![];
     for row in rows {
         let (id, body) = row?;
-        if let Op::Remember { subject, fact, .. } = serde_json::from_str::<Entry>(&body)?.op {
-            out.push((Missing::Entry(id), format!("{subject}: {fact}")));
+        match serde_json::from_str::<Entry>(&body).map(|e| e.op) {
+            Ok(Op::Remember { subject, fact, .. }) => {
+                out.push((Missing::Entry(id), format!("{subject}: {fact}")))
+            }
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("embed: entry {id} is not readable ({e}); skipped");
+                bad.push(id);
+            }
         }
+    }
+    for id in bad {
+        store.conn().execute(
+            "INSERT OR IGNORE INTO memory_vec (id, v) VALUES (?1, X'')",
+            [id],
+        )?;
     }
     let mut stmt = store.conn().prepare(
         "SELECT rowid, text FROM capture_turns WHERE rowid NOT IN (SELECT turn FROM turns_vec)
@@ -340,8 +355,14 @@ pub fn embed_missing_with<'a, S: std::ops::Deref<Target = Store> + 'a>(
     let rows = missing(&lock(), limit)?;
     let mut n = 0;
     for (row, text) in rows {
-        if let Some(v) = embed_model::text(&text) {
-            n += put_vec(lock().conn(), &row, &v)?;
+        // Installed but not loading: no row would embed this pass; the next one tries again.
+        let Some(v) = embed_model::text(&text) else {
+            eprintln!("embed: the model did not load; stopping this pass");
+            break;
+        };
+        match put_vec(lock().conn(), &row, &v) {
+            Ok(k) => n += k,
+            Err(e) => eprintln!("embed: a vector was not stored ({e}); skipped"),
         }
     }
     Ok(n)

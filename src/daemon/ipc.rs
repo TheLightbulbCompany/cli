@@ -738,13 +738,20 @@ pub(crate) fn embed_missing(daemon: &Arc<Daemon>) {
     if RUNNING.swap(true, SeqCst) {
         return; // what a pass misses, the next minute's picks up
     }
+    /// Clears `RUNNING` however the pass ends, a panic included.
+    struct Done;
+    impl Drop for Done {
+        fn drop(&mut self) {
+            RUNNING.store(false, SeqCst);
+        }
+    }
     let d = daemon.clone();
     tokio::task::spawn_blocking(move || {
+        let _done = Done;
         let lock = || d.store.lock().unwrap();
         if let Err(e) = crate::memory::embed_missing_with(lock, 200) {
             eprintln!("embed: {e}");
         }
-        RUNNING.store(false, SeqCst);
     });
 }
 
