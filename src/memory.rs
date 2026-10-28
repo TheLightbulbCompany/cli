@@ -266,7 +266,9 @@ pub fn vectors(store: &Store) -> Result<Vec<(String, Vec<f32>)>> {
         .filter(|l| l.fact.status != Status::Replaced)
         .map(|l| l.fact.id)
         .collect();
-    let mut stmt = store.conn().prepare("SELECT id, v FROM memory_vec")?;
+    let mut stmt = store
+        .conn()
+        .prepare("SELECT id, v FROM memory_vec ORDER BY id")?;
     let rows = stmt.query_map([], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
     })?;
@@ -546,6 +548,10 @@ const STOPWORDS: [&str; 37] = [
 /// shows them; a match that has since been replaced says so. Any word but a stopword may match,
 /// a word of 3 or more characters as a prefix too; a query of stopwords only is matched as the
 /// whole phrase.
+/// The least cosine a vector match counts at (`ponytail:` one constant for the current model;
+/// tune on real recalls, per-model when the model changes).
+const COSINE_FLOOR: f32 = 0.25;
+
 pub fn search(store: &Store, query: &str, limit: usize) -> Result<Vec<Fact>> {
     // Each word quoted (its own quotes dropped), so FTS5 syntax in a query is text.
     let words: Vec<String> = query
@@ -585,7 +591,14 @@ pub fn search(store: &Store, query: &str, limit: usize) -> Result<Vec<Fact>> {
                 .map(|(id, v)| (embed_model::cosine(&qv, &v), id))
                 .collect();
             scored.sort_by(|a, b| b.0.total_cmp(&a.0));
-            let cos: Vec<String> = scored.into_iter().take(50).map(|s| s.1).collect();
+            // Below the floor a candidate shares no meaning with the question: without it a
+            // short or nonsense question fills the page with whatever is nearest.
+            let cos: Vec<String> = scored
+                .into_iter()
+                .filter(|s| s.0 >= COSINE_FLOOR)
+                .take(50)
+                .map(|s| s.1)
+                .collect();
             rrf(&[ids, cos], limit)
         }
         None => ids,

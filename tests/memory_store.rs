@@ -126,6 +126,7 @@ fn two_replaces_of_same_target_are_contested() {
 
 #[test]
 fn test_tombstone_before_entry_wins() {
+    let Some(_env) = vec_env(false) else { return }; // no model: the keyword path
     let a = identity();
     let (_d1, s1) = team(&a);
     let e = memory::remember(&s1, &a, rem("db", "postgres", &[]), 1).unwrap();
@@ -153,6 +154,7 @@ fn test_tombstone_before_entry_wins() {
 
 #[test]
 fn search_finds_by_subject_and_fact() {
+    let Some(_env) = vec_env(false) else { return }; // no model: the keyword path
     let a = identity();
     let (_d, s) = team(&a);
     memory::remember(&s, &a, rem("database choice", "we run postgres 16", &[]), 1).unwrap();
@@ -168,6 +170,7 @@ fn search_finds_by_subject_and_fact() {
 /// Agents ask questions: any word of one may match (stemmed, prefix), stopwords aside.
 #[test]
 fn search_matches_natural_questions() {
+    let Some(_env) = vec_env(false) else { return }; // no model: the keyword path
     let a = identity();
     let (_d, s) = team(&a);
     let fact = "Run the suite with cargo test --workspace before pushing";
@@ -221,6 +224,7 @@ fn an_absurd_seen_head_is_ignored() {
 /// A state.db from before stemming gets its index rebuilt stemmed, entries kept.
 #[test]
 fn an_older_index_is_rebuilt_stemmed() {
+    let Some(_env) = vec_env(false) else { return }; // no model: the keyword path
     let a = identity();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
@@ -250,6 +254,7 @@ fn an_older_index_is_rebuilt_stemmed() {
 /// A question of stopwords only is matched as the whole phrase.
 #[test]
 fn a_stopword_question_matches_as_a_phrase() {
+    let Some(_env) = vec_env(false) else { return }; // no model: the keyword path
     let a = identity();
     let (_d, s) = team(&a);
     memory::remember(&s, &a, rem("motto", "what we do is ship", &[]), 1).unwrap();
@@ -340,6 +345,7 @@ fn forget_by(b: &Identity, target: &str) -> memory::Entry {
 
 #[test]
 fn non_author_forget_before_body_wins() {
+    let Some(_env) = vec_env(false) else { return }; // no model: the keyword path
     let (a, b) = (identity(), identity());
     let (_d1, s1) = team(&a);
     let x = memory::remember(&s1, &a, rem("db", "postgres", &[]), 1).unwrap();
@@ -402,6 +408,7 @@ fn forget_of_known_entry_by_other_member_applies() {
 
 #[test]
 fn search_survives_snapshot() {
+    let Some(_env) = vec_env(false) else { return }; // no model: the keyword path
     let a = identity();
     let (d, s) = team(&a);
     memory::remember(&s, &a, rem("gone", "temp", &[]), 1).unwrap();
