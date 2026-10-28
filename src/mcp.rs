@@ -143,8 +143,9 @@ struct ReceiptArgs {
 }
 
 /// The longest one `check_inbox` call waits. Codex times a tool call out at 60 s, so a Codex
-/// caller should pass `wait_secs` of 55 or less.
+/// session's wait is held to `CODEX_WAIT_CAP_S` whatever it asks for.
 const WAIT_CAP_S: u32 = 600;
+const CODEX_WAIT_CAP_S: u32 = 55;
 
 #[derive(Deserialize)]
 struct InboxArgs {
@@ -937,9 +938,14 @@ impl Server {
         if a.wait_secs > 600 {
             return code("bad_request");
         }
+        let member = crate::sessions::member_of(&call.from.0).unwrap_or_default();
+        let cap = match crate::frame::Sender::of(member, &call.from.0) {
+            crate::frame::Sender::Agent("codex") => CODEX_WAIT_CAP_S,
+            _ => WAIT_CAP_S,
+        };
         let r = ask(
             "inbox",
-            json!({ "key": call.from, "wait_secs": a.wait_secs.min(WAIT_CAP_S),
+            json!({ "key": call.from, "wait_secs": a.wait_secs.min(cap),
                 "caller": hook::proc_json(&call.me) }),
         )
         .await;

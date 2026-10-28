@@ -551,6 +551,20 @@ fn find_sessions_marks_is_this_session() {
     );
 }
 
+/// Codex times a tool call out at 60 s: a Codex session's long wait comes back before that.
+#[test]
+fn a_codex_wait_returns_inside_codexs_tool_timeout() {
+    let net = Net::new();
+    net.register("codex", "t1", &me());
+    let mut m = net.mcp(&me());
+    let started = Instant::now();
+    let out = m.tool("check_inbox", json!({"wait_secs": 600}));
+    let took = started.elapsed();
+    assert!(!out.error, "{}", out.text);
+    assert_eq!(out.json()["messages"], json!([]));
+    assert!(took < Duration::from_secs(60), "{took:?}");
+}
+
 #[test]
 fn codex_calls_pick_their_thread_from_meta() {
     let net = Net::new();
