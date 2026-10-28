@@ -29,6 +29,7 @@ fn op(subject: &str, fact: &str, scope: Scope) -> Op {
             repo: None,
             session: None,
             on_behalf_of: None,
+            shared_from: None,
         },
         replaces: vec![],
     }

@@ -355,7 +355,7 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
         "memory.remember" => memory_remember(id, body, daemon),
         "memory.recall" => memory_recall(id, body, daemon),
         "memory.list" | "memory.show" | "memory.forget" | "memory.share" | "memory.last"
-        | "memory.export" => memory_manage(id, op, body, daemon),
+        | "memory.export" | "memory.team" => memory_manage(id, op, body, daemon, for_a_person()),
         "team.leave" => super::net_ops::leave(id, daemon, for_a_person()).await,
         "holds" | "hold.get" | "hold.answer" | "hold.file" => {
             crate::holds::op(id, op, body, daemon, caller)
@@ -422,6 +422,7 @@ fn memory_remember(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
         repo: found.and_then(|s| s.repo),
         session,
         on_behalf_of: None,
+        shared_from: None,
     };
     let op = Op::Remember {
         subject: subject.into(),
@@ -517,7 +518,7 @@ fn member_names(daemon: &Daemon) -> std::collections::HashMap<String, String> {
 /// `show {entry}` -> `{fact, source}`; `forget {entry}` -> `{}`; `share {entry}` -> `{entry_id}`;
 /// `last {session?}` -> `{block}`; `export` -> `{entries}`. `entry` is an entry id or its first
 /// six or more digits. Authors are member names where the roster knows them.
-fn memory_manage(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>) -> Response {
+fn memory_manage(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, person: bool) -> Response {
     use crate::memory::{self, Op, Scope};
     let names = member_names(daemon);
     let who = |k: &str| {
@@ -531,31 +532,43 @@ fn memory_manage(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>) -> Respo
         j["author"] = who(&f.author).into();
         j
     };
+    let bad = |c: &str| Response::err(id, c);
     let store = daemon.store.lock().unwrap();
     let entry = || match body["entry"].as_str() {
         Some(i) => memory::entry(&store, i)
-            .map_err(|_| INTERNAL)
-            .and_then(|e| e.ok_or(NOT_FOUND)),
-        None => Err(BAD_REQUEST),
+            .map_err(|_| bad(INTERNAL))
+            .and_then(|e| e.ok_or_else(|| bad(NOT_FOUND))),
+        None => Err(bad(BAD_REQUEST)),
     };
-    let r: Result<Value, &str> = (|| match op {
+    if !person && matches!(op, "memory.forget" | "memory.share" | "memory.team") {
+        return refused(id, "not_a_person");
+    }
+    let r: Result<Value, Response> = (|| match op {
+        "memory.team" => {
+            let on = body["on"].as_bool().ok_or_else(|| bad(BAD_REQUEST))?;
+            crate::config::Config::set(&daemon.dir, "memory_team", &on.to_string())
+                .and_then(|_| super::net_ops::reload(daemon))
+                .map_err(|_| bad(INTERNAL))?;
+            Ok(json!({}))
+        }
         "memory.list" => {
             let scope = match body["scope"].as_str() {
                 None => None,
                 Some("me") => Some(Scope::Me),
                 Some("team") => Some(Scope::Team),
-                Some(_) => return Err(BAD_REQUEST),
+                Some(_) => return Err(bad(BAD_REQUEST)),
             };
-            let f = memory::facts(&store, scope, body["repo"].as_str()).map_err(|_| INTERNAL)?;
+            let f =
+                memory::facts(&store, scope, body["repo"].as_str()).map_err(|_| bad(INTERNAL))?;
             Ok(json!({ "facts": f.iter().map(&shown).collect::<Vec<_>>() }))
         }
         "memory.show" => {
             let e = entry()?;
             let f = memory::fact(&store, &e.id)
-                .map_err(|_| INTERNAL)?
-                .ok_or(NOT_FOUND)?;
+                .map_err(|_| bad(INTERNAL))?
+                .ok_or_else(|| bad(NOT_FOUND))?;
             let Op::Remember { source, .. } = e.op else {
-                return Err(NOT_FOUND);
+                return Err(bad(NOT_FOUND));
             };
             let mut fact = shown(&f);
             fact["history"] = f
@@ -568,13 +581,14 @@ fn memory_manage(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>) -> Respo
         "memory.forget" => {
             let e = entry()?;
             let op = Op::Forget { target: e.id };
-            memory::remember(&store, &daemon.identity, op, now() as i64).map_err(|_| INTERNAL)?;
+            memory::remember(&store, &daemon.identity, op, now() as i64)
+                .map_err(|_| bad(INTERNAL))?;
             daemon.peers.outbox.notify_one();
             Ok(json!({}))
         }
         "memory.share" => {
             if !daemon.team.lock().unwrap().config.memory_team {
-                return Err("team_off");
+                return Err(bad("team_off"));
             }
             let e = entry()?;
             let Op::Remember {
@@ -586,12 +600,32 @@ fn memory_manage(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>) -> Respo
                 ..
             } = e.op
             else {
-                return Err("not_mine");
+                return Err(bad("not_mine"));
             };
             if e.author != daemon.identity.key {
-                return Err("not_mine");
+                return Err(bad("not_mine"));
             }
-            source.session = Some(e.id);
+            let current = memory::fact(&store, &e.id)
+                .map_err(|_| bad(INTERNAL))?
+                .ok_or_else(|| bad(NOT_FOUND))?;
+            if current.status == memory::Status::Replaced {
+                let newer = memory::facts(&store, None, None)
+                    .map_err(|_| bad(INTERNAL))?
+                    .into_iter()
+                    .find(|f| f.history.iter().any(|(h, _, _)| *h == e.id));
+                return Err(Response::err_with(
+                    id,
+                    "replaced",
+                    json!({ "current": newer.map(|f| f.id) }),
+                ));
+            }
+            let shared = memory::entries(&store).map_err(|_| bad(INTERNAL))?;
+            if shared.iter().any(|x| {
+                matches!(&x.op, Op::Remember { source, .. } if source.shared_from.as_deref() == Some(&e.id))
+            }) {
+                return Err(bad("already_shared"));
+            }
+            source.shared_from = Some(e.id);
             let op = Op::Remember {
                 subject,
                 fact,
@@ -602,20 +636,20 @@ fn memory_manage(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>) -> Respo
                 replaces: vec![],
             };
             let n = memory::remember(&store, &daemon.identity, op, now() as i64)
-                .map_err(|_| INTERNAL)?;
+                .map_err(|_| bad(INTERNAL))?;
             Ok(json!({ "entry_id": n.id }))
         }
         "memory.last" => {
             let b = store
                 .memory_last(body["session"].as_str())
-                .map_err(|_| INTERNAL)?;
+                .map_err(|_| bad(INTERNAL))?;
             Ok(json!({ "block": b.unwrap_or_default() }))
         }
-        _ => Ok(json!({ "entries": memory::entries(&store).map_err(|_| INTERNAL)? })),
+        _ => Ok(json!({ "entries": memory::entries(&store).map_err(|_| bad(INTERNAL))? })),
     })();
     match r {
         Ok(b) => Response::ok(id, b),
-        Err(code) => Response::err(id, code),
+        Err(r) => r,
     }
 }
 

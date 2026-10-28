@@ -135,6 +135,7 @@ wrote it.
   copied it before. The entry's id stays as a marker.
 - **No block without an origin.** A session is handed the memory for its repository, found from
   the git origin. A folder with no git origin gets no block; its agent can still call `recall`.
+- **Who can change it.** `memory forget`, `memory share` and `memory team` are refused when run from an agent's shell or tools, like `remove`; `list`, `show`, `last` and `export` are open. An agent still writes entries with `remember`.
 - **The log.** `daemon.log` never holds an entry's text.
 
 ## Loop limits

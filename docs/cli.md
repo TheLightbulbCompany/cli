@@ -354,14 +354,14 @@ lightbulb memory team <on|off>
 
 Agents write memory with the `remember` tool and read it with `recall`. These commands are your
 own view of it. An `<ID>` is the first characters of an entry's id as `list` prints it (six or
-more).
+more). `forget`, `share` and `team` must be run from your own terminal; an agent's shell is refused.
 
 | Command | What it does |
 |---|---|
 | `list` | What is remembered now: the id, whether it is `team` or `me`, who wrote it, its status (`current`, or `contested` when two people hold different values for one subject), the subject and the value. `--team` or `--me` keeps one scope; `--repo` keeps entries made in one git origin. |
 | `show <ID>` | One entry in full: its value, its author, the agent and repository it came from, and the values it replaced. |
 | `forget <ID>` | Deletes the entry. The delete goes to every computer that holds it, as each comes online. |
-| `share <ID>` | Copies one of your `me` entries to the team as a new `team` entry. The `me` entry stays. It refuses an entry that is not your own `me` entry, and when `memory team` is `off`. |
+| `share <ID>` | Copies one of your `me` entries to the team as a new `team` entry. The `me` entry stays. It refuses an entry that is not your own `me` entry, one that was replaced, one you already shared, and any entry when `memory team` is `off`. |
 | `export` | Every entry this computer holds, as stored: one JSON object per line, or one array with `--json`. A forgotten entry has no text left to export. |
 | `last` | The memory block the last session was handed at its start, word for word. |
 | `team on\|off` | Whether team memory may be written from this computer (`memory_team` in `config.toml`, on by default). `off` makes `remember` and `share` refuse `team` entries; what is already held stays. |

@@ -42,6 +42,7 @@ fn rem(subject: &str, fact: &str, replaces: &[&str]) -> Op {
             repo: Some("acme/app".into()),
             session: None,
             on_behalf_of: None,
+            shared_from: None,
         },
         replaces: replaces.iter().map(|s| s.to_string()).collect(),
     }

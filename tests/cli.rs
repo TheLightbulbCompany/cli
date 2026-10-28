@@ -1214,7 +1214,7 @@ fn memory_list_shows_scope_author_and_status() {
         shown.contains("port: 8080") && shown.contains(id),
         "{shown}"
     );
-    assert!(e.run(&["memory", "forget", &id[..8]]).status.success());
+    assert!(e.person(&["memory", "forget", &id[..8]]).status.success());
     assert!(!out(&e.run(&["memory", "list"])).contains("8080"));
     let missing = e.run(&["memory", "show", "abcdef"]);
     assert!(!missing.status.success() && err(&missing).contains("No entry starts with that id"));
@@ -1226,7 +1226,7 @@ fn memory_share_creates_team_entry() {
     assert!(e.run(&["who"]).status.success());
     let mine = remember(&e, "editor", "vim", "me");
     let id = mine["entry_id"].as_str().unwrap();
-    assert!(e.run(&["memory", "share", &id[..10]]).status.success());
+    assert!(e.person(&["memory", "share", &id[..10]]).status.success());
     let facts = lightbulb::memory::facts(&e.store(), None, None).unwrap();
     assert_eq!(facts.len(), 2, "{facts:?}");
     let team = facts
@@ -1243,7 +1243,7 @@ fn memory_share_creates_team_entry() {
         "{shown}"
     );
     // The team entry is not one to share again.
-    let again = e.run(&["memory", "share", &team.id]);
+    let again = e.person(&["memory", "share", &team.id]);
     assert!(!again.status.success() && err(&again).contains("Only an entry of yours"));
 }
 
@@ -1253,7 +1253,7 @@ fn memory_team_off_refuses_team_scope() {
     assert!(e.run(&["who"]).status.success());
     let mine = remember(&e, "editor", "vim", "me");
     let id = mine["entry_id"].as_str().unwrap().to_string();
-    let o = out(&e.run(&["memory", "team", "off"]));
+    let o = out(&e.person(&["memory", "team", "off"]));
     assert!(o.contains("off"), "{o}");
     let r = remember(&e, "db", "postgres 16", "team");
     assert_eq!(
@@ -1261,9 +1261,9 @@ fn memory_team_off_refuses_team_scope() {
         (json!(false), json!("team_off"))
     );
     assert_eq!(remember(&e, "db", "postgres 16", "me")["stored"], true);
-    let share = e.run(&["memory", "share", &id]);
+    let share = e.person(&["memory", "share", &id]);
     assert!(!share.status.success() && err(&share).contains("Team memory is off"));
-    assert!(e.run(&["memory", "team", "on"]).status.success());
+    assert!(e.person(&["memory", "team", "on"]).status.success());
     assert_eq!(remember(&e, "db", "postgres 16", "team")["stored"], true);
 }
 
@@ -1290,4 +1290,101 @@ fn memory_last_prints_block() {
     remember(&e, "db", "postgres 16", "me");
     let j: Value = serde_json::from_str(&out(&e.run(&["memory", "export", "--json"]))).unwrap();
     assert_eq!(j[0]["op"]["fact"], "postgres 16");
+}
+
+#[test]
+fn memory_show_plain_team_entry_has_no_shared_line() {
+    let e = Env::new();
+    assert!(e.run(&["who"]).status.success());
+    let team = remember(&e, "db", "postgres 16", "team");
+    let shown = out(&e.run(&["memory", "show", team["entry_id"].as_str().unwrap()]));
+    assert!(
+        shown.contains("db: postgres 16") && !shown.contains("Shared"),
+        "{shown}"
+    );
+}
+
+#[test]
+fn memory_share_refuses_replaced_entry() {
+    let e = Env::new();
+    assert!(e.run(&["who"]).status.success());
+    let old = remember(&e, "port", "8080", "me");
+    let old = old["entry_id"].as_str().unwrap();
+    let new = e.ask(
+        json!({"id": 1, "op": "memory.remember", "subject": "port", "fact": "9090",
+        "kind": "fact", "scope": "me", "replaces": [old]}),
+    );
+    let o = e.person(&["memory", "share", old]);
+    let msg = err(&o);
+    assert!(!o.status.success() && msg.contains("was replaced"), "{msg}");
+    assert!(msg.contains(new["entry_id"].as_str().unwrap()), "{msg}");
+    assert_eq!(
+        lightbulb::memory::facts(&e.store(), Some(lightbulb::memory::Scope::Team), None)
+            .unwrap()
+            .len(),
+        0
+    );
+}
+
+#[test]
+fn memory_share_twice_is_refused() {
+    let e = Env::new();
+    assert!(e.run(&["who"]).status.success());
+    let id = remember(&e, "editor", "vim", "me")["entry_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(e.person(&["memory", "share", &id]).status.success());
+    let again = e.person(&["memory", "share", &id]);
+    assert!(
+        !again.status.success() && err(&again).contains("already shared"),
+        "{}",
+        err(&again)
+    );
+    assert_eq!(
+        lightbulb::memory::facts(&e.store(), Some(lightbulb::memory::Scope::Team), None)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn memory_share_from_agent_shell_is_refused() {
+    let mut e = Env::new();
+    let birth = os::process(std::process::id()).unwrap().birth_micros;
+    e.pin = Some(format!("{}:{birth}", std::process::id()));
+    e.daemon(false, "", &[]);
+    let id = remember(&e, "editor", "vim", "me")["entry_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for args in [
+        vec!["memory", "share", &id],
+        vec!["memory", "forget", &id],
+        vec!["memory", "team", "off"],
+    ] {
+        let o = e.run(&args);
+        assert!(
+            !o.status.success() && err(&o).contains("from your own terminal"),
+            "{args:?}: {}",
+            err(&o)
+        );
+    }
+    assert_eq!(
+        lightbulb::memory::facts(&e.store(), None, None)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(Config_on(&e));
+    // Reading stays open.
+    assert!(out(&e.run(&["memory", "list"])).contains("vim"));
+}
+
+#[allow(non_snake_case)]
+fn Config_on(e: &Env) -> bool {
+    lightbulb::config::Config::load(e.state.path())
+        .unwrap()
+        .memory_team
 }

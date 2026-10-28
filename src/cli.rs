@@ -571,19 +571,7 @@ pub fn memory(cmd: Memory) -> Result<i32> {
     ];
     let day = |v: &Value| crate::date::day(v.as_i64().unwrap_or_default());
     let s = |v: &Value| cell(v.as_str().unwrap_or_default());
-    let mut conn = if let Memory::Team(on) = &cmd {
-        let dir = paths::state_dir();
-        crate::config::Config::set(&dir, "memory_team", &on.to_string())?;
-        let mut conn = connect()?;
-        ask(&mut conn, "reload", json!({}))?;
-        println!(
-            "Team memory is {} on this computer.",
-            if *on { "on" } else { "off" }
-        );
-        return Ok(0);
-    } else {
-        connect()?
-    };
+    let mut conn = connect()?;
     let (op, body) = match &cmd {
         Memory::List { team, me, repo } => (
             "memory.list",
@@ -597,9 +585,16 @@ pub fn memory(cmd: Memory) -> Result<i32> {
             "memory.last",
             json!({ "session": calling_session(&mut conn) }),
         ),
-        Memory::Team(_) => unreachable!(),
+        Memory::Team(on) => ("memory.team", json!({ "on": on })),
     };
     let r = conn.call(op, body)?;
+    if r["error"] == "replaced" {
+        let now = r["current"]
+            .as_str()
+            .map_or(String::new(), |c| format!(": {c}"));
+        eprintln!("This entry was replaced; share the current one{now}");
+        return Ok(1);
+    }
     if r["ok"] != true {
         return refuse(&r, &texts);
     }
@@ -642,7 +637,7 @@ pub fn memory(cmd: Memory) -> Result<i32> {
                 s(&src["harness"]),
                 src["repo"].as_str().map_or("no repository".into(), cell)
             );
-            if let Some(from) = src["session"].as_str().filter(|_| f["scope"] == "team") {
+            if let Some(from) = src["shared_from"].as_str() {
                 println!("Shared  from your entry {}", cell(from));
             }
             for h in f["history"].as_array().into_iter().flatten() {
@@ -663,7 +658,10 @@ pub fn memory(cmd: Memory) -> Result<i32> {
             Some(b) => println!("{b}"),
             None => println!("No session has been handed a memory block yet."),
         },
-        Memory::Team(_) => {}
+        Memory::Team(on) => println!(
+            "Team memory is {} on this computer.",
+            if on { "on" } else { "off" }
+        ),
     }
     Ok(0)
 }

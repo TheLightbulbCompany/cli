@@ -38,6 +38,9 @@ pub struct Source {
     pub repo: Option<String>,
     pub session: Option<String>,
     pub on_behalf_of: Option<String>,
+    /// The id of the `me` entry this `team` entry was copied from (`memory share`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_from: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
