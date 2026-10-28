@@ -844,7 +844,7 @@ impl Net {
                 expired_at = Some(std::time::Instant::now());
             }
             match flush(d, all, expire) {
-                Ok(wake) => wake.iter().for_each(|k| ipc::stored(d, k, None)),
+                Ok(wake) => (wake.iter()).for_each(|(k, id)| ipc::stored(d, k, Some(id))),
                 Err(e) => eprintln!("net: outbox: {e}"),
             }
         }
@@ -1310,9 +1310,9 @@ fn receipt_changed(d: &Daemon, id: &str, state: &str, reason: Option<&str>) {
 
 /// One flush (`Net::flush_loop`): with `all`, every queued envelope of an online member,
 /// whatever its backoff; with `expire`, first what waited too long.
-/// Returns the askers whose assignments just timed out, for the caller to wake (`ipc::stored`
-/// needs the `Arc`).
-fn flush(d: &Daemon, all: bool, expire: bool) -> Result<Vec<Key>> {
+/// Returns the askers whose assignments just timed out, with each timeout result's id, for the
+/// caller to wake (`ipc::stored` needs the `Arc`; the id wakes a hosted app's bot).
+fn flush(d: &Daemon, all: bool, expire: bool) -> Result<Vec<(Key, String)>> {
     let now = ipc::now();
     let online = d.peers.online();
     let store = d.store.lock().unwrap();
