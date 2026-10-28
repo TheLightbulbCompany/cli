@@ -3,7 +3,7 @@ use std::path::Path;
 
 /// Migration `i` takes the db to `user_version` `i + 1`. Forward only; each one only adds
 /// tables or columns, and runs once (in the transaction that moves `user_version`).
-const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11];
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12];
 
 const V1: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
@@ -101,6 +101,20 @@ CREATE TABLE IF NOT EXISTS capture_tool_calls (
     session_id TEXT NOT NULL, seq INTEGER NOT NULL, at INTEGER NOT NULL, tool TEXT NOT NULL,
     summary TEXT, duration_ms INTEGER, ok INTEGER NOT NULL, PRIMARY KEY (session_id, seq)
 );
+";
+/// Memory search stems words (`porter`: tests/test, deploys/deploy), so the index is rebuilt
+/// from the entries as the triggers write it; V9's triggers stay. `memory_seen`: the highest
+/// seq a peer has reported holding for one of our own keys, so an entry written after a
+/// restored `state.db` never reuses a number peers already hold.
+const V12: &str = "
+DROP TABLE IF EXISTS memory_fts;
+CREATE VIRTUAL TABLE memory_fts USING fts5(
+    subject, fact, content='memory_entries', content_rowid='rowid', tokenize='porter unicode61'
+);
+INSERT INTO memory_fts(rowid, subject, fact)
+    SELECT rowid, json_extract(entry, '$.op.subject'), json_extract(entry, '$.op.fact')
+    FROM memory_entries;
+CREATE TABLE IF NOT EXISTS memory_seen (author TEXT PRIMARY KEY, seq INTEGER NOT NULL);
 ";
 /// Memory: signed entries numbered per author, with a full-text index over `subject` and `fact`
 /// (`memory`). `rowid` is explicit so it survives `VACUUM` (the FTS index points at it). A
@@ -1056,10 +1070,10 @@ mod tests {
         let path = dir.path().join("state.db");
         Connection::open(&path)
             .unwrap()
-            .execute_batch("PRAGMA user_version = 12;")
+            .execute_batch("PRAGMA user_version = 13;")
             .unwrap();
         let err = Store::open(&path).err().unwrap().to_string();
-        assert!(err.contains("State is from a newer version (v12)"), "{err}");
-        assert_eq!(user_version(&path), 12);
+        assert!(err.contains("State is from a newer version (v13)"), "{err}");
+        assert_eq!(user_version(&path), 13);
     }
 }

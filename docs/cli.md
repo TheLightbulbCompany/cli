@@ -366,7 +366,7 @@ more). `forget`, `share`, `team`, `drafts`, `approve` and `dismiss` must be run 
 | `forget <ID>` | Deletes the entry. The delete goes to every computer that holds it, as each comes online. |
 | `share <ID>` | Copies one of your `me` entries to the team as a new `team` entry. The `me` entry stays. It refuses an entry that is not your own `me` entry, one that was replaced, one you already shared, and any entry when `memory team` is `off`. |
 | `export` | Every entry this computer holds, as stored: one JSON object per line, or one array with `--json`. A forgotten entry has no text left to export. |
-| `last` | The memory block the last session was handed at its start, word for word. |
+| `last` | The memory block the last session was handed at its start, word for word. Any `forget` clears it (`No session has been handed a memory block yet.`) until the next session starts. |
 | `team on\|off` | Whether team memory may be written from this computer (`memory_team` in `config.toml`, on by default). `off` makes `remember` and `share` refuse `team` entries; what is already held stays. |
 | `drafts` | The lessons Lightbulb's evaluator suggests from sessions you uploaded in full (see `sessions upload`): the id, the kind, the first line and how many sessions it came from. Needs `lightbulb login`. |
 | `approve <ID> [--team]` | Keeps a suggested lesson. Signed in on your own, it becomes a `me` entry on this computer, marked as from the cloud evaluator. In a workspace it says `Approved; the workspace will remember it` and the entry arrives through the network; `--team` shares it with the whole workspace. It says so if the draft was settled elsewhere, or refused (a secret, or too long). |

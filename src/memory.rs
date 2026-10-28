@@ -9,7 +9,7 @@ use crate::store::Store;
 use crate::Result;
 use data_encoding::HEXLOWER;
 use regex::Regex;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -116,13 +116,14 @@ pub fn remember(store: &Store, id: &Identity, op: Op, now: i64) -> Result<Entry>
         }
     }
     let tx = store.conn().unchecked_transaction()?;
-    let seq: Option<u64> = tx
-        .query_row(
-            "SELECT seq FROM memory_heads WHERE author = ?1",
-            [&id.key],
-            |r| r.get(0),
-        )
-        .optional()?;
+    // Past what we hold and what a peer said it holds of ours (`saw`): a restored state.db
+    // never reuses a number peers already hold.
+    let seq: Option<u64> = tx.query_row(
+        "SELECT MAX(seq) FROM (SELECT seq FROM memory_heads WHERE author = ?1
+         UNION ALL SELECT seq FROM memory_seen WHERE author = ?1)",
+        [&id.key],
+        |r| r.get(0),
+    )?;
     let mut e = Entry {
         v: 1,
         id: String::new(),
@@ -165,7 +166,8 @@ pub fn accept(store: &Store, e: &Entry, now: i64) -> Result<bool> {
 
 /// The row for verified `e`; `Ok(false)` when its id is held. A `Forget` is an entry like any
 /// other, and tombstones its target (any member's forget applies): the target's body is dropped
-/// if held, and if it arrives later it is stored without its text.
+/// if held, and if it arrives later it is stored without its text; every `memory_last` block
+/// is cleared.
 fn insert(conn: &rusqlite::Connection, e: &Entry, now: i64) -> Result<bool> {
     let held = conn
         .prepare_cached("SELECT 1 FROM memory_entries WHERE id = ?1")?
@@ -196,8 +198,21 @@ fn insert(conn: &rusqlite::Connection, e: &Entry, now: i64) -> Result<bool> {
              WHERE id = ?1 AND json_extract(entry, '$.op.t') = 'remember'",
             [target],
         )?;
+        // The blocks handed out may quote it: all go (the next session start makes its own).
+        conn.execute("DELETE FROM memory_last", [])?;
     }
     Ok(true)
+}
+
+/// A peer holds `key`'s entries up to `seq` (its `MemoryHeads`): kept, so our next entry is
+/// numbered past it.
+pub fn saw(store: &Store, key: &str, seq: u64) -> Result<()> {
+    store.conn().execute(
+        "INSERT INTO memory_seen (author, seq) VALUES (?1, ?2)
+         ON CONFLICT(author) DO UPDATE SET seq = MAX(seq, excluded.seq)",
+        params![key, seq],
+    )?;
+    Ok(())
 }
 
 /// Each author's highest `seq` held.
@@ -427,18 +442,41 @@ pub fn page_since(store: &Store, after: i64, limit: usize) -> Result<Vec<(i64, V
     Ok(out)
 }
 
-/// The best `limit` matches for `query` (FTS5 `bm25`, subject and fact), as `facts` shows them;
-/// a match that has since been replaced says so. Every word must match.
+/// Words a question carries that say nothing about what is asked.
+const STOPWORDS: [&str; 37] = [
+    "how", "do", "does", "we", "i", "you", "the", "a", "an", "of", "to", "in", "on", "is", "are",
+    "was", "were", "be", "it", "that", "this", "what", "when", "where", "which", "who", "why",
+    "before", "after", "with", "for", "and", "or", "not", "our", "my", "your",
+];
+
+/// The best `limit` matches for `query` (FTS5 `bm25`, subject and fact, stemmed), as `facts`
+/// shows them; a match that has since been replaced says so. Any word but a stopword may match,
+/// a word of 3 or more characters as a prefix too; a query of stopwords only is matched as the
+/// whole phrase.
 pub fn search(store: &Store, query: &str, limit: usize) -> Result<Vec<Fact>> {
-    // Each word quoted, so FTS5 syntax in a query is text.
-    let q = query
+    // Each word quoted (its own quotes dropped), so FTS5 syntax in a query is text.
+    let words: Vec<String> = query
         .split_whitespace()
-        .map(|w| format!("\"{}\"", w.replace('"', "")))
+        .map(|w| w.replace('"', ""))
+        .filter(|w| !w.is_empty())
+        .collect();
+    let q = words
+        .iter()
+        .filter(|w| !STOPWORDS.contains(&w.to_lowercase().as_str()))
+        .map(|w| {
+            let star = if w.chars().count() >= 3 { "*" } else { "" };
+            format!("\"{w}\"{star}")
+        })
         .collect::<Vec<_>>()
-        .join(" ");
-    if q.is_empty() {
+        .join(" OR ");
+    if words.is_empty() {
         return Ok(Vec::new());
     }
+    let q = if q.is_empty() {
+        format!("\"{}\"", words.join(" "))
+    } else {
+        q
+    };
     let mut stmt = store.conn().prepare(
         "SELECT m.id FROM memory_fts JOIN memory_entries m ON m.rowid = memory_fts.rowid
          WHERE memory_fts MATCH ?1 ORDER BY bm25(memory_fts) LIMIT ?2",

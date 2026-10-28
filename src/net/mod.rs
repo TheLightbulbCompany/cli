@@ -1175,6 +1175,12 @@ impl Net {
         if let Some(theirs) = memory_heads.filter(|_| d.peers.speaks_memory(key, conn)) {
             let (d, tx, key, conn) = (d.clone(), tx.clone(), key.to_string(), conn.clone());
             tokio::task::spawn_blocking(move || {
+                // What the peer holds of ours numbers our next entry (`memory::saw`).
+                if let Some(&n) = theirs.get(&d.identity.key) {
+                    if let Err(e) = memory::saw(&d.store.lock().unwrap(), &d.identity.key, n) {
+                        eprintln!("net: memory seen: {e}");
+                    }
+                }
                 // No answer with our own heads: they are sent when they change.
                 match memsync::send_pages(&d, &tx, &theirs, memsync::same_person(&d, &key)) {
                     Ok(ours) => {

@@ -164,6 +164,78 @@ fn search_finds_by_subject_and_fact() {
     assert!(memory::search(&s, "kubernetes", 5).unwrap().is_empty());
 }
 
+/// Agents ask questions: any word of one may match (stemmed, prefix), stopwords aside.
+#[test]
+fn search_matches_natural_questions() {
+    let a = identity();
+    let (_d, s) = team(&a);
+    let fact = "Run the suite with cargo test --workspace before pushing";
+    memory::remember(&s, &a, rem("test runner", fact, &[]), 1).unwrap();
+    memory::remember(&s, &a, rem("deploy", "fridays only", &[]), 2).unwrap();
+    for q in [
+        "How do we run tests before pushing?",
+        "tests",
+        "cargo test",
+        "run the suite",
+    ] {
+        let hits = memory::search(&s, q, 5).unwrap();
+        assert_eq!(hits.len(), 1, "{q}: {hits:?}");
+        assert_eq!(hits[0].subject, "test runner", "{q}");
+    }
+    // Stemmed both ways.
+    assert_eq!(
+        memory::search(&s, "deploys", 5).unwrap()[0].subject,
+        "deploy"
+    );
+    // FTS5 syntax is text, never an error.
+    for q in [r#"cargo" OR "x*"#, "* NEAR( OR", r#"""#, "tests*"] {
+        assert!(memory::search(&s, q, 5).is_ok(), "{q}");
+    }
+    assert_eq!(memory::search(&s, r#"cargo" OR "x*"#, 5).unwrap().len(), 1);
+}
+
+/// A state.db from before stemming gets its index rebuilt stemmed, entries kept.
+#[test]
+fn an_older_index_is_rebuilt_stemmed() {
+    let a = identity();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let s = Store::open(&path).unwrap();
+    memory::remember(&s, &a, rem("test runner", "cargo test", &[]), 1).unwrap();
+    drop(s);
+    // Back to v11: the index as V9 made it, no `memory_seen`.
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "DROP TABLE memory_fts; DROP TABLE memory_seen;
+             CREATE VIRTUAL TABLE memory_fts USING fts5(
+                 subject, fact, content='memory_entries', content_rowid='rowid');
+             INSERT INTO memory_fts(rowid, subject, fact) SELECT rowid,
+                 json_extract(entry, '$.op.subject'), json_extract(entry, '$.op.fact')
+                 FROM memory_entries;
+             PRAGMA user_version = 11;",
+        )
+        .unwrap();
+    let s = Store::open(&path).unwrap();
+    assert_eq!(memory::search(&s, "tests", 5).unwrap().len(), 1);
+    // The triggers still feed the new index.
+    memory::remember(&s, &a, rem("deploy", "fridays", &[]), 2).unwrap();
+    assert_eq!(memory::search(&s, "deploys", 5).unwrap().len(), 1);
+}
+
+/// A question of stopwords only is matched as the whole phrase.
+#[test]
+fn a_stopword_question_matches_as_a_phrase() {
+    let a = identity();
+    let (_d, s) = team(&a);
+    memory::remember(&s, &a, rem("motto", "what we do is ship", &[]), 1).unwrap();
+    memory::remember(&s, &a, rem("ci", "we use what works", &[]), 2).unwrap();
+    let hits = memory::search(&s, "what we", 5).unwrap();
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(hits[0].subject, "motto");
+    assert!(memory::search(&s, "how is it", 5).unwrap().is_empty());
+}
+
 #[test]
 fn refuse_secret_matches_the_six_patterns() {
     for (text, name) in [

@@ -129,7 +129,8 @@ wrote it.
   a token, a private key, or a credential in a URL (`https://user:password@host`), and stores
   nothing. It does not try to remove the secret and keep the rest. The check is a pattern match,
   so it will miss some and flag some. Do not rely on it to catch everything.
-- **`forget`.** It deletes the entry's text on this computer and sends the delete to every other
+- **`forget`.** It deletes the entry's text on this computer, clears the memory blocks kept for
+  `lightbulb memory last` (the next session start makes a new one), and sends the delete to every other
   computer, which applies it when it comes online. Any member's `forget` applies, not only the
   author's. A computer that never comes online again keeps what it held, and so does anyone who
   copied it before. The entry's id stays as a marker.

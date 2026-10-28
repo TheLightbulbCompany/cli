@@ -234,3 +234,42 @@ async fn me_latest_on_both_sides_does_not_ping_pong() {
     assert!((1..=3).contains(&na) && (1..=3).contains(&nb), "{na} {nb}");
     assert_eq!((held(&b, &ka).len(), held(&a, &kb).len()), (1, 1));
 }
+
+/// A node restored to an older state.db (its key kept) is told by a peer how far it got, and
+/// numbers its next entry past that, so the peer stores it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restored_node_numbers_past_what_peers_hold() {
+    let (a, b) = (Env::new(), Env::new());
+    seed_pair(&a, &b);
+    let ka = a.identity().key;
+    // B holds A's first three; A then loses them (an older state.db restored).
+    for i in 0..3 {
+        let e = remember(&a, op(&format!("s{i}"), "x", Scope::Team));
+        assert!(memory::accept(&b.store(), &e, 10).unwrap());
+    }
+    rusqlite::Connection::open(a.state.path().join("state.db"))
+        .unwrap()
+        .execute("DELETE FROM memory_entries", [])
+        .unwrap();
+    a.daemon(false, "", &[]);
+    let ep = endpoint(&b.identity()).await;
+    let mut p = Peer::dial(&ep, &a).await;
+    p.hello_full(vec![], None, true).await;
+    p.send(&Frame::MemoryHeads {
+        heads: memory::heads(&b.store()).unwrap(),
+    })
+    .await;
+    until(5, "A records what B holds of it", || {
+        common::count(
+            &a.state.path().join("state.db"),
+            "SELECT COALESCE(MAX(seq), 0) FROM memory_seen",
+        ) == 3
+    });
+    let next = remember(&a, op("s3", "after the restore", Scope::Team));
+    assert_eq!(next.seq, 4);
+    assert!(
+        memory::accept(&b.store(), &next, 10).unwrap(),
+        "B stores it"
+    );
+    assert_eq!(held(&b, &ka).len(), 4);
+}

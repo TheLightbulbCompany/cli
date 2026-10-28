@@ -1292,6 +1292,30 @@ fn memory_last_prints_block() {
     assert_eq!(j[0]["op"]["fact"], "postgres 16");
 }
 
+/// A forgotten fact is not left word for word in the last block handed out.
+#[test]
+fn memory_forget_clears_the_last_block() {
+    let e = Env::new();
+    assert!(e.run(&["who"]).status.success());
+    let id = remember(&e, "db", "postgres 16", "me")["entry_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for s in ["s1", "s2"] {
+        e.store()
+            .set_memory_last(s, "Memory (team and yours):\nCurrent:\ndb: postgres 16", 1)
+            .unwrap();
+    }
+    let o = e.person(&["memory", "forget", &id]);
+    assert!(o.status.success(), "{}", err(&o));
+    let last = out(&e.run(&["memory", "last"]));
+    assert!(!last.contains("postgres"), "{last}");
+    assert!(
+        last.contains("No session has been handed a memory block yet"),
+        "{last}"
+    );
+}
+
 #[test]
 fn memory_show_plain_team_entry_has_no_shared_line() {
     let e = Env::new();
