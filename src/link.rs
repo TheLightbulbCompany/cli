@@ -8,7 +8,7 @@
 //! `lightbulb-route`, its sign-in proof and its name); Lightbulb answers `{type: ready, person}`, the opaque handle of the
 //! signed-in person. From then on Lightbulb asks `{id, op, ...}` and this computer answers
 //! `{id, ok, result}` or `{id, ok: false, error, reason?}`. Only these ops run, and only for the
-//! app sessions `<me>/<app>-<person>` of that person: `app.send`, `app.inbox` (`peek`), `app.ack`,
+//! app sessions `<me>/<app>-<person>` of that person: `app.send` (which may carry a kind), `app.inbox` (`peek`), `app.ack`,
 //! `app.unread`, `app.receipt` (`app_send`) and `directory`. Each app op carries the app
 //! session's `title`, which declares it here (published in presence, like a workspace's). New
 //! mail for one of them sends `{type: mail, session}`, so Lightbulb can wake a bot that asked.
