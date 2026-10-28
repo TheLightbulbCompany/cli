@@ -29,7 +29,8 @@ async fn call(
 }
 
 /// One Claude home for the whole binary (the env var is process-wide): this process is
-/// registered as two Claude sessions, `ok-conv` (socket `ok.sock`) and `gone-conv` (`gone.sock`).
+/// registered as three Claude sessions, `ok-conv` (socket `ok.sock`), `gone-conv` (`gone.sock`)
+/// and `assign-conv` (`assign.sock`).
 fn claude_home() -> &'static Path {
     static HOME: OnceLock<tempfile::TempDir> = OnceLock::new();
     HOME.get_or_init(|| {
@@ -38,7 +39,11 @@ fn claude_home() -> &'static Path {
         std::fs::create_dir_all(&dir).unwrap();
         let me = std::process::id();
         let started = os::started_ms(me).unwrap();
-        for (file, conv, sock) in [("a", "ok-conv", "ok.sock"), ("b", "gone-conv", "gone.sock")] {
+        for (file, conv, sock) in [
+            ("a", "ok-conv", "ok.sock"),
+            ("b", "gone-conv", "gone.sock"),
+            ("c", "assign-conv", "assign.sock"),
+        ] {
             let entry = json!({"pid": me, "sessionId": conv, "cwd": "/tmp", "startedAt": started,
                 "kind": "interactive", "status": "idle",
                 "messagingSocketPath": home.path().join(sock)});
@@ -134,6 +139,50 @@ async fn claude_push_posts_a_user_frame_to_the_inbox_socket_and_marks_delivered(
     assert_eq!(state, "delivered");
     let unread = call(&mut l, &mut w, json!({"id": 4, "op": "unread", "key": to})).await;
     assert_eq!(unread["unread"], 0);
+}
+
+/// An assignment is pushed with its own header: its done_when and deadline, and how to answer.
+#[tokio::test]
+async fn claude_push_frames_an_assignment_as_one() {
+    let listener = UnixListener::bind(claude_home().join("assign.sock")).unwrap();
+    let (_dir, mut l, mut w, to) = start("assign-conv").await;
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    };
+    let before = now();
+    let sent = call(
+        &mut l,
+        &mut w,
+        json!({"id": 3, "op": "send", "from": "x/codex:a", "to": to, "kind": "assign",
+        "text": "run the tests", "done_when": "tests pass", "deadline_s": 600,
+        "request_id": "as1"}),
+    )
+    .await;
+    let after = now();
+    assert_eq!(sent["receipt"]["state"], "stored", "{sent}");
+
+    let (conn, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut got = String::new();
+    BufReader::new(conn).read_line(&mut got).await.unwrap();
+    let got: Value = serde_json::from_str(&got).unwrap();
+    let content = got["message"]["content"].as_str().unwrap();
+    let framed = (before..=after)
+        .map(|t| {
+            let meta = lightbulb::mail::Meta {
+                done_when: Some("tests pass".into()),
+                deadline_at: Some(t + 600),
+                ..Default::default()
+            };
+            frame::framed_kind("assign", "Your Codex", "as1", None, &meta, "run the tests")
+        })
+        .find(|f| f == content);
+    assert!(framed.is_some(), "{content}");
 }
 
 #[tokio::test]
