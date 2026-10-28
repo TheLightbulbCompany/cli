@@ -368,11 +368,7 @@ pub fn vectors(store: &Store) -> Result<Vec<(String, Vec<f32>)>> {
     let mut out = Vec::new();
     for row in rows {
         let (id, blob) = row?;
-        if current.contains(&id) && blob.len() == embed_model::DIM * 4 {
-            let v = blob
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect();
+        if let Some(v) = unblob(&blob).filter(|_| current.contains(&id)) {
             out.push((id, v));
         }
     }
@@ -659,12 +655,35 @@ const STOPWORDS: [&str; 37] = [
 const COSINE_FLOOR: f32 = 0.25;
 
 pub fn search(store: &Store, query: &str, limit: usize) -> Result<Vec<Fact>> {
-    // Each word quoted (its own quotes dropped), so FTS5 syntax in a query is text.
+    let Some(q) = fts_query(query) else {
+        return Ok(Vec::new());
+    };
+    let mut stmt = store.conn().prepare(
+        "SELECT m.id FROM memory_fts JOIN memory_entries m ON m.rowid = memory_fts.rowid
+         WHERE memory_fts MATCH ?1 ORDER BY bm25(memory_fts) LIMIT ?2",
+    )?;
+    let ids: Vec<String> = stmt
+        .query_map(params![q, limit], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let ids = fuse(ids, query, || vectors(store), limit)?;
+    let mut all: HashMap<String, Fact> = replay(store)?
+        .into_iter()
+        .map(|l| (l.fact.id.clone(), l.fact))
+        .collect();
+    Ok(ids.iter().filter_map(|id| all.remove(id)).collect())
+}
+
+/// `query` as an FTS5 match: each word quoted (its own quotes dropped, so FTS5 syntax in a
+/// query is text). `None` for a query with no words.
+pub(crate) fn fts_query(query: &str) -> Option<String> {
     let words: Vec<String> = query
         .split_whitespace()
         .map(|w| w.replace('"', ""))
         .filter(|w| !w.is_empty())
         .collect();
+    if words.is_empty() {
+        return None;
+    }
     let q = words
         .iter()
         .filter(|w| !STOPWORDS.contains(&w.to_lowercase().as_str()))
@@ -674,46 +693,47 @@ pub fn search(store: &Store, query: &str, limit: usize) -> Result<Vec<Fact>> {
         })
         .collect::<Vec<_>>()
         .join(" OR ");
-    if words.is_empty() {
-        return Ok(Vec::new());
-    }
-    let q = if q.is_empty() {
+    Some(if q.is_empty() {
         format!("\"{}\"", words.join(" "))
     } else {
         q
+    })
+}
+
+/// The bm25 order `ids`, fused with the cosine order of `query`'s embedding over `vecs` when
+/// there is a model; `ids` as they are without one (`vecs` is then never read).
+pub(crate) fn fuse(
+    ids: Vec<String>,
+    query: &str,
+    vecs: impl FnOnce() -> Result<Vec<(String, Vec<f32>)>>,
+    limit: usize,
+) -> Result<Vec<String>> {
+    let Some(qv) = embed_model::text(query) else {
+        return Ok(ids);
     };
-    let mut stmt = store.conn().prepare(
-        "SELECT m.id FROM memory_fts JOIN memory_entries m ON m.rowid = memory_fts.rowid
-         WHERE memory_fts MATCH ?1 ORDER BY bm25(memory_fts) LIMIT ?2",
-    )?;
-    let ids: Vec<String> = stmt
-        .query_map(params![q, limit], |r| r.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    // With a model, fuse the bm25 order with the cosine order of the query's embedding.
-    let ids = match embed_model::text(query) {
-        Some(qv) => {
-            let mut scored: Vec<(f32, String)> = vectors(store)?
-                .into_iter()
-                .map(|(id, v)| (embed_model::cosine(&qv, &v), id))
-                .collect();
-            scored.sort_by(|a, b| b.0.total_cmp(&a.0));
-            // Below the floor a candidate shares no meaning with the question: without it a
-            // short or nonsense question fills the page with whatever is nearest.
-            let cos: Vec<String> = scored
-                .into_iter()
-                .filter(|s| s.0 >= COSINE_FLOOR)
-                .take(50)
-                .map(|s| s.1)
-                .collect();
-            rrf(&[ids, cos], limit)
-        }
-        None => ids,
-    };
-    let mut all: HashMap<String, Fact> = replay(store)?
+    let mut scored: Vec<(f32, String)> = vecs()?
         .into_iter()
-        .map(|l| (l.fact.id.clone(), l.fact))
+        .map(|(id, v)| (embed_model::cosine(&qv, &v), id))
         .collect();
-    Ok(ids.iter().filter_map(|id| all.remove(id)).collect())
+    scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+    // Below the floor a candidate shares no meaning with the question: without it a
+    // short or nonsense question fills the page with whatever is nearest.
+    let cos: Vec<String> = scored
+        .into_iter()
+        .filter(|s| s.0 >= COSINE_FLOOR)
+        .take(50)
+        .map(|s| s.1)
+        .collect();
+    Ok(rrf(&[ids, cos], limit))
+}
+
+/// A stored vector, or `None` when its blob is not one of this model's.
+pub(crate) fn unblob(blob: &[u8]) -> Option<Vec<f32>> {
+    (blob.len() == embed_model::DIM * 4).then(|| {
+        blob.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    })
 }
 
 /// Reciprocal rank fusion (k = 60) of ranked id lists, best first, cut to `limit`.
@@ -761,7 +781,8 @@ pub fn refuse_secret(text: &str) -> Option<&'static str> {
 }
 
 /// What an agent reads: `Contested:` lines, then `Current:`, then `Lessons:` (replaced facts
-/// left out), whole lines only, within `budget` chars. `names` maps a member key to the name
+/// left out), then `Turns:` (excerpts of this computer's own session turns), whole lines only,
+/// within `budget` chars. `names` maps a member key to the name
 /// shown (the short key when it is not there).
 /// The heading and the instruction line a session-start block carries around the page.
 pub const BLOCK_HEADING: &str = "Memory (team and yours):";
@@ -778,6 +799,7 @@ pub fn block(page: &str) -> String {
 pub fn page(
     store: &Store,
     facts: &[Fact],
+    turns: &[crate::capture::TurnHit],
     names: &HashMap<String, String>,
     budget: usize,
 ) -> String {
@@ -845,6 +867,7 @@ pub fn page(
         ("Contested:", contested),
         ("Current:", current),
         ("Lessons:", lessons),
+        ("Turns:", turns.iter().map(|t| t.line()).collect()),
     ] {
         let mut headed = false;
         for l in &lines {

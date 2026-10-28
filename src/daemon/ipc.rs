@@ -657,9 +657,10 @@ fn capture_op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, person: boo
     }
 }
 
-/// `memory.recall {question, budget_chars?, repo?, session?}` -> `{page, facts}`: what the team holds
-/// that matches `question` (all of it when empty, or only `repo`'s, team facts first), as the page
-/// an agent reads and as facts. With `repo` and `session` (a session-start hook) the page is kept
+/// `memory.recall {question, budget_chars?, repo?, session?}` -> `{page, facts, turns}`: what the
+/// team holds that matches `question` (all of it when empty, or only `repo`'s, team facts first),
+/// as the page an agent reads and as facts, and up to 5 of this computer's own turns that match a
+/// question (never for an empty one). With `repo` and `session` (a session-start hook) the page is kept
 /// for `memory last`.
 fn memory_recall(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
     use crate::memory::{self, Status};
@@ -684,7 +685,16 @@ fn memory_recall(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
         return Response::err(id, INTERNAL);
     };
     facts.retain(|f| f.status != Status::Replaced);
-    let page = memory::page(&store, &facts, &names, budget);
+    // The session-start block (an empty question) never carries turns.
+    let turns = if q.trim().is_empty() {
+        Ok(Vec::new())
+    } else {
+        crate::capture::search_turns(&store, q, 5)
+    };
+    let Ok(turns) = turns else {
+        return Response::err(id, INTERNAL);
+    };
+    let page = memory::page(&store, &facts, &turns, &names, budget);
     let block = memory::block(&page);
     if let (Some(_), Some(session), false) = (
         body["repo"].as_str(),
@@ -695,7 +705,7 @@ fn memory_recall(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
     }
     Response::ok(
         id,
-        json!({ "page": page, "block": block, "facts": facts.iter().map(fact_json).collect::<Vec<_>>() }),
+        json!({ "page": page, "block": block, "facts": facts.iter().map(fact_json).collect::<Vec<_>>(), "turns": turns }),
     )
 }
 

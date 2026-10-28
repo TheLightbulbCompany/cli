@@ -69,7 +69,10 @@ Run `lightbulb <command> --help` for the options of each one.
 ## Memory
 
 Your agents can remember things (a decision, a lesson, a preference) with the `remember` tool and
-look them up with `recall`. Each entry is `me` or `team`.
+look them up with `recall`. Each entry is `me` or `team`. Under `Turns:`, `recall` also shows up
+to five short excerpts from this computer's own session turns that match the question; the block
+handed over at a session's start never includes them, and a turn refused for a secret is never
+shown.
 
 - `team` entries go to every member of the team.
 - `me` entries go only to your own signed-in computers. If this computer is not signed in, a `me`

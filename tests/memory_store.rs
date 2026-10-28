@@ -632,7 +632,7 @@ fn a_long_current_section_does_not_hide_lessons() {
     let lesson = rem_as("tests", "run them twice", Scope::Team, Kind::Lesson);
     memory::remember(&s, &a, lesson, 3).unwrap();
     let f = memory::facts(&s, None, None).unwrap();
-    let page = memory::page(&s, &f, &Default::default(), 200);
+    let page = memory::page(&s, &f, &[], &Default::default(), 200);
     // The long line does not fit and is left out; the line after it and the lessons are kept.
     assert!(!page.contains("yyy"), "{page}");
     assert!(page.starts_with("Current:\nshort: x ("), "{page}");
@@ -658,7 +658,7 @@ fn a_me_value_does_not_contest_a_team_value() {
     memory::remember(&s, &a, team_op("zed"), 4).unwrap();
     let f = memory::facts(&s, None, None).unwrap();
     assert!(f.iter().all(|x| x.status == Status::Contested), "{f:?}");
-    let page = memory::page(&s, &f, &Default::default(), 1600);
+    let page = memory::page(&s, &f, &[], &Default::default(), 1600);
     let lines: Vec<&str> = page.lines().collect();
     assert_eq!(lines.len(), 3, "{page}");
     assert_eq!(lines[0], "Contested:");
