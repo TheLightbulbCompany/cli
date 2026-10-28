@@ -113,7 +113,7 @@ pub fn takes_mail(h: &Hook) -> bool {
     match (h.provider, h.event) {
         (_, Event::SessionEnd) => false,
         // Grok ignores a SessionStart hook's stdout (docs.x.ai/build/features/hooks).
-        ("cursor", Event::SessionStart) => true,
+        ("cursor" | "opencode", Event::SessionStart) => true,
         ("cursor" | "grok" | "opencode", e) => matches!(e, Event::PostToolUse | Event::Stop),
         _ => true,
     }
@@ -681,7 +681,7 @@ mod tests {
             let start = e == Event::SessionStart;
             assert_eq!(takes_mail(&hook("cursor", e)), tool_or_stop || start);
             assert_eq!(takes_mail(&hook("grok", e)), tool_or_stop);
-            assert_eq!(takes_mail(&hook("opencode", e)), tool_or_stop);
+            assert_eq!(takes_mail(&hook("opencode", e)), tool_or_stop || start);
         }
     }
 

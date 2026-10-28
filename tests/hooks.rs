@@ -1000,3 +1000,34 @@ fn cursor_session_start_includes_the_memory_block() {
     assert!(text.contains("ci: github actions"), "{text}");
     assert!(text.ends_with(INSTRUCTION), "{text}");
 }
+
+/// Our OpenCode plugin asks the start hook for mail and the block before the session's first
+/// request and adds the text to the system prompt: the hook offers both, and acks nothing itself.
+#[test]
+fn opencode_session_start_includes_the_memory_block() {
+    let net = Net::new();
+    let cli = repo_dir("cli");
+    claude_hook(&net, "session-start", "SessionStart", A, cli.path());
+    remember_in(&net, &net.key("claude", A), "ci", "github actions", "team");
+    let conv = "ses_0a1b2c3d4e5fOpEnCoDe0003";
+    let start = |mail: bool| {
+        agent_hook(
+            &net,
+            "opencode",
+            "session-start",
+            json!({"session_id": conv, "cwd": cli.path(), "mail": mail}),
+        )
+    };
+    // At session.created the plugin asks for no mail: it registers, and nothing is offered.
+    assert_eq!(start(false), "");
+    let key = net.key("opencode", conv);
+    net.send(&key, "body r1", "r1");
+    let out: Value = serde_json::from_str(&start(true)).unwrap();
+    let text = out["text"].as_str().unwrap();
+    let (mail, block) = text.split_once("\n\nMemory (team and yours):\n").unwrap();
+    assert_eq!(mail, frame_of("r1"));
+    assert!(block.contains("ci: github actions"), "{block}");
+    assert!(block.ends_with(INSTRUCTION), "{block}");
+    assert_eq!(out["ids"].as_array().map(Vec::len), Some(1), "{out}");
+    assert_eq!(net.receipt("r1"), "stored");
+}

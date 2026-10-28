@@ -5,6 +5,8 @@
 //   EXE hook opencode stop            (the session goes idle)
 //   EXE hook opencode session-end     (the session is deleted)
 // with {session_id, cwd, mail} on stdin, and puts the text a hook offers into the session.
+// Before a session's first request it runs session-start once more with mail, and adds what it
+// offers (mail and the memory block) to the system prompt of each of the session's requests.
 // The offer leaves the mail waiting; only once the prompt is in does it run
 //   EXE hook opencode ack             ({session_id, ids} on stdin)
 // so a push that fails is offered again at the next step (a resend may repeat a message,
@@ -76,6 +78,24 @@ const step = async (arg, id, cwd, push, extra) => {
   }
 }
 
+// Session id -> the text its start hook offered, or null: asked for once (a promise, so requests
+// at once share it) and kept, since OpenCode builds the system prompt anew for each request. Its
+// mail is acked as soon as it is offered: the caller adds the text, which cannot fail.
+const starts = new Map()
+const start = (id, cwd) => {
+  if (!starts.has(id)) {
+    starts.set(
+      id,
+      hook("session-start", id, cwd, true).then((offer) => {
+        if (typeof offer?.text !== "string") return null
+        if (Array.isArray(offer.ids) && offer.ids.length) hook("ack", id, cwd, false, { ids: offer.ids })
+        return offer.text
+      }),
+    )
+  }
+  return starts.get(id)
+}
+
 // OpenCode 1.x, from v1.18.32:
 // https://github.com/anomalyco/opencode/blob/v1.18.32/packages/sdk/js/src/gen/types.gen.ts
 //   (session.created/deleted carry properties.info: Session {id, parentID?};
@@ -86,6 +106,9 @@ const step = async (arg, id, cwd, push, extra) => {
 //    UserMessage {agent, model: {providerID, modelID}} in types.gen.ts above)
 // https://github.com/anomalyco/opencode/blob/v1.18.32/packages/opencode/src/session/prompt.ts
 //   (a prompt with no agent runs the default agent; with noReply it is only saved)
+// https://github.com/anomalyco/opencode/blob/v1.18.32/packages/opencode/src/session/llm/request.ts
+//   ("experimental.chat.system.transform" input {sessionID?, model}, output {system: string[]}:
+//    run as each request's system prompt is built)
 // A 1.x prompt names its own agent and model, so mail goes in only with the session's own
 // (seen in chat.message); until they are seen, `mail: false` leaves it for check_inbox.
 const server = async ({ client, directory }) => {
@@ -142,6 +165,7 @@ const server = async ({ client, directory }) => {
           if (event.type === "session.deleted") {
             child.delete(info.id)
             who.delete(info.id)
+            starts.delete(info.id)
           }
         } else if (event.type === "session.idle") {
           const id = props.sessionID
@@ -150,6 +174,14 @@ const server = async ({ client, directory }) => {
           // the whole reply.
           step("stop", id, directory, say(id, false)).catch(() => {})
         }
+      } catch {}
+    },
+    "experimental.chat.system.transform": async (input, output) => {
+      try {
+        const id = input?.sessionID
+        if (!id || (await isChild(id))) return
+        const text = await start(id, directory)
+        if (text) output.system.push(text)
       } catch {}
     },
     // Capture reads the tool and its args from the v1.18.32 plugin type
@@ -178,6 +210,10 @@ const server = async ({ client, directory }) => {
 // https://github.com/anomalyco/opencode/blob/v2.1.4/packages/core/src/session/session.ts
 //   (Session.prompt admits the text to the session's inbox, by default delivery "steer": taken
 //    in at the next step boundary of a running turn, and wakes the session when it is idle)
+// https://github.com/anomalyco/opencode/blob/v2.1.4/packages/plugin/src/promise/session.ts
+//   (ctx.session.hook("context", cb): cb gets {sessionID, agent, model, system: SystemPart[], ...}
+//    before each of a session's requests, packages/core/src/session/model-request.ts;
+//    SystemPart {type: "text", text}, packages/ai/src/schema/messages.ts)
 // A 2.x prompt names no agent or model: it runs as the session's own (it is changed only by
 // session.switchAgent / switchModel), so a teammate's message cannot change either.
 const setup = async (ctx) => {
@@ -220,8 +256,20 @@ const setup = async (ctx) => {
       case "session.deleted":
         await hook("session-end", id, s.cwd, false)
         sessions.delete(id)
+        starts.delete(id)
     }
   }
+  let context
+  try {
+    context = await ctx.session.hook?.("context", async (e) => {
+      try {
+        const s = await known(e.sessionID)
+        if (s.child) return
+        const text = await start(e.sessionID, s.cwd)
+        if (text) e.system.push({ type: "text", text })
+      } catch {}
+    })
+  } catch {}
   const stop = new AbortController()
   ;(async () => {
     while (!stop.signal.aborted) {
@@ -233,7 +281,10 @@ const setup = async (ctx) => {
       if (!stop.signal.aborted) await new Promise((r) => setTimeout(r, 1000))
     }
   })()
-  return () => stop.abort()
+  return async () => {
+    stop.abort()
+    await context?.dispose?.().catch(() => {})
+  }
 }
 
 export default { id: "lightbulb", setup, server }

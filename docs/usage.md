@@ -79,9 +79,9 @@ An agent writes `me` unless you tell it to share. `lightbulb memory list` shows 
 wrote it and whether two people disagree. `lightbulb memory share <id>` turns one of yours into a
 team entry; `lightbulb memory team off` stops team entries from this computer.
 
-Claude Code, Codex and Cursor are handed what is remembered for the repository at the start of a
-session (`lightbulb memory last` shows what the last one got). Grok CLI and OpenCode do not get
-that block; their agents use `recall`. A folder with no git origin gets no block, because the
+Claude Code, Codex, Cursor and OpenCode are handed what is remembered for the repository at the
+start of a session (`lightbulb memory last` shows what the last one got). Grok CLI does not get
+that block, because it ignores what a hook prints at a session's start; its agents use `recall`. A folder with no git origin gets no block, because the
 block is chosen by repository.
 
 `lightbulb memory forget <id>` deletes an entry. The delete reaches every computer that comes

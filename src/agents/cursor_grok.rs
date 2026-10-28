@@ -9,6 +9,9 @@
 //! - Grok CLI cannot: "For passive events, stdout is ignored" and SessionStart is passive; no
 //!   context field is documented (https://docs.x.ai/build/features/hooks). Its agents use
 //!   `recall`.
+//! - OpenCode can, through our plugin: an event's output reaches no model, so the plugin adds
+//!   what the start hook offers to the system prompt, by `experimental.chat.system.transform` on
+//!   1.x and `ctx.session.hook("context")` on 2.x (the URLs are in `setup/opencode-plugin.js`).
 
 use crate::hook::{Event, Hook};
 use serde_json::{json, Value};
