@@ -360,6 +360,14 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
             },
             None => Response::err(id, BAD_REQUEST),
         },
+        "capture.session_start"
+        | "capture.tool_call"
+        | "capture.stop"
+        | "capture.session_end"
+        | "sessions.list"
+        | "sessions.show"
+        | "sessions.forget"
+        | "sessions.export" => capture_op(id, op, body, daemon, for_a_person()),
         "memory.remember" => memory_remember(id, body, daemon, instance),
         "memory.recall" => memory_recall(id, body, daemon),
         // Takes the team lock and no store lock; `memory_manage` reads the team first.
@@ -477,6 +485,112 @@ fn memory_remember(id: u64, body: &Value, daemon: &Arc<Daemon>, instance: bool) 
                 Response::err(id, INTERNAL)
             }
         }
+    }
+}
+
+/// Local capture. The hooks send `capture.session_start {harness, conversation, cwd, repo?,
+/// branch?}`, `capture.tool_call {harness, conversation, tool, args, duration_ms?, ok?}`,
+/// `capture.stop {harness, conversation, prompt_tokens?, completion_tokens?}` and
+/// `capture.session_end {harness, conversation}` -> `{stored}`. A person reads and deletes:
+/// `sessions.list` -> `{sessions}`, `sessions.show {id}` -> `{session, tool_calls}`,
+/// `sessions.forget {id}` -> `{}`, `sessions.export` -> `{sessions: [{..., tool_calls}]}`.
+fn capture_op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, person: bool) -> Response {
+    use crate::capture;
+    let bad = Response::err(id, BAD_REQUEST);
+    let who = |b: &Value| match (b["harness"].as_str(), b["conversation"].as_str()) {
+        (Some(h), Some(c)) if !h.is_empty() && !c.is_empty() => Some(format!("{h}:{c}")),
+        _ => None,
+    };
+    // Team before store, never the other way round.
+    let (computer, hidden) = {
+        let t = daemon.team.lock().unwrap();
+        let cwd = body["cwd"].as_str();
+        (
+            t.config.computer.clone(),
+            cwd.is_some_and(|c| presence::hidden(&t.off, c)),
+        )
+    };
+    let store = daemon.store.lock().unwrap();
+    let r: crate::Result<Value> = (|| match op {
+        "capture.session_start" => {
+            let (Some(sid), Some(cwd)) = (who(body), body["cwd"].as_str()) else {
+                return Err("bad".into());
+            };
+            let row = capture::SessionRow {
+                id: sid,
+                harness: body["harness"].as_str().unwrap_or_default().into(),
+                computer,
+                repo: body["repo"].as_str().map(String::from),
+                branch: body["branch"].as_str().map(String::from),
+                started: now() as i64,
+                ended: None,
+                prompt_tokens: None,
+                completion_tokens: None,
+            };
+            let stored = !hidden && capture::start_session(&store, &row, cwd)?;
+            Ok(json!({ "stored": stored }))
+        }
+        "capture.tool_call" => {
+            let (Some(sid), Some(tool)) = (who(body), body["tool"].as_str()) else {
+                return Err("bad".into());
+            };
+            let stored = capture::record_tool_call(
+                &store,
+                &sid,
+                tool,
+                body["args"].as_str().unwrap_or_default(),
+                body["duration_ms"].as_i64(),
+                body["ok"].as_bool().unwrap_or(true),
+            )?;
+            Ok(json!({ "stored": stored }))
+        }
+        "capture.stop" => {
+            let Some(sid) = who(body) else {
+                return Err("bad".into());
+            };
+            capture::add_tokens(
+                &store,
+                &sid,
+                body["prompt_tokens"].as_i64(),
+                body["completion_tokens"].as_i64(),
+            )?;
+            Ok(json!({}))
+        }
+        "capture.session_end" => {
+            let Some(sid) = who(body) else {
+                return Err("bad".into());
+            };
+            capture::end_session(&store, &sid, now() as i64)?;
+            Ok(json!({}))
+        }
+        _ if !person => Err("not_a_person".into()),
+        "sessions.list" => Ok(json!({ "sessions": capture::sessions_since(&store, -1)? })),
+        "sessions.show" | "sessions.forget" => {
+            let Some(s) = capture::find(&store, body["id"].as_str().unwrap_or_default())? else {
+                return Err("not_found".into());
+            };
+            if op == "sessions.forget" {
+                capture::forget(&store, &s.id)?;
+                return Ok(json!({}));
+            }
+            Ok(json!({ "session": s, "tool_calls": capture::tool_calls(&store, &s.id, true)? }))
+        }
+        _ => {
+            let mut all = vec![];
+            for s in capture::sessions_since(&store, -1)? {
+                let mut j = serde_json::to_value(&s)?;
+                j["tool_calls"] = serde_json::to_value(capture::tool_calls(&store, &s.id, true)?)?;
+                all.push(j);
+            }
+            Ok(json!({ "sessions": all }))
+        }
+    })();
+    match r {
+        Ok(v) => Response::ok(id, v),
+        Err(e) if e.to_string() == "bad" => bad,
+        Err(e) if e.to_string() == "not_a_person" => refused(id, "not_a_person"),
+        Err(e) if e.to_string() == "not_found" => Response::err(id, NOT_FOUND),
+        Err(_) => Response::err(id, INTERNAL),
     }
 }
 

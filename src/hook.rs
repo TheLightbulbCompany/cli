@@ -151,6 +151,7 @@ pub fn run(agent: &str, event: &str, stdin: &str) -> Result<Option<String>> {
         daemon::ensure_running()?;
         let mut conn = Conn::open()?;
         let key = crate::sessions::Key::new(&conn.member()?, h.provider, &h.conversation);
+        capture(&mut conn, &h, &payload, &json!({}));
         let r = match &caller {
             Ok(me) => conn.call("end", json!({ "key": key, "caller": proc_json(me) }))?,
             Err(_) => conn.call("end", json!({ "key": key, "if_gone": true }))?,
@@ -190,6 +191,7 @@ pub fn run(agent: &str, event: &str, stdin: &str) -> Result<Option<String>> {
     if !key.is_string() {
         return Err(format!("register: {r}").into());
     }
+    capture(&mut conn, &h, &payload, &session);
     // Our OpenCode plugin sends `mail: false` when it could not hand mail over (it has not
     // seen the session's agent and model yet): the mail waits for `check_inbox`.
     if !takes_mail(&h) || (h.provider == "opencode" && payload["mail"] == false) {
@@ -237,6 +239,47 @@ pub fn run(agent: &str, event: &str, stdin: &str) -> Result<Option<String>> {
         out["ids"] = messages.iter().map(|m| m["id"].clone()).collect();
     }
     Ok(Some(out.to_string()))
+}
+
+/// Tells the daemon what this event adds to the local capture (`capture::*`, written by the
+/// daemon). Any failure is silent: capture never breaks the agent or the mail.
+fn capture(conn: &mut Conn, h: &Hook, payload: &Value, session: &Value) {
+    let who = json!({ "harness": h.provider, "conversation": h.conversation });
+    let with = |extra: Value| {
+        let mut b = who.clone();
+        b.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().cloned().unwrap_or_default());
+        b
+    };
+    let tokens = |keys: [&str; 2]| {
+        let u = &payload["usage"];
+        keys.iter().find_map(|k| u[k].as_i64())
+    };
+    let _ = match h.event {
+        Event::SessionStart => conn.call(
+            "capture.session_start",
+            with(json!({ "cwd": session["cwd"], "repo": session["repo"], "branch": session["branch"] })),
+        ),
+        Event::PostToolUse => {
+            let tool = ["tool_name", "toolName", "tool"].iter().find_map(|k| payload[k].as_str());
+            let Some(tool) = tool else { return };
+            let args = ["tool_input", "args"].iter().map(|k| &payload[k]).find(|a| !a.is_null());
+            conn.call(
+                "capture.tool_call",
+                with(json!({ "tool": tool, "args": args.map(Value::to_string),
+                    "duration_ms": payload["duration"].as_i64(),
+                    "ok": payload["tool_response"]["is_error"] != true })),
+            )
+        }
+        Event::Stop => conn.call(
+            "capture.stop",
+            with(json!({ "prompt_tokens": tokens(["input_tokens", "prompt_tokens"]),
+                "completion_tokens": tokens(["output_tokens", "completion_tokens"]) })),
+        ),
+        Event::SessionEnd => conn.call("capture.session_end", who),
+        Event::UserPromptSubmit => return,
+    };
 }
 
 /// `hook opencode ack`, payload `{session_id, ids}`: the plugin put those messages into the
@@ -381,6 +424,20 @@ mod tests {
         conn.wait_up_to(Duration::from_secs(1)).unwrap();
         let e = conn.call("ping", json!({})).unwrap_err().to_string();
         assert_eq!(e, "The background service did not answer in 1 s. If macOS is asking whether lightbulb may read a folder, click Allow, then try again.");
+    }
+
+    #[test]
+    fn capture_to_a_dead_daemon_is_silent() {
+        let (a, b) = UnixStream::pair().unwrap();
+        drop(b);
+        let mut conn = Conn {
+            stream: BufReader::new(a),
+            next: 1,
+        };
+        for e in EVENTS {
+            let p = json!({"tool_name": "Bash", "tool_input": {}});
+            capture(&mut conn, &hook("claude", e), &p, &json!({}));
+        }
     }
 
     fn hook(provider: &'static str, event: Event) -> Hook {

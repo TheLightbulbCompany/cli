@@ -366,6 +366,37 @@ more). `forget`, `share` and `team` must be run from your own terminal; an agent
 | `last` | The memory block the last session was handed at its start, word for word. |
 | `team on\|off` | Whether team memory may be written from this computer (`memory_team` in `config.toml`, on by default). `off` makes `remember` and `share` refuse `team` entries; what is already held stays. |
 
+### sessions
+
+When you use it: to see, read, export or delete what Lightbulb captured of your coding sessions on this computer.
+
+```
+lightbulb sessions list
+lightbulb sessions show <ID>
+lightbulb sessions forget <ID>
+lightbulb sessions export
+```
+
+`--help`: The sessions captured on this computer: list, show, forget, export.
+
+Each agent's hooks tell the background service when a session starts, after each tool call, at
+the end of each turn and when the session ends. It keeps, on this computer only: the session (its
+id, the agent, the computer, the repository and branch, when it started and ended, and the
+tokens when the agent reports them), and for each tool call its number, time, tool, duration,
+whether it worked, and a summary of at most 200 characters (a command, a path, a pattern). It
+never keeps file contents, diffs, command output or your prompts. A summary that looks like a
+password or key is replaced by `[refused: <what it matched>]`. Sessions under a hidden folder
+(`lightbulb folder <path> off`, or any folder whose name starts with a dot) are not captured. An
+`<ID>` is the id as `list` prints it, or its first characters. `list`, `show`, `forget` and
+`export` must be run from your own terminal; an agent's shell is refused.
+
+| Command | What it does |
+|---|---|
+| `list` | The id, the agent, the repository, the day it started and the tokens in and out (`-` where the agent did not report them). |
+| `show <ID>` | One session and its tool calls in order. |
+| `forget <ID>` | Deletes the session and its tool calls. |
+| `export` | Every session with its tool calls, as one JSON array on stdout. |
+
 ## Commands the agents and macOS run
 
 `hook`, `mcp` and `daemon` are not for typing. The agents run `lightbulb hook <agent> <event>`

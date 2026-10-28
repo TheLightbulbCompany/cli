@@ -3,7 +3,7 @@ use std::path::Path;
 
 /// Migration `i` takes the db to `user_version` `i + 1`. Forward only; each one only adds
 /// tables or columns, and runs once (in the transaction that moves `user_version`).
-const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10];
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11];
 
 const V1: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
@@ -90,6 +90,18 @@ const V8: &str =
 /// The memory block last handed to each session at its start (`lightbulb memory last`).
 const V10: &str =
     "CREATE TABLE IF NOT EXISTS memory_last (session TEXT PRIMARY KEY, block TEXT, at INTEGER);";
+/// Local capture (`capture`): a coding session and its tool calls. `summary` is at most 200
+/// characters, or `[refused: <pattern>]`.
+const V11: &str = "
+CREATE TABLE IF NOT EXISTS capture_sessions (
+    id TEXT PRIMARY KEY, harness TEXT NOT NULL, computer TEXT NOT NULL, repo TEXT, branch TEXT,
+    started INTEGER NOT NULL, ended INTEGER, prompt_tokens INTEGER, completion_tokens INTEGER
+);
+CREATE TABLE IF NOT EXISTS capture_tool_calls (
+    session_id TEXT NOT NULL, seq INTEGER NOT NULL, at INTEGER NOT NULL, tool TEXT NOT NULL,
+    summary TEXT, duration_ms INTEGER, ok INTEGER NOT NULL, PRIMARY KEY (session_id, seq)
+);
+";
 /// Memory: signed entries numbered per author, with a full-text index over `subject` and `fact`
 /// (`memory`). `rowid` is explicit so it survives `VACUUM` (the FTS index points at it). A
 /// tombstoned row keeps its id and seq and drops its body (`entry` NULL); `memory_tombstones`
@@ -1044,10 +1056,10 @@ mod tests {
         let path = dir.path().join("state.db");
         Connection::open(&path)
             .unwrap()
-            .execute_batch("PRAGMA user_version = 11;")
+            .execute_batch("PRAGMA user_version = 12;")
             .unwrap();
         let err = Store::open(&path).err().unwrap().to_string();
-        assert!(err.contains("State is from a newer version (v11)"), "{err}");
-        assert_eq!(user_version(&path), 11);
+        assert!(err.contains("State is from a newer version (v12)"), "{err}");
+        assert_eq!(user_version(&path), 12);
     }
 }

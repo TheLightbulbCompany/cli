@@ -1432,3 +1432,13 @@ fn setup_without_sign_in_sets_upload_off() {
     let config = std::fs::read_to_string(e.state.path().join("config.toml")).unwrap();
     assert!(config.contains("capture_upload = \"off\""), "{config}");
 }
+
+/// End of input at the first screen is not a yes: the computer stays local.
+#[test]
+fn setup_eof_stays_local() {
+    let e = Env::new();
+    let o = setup_answering(&e, "");
+    assert!(o.status.success(), "{}", err(&o));
+    let config = std::fs::read_to_string(e.state.path().join("config.toml")).unwrap();
+    assert!(config.contains("capture_upload = \"off\""), "{config}");
+}

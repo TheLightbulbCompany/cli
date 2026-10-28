@@ -59,11 +59,11 @@ const pushing = new Set()
 
 // One step: the hook registers it; with `push` (text => whether it went in), and no offer in
 // flight, it is offered the mail, and mail that went in is acked.
-const step = async (arg, id, cwd, push) => {
-  if (!push || pushing.has(id)) return void (await hook(arg, id, cwd, false))
+const step = async (arg, id, cwd, push, extra) => {
+  if (!push || pushing.has(id)) return void (await hook(arg, id, cwd, false, extra))
   pushing.add(id)
   try {
-    const offer = await hook(arg, id, cwd, true)
+    const offer = await hook(arg, id, cwd, true, extra)
     const ids = offer?.ids
     if (typeof offer?.text !== "string" || !Array.isArray(ids)) return
     let went = false
@@ -156,7 +156,7 @@ const server = async ({ client, directory }) => {
       try {
         const id = input?.sessionID
         if (!id || (await isChild(id))) return
-        await step("post-tool-use", id, directory, say(id, true))
+        await step("post-tool-use", id, directory, say(id, true), { tool: input.tool, args: input.args })
       } catch {}
     },
   }
@@ -209,7 +209,7 @@ const setup = async (ctx) => {
         return void (await hook("session-start", id, s.cwd, false))
       case "session.tool.success":
       case "session.tool.failed":
-        return step("post-tool-use", id, s.cwd, say(id))
+        return step("post-tool-use", id, s.cwd, say(id), { tool: d.tool ?? d.name, args: d.args ?? d.input })
       case "session.idle":
         return step("stop", id, s.cwd, say(id))
       case "session.deleted":

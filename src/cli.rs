@@ -666,6 +666,77 @@ pub fn memory(cmd: Memory) -> Result<i32> {
     Ok(0)
 }
 
+/// A `sessions` subcommand.
+pub enum Sessions {
+    List,
+    Show(String),
+    Forget(String),
+    Export,
+}
+
+/// `sessions ...`: what was captured of your coding sessions on this computer.
+pub fn sessions(cmd: Sessions) -> Result<i32> {
+    let (op, body) = match &cmd {
+        Sessions::List => ("sessions.list", json!({})),
+        Sessions::Show(id) => ("sessions.show", json!({ "id": id })),
+        Sessions::Forget(id) => ("sessions.forget", json!({ "id": id })),
+        Sessions::Export => ("sessions.export", json!({})),
+    };
+    let r = connect()?.call(op, body)?;
+    if r["ok"] != true {
+        let none = "No session starts with that id. `lightbulb sessions list` shows them.";
+        return refuse(&r, &[("not_found", none.to_string())]);
+    }
+    let day = |v: &Value| crate::date::day(v.as_i64().unwrap_or_default());
+    let s = |v: &Value| cell(v.as_str().unwrap_or_default());
+    let tokens = |v: &Value| v.as_i64().map_or("-".to_string(), |n| n.to_string());
+    match cmd {
+        Sessions::List => {
+            let rows = r["sessions"].as_array().cloned().unwrap_or_default();
+            if rows.is_empty() {
+                println!("No sessions captured yet.");
+                return Ok(0);
+            }
+            let mut t = vec![["Id", "Agent", "Repo", "Started", "In", "Out"]
+                .map(String::from)
+                .to_vec()];
+            for x in rows.iter().rev() {
+                t.push(vec![
+                    s(&x["id"]),
+                    s(&x["harness"]),
+                    s(&x["repo"]),
+                    day(&x["started"]),
+                    tokens(&x["prompt_tokens"]),
+                    tokens(&x["completion_tokens"]),
+                ]);
+            }
+            table(&t);
+        }
+        Sessions::Show(_) => {
+            let x = &r["session"];
+            println!("Session {}", s(&x["id"]));
+            println!("Agent   {} on {}", s(&x["harness"]), s(&x["computer"]));
+            println!("Repo    {} {}", s(&x["repo"]), s(&x["branch"]));
+            println!("Started {}", day(&x["started"]));
+            println!(
+                "Tokens  in {} out {}",
+                tokens(&x["prompt_tokens"]),
+                tokens(&x["completion_tokens"])
+            );
+            for c in r["tool_calls"].as_array().into_iter().flatten() {
+                let ok = if c["ok"] == true { "" } else { "  (failed)" };
+                let text = c["summary"]
+                    .as_str()
+                    .unwrap_or(c["tool"].as_str().unwrap_or_default());
+                println!("{:>4}  {}{ok}", c["seq"], cell(text));
+            }
+        }
+        Sessions::Forget(_) => println!("Forgotten. The session and its tool calls are deleted."),
+        Sessions::Export => println!("{}", serde_json::to_string_pretty(&r["sessions"])?),
+    }
+    Ok(0)
+}
+
 // ---- team -------------------------------------------------------------------------------
 
 /// Prints the text `texts` maps `r`'s error code to (else `refusal`'s); returns the exit code 1.
@@ -1830,8 +1901,10 @@ fn first_screen() -> Result<()> {
     }
     println!("{SIGN_IN_OFFER}");
     let mut answer = String::new();
-    std::io::stdin().read_line(&mut answer)?;
-    if !answer.trim().eq_ignore_ascii_case("l") {
+    // Only Enter or `y` signs in; anything else, and end of input, stays local.
+    let n = std::io::stdin().read_line(&mut answer)?;
+    let a = answer.trim();
+    if n > 0 && (a.is_empty() || a.eq_ignore_ascii_case("y")) {
         match crate::login::login() {
             Ok(0) => return Ok(()),
             Ok(_) => {}

@@ -58,6 +58,7 @@ Run `lightbulb <command> --help` for the options of each one.
 | `login` | Sign this computer in to Lightbulb (confirm in the browser), so your workspace's agents answer it. |
 | `logout` | Sign this computer out. |
 | `memory list\|show\|forget\|share\|export\|last\|team` | See and control what your agents remember (see "Memory" below). |
+| `sessions list\|show\|forget\|export` | See and delete what was captured of your coding sessions here: the agent, the repository, each tool call and a short summary of it, never file contents or output. |
 | `telemetry [on\|off\|status]` | Show or set anonymous usage counts (see the [README](../README.md#usage-counts)). |
 | `version` | Print the version. |
 

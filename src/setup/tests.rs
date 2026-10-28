@@ -583,7 +583,13 @@ console.log(JSON.stringify(prompts));
     // A session with no agent recorded asks for no mail, so it stays in the inbox; only a
     // prompt that went in is acked.
     let call = |arg: &str, id: &str, mail: bool| {
-        format!("opencode {arg} {{\"session_id\":\"{id}\",\"cwd\":\"/tmp/proj\",\"mail\":{mail}}}")
+        // A tool call also carries the tool and its args (what `capture` summarises).
+        let tool = if arg == "post-tool-use" {
+            ",\"tool\":\"bash\",\"args\":{}"
+        } else {
+            ""
+        };
+        format!("opencode {arg} {{\"session_id\":\"{id}\",\"cwd\":\"/tmp/proj\",\"mail\":{mail}{tool}}}")
     };
     let ack = r#"opencode ack {"session_id":"ses_a","cwd":"/tmp/proj","mail":false,"ids":["m1"]}"#
         .to_string();

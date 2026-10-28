@@ -86,6 +86,18 @@ enum MemoryCommand {
 }
 
 #[derive(Subcommand)]
+enum SessionsCommand {
+    /// Your coding sessions captured on this computer: agent, repo, tool calls and tokens.
+    List,
+    /// One session with its tool calls (a tool and a short summary, never file contents).
+    Show { id: String },
+    /// Delete a session and its tool calls.
+    Forget { id: String },
+    /// Print every captured session with its tool calls as JSON.
+    Export,
+}
+
+#[derive(Subcommand)]
 enum Command {
     /// Print the version.
     Version,
@@ -203,6 +215,11 @@ enum Command {
     Memory {
         #[command(subcommand)]
         command: MemoryCommand,
+    },
+    /// The sessions captured on this computer: list, show, forget, export.
+    Sessions {
+        #[command(subcommand)]
+        command: SessionsCommand,
     },
     /// Show (`on`) or hide (`off`) the sessions under a folder from your teammates.
     Folder {
@@ -372,6 +389,12 @@ fn run() -> lightbulb::Result<()> {
             MemoryCommand::Export { json } => cli::Memory::Export(json),
             MemoryCommand::Last => cli::Memory::Last,
             MemoryCommand::Team { state } => cli::Memory::Team(state == "on"),
+        })?),
+        Command::Sessions { command } => exit(cli::sessions(match command {
+            SessionsCommand::List => cli::Sessions::List,
+            SessionsCommand::Show { id } => cli::Sessions::Show(id),
+            SessionsCommand::Forget { id } => cli::Sessions::Forget(id),
+            SessionsCommand::Export => cli::Sessions::Export,
         })?),
         Command::Folder { path, state } => exit(cli::folder(&path, state == "on")?),
         Command::Relay { url, clear, local } => {
