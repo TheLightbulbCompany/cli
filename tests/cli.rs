@@ -1814,3 +1814,35 @@ fn memory_approve_prints_the_lesson_when_the_local_store_refuses() {
     assert!(text.contains(fact), "{text}");
     assert!(!text.contains("memory team on"), "no retry hint: {text}");
 }
+
+#[test]
+fn memory_list_repo_takes_a_bare_name() {
+    use lightbulb::memory::{self, Kind, Op, Scope, Source};
+    let e = Env::new();
+    assert!(e.run(&["who"]).status.success());
+    for (repo, subject) in [("acme/api", "db"), ("acme/web", "ci")] {
+        let op = Op::Remember {
+            subject: subject.into(),
+            fact: "x".into(),
+            kind: Kind::Fact,
+            scope: Scope::Team,
+            when: None,
+            source: Source {
+                harness: "test".into(),
+                repo: Some(repo.into()),
+                session: None,
+                on_behalf_of: None,
+                shared_from: None,
+            },
+            replaces: vec![],
+        };
+        memory::remember(&e.store(), &e.identity(), op, 5).unwrap();
+    }
+    for repo in ["api", "acme/api"] {
+        let table = out(&e.run(&["memory", "list", "--repo", repo]));
+        assert!(
+            table.lines().any(|l| l.contains(" db ")) && !table.contains(" ci "),
+            "{repo}: {table}"
+        );
+    }
+}

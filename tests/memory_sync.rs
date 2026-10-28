@@ -277,6 +277,14 @@ async fn a_restored_node_numbers_past_what_peers_hold() {
 /// An entry with a credential in it, signed by `env` as its first: what an older build, which
 /// did not refuse it on `remember`, could send.
 fn with_secret(env: &Env) -> Entry {
+    signed_first(
+        env,
+        op("deploy", "export API_KEY=abcd1234efgh5678", Scope::Team),
+    )
+}
+
+/// `op` signed by `env` as its first entry, unchecked.
+fn signed_first(env: &Env, op: Op) -> Entry {
     use data_encoding::HEXLOWER;
     use sha2::{Digest, Sha256};
     let id = env.identity();
@@ -285,7 +293,7 @@ fn with_secret(env: &Env) -> Entry {
         id: String::new(),
         author: id.key.clone(),
         seq: 1,
-        op: op("deploy", "export API_KEY=abcd1234efgh5678", Scope::Team),
+        op,
         at: 5,
         sig: String::new(),
     };
@@ -325,4 +333,21 @@ fn an_entry_from_a_peer_with_a_secret_is_refused_on_accept() {
     assert!(memory::accept(&a.store(), &e, 10).unwrap());
     let next = remember(&a, op("ci", "github actions", Scope::Team));
     assert!(memory::accept(&b.store(), &next, 10).unwrap());
+}
+
+#[test]
+fn an_entry_with_a_secret_only_in_its_source_is_refused_on_accept() {
+    let (a, b) = (Env::new(), Env::new());
+    seed_pair(&a, &b);
+    let mut o = op("deploy", "fridays", Scope::Team);
+    if let Op::Remember { source, .. } = &mut o {
+        source.session = Some("export API_KEY=abcd1234efgh5678".into());
+    }
+    // `remember` refuses it, and `accept` holds a peer's copy as a tombstone.
+    let err = memory::remember(&a.store(), &a.identity(), o.clone(), 5).unwrap_err();
+    assert!(err.to_string().contains("secret:credential"), "{err}");
+    let e = signed_first(&a, o);
+    assert!(memory::accept(&b.store(), &e, 10).unwrap());
+    assert!(held(&b, &e.author).is_empty());
+    assert_eq!(memory::heads(&b.store()).unwrap()[&e.author], 1);
 }
