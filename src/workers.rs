@@ -295,9 +295,10 @@ pub fn first_prompt(label: &str, a: &Message) -> String {
 }
 
 /// `start`'s half under the store lock, the one place the cap is kept: assignment `a`, not yet
-/// claimed and before its deadline, gets a `starting` row as `session` while fewer than
-/// `workers_max` run; at the cap its receipt is `refused`/`busy` (a hold it came through stays
-/// closed as it is). The row, or `None` when nothing is to start.
+/// claimed and before its deadline, gets a `starting` row as `session` while its harness is
+/// offered and fewer than `workers_max` run; else its receipt is `refused`/`no_worker` (not
+/// offered) or `busy` (at the cap; a hold it came through stays closed as it is). The row, or
+/// `None` when nothing is to start.
 pub fn claim(
     store: &Store,
     config: &Config,
@@ -309,17 +310,13 @@ pub fn claim(
     if late || store.worker_by_assignment(&a.id)?.is_some() {
         return Ok(None);
     }
-    if store.workers(true)?.len() as i64 >= config.workers_max {
+    // Not offered any more (`workers off` since it was held): nothing starts.
+    let offered = offers(config).iter().any(|p| p == provider_of(&a.to_key));
+    let full = store.workers(true)?.len() as i64 >= config.workers_max;
+    if !offered || full {
         let (from, rid, at) = (&a.from_key, &a.request_id, now as u64);
-        mail::advance(
-            store.conn(),
-            from,
-            rid,
-            State::Refused,
-            Some("busy"),
-            None,
-            at,
-        )?;
+        let why = Some(if offered { "busy" } else { "no_worker" });
+        mail::advance(store.conn(), from, rid, State::Refused, why, None, at)?;
         return Ok(None);
     }
     let mut w = Worker {
@@ -376,7 +373,7 @@ pub fn start(d: &Arc<Daemon>, assign_id: &str) -> Result<()> {
         )
     };
     let Some(w) = claimed else {
-        d.peers.outbox.notify_one(); // a `busy` refusal goes to its asker
+        d.peers.outbox.notify_one(); // a `busy` or `no_worker` refusal goes to its asker
         eprintln!("worker for {assign_id}: not started");
         return Ok(());
     };
@@ -847,6 +844,19 @@ pub fn op(
             Err(e) => fail(e),
         },
         "workers.off" => {
+            // Every start dialog still up is declined (`no_worker`), then the running stop.
+            let declined = {
+                let store = d.store.lock().unwrap();
+                let ids: Vec<i64> = (holds::open(&store).unwrap_or_default().iter())
+                    .filter(|h| h.kind() == holds::Kind::Worker)
+                    .map(|h| h.id)
+                    .collect();
+                decline(&store, &ids, "no_worker", ipc::now() as i64)
+            };
+            match declined {
+                Ok(h) => declined_here(d, &h, "local", None),
+                Err(e) => return fail(e),
+            }
             let running = d.store.lock().unwrap().workers(true).unwrap_or_default();
             for w in running {
                 let _ = stop(d, w.id, "stopped", &by);
@@ -964,37 +974,45 @@ pub fn cancel(d: &Arc<Daemon>, assign_id: &str, by: &str) -> Result<()> {
             let rows = stmt.query_map([assign_id], |r| r.get(0))?;
             rows.collect::<rusqlite::Result<_>>()?
         };
-        let mut declined = vec![];
-        for id in ids {
-            (store.conn()).execute("UPDATE holds SET state = 'declined' WHERE id = ?1", [id])?;
-            let Some(h) = holds::get(&store, id)? else {
-                continue;
-            };
-            // Its asker hears the held assignment went nowhere.
-            let (m, at) = (&h.message, now as u64);
-            let why = Some("cancelled");
-            mail::advance(
-                store.conn(),
-                &m.from_key,
-                &m.request_id,
-                State::Refused,
-                why,
-                None,
-                at,
-            )?;
-            declined.push(h);
-        }
+        let declined = decline(&store, &ids, "cancelled", now)?;
         cancel_worker(&store, &d.workers, assign_id, by, now)?;
         declined
     };
-    for h in &declined {
-        holds::closed(d, h, holds::DECLINE, Some(by), Some("cancelled"), None);
-    }
-    if !declined.is_empty() {
-        d.peers.outbox.notify_one(); // the refused receipt goes to its asker
-    }
+    declined_here(d, &declined, by, Some("cancelled"));
     eprintln!("worker for {assign_id}: cancelled");
     Ok(())
+}
+
+/// Declines open start holds `ids` (the caller holds the store lock): each asker's receipt is
+/// `refused`/`why`. The holds declined.
+fn decline(store: &Store, ids: &[i64], why: &str, now: i64) -> Result<Vec<holds::Hold>> {
+    let mut declined = vec![];
+    for &id in ids {
+        let sql = "UPDATE holds SET state = 'declined' WHERE id = ?1 AND state = 'open'";
+        if store.conn().execute(sql, [id])? == 0 {
+            continue;
+        }
+        let Some(h) = holds::get(store, id)? else {
+            continue;
+        };
+        // Its asker hears the held assignment went nowhere.
+        let (m, at) = (&h.message, now as u64);
+        let (from, rid) = (&m.from_key, &m.request_id);
+        mail::advance(store.conn(), from, rid, State::Refused, Some(why), None, at)?;
+        declined.push(h);
+    }
+    Ok(declined)
+}
+
+/// `decline`'s daemon side, with no lock held: the dialogs withdrawn (declined by `by`), the
+/// refused receipts sent.
+fn declined_here(d: &Daemon, declined: &[holds::Hold], by: &str, reason: Option<&str>) {
+    for h in declined {
+        holds::closed(d, h, holds::DECLINE, Some(by), reason, None);
+    }
+    if !declined.is_empty() {
+        d.peers.outbox.notify_one(); // the refused receipts go to their askers
+    }
 }
 
 /// `cancel`'s worker half, under the store lock the caller holds (`register` takes the same
@@ -1130,6 +1148,14 @@ mod tests {
         }
     }
 
+    /// A config offering Claude Code workers (the tests' assignments are to `m/claude:new`).
+    fn offering() -> Config {
+        Config {
+            workers_offer: "claude".into(),
+            ..Config::default()
+        }
+    }
+
     fn mode(p: &std::path::Path) -> u32 {
         std::fs::metadata(p).unwrap().permissions().mode() & 0o777
     }
@@ -1191,7 +1217,7 @@ mod tests {
         let base = dir.path().join("work");
         let config = Config {
             workers_folder: base.to_string_lossy().into(),
-            ..Config::default()
+            ..offering()
         };
         let s = Store::open(&dir.path().join("state.db")).unwrap();
         let id = ulid::Ulid::generate().to_string();
@@ -1226,7 +1252,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = Store::open(&dir.path().join("state.db")).unwrap();
         let reg = Registry::default();
-        let config = Config::default();
+        let config = offering();
         let a = assign("a1", "r1", "p/codex:a", 100);
         let w = claim(&s, &config, &a, "m/claude:w1", 10).unwrap().unwrap();
         // The cancel lands after the claim, before the spawned worker registers.
@@ -1263,7 +1289,7 @@ mod tests {
         let s = Store::open(&dir.path().join("state.db")).unwrap();
         let reg = Registry::default();
         let a = assign("a1", "r1", "p/codex:a", 100);
-        let w = claim(&s, &Config::default(), &a, "m/claude:w1", 10)
+        let w = claim(&s, &offering(), &a, "m/claude:w1", 10)
             .unwrap()
             .unwrap();
         let argv: Vec<String> = ["sleep", "30"].map(String::from).into();
@@ -1287,7 +1313,7 @@ mod tests {
         );
         // Not registered yet: the row ends, and a register after it kills the process.
         let b = assign("a2", "r2", "p/codex:a", 100);
-        let w = claim(&s, &Config::default(), &b, "m/claude:w2", 10)
+        let w = claim(&s, &offering(), &b, "m/claude:w2", 10)
             .unwrap()
             .unwrap();
         cancel_worker(&s, &reg, "a2", "p/codex:a", 12).unwrap();
@@ -1439,7 +1465,7 @@ mod tests {
         let s = Store::open(&dir.path().join("state.db")).unwrap();
         let config = Config {
             workers_max: 1,
-            ..Config::default()
+            ..offering()
         };
         let (a, b) = (
             assign("a1", "r1", "p/codex:a", 100),
@@ -1484,6 +1510,32 @@ mod tests {
         assert!(claim(&s, &config, &late, "m/claude:w4", 10)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn start_refuses_a_harness_no_longer_offered() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("state.db")).unwrap();
+        let a = assign("a1", "r1", "p/codex:a", 100);
+        s.put_message(&a).unwrap();
+        mail::advance(s.conn(), &a.from_key, "r1", State::Held, None, None, 1).unwrap();
+        // `workers off` (or an offer of Codex only) since the assignment was held.
+        for offer in ["", "codex"] {
+            let config = Config {
+                workers_offer: offer.into(),
+                ..Config::default()
+            };
+            assert!(claim(&s, &config, &a, "m/claude:w1", 10).unwrap().is_none());
+            let r = mail::receipt(&s, &crate::sessions::Key(a.from_key.clone()), "r1")
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                (r.state, r.reason.as_deref()),
+                (State::Refused, Some("no_worker")),
+                "{offer:?}"
+            );
+        }
+        assert!(s.workers(false).unwrap().is_empty());
     }
 
     #[test]

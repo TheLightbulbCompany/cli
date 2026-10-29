@@ -893,6 +893,30 @@ fn row_10_workers_off_stops_the_worker_and_unlists_the_host() {
     });
 }
 
+/// `workers off` is a kill switch for a start dialog too: the dialog up is withdrawn, its
+/// asker hears `refused`/`no_worker`, and an Allow afterwards starts nothing.
+#[test]
+fn row_10_a_start_dialog_up_at_workers_off_is_withdrawn_and_allow_starts_nothing() {
+    let p = hosted(json!([{"result": "never"}]), Opts::default());
+    p.assign("as1", "maybe", 300);
+    p.wait_state("as1", "held");
+    let (dlg, ..) = p.dialog(1);
+    let o = p.b.detached(&[EXE, "workers", "off"], "");
+    assert!(o.status.success(), "{}", common::err(&o));
+    until(10, "the dialog is withdrawn", || gone(dlg.parse().unwrap()));
+    p.wait_state("as1", "refused");
+    assert_eq!(p.a.receipt(&p.asker(), "as1")["reason"], "no_worker");
+    let h = lightbulb::holds::get(&p.b.store(), 1).unwrap().unwrap();
+    assert_eq!(h.state, "declined");
+    let r = person(
+        &p.b,
+        json!({"id": 1, "op": "hold.answer", "hold": "H1", "verdict": "allow"}),
+    );
+    assert_ne!(r["ok"], true, "{r}");
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(p.workers().is_empty());
+}
+
 /// B offers Codex workers (§8 rows 3, 5, 6): the same flow over the app-server protocol.
 fn codex() -> Opts {
     Opts {
