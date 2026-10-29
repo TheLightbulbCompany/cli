@@ -288,15 +288,16 @@ const BYPASS: [&str; 14] = [
 const DISTINCTIVE: [&str; 4] = ["dangerously", "bypassPermissions", "always-approve", "yolo"];
 
 /// Whether `argv` names a program and no permission bypass: a `DISTINCTIVE` word anywhere in an
-/// element, or a `BYPASS` word as a whole element or either side of its first `=`
-/// (`--force=true`, `--permission-mode=dontAsk`); `--automation` is not `--auto`.
+/// argument (not the program's path, which a person's folder names may contain), or a `BYPASS`
+/// word as a whole element or either side of its first `=` (`--force=true`,
+/// `--permission-mode=dontAsk`); `--automation` is not `--auto`.
 pub fn launchable(argv: &[String]) -> bool {
-    let bypass = |a: &str| {
+    let bypass = |(i, a): (usize, &String)| {
         let (flag, value) = a.split_once('=').unwrap_or((a, ""));
-        [a, flag, value].iter().any(|w| BYPASS.contains(w))
-            || DISTINCTIVE.iter().any(|d| a.contains(d))
+        [a.as_str(), flag, value].iter().any(|w| BYPASS.contains(w))
+            || (i > 0 && DISTINCTIVE.iter().any(|d| a.contains(d)))
     };
-    !argv.is_empty() && !argv.iter().any(|a| bypass(a))
+    !argv.is_empty() && !argv.iter().enumerate().any(bypass)
 }
 
 /// Starts `argv` in `folder` with `env` set or removed (`Driver::env`): its own process group (a
@@ -468,7 +469,13 @@ pub(crate) mod tests {
             assert!(launchable(&argv(ok)), "{ok:?}");
         }
         assert!(!launchable(&[]));
+        // The program's path is the person's: a folder named `yolo` is not a flag.
+        let program = |p: &str| [p, "acp"].map(String::from);
+        assert!(launchable(&program("/Users/yolo-fan/.local/bin/cursor-agent")));
+        assert!(launchable(&program("/opt/dangerously/grok")));
+        assert!(!launchable(&program("--yolo")));
     }
+
 
     #[tokio::test]
     async fn a_natural_end_takes_the_whole_process_group() {
