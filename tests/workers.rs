@@ -1032,3 +1032,55 @@ fn codex_row_6_deadline_stops_it() {
     });
     assert_eq!(p.workers()[0].by.as_deref(), Some("deadline"));
 }
+
+#[test]
+fn codex_row_3_decline_on_a_prompt_sends_decline() {
+    let p = hosted(
+        json!([{"ask": "rm -rf x"}, {"result": "{last}"}]),
+        Opts {
+            always: true,
+            ..codex()
+        },
+    );
+    p.assign("as1", "careful", 300);
+    let (_, text, _) = p.dialog(1);
+    assert!(text.ends_with("wants to: Command: rm -rf x"), "{text}");
+    p.click("Decline");
+    let r = p.result("as1", 15);
+    assert_eq!(
+        (&r["status"], &r["text"]),
+        (&json!("done"), &json!("decline")),
+        "{r}"
+    );
+    let read = p.harness_read();
+    let answer = read.iter().find(|l| l["id"] == 100).unwrap();
+    assert_eq!(answer["result"], json!({"decision": "decline"}), "{answer}");
+}
+
+#[test]
+fn codex_a_withdrawn_request_closes_its_hold_expired() {
+    let p = hosted(
+        json!([
+            {"ask": "rm -rf x", "wait": false},
+            {"sleep": 3}, {"cancel": 0}, {"sleep": 1}, {"result": "carried on"}
+        ]),
+        Opts {
+            always: true,
+            ..codex()
+        },
+    );
+    p.assign("as1", "changes its mind", 300);
+    let (dlg, text, _) = p.dialog(1);
+    assert!(text.ends_with("wants to: Command: rm -rf x"), "{text}");
+    until(10, "the dialog is withdrawn", || gone(dlg.parse().unwrap()));
+    let r = p.result("as1", 15);
+    assert_eq!(
+        (&r["status"], &r["text"]),
+        (&json!("done"), &json!("carried on")),
+        "{r}"
+    );
+    let h = lightbulb::holds::get(&p.b.store(), 1).unwrap().unwrap();
+    assert_eq!(h.state, "expired");
+    // It was never answered.
+    assert!(!p.harness_read().iter().any(|l| l["id"] == 100));
+}

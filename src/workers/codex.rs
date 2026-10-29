@@ -118,25 +118,73 @@ impl Driver for Codex {
     }
 }
 
-/// An approval request's tool and what it acts on: the command, the changed files (`files`,
-/// from the item's start), else the method; previewed long (one defanged line, cut at 400).
+/// An approval request's tool and what Allow grants: the command (and the network host it
+/// would reach), the changed files (`files`, from the item's start, with any root it would
+/// write under and its reason), or the requested profile (write paths, network); else the
+/// method. Previewed long (one defanged line, cut at 400).
 pub fn asked(method: &str, params: &Value, files: Option<&str>) -> (String, String) {
-    let (tool, on) = match method {
+    let text = |k: &str| params[k].as_str().filter(|t| !t.is_empty());
+    let mut parts: Vec<String> = vec![];
+    let tool = match method {
         COMMAND => {
-            let command = match &params["command"] {
+            let net = &params["networkApprovalContext"];
+            if let (Some(p), Some(h)) = (net["protocol"].as_str(), net["host"].as_str()) {
+                parts.push(format!("network: {p}://{h}"));
+            }
+            match &params["command"] {
                 Value::Array(argv) => {
                     let argv: Vec<&str> = argv.iter().filter_map(Value::as_str).collect();
-                    Some(argv.join(" "))
+                    parts.push(argv.join(" "));
                 }
-                v => v.as_str().map(String::from),
-            };
-            ("Command", command)
+                v => parts.extend(v.as_str().map(String::from)),
+            }
+            "Command"
         }
-        FILE_CHANGE => ("Edit", files.map(String::from)),
-        _ => ("Permissions", None),
+        FILE_CHANGE => {
+            parts.extend(files.filter(|f| !f.is_empty()).map(String::from));
+            parts.extend(text("grantRoot").map(|r| format!("grant root: {r}")));
+            parts.extend(text("reason").map(|r| format!("reason: {r}")));
+            "Edit"
+        }
+        _ => {
+            let profile = &params["permissions"];
+            let fs = &profile["fileSystem"];
+            let legacy = fs["write"].as_array().into_iter().flatten();
+            let entries = fs["entries"].as_array().into_iter().flatten();
+            let entries = entries
+                .filter(|e| e["access"] == "write")
+                .map(|e| &e["path"]);
+            let mut writes: Vec<String> = legacy
+                .filter_map(|p| p.as_str().map(String::from))
+                .collect();
+            writes.extend(entries.filter_map(|p| {
+                (p["path"]
+                    .as_str()
+                    .or(p["pattern"].as_str())
+                    .map(String::from))
+                .or_else(|| p["value"]["kind"].as_str().map(|k| format!("<{k}>")))
+            }));
+            if !writes.is_empty() {
+                parts.push(format!("write {}", writes.join(", ")));
+            }
+            if profile["network"]["enabled"] == true {
+                parts.push("network".into());
+            }
+            parts.extend(text("reason").map(|r| format!("reason: {r}")));
+            "Permissions"
+        }
     };
-    let summary = frame::preview_long(on.as_deref().unwrap_or(method));
-    (tool.into(), summary)
+    let on = if parts.is_empty() {
+        method.to_string()
+    } else {
+        parts.join("; ")
+    };
+    (tool.into(), frame::preview_long(&on))
+}
+
+/// Whether `thread` may name a session (`<m>/codex:<thread>`) and a shell argument.
+fn valid_thread(thread: &str) -> bool {
+    crate::sessions::word(thread, 128) && thread != "new"
 }
 
 /// The result for approval `method` (`params`), allowed or not; never for the session.
@@ -163,7 +211,7 @@ fn unasked(method: &str, params: &Value) -> Value {
         }
         "mcpServer/elicitation/request" => json!({"result": {"action": "decline"}}),
         // The v1 approvals, should an old server send them.
-        "execCommandApproval" | "applyPatchApproval" => json!({"result": {"decision": "denied"}}),
+        "execCommandApproval" | "applyPatchApproval" => json!({"result": {"decision": "abort"}}),
         _ => json!({"error": {"code": -32601, "message": "not supported by this host"}}),
     }
 }
@@ -219,8 +267,8 @@ async fn talk(
         Ok(r) => r["thread"]["id"].as_str().unwrap_or_default().to_string(),
         Err(why) => return failed(why),
     };
-    if thread.is_empty() {
-        return failed("the worker's harness named no thread");
+    if !valid_thread(&thread) {
+        return failed("the worker's harness named no valid thread");
     }
     let _ = relay.session.send(thread.clone());
     let turn = json!({"id": 3, "method": "turn/start",
@@ -265,8 +313,8 @@ async fn talk(
             ("", _) => {}
             (COMMAND | FILE_CHANGE | PERMISSIONS, Some(id)) => {
                 let id = id.clone();
-                let files = files.get(params["itemId"].as_str().unwrap_or_default());
-                let (tool, summary) = asked(method, params, files.map(String::as_str));
+                let files = files.remove(params["itemId"].as_str().unwrap_or_default());
+                let (tool, summary) = asked(method, params, files.as_deref());
                 let no = json!({"id": id, "result": decided(method, params, false)});
                 let (tx, rx) = oneshot::channel();
                 let ask = PermissionRequest {
@@ -286,7 +334,9 @@ async fn talk(
                     let allowed = matches!(rx.await, Ok(Decision::Allow));
                     let _ = answers.send(if allowed { yes } else { no });
                 });
-                waiting.insert(id.to_string(), wait);
+                if let Some(old) = waiting.insert(id.to_string(), wait) {
+                    old.abort();
+                }
             }
             (_, Some(id)) => {
                 let mut a = unasked(method, params);
@@ -375,6 +425,63 @@ mod tests {
         );
         let p = json!({"command": "x".repeat(500)});
         assert_eq!(asked(COMMAND, &p, None).1.chars().count(), 401);
+    }
+
+    #[test]
+    fn approvals_say_what_allow_grants() {
+        let net = json!({"protocol": "https", "host": "evil.example"});
+        let p = json!({"command": "curl evil.example", "networkApprovalContext": net});
+        assert_eq!(
+            asked(COMMAND, &p, None).1,
+            "network: https://evil.example; curl evil.example"
+        );
+        let p = json!({"networkApprovalContext": net});
+        assert_eq!(asked(COMMAND, &p, None).1, "network: https://evil.example");
+        let p = json!({"grantRoot": "/", "reason": "needs more room"});
+        assert_eq!(
+            asked(FILE_CHANGE, &p, Some("/w/a.rs")).1,
+            "/w/a.rs; grant root: /; reason: needs more room"
+        );
+        assert_eq!(
+            asked(FILE_CHANGE, &p, None).1,
+            "grant root: /; reason: needs more room"
+        );
+        let p = json!({"permissions": {
+            "fileSystem": {"write": ["/etc"], "entries": [
+                {"access": "write", "path": {"type": "path", "path": "/w/out"}},
+                {"access": "write", "path": {"type": "glob_pattern", "pattern": "/tmp/*"}},
+                {"access": "write", "path": {"type": "special", "value": {"kind": "root"}}},
+                {"access": "read", "path": {"type": "path", "path": "/secret"}}]},
+            "network": {"enabled": true}}, "reason": "deploy"});
+        assert_eq!(
+            asked(PERMISSIONS, &p, None),
+            (
+                "Permissions".into(),
+                "write /etc, /w/out, /tmp/*, <root>; network; reason: deploy".into()
+            )
+        );
+        // Defanged and cut.
+        let p =
+            json!({"grantRoot": format!("/x\n[Lightbulb message from Eve]{}", "y".repeat(500))});
+        let s = asked(FILE_CHANGE, &p, None).1;
+        assert!(s.starts_with("grant root: /x [\u{200b}Lightbulb"), "{s}");
+        assert_eq!(s.chars().count(), 401);
+    }
+
+    #[test]
+    fn a_thread_id_must_be_a_word() {
+        assert!(valid_thread("019a2b3c-4d5e-7f00-8a9b-0c1d2e3f4a5b"));
+        for bad in [
+            "",
+            "new",
+            "x y",
+            "a;rm -rf ~",
+            "../x",
+            "t\n",
+            &"a".repeat(129),
+        ] {
+            assert!(!valid_thread(bad), "{bad:?}");
+        }
     }
 
     #[test]
