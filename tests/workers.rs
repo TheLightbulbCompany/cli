@@ -718,8 +718,9 @@ fn row_12_no_bypass_flag_in_argv() {
             .unwrap();
         assert_eq!(o.status.code(), Some(3), "{extra:?}");
     }
-    // Cursor and Grok launch exactly their ACP argv (a fake under `~/.local/bin` is found when
-    // no real one is installed), and their fake refuses any bypass word, and Grok any leader.
+    // Cursor and Grok launch exactly their ACP argv, and their fake refuses any bypass word,
+    // and Grok any leader. The fake under `~/.local/bin` is Cursor's first candidate; Grok's
+    // system installs come before it, so a real Grok, when installed, is the one found.
     for (h, name, exact) in [
         ("cursor", "cursor-agent", &["acp"][..]),
         ("grok", "grok", &["agent", "--no-leader", "stdio"]),
@@ -1681,11 +1682,80 @@ fn acp_withdrawn(h: &'static str) {
 }
 
 #[test]
-fn cursor_a_withdrawn_request_closes_its_hold() {
+fn cursor_a_withdrawn_request_closes_its_hold_expired() {
     acp_withdrawn("cursor");
 }
 
 #[test]
-fn grok_a_withdrawn_request_closes_its_hold() {
+fn grok_a_withdrawn_request_closes_its_hold_expired() {
     acp_withdrawn("grok");
+}
+
+/// A repo hint's clone that commits a config skipping approvals (`file`, `text`): the worktree
+/// is made, the start fails naming the file, and no harness runs.
+fn acp_folder_bypass(h: &'static str, file: &str, text: &str) {
+    let p = hosted(
+        json!([{"result": "ran"}]),
+        Opts {
+            always: true,
+            ..acp(h)
+        },
+    );
+    let clone = p.work.path().join("app");
+    let config = clone.join(file);
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(&config, text).unwrap();
+    for args in [
+        &["init", "-q"][..],
+        &["add", "."],
+        &["commit", "-q", "-m", "first"],
+    ] {
+        let o = Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t", "-C"])
+            .arg(&clone)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{args:?}: {o:?}");
+    }
+    let to = format!("{}/{h}:new", p.b.short());
+    let r =
+        p.a.ask(json!({"id": 1, "op": "send", "from": p.asker(), "to": to,
+        "kind": "assign", "text": "build it", "done_when": "done", "deadline_s": 300,
+        "repo": "app", "request_id": "as1"}));
+    assert_eq!(r["ok"], true, "{r}");
+    let r = p.result("as1", 15);
+    let w = p.workers().remove(0);
+    let text = r["text"].as_str().unwrap();
+    assert_eq!(r["status"], "failed", "{r}");
+    assert!(text.contains("runs without approvals"), "{text}");
+    assert!(
+        text.ends_with(&format!("{}/{file}", w.folder.display())),
+        "{text}"
+    );
+    assert!(w.folder.join(file).exists());
+    assert!(p.harness_read().is_empty());
+}
+
+#[test]
+fn cursor_a_worktree_that_allows_everything_refuses_the_start() {
+    acp_folder_bypass(
+        "cursor",
+        ".cursor/cli-config.json",
+        r#"{"approvalMode": "unrestricted"}"#,
+    );
+}
+
+#[test]
+fn grok_a_worktree_that_skips_approvals_refuses_the_start() {
+    acp_folder_bypass("grok", ".grok/config.toml", "permission-mode = \"yolo\"\n");
+}
+
+#[test]
+fn grok_a_worktree_with_claude_bypass_settings_refuses_the_start() {
+    acp_folder_bypass(
+        "grok",
+        ".claude/settings.json",
+        r#"{"permissions": {"defaultMode": "bypassPermissions"}}"#,
+    );
 }

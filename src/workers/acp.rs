@@ -23,6 +23,8 @@ pub struct Acp {
     args: &'static [&'static str],
     /// The folder `argv` named, for `session/new`'s `cwd`.
     folder: OnceLock<String>,
+    /// The harness's check of a worker's folder (`Driver::refuses`).
+    folder_check: Option<fn(&Path) -> Option<String>>,
 }
 
 impl Acp {
@@ -32,6 +34,15 @@ impl Acp {
             harness,
             args,
             folder: OnceLock::new(),
+            folder_check: None,
+        }
+    }
+
+    /// This driver, refusing a folder `check` names a reason for.
+    pub fn checking(self, check: fn(&Path) -> Option<String>) -> Acp {
+        Acp {
+            folder_check: Some(check),
+            ..self
         }
     }
 }
@@ -45,6 +56,10 @@ impl Driver for Acp {
             .into_iter()
             .chain(self.args.iter().map(|a| a.to_string()))
             .collect()
+    }
+
+    fn refuses(&self, folder: &Path) -> Option<String> {
+        self.folder_check.and_then(|check| check(folder))
     }
 
     fn run(self: Box<Self>, child: Child, first_prompt: String, relay: Relay) -> Run {

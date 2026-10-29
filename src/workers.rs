@@ -463,6 +463,9 @@ impl Launch {
         let made = tokio::task::spawn_blocking(move || workspace(&b, &id, &meta)).await;
         let made = made.unwrap_or_else(|e| Err(e.to_string().into()));
         let spawned = made.and_then(|(dir, bare)| {
+            if let Some(why) = driver.refuses(&dir) {
+                return Err(why.into());
+            }
             let argv = driver.argv(&dir, &conv);
             Ok((
                 driver::spawn(&argv, &dir, &log_for(&base, &a.id))?,

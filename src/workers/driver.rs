@@ -64,6 +64,11 @@ pub trait Driver: Send {
     fn argv(&self, folder: &Path, session_id: &str) -> Vec<String>;
     /// Hands the harness `first_prompt` and speaks its protocol until it ends.
     fn run(self: Box<Self>, child: Child, first_prompt: String, relay: Relay) -> Run;
+    /// Why the harness may not run in `folder` (a config there it reads would skip its
+    /// person's approvals), checked once the folder is made and before the spawn.
+    fn refuses(&self, _folder: &Path) -> Option<String> {
+        None
+    }
 }
 
 /// The driver for `provider`'s harness on this computer (`home` holds `.claude/`): none for a
