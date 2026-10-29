@@ -671,7 +671,7 @@ pub fn page_since(store: &Store, after: i64, limit: usize) -> Result<Vec<(i64, V
 }
 
 /// Words a question carries that say nothing about what is asked.
-const STOPWORDS: [&str; 37] = [
+pub(crate) const STOPWORDS: [&str; 37] = [
     "how", "do", "does", "we", "i", "you", "the", "a", "an", "of", "to", "in", "on", "is", "are",
     "was", "were", "be", "it", "that", "this", "what", "when", "where", "which", "who", "why",
     "before", "after", "with", "for", "and", "or", "not", "our", "my", "your",
@@ -812,6 +812,45 @@ pub fn refuse_secret(text: &str) -> Option<&'static str> {
         .iter()
         .find(|(_, re)| re.is_match(text))
         .map(|(n, _)| *n)
+}
+
+/// A recall with a question: at most this many results (facts, then turns)...
+pub const RECALL_RESULTS: usize = 100;
+/// ...within this many tokens of evidence, as the benchmark counts them (`evidence_tokens`).
+pub const RECALL_TOKENS: usize = 8_000;
+
+/// A result's evidence tokens as the BEAM harness counts them (past.dev's published rule):
+/// characters / 4, rounded up, of its content.
+fn evidence_tokens(content: &str) -> usize {
+    content.chars().count().div_ceil(4)
+}
+
+/// `facts` then `turns`, in rank order, kept while they fit `RECALL_RESULTS` and
+/// `RECALL_TOKENS`; the first that would overflow ends the page, as the benchmark trims. A
+/// fact counts as `subject: value` (and ` (was <value>, <day>)` when it replaced one), a turn
+/// as `role: excerpt`.
+pub fn trim_evidence(facts: &mut Vec<Fact>, turns: &mut Vec<crate::capture::TurnHit>) {
+    let fact = |f: &Fact| {
+        let was = f.history.last().map_or(String::new(), |(_, v, when)| {
+            format!(" (was {v}, {})", &crate::date::utc(*when)[..10])
+        });
+        format!("{}: {}{was}", f.subject, f.value)
+    };
+    let mut sizes = facts
+        .iter()
+        .map(fact)
+        .chain(turns.iter().map(|t| format!("{}: {}", t.role, t.excerpt)))
+        .map(|c| evidence_tokens(&c));
+    let (mut kept, mut used) = (0, 0);
+    while kept < RECALL_RESULTS {
+        match sizes.next() {
+            Some(n) if used + n <= RECALL_TOKENS => (kept, used) = (kept + 1, used + n),
+            _ => break,
+        }
+    }
+    let keep_facts = kept.min(facts.len());
+    facts.truncate(keep_facts);
+    turns.truncate(kept - keep_facts);
 }
 
 /// What an agent reads: `Contested:` lines, then `Current:`, then `Lessons:` (replaced facts

@@ -296,11 +296,12 @@ pub fn turns(store: &Store, session_id: &str) -> Result<Vec<Turn>> {
     Ok(rows)
 }
 
-/// Longest excerpt of a turn `recall` shows, in characters.
-pub const EXCERPT_MAX: usize = 240;
+/// Longest excerpt of a turn `recall` shows, in characters: long enough to hold the passage
+/// that answers (the benchmark's page).
+pub const EXCERPT_MAX: usize = 800;
 
-/// A turn that matched a `recall` question: its first `EXCERPT_MAX` characters, each run of
-/// whitespace one space.
+/// A turn that matched a `recall` question: the `EXCERPT_MAX` characters of it that hold the
+/// most of the question's words (`excerpt`), each run of whitespace one space.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TurnHit {
     pub session: String,
@@ -319,8 +320,9 @@ impl TurnHit {
 }
 
 /// The best `limit` of this computer's turns for `query`: bm25 over `turns_fts`, fused with the
-/// cosine order of `turns_vec` when there is a model (`memory::fuse`). With `repo`, only the
-/// turns of sessions in that repo; every turn without one. A refused turn is never a candidate.
+/// cosine order of `turns_vec` when there is a model (`memory::fuse`), the newest first where
+/// ranks tie. With `repo`, only the turns of sessions in that repo; every turn without one. A
+/// refused turn is never a candidate.
 pub fn search_turns(
     store: &Store,
     query: &str,
@@ -337,11 +339,11 @@ pub fn search_turns(
          JOIN capture_sessions s ON s.id = t.session_id
          WHERE turns_fts MATCH ?1 AND substr(t.text, 1, length(?2)) != ?2
          AND (?3 IS NULL OR s.repo = ?3 COLLATE NOCASE)
-         ORDER BY bm25(turns_fts) LIMIT ?4",
+         ORDER BY bm25(turns_fts), t.rowid DESC LIMIT ?4",
     )?;
     let ids: Vec<String> = stmt
         .query_map(rusqlite::params![q, REFUSED, repo, limit], |r| {
-            Ok(r.get::<_, i64>(0)?.to_string())
+            Ok(key(r.get(0)?))
         })?
         .collect::<rusqlite::Result<_>>()?;
     let vecs = || -> Result<Vec<(String, Vec<f32>)>> {
@@ -357,7 +359,7 @@ pub fn search_turns(
         let mut out = Vec::new();
         for row in rows {
             let (turn, blob) = row?;
-            out.extend(unblob(&blob).map(|v| (turn.to_string(), v)));
+            out.extend(unblob(&blob).map(|v| (key(turn), v)));
         }
         Ok(out)
     };
@@ -365,7 +367,7 @@ pub fn search_turns(
     for id in fuse(store.dir(), ids, query, vecs, limit)? {
         let hit = conn.query_row(
             "SELECT session_id, seq, role, text, at FROM capture_turns WHERE rowid = ?1",
-            [&id],
+            [rowid(&id)],
             |r| {
                 let text: String = r.get(3)?;
                 Ok(TurnHit {
@@ -373,19 +375,77 @@ pub fn search_turns(
                     seq: r.get(1)?,
                     role: r.get(2)?,
                     at: r.get(4)?,
-                    excerpt: text
-                        .split_whitespace()
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                        .chars()
-                        .take(EXCERPT_MAX)
-                        .collect(),
+                    excerpt: excerpt(&text, query, EXCERPT_MAX),
                 })
             },
         )?;
         out.push(hit);
     }
     Ok(out)
+}
+
+/// A turn's id as `fuse` ranks it: fixed width and descending with the rowid, so the newer turn
+/// sorts first where fused ranks tie (`rrf` breaks ties by id).
+fn key(rowid: i64) -> String {
+    format!("{:020}", i64::MAX - rowid)
+}
+
+/// The rowid a `key` stands for.
+fn rowid(key: &str) -> i64 {
+    i64::MAX - key.parse::<i64>().unwrap_or(i64::MAX)
+}
+
+/// The `max` characters of `text` (each run of whitespace one space) that hold the most of
+/// `query`'s words: the window starting at the word that gives the most distinct query words
+/// (a word of 3 or more characters, not a stopword, matching as a prefix, as
+/// `memory::fts_query` matches), the earliest on a tie, so a turn whose opening matches reads
+/// from its start. "…" marks a window that starts inside the turn.
+pub fn excerpt(text: &str, query: &str, max: usize) -> String {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let clean = |w: &str| {
+        w.trim_matches(|c: char| !c.is_alphanumeric())
+            .to_lowercase()
+    };
+    // ponytail: the first 64 distinct terms count; a question has far fewer.
+    let mut terms: Vec<String> = vec![];
+    for t in query.split_whitespace().map(clean) {
+        let stop = crate::memory::STOPWORDS.contains(&t.as_str());
+        if t.chars().count() >= 3 && !stop && !terms.contains(&t) && terms.len() < 64 {
+            terms.push(t);
+        }
+    }
+    // Each word: its length with the space after it, and the terms it matches as a bit set.
+    let lens: Vec<usize> = words.iter().map(|w| w.chars().count() + 1).collect();
+    let hits: Vec<u64> = words
+        .iter()
+        .map(|w| {
+            let w = clean(w);
+            terms
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| w.starts_with(t.as_str()))
+                .fold(0, |m, (i, _)| m | 1 << i)
+        })
+        .collect();
+    let (mut best, mut best_score) = (0, 0);
+    for start in 0..words.len() {
+        let (mut len, mut seen) = (0, 0u64);
+        for (l, h) in lens[start..].iter().zip(&hits[start..]) {
+            len += l;
+            if len > max + 1 {
+                break;
+            }
+            seen |= h;
+        }
+        if seen.count_ones() > best_score {
+            (best, best_score) = (start, seen.count_ones());
+        }
+    }
+    let lead = if best > 0 { "…" } else { "" };
+    format!("{lead}{}", words[best..].join(" "))
+        .chars()
+        .take(max)
+        .collect()
 }
 
 /// Deletes the turns recorded more than `days` days before `now`; how many.
