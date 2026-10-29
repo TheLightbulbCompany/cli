@@ -7,7 +7,7 @@ use crate::admission::NOT_OPEN;
 use crate::daemon::ipc::{self, refused, Caller, Response, BAD_REQUEST, INTERNAL, NOT_FOUND};
 use crate::daemon::Daemon;
 use crate::daemon::TeamState;
-use crate::frame::{agent_name, defang, Sender};
+use crate::frame::{agent_name, preview, Sender};
 use crate::identity::Identity;
 use crate::mail::{self, State};
 use crate::roster::Roster;
@@ -175,20 +175,6 @@ fn open_rows(store: &Store) -> Result<Vec<(Hold, Option<i64>)>> {
 /// The open holds, oldest first.
 pub fn open(store: &Store) -> Result<Vec<Hold>> {
     Ok(open_rows(store)?.into_iter().map(|(h, _)| h).collect())
-}
-
-/// The first 160 characters of `text` as one printable, defanged line: what cannot be shown
-/// goes first, so nothing hidden can shield a forged prefix from `defang`.
-fn preview(text: &str) -> String {
-    let shown: String = text
-        .chars()
-        .filter(|c| matches!(c, '\n' | '\t') || label::printable(*c))
-        .collect();
-    defang(&shown)
-        .chars()
-        .map(|c| if matches!(c, '\n' | '\t') { ' ' } else { c })
-        .take(160)
-        .collect()
 }
 
 /// `session`'s agent as the person reads it: `Claude Code`, `desk mailbox`, `terminal`.

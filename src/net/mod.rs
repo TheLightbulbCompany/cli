@@ -94,6 +94,9 @@ pub struct Knobs {
     /// `LIGHTBULB_CONNECT_DEBUG_NO_DEFAULT_RELAYS=1`: no public relays when nothing else is
     /// set (direct only), so a test never reaches the internet.
     no_default_relays: bool,
+    /// The Claude Code a worker runs (`claude` on `PATH` when none), or
+    /// `LIGHTBULB_CONNECT_DEBUG_CLAUDE` (a fake harness).
+    pub claude_program: Option<PathBuf>,
 }
 
 /// Off macOS there is no dialog program: an empty one answers nothing (`dialog::Queue`).
@@ -145,6 +148,7 @@ impl Knobs {
             relay_only: var("LIGHTBULB_CONNECT_DEBUG_RELAY_ONLY").is_some_and(|v| v == "1"),
             no_default_relays: var("LIGHTBULB_CONNECT_DEBUG_NO_DEFAULT_RELAYS")
                 .is_some_and(|v| v == "1"),
+            claude_program: var("LIGHTBULB_CONNECT_DEBUG_CLAUDE").map(Into::into),
         }
     }
 
@@ -163,6 +167,7 @@ impl Knobs {
             outbox_s: outbox::TTL_S,
             relay_only: false,
             no_default_relays: false,
+            claude_program: None,
         }
     }
 }

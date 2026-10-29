@@ -38,6 +38,20 @@ pub fn defang(text: &str) -> String {
         .collect()
 }
 
+/// The first 160 characters of `text` as one printable, defanged line: what cannot be shown
+/// goes first, so nothing hidden can shield a forged prefix from `defang`.
+pub fn preview(text: &str) -> String {
+    let shown: String = text
+        .chars()
+        .filter(|c| matches!(c, '\n' | '\t') || crate::label::printable(*c))
+        .collect();
+    defang(&shown)
+        .chars()
+        .map(|c| if matches!(c, '\n' | '\t') { ' ' } else { c })
+        .take(160)
+        .collect()
+}
+
 /// What kind of address a message came from, which is what the frame names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sender<'a> {

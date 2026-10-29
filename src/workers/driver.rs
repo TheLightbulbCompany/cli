@@ -2,6 +2,7 @@
 //! protocol over the child's stdio until it ends. Shared here: the types a driver hands back
 //! and the child plumbing.
 
+use crate::net::Knobs;
 use crate::Result;
 use std::fs::File;
 use std::future::Future;
@@ -52,9 +53,19 @@ pub trait Driver: Send {
     fn run(self: Box<Self>, child: Child, first_prompt: String, relay: Relay) -> Run;
 }
 
-/// The driver for `provider`'s harness; none yet (the Claude Code driver is Task 5's).
-pub fn driver_for(_provider: &str) -> Option<Box<dyn Driver>> {
-    None
+/// The driver for `provider`'s harness (Claude Code: `knobs.claude_program`, else `claude` on
+/// `PATH`); none for a harness without one.
+pub fn driver_for(provider: &str, knobs: &Knobs) -> Option<Box<dyn Driver>> {
+    match provider {
+        "claude" => {
+            let program = knobs
+                .claude_program
+                .clone()
+                .unwrap_or_else(|| "claude".into());
+            Some(Box::new(super::claude::Claude::new(program)))
+        }
+        _ => None,
+    }
 }
 
 /// Flags that would let a harness act without its person: never in a launch argv.

@@ -2,6 +2,7 @@
 //! start, the registry of running workers, their prompts, stop, deadline and reap, and the
 //! result each sends from its own key.
 
+mod claude;
 mod driver;
 
 pub use driver::{
@@ -341,7 +342,7 @@ pub fn start(d: &Arc<Daemon>, assign_id: &str) -> Result<()> {
     };
     let provider = provider_of(&a.to_key).to_string();
     let now = ipc::now() as i64;
-    let Some(driver) = driver_for(&provider) else {
+    let Some(driver) = driver_for(&provider, d.peers.knobs()) else {
         let (from, rid, at) = (&a.from_key, &a.request_id, now as u64);
         let refused = Some("no_worker");
         let store = d.store.lock().unwrap();
@@ -548,16 +549,25 @@ async fn drive(
 }
 
 /// Files worker `w`'s prompt `ask` as a permission hold on its session and shows its dialog;
-/// the hold's close answers it (`Registry::answered`).
+/// the hold's close answers it (`Registry::answered`), and a prompt the harness withdraws
+/// (its reply dropped) closes the hold `expired`.
 fn prompt(d: &Arc<Daemon>, w: &Worker, ask: PermissionRequest) {
     let team = d.team.lock().unwrap();
     let store = d.store.lock().unwrap();
     let text = format!("{}: {}", ask.tool, ask.summary);
     match holds::file_permission(&store, &w.session, &text, ipc::now() as i64) {
         Ok(h) => {
-            d.workers.prompts.lock().unwrap().insert(h.id, ask.reply);
+            let (tx, rx) = oneshot::channel();
+            d.workers.prompts.lock().unwrap().insert(h.id, tx);
             holds::shown(d, &team, &store, &h);
             eprintln!("worker {}: prompt {}", w.id, h.name());
+            let (d, id, mut reply) = (d.clone(), h.id, ask.reply);
+            tokio::spawn(async move {
+                tokio::select! {
+                    r = rx => if let Ok(r) = r { let _ = reply.send(r); },
+                    _ = reply.closed() => withdrawn(&d, id),
+                }
+            });
         }
         Err(e) => {
             eprintln!("worker {}: prompt not filed: {e}", w.id);
@@ -565,6 +575,22 @@ fn prompt(d: &Arc<Daemon>, w: &Worker, ask: PermissionRequest) {
                 .reply
                 .send(Decision::Deny("the person could not be asked".into()));
         }
+    }
+}
+
+/// The harness withdrew prompt hold `id`: closed `expired` if still open, its dialog gone.
+fn withdrawn(d: &Daemon, id: i64) {
+    d.workers.prompts.lock().unwrap().remove(&id);
+    let h = {
+        let store = d.store.lock().unwrap();
+        let sql = "UPDATE holds SET state = 'expired' WHERE id = ?1 AND state = 'open'";
+        match store.conn().execute(sql, [id]) {
+            Ok(1) => holds::get(&store, id).ok().flatten(),
+            _ => None,
+        }
+    };
+    if let Some(h) = h {
+        holds::closed(d, &h, "expired", None, None, None);
     }
 }
 
@@ -1215,8 +1241,9 @@ mod tests {
     #[test]
     fn no_launch_argv_contains_a_bypass_flag() {
         let folder = Path::new("/w/r1");
+        let peers = crate::net::Peers::default();
         for provider in ["claude", "codex"] {
-            if let Some(d) = driver_for(provider) {
+            if let Some(d) = driver_for(provider, peers.knobs()) {
                 let argv = d.argv(folder, "s1");
                 assert!(launchable(&argv), "{provider}: {argv:?}");
             }
