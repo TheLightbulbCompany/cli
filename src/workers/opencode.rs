@@ -266,8 +266,10 @@ impl Driver for OpenCode {
     }
 }
 
-/// Runs the turn on `child`'s server (`talk`); then its process group is told to end, and it is
-/// killed if it has not within 5 s (`kill_on_drop`). Its stdout is read (for its listening line
+/// Runs the turn on `child`'s server (`talk`); then its process group is told to end, and what
+/// is left of it is killed after 5 s (`kill_on_drop`, `end_group`). Its stdout is read (for
+/// its listening line
+
 /// on `port`) to the end, its stdin held open.
 async fn serve(
     mut child: Child,
@@ -293,12 +295,15 @@ async fn serve(
     }
     let outcome = talk(&mut child, listening, &server, prompt, relay).await;
     drop(stdin);
-    if let Some(pid) = child.id().filter(|&p| p > 0) {
+    let group = child.id();
+    if let Some(pid) = group.filter(|&p| p > 0) {
         // SAFETY: a plain syscall on the server's own process group (`spawn` made it leader).
         unsafe { libc::killpg(pid as i32, libc::SIGTERM) };
     }
     let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+    super::driver::end_group(group);
     outcome
+
 }
 
 /// Whether `id` may name a session (`<m>/opencode:<id>`, a shell argument) or a request (a path

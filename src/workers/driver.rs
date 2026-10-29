@@ -227,7 +227,8 @@ pub async fn response(
 }
 
 /// Runs `talk` over `child`'s stdin and its stdout's lines to an `Outcome`; then stdin is
-/// closed (`talk` owns it), the child has a moment to exit, and is killed (`kill_on_drop`).
+/// closed (`talk` owns it), the child has a moment to exit, and is killed (`kill_on_drop`)
+/// with whatever is left of its process group (`end_group`).
 pub async fn converse<F, Fut>(mut child: Child, talk: F) -> Outcome
 where
     F: FnOnce(ChildStdin, mpsc::Receiver<Line>) -> Fut,
@@ -236,12 +237,31 @@ where
     let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
         return failed("the worker's harness has no stdio");
     };
+    let group = child.id();
     let (tx, lines) = mpsc::channel(64);
     let reader = tokio::spawn(read_lines(stdout, tx));
     let outcome = talk(stdin, lines).await;
     reader.abort();
     let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+    end_group(group);
     outcome
+}
+
+/// Kills what is left of process group `pgid` (the harness's own, `spawn` made it leader: its
+/// tools' processes), when the group still exists. A child that is not a group leader names
+/// no group, and nothing is sent.
+// ponytail: once the leader is reaped its id could in principle be reused before this runs;
+// the window is the few instructions between `wait` and here.
+pub fn end_group(pgid: Option<u32>) {
+    let Some(pgid) = pgid.and_then(|p| i32::try_from(p).ok()).filter(|&p| p > 0) else {
+        return;
+    };
+    // SAFETY: plain syscalls on a process group id, no memory involved.
+    unsafe {
+        if libc::killpg(pgid, 0) == 0 {
+            libc::killpg(pgid, libc::SIGKILL);
+        }
+    }
 }
 
 /// Flags (and `--permission-mode` values) that would let a harness act without its person:
@@ -450,8 +470,42 @@ pub(crate) mod tests {
         assert!(!launchable(&[]));
     }
 
+    #[tokio::test]
+    async fn a_natural_end_takes_the_whole_process_group() {
+        let d = tempfile::tempdir().unwrap();
+        let pid = d.path().join("pid");
+        // The harness leaves a sleeping grandchild behind and exits when its stdin closes.
+        let script = format!(
+            "sleep 300 >/dev/null 2>&1 & echo $! > {}; cat >/dev/null",
+            pid.display()
+        );
+        let argv = ["/bin/sh", "-c", &script].map(String::from);
+        let child = super::spawn(&argv, &[], d.path(), &d.path().join("log")).unwrap();
+        let wait = pid.clone();
+        let outcome = super::converse(child, |stdin, _lines| async move {
+            while std::fs::read_to_string(&wait).map_or(true, |p| !p.ends_with('\n')) {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            drop(stdin);
+            super::failed("done")
+        })
+        .await;
+        assert_eq!(outcome.body, "done");
+        let grandchild: i32 = std::fs::read_to_string(&pid).unwrap().trim().parse().unwrap();
+        // Gone (once reaped by init).
+        let alive = || unsafe { libc::kill(grandchild, 0) } == 0;
+        for _ in 0..100 {
+            if !alive() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        panic!("the grandchild {grandchild} outlived the worker");
+    }
+
     #[test]
     fn comments_go_but_strings_stay() {
+
         let text = "{\"u\": \"https://x/*y*/\\\"//z\", // a\n/* b\n */ \"v\": [1, \",]\",],}";
         let v: serde_json::Value = serde_json::from_str(&super::uncommented(text)).unwrap();
         assert_eq!(v["u"], "https://x/*y*/\"//z");
