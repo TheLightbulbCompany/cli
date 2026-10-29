@@ -2968,6 +2968,19 @@ mod tests {
         let e = assign("r5", "p/codex:c");
         assert_eq!(take(&config, &e), Taken::Start);
         assert_eq!(st(&e), State::Stored);
+        // A peer's 30-day deadline is stored as this host's most: now + 14 400.
+        let f = Message {
+            meta: terms("x", 10 + 30 * 86_400),
+            ..assign("r6", "p/codex:d")
+        };
+        assert_eq!(take(&config, &f), Taken::Start);
+        let stored = s.message(&f.id).unwrap().unwrap();
+        assert_eq!(stored.meta.deadline_at, Some(10 + 14_400));
+        // An earlier one stays as asked.
+        assert_eq!(
+            s.message(&e.id).unwrap().unwrap().meta.deadline_at,
+            Some(100)
+        );
     }
 
     #[test]

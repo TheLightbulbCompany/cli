@@ -20,7 +20,7 @@ enum Kind {
 }
 
 /// Every setting: the one list `load` and `set` read.
-const KEYS: [(&str, Kind); 18] = [
+const KEYS: [(&str, Kind); 17] = [
     ("computer", Kind::Str(|c| &mut c.computer)),
     (
         "preview_to_workspace",
@@ -43,10 +43,6 @@ const KEYS: [(&str, Kind); 18] = [
     ("workers_offer", Kind::Str(|c| &mut c.workers_offer)),
     ("workers_folder", Kind::Str(|c| &mut c.workers_folder)),
     ("workers_max", Kind::Int(|c| &mut c.workers_max)),
-    (
-        "workers_deadline_s",
-        Kind::Int(|c| &mut c.workers_deadline_s),
-    ),
     (
         "workers_max_deadline_s",
         Kind::Int(|c| &mut c.workers_max_deadline_s),
@@ -89,8 +85,7 @@ pub struct Config {
     pub workers_folder: String,
     /// Workers running at once.
     pub workers_max: i64,
-    /// Seconds a worker runs when the assignment names no deadline, and the most it may be given.
-    pub workers_deadline_s: i64,
+    /// The most seconds a worker here runs: a later deadline from an asker is clamped to it.
     pub workers_max_deadline_s: i64,
 }
 
@@ -113,7 +108,6 @@ impl Default for Config {
             workers_offer: String::new(),
             workers_folder: "~/lightbulb-work".into(),
             workers_max: 3,
-            workers_deadline_s: 3600,
             workers_max_deadline_s: 14400,
         }
     }
@@ -207,14 +201,7 @@ mod tests {
             (c.workers_offer.as_str(), c.workers_folder.as_str()),
             ("", "~/lightbulb-work")
         );
-        assert_eq!(
-            (
-                c.workers_max,
-                c.workers_deadline_s,
-                c.workers_max_deadline_s
-            ),
-            (3, 3600, 14400)
-        );
+        assert_eq!((c.workers_max, c.workers_max_deadline_s), (3, 14400));
         Config::set(d, "workers_offer", "claude,codex,vim").unwrap();
         Config::set(d, "workers_max", "7").unwrap();
         let c = Config::load(d).unwrap();

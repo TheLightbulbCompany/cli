@@ -116,8 +116,9 @@ pub enum Taken {
 /// Decides assignment `assign` (to `<member>/<provider>:new`) on this computer `me` (member
 /// short key): refused when this computer does not offer the harness, is running `workers_max`
 /// workers, or refuses the asker; else stored (in no mailbox) and either held for the person
-/// (their policy for the asker is Ask) or ready to start. The caller holds the store lock and
-/// a transaction.
+/// (their policy for the asker is Ask) or ready to start; a deadline past `now +
+/// workers_max_deadline_s` is stored as that. The caller holds the store lock and a
+/// transaction.
 pub fn take_assign(
     store: &Store,
     config: &Config,
@@ -139,14 +140,18 @@ pub fn take_assign(
     if verdict == Policy::Refuse {
         return Ok(Taken::Refused("declined"));
     }
-    store.put_message(assign)?;
+    // This host runs a worker `workers_max_deadline_s` at most, whatever the asker asked.
+    let mut assign = assign.clone();
+    let cap = now.saturating_add(config.workers_max_deadline_s);
+    assign.meta.deadline_at = assign.meta.deadline_at.map(|d| d.min(cap));
+    store.put_message(&assign)?;
     let (from, rid, at) = (&assign.from_key, &assign.request_id, now as u64);
     if verdict == Policy::Allow {
         mail::advance(store.conn(), from, rid, State::Stored, None, None, at)?;
         return Ok(Taken::Start);
     }
     mail::advance(store.conn(), from, rid, State::Held, None, None, at)?;
-    let hold = holds::insert(store, assign.clone(), member, now)?;
+    let hold = holds::insert(store, assign, member, now)?;
     Ok(Taken::Held { hold: hold.id })
 }
 
