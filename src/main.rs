@@ -29,6 +29,10 @@ Everyday:
   approve   Allow one: approve H1
   decline   Decline one: decline H1
 
+Workers:
+  workers   Let teammates start Claude Code or Codex workers here: workers on|off, workers show <name>,
+            workers stop <name>, workers policy, workers clean
+
 Team:
   team      The team and its computers
   remove    Remove a member
@@ -231,6 +235,11 @@ enum Command {
     Decline { request: String },
     /// The permission prompts waiting for your answer.
     Held,
+    /// Workers teammates start here: list, show, stop, on, off, policy, clean.
+    Workers {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Anonymous usage counts: `on`, `off`, or (no argument) their state.
     Telemetry {
         #[arg(value_parser = ["on", "off", "status"])]
@@ -409,6 +418,7 @@ fn run() -> lightbulb::Result<()> {
         Command::Approve { request, always } => exit(cli::answer(&request, true, always)?),
         Command::Decline { request } => exit(cli::answer(&request, false, false)?),
         Command::Held => exit(cli::held()?),
+        Command::Workers { args } => exit(cli::workers(&args)?),
         Command::Telemetry { state } => exit(lightbulb::telemetry::command(
             &lightbulb::paths::state_dir(),
             state.as_deref().filter(|s| *s != "status"),

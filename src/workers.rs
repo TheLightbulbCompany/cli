@@ -759,6 +759,143 @@ fn result_for(
     })
 }
 
+/// The person-only ops of `lightbulb workers` (`caller` must be a person, as `hold.file`):
+/// `workers.list` -> `{workers: [{handle, asker, provider, folder, started_at, ended_at?, state,
+/// assignment, result_status?}]}`; `workers.show {worker}` -> that row (a handle or an assignment
+/// id) with `result`, `conversation`; `workers.stop {worker}`; `workers.off` (stops every running
+/// worker); `workers.policy {action?: allow|refuse|revoke, member?}` -> `{members: [{name, short,
+/// policy}]}`. `member` is a name, an address, or `self`.
+pub fn op(
+    id: u64,
+    op: &str,
+    body: &serde_json::Value,
+    d: &Arc<Daemon>,
+    caller: ipc::Caller,
+) -> ipc::Response {
+    use serde_json::json;
+    if !caller.is_person() {
+        return ipc::refused(id, "not_a_person");
+    }
+    let me = &d.identity.short;
+    let by = named_here(d, "local");
+    let list = || -> Result<Vec<serde_json::Value>> {
+        let team = d.team.lock().unwrap();
+        let store = d.store.lock().unwrap();
+        let mut rows = vec![];
+        for w in store.workers(false)? {
+            let m = store.message(&w.assignment)?;
+            let result = store.result_message(&w.assignment)?;
+            let handle: Option<String> = store
+                .conn()
+                .query_row(
+                    "SELECT handle FROM sessions WHERE key = ?1",
+                    [&w.session],
+                    |r| r.get(0),
+                )
+                .ok()
+                .flatten();
+            rows.push(json!({
+                "handle": handle.unwrap_or_else(|| w.assignment.clone()),
+                "asker": m.as_ref().map(|m| label::render(&team.roster, me, &m.from_key)),
+                "provider": w.provider, "folder": w.folder, "started_at": w.started_at,
+                "ended_at": w.ended_at, "state": w.state, "assignment": w.assignment,
+                "result_status": result.as_ref().map(|r| r.meta.status.clone().unwrap_or_else(|| "done".into())),
+                "result": result.map(|r| r.body),
+                "conversation": w.session.split_once(':').map(|(_, c)| c.to_string()),
+                "worker": w.id,
+            }));
+        }
+        Ok(rows)
+    };
+    let found = |rows: Vec<serde_json::Value>| {
+        let want = body["worker"].as_str().unwrap_or_default();
+        rows.into_iter()
+            .rev()
+            .find(|r| r["handle"] == want || r["assignment"] == want)
+    };
+    let fail = |e: Box<dyn std::error::Error + Send + Sync>| {
+        eprintln!("{op}: {e}");
+        ipc::Response::err(id, ipc::INTERNAL)
+    };
+    match op {
+        "workers.list" => match list() {
+            Ok(rows) => ipc::Response::ok(id, json!({ "workers": rows })),
+            Err(e) => fail(e),
+        },
+        "workers.show" => match list().map(found) {
+            Ok(Some(w)) => ipc::Response::ok(id, w),
+            Ok(None) => ipc::Response::err(id, ipc::NOT_FOUND),
+            Err(e) => fail(e),
+        },
+        "workers.stop" => match list().map(found) {
+            Ok(Some(w)) if w["ended_at"].is_null() => {
+                match stop(d, w["worker"].as_i64().unwrap_or_default(), "stopped", &by) {
+                    Ok(()) => ipc::Response::ok(id, json!({})),
+                    Err(e) => fail(e),
+                }
+            }
+            Ok(Some(_)) => ipc::refused(id, "not_running"),
+            Ok(None) => ipc::Response::err(id, ipc::NOT_FOUND),
+            Err(e) => fail(e),
+        },
+        "workers.off" => {
+            let running = d.store.lock().unwrap().workers(true).unwrap_or_default();
+            for w in running {
+                let _ = stop(d, w.id, "stopped", &by);
+            }
+            ipc::Response::ok(id, json!({}))
+        }
+        "workers.policy" => {
+            let team = d.team.lock().unwrap();
+            let store = d.store.lock().unwrap();
+            let members: Vec<_> = team.roster.members.values().collect();
+            if let Some(action) = body["action"].as_str() {
+                let want = body["member"].as_str().unwrap_or_default();
+                let hit: Vec<_> = members
+                    .iter()
+                    .filter(|m| {
+                        want == "self" && m.short == *me
+                            || m.short == want
+                            || label::name(m).eq_ignore_ascii_case(want)
+                    })
+                    .collect();
+                let scope = match action {
+                    "allow" => "always",
+                    "refuse" => "refused",
+                    "revoke" => "revoked",
+                    _ => return ipc::Response::err(id, ipc::BAD_REQUEST),
+                };
+                let [m] = hit[..] else {
+                    return ipc::refused(
+                        id,
+                        if hit.is_empty() {
+                            "no_such_member"
+                        } else {
+                            "ambiguous_member"
+                        },
+                    );
+                };
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |t| t.as_secs() as i64);
+                if let Err(e) = set_policy(&store, &d.identity, &m.short, scope, &by, now) {
+                    return fail(e);
+                }
+            }
+            let rows: Vec<_> = members
+                .iter()
+                .map(|m| {
+                    let p = policy(&store, me, &m.short).unwrap_or(Policy::Ask);
+                    json!({"name": label::name(m), "short": m.short, "self": m.short == *me,
+                        "policy": match p { Policy::Allow => "always", Policy::Ask => "ask", Policy::Refuse => "refused" }})
+                })
+                .collect();
+            ipc::Response::ok(id, json!({ "members": rows }))
+        }
+        _ => ipc::Response::err(id, ipc::BAD_REQUEST),
+    }
+}
+
 /// Stops worker `worker_id` for `reason` (`stopped`, `cancelled`, `timed_out`) by `by`: its
 /// task is told why, its process group gets SIGTERM, and SIGKILL 5 s later if any of it is
 /// left. A second stop of the same worker does nothing; one not running here is an error.

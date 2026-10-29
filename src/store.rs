@@ -737,6 +737,18 @@ impl Store {
         Ok(())
     }
 
+    /// The oldest result answering message `message_id` (see `result_of`).
+    pub fn result_message(&self, message_id: &str) -> rusqlite::Result<Option<Message>> {
+        self.conn
+            .query_row(
+                "SELECT * FROM messages WHERE kind = 'result' AND reply_to = ?1 \
+                 ORDER BY rowid ASC LIMIT 1",
+                [message_id],
+                row_message,
+            )
+            .optional()
+    }
+
     pub fn message(&self, id: &str) -> rusqlite::Result<Option<Message>> {
         self.conn
             .query_row("SELECT * FROM messages WHERE id = ?1", [id], row_message)

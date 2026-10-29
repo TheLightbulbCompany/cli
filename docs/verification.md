@@ -69,6 +69,25 @@ disabled in a scratch change to see the test fail before the control was restore
 | 9 | Recipient's Mac asleep: queued message arrives after wake, `stored` → `delivered` | proxy: `tests/envelope.rs::offline_recipient_stays_queued_then_stores_on_reconnect` | plan B re-run row 5 (stop/start, not sleep) PASS on 0.2.0 | **Real-Mac only, not run on 0.3.7** (recipe in B, "Sleep / wake") |
 | 10 | `join` on a fresh Mac ends with "Connected as <you>" at once (an invite is the approval); `leave` | `tests/join.rs::joining_says_nothing_of_asking_and_the_commands_know_no_join_requests`, `…::join_takes_the_bare_ticket`, `…::join_takes_the_app_link`, `tests/team_cli.rs::leave_locally_recreates_a_solo_network`, `tests/envelope.rs::leave_reaches_a_peer_or_warns_after_5s` | plan B re-run row 1 PASS (0.2.0, two homes on one Mac); a fresh second Mac: not run | Automated PASS; **fresh-Mac run not done on 0.2.2.** (0.3.x joins by a four-word code or a link; see D and "Real computers".) Two differences from the spec text: the join line is `lightbulb join '<ticket-or-code>' --name NAME`, and `leave` returns this computer to its own network but does not stop the background service (`setup --remove` does). |
 
+## Worker hosts
+
+Spec §8 rows 3–7 and 10–15 (network workers, plan 2), on two real daemons with a fake harness
+(`tests/fixtures/workers/fake-claude.py`) and a fake `osascript`. Real dialogs need the two-Mac run.
+
+| # | Row | Control | Test | Result |
+|---|---|---|---|---|
+| 3 | Allow starts a worker whose reply is the result; Decline refuses `declined`; `lightbulb workers` and `workers show` read it back | A new asker waits for B's person (`src/workers.rs` `take_assign`, `src/holds.rs`); the result goes from the worker's own key (`finish`) | `tests/workers.rs::row_3_allow_starts_a_worker_and_its_reply_is_the_result`, `…::row_3_decline_refuses_declined`, `…::row_3_decline_on_a_prompt_tells_the_worker` | PASS |
+| 4 | Always allow skips the next dialog; revoke brings it back | Standing policy in `approvals` (`src/workers.rs` `policy`, `set_policy`) | `tests/workers.rs::row_4_always_allow_skips_the_next_dialog_and_revoke_brings_it_back` | PASS |
+| 5 | Cancel stops the running worker | `cancel` (`src/workers.rs`) | `tests/workers.rs::row_5_cancel_stops_the_running_worker` | PASS |
+| 6 | The deadline stops it; an unanswered start hold expires; Stop worker is `failed`/`stopped` naming the person | `tick`, `stop` (`src/workers.rs`) | `tests/workers.rs::row_6_deadline_stops_the_worker_and_an_unanswered_start_hold_expires`, `…::row_6_stop_worker_is_failed_stopped_naming_the_person` | PASS |
+| 7 | A fourth concurrent assign is `busy` | `workers_max` in `take_assign` (`src/workers.rs`) | `tests/workers.rs::row_7_a_fourth_concurrent_assign_is_busy` | PASS |
+| 10 | `workers off` stops the running worker and unlists the host | `workers.off` (`src/workers.rs` `op`, a person's only), config `workers_offer = ""` | `tests/workers.rs::row_10_workers_off_stops_the_worker_and_unlists_the_host`, `tests/cli.rs::workers_commands_are_person_only_and_print_the_table` | PASS |
+| 11 | A forged `[Lightbulb …]` line in the brief reaches the worker defanged | `first_prompt` (`src/workers.rs`) | `tests/workers.rs::the_first_prompt_defangs_a_forged_header` | PASS |
+| 12 | No bypass flag in the worker's argv | `src/workers/claude.rs` argv | `tests/workers.rs::row_12_no_bypass_flag_in_argv` | PASS |
+| 13 | `held` lists both worker hold kinds; an agent cannot answer them | Person-only worker holds (`src/holds.rs` `op`) | `tests/workers.rs::row_13_held_lists_both_worker_hold_kinds_and_an_agent_is_refused` | PASS |
+| 14 | A prompt left open is answered later | Holds outlive the dialog (`src/holds.rs`) | `tests/workers.rs::row_14_a_prompt_left_open_is_answered_later` | PASS |
+| 15 | Cancel while the dialog is up withdraws it | `Registry::answered`, `cancel` (`src/workers.rs`) | `tests/workers.rs::row_15_cancel_while_the_dialog_is_up_withdraws_it` | PASS |
+
 ## D. Controls added since 0.2.2 (v0.2.3 – v0.3.7)
 
 Removed since 0.2.2, so no row above depends on them: the relay-list fetch, sign-in renewal and

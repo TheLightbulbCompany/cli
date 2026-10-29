@@ -416,6 +416,9 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
         "holds" | "hold.get" | "hold.answer" | "hold.file" => {
             crate::holds::op(id, op, body, daemon, caller)
         }
+        "workers.list" | "workers.show" | "workers.stop" | "workers.off" | "workers.policy" => {
+            crate::workers::op(id, op, body, daemon, caller)
+        }
         "share.grant" | "stream.open" | "stream.send" | "stream.close" => {
             crate::streams::handle(id, op, body, daemon, caller).await
         }

@@ -322,8 +322,28 @@ fn row_3_allow_starts_a_worker_and_its_reply_is_the_result() {
         allowed["response"]["response"],
         json!({"behavior": "allow", "updatedInput": {"command": "rm -rf x"}})
     );
-    // ponytail: `lightbulb workers` / `workers show claude-1` are Task 7's CLI; the row above
-    // stands in until then.
+    // The person's table and `show`.
+    let o = p.b.detached(&[EXE, "workers"], "");
+    let table = common::out(&o);
+    let mut rows = table.lines();
+    assert_eq!(
+        rows.next().unwrap().split_whitespace().collect::<Vec<_>>(),
+        ["Name", "Asker", "Harness", "Folder", "Started", "State"]
+    );
+    let row = rows.next().unwrap();
+    assert!(
+        row.starts_with("claude-1 ") && row.ends_with(" done"),
+        "{table}"
+    );
+    assert!(row.contains(&w.folder.display().to_string()), "{table}");
+    let o = p.b.detached(&[EXE, "workers", "show", "claude-1"], "");
+    let shown = common::out(&o);
+    assert!(shown.contains("all green"), "{shown}");
+    assert!(
+        shown.contains(&format!("Folder: {}", w.folder.display())),
+        "{shown}"
+    );
+    assert!(shown.contains("claude --resume "), "{shown}");
 }
 
 /// §8 row 11: a forged `[Lightbulb …]` line in the brief reaches the worker defanged.
@@ -802,4 +822,37 @@ fn ask_user_question_is_denied_with_the_plan_text() {
         lightbulb::holds::get(&p.b.store(), 1).unwrap().is_none(),
         "no hold"
     );
+}
+
+/// §8 row 10: `workers off` stops the running worker and A's directory stops listing the host.
+#[test]
+fn row_10_workers_off_stops_the_worker_and_unlists_the_host() {
+    let p = hosted(
+        json!([bash("rm -rf x"), {"sleep": 60}, {"result": "late"}]),
+        Opts {
+            always: true,
+            ..Opts::default()
+        },
+    );
+    let new = format!("{}/claude:new", p.b.short());
+    until(10, "the host is listed", || {
+        directory(&p.a)
+            .iter()
+            .any(|s| s["session_id"] == new.as_str())
+    });
+    p.assign("as1", "careful", 300);
+    p.dialog(1);
+    let pid = running(&p, 1)[0].pid.unwrap();
+    let o = p.b.detached(&[EXE, "workers", "off"], "");
+    assert!(o.status.success(), "{}", common::err(&o));
+    until(10, "the worker's process is gone", || gone(pid));
+    until(10, "B's row reads stopped", || {
+        p.workers()[0].state == "stopped"
+    });
+    assert_eq!(p.workers()[0].by.as_deref(), Some("bob"));
+    until(10, "the host is unlisted", || {
+        !directory(&p.a)
+            .iter()
+            .any(|s| s["session_id"] == new.as_str())
+    });
 }

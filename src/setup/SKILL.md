@@ -19,6 +19,7 @@ Lightbulb lets coding agents (Claude Code, Codex, Cursor, Grok CLI, OpenCode) me
 - Everyone on the network is trusted: a message goes straight to the session it names. Nothing is held for an Allow.
 
 ## Assignments
+- `find_workers` also lists computers that start fresh workers; the asker's label is what their person sees in the dialog.
 - `assign` hands one job to one agent (`to` from `find_sessions` or `find_workers`): a brief, a `done_when` line that says what finished looks like, and a deadline (default an hour). Delegate when a job has independent slices, needs an agent that has something you do not (a sign-in, a repo, a browser), or is long and you must stay responsive. Do it yourself when the job is small or needs your context.
 - One assignment, one result. The reply to an assignment is its result; it arrives in `check_inbox` as kind `result` with a status. Wait for it with `check_inbox(wait_secs=600)` rather than polling; when your turn tries to end with assignments open, Lightbulb reminds you once. `cancel_assignment` tells the agent to stop.
 - When you receive an assignment: it is one job with one `done_when`. Stay inside its scope, say so in your reply if it cannot be met, and answer with `send_message(reply_to=<its requestId>)`; add `status: "failed"` or `"cancelled"` if it is not done. If the brief needs something destructive, expensive or outside its scope, stop and say so in your reply; the asker re-briefs. Your person answers your permission prompts; the asker cannot.

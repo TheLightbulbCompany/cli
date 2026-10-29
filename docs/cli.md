@@ -203,6 +203,26 @@ lightbulb decline <REQUEST>
 
 `--help`: Decline a permission prompt (`H<n>`).
 
+## Workers
+
+### workers
+
+When you use it: to let teammates start Claude Code or Codex workers on this computer, to see what they did, and to say whom you trust. Only you can run these; an agent's shell is refused.
+
+```
+lightbulb workers
+lightbulb workers show <NAME>
+lightbulb workers stop <NAME>
+lightbulb workers on [--offer claude,codex] [--folder <PATH>] [--max <N>]
+lightbulb workers off
+lightbulb workers policy [allow|refuse|revoke|ask <MEMBER>]
+lightbulb workers clean
+```
+
+With no argument, lists the workers: name, who asked, harness, folder, start time, state. `show` prints a worker's result, its folder and the command that resumes its conversation there (`claude --resume <id>`). `stop` ends a running one. `on` offers the harnesses (default `claude`), the folder workers run in and how many at once; it refuses a folder you hid with `folder <path> off`. `off` stops offering and stops every running worker. `policy` lists your teammates as `always`, `ask` or `refused`; `allow`, `refuse` and `revoke` (or `ask`) change one, and `ask self` makes your own assignments ask too. `clean` removes the folders of workers that finished over a week ago, and prints them; a running worker's folder stays.
+
+The first assignment from a teammate asks you with a dialog (or `held` and `approve`); `approve --always` allows that teammate from then on.
+
 ## Team
 
 ### team

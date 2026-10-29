@@ -1923,3 +1923,43 @@ fn memory_list_repo_takes_a_bare_name() {
         );
     }
 }
+
+#[test]
+fn workers_commands_are_person_only_and_print_the_table() {
+    let mut e = Env::new();
+    assert!(e.run(&["who"]).status.success());
+    // An agent's shell: this process, pinned as the caller.
+    let birth = os::process(std::process::id()).unwrap().birth_micros;
+    e.pin = Some(format!("{}:{birth}", std::process::id()));
+    let pin = e.pin.clone().unwrap();
+    for args in [&["workers"][..], &["workers", "off"], &["workers", "on"]] {
+        let o = e
+            .cmd(args)
+            .env("LIGHTBULB_CONNECT_HOOK_CALLER", &pin)
+            .output()
+            .unwrap();
+        assert!(!o.status.success(), "{args:?}");
+        assert!(
+            err(&o).contains("Run this from your own terminal"),
+            "{}",
+            err(&o)
+        );
+    }
+    // Nothing was written by the refused `on`.
+    assert!(!std::fs::read_to_string(e.state.path().join("config.toml"))
+        .unwrap_or_default()
+        .contains("workers_offer"));
+    e.pin = None;
+    let o = e.person(&["workers"]);
+    assert!(out(&o).contains("No workers"), "{}", out(&o));
+    let o = e.person(&["workers", "on", "--offer", "claude"]);
+    assert!(o.status.success(), "{}", err(&o));
+    let config = std::fs::read_to_string(e.state.path().join("config.toml")).unwrap();
+    assert!(config.contains("workers_offer = \"claude\""), "{config}");
+    let o = e.person(&["workers", "policy", "refuse", "self"]);
+    assert!(o.status.success(), "{}", err(&o));
+    let o = e.person(&["workers", "policy"]);
+    assert!(out(&o).lines().any(|l| l == "self  refused"), "{}", out(&o));
+    let o = e.person(&["workers", "show", "claude-9"]);
+    assert!(!o.status.success() && err(&o).contains("No worker claude-9"));
+}

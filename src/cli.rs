@@ -1153,6 +1153,189 @@ pub fn held() -> Result<i32> {
     Ok(0)
 }
 
+/// `workers …`: the worker host's controls (all a person's: the daemon refuses an agent).
+pub fn workers(args: &[String]) -> Result<i32> {
+    let a: Vec<&str> = args.iter().map(String::as_str).collect();
+    let mut conn = connect()?;
+    let f = |v: &Value, k: &str| v[k].as_str().map(cell).unwrap_or_default();
+    let list = |conn: &mut Conn| -> Result<Vec<Value>> {
+        let r = ask(conn, "workers.list", json!({}))?;
+        Ok(r["workers"].as_array().cloned().unwrap_or_default())
+    };
+    match a[..] {
+        [] => {
+            let rows = list(&mut conn)?;
+            if rows.is_empty() {
+                println!(
+                    "No workers have run here. Turn them on with: {} workers on",
+                    command()
+                );
+                return Ok(0);
+            }
+            let mut t = vec![["Name", "Asker", "Harness", "Folder", "Started", "State"]
+                .map(String::from)
+                .to_vec()];
+            for w in &rows {
+                let at = crate::date::utc(w["started_at"].as_i64().unwrap_or(0));
+                t.push(vec![
+                    f(w, "handle"),
+                    f(w, "asker"),
+                    f(w, "provider"),
+                    f(w, "folder"),
+                    at.chars().take(16).collect(),
+                    f(w, "state"),
+                ]);
+            }
+            table(&t);
+        }
+        ["show", handle] => {
+            let r = ask(&mut conn, "workers.show", json!({"worker": handle}));
+            let w = match r {
+                Ok(w) => w,
+                Err(_) => {
+                    eprintln!("No worker {handle}.");
+                    return Ok(1);
+                }
+            };
+            println!(
+                "{} for {}: {}",
+                f(&w, "handle"),
+                f(&w, "asker"),
+                f(&w, "state")
+            );
+            println!("Folder: {}", f(&w, "folder"));
+            match w["result"].as_str() {
+                Some(body) => println!("Result ({}):\n{body}", f(&w, "result_status")),
+                None => println!("No result yet."),
+            }
+            if let Some(c) = w["conversation"].as_str() {
+                let resume = match f(&w, "provider").as_str() {
+                    "codex" => format!("codex resume {c}"),
+                    _ => format!("claude --resume {c}"),
+                };
+                println!("Resume it: cd {} && {resume}", f(&w, "folder"));
+            }
+        }
+        ["stop", handle] => {
+            let r = conn.call("workers.stop", json!({"worker": handle}))?;
+            let texts = [
+                (ipc::NOT_FOUND, format!("No worker {handle}.")),
+                ("not_running", format!("{handle} is not running.")),
+            ];
+            if r["ok"] != true {
+                return refuse(&r, &texts);
+            }
+            println!("Stopping {handle}.");
+        }
+        ["on", ref rest @ ..] => {
+            let (mut offer, mut folder, mut max) = (None, None, None);
+            let mut it = rest.iter();
+            while let Some(flag) = it.next() {
+                let v = it.next().map(|v| v.to_string());
+                match (*flag, v) {
+                    ("--offer", Some(v)) => offer = Some(v),
+                    ("--folder", Some(v)) => folder = Some(v),
+                    ("--max", Some(v)) if v.parse::<u32>().is_ok() => max = Some(v),
+                    _ => {
+                        eprintln!("Usage: {} workers on [--offer claude,codex] [--folder <path>] [--max <n>]", command());
+                        return Ok(2);
+                    }
+                }
+            }
+            let dir = crate::paths::state_dir();
+            // A person's only: the daemon refuses an agent before any key is written.
+            ask(&mut conn, "workers.policy", json!({}))?;
+            let cfg = crate::config::Config::load(&dir)?;
+            let offer = offer.unwrap_or_else(|| match cfg.workers_offer.is_empty() {
+                true => "claude".into(),
+                false => cfg.workers_offer.clone(),
+            });
+            let path = folder.unwrap_or_else(|| cfg.workers_folder.clone());
+            let full = crate::config::expand_home(&path);
+            if cfg.folders_off.iter().any(|o| full.starts_with(o)) {
+                eprintln!("{path} is under a folder you hid from your teammates (folder <path> off). Pick another.");
+                return Ok(1);
+            }
+            crate::config::Config::set(&dir, "workers_offer", &offer)?;
+            crate::config::Config::set(&dir, "workers_folder", &path)?;
+            if let Some(m) = max {
+                crate::config::Config::set(&dir, "workers_max", &m)?;
+            }
+            ask(&mut conn, "reload", json!({}))?;
+            println!("This computer now starts {offer} workers for teammates in {path}. Each new asker waits for your Allow.");
+        }
+        ["off"] => {
+            ask(&mut conn, "workers.off", json!({}))?;
+            crate::config::Config::set(&crate::paths::state_dir(), "workers_offer", "")?;
+            ask(&mut conn, "reload", json!({}))?;
+            println!("Workers are off; the running ones were stopped.");
+        }
+        ["policy"] => {
+            let r = ask(&mut conn, "workers.policy", json!({}))?;
+            for m in r["members"].as_array().into_iter().flatten() {
+                let who = if m["self"] == true {
+                    "self".into()
+                } else {
+                    f(m, "name")
+                };
+                println!("{who}  {}", f(m, "policy"));
+            }
+        }
+        ["policy", action @ ("allow" | "refuse" | "revoke" | "ask"), member] => {
+            let action = if action == "ask" { "revoke" } else { action };
+            let r = conn.call(
+                "workers.policy",
+                json!({"action": action, "member": member}),
+            )?;
+            let texts = [
+                ("no_such_member", format!("No teammate {member}.")),
+                (
+                    "ambiguous_member",
+                    format!("More than one teammate is called {member}; use their address."),
+                ),
+            ];
+            if r["ok"] != true {
+                return refuse(&r, &texts);
+            }
+            println!("{member}: {action}.");
+        }
+        ["clean"] => {
+            let cutoff = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |t| t.as_secs() as i64)
+                - 7 * 86400;
+            let base =
+                crate::workers::folder(&crate::config::Config::load(&crate::paths::state_dir())?);
+            let mut any = false;
+            for w in list(&mut conn)? {
+                let (Some(end), Some(dir)) = (w["ended_at"].as_i64(), w["folder"].as_str()) else {
+                    continue;
+                };
+                let dir = std::path::Path::new(dir);
+                // Only what the workers folder holds, only what finished a week ago.
+                if end > cutoff || !dir.starts_with(&base) || dir == base {
+                    continue;
+                }
+                if std::fs::remove_dir_all(dir).is_ok() {
+                    println!("Removed {}", dir.display());
+                    any = true;
+                }
+            }
+            if !any {
+                println!("Nothing to clean.");
+            }
+        }
+        _ => {
+            eprintln!(
+                "Usage: {} workers [show <name> | stop <name> | on | off | policy | clean]",
+                command()
+            );
+            return Ok(2);
+        }
+    }
+    Ok(0)
+}
+
 /// `team`: the team's name and members, this computer first as `You`; a member's address only
 /// where its name is shared (what `send` then needs).
 pub fn team() -> Result<i32> {
