@@ -1634,3 +1634,29 @@ fn find_workers_lists_always_on_sessions_only() {
     );
     assert_eq!(v["total"], 0, "{v}");
 }
+
+#[test]
+fn find_workers_shows_a_teammates_worker_host() {
+    let (b, a) = (common::Env::new(), common::Env::new());
+    common::seed_pair(&b, &a);
+    common::start_pair(
+        &b,
+        &a,
+        "computer = \"mbp\"\nworkers_offer = \"claude\"\nworkers_max = 2\n",
+        &[],
+    );
+    let key = format!("{}/claude:new", b.short());
+    common::until(15, "A sees B's worker host", || common::sees(&a, &key));
+    register_on(&a, "claude", "c1", &me(), "/tmp");
+    let mut m = mcp_on(&a, &me());
+    let v = m.tool("find_workers", json!({})).json();
+    let host = v["sessions"][0].clone();
+    assert_eq!(host["session_id"], key.as_str(), "{v}");
+    assert_eq!(
+        (&host["always_on"], &host["free"]),
+        (&json!(false), &json!(2)),
+        "{v}"
+    );
+    assert_eq!(host["folder"], "lightbulb-work", "{v}");
+    assert_eq!(v["total"], 1, "{v}");
+}

@@ -43,6 +43,9 @@ pub struct Remote {
     pub doing: Option<String>,
     pub tier: String,
     pub title: Option<String>,
+    /// A worker host's free slots (`<m>/<harness>:new` rows only); an older peer ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free: Option<u32>,
 }
 
 /// A remote session's `status`: busy (`Status::Live`) or idle.

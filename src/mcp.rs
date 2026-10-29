@@ -154,21 +154,28 @@ struct InboxArgs {
     wait_secs: u32,
 }
 
-/// The rows of a directory listing that are always-on agents: online, at a name address
-/// (`<member>/<name>`, never a terminal or a coding session), each marked `always_on`.
+/// The rows of a directory listing that take assignments: first the worker hosts (a row with
+/// `kind` `worker`, online, `always_on: false`, with `free` and `folder`), then the always-on
+/// agents: online, at a name address (`<member>/<name>`, never a terminal or a coding
+/// session), marked `always_on`.
 fn always_on(short: &str, sessions: Vec<Value>) -> Vec<Value> {
-    (sessions.into_iter())
-        .filter(|s| {
-            s["online"] == true
-                && s["session_id"].as_str().is_some_and(|id| {
-                    matches!(
-                        crate::frame::Sender::of(short, id),
-                        crate::frame::Sender::Name(_)
-                    )
-                })
+    let (hosts, rest): (Vec<Value>, Vec<Value>) = (sessions.into_iter())
+        .filter(|s| s["online"] == true)
+        .partition(|s| s["kind"] == "worker");
+    let named = rest.into_iter().filter(|s| {
+        s["session_id"].as_str().is_some_and(|id| {
+            matches!(
+                crate::frame::Sender::of(short, id),
+                crate::frame::Sender::Name(_)
+            )
         })
-        .map(|mut s| {
-            s["always_on"] = true.into();
+    });
+    hosts
+        .into_iter()
+        .map(|s| (s, false))
+        .chain(named.map(|s| (s, true)))
+        .map(|(mut s, on)| {
+            s["always_on"] = on.into();
             s
         })
         .collect()
@@ -1038,6 +1045,25 @@ mod tests {
         assert_eq!(
             always_on("abc", rows),
             vec![json!({"session_id": "abc/friday", "online": true, "always_on": true})]
+        );
+    }
+
+    #[test]
+    fn find_workers_lists_worker_hosts_then_always_on_agents() {
+        let rows = vec![
+            json!({"session_id": "abc/friday", "online": true}),
+            json!({"session_id": "abc/claude:1", "online": true}),
+            json!({"session_id": "abc/claude:new", "online": true, "kind": "worker",
+                "free": 2, "folder": "lightbulb-work"}),
+        ];
+        let got = always_on("abc", rows);
+        assert_eq!(
+            got,
+            vec![
+                json!({"session_id": "abc/claude:new", "online": true, "kind": "worker",
+                    "free": 2, "folder": "lightbulb-work", "always_on": false}),
+                json!({"session_id": "abc/friday", "online": true, "always_on": true}),
+            ]
         );
     }
 

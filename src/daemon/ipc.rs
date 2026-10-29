@@ -1738,6 +1738,9 @@ pub(crate) async fn finish(daemon: &Daemon, from: &Key, mut r: mail::Receipt, wa
     let mut v = with_thread(&r);
     v["where"] = computer.into();
     v["person"] = person.into();
+    if let Some(h) = r.to.as_deref().and_then(mail::new_harness) {
+        v["harness"] = h.into();
+    }
     let online = daemon.peers.is_online(&member);
     v["online"] = online.into();
     // A parked workspace with a doorbell: the outbox rang it, so it is starting, not gone.

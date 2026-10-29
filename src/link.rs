@@ -291,6 +291,7 @@ fn declare(d: &Daemon, frame: &Value) -> Result<(), &'static str> {
         doing: None,
         tier: sessions::Tier::Pull.as_str().into(),
         title,
+        free: None,
     }
     .clamp();
     if !r.valid(&d.identity.short) {

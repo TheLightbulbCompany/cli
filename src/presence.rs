@@ -103,8 +103,55 @@ fn remote(s: &Session, share_paths: bool) -> Remote {
         doing: s.doing.clone(),
         tier: s.tier.as_str().into(),
         title: s.title.clone(),
+        free: None,
     }
     .clamp()
+}
+
+/// This computer's worker-host rows: one `<short>/<harness>:new` per harness `workers_offer`
+/// names, with the slots left under `workers_max` (all harnesses share the cap).
+fn hosts(d: &Daemon) -> Vec<Remote> {
+    let (offered, max, folder) = {
+        let t = d.team.lock().unwrap();
+        (
+            crate::workers::offers(&t.config),
+            t.config.workers_max.max(0),
+            crate::workers::folder(&t.config),
+        )
+    };
+    if offered.is_empty() {
+        return vec![];
+    }
+    let running = d
+        .store
+        .lock()
+        .unwrap()
+        .workers(true)
+        .unwrap_or_default()
+        .len() as i64;
+    let free = u32::try_from((max - running).max(0)).unwrap_or(u32::MAX);
+    let folder = folder
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    offered
+        .into_iter()
+        .map(|h| {
+            Remote {
+                session_id: format!("{}/{h}:new", d.identity.short),
+                agent: h,
+                repo: None,
+                branch: None,
+                folder: folder.clone(),
+                status: STATUSES[usize::from(free != 0)].into(),
+                doing: None,
+                tier: "pull".into(),
+                title: Some(String::new()),
+                free: Some(free),
+            }
+            .clamp()
+        })
+        .collect()
 }
 
 /// Whether `cwd` is under one of `off` (`folders_off`, each `canonical`). A string compare, no
@@ -204,7 +251,12 @@ fn build(d: &Daemon, seq: u64) -> Frame {
     Frame::Presence {
         member: d.identity.key.clone(),
         seq,
-        sessions: live.iter().map(|s| remote(s, share)).chain(apps).collect(),
+        sessions: live
+            .iter()
+            .map(|s| remote(s, share))
+            .chain(hosts(d))
+            .chain(apps)
+            .collect(),
         known,
         kept,
     }
@@ -423,7 +475,7 @@ fn stored(d: &Daemon) -> Vec<(Member, Latest)> {
 /// `verified` as its label says it (`label::verified`); `online`, whether its computer is
 /// connected now (this one always is).
 fn record(m: &Member, me: &str, s: &Remote, cwd: &str, verified: bool, online: bool) -> Value {
-    json!({
+    let mut v = json!({
         "session_id": s.session_id,
         "person": m.name,
         "person_id": m.person_id,
@@ -440,7 +492,13 @@ fn record(m: &Member, me: &str, s: &Remote, cwd: &str, verified: bool, online: b
         "online": online,
         "can_send": true,
         "needs_owner_ok": m.person_id != me,
-    })
+    });
+    if let Some(free) = s.free {
+        v["free"] = free.into();
+        v["kind"] = "worker".into();
+        v["folder"] = s.folder.clone().into();
+    }
+    v
 }
 
 /// `directory {query?}` -> `{sessions}`: this computer's sessions, then every member's latest
@@ -459,8 +517,9 @@ pub fn directory(d: &Daemon, query: Option<&str>) -> Value {
             .iter()
             .map(|s| (remote(s, false), s.cwd.clone(), s.handle.clone(), s.hidden))
             .chain(
-                crate::link::apps(d)
+                hosts(d)
                     .into_iter()
+                    .chain(crate::link::apps(d))
                     .map(|r| (r, String::new(), None, false)),
             )
             .collect(),

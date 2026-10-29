@@ -182,6 +182,16 @@ pub fn receipt_note(r: &Value, person: Option<&ForPerson>) -> Option<String> {
     )
 }
 
+/// The `no_worker` note, naming `harness` (a provider) when the address has one.
+fn no_worker(harness: &str, hint: &str) -> String {
+    if harness.is_empty() {
+        format!("that computer does not take fresh workers yet{hint}")
+    } else {
+        let h = crate::frame::agent_name(harness);
+        format!("that computer does not take {h} workers (find_workers lists who does)")
+    }
+}
+
 fn receipt_text(r: &Value, person: Option<&ForPerson>) -> Option<String> {
     let at = |f: &str| r[f].as_str().unwrap_or_default();
     // A teammate's words, printed to a terminal: one line, nothing it would act on.
@@ -202,7 +212,7 @@ fn receipt_text(r: &Value, person: Option<&ForPerson>) -> Option<String> {
         let (computer, person) = (at("where"), at("person"));
         return Some(match at("state") {
             "refused" if at("reason") == "loop" => limit(),
-            "refused" if at("reason") == "no_worker" => "not sent: that computer does not take fresh workers yet (find_workers lists who takes assignments)".into(),
+            "refused" if at("reason") == "no_worker" => format!("not sent: {}", no_worker(at("harness"), " (find_workers lists who takes assignments)")),
             "refused" if at("reason") == "busy" && remote => format!("not sent: {person}'s computer is running all the workers it allows; try later or another worker"),
             "refused" if at("reason") == "declined" && remote => format!("not sent: {person} declined to start a worker"),
             "queued" if remote && r["waking"] == true => {
@@ -242,7 +252,7 @@ fn receipt_text(r: &Value, person: Option<&ForPerson>) -> Option<String> {
                 "not_a_member" => NOT_A_MEMBER.into(),
                 "request_id_reused" => "that request id was used for another message".into(),
                 "unsupported" => "their computer cannot take it".into(),
-                "no_worker" => "that computer does not take fresh workers yet".into(),
+                "no_worker" => no_worker(p.to.and_then(new_harness).unwrap_or_default(), ""),
                 "bad_request" => "the assignment's terms were refused".into(),
                 _ => shown("reason").replace('_', " "),
             }
@@ -580,6 +590,13 @@ pub fn new_key_of(session: &str) -> Option<String> {
     let (provider, conv) = rest.split_once(':')?;
     (sessions::PROVIDERS.contains(&provider) && conv != "new")
         .then(|| format!("{member}/{provider}:new"))
+}
+
+/// The harness of a `<member>/<provider>:new` address.
+pub fn new_harness(to: &str) -> Option<&str> {
+    let (_, rest) = sessions::split_addr(to)?;
+    rest.strip_suffix(":new")
+        .filter(|p| sessions::PROVIDERS.contains(p))
 }
 
 /// Whether `to` is `<member>/<provider>:new`: a request for a fresh worker session.
