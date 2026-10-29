@@ -2,7 +2,7 @@
 //! spoken by `Acp`.
 
 use super::acp::Acp;
-use super::driver::find;
+use super::driver::{find, uncommented};
 use crate::store::Store;
 use serde_json::Value;
 use std::ffi::OsStr;
@@ -112,48 +112,6 @@ fn bypass(path: &Path) -> bool {
     mode || allow
 }
 
-/// `text` without its `//` line and `/* */` block comments outside strings (a URL's `//`
-/// stays), each comment replaced by a space.
-fn uncommented(text: &str) -> String {
-    let (mut out, mut chars) = (String::with_capacity(text.len()), text.chars().peekable());
-    let (mut string, mut escaped) = (false, false);
-    while let Some(c) = chars.next() {
-        if string {
-            out.push(c);
-            match c {
-                _ if escaped => escaped = false,
-                '\\' => escaped = true,
-                '"' => string = false,
-                _ => {}
-            }
-            continue;
-        }
-        match (c, chars.peek()) {
-            ('"', _) => {
-                string = true;
-                out.push(c);
-            }
-            ('/', Some('/')) => {
-                while chars.next_if(|&n| n != '\n').is_some() {}
-                out.push(' ');
-            }
-            ('/', Some('*')) => {
-                chars.next();
-                let mut prev = ' ';
-                for n in chars.by_ref() {
-                    if prev == '*' && n == '/' {
-                        break;
-                    }
-                    prev = n;
-                }
-                out.push(' ');
-            }
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,14 +164,6 @@ mod tests {
         );
         let none = d.path().join("nope");
         assert_eq!(program(Some(&none), &home, &system, &s, Some(&path)), None);
-    }
-
-    #[test]
-    fn comments_go_but_strings_stay() {
-        let text = "{\"u\": \"https://x/*y*/\\\"//z\", // a\n/* b\n */ \"v\": 1}";
-        let v: Value = serde_json::from_str(&uncommented(text)).unwrap();
-        assert_eq!(v["u"], "https://x/*y*/\"//z");
-        assert_eq!(v["v"], 1);
     }
 
     #[test]

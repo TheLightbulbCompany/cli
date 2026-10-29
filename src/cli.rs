@@ -1246,6 +1246,7 @@ pub fn workers(args: &[String]) -> Result<i32> {
                     "codex" => format!("codex resume {c}"),
                     "cursor" => format!("cursor-agent --resume {c}"),
                     "grok" => format!("grok -r {c}"),
+                    "opencode" => format!("opencode -s {c}"),
                     _ => format!("claude --resume {c}"),
                 };
                 println!("Resume it: cd {} && {resume}", f(&w, "folder"));

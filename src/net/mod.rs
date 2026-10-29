@@ -103,6 +103,8 @@ pub struct Knobs {
     pub cursor_program: Option<PathBuf>,
     /// The Grok CLI a worker runs, or `LIGHTBULB_CONNECT_DEBUG_GROK` (a fake harness).
     pub grok_program: Option<PathBuf>,
+    /// The OpenCode a worker runs, or `LIGHTBULB_CONNECT_DEBUG_OPENCODE` (a fake harness).
+    pub opencode_program: Option<PathBuf>,
 }
 
 /// Off macOS there is no dialog program: an empty one answers nothing (`dialog::Queue`).
@@ -158,6 +160,7 @@ impl Knobs {
             codex_program: var("LIGHTBULB_CONNECT_DEBUG_CODEX").map(Into::into),
             cursor_program: var("LIGHTBULB_CONNECT_DEBUG_CURSOR").map(Into::into),
             grok_program: var("LIGHTBULB_CONNECT_DEBUG_GROK").map(Into::into),
+            opencode_program: var("LIGHTBULB_CONNECT_DEBUG_OPENCODE").map(Into::into),
         }
     }
 
@@ -180,6 +183,7 @@ impl Knobs {
             codex_program: None,
             cursor_program: None,
             grok_program: None,
+            opencode_program: None,
         }
     }
 }

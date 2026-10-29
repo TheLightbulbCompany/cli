@@ -69,6 +69,10 @@ pub trait Driver: Send {
     fn refuses(&self, _folder: &Path) -> Option<String> {
         None
     }
+    /// What the harness's environment adds (OpenCode's server password), set in its child only.
+    fn env(&self) -> Vec<(&'static str, String)> {
+        vec![]
+    }
 }
 
 /// The driver for `provider`'s harness on this computer (`home` holds `.claude/`): none for a
@@ -97,6 +101,10 @@ pub fn driver_for(
         "grok" => {
             let g = super::grok::here(knobs.grok_program.as_deref(), home, store);
             Some(g.map(|g| Box::new(g) as Box<dyn Driver>))
+        }
+        "opencode" => {
+            let o = super::opencode::here(knobs.opencode_program.as_deref(), home, store);
+            Some(o.map(|o| Box::new(o) as Box<dyn Driver>))
         }
         _ => None,
     }
@@ -237,7 +245,7 @@ where
 
 /// Flags (and `--permission-mode` values) that would let a harness act without its person:
 /// never in a launch argv.
-const BYPASS: [&str; 12] = [
+const BYPASS: [&str; 14] = [
     "--dangerously-skip-permissions",
     "--dangerously-bypass-approvals-and-sandbox",
     "bypassPermissions",
@@ -250,6 +258,9 @@ const BYPASS: [&str; 12] = [
     "--trust",
     "--auto",
     "dontAsk",
+    // OpenCode's server open beyond this computer's loopback or to a browser origin.
+    "--cors",
+    "--mdns",
 ];
 
 /// Words that mean a bypass wherever they appear in an argv element.
@@ -267,9 +278,14 @@ pub fn launchable(argv: &[String]) -> bool {
     !argv.is_empty() && !argv.iter().any(|a| bypass(a))
 }
 
-/// Starts `argv` in `folder`: its own process group (a daemon restart leaves it running),
-/// killed if its handle drops, stdin and stdout piped, stderr appended to `log`.
-pub fn spawn(argv: &[String], folder: &Path, log: &Path) -> Result<Child> {
+/// Starts `argv` in `folder` with `env` added: its own process group (a daemon restart leaves it
+/// running), killed if its handle drops, stdin and stdout piped, stderr appended to `log`.
+pub fn spawn(
+    argv: &[String],
+    env: &[(&'static str, String)],
+    folder: &Path,
+    log: &Path,
+) -> Result<Child> {
     if !launchable(argv) {
         return Err("refused: the launch argv has no program or names a bypass".into());
     }
@@ -285,6 +301,7 @@ pub fn spawn(argv: &[String], folder: &Path, log: &Path) -> Result<Child> {
         .stdout(Stdio::piped())
         .stderr(log)
         .env("PATH", child_path(&argv[0]))
+        .envs(env.iter().map(|(k, v)| (k, v)))
         .kill_on_drop(true)
         .process_group(0)
         .spawn()?)
@@ -303,6 +320,55 @@ fn child_path(program: &str) -> std::ffi::OsString {
         .chain(std::env::split_paths(&inherited))
         .filter(|d| !d.as_os_str().is_empty());
     std::env::join_paths(dirs).unwrap_or_default()
+}
+
+/// JSONC `text` as JSON: without its `//` line and `/* */` block comments outside strings (a
+/// URL's `//` stays), each comment replaced by a space, nor a trailing comma before `}` or `]`.
+pub fn uncommented(text: &str) -> String {
+    let (mut out, mut chars) = (String::with_capacity(text.len()), text.chars().peekable());
+    let (mut string, mut escaped) = (false, false);
+    while let Some(c) = chars.next() {
+        if string {
+            out.push(c);
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match (c, chars.peek()) {
+            ('"', _) => {
+                string = true;
+                out.push(c);
+            }
+            ('/', Some('/')) => {
+                while chars.next_if(|&n| n != '\n').is_some() {}
+                out.push(' ');
+            }
+            ('/', Some('*')) => {
+                chars.next();
+                let mut prev = ' ';
+                for n in chars.by_ref() {
+                    if prev == '*' && n == '/' {
+                        break;
+                    }
+                    prev = n;
+                }
+                out.push(' ');
+            }
+            ('}' | ']', _) => {
+                let end = out.trim_end().len();
+                if out[..end].ends_with(',') {
+                    out.remove(end - 1);
+                }
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -357,6 +423,9 @@ pub(crate) mod tests {
             &["--settings={\"defaultMode\":\"bypassPermissions\"}"],
             &["--dangerously-skip-permissions=1"],
             &["x--yolo"],
+            &["--cors", "https://x"],
+            &["--cors=https://x"],
+            &["--mdns"],
         ] {
             assert!(!launchable(&argv(bad)), "{bad:?}");
         }
@@ -371,6 +440,14 @@ pub(crate) mod tests {
             assert!(launchable(&argv(ok)), "{ok:?}");
         }
         assert!(!launchable(&[]));
+    }
+
+    #[test]
+    fn comments_go_but_strings_stay() {
+        let text = "{\"u\": \"https://x/*y*/\\\"//z\", // a\n/* b\n */ \"v\": [1, \",]\",],}";
+        let v: serde_json::Value = serde_json::from_str(&super::uncommented(text)).unwrap();
+        assert_eq!(v["u"], "https://x/*y*/\"//z");
+        assert_eq!(v["v"], serde_json::json!([1, ",]"]));
     }
 
     #[test]

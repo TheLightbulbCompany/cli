@@ -8,6 +8,7 @@ pub mod codex;
 pub mod cursor;
 mod driver;
 pub mod grok;
+pub mod opencode;
 
 pub use driver::{
     driver_for, launchable, Decision, Driver, Outcome, PermissionRequest, Relay, Run,
@@ -468,7 +469,7 @@ impl Launch {
             }
             let argv = driver.argv(&dir, &conv);
             Ok((
-                driver::spawn(&argv, &dir, &log_for(&base, &a.id))?,
+                driver::spawn(&argv, &driver.env(), &dir, &log_for(&base, &a.id))?,
                 dir,
                 argv,
                 bare.then_some(NO_WORKTREE),
@@ -1309,7 +1310,7 @@ mod tests {
             .unwrap();
         let argv: Vec<String> = ["sleep", "30"].map(String::from).into();
         let log = dir.path().join("w.log");
-        let mut child = driver::spawn(&argv, dir.path(), &log).unwrap();
+        let mut child = driver::spawn(&argv, &[], dir.path(), &log).unwrap();
         let pid = child.id().unwrap();
         assert!(register(&s, &reg, &w, pid).unwrap().is_none());
         let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
@@ -1324,7 +1325,7 @@ mod tests {
         // Not cancelled: registered and running; a pid 0 is never registered (nor killed).
         let b = assign("a2", "r2", "p/codex:a", 100);
         let w = claim(&s, &config, &b, "m/claude:w2", 10).unwrap().unwrap();
-        let mut child = driver::spawn(&argv, dir.path(), &log).unwrap();
+        let mut child = driver::spawn(&argv, &[], dir.path(), &log).unwrap();
         let pid = child.id().unwrap();
         assert!(register(&s, &reg, &w, pid).unwrap().is_some());
         assert_eq!(s.workers(true).unwrap()[0].state, "running");
@@ -1342,7 +1343,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let argv: Vec<String> = ["sleep", "30"].map(String::from).into();
-        let mut child = driver::spawn(&argv, dir.path(), &dir.path().join("w.log")).unwrap();
+        let mut child = driver::spawn(&argv, &[], dir.path(), &dir.path().join("w.log")).unwrap();
         // Registered first: the cancel stops it (its task hears why) and leaves the row live
         // for the task's own end.
         let mut stop = register(&s, &reg, &w, child.id().unwrap())
@@ -1368,7 +1369,7 @@ mod tests {
         cancel_worker(&s, &reg, "a2", "p/codex:a", 12).unwrap();
         let row = s.worker_by_assignment("a2").unwrap().unwrap();
         assert_eq!((row.state.as_str(), row.ended_at), ("cancelled", Some(12)));
-        let mut child = driver::spawn(&argv, dir.path(), &dir.path().join("w.log")).unwrap();
+        let mut child = driver::spawn(&argv, &[], dir.path(), &dir.path().join("w.log")).unwrap();
         assert!(register(&s, &reg, &w, child.id().unwrap())
             .unwrap()
             .is_none());
@@ -1456,7 +1457,7 @@ mod tests {
         assert!(adopted.is_empty());
     }
 
-    const BYPASS: [&str; 12] = [
+    const BYPASS: [&str; 14] = [
         "--dangerously-skip-permissions",
         "--dangerously-bypass-approvals-and-sandbox",
         "bypassPermissions",
@@ -1469,6 +1470,8 @@ mod tests {
         "--trust",
         "--auto",
         "dontAsk",
+        "--cors",
+        "--mdns",
     ];
 
     /// A driver whose argv is fixed.
@@ -1498,7 +1501,7 @@ mod tests {
         assert!(launchable(
             &claude::Claude::new("claude".into()).argv(folder, "s1")
         ));
-        for provider in ["claude", "codex", "cursor", "grok"] {
+        for provider in ["claude", "codex", "cursor", "grok", "opencode"] {
             if let Some(Ok(d)) = driver_for(provider, peers.knobs(), dir.path(), &s) {
                 let argv = d.argv(folder, "s1");
                 assert!(launchable(&argv), "{provider}: {argv:?}");

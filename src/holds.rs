@@ -210,10 +210,15 @@ pub fn dialog(
         let asker = sessions::member_of(&h.from_session)
             .and_then(|m| roster.by_short(m))
             .map_or_else(|| "the asker".into(), label::name);
+        let name = agent_name(provider);
+        let a = if name.starts_with(['A', 'E', 'I', 'O', 'U']) {
+            "an"
+        } else {
+            "a"
+        };
         let text = format!(
-            "{who} wants to start a {} worker in {}: \"{}\". Always allow lets {asker}'s \
+            "{who} wants to start {a} {name} worker in {}: \"{}\". Always allow lets {asker}'s \
              computer start workers here without asking.",
-            agent_name(provider),
             dir.display(),
             preview(&h.message.body)
         );

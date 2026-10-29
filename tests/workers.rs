@@ -1,7 +1,7 @@
 //! Network workers, end to end (spec §8 rows 3-7, 11-15): B offers Claude Code workers (a fake
 //! harness, `tests/fixtures/workers/fake-claude.py`, speaking its stream-json protocol) or Codex
-//! ones (`fake-codex.py`, app-server JSON-RPC) or Cursor and Grok ones (`fake-acp.py`, ACP), A
-//! assigns work to `<B>/<harness>:new`. Real
+//! ones (`fake-codex.py`, app-server JSON-RPC) or Cursor and Grok ones (`fake-acp.py`, ACP) or
+//! OpenCode ones (`fake-opencode.py`, HTTP and SSE), A assigns work to `<B>/<harness>:new`. Real
 //! daemons; B's dialogs are a fake `osascript` the test clicks (`Pair::click`), or a fixed answer.
 
 use lightbulb::store::Worker;
@@ -25,6 +25,10 @@ const FAKE_ACP: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/workers/fake-acp.py"
 );
+const FAKE_OPENCODE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/workers/fake-opencode.py"
+);
 
 /// How B is set up.
 #[derive(Default)]
@@ -41,8 +45,8 @@ struct Opts {
     env: Vec<(&'static str, String)>,
     /// More of A's environment.
     a_env: Vec<(&'static str, String)>,
-    /// The harness B offers: `codex` (`fake-codex.py`), `cursor` or `grok` (`fake-acp.py`);
-    /// empty: Claude Code (`fake-claude.py`).
+    /// The harness B offers: `codex` (`fake-codex.py`), `cursor` or `grok` (`fake-acp.py`),
+    /// `opencode` (`fake-opencode.py`); empty: Claude Code (`fake-claude.py`).
     harness: &'static str,
 }
 
@@ -118,6 +122,17 @@ fn hosted(script: Value, o: Opts) -> Pair {
                 ("FAKE_ACP_HARNESS", h.to_string()),
                 ("FAKE_ACP_SCRIPT", script.to_string()),
                 ("FAKE_ACP_LOG", log),
+            ],
+        ),
+        "opencode" => (
+            "opencode",
+            vec![
+                (
+                    "LIGHTBULB_CONNECT_DEBUG_OPENCODE",
+                    FAKE_OPENCODE.to_string(),
+                ),
+                ("FAKE_OPENCODE_SCRIPT", script.to_string()),
+                ("FAKE_OPENCODE_LOG", log),
             ],
         ),
         _ => (
@@ -266,7 +281,8 @@ impl Pair {
         std::fs::rename(tmp, self.ui.path().join("answer")).unwrap();
     }
 
-    /// What the fake harness read on its stdin, as JSON lines.
+    /// What the fake harness read on its stdin (OpenCode: the requests it served), as JSON
+    /// lines.
     fn harness_read(&self) -> Vec<Value> {
         let log = std::fs::read_to_string(self.ui.path().join("fake.log")).unwrap_or_default();
         log.lines()
@@ -765,6 +781,47 @@ fn row_12_no_bypass_flag_in_argv() {
         .output()
         .unwrap();
     assert_eq!(o.status.code(), Some(3), "grok without --no-leader");
+    // OpenCode launches exactly its loopback server on a free port (its password in its
+    // environment only), and its fake refuses a bypass, an open host, or any other argv.
+    let d = workers::driver_for("opencode", knobs.knobs(), dir.path(), &store)
+        .expect("an OpenCode driver");
+    if let Ok(d) = d {
+        let argv = d.argv(std::path::Path::new("/w/r1"), "s1");
+        assert_eq!(argv[1..5], ["serve", "--hostname", "127.0.0.1", "--port"]);
+        assert!(argv[5].parse::<u16>().is_ok_and(|p| p > 0), "{argv:?}");
+        assert_eq!(argv.len(), 6);
+        assert!(workers::launchable(&argv), "{argv:?}");
+        assert!(d
+            .env()
+            .iter()
+            .any(|(k, _)| *k == "OPENCODE_SERVER_PASSWORD"));
+    }
+    let fake = |args: &[&str]| {
+        Command::new(FAKE_OPENCODE)
+            .env("OPENCODE_SERVER_PASSWORD", "pw")
+            .args(args)
+            .output()
+            .unwrap()
+            .status
+            .code()
+    };
+    let exact = ["serve", "--hostname", "127.0.0.1", "--port", "1"];
+    for extra in [
+        &["--auto"][..],
+        &["--cors", "https://x"],
+        &["--cors=https://x"],
+        &["--mdns"],
+        &["--hostname", "0.0.0.0"],
+        &["--hostname=::"],
+    ] {
+        let args: Vec<&str> = exact.iter().copied().chain(extra.iter().copied()).collect();
+        assert_eq!(fake(&args), Some(3), "{extra:?}");
+    }
+    assert_eq!(fake(&["serve", "--port", "1"]), Some(2));
+    assert_eq!(
+        fake(&["serve", "--hostname", "127.0.0.1", "--port", "x"]),
+        Some(2)
+    );
 }
 
 #[test]
@@ -1757,5 +1814,283 @@ fn grok_a_worktree_with_claude_bypass_settings_refuses_the_start() {
         "grok",
         ".claude/settings.json",
         r#"{"permissions": {"defaultMode": "bypassPermissions"}}"#,
+    );
+}
+
+/// B offers OpenCode workers (§8 rows 3, 5, 6): the same flow over its local HTTP server.
+fn opencode() -> Opts {
+    Opts {
+        harness: "opencode",
+        ..Opts::default()
+    }
+}
+
+/// A command permission request, as OpenCode sends one.
+fn opencode_ask(command: &str) -> Value {
+    json!({"ask": {"type": "bash", "pattern": command, "title": format!("Run {command}")}})
+}
+
+/// The requests the fake OpenCode served to `path`.
+fn served(p: &Pair, path: &str) -> Vec<Value> {
+    p.harness_read()
+        .into_iter()
+        .filter(|l| l["path"] == path)
+        .collect()
+}
+
+#[test]
+fn opencode_row_3_allow_starts_a_worker_whose_turn_is_the_result() {
+    let p = hosted(
+        json!([opencode_ask("rm -rf x"), {"question": "which one?"}, {"result": "all green"}]),
+        opencode(),
+    );
+    p.assign("as1", "fix the build", 300);
+    p.wait_state("as1", "held");
+    let (_, text, buttons) = p.dialog(1);
+    assert!(
+        text.contains(&format!(
+            "wants to start an OpenCode worker in {}/",
+            p.folder()
+        )),
+        "{text}"
+    );
+    assert_eq!(buttons, ["Decline", "Allow", "Always allow"]);
+    p.click("Allow");
+
+    let (_, text, buttons) = p.dialog(2);
+    // Re-keyed to the session the server named before the turn.
+    let w = running(&p, 1).remove(0);
+    let session = w.session.split_once(':').unwrap().1.to_string();
+    assert!(session.starts_with("ses_"), "{}", w.session);
+    assert!(
+        text.starts_with("worker opencode-1 (opencode) for prasiddha"),
+        "{text}"
+    );
+    // What Allow grants: the request's title, permission and pattern.
+    let at = format!(
+        " in {} wants to: bash: Run rm -rf x; bash; rm -rf x",
+        w.folder.display()
+    );
+    assert!(text.ends_with(&at), "{text}");
+    assert_eq!(buttons, ["Decline", "Allow", "Stop worker"]);
+    assert!(p.a.inbox(&p.asker()).is_empty());
+    p.click("Allow");
+
+    let r = p.result("as1", 15);
+    assert_eq!(
+        (&r["status"], &r["text"]),
+        (&json!("done"), &json!("all green")),
+        "{r}"
+    );
+    assert_eq!(r["from"], w.session.as_str(), "{r}");
+    until(10, "B's row reads done", || p.workers()[0].state == "done");
+    // Every request carried the worker's password.
+    let read = p.harness_read();
+    assert!(read.len() >= 6, "{read:?}");
+    assert!(read.iter().all(|l| l["auth"] == true), "{read:?}");
+    // Health, the session, the events before the turn, the one-time reply, the question
+    // refused.
+    assert!(!served(&p, "/global/health").is_empty());
+    let new = &served(&p, "/session")[0];
+    assert_eq!(new["method"], "POST");
+    let at = |path: &str| read.iter().position(|l| l["path"] == path).unwrap();
+    let turn = format!("/session/{session}/message");
+    assert!(at("/event") < at(&turn), "{read:?}");
+    let message = &served(&p, &turn)[0]["body"]["parts"][0];
+    assert_eq!(message["type"], "text");
+    assert!(
+        message["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("[Lightbulb assignment from "),
+        "{message}"
+    );
+    assert_eq!(
+        served(&p, "/permission/p0/reply")[0]["body"],
+        json!({"reply": "once"})
+    );
+    assert_eq!(served(&p, "/question/q0/reject").len(), 1);
+    // `show` names the way back into the session.
+    let o = p.b.detached(&[EXE, "workers", "show", "opencode-1"], "");
+    let shown = common::out(&o);
+    assert!(shown.contains("all green"), "{shown}");
+    assert!(
+        shown.contains(&format!(
+            "Resume it: cd {} && opencode -s {session}",
+            w.folder.display()
+        )),
+        "{shown}"
+    );
+}
+
+#[test]
+fn opencode_row_3_decline_sends_reject() {
+    let p = hosted(
+        json!([opencode_ask("rm -rf x"), {"result": "{last}"}]),
+        Opts {
+            always: true,
+            ..opencode()
+        },
+    );
+    p.assign("as1", "careful", 300);
+    let (_, text, _) = p.dialog(1);
+    assert!(
+        text.ends_with("wants to: bash: Run rm -rf x; bash; rm -rf x"),
+        "{text}"
+    );
+    p.click("Decline");
+    let r = p.result("as1", 15);
+    assert_eq!(
+        (&r["status"], &r["text"]),
+        (&json!("done"), &json!("reject")),
+        "{r}"
+    );
+    let reply = &served(&p, "/permission/p0/reply")[0]["body"];
+    assert_eq!(reply["reply"], "reject", "{reply}");
+    assert!(
+        reply["message"].as_str().is_some_and(|m| !m.is_empty()),
+        "{reply}"
+    );
+}
+
+#[test]
+fn opencode_row_5_cancel_stops_it() {
+    let p = hosted(
+        json!([{"sleep": 60}, {"result": "late"}]),
+        Opts {
+            always: true,
+            ..opencode()
+        },
+    );
+    p.assign("as1", "take your time", 300);
+    let pid = running(&p, 1)[0].pid.unwrap();
+    assert!(!gone(pid));
+    p.cancel("as1");
+    until(10, "the worker's process is gone", || gone(pid));
+    until(15, "as1's result reads cancelled", || {
+        p.a.receipt(&p.asker(), "as1")["result"]["status"] == "cancelled"
+    });
+    until(10, "B's row reads cancelled", || {
+        p.workers()[0].state == "cancelled"
+    });
+}
+
+#[test]
+fn opencode_row_6_deadline_stops_it() {
+    let p = hosted(
+        json!([{"say": "half done"}, {"sleep": 60}, {"result": "late"}]),
+        Opts {
+            always: true,
+            env: vec![("LIGHTBULB_CONNECT_DEBUG_OUTBOX_S", "1".into())],
+            a_env: vec![("LIGHTBULB_CONNECT_DEBUG_OUTBOX_S", "1".into())],
+            ..opencode()
+        },
+    );
+    p.assign("as1", "too slow", 3);
+    let pid = running(&p, 1)[0].pid.unwrap();
+    until(10, "the worker is the session", || {
+        p.workers()[0].session.contains("/opencode:ses_")
+    });
+    // The host's own result, from the session's key, with what the worker had said so far
+    // (not the prompt's own text part).
+    let r = p.result_from("as1", &p.workers()[0].session, 15);
+    assert_eq!(
+        (&r["status"], &r["reason"], &r["text"]),
+        (&json!("failed"), &json!("timed_out"), &json!("half done")),
+        "{r}"
+    );
+    until(10, "the worker's process is gone", || gone(pid));
+    until(10, "B's row reads failed", || {
+        p.workers()[0].state == "failed"
+    });
+    assert_eq!(p.workers()[0].by.as_deref(), Some("deadline"));
+}
+
+#[test]
+fn opencode_a_withdrawn_request_closes_its_hold_expired() {
+    let mut ask = opencode_ask("rm -rf x");
+    ask["wait"] = false.into();
+    let p = hosted(
+        json!([ask, {"sleep": 3}, {"cancel": 0}, {"sleep": 8}, {"result": "carried on"}]),
+        Opts {
+            always: true,
+            ..opencode()
+        },
+    );
+    p.assign("as1", "changes its mind", 300);
+    let (dlg, text, _) = p.dialog(1);
+    assert!(text.ends_with("; bash; rm -rf x"), "{text}");
+    // Withdrawn while the worker still runs: the server said it was answered.
+    until(7, "the dialog is withdrawn", || gone(dlg.parse().unwrap()));
+    assert_eq!(p.workers()[0].state, "running");
+    let h = lightbulb::holds::get(&p.b.store(), 1).unwrap().unwrap();
+    assert_eq!(h.state, "expired");
+    let r = p.result("as1", 15);
+    assert_eq!(
+        (&r["status"], &r["text"]),
+        (&json!("done"), &json!("carried on")),
+        "{r}"
+    );
+    // It was never answered.
+    assert!(served(&p, "/permission/p0/reply").is_empty());
+}
+
+#[test]
+fn opencode_an_sse_drop_fails_the_worker_and_closes_its_holds() {
+    let mut ask = opencode_ask("rm -rf x");
+    ask["wait"] = false.into();
+    let p = hosted(
+        json!([ask, {"say": "so far"}, {"sleep": 3}, {"drop": true}, {"sleep": 60},
+            {"result": "late"}]),
+        Opts {
+            always: true,
+            ..opencode()
+        },
+    );
+    p.assign("as1", "loses its events", 300);
+    let pid = running(&p, 1)[0].pid.unwrap();
+    let (dlg, text, _) = p.dialog(1);
+    assert!(text.ends_with("; bash; rm -rf x"), "{text}");
+    let r = p.result("as1", 15);
+    assert_eq!(
+        (&r["status"], &r["reason"], &r["text"]),
+        (&json!("failed"), &json!("error"), &json!("so far")),
+        "{r}"
+    );
+    until(10, "the dialog is withdrawn", || gone(dlg.parse().unwrap()));
+    let h = lightbulb::holds::get(&p.b.store(), 1).unwrap().unwrap();
+    assert_eq!(h.state, "expired");
+    until(10, "the worker's server is gone", || gone(pid));
+    assert!(served(&p, "/permission/p0/reply").is_empty());
+}
+
+#[test]
+fn opencode_the_prompts_own_text_is_not_what_the_worker_said() {
+    let p = hosted(
+        json!([{"drop": true}, {"sleep": 60}]),
+        Opts {
+            always: true,
+            ..opencode()
+        },
+    );
+    p.assign("as1", "says nothing", 300);
+    let r = p.result("as1", 15);
+    assert_eq!(
+        (&r["status"], &r["reason"], &r["text"]),
+        (
+            &json!("failed"),
+            &json!("error"),
+            &json!("the worker's OpenCode event stream ended")
+        ),
+        "{r}"
+    );
+}
+
+#[test]
+fn opencode_a_worktree_that_allows_without_asking_refuses_the_start() {
+    acp_folder_bypass(
+        "opencode",
+        ".opencode/opencode.jsonc",
+        "// shared\n{\"permission\": {\"bash\": {\"*\": \"allow\"}},}",
     );
 }
