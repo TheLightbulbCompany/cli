@@ -398,6 +398,10 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
             memory_remember(id, body, daemon, instance, !instance && for_a_person())
         }
         "memory.recall" => memory_recall(id, body, daemon),
+        #[cfg(feature = "bench")]
+        "bench.ingest_turns" => bench_ingest_turns(id, body, daemon),
+        #[cfg(feature = "bench")]
+        "bench.settle" => bench_settle(id, daemon),
         // Takes the team lock and no store lock; `memory_manage` reads the team first.
         "memory.team" => memory_team(id, body, daemon, for_a_person()),
         "memory.import" => memory_import(id, body, daemon),
@@ -708,6 +712,7 @@ fn memory_recall(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
     let budget = body["budget_chars"]
         .as_u64()
         .map_or(if asked { usize::MAX } else { 1_600 }, |b| b as usize);
+    let (as_of, _) = bench_knobs(body);
     let names = member_names(daemon);
     // From the file, before the lock: `sessions turns off` also stops recall using the turns
     // already stored (they stay for `sessions show` and `sessions forget`).
@@ -722,7 +727,7 @@ fn memory_recall(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
             f
         })
     } else {
-        memory::search(&store, q, 50)
+        memory::search_as_of(&store, q, 50, as_of)
     };
     let Ok(mut facts) = found else {
         return Response::err(id, INTERNAL);
@@ -732,7 +737,7 @@ fn memory_recall(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
     let turns = if q.trim().is_empty() || !turns_on {
         Ok(Vec::new())
     } else {
-        crate::capture::search_turns(&store, q, body["repo"].as_str(), 50)
+        crate::capture::search_turns(&store, q, body["repo"].as_str(), 50, as_of)
     };
     let Ok(mut turns) = turns else {
         return Response::err(id, INTERNAL);
@@ -757,10 +762,80 @@ fn memory_recall(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
     ) {
         let _ = store.set_memory_last(session, &block, now() as i64);
     }
-    Response::ok(
-        id,
-        json!({ "page": page, "block": block, "facts": facts.iter().map(fact_json).collect::<Vec<_>>(), "turns": turns }),
+    let mut out = json!({ "page": page, "block": block, "facts": facts.iter().map(fact_json).collect::<Vec<_>>(), "turns": turns });
+    if let Some(t) = as_of {
+        out["as_of"] = t.into();
+    }
+    Response::ok(id, out)
+}
+
+/// `memory.recall`'s benchmark knobs, `(as_of, turn_limit)`: read only in a `bench` build;
+/// a release recalls as of now with 5 turns.
+#[cfg(feature = "bench")]
+fn bench_knobs(body: &Value) -> (Option<i64>, usize) {
+    (
+        body["as_of"].as_i64(),
+        body["turn_limit"].as_u64().map_or(5, |n| n as usize),
     )
+}
+
+#[cfg(not(feature = "bench"))]
+fn bench_knobs(_: &Value) -> (Option<i64>, usize) {
+    (None, 5)
+}
+
+/// `bench.ingest_turns {session, turns: [{role, text, at}]}` -> `{stored}`: a benchmark's turns,
+/// in order, at the times the dataset gives (unix seconds), through `capture::record_turn`.
+#[cfg(feature = "bench")]
+fn bench_ingest_turns(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
+    use crate::capture::{record_turn, start_session, SessionRow};
+    let (Some(session), Some(turns)) = (body["session"].as_str(), body["turns"].as_array()) else {
+        return Response::err(id, BAD_REQUEST);
+    };
+    let store = daemon.store.lock().unwrap();
+    let row = SessionRow {
+        id: session.into(),
+        harness: "bench".into(),
+        computer: "bench".into(),
+        repo: None,
+        branch: None,
+        started: turns.first().and_then(|t| t["at"].as_i64()).unwrap_or(0),
+        ended: None,
+        prompt_tokens: None,
+        completion_tokens: None,
+    };
+    if start_session(&store, &row, "/bench").is_err() {
+        return Response::err(id, INTERNAL);
+    }
+    let mut stored = 0;
+    for t in turns {
+        let (Some(role), Some(text), Some(at)) =
+            (t["role"].as_str(), t["text"].as_str(), t["at"].as_i64())
+        else {
+            return Response::err(id, BAD_REQUEST);
+        };
+        match record_turn(&store, session, role, text, at) {
+            Ok(true) => stored += 1,
+            Ok(false) => {}
+            Err(_) => return Response::err(id, INTERNAL),
+        }
+    }
+    Response::ok(id, json!({ "stored": stored }))
+}
+
+/// `bench.settle` -> `{embedded}`: embeds every entry and turn still without a vector, before
+/// answering, so a benchmark's questions see all of it.
+#[cfg(feature = "bench")]
+fn bench_settle(id: u64, daemon: &Arc<Daemon>) -> Response {
+    let mut embedded = 0;
+    loop {
+        match crate::memory::embed_missing(&daemon.store.lock().unwrap(), 200) {
+            Ok(0) => break,
+            Ok(n) => embedded += n,
+            Err(_) => return Response::err(id, INTERNAL),
+        }
+    }
+    Response::ok(id, json!({ "embedded": embedded }))
 }
 
 /// Member key -> the name shown for it.
