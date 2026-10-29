@@ -1440,7 +1440,7 @@ fn tools_json_lists_remember_and_recall() {
     assert_eq!(remember["scope"], "network");
     assert_eq!(
         recall["description"],
-        "Call when a task starts or you need something a teammate may know. The answer also includes excerpts from your own prompts and replies in this repository on this computer, or in every repository when the folder has no git origin."
+        "Call when a task starts or you need something a teammate may know, not on every turn: the answer can run to about 8,000 tokens. It also includes excerpts from your own prompts and replies in this repository on this computer, or in every repository when the folder has no git origin."
     );
     assert_eq!(
         remember["description"],
