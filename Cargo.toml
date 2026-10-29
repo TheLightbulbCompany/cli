@@ -10,6 +10,10 @@ license = "Apache-2.0"
 name = "lightbulb"
 path = "src/main.rs"
 
+# `bench`: the BEAM benchmark's daemon ops (dated turns, recall as of a moment). Never in a release.
+[features]
+bench = []
+
 [dependencies]
 argon2 = "0.5"
 clap = { version = "4", features = ["derive"] }

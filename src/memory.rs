@@ -385,7 +385,12 @@ pub fn embed_missing(store: &Store, limit: usize) -> Result<usize> {
 
 /// `(id, vector)` of every embedded entry that is neither tombstoned nor replaced.
 pub fn vectors(store: &Store) -> Result<Vec<(String, Vec<f32>)>> {
-    let current: std::collections::HashSet<String> = replay(store)?
+    vectors_as_of(store, None)
+}
+
+/// `vectors` as the entries stood at `as_of` (`replay_as_of`).
+fn vectors_as_of(store: &Store, as_of: Option<i64>) -> Result<Vec<(String, Vec<f32>)>> {
+    let current: std::collections::HashSet<String> = replay_as_of(store, as_of)?
         .into_iter()
         .filter(|l| l.fact.status != Status::Replaced)
         .map(|l| l.fact.id)
@@ -463,6 +468,12 @@ struct Live {
 
 /// Every live (not tombstoned) `remember`, with its status. Replaced ones are included.
 fn replay(store: &Store) -> Result<Vec<Live>> {
+    replay_as_of(store, None)
+}
+
+/// `replay` of only the entries whose `when` is at or before `as_of`: what was known then, so a
+/// value replaced later is still current.
+fn replay_as_of(store: &Store, as_of: Option<i64>) -> Result<Vec<Live>> {
     let mut stmt = store
         .conn()
         .prepare("SELECT entry FROM memory_entries WHERE tombstone = 0 AND entry IS NOT NULL")?;
@@ -496,6 +507,9 @@ fn replay(store: &Store) -> Result<Vec<Live>> {
                 replaces,
             });
         }
+    }
+    if let Some(t) = as_of {
+        live.retain(|l| l.fact.when <= t);
     }
     live.sort_by(|a, b| (a.fact.when, &a.fact.id).cmp(&(b.fact.when, &b.fact.id)));
 
@@ -686,21 +700,43 @@ const STOPWORDS: [&str; 37] = [
 const COSINE_FLOOR: f32 = 0.25;
 
 pub fn search(store: &Store, query: &str, limit: usize) -> Result<Vec<Fact>> {
+    search_as_of(store, query, limit, None)
+}
+
+/// `search` over what was known at `as_of` (`replay_as_of`). With `as_of`, bm25 ranks every
+/// match and the later entries are dropped before the cut, so they take no place.
+pub fn search_as_of(
+    store: &Store,
+    query: &str,
+    limit: usize,
+    as_of: Option<i64>,
+) -> Result<Vec<Fact>> {
     let Some(q) = fts_query(query) else {
         return Ok(Vec::new());
     };
+    let mut all: HashMap<String, Fact> = replay_as_of(store, as_of)?
+        .into_iter()
+        .map(|l| (l.fact.id.clone(), l.fact))
+        .collect();
     let mut stmt = store.conn().prepare(
         "SELECT m.id FROM memory_fts JOIN memory_entries m ON m.rowid = memory_fts.rowid
          WHERE memory_fts MATCH ?1 ORDER BY bm25(memory_fts) LIMIT ?2",
     )?;
-    let ids: Vec<String> = stmt
-        .query_map(params![q, limit], |r| r.get(0))?
+    let fts_limit = if as_of.is_some() { -1 } else { limit as i64 };
+    let mut ids: Vec<String> = stmt
+        .query_map(params![q, fts_limit], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
-    let ids = fuse(store.dir(), ids, query, || vectors(store), limit)?;
-    let mut all: HashMap<String, Fact> = replay(store)?
-        .into_iter()
-        .map(|l| (l.fact.id.clone(), l.fact))
-        .collect();
+    if as_of.is_some() {
+        ids.retain(|id| all.contains_key(id));
+        ids.truncate(limit);
+    }
+    let ids = fuse(
+        store.dir(),
+        ids,
+        query,
+        || vectors_as_of(store, as_of),
+        limit,
+    )?;
     Ok(ids.iter().filter_map(|id| all.remove(id)).collect())
 }
 
