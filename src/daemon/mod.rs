@@ -291,7 +291,7 @@ pub async fn run(dir: &Path) -> Result<()> {
     let config = Config::load(dir)?;
     let (daemon, net) = crate::embed::boot(dir, config, None).await?;
     // Workers whose process went with the last daemon end; live ones are re-adopted.
-    crate::workers::reap(&daemon, ipc::now() as i64);
+    crate::workers::reap(&daemon);
 
     // We hold the lock, so any socket file left behind is stale.
     let sock = dir.join(paths::SOCKET);

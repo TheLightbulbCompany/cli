@@ -472,6 +472,47 @@ fn row_5_cancel_stops_the_running_worker() {
     });
 }
 
+/// A worker killed with its daemon (a crash, a reboot) still answers: the restarted daemon
+/// sends its asker `failed`/`error` from the worker's key and ends its row.
+#[test]
+fn a_worker_killed_with_its_daemon_sends_a_failed_result_on_restart() {
+    let p = hosted(
+        json!([{"sleep": 60}, {"result": "late"}]),
+        Opts {
+            always: true,
+            ..Opts::default()
+        },
+    );
+    p.assign("as1", "take your time", 300);
+    let w = running(&p, 1).remove(0);
+    let pid = w.pid.unwrap();
+    let daemon = std::fs::read_to_string(p.b.state.path().join("daemon.lock")).unwrap();
+    for target in [daemon.trim().to_string(), format!("-{pid}")] {
+        let killed = Command::new("kill").args(["-9", &target]).status().unwrap();
+        assert!(killed.success(), "kill -9 {target}");
+    }
+    until(10, "B and its worker are gone", || {
+        gone(pid) && std::os::unix::net::UnixStream::connect(p.b.state.path().join("sock")).is_err()
+    });
+    // B comes back (`lan = ...` is written again by `daemon`) and dials A.
+    let config = std::fs::read_to_string(p.b.state.path().join("config.toml")).unwrap();
+    let config = config.split_once('\n').unwrap().1;
+    p.b.daemon(false, config, &[peers(&[&p.a])]);
+    let r = p.result_from("as1", &w.session, 20);
+    assert_eq!(r["status"], "failed", "{r}");
+    assert!(
+        r["text"]
+            .as_str()
+            .is_some_and(|t| t.contains("the worker's daemon restarted")),
+        "{r}"
+    );
+    let row = &p.workers()[0];
+    assert_eq!(
+        (row.state.as_str(), row.ended_at.is_some()),
+        ("failed", true)
+    );
+}
+
 #[test]
 fn row_6_deadline_stops_the_worker_and_an_unanswered_start_hold_expires() {
     // Both timers (B: worker deadline, hold expiry; A: its assignments' deadlines) run every

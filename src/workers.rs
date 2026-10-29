@@ -1063,35 +1063,30 @@ fn alive(store: &Store, w: &Worker) -> bool {
     }
 }
 
-/// `reap`'s store half: each unended worker whose process is gone ends `failed` (by `daemon
-/// restarted`) with its session, and its open prompts close `expired`. The holds closed, and
-/// the workers still alive (to re-adopt).
-pub fn reaped(store: &Store, now: i64) -> Result<(Vec<holds::Hold>, Vec<Worker>)> {
-    let (mut closed, mut alive_ones) = (vec![], vec![]);
-    for w in store.workers(true)? {
-        if alive(store, &w) {
-            alive_ones.push(w);
-            continue;
-        }
-        store.end_worker(w.id, "failed", Some("daemon restarted"), now)?;
-        store.end_session(&w.session, now)?;
-        closed.extend(holds::expire_for(store, &w.session)?);
-    }
-    Ok((closed, alive_ones))
+/// `reap`'s store half: the unended workers whose process is gone (to `finish` as failed),
+/// and those still alive (to re-adopt). Nothing is written.
+pub fn reaped(store: &Store) -> Result<(Vec<Worker>, Vec<Worker>)> {
+    Ok(store.workers(true)?.into_iter().partition(|w| !alive(store, w)))
 }
 
-/// At daemon start: the workers whose process is gone are ended (`reaped`) and their dialogs
-/// withdrawn; one still running (its own process group outlived the old daemon) is re-adopted
-/// with a stop channel and no stream: stopped, or found gone, it ends `failed` with what is
-/// known (its output went to the old daemon).
-pub fn reap(d: &Arc<Daemon>, now: i64) {
-    let r = reaped(&d.store.lock().unwrap(), now);
-    let (closed, adopted) = match r {
+/// At daemon start: each worker whose process is gone ends `failed`/`error` and its asker is
+/// sent that result (`finish`: its row and session end, its prompts close); one still running
+/// (its own process group outlived the old daemon) is re-adopted with a stop channel and no
+/// stream: stopped, or found gone, it ends `failed` with what is known (its output went to the
+/// old daemon).
+pub fn reap(d: &Arc<Daemon>) {
+    let r = reaped(&d.store.lock().unwrap());
+    let (dead, adopted) = match r {
         Ok(r) => r,
         Err(e) => return eprintln!("workers: reap: {e}"),
     };
-    for h in closed {
-        holds::closed(d, &h, "expired", None, None, None);
+    for w in dead {
+        let o = Outcome {
+            status: "failed",
+            reason: Some("error"),
+            body: "the worker's daemon restarted; nothing more came from it".into(),
+        };
+        finish(d, &w, o, None);
     }
     for w in adopted {
         let Some(pid) = w.pid else { continue };
@@ -1388,25 +1383,13 @@ mod tests {
         let s = Store::open(&dir.path().join("state.db")).unwrap();
         let gone = worker_row(&s, "a1", "m/claude:w1", false);
         let live = worker_row(&s, "a2", "m/claude:w2", true);
-        let h = holds::file_permission(&s, "m/claude:w1", "Bash: rm -rf x", 5).unwrap();
-        let (closed, adopted) = reaped(&s, 10).unwrap();
+        let (dead, adopted) = reaped(&s).unwrap();
+        // The dead one is left for `finish` (it sends the result and ends the row).
+        assert_eq!(dead.iter().map(|w| w.id).collect::<Vec<_>>(), [gone]);
         let w = s.worker_by_assignment("a1").unwrap().unwrap();
-        assert_eq!(
-            (w.id, w.state.as_str(), w.by.as_deref(), w.ended_at),
-            (gone, "failed", Some("daemon restarted"), Some(10))
-        );
-        assert_eq!(holds::get(&s, h.id).unwrap().unwrap().state, "expired");
-        assert_eq!(closed.iter().map(|h| h.id).collect::<Vec<_>>(), [h.id]);
-        assert!(
-            s.session("m/claude:w1").unwrap().is_none(),
-            "its session ended"
-        );
+        assert_eq!((w.state.as_str(), w.ended_at), ("running", None));
         // The live one is re-adopted, untouched.
         assert_eq!(adopted.iter().map(|w| w.id).collect::<Vec<_>>(), [live]);
-        assert_eq!(
-            s.worker_by_assignment("a2").unwrap().unwrap().state,
-            "running"
-        );
     }
 
     const BYPASS: [&str; 4] = [
