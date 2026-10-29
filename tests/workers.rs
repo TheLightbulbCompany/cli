@@ -1784,7 +1784,9 @@ fn acp_folder_bypass(h: &'static str, file: &str, text: &str) {
     std::fs::write(&config, text).unwrap();
     for args in [
         &["init", "-q"][..],
-        &["add", "."],
+        // Forced: a global ignore of `settings.local.json` would leave nothing to commit.
+        &["add", "-f", "."],
+
         &["commit", "-q", "-m", "first"],
     ] {
         let o = Command::new("git")
@@ -1841,7 +1843,17 @@ fn grok_a_worktree_that_skips_approvals_refuses_the_start() {
 }
 
 #[test]
+fn grok_a_worktree_with_a_local_allow_rule_refuses_the_start() {
+    acp_folder_bypass(
+        "grok",
+        ".claude/settings.local.json",
+        r#"{"permissions": {"allow": ["Bash(npm test)"]}}"#,
+    );
+}
+
+#[test]
 fn grok_a_worktree_with_claude_bypass_settings_refuses_the_start() {
+
     acp_folder_bypass(
         "grok",
         ".claude/settings.json",
