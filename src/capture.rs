@@ -321,11 +321,13 @@ impl TurnHit {
 /// The best `limit` of this computer's turns for `query`: bm25 over `turns_fts`, fused with the
 /// cosine order of `turns_vec` when there is a model (`memory::fuse`). With `repo`, only the
 /// turns of sessions in that repo; every turn without one. A refused turn is never a candidate.
+/// Each hit's excerpt is `excerpt_chars` long at most (`excerpt`).
 pub fn search_turns(
     store: &Store,
     query: &str,
     repo: Option<&str>,
     limit: usize,
+    excerpt_chars: usize,
 ) -> Result<Vec<TurnHit>> {
     use crate::memory::{fts_query, fuse, unblob};
     let Some(q) = fts_query(query) else {
@@ -373,7 +375,7 @@ pub fn search_turns(
                     seq: r.get(1)?,
                     role: r.get(2)?,
                     at: r.get(4)?,
-                    excerpt: excerpt(&text, query),
+                    excerpt: excerpt(&text, query, excerpt_chars),
                 })
             },
         )?;
@@ -382,12 +384,12 @@ pub fn search_turns(
     Ok(out)
 }
 
-/// The `EXCERPT_MAX` characters of `text` (each run of whitespace one space) that hold the most
+/// The `max` characters of `text` (`EXCERPT_MAX` unless a recall asks for more) (each run of whitespace one space) that hold the most
 /// of `query`'s words: the window starting at the word that gives the most distinct query words
 /// (a word of 3 or more characters matching as a prefix, as `memory::fts_query` matches), the
 /// earliest on a tie, so a turn whose opening matches reads from its start. "…" marks a window
 /// that starts inside the turn.
-pub fn excerpt(text: &str, query: &str) -> String {
+pub fn excerpt(text: &str, query: &str, max: usize) -> String {
     let words: Vec<&str> = text.split_whitespace().collect();
     let terms: Vec<String> = query
         .split_whitespace()
@@ -408,7 +410,7 @@ pub fn excerpt(text: &str, query: &str) -> String {
         let (mut len, mut seen) = (0, std::collections::HashSet::new());
         for w in &words[start..] {
             len += w.chars().count() + 1;
-            if len > EXCERPT_MAX + 1 {
+            if len > max + 1 {
                 break;
             }
             seen.extend(matches(w));
@@ -420,7 +422,7 @@ pub fn excerpt(text: &str, query: &str) -> String {
     let lead = if best > 0 { "…" } else { "" };
     format!("{lead}{}", words[best..].join(" "))
         .chars()
-        .take(EXCERPT_MAX)
+        .take(max)
         .collect()
 }
 
@@ -534,6 +536,7 @@ mod excerpt_tests {
         let e = excerpt(
             &text,
             "how did you recommend queuing requests and counters?",
+            EXCERPT_MAX,
         );
         assert!(
             e.starts_with('…') && e.contains("reset the counters every minute and queue requests"),
@@ -541,9 +544,10 @@ mod excerpt_tests {
         );
         assert!(e.chars().count() <= EXCERPT_MAX);
         // no match, or a match at the start: the turn's opening, as before
-        assert!(excerpt(&text, "kubernetes").starts_with("lorem ipsum"));
+        assert!(excerpt(&text, "kubernetes", EXCERPT_MAX).starts_with("lorem ipsum"));
         assert!(
-            excerpt("rotate the deploy keys now", "rotate keys").starts_with("rotate the deploy")
+            excerpt("rotate the deploy keys now", "rotate keys", EXCERPT_MAX)
+                .starts_with("rotate the deploy")
         );
     }
 }

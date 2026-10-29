@@ -702,6 +702,12 @@ fn memory_recall(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
         return Response::err(id, BAD_REQUEST);
     };
     let budget = body["budget_chars"].as_u64().map_or(1_600, |b| b as usize);
+    // A caller with room for more of each turn asks for it; a turn is at most TURN_MAX bytes.
+    let excerpt_chars = body["excerpt_chars"]
+        .as_u64()
+        .map_or(crate::capture::EXCERPT_MAX, |n| {
+            (n as usize).clamp(1, crate::capture::TURN_MAX)
+        });
     let names = member_names(daemon);
     // From the file, before the lock: `sessions turns off` also stops recall using the turns
     // already stored (they stay for `sessions show` and `sessions forget`).
@@ -726,7 +732,7 @@ fn memory_recall(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
     let turns = if q.trim().is_empty() || !turns_on {
         Ok(Vec::new())
     } else {
-        crate::capture::search_turns(&store, q, body["repo"].as_str(), 5)
+        crate::capture::search_turns(&store, q, body["repo"].as_str(), 5, excerpt_chars)
     };
     let Ok(turns) = turns else {
         return Response::err(id, INTERNAL);

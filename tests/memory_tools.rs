@@ -264,3 +264,25 @@ fn turns_from_another_repo_are_not_recalled() {
         2
     );
 }
+
+#[test]
+fn recall_can_ask_for_longer_excerpts() {
+    let e = daemon();
+    let long = format!(
+        "rotate the staging deploy keys {}",
+        "with the vault script ".repeat(40)
+    );
+    turns(&e, &[("assistant", &long)]);
+    let short = recall(&e, "rotate deploy keys", None);
+    assert_eq!(
+        short["turns"][0]["excerpt"]
+            .as_str()
+            .unwrap()
+            .chars()
+            .count(),
+        240
+    );
+    let r = e.ask(json!({"id": 2, "op": "memory.recall", "question": "rotate deploy keys", "excerpt_chars": 600}));
+    let n = r["turns"][0]["excerpt"].as_str().unwrap().chars().count();
+    assert!(n > 240 && n <= 600, "{n}");
+}
