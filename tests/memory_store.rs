@@ -797,11 +797,13 @@ fn two_people_through_one_signing_key_are_contested() {
     let mut b = fact("b", "workspace", "10 March", 1_700_100_000);
     b.on_behalf_of = Some("bo".into());
     let page = memory::page(&s, &[a.clone(), b], &[], &names, 10_000, usize::MAX);
+    // Each value is labelled with its person, not the workspace agent that signed both.
     assert!(
-        page.starts_with("Contested:\nlaunch date: 3 March"),
+        page.starts_with(
+            "Contested:\nlaunch date: 3 March (ann, 2023-11-14) vs 10 March (bo, 2023-11-16)"
+        ),
         "{page}"
     );
-    assert!(page.contains(" vs 10 March"), "{page}");
     // The same person through the workspace twice: notes over time, not a dispute.
     let mut c = fact("c", "workspace", "10 March", 1_700_100_000);
     c.on_behalf_of = Some("ann".into());

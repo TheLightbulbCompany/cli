@@ -909,7 +909,11 @@ pub fn page(
     };
     // A line's date is the whole day, year included: a page can span years.
     let ymd = |secs: i64| crate::date::utc(secs)[..10].to_string();
-    let by = |f: &Fact| format!("{} ({}, {})", f.value, who(&f.author), ymd(f.when));
+    // A "vs" value is labelled with its person, as the grouping counts them.
+    let by = |f: &Fact| {
+        let person = f.on_behalf_of.as_deref().unwrap_or(&f.author);
+        format!("{} ({}, {})", f.value, who(person), ymd(f.when))
+    };
     // Contested only when two people hold different values. One person's values of one subject
     // are that person's own notes over time: each prints as its own dated line, in rank order,
     // instead of one "a vs b vs c" line (BEAM 100K: a broad subject gathered a median 17 values).
