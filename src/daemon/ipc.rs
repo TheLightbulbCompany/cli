@@ -701,17 +701,13 @@ fn memory_recall(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
     let Some(q) = body["question"].as_str() else {
         return Response::err(id, BAD_REQUEST);
     };
-    // The start block keeps its 1,600 characters; a question's page is the benchmark's, up to
-    // `RECALL_TOKENS` tokens (4 characters each, as `memory::trim_evidence` counts).
+    // The start block keeps its 1,600 characters. A question's page is the benchmark's:
+    // `memory::trim_evidence` is its only cutter, and the page holds every result it kept, each
+    // with its line's author and date (so `counts` are the page's lines).
     let asked = !q.trim().is_empty();
-    let budget = body["budget_chars"].as_u64().map_or(
-        if asked {
-            memory::RECALL_TOKENS * 4
-        } else {
-            1_600
-        },
-        |b| b as usize,
-    );
+    let budget = body["budget_chars"]
+        .as_u64()
+        .map_or(if asked { usize::MAX } else { 1_600 }, |b| b as usize);
     let names = member_names(daemon);
     // From the file, before the lock: `sessions turns off` also stops recall using the turns
     // already stored (they stay for `sessions show` and `sessions forget`).

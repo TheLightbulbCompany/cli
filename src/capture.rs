@@ -427,18 +427,35 @@ pub fn excerpt(text: &str, query: &str, max: usize) -> String {
                 .fold(0, |m, (i, _)| m | 1 << i)
         })
         .collect();
+    // One pass: the window `start..end` grows while it fits (one character kept for the "…"
+    // lead, so a window that ends on the match is never cut) and drops its first word as
+    // `start` moves, keeping how many of its words match each term.
+    let room = max.saturating_sub(1);
     let (mut best, mut best_score) = (0, 0);
+    let (mut count, mut distinct) = ([0u32; 64], 0);
+    let (mut end, mut len) = (0, 0);
+    let bits = |h: u64| (0..64).filter(move |i| h & 1 << i != 0);
     for start in 0..words.len() {
-        let (mut len, mut seen) = (0, 0u64);
-        for (l, h) in lens[start..].iter().zip(&hits[start..]) {
-            len += l;
-            if len > max + 1 {
-                break;
-            }
-            seen |= h;
+        if end < start {
+            (end, len) = (start, 0); // the word before was longer than the window alone
         }
-        if seen.count_ones() > best_score {
-            (best, best_score) = (start, seen.count_ones());
+        while end < words.len() && len + lens[end] <= room + 1 {
+            for i in bits(hits[end]) {
+                distinct += u32::from(count[i] == 0);
+                count[i] += 1;
+            }
+            len += lens[end];
+            end += 1;
+        }
+        if distinct > best_score {
+            (best, best_score) = (start, distinct);
+        }
+        if end > start {
+            for i in bits(hits[start]) {
+                count[i] -= 1;
+                distinct -= u32::from(count[i] == 0);
+            }
+            len -= lens[start];
         }
     }
     let lead = if best > 0 { "…" } else { "" };
@@ -545,4 +562,41 @@ pub fn transcript_tokens(path: &str) -> Option<(i64, i64)> {
             .values()
             .fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1))
     })
+}
+
+#[cfg(test)]
+mod excerpt_tests {
+    use super::{excerpt, EXCERPT_MAX};
+
+    /// The window that holds the question's words, found in one pass even in a very long text
+    /// (a turn is cut to 4 KB, but `excerpt` takes any text), and the opening when nothing
+    /// matches or the opening does.
+    #[test]
+    fn the_excerpt_is_the_window_that_matches_in_a_long_text() {
+        let filler = "lorem ipsum dolor sit amet ".repeat(8_000); // about 216 KB
+        let text = format!("{filler}reset the counters every minute and queue requests {filler}");
+        let t = std::time::Instant::now();
+        let e = excerpt(
+            &text,
+            "how did you recommend queuing requests and counters?",
+            EXCERPT_MAX,
+        );
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(1),
+            "{:?}",
+            t.elapsed()
+        );
+        assert!(e.starts_with('…'), "{e}");
+        assert!(
+            e.contains("reset the counters every minute and queue requests"),
+            "{e}"
+        );
+        assert!(e.chars().count() <= EXCERPT_MAX);
+        assert!(excerpt(&text, "kubernetes", EXCERPT_MAX).starts_with("lorem ipsum"));
+        let opening = excerpt("rotate the deploy keys now", "rotate keys", EXCERPT_MAX);
+        assert_eq!(opening, "rotate the deploy keys now");
+        // A word longer than the window is passed over, not a stall.
+        let long = format!("{} rotate the keys", "x".repeat(EXCERPT_MAX + 10));
+        assert!(excerpt(&long, "rotate keys", EXCERPT_MAX).starts_with("…rotate the keys"));
+    }
 }

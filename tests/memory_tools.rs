@@ -310,10 +310,21 @@ fn an_excerpt_is_the_window_that_matches() {
 }
 
 /// The evidence stops at 8,000 tokens counted as the benchmark counts them (characters / 4,
-/// rounded up, of `role: excerpt`): the first turn that would overflow ends the page.
+/// rounded up, of `subject: value` and `role: excerpt`): the first result that would overflow
+/// ends the page, and every result kept is a line on it (the trim is the only cutter).
 #[test]
 fn recall_trims_its_evidence_at_8000_tokens() {
     let e = daemon();
+    for i in 0..5 {
+        let r = remember(
+            &e,
+            &format!("rotate note {i}"),
+            "deploy keys go through the vault",
+            "fact",
+            json!({}),
+        );
+        assert_eq!(r["stored"], true, "{r}");
+    }
     let texts: Vec<String> = (100..150)
         .map(|i| format!("rotate the deploy keys {i} {}", "lorem ".repeat(200)))
         .collect();
@@ -335,41 +346,63 @@ fn recall_trims_its_evidence_at_8000_tokens() {
     assert!(tokens.iter().all(|&n| n == 203), "{tokens:?}");
     assert_eq!(tokens.len(), 39);
     assert!(tokens.iter().sum::<usize>() <= lightbulb::memory::RECALL_TOKENS);
+    // The counts are the page's lines, author and date included.
     let page = r["page"].as_str().unwrap();
-    assert!(
-        page.chars().count() <= lightbulb::memory::RECALL_TOKENS * 4,
-        "{}",
-        page.len()
-    );
+    let lines = |prefix: &str| page.lines().filter(|l| l.starts_with(prefix)).count();
+    assert_eq!(r["facts"].as_array().unwrap().len(), 5, "{r}");
+    assert_eq!(lines("rotate note "), 5, "{page}");
+    assert_eq!(lines("assistant, "), 39, "{page}");
 }
 
-/// The session-start block (no question, the hook's 1,600 characters) is what it was: facts
-/// only, within 1,600 characters, while a question's page runs past it.
+/// The session-start block, asked as the hook asks it (hook.rs: no question, the session's repo,
+/// 1,600 characters, its key), is what it was: facts only, within 1,600 characters, never trimmed
+/// to the question page's 100 results, while a question's page runs past it.
 #[test]
 fn the_start_block_keeps_its_1600_characters() {
     let e = daemon();
-    for i in 0..40 {
+    let me = lightbulb::os::process(std::process::id()).unwrap();
+    let r = e.ask(
+        json!({"id": 1, "op": "register", "session": {"provider": "claude",
+        "conversation": "s1", "pid": me.pid, "birth_micros": me.birth_micros, "cwd": "/tmp",
+        "repo": "engine"}}),
+    );
+    let key = r["key"].as_str().unwrap().to_string();
+    // 120 facts in this repo: past the question page's 100 results.
+    for i in 0..120 {
         let r = remember(
             &e,
             &format!("deploy step {i}"),
             &format!("the deploy runs the vault script with the staging profile, step {i}"),
             "fact",
-            json!({}),
+            json!({ "session": key }),
         );
         assert_eq!(r["stored"], true, "{r}");
     }
-    turns(&e, &[("user", "the deploy uses the vault script")]);
-    let start =
-        e.ask(json!({"id": 5, "op": "memory.recall", "question": "", "budget_chars": 1600}));
+    // A turn in the same repo, which the start block never shows.
+    let start = json!({"id": 3, "op": "capture.session_start", "harness": "claude",
+        "conversation": "s1", "cwd": "/tmp/proj", "repo": "engine"});
+    assert_eq!(e.ask(start)["stored"], true);
+    let turn = json!({"id": 4, "op": "capture.turn", "harness": "claude", "conversation": "s1",
+        "role": "user", "text": "the deploy uses the vault script"});
+    assert_eq!(e.ask(turn)["stored"], true);
+    let start = e.ask(
+        json!({"id": 5, "op": "memory.recall", "question": "", "repo": "engine",
+        "budget_chars": 1600, "session": key}),
+    );
     let page = start["page"].as_str().unwrap();
     assert!(
         page.chars().count() <= 1600 && !page.contains("Turns:"),
         "{page}"
     );
+    assert!(start["block"]
+        .as_str()
+        .unwrap()
+        .starts_with("Memory (team and yours):"));
+    assert_eq!(start["facts"].as_array().unwrap().len(), 120, "not trimmed");
+    assert_eq!(start["turns"], json!([]));
     let asked = recall(&e, "deploy vault script", None);
     assert!(
         asked["page"].as_str().unwrap().chars().count() > 1600,
         "{asked}"
     );
-    assert_eq!(asked["facts"].as_array().unwrap().len(), 40);
 }
