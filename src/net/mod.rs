@@ -23,6 +23,7 @@ use crate::mail::{self, State};
 use crate::memory;
 use crate::roster::{self, Entry, Roster};
 use crate::sessions::Key;
+use crate::workers::{self, Taken};
 use crate::Result;
 use crate::{holds, identity, outbox, relay};
 use frames::Frame;
@@ -1283,18 +1284,52 @@ fn receive(d: &Arc<Daemon>, key: &str, env: &Frame, tx: &Tx) {
     let store = d.store.lock().unwrap();
     let me = &d.identity.short;
     let now = ipc::now();
-    match mail::receive(&store, env, peer, &team.roster, me, ids, members, now) {
+    match mail::receive(
+        &store,
+        env,
+        peer,
+        &team.roster,
+        me,
+        ids,
+        members,
+        &team.config,
+        now,
+    ) {
         Ok(mail::Answer {
             state,
             reason,
             limit,
             fresh,
+            taken,
+            cancelled,
         }) => {
             eprintln!("net: envelope {id} from {short}: {}", state.name());
             ack(state, reason, limit);
-            if state == State::Stored {
-                drop((store, team));
-                ipc::stored(d, &Key(to.clone()), fresh.then_some(id.as_str()));
+            // A fresh worker's address has no mailbox: nothing to wake, only a follow-up.
+            match (taken, cancelled) {
+                (Some(Taken::Held { hold }), _) => {
+                    if let Ok(Some(h)) = holds::get(&store, hold) {
+                        holds::shown(d, &team, &store, &h);
+                    }
+                }
+                (Some(Taken::Start), _) => {
+                    drop((store, team));
+                    if let Err(e) = workers::start(d, id) {
+                        eprintln!("net: worker for {id}: {e}");
+                    }
+                }
+                (_, Some(assign)) => {
+                    let by = short.to_string();
+                    drop((store, team));
+                    if let Err(e) = workers::cancel(d, &assign, &by) {
+                        eprintln!("net: cancel for {assign}: {e}");
+                    }
+                }
+                _ if state == State::Stored => {
+                    drop((store, team));
+                    ipc::stored(d, &Key(to.clone()), fresh.then_some(id.as_str()));
+                }
+                _ => {}
             }
         }
         Err(e) => eprintln!("net: dropped envelope {id} from {short}: {e}"),

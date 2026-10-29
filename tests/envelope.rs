@@ -799,3 +799,28 @@ async fn an_assignment_crosses_the_wire_and_its_result_comes_back() {
     wait_state(&a, &asker, "as2", "refused");
     assert_eq!(a.receipt(&asker, "as2")["reason"], "no_worker");
 }
+
+/// B offers claude and has no standing word for A, so A's assignment to `<B>/claude:new` is
+/// held: A's receipt says so, and B's person sees a worker-start hold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_peer_assign_to_a_worker_address_is_held_and_the_receipt_says_so() {
+    let (a, b) = (Env::new(), Env::new());
+    seed_pair(&a, &b);
+    b.daemon(false, "workers_offer = \"claude\"\n", &[]);
+    a.daemon(false, "", &[peers(&[&b])]);
+    until(10, "both online", || {
+        a.status()["peers"]["online"] == 1 && b.status()["peers"]["online"] == 1
+    });
+    let asker = session(&a, "a1");
+    let new = format!("{}/claude:new", b.short());
+    let r = a.ask(
+        json!({"id": 1, "op": "send", "from": asker, "to": new, "kind": "assign",
+        "text": "start fresh", "done_when": "green", "deadline_s": 300, "request_id": "as1"}),
+    );
+    assert_eq!(r["ok"], true, "{r}");
+    wait_state(&a, &asker, "as1", "held");
+    let holds = person(&b, json!({"id": 1, "op": "holds"}));
+    let list = holds["holds"].as_array().unwrap();
+    assert_eq!(list.len(), 1, "{holds}");
+    assert_eq!(list[0]["kind"], "worker", "{holds}");
+}

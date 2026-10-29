@@ -498,3 +498,74 @@ async fn a_late_result_after_the_timeout_is_mail_not_a_second_closing() {
         format!("timeout-{assign_id}")
     );
 }
+
+/// An assignment to this computer's own `<me>/claude:new` (policy: this key allows itself) is
+/// stored with no mailbox and its worker recorded `starting`; a cancel of it reaches the worker
+/// module, which ends the row `cancelled`. (`workers::start` and `cancel` are still stubs that
+/// only move the row.)
+#[tokio::test]
+async fn an_assign_to_my_own_new_claude_is_stored_and_a_cancel_reaches_the_worker_module() {
+    let dir = tempfile::tempdir().unwrap();
+    let claude_home = tempfile::tempdir().unwrap();
+    std::env::set_var("LIGHTBULB_CONNECT_CLAUDE_HOME", claude_home.path());
+    std::fs::write(
+        dir.path().join("config.toml"),
+        "lan = false\nworkers_offer = \"claude\"\n",
+    )
+    .unwrap();
+    let home = dir.path().to_path_buf();
+    tokio::spawn(async move { daemon::run(&home).await.unwrap() });
+    let sock = dir.path().join(paths::SOCKET);
+    let (mut l, mut w) = connect(&sock).await;
+    let birth = os::process(std::process::id()).unwrap().birth_micros;
+    let reg = call(
+        &mut l,
+        &mut w,
+        json!({"id": 1, "op": "register", "session": {
+        "provider": "codex", "conversation": "a", "pid": std::process::id(),
+        "birth_micros": birth, "cwd": "/tmp"}}),
+    )
+    .await;
+    let asker = reg["key"].as_str().unwrap().to_string();
+    let me = asker.split('/').next().unwrap();
+    let new = format!("{me}/claude:new");
+
+    let sent = call(
+        &mut l,
+        &mut w,
+        json!({"id": 2, "op": "send", "from": asker, "to": new, "kind": "assign",
+        "text": "start fresh", "done_when": "green", "deadline_s": 300, "request_id": "as1"}),
+    )
+    .await;
+    assert_eq!(sent["ok"], true, "{sent}");
+    assert_eq!(sent["receipt"]["state"], "stored", "{sent}");
+    let db = dir.path().join("state.db");
+    let store = lightbulb::store::Store::open(&db).unwrap();
+    let ws = store.workers(true).unwrap();
+    let [worker] = &ws[..] else { panic!("{ws:?}") };
+    assert_eq!(
+        (worker.state.as_str(), worker.provider.as_str()),
+        ("starting", "claude")
+    );
+    // No mailbox holds it.
+    let rows = |sql: &str| {
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .query_row(sql, [], |r| r.get::<_, i64>(0))
+            .unwrap()
+    };
+    assert_eq!(rows("SELECT COUNT(*) FROM mailbox"), 0);
+    assert_eq!(rows("SELECT COUNT(*) FROM holds"), 0);
+
+    let cancelled = call(
+        &mut l,
+        &mut w,
+        json!({"id": 3, "op": "send", "from": asker, "reply_to": "as1", "kind": "cancel",
+        "text": "stop", "request_id": "c1"}),
+    )
+    .await;
+    assert_eq!(cancelled["receipt"]["state"], "stored", "{cancelled}");
+    let ws = store.workers(false).unwrap();
+    assert_eq!(ws[0].state, "cancelled", "{ws:?}");
+    assert_eq!(rows("SELECT COUNT(*) FROM mailbox"), 0);
+}

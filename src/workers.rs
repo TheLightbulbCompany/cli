@@ -1,13 +1,16 @@
 //! Network workers, host side: what this computer offers and whom it lets start a worker.
 
 use crate::config::{expand_home, Config};
-use crate::holds::signed_record;
+use crate::daemon::Daemon;
+use crate::holds::{self, signed_record};
 use crate::identity::Identity;
-use crate::sessions::PROVIDERS;
-use crate::store::Store;
+use crate::mail::{self, State};
+use crate::sessions::{self, PROVIDERS};
+use crate::store::{Message, Store, Worker};
 use crate::Result;
 use rusqlite::params;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// What a member may do here: start a worker without asking, be asked, or be refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +85,111 @@ pub fn offers(config: &Config) -> Vec<String> {
 /// The folder workers run in (`~` expanded).
 pub fn folder(config: &Config) -> PathBuf {
     expand_home(&config.workers_folder)
+}
+
+/// What `take_assign` did with an assignment addressed to a fresh worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Taken {
+    /// Nothing written; the asker is told this reason (`no_worker`, `busy`, `declined`).
+    Refused(&'static str),
+    /// Stored, receipt `held`, with this open `holds` row: the caller shows its dialog.
+    Held { hold: i64 },
+    /// Stored, receipt `stored`: the caller runs `start`.
+    Start,
+}
+
+/// Decides assignment `assign` (to `<member>/<provider>:new`) on this computer `me` (member
+/// short key): refused when this computer does not offer the harness, is running `workers_max`
+/// workers, or refuses the asker; else stored (in no mailbox) and either held for the person
+/// (their policy for the asker is Ask) or ready to start. The caller holds the store lock and
+/// a transaction.
+pub fn take_assign(
+    store: &Store,
+    config: &Config,
+    me: &str,
+    assign: &Message,
+    now: i64,
+) -> Result<Taken> {
+    let provider = sessions::split_addr(&assign.to_key)
+        .and_then(|(_, rest)| rest.strip_suffix(":new"))
+        .unwrap_or_default();
+    if !offers(config).iter().any(|p| p == provider) {
+        return Ok(Taken::Refused("no_worker"));
+    }
+    if store.workers(true)?.len() as i64 >= config.workers_max {
+        return Ok(Taken::Refused("busy"));
+    }
+    let member = sessions::member_of(&assign.from_key).unwrap_or_default();
+    let verdict = policy(store, me, member)?;
+    if verdict == Policy::Refuse {
+        return Ok(Taken::Refused("declined"));
+    }
+    store.put_message(assign)?;
+    let (from, rid, at) = (&assign.from_key, &assign.request_id, now as u64);
+    if verdict == Policy::Allow {
+        mail::advance(store.conn(), from, rid, State::Stored, None, None, at)?;
+        return Ok(Taken::Start);
+    }
+    mail::advance(store.conn(), from, rid, State::Held, None, None, at)?;
+    let hold = holds::insert(store, assign.clone(), member, now)?;
+    Ok(Taken::Held { hold: hold.id })
+}
+
+/// Starts the worker for assignment `assign_id`. Task 4 spawns the harness; for now it only
+/// records the worker as `starting`.
+pub fn start(d: &Arc<Daemon>, assign_id: &str) -> Result<()> {
+    let team = d.team.lock().unwrap();
+    let store = d.store.lock().unwrap();
+    let Some(a) = store.message(assign_id)? else {
+        return Err(format!("no assignment {assign_id}").into());
+    };
+    let provider = (sessions::split_addr(&a.to_key))
+        .and_then(|(_, rest)| rest.strip_suffix(":new"))
+        .unwrap_or_default();
+    let now = crate::daemon::ipc::now() as i64;
+    store.insert_worker(&Worker {
+        id: 0,
+        assignment: a.id.clone(),
+        session: a.to_key.clone(),
+        provider: provider.into(),
+        folder: folder(&team.config).join(&a.request_id),
+        pid: None,
+        started_at: now,
+        ended_at: None,
+        state: "starting".into(),
+        by: None,
+    })?;
+    eprintln!("worker for {assign_id}: starting");
+    Ok(())
+}
+
+/// The asker `by` cancelled assignment `assign_id` addressed to a fresh worker: an open start
+/// hold is declined and its dialog withdrawn; a worker row ends `cancelled`. Task 4 also stops
+/// the process.
+pub fn cancel(d: &Arc<Daemon>, assign_id: &str, by: &str) -> Result<()> {
+    let store = d.store.lock().unwrap();
+    let now = crate::daemon::ipc::now() as i64;
+    let holds_open: Vec<i64> = {
+        let mut stmt = store
+            .conn()
+            .prepare("SELECT id FROM holds WHERE message_id = ?1 AND state = 'open'")?;
+        let rows = stmt.query_map([assign_id], |r| r.get(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for id in holds_open {
+        store
+            .conn()
+            .execute("UPDATE holds SET state = 'declined' WHERE id = ?1", [id])?;
+        d.dialogs.withdraw(&format!("H{id}"));
+    }
+    if let Some(w) = store
+        .worker_by_assignment(assign_id)?
+        .filter(|w| w.ended_at.is_none())
+    {
+        store.end_worker(w.id, "cancelled", Some(by), now)?;
+    }
+    eprintln!("worker for {assign_id}: cancelled");
+    Ok(())
 }
 
 /// A person asked to stop the worker `session` (the dialog's Stop worker). Task 4 fills it.

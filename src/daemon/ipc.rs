@@ -1538,27 +1538,136 @@ pub(crate) fn send_as(
     if app {
         p.hops = p.hops.max(1);
     }
+    let origin = if app {
+        mail::Origin::App
+    } else {
+        mail::Origin::Local
+    };
+    match dispatch_locked(daemon, team, store, &p, origin) {
+        Ok(r) => Ok((from, r)),
+        Err(Failed::NotMember) => Err(Response::err(id, super::net_ops::NOT_MEMBER)),
+        Err(Failed::Internal(_)) => Err(Response::err(id, INTERNAL)),
+    }
+}
+
+/// Why `dispatch` did not route a message.
+#[derive(Debug)]
+pub(crate) enum Failed {
+    /// Its recipient's member prefix is in no roster.
+    NotMember,
+    Internal(String),
+}
+
+impl std::fmt::Display for Failed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Failed::NotMember => f.write_str("not_member"),
+            Failed::Internal(e) => f.write_str(e),
+        }
+    }
+}
+
+impl std::error::Error for Failed {}
+
+fn internal(e: impl std::fmt::Display) -> Failed {
+    Failed::Internal(e.to_string())
+}
+
+#[allow(dead_code)] // Task 4 sends a worker's result through it
+/// Routes the prepared message `p` from this computer: to the outbox for another member, else
+/// recorded here (`dispatch_locked`); its receipt.
+pub(crate) fn dispatch(daemon: &Arc<Daemon>, p: &mail::Prepared) -> Result<mail::Receipt, Failed> {
+    let team = daemon.team.lock().unwrap();
+    let store = daemon.store.lock().unwrap();
+    dispatch_locked(daemon, team, store, p, mail::Origin::Local)
+}
+
+/// `dispatch` under the locks the caller prepared `p` with (they are released here, before any
+/// wake or follow-up that takes them again). An assignment to this computer's fresh-worker
+/// address is refused, held (its dialog shown) or started (`workers::take_assign`); a cancel
+/// of one is stored and reaches `workers::cancel`; any other mail for a session here is
+/// stored and the session woken.
+fn dispatch_locked(
+    daemon: &Arc<Daemon>,
+    team: std::sync::MutexGuard<'_, super::TeamState>,
+    store: std::sync::MutexGuard<'_, store::Store>,
+    p: &mail::Prepared,
+    origin: mail::Origin,
+) -> Result<mail::Receipt, Failed> {
     let prefix = sessions::member_of(&p.to.0).unwrap_or("");
-    if prefix != daemon.identity.short {
+    let me = &daemon.identity.short;
+    if prefix != me {
         let Some(member) = team.roster.by_short(prefix) else {
-            return Err(Response::err(id, super::net_ops::NOT_MEMBER));
+            return Err(Failed::NotMember);
         };
-        let r = outbox::enqueue(&store, p, member).map_err(internal)?;
+        let r = outbox::enqueue(&store, p.clone(), member).map_err(internal)?;
         daemon.peers.outbox.notify_one();
-        return Ok((from, r));
+        return Ok(r);
+    }
+    if mail::is_new_worker(&p.to.0) {
+        return fresh_worker(daemon, team, store, p, origin);
     }
     drop(team);
-    let sent = if app {
-        mail::store_local_from(&store, &p, mail::Origin::App)
-    } else {
-        mail::store_local(&store, &p)
-    }
-    .map_err(internal)?;
+    let sent = mail::store_local_from(&store, p, origin).map_err(internal)?;
     drop(store);
     if sent.state == mail::State::Stored {
         stored(daemon, &p.to, Some(&p.message_id));
     }
-    Ok((from, sent))
+    Ok(sent)
+}
+
+/// `dispatch_locked` for an assign (or its cancel) addressed to `<me>/<provider>:new`.
+fn fresh_worker(
+    daemon: &Arc<Daemon>,
+    team: std::sync::MutexGuard<'_, super::TeamState>,
+    store: std::sync::MutexGuard<'_, store::Store>,
+    p: &mail::Prepared,
+    origin: mail::Origin,
+) -> Result<mail::Receipt, Failed> {
+    use crate::workers::{self, Taken};
+    let now = now();
+    let tx = store.conn().unchecked_transaction().map_err(internal)?;
+    let (mut taken, mut cancelled) = (None, None);
+    if p.kind == "assign" {
+        let mut m = store::Message::from(p);
+        if let mail::Origin::App = origin {
+            m.origin = Some(mail::APP_ORIGIN.into());
+        }
+        match workers::take_assign(&store, &team.config, &daemon.identity.short, &m, now as i64)
+            .map_err(internal)?
+        {
+            Taken::Refused(reason) => {
+                drop(tx); // nothing was written
+                let r = mail::refuse(store.conn(), &p.from, &p.request_id, reason, None, now)
+                    .map_err(internal)?;
+                return Ok(r);
+            }
+            t => taken = Some(t),
+        }
+    } else {
+        mail::put(&store, p, origin, mail::State::Stored).map_err(internal)?;
+        cancelled = p.reply_to.clone();
+    }
+    tx.commit().map_err(internal)?;
+    let r = mail::receipt(&store, &p.from, &p.request_id)
+        .map_err(internal)?
+        .ok_or_else(|| internal("receipt missing after write"))?;
+    if let Some(Taken::Held { hold }) = taken {
+        if let Some(h) = crate::holds::get(&store, hold).map_err(internal)? {
+            crate::holds::shown(daemon, &team, &store, &h);
+        }
+    }
+    drop((team, store));
+    let log = |e: Box<dyn std::error::Error + Send + Sync>| {
+        eprintln!("workers: {} {}: {e}", p.kind, p.message_id)
+    };
+    if let Some(Taken::Start) = taken {
+        workers::start(daemon, &p.message_id).unwrap_or_else(log);
+    }
+    if let Some(assign) = cancelled {
+        workers::cancel(daemon, &assign, &p.from.0).unwrap_or_else(log);
+    }
+    Ok(r)
 }
 
 /// Mail was stored for `to` here: a waiting `inbox` looks again, a Claude or Codex session is

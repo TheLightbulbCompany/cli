@@ -1,9 +1,11 @@
 //! Messages, the mailbox, receipts and the loop limit. Time is passed in (`now`, unix seconds).
 
+use crate::config::Config;
 use crate::net::frames::Frame;
 use crate::roster::{Member, Roster};
 use crate::sessions::{self, Key};
 use crate::store::{Message, Store, MSG_RECEIPT};
+use crate::workers::{self, Taken};
 use crate::Result;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -36,6 +38,10 @@ pub struct Answer {
     pub limit: Option<String>,
     /// Whether it is new mail (stored now), not a resend or a refusal.
     pub fresh: bool,
+    /// What a fresh worker's assignment became (the caller runs its follow-up).
+    pub taken: Option<Taken>,
+    /// The assignment (message id) a cancel for a fresh worker names.
+    pub cancelled: Option<String>,
 }
 
 impl Answer {
@@ -45,6 +51,8 @@ impl Answer {
             reason: None,
             limit: None,
             fresh: false,
+            taken: None,
+            cancelled: None,
         }
     }
 
@@ -195,6 +203,8 @@ fn receipt_text(r: &Value, person: Option<&ForPerson>) -> Option<String> {
         return Some(match at("state") {
             "refused" if at("reason") == "loop" => limit(),
             "refused" if at("reason") == "no_worker" => "not sent: that computer does not take fresh workers yet (find_workers lists who takes assignments)".into(),
+            "refused" if at("reason") == "busy" && remote => format!("not sent: {person}'s computer is running all the workers it allows; try later or another worker"),
+            "refused" if at("reason") == "declined" && remote => format!("not sent: {person} declined to start a worker"),
             "queued" if remote && r["waking"] == true => {
                 format!("queued: {computer} is waking up and gets it in a moment.")
             }
@@ -207,7 +217,7 @@ fn receipt_text(r: &Value, person: Option<&ForPerson>) -> Option<String> {
                 format!("queued: {computer} {why}. Will retry until {}.", until())
             }
             "stored" if remote => format!("stored on {computer}."),
-            "held" if remote => format!("held: waiting for {person} to approve"),
+            "held" if remote => format!("held until {person} allows it"),
             _ => return None,
         });
     };
@@ -225,7 +235,9 @@ fn receipt_text(r: &Value, person: Option<&ForPerson>) -> Option<String> {
             "Not sent: {}.",
             match at("reason") {
                 "policy" => "they do not take messages from you".to_string(),
+                "declined" if remote => format!("{who} declined to start a worker"),
                 "declined" => "they declined it".into(),
+                "busy" => format!("{who}'s computer is running all the workers it allows; try later or another worker"),
                 "not_member" => "that computer is not in your team".into(),
                 "not_a_member" => NOT_A_MEMBER.into(),
                 "request_id_reused" => "that request id was used for another message".into(),
@@ -403,7 +415,7 @@ pub fn receipt(store: &Store, from: &Key, request_id: &str) -> Result<Option<Rec
     }))
 }
 
-fn refuse(
+pub(crate) fn refuse(
     conn: &Connection,
     from: &Key,
     request_id: &str,
@@ -556,9 +568,18 @@ pub(crate) fn expires_for(to: &str, sent_at: i64) -> i64 {
     }
 }
 
-/// Whether `m` is an assignment addressed to `to`.
+/// Whether `m` is an assignment addressed to `to`, or to `<member>/<provider>:new` when `to`
+/// is a session of that harness (the worker started for it).
 fn answers_assign(m: &Message, to: &str) -> bool {
-    m.kind == "assign" && m.to_key == to
+    m.kind == "assign" && (m.to_key == to || Some(&m.to_key) == new_key_of(to).as_ref())
+}
+
+/// `<m>/<p>:<conv>` as the address a worker for it was asked at: `<m>/<p>:new`.
+pub fn new_key_of(session: &str) -> Option<String> {
+    let (member, rest) = sessions::split_addr(session)?;
+    let (provider, conv) = rest.split_once(':')?;
+    (sessions::PROVIDERS.contains(&provider) && conv != "new")
+        .then(|| format!("{member}/{provider}:new"))
 }
 
 /// Whether `to` is `<member>/<provider>:new`: a request for a fresh worker session.
@@ -677,10 +698,11 @@ pub fn prepare(
                 .query_row(
                     // A cancel names the asker's own assignment by request id; any other
                     // reply names a message sent to `from`.
+                    // A worker started for `<m>/<p>:new` answers it as its own session.
                     "SELECT id FROM messages WHERE id = ?1 OR (request_id = ?1 AND \
-                     CASE WHEN ?3 = 'cancel' THEN from_key ELSE to_key END = ?2) \
-                     ORDER BY id = ?1 DESC, rowid DESC LIMIT 1",
-                    params![r, from.0, kind],
+                     CASE WHEN ?3 = 'cancel' THEN from_key = ?2 ELSE (to_key = ?2 OR to_key = ?4) \
+                     END) ORDER BY id = ?1 DESC, rowid DESC LIMIT 1",
+                    params![r, from.0, kind, new_key_of(&from.0)],
                     |x| x.get(0),
                 )
                 .optional()?;
@@ -724,8 +746,10 @@ pub fn prepare(
         return looped(RATE);
     }
 
-    if is_new_worker(&to.0) {
-        return refused("no_worker"); // plan 2 starts a worker here
+    // Only an assignment (taken or refused where the worker would run) and its cancel go to
+    // a fresh worker's address.
+    if is_new_worker(&to.0) && !matches!(kind, "assign" | "cancel") {
+        return refused("no_worker");
     }
     // A plain message answering an assignment addressed to `from`, sent back to its asker, is
     // its result.
@@ -912,6 +936,7 @@ pub fn receive(
     me: &str,
     declared: Option<&std::collections::HashSet<String>>,
     members: Option<&std::collections::HashSet<String>>,
+    config: &Config,
     now: u64,
 ) -> Result<Answer> {
     let Frame::Envelope {
@@ -953,8 +978,7 @@ pub fn receive(
     if sessions::member_of(to) != Some(me) {
         return refused("not_member");
     }
-    // This build starts no workers: a request for a fresh session cannot be met.
-    if is_new_worker(to) {
+    if is_new_worker(to) && !matches!(kind.as_str(), "assign" | "cancel") {
         return refused("no_worker");
     }
     if let Some((state, reason)) = store.seen_state(&peer.key, id)? {
@@ -1024,6 +1048,36 @@ pub fn receive(
         sent_at: now as i64,
     };
     let tx = store.conn().unchecked_transaction()?;
+    if is_new_worker(to) {
+        // A fresh worker's address has no mailbox: the assignment is refused, held for the
+        // person or started; its cancel is stored and reaches the worker module.
+        let mut taken = None;
+        let mut cancelled = None;
+        let state = if kind == "assign" {
+            let mut m = Message::from(&p);
+            m.origin = Some(format!("net:{}", peer.short));
+            let t = workers::take_assign(store, config, me, &m, now as i64)?;
+            let state = match t {
+                Taken::Refused(r) => return refused(r), // nothing written: the tx rolls back
+                Taken::Held { .. } => State::Held,
+                Taken::Start => State::Stored,
+            };
+            taken = Some(t);
+            state
+        } else {
+            put(store, &p, Origin::Net(&peer.short), State::Stored)?;
+            cancelled = p.reply_to.clone();
+            State::Stored
+        };
+        store.put_seen(&peer.key, id, state.name(), now as i64)?;
+        tx.commit()?;
+        return Ok(Answer {
+            fresh: true,
+            taken,
+            cancelled,
+            ..Answer::is(state)
+        });
+    }
     // Seen with what the sender is told, so a resend makes no second copy.
     let state = State::Stored;
     record(store, &p, Origin::Net(&peer.short), false)?;
@@ -1309,6 +1363,26 @@ mod tests {
     fn a_no_worker_refusal_has_a_note() {
         let r = serde_json::json!({"state": "refused", "reason": "no_worker", "person": "aden", "where": "mac"});
         assert_eq!(receipt_note(&r, None).as_deref(), Some("not sent: that computer does not take fresh workers yet (find_workers lists who takes assignments)"));
+    }
+
+    #[test]
+    fn worker_receipts_name_the_person_in_both_notes() {
+        let r = |state: &str, reason: Option<&str>| serde_json::json!({"state": state, "reason": reason, "person": "aden", "where": "mac"});
+        let note = |v| receipt_note(&v, None).unwrap();
+        assert_eq!(note(r("held", None)), "held until aden allows it");
+        assert_eq!(
+            note(r("refused", Some("declined"))),
+            "not sent: aden declined to start a worker"
+        );
+        assert!(note(r("refused", Some("busy"))).contains("running all the workers it allows"));
+        let p = ForPerson {
+            to: Some("m/claude:new"),
+            rid: "r1",
+            cmd: "lightbulb",
+            check: false,
+        };
+        let said = receipt_note(&r("refused", Some("declined")), Some(&p)).unwrap();
+        assert_eq!(said, "Not sent: aden declined to start a worker.");
     }
 
     #[test]
@@ -1970,7 +2044,18 @@ mod tests {
         let (peer, roster, _) = peer_mail("m/claude:2", "x");
         let meta = terms("green", 1060);
         let env = peer_env("p/codex:a", "m/claude:2", "r1", "assign", meta);
-        let got = receive(&s, &env, &peer, &roster, "m", None, None, 1000).unwrap();
+        let got = receive(
+            &s,
+            &env,
+            &peer,
+            &roster,
+            "m",
+            None,
+            None,
+            &Config::default(),
+            1000,
+        )
+        .unwrap();
         assert_eq!(
             got,
             Answer {
@@ -1991,7 +2076,18 @@ mod tests {
             "assign",
             terms("green", 1060),
         );
-        let got = receive(&s, &env, &peer, &roster, "m", None, None, 1000).unwrap();
+        let got = receive(
+            &s,
+            &env,
+            &peer,
+            &roster,
+            "m",
+            None,
+            None,
+            &Config::default(),
+            1000,
+        )
+        .unwrap();
         assert_eq!(
             (got.state, got.reason.as_deref()),
             (State::Refused, Some("no_worker"))
@@ -2026,12 +2122,34 @@ mod tests {
         if let Frame::Envelope { reply_to, hops, .. } = &mut third {
             (*reply_to, *hops) = (Some(a.message_id.clone()), a.hops as u32 + 1);
         }
-        let got = receive(&s, &third, &peer, &roster, "m", None, None, 1000).unwrap();
+        let got = receive(
+            &s,
+            &third,
+            &peer,
+            &roster,
+            "m",
+            None,
+            None,
+            &Config::default(),
+            1000,
+        )
+        .unwrap();
         assert_eq!(
             (got.state, got.reason.as_deref()),
             (State::Refused, Some("policy"))
         );
-        let got = receive(&s, &env, &peer, &roster, "m", None, None, 1000).unwrap();
+        let got = receive(
+            &s,
+            &env,
+            &peer,
+            &roster,
+            "m",
+            None,
+            None,
+            &Config::default(),
+            1000,
+        )
+        .unwrap();
         assert_eq!(got.state, State::Stored);
         let Frame::Envelope { id, .. } = &env else {
             unreachable!()
@@ -2041,7 +2159,18 @@ mod tests {
         assert!(stored.hops >= 1);
         // A result to a plain message is not an answer to an assignment.
         let plain = peer_env("p/claude:9", "m/codex:1", "r2", "message", Meta::default());
-        receive(&s, &plain, &peer, &roster, "m", None, None, 1000).unwrap();
+        receive(
+            &s,
+            &plain,
+            &peer,
+            &roster,
+            "m",
+            None,
+            None,
+            &Config::default(),
+            1000,
+        )
+        .unwrap();
         let Frame::Envelope { id: plain_id, .. } = &plain else {
             unreachable!()
         };
@@ -2049,7 +2178,18 @@ mod tests {
         if let Frame::Envelope { reply_to, hops, .. } = &mut env {
             (*reply_to, *hops) = (Some(plain_id.clone()), 1);
         }
-        let got = receive(&s, &env, &peer, &roster, "m", None, None, 1000).unwrap();
+        let got = receive(
+            &s,
+            &env,
+            &peer,
+            &roster,
+            "m",
+            None,
+            None,
+            &Config::default(),
+            1000,
+        )
+        .unwrap();
         assert_eq!(
             (got.state, got.reason.as_deref()),
             (State::Refused, Some("policy"))
@@ -2061,7 +2201,18 @@ mod tests {
         let (_d, s) = setup();
         let (peer, roster, _) = peer_mail("m/codex:c", "x");
         let env = peer_env("p/codex:a", "m/codex:c", "r1", "poke", Meta::default());
-        let got = receive(&s, &env, &peer, &roster, "m", None, None, 1000).unwrap();
+        let got = receive(
+            &s,
+            &env,
+            &peer,
+            &roster,
+            "m",
+            None,
+            None,
+            &Config::default(),
+            1000,
+        )
+        .unwrap();
         assert_eq!(
             (got.state, got.reason.as_deref()),
             (State::Refused, Some("unsupported"))
@@ -2073,7 +2224,18 @@ mod tests {
         let (_d, s) = setup();
         for (i, to) in ["m/terminal", "m/codex:c"].iter().enumerate() {
             let (peer, roster, env) = peer_mail(to, &format!("r{i}"));
-            let got = receive(&s, &env, &peer, &roster, "m", None, None, 1000).unwrap();
+            let got = receive(
+                &s,
+                &env,
+                &peer,
+                &roster,
+                "m",
+                None,
+                None,
+                &Config::default(),
+                1000,
+            )
+            .unwrap();
             let fresh = Answer {
                 fresh: true,
                 ..Answer::is(State::Stored)
@@ -2091,10 +2253,32 @@ mod tests {
         let (_d, s) = setup();
         let (peer, roster, env) = peer_mail("m/codex:c", "r1");
         let again = || {
-            let r = receive(&s, &env, &peer, &roster, "m", None, None, 1001).unwrap();
+            let r = receive(
+                &s,
+                &env,
+                &peer,
+                &roster,
+                "m",
+                None,
+                None,
+                &Config::default(),
+                1001,
+            )
+            .unwrap();
             (r.state, r.reason, r.fresh)
         };
-        receive(&s, &env, &peer, &roster, "m", None, None, 1000).unwrap();
+        receive(
+            &s,
+            &env,
+            &peer,
+            &roster,
+            "m",
+            None,
+            None,
+            &Config::default(),
+            1000,
+        )
+        .unwrap();
         advance(
             s.conn(),
             "p/codex:a",
@@ -2524,22 +2708,227 @@ mod tests {
     }
 
     #[test]
-    fn a_new_worker_address_is_refused_no_worker_in_plan_one() {
+    fn only_an_assign_or_its_cancel_may_go_to_a_new_worker_address() {
         let (_d, s) = setup();
-        let p = prep(
+        let to = Some("a/codex:new");
+        let assign = prep(
             &s,
             "a/claude:2",
-            Some("a/codex:new"),
+            to,
             "r1",
             None,
             "assign",
             terms("x", 10),
             100,
         );
-        refused_for(p, "no_worker");
+        assert_eq!(go(assign).to, k("a/codex:new"));
+        refused_for(
+            prep(
+                &s,
+                "a/claude:2",
+                to,
+                "r2",
+                None,
+                "message",
+                Meta::default(),
+                100,
+            ),
+            "no_worker",
+        );
         assert!(is_new_worker("a/codex:new"));
         assert!(!is_new_worker("a/codex:1"));
         assert!(!is_new_worker("a/other:new"));
+    }
+
+    /// Stores the assign `from` -> `to` (a worker address) as request `rid` in no mailbox.
+    fn assigned_new(s: &Store, from: &str, to: &str, rid: &str) -> Prepared {
+        let p = go(prep(
+            s,
+            from,
+            Some(to),
+            rid,
+            None,
+            "assign",
+            terms("x", 1060),
+            900,
+        ));
+        put(s, &p, Origin::Local, State::Stored).unwrap();
+        p
+    }
+
+    #[test]
+    fn a_new_assignment_is_answered_by_the_worker_started_for_it() {
+        let (_d, s) = setup();
+        let a = assigned_new(&s, "a/codex:1", "m/claude:new", "r1");
+        assert_eq!(new_key_of("m/claude:w1").as_deref(), Some("m/claude:new"));
+        assert_eq!(new_key_of("m/claude:new"), None);
+        assert_eq!(new_key_of("m/inbox"), None);
+        // A plain reply from the worker (by request id) finds the assignment and is a result.
+        let p = go(prep(
+            &s,
+            "m/claude:w1",
+            None,
+            "w-r1",
+            Some("r1"),
+            "message",
+            Meta::default(),
+            901,
+        ));
+        assert_eq!((p.kind.as_str(), p.to.0.as_str()), ("result", "a/codex:1"));
+        assert_eq!(p.reply_to.as_deref(), Some(a.message_id.as_str()));
+        assert_eq!(p.meta.status.as_deref(), Some("done"));
+        // Another harness's session did not get this assignment.
+        refused_for(
+            prep(
+                &s,
+                "m/codex:x",
+                Some("a/codex:1"),
+                "w-r2",
+                Some("r1"),
+                "result",
+                Meta::default(),
+                901,
+            ),
+            "policy",
+        );
+    }
+
+    #[test]
+    fn receive_accepts_a_result_from_the_workers_real_key() {
+        let (_d, s) = setup();
+        let (peer, roster, _) = peer_mail("m/codex:1", "x");
+        // The asker's copy: addressed to the host's `:new`.
+        let a = assigned_new(&s, "m/codex:1", "p/claude:new", "a1");
+        let done = Meta {
+            status: Some("done".into()),
+            ..Default::default()
+        };
+        let mut env = peer_env("p/claude:abc", "m/codex:1", "r1", "result", done);
+        if let Frame::Envelope { reply_to, hops, .. } = &mut env {
+            (*reply_to, *hops) = (Some(a.message_id.clone()), a.hops as u32 + 1);
+        }
+        let got = receive(
+            &s,
+            &env,
+            &peer,
+            &roster,
+            "m",
+            None,
+            None,
+            &Config::default(),
+            1000,
+        )
+        .unwrap();
+        assert_eq!(got.state, State::Stored);
+    }
+
+    #[test]
+    fn take_assign_refuses_holds_or_starts() {
+        let (dir, s) = setup();
+        let me = crate::identity::Identity::load_or_create(dir.path()).unwrap();
+        let assign = |rid: &str, from: &str| Message {
+            id: ulid::Ulid::generate().to_string(),
+            request_id: rid.into(),
+            from_key: from.into(),
+            to_key: "m/claude:new".into(),
+            kind: "assign".into(),
+            thread: None,
+            hops: 0,
+            origin: None,
+            body: "x".into(),
+            sent_at: 1,
+            reply_to: None,
+            meta: terms("x", 100),
+        };
+        let mut config = Config::default();
+        let take =
+            |config: &Config, a: &Message| workers::take_assign(&s, config, "m", a, 10).unwrap();
+        let st = |a: &Message| state(&s, &a.request_id);
+        // Not offered, nor for this harness.
+        let a = assign("r1", "p/codex:a");
+        assert_eq!(take(&config, &a), Taken::Refused("no_worker"));
+        config.workers_offer = "codex".into(); // another harness's worker is not this one
+        assert_eq!(take(&config, &a), Taken::Refused("no_worker"));
+        config.workers_offer = "claude".into();
+        // Busy at the cap.
+        config.workers_max = 1;
+        s.insert_worker(&crate::store::Worker {
+            id: 0,
+            assignment: "x".into(),
+            session: "m/claude:w".into(),
+            provider: "claude".into(),
+            folder: "/f".into(),
+            pid: None,
+            started_at: 1,
+            ended_at: None,
+            state: "running".into(),
+            by: None,
+        })
+        .unwrap();
+        let b = assign("r2", "p/codex:a");
+        assert_eq!(take(&config, &b), Taken::Refused("busy"));
+        config.workers_max = 3;
+        // Refused by policy, nothing written.
+        workers::set_policy(&s, &me, "q", "refused", "me", 1).unwrap();
+        let c = assign("r3", "q/codex:a");
+        assert_eq!(take(&config, &c), Taken::Refused("declined"));
+        assert!(s.message(&c.id).unwrap().is_none());
+        // Ask: held, with a hold row and receipt.
+        let d = assign("r4", "p/codex:b");
+        let Taken::Held { hold } = take(&config, &d) else {
+            panic!()
+        };
+        let h = crate::holds::get(&s, hold).unwrap().unwrap();
+        assert_eq!(
+            (h.message.id, h.from_member, h.state),
+            (d.id.clone(), "p".into(), "open".into())
+        );
+        assert_eq!(st(&d), State::Held);
+        // Allow (the standing policy): stored, to start.
+        workers::set_policy(&s, &me, "p", "always", "me", 2).unwrap();
+        let e = assign("r5", "p/codex:c");
+        assert_eq!(take(&config, &e), Taken::Start);
+        assert_eq!(st(&e), State::Stored);
+    }
+
+    #[test]
+    fn a_replayed_assign_to_a_worker_address_is_answered_held_once() {
+        let (_d, s) = setup();
+        let (peer, roster, _) = peer_mail("m/claude:new", "x");
+        let config = Config {
+            workers_offer: "claude".into(),
+            ..Config::default()
+        };
+        let env = peer_env(
+            "p/codex:a",
+            "m/claude:new",
+            "r1",
+            "assign",
+            terms("x", 1060),
+        );
+        let first = receive(&s, &env, &peer, &roster, "m", None, None, &config, 1000).unwrap();
+        assert_eq!((first.state, first.fresh), (State::Held, true));
+        assert!(matches!(first.taken, Some(Taken::Held { .. })));
+        // The same envelope again, and the same request under another envelope id.
+        let again = receive(&s, &env, &peer, &roster, "m", None, None, &config, 1001).unwrap();
+        assert_eq!(
+            (again.state, again.fresh, again.taken),
+            (State::Held, false, None)
+        );
+        let other = peer_env(
+            "p/codex:a",
+            "m/claude:new",
+            "r1",
+            "assign",
+            terms("x", 1060),
+        );
+        let again = receive(&s, &other, &peer, &roster, "m", None, None, &config, 1002).unwrap();
+        assert_eq!((again.state, again.fresh), (State::Held, false));
+        let holds: i64 = s
+            .conn()
+            .query_row("SELECT COUNT(*) FROM holds", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(holds, 1);
     }
 
     #[test]
