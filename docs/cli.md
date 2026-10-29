@@ -234,7 +234,6 @@ With no argument, lists the workers: name, who asked, harness, folder, start tim
 For Cursor, Grok CLI and OpenCode, a config file that exists but cannot be read or parsed refuses too.
 
 
-
 The first assignment from a teammate asks you with a dialog (or `held` and `approve`); Always allow (`approve --always`) lets that teammate's computer start workers here without asking from then on. A dialog that gave up comes back when you run `held`. An Allow that lands while this computer already runs `workers_max` workers starts nothing, and the asker is told `busy`.
 
 ### config

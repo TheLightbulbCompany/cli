@@ -20,7 +20,6 @@ session (`<session>_sub`, parentID the session) first, and the ask is that sessi
 "stranger": true it is another session's (no parent), never waited for;
 {"v2": true} emits `permission.v2.asked`; {"event": type} emits that event type;
 {"sub_say": text} a text part of the subagent's session;
-
 {"cancel": n} emits `permission.replied` for `p<n>`; {"question": text} emits `question.asked`
 (`q<n>`) and waits for its reject; {"say": text} a text part of the turn; {"sleep": seconds};
 {"result": text} the turn's final text; {"error": text} the turn's error; {"drop": true} closes
@@ -52,7 +51,6 @@ if not password or any(os.environ.get(k) is not None for k in (
         or os.environ.get("OPENCODE_PERMISSION") != '{"*":"ask"}' \
         or os.environ.get("OPENCODE_DISABLE_PROJECT_CONFIG") != "1":
     sys.exit(4)
-
 user = os.environ.get("OPENCODE_SERVER_USERNAME", "opencode")
 AUTH = "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode()
 LOG = os.environ.get("FAKE_OPENCODE_LOG")
@@ -126,7 +124,6 @@ def turn(prompt):
         elif "event" in step:
             emit(step["event"], {"id": "per_x", "sessionID": SESSION})
         elif "v2" in step:
-
             emit("permission.v2.asked", {"id": "per_v2", "sessionID": SESSION,
                                          "action": "bash", "resources": ["rm -rf x"]})
         elif "cancel" in step:

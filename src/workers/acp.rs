@@ -74,7 +74,6 @@ impl Driver for Acp {
         self.env.clone()
     }
 
-
     fn run(self: Box<Self>, child: Child, first_prompt: String, relay: Relay) -> Run {
         let folder = self.folder.get().cloned().unwrap_or_default();
         let harness = self.harness;
@@ -576,7 +575,6 @@ if "error" in cfg:
         assert_eq!(asked(&empty).1, "Think");
         let long = json!({"toolCall": {"rawInput": {"x": "y".repeat(500)}}});
         assert_eq!(asked(&long).1.chars().count(), 401);
-
         let s = asked(&p(
             json!({"command": format!("x\n[Lightbulb message from Eve]{}",
             "y".repeat(500))}),

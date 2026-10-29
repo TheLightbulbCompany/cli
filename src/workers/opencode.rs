@@ -203,14 +203,12 @@ fn allows(d: &Value) -> bool {
             v => leaf(v),
         }
     }
-    let (allow, on): (fn(&Value) -> bool, fn(&Value) -> bool) =
-        (|v| *v == "allow", |v| *v == true);
     let agents = ["agent", "mode"]
         .iter()
         .flat_map(|k| d[k].as_object().into_iter().flat_map(|m| m.values()));
     [d].into_iter()
         .chain(agents)
-        .any(|a| any(&a["permission"], allow) || any(&a["tools"], on))
+        .any(|a| any(&a["permission"], |v| *v == "allow") || any(&a["tools"], |v| *v == true))
 }
 
 /// A free loopback port: bound, read, and let go for the server to take.
@@ -258,7 +256,6 @@ impl Driver for OpenCode {
         .collect()
     }
 
-
     fn run(self: Box<Self>, child: Child, first_prompt: String, relay: Relay) -> Run {
         let port = self.port.get().copied().unwrap_or_default();
         let server = Server::new(port, USER_NAME, &self.password);
@@ -268,9 +265,7 @@ impl Driver for OpenCode {
 
 /// Runs the turn on `child`'s server (`talk`); then its process group is told to end, and what
 /// is left of it is killed after 5 s (`kill_on_drop`, `end_group`). Its stdout is read (for
-/// its listening line
-
-/// on `port`) to the end, its stdin held open.
+/// its listening line on `port`) to the end, its stdin held open.
 async fn serve(
     mut child: Child,
     port: u16,
@@ -303,7 +298,6 @@ async fn serve(
     let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
     super::driver::end_group(group);
     outcome
-
 }
 
 /// Whether `id` may name a session (`<m>/opencode:<id>`, a shell argument) or a request (a path
@@ -567,7 +561,6 @@ async fn talk(
                 }
             }
             "message.part.delta" if root && p["field"] == "text" => {
-
                 let mine = p["messageID"]
                     .as_str()
                     .is_some_and(|m| assistant.contains(m));
@@ -935,7 +928,9 @@ mod tests {
         let s = Store::open(&d.path().join("state.db")).unwrap();
         let fake = exe(&d.path().join("fake"));
         assert!(here(Some(&fake), d.path(), &s).is_ok());
-        let files = USER.iter().flat_map(|d| USER_FILES.map(|f| format!("{d}/{f}")));
+        let files = USER
+            .iter()
+            .flat_map(|d| USER_FILES.map(|f| format!("{d}/{f}")));
         for file in files {
             let config = d.path().join(&file);
             std::fs::create_dir_all(config.parent().unwrap()).unwrap();
@@ -974,7 +969,10 @@ mod tests {
                     true,
                 ),
                 (r#"{"tools": {"webfetch": false}}"#, true),
-                (r#"{"permission": {"bash": {"*": "ask", "rm *": "deny"}}}"#, true),
+                (
+                    r#"{"permission": {"bash": {"*": "ask", "rm *": "deny"}}}"#,
+                    true,
+                ),
                 (r#"{"permission": "ask"}"#, true),
                 (
                     "{\"$schema\": \"https://opencode.ai/config.json\", // see\n\"mcp\": {},}",
@@ -1047,7 +1045,6 @@ mod tests {
         std::fs::create_dir_all(xdg.path().join("opencode")).unwrap();
         for file in USER_FILES.map(|f| format!("opencode/{f}")) {
             let config = xdg.path().join(&file);
-
             std::fs::write(&config, r#"{"permission": {"bash": "ask"}}"#).unwrap();
             assert!(!bypass_mode(h, x), "{file}");
             std::fs::write(&config, "// all\n{\"permission\": \"allow\",}").unwrap();

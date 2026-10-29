@@ -471,11 +471,12 @@ pub(crate) mod tests {
         assert!(!launchable(&[]));
         // The program's path is the person's: a folder named `yolo` is not a flag.
         let program = |p: &str| [p, "acp"].map(String::from);
-        assert!(launchable(&program("/Users/yolo-fan/.local/bin/cursor-agent")));
+        assert!(launchable(&program(
+            "/Users/yolo-fan/.local/bin/cursor-agent"
+        )));
         assert!(launchable(&program("/opt/dangerously/grok")));
         assert!(!launchable(&program("--yolo")));
     }
-
 
     #[tokio::test]
     async fn a_natural_end_takes_the_whole_process_group() {
@@ -498,7 +499,11 @@ pub(crate) mod tests {
         })
         .await;
         assert_eq!(outcome.body, "done");
-        let grandchild: i32 = std::fs::read_to_string(&pid).unwrap().trim().parse().unwrap();
+        let grandchild: i32 = std::fs::read_to_string(&pid)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
         // Gone (once reaped by init).
         let alive = || unsafe { libc::kill(grandchild, 0) } == 0;
         for _ in 0..100 {
@@ -512,7 +517,6 @@ pub(crate) mod tests {
 
     #[test]
     fn comments_go_but_strings_stay() {
-
         let text = "{\"u\": \"https://x/*y*/\\\"//z\", // a\n/* b\n */ \"v\": [1, \",]\",],}";
         let v: serde_json::Value = serde_json::from_str(&super::uncommented(text)).unwrap();
         assert_eq!(v["u"], "https://x/*y*/\"//z");

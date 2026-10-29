@@ -1786,7 +1786,6 @@ fn acp_folder_bypass(h: &'static str, file: &str, text: &str) {
         &["init", "-q"][..],
         // Forced: a global ignore of `settings.local.json` would leave nothing to commit.
         &["add", "-f", "."],
-
         &["commit", "-q", "-m", "first"],
     ] {
         let o = Command::new("git")
@@ -1808,7 +1807,6 @@ fn acp_folder_bypass(h: &'static str, file: &str, text: &str) {
     let text = r["text"].as_str().unwrap();
     assert_eq!(r["status"], "failed", "{r}");
     assert!(text.contains("run without approvals"), "{text}");
-
     assert!(
         text.ends_with(&format!("{}/{file}", w.folder.display())),
         "{text}"
@@ -1828,14 +1826,17 @@ fn cursor_a_worktree_that_allows_a_command_refuses_the_start() {
 
 #[test]
 fn cursor_a_worktree_with_its_own_hooks_refuses_the_start() {
-    acp_folder_bypass("cursor", ".cursor/hooks.json", r#"{"version": 1, "hooks": {}}"#);
+    acp_folder_bypass(
+        "cursor",
+        ".cursor/hooks.json",
+        r#"{"version": 1, "hooks": {}}"#,
+    );
 }
 
 #[test]
 fn cursor_a_worktree_with_its_own_mcp_servers_refuses_the_start() {
     acp_folder_bypass("cursor", ".cursor/mcp.json", r#"{"mcpServers": {}}"#);
 }
-
 
 #[test]
 fn grok_a_worktree_that_skips_approvals_refuses_the_start() {
@@ -1853,7 +1854,6 @@ fn grok_a_worktree_with_a_local_allow_rule_refuses_the_start() {
 
 #[test]
 fn grok_a_worktree_with_claude_bypass_settings_refuses_the_start() {
-
     acp_folder_bypass(
         "grok",
         ".claude/settings.json",
@@ -2147,7 +2147,6 @@ fn opencode_a_config_in_the_daemons_environment_never_reaches_the_server() {
                 ("OPENCODE_CONFIG_DIR", "/tmp/allow-all".into()),
                 ("OPENCODE_DISABLE_PROJECT_CONFIG", "0".into()),
             ],
-
             ..opencode()
         },
     );
@@ -2261,7 +2260,6 @@ fn opencode_an_unknown_permission_event_fails_the_turn() {
 
 #[test]
 fn opencode_a_refused_answer_fails_the_turn() {
-
     let mut ask = opencode_ask("rm -rf x");
     ask["reply_status"] = 500.into();
     let p = hosted(

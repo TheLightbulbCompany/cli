@@ -1388,9 +1388,11 @@ mod tests {
         assert!(p.contains("\"doneWhen\""), "{p}");
         // Exactly one reply line, with the real request id.
         assert_eq!(p.matches("reply_to=").count(), 1, "{p}");
-        assert!(p.contains("\nReply to this assignment with reply_to=\"r1\" "), "{p}");
+        assert!(
+            p.contains("\nReply to this assignment with reply_to=\"r1\" "),
+            "{p}"
+        );
     }
-
 
     /// A worker of this process for `assign_id`, as session `key`; `alive` picks this
     /// process's real birth time, else a wrong one.

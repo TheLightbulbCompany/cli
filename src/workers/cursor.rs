@@ -60,7 +60,12 @@ pub fn here(knob: Option<&Path>, home: &Path, store: &Store) -> Result<Acp, &'st
         std::env::var_os("CURSOR_CONFIG_DIR"),
         std::env::var_os("XDG_CONFIG_HOME"),
     );
-    here_in(knob, home, store, config_dir(home, dir.as_deref(), xdg.as_deref()))
+    here_in(
+        knob,
+        home,
+        store,
+        config_dir(home, dir.as_deref(), xdg.as_deref()),
+    )
 }
 
 /// `here` with the person's config folder `dir`, which the child is pinned to
@@ -79,7 +84,10 @@ pub fn here_in(
     if bypass(&dir.join(CONFIG)) {
         return Err(BYPASS_MODE);
     }
-    let env = vec![("CURSOR_CONFIG_DIR", Some(dir.to_string_lossy().into_owned()))];
+    let env = vec![(
+        "CURSOR_CONFIG_DIR",
+        Some(dir.to_string_lossy().into_owned()),
+    )];
     Ok(Acp::new(program, "cursor", ARGS)
         .checking(folder_bypass)
         .with_env(env))
@@ -89,8 +97,10 @@ pub fn here_in(
 /// `xdg/cursor` (`$XDG_CONFIG_HOME`), else `home/.cursor`; a blank value is unset.
 pub fn config_dir(home: &Path, cursor_dir: Option<&OsStr>, xdg: Option<&OsStr>) -> PathBuf {
     let set = |v: Option<&OsStr>| v.is_some_and(|v| !v.to_string_lossy().trim().is_empty());
-    match (cursor_dir.filter(|_| set(cursor_dir)), xdg.filter(|_| set(xdg))) {
-
+    match (
+        cursor_dir.filter(|_| set(cursor_dir)),
+        xdg.filter(|_| set(xdg)),
+    ) {
         (Some(d), _) => d.into(),
         (None, Some(x)) => Path::new(x).join("cursor"),
         (None, None) => home.join(".cursor"),
@@ -129,9 +139,7 @@ pub fn folder_bypass(folder: &Path) -> Option<String> {
         let rules = &d["permissions"]["allow"];
         bypass_in(d) || !(rules.is_null() || rules.as_array().is_some_and(|r| r.is_empty()))
     };
-    let present = |p: &PathBuf| {
-        !matches!(p.symlink_metadata(), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
-    };
+    let present = |p: &PathBuf| !matches!(p.symlink_metadata(), Err(e) if e.kind() == std::io::ErrorKind::NotFound);
     let found = if read(&cli).is_none_or(|d| allows(&d)) {
         cli
     } else {
@@ -142,7 +150,6 @@ pub fn folder_bypass(folder: &Path) -> Option<String> {
 }
 
 /// The Cursor CLI config at `path`: `null` when missing; `None` when it cannot be read, is not
-
 /// UTF-8, or does not parse (comments allowed).
 fn read(path: &Path) -> Option<Value> {
     let text = match std::fs::read_to_string(path) {
@@ -172,7 +179,6 @@ fn bypass_in(d: &Value) -> bool {
         .any(|r| r.as_str().is_some_and(|r| WILDCARDS.contains(&r.trim())));
     mode || allow
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -261,7 +267,10 @@ mod tests {
         // The child is pinned to the folder checked.
         let pinned = other.join("cursor").to_string_lossy().into_owned();
         assert_eq!(a.env(), [("CURSOR_CONFIG_DIR", Some(pinned))]);
-        write(&other.join("cursor"), r#"{"permissions": {"allow": ["Shell(*)"]}}"#);
+        write(
+            &other.join("cursor"),
+            r#"{"permissions": {"allow": ["Shell(*)"]}}"#,
+        );
         let r = here_in(Some(&fake), &home, &s, config_dir(&home, None, x));
         assert_eq!(r.err(), Some(BYPASS_MODE));
         let r = here_in(Some(&fake), &home, &s, config_dir(&home, None, None));
@@ -347,5 +356,4 @@ mod tests {
         }
         assert_eq!(folder_bypass(f), None);
     }
-
 }

@@ -245,7 +245,6 @@ mod tests {
         let out = framed_kind("assign", "Your Codex", "as1", None, &meta, "run tests");
         assert!(out.starts_with("[Lightbulb assignment from Your Codex {\"requestId\":\"as1\",\"doneWhen\":\"green\",\"deadlineAt\":42}]\n"), "{out}");
         assert!(out.contains("\nReply to this assignment with reply_to=\"as1\" (status failed or cancelled if not done).\n"), "{out}");
-
         assert!(!out.contains("send_message"));
         assert!(out.ends_with("\n\nrun tests"));
     }

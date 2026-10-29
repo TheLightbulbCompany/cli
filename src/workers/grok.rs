@@ -54,7 +54,15 @@ const FOLDER_SETTINGS: [&str; 3] = [
 /// `defaultMode` values that skip the prompts.
 const MODES: [&str; 4] = ["bypassPermissions", "acceptEdits", "auto", "dontAsk"];
 /// Allow rules that allow every command or edit without a prompt.
-const WILDCARDS: [&str; 7] = ["*", "Bash", "Bash(*)", "Edit", "Edit(**)", "Write", "Write(**)"];
+const WILDCARDS: [&str; 7] = [
+    "*",
+    "Bash",
+    "Bash(*)",
+    "Edit",
+    "Edit(**)",
+    "Write",
+    "Write(**)",
+];
 /// Variables that would hand Grok a config other than the one checked: removed from the
 /// child's environment.
 const CONFIG_ENV: [&str; 2] = ["GROK_CONFIG", "GROK_CONFIG_PATH"];
@@ -97,7 +105,9 @@ pub fn program(
 /// settings file (`settings_bypass`), Grok's own or Claude Code's (Grok reads it too).
 pub fn bypass_mode(home: &Path) -> bool {
     bypass(&home.join(CONFIG), false)
-        || SETTINGS.iter().any(|f| settings_bypass(&home.join(f), false))
+        || SETTINGS
+            .iter()
+            .any(|f| settings_bypass(&home.join(f), false))
 }
 
 /// Why a worker may not run in `folder`: a `.grok/config.toml` or settings file of its own
@@ -163,9 +173,9 @@ fn bypass(path: &Path, any: bool) -> bool {
     let permission = d.get("permission");
     let allow = match permission.and_then(|p| p.get("allow")) {
         None => false,
-        Some(a) => a.as_array().is_none_or(|a| {
-            a.iter().any(|r| allowing(r.as_str(), any))
-        }),
+        Some(a) => a
+            .as_array()
+            .is_none_or(|a| a.iter().any(|r| allowing(r.as_str(), any))),
     };
     // Each rule's (action, pattern); a rule of another shape counts as allowing everything.
     let rule = |action: Option<&str>, pattern: Option<&str>| {
@@ -191,7 +201,6 @@ fn bypass(path: &Path, any: bool) -> bool {
     };
     mode || allow || rules
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -278,7 +287,10 @@ mod tests {
             ),
             ("garbage".into(), false),
             // Compact rules that allow every command or edit.
-            ("[permission]\nallow = [\"Bash(git status)\"]\n".into(), true),
+            (
+                "[permission]\nallow = [\"Bash(git status)\"]\n".into(),
+                true,
+            ),
             ("[permission]\nallow = \"Bash\"\n".into(), false),
             // Rules: an allow with no pattern, or `*`.
             (
@@ -294,7 +306,10 @@ mod tests {
                 true,
             ),
             ("[[permission.rules]]\naction = \"deny\"\n".into(), true),
-            ("[permission]\nrules = [{action = \"allow\"}]\n".into(), false),
+            (
+                "[permission]\nrules = [{action = \"allow\"}]\n".into(),
+                false,
+            ),
             (
                 "[permission]\nrules = [{action = \"ask\", pattern = \"*\"}]\n".into(),
                 true,
@@ -330,7 +345,10 @@ mod tests {
     /// Settings rows: (text, whether a worker may start).
     fn settings_rows() -> Vec<(String, bool)> {
         let mut rows: Vec<(String, bool)> = vec![
-            (r#"{"permissions": {"defaultMode": "default"}}"#.into(), true),
+            (
+                r#"{"permissions": {"defaultMode": "default"}}"#.into(),
+                true,
+            ),
             (r#"{"defaultMode": "plan"}"#.into(), true),
             (r#"{"permissions": {"deny": ["Bash"]}}"#.into(), true),
             (r#"{"permissions": {"allow": "Bash"}}"#.into(), false),
@@ -381,10 +399,7 @@ mod tests {
         let s = Store::open(&d.path().join("state.db")).unwrap();
         let fake = exe(&d.path().join("fake"));
         let g = here(Some(&fake), d.path(), &s).unwrap();
-        assert_eq!(
-            g.env(),
-            [("GROK_CONFIG", None), ("GROK_CONFIG_PATH", None)]
-        );
+        assert_eq!(g.env(), [("GROK_CONFIG", None), ("GROK_CONFIG_PATH", None)]);
     }
 
     #[test]
@@ -434,5 +449,4 @@ mod tests {
         }
         assert_eq!(folder_bypass(folder), None);
     }
-
 }
