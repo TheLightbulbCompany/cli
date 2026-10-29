@@ -892,20 +892,23 @@ pub fn page(
             )
             .map_or_else(|_| "?".into(), |k| who(&k))
     };
-    let by = |f: &Fact| {
-        format!(
-            "{} ({}, {})",
-            f.value,
-            who(&f.author),
-            crate::date::day(f.when)
-        )
-    };
+    // A line's date is the whole day, year included: a page can span years.
+    let ymd = |secs: i64| crate::date::utc(secs)[..10].to_string();
+    let by = |f: &Fact| format!("{} ({}, {})", f.value, who(&f.author), ymd(f.when));
+    // Contested only when two people hold different values. One author's values of one subject
+    // are that author's own notes over time: each prints as its own dated line, in rank order,
+    // instead of one "a vs b vs c" line (BEAM 100K: a broad subject gathered a median 17 values).
+    let key = |f: &Fact| (f.scope == Scope::Team, f.subject.trim().to_lowercase());
+    let mut authors: HashMap<(bool, String), HashSet<&str>> = HashMap::new();
+    for f in facts.iter().filter(|f| f.status == Status::Contested) {
+        authors.entry(key(f)).or_default().insert(f.author.as_str());
+    }
     let (mut contested, mut current, mut lessons) = (Vec::new(), Vec::new(), Vec::new());
     let mut groups: Vec<((Scope, String), Vec<String>)> = Vec::new();
     for f in facts {
         match (f.status, f.kind) {
             (Status::Replaced, _) => {}
-            (Status::Contested, _) => {
+            (Status::Contested, _) if authors[&key(f)].len() > 1 => {
                 let key = (f.scope, f.subject.trim().to_lowercase());
                 match groups.iter_mut().find(|(k, _)| *k == key) {
                     Some((_, v)) => v.push(by(f)),
@@ -914,14 +917,14 @@ pub fn page(
             }
             (_, kind) => {
                 let was = f.history.last().map_or(String::new(), |(id, v, when)| {
-                    format!("; was {v}, {}, {}", author_of(id), crate::date::day(*when))
+                    format!("; was {v}, {}, {}", author_of(id), ymd(*when))
                 });
                 let line = format!(
                     "{}: {} ({}, {}{was})",
                     f.subject,
                     f.value,
                     who(&f.author),
-                    crate::date::day(f.when)
+                    ymd(f.when)
                 );
                 if kind == Kind::Lesson {
                     &mut lessons

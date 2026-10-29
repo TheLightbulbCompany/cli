@@ -672,18 +672,12 @@ fn a_me_value_does_not_contest_a_team_value() {
     memory::remember(&s, &a, team_op("zed"), 4).unwrap();
     let f = memory::facts(&s, None, None).unwrap();
     assert!(f.iter().all(|x| x.status == Status::Contested), "{f:?}");
+    // One author: the page prints each value on its own dated line (Contested needs two people).
     let page = memory::page(&s, &f, &[], &Default::default(), 1600);
     let lines: Vec<&str> = page.lines().collect();
-    assert_eq!(lines.len(), 3, "{page}");
-    assert_eq!(lines[0], "Contested:");
-    for (x, y) in [("zed", "vscode"), ("emacs", "vim")] {
-        assert!(
-            lines
-                .iter()
-                .any(|l| l.contains(x) && l.contains(y) && l.matches(" vs ").count() == 1),
-            "{page}"
-        );
-    }
+    assert_eq!(lines.len(), 5, "{page}");
+    assert_eq!(lines[0], "Current:");
+    assert!(!page.contains(" vs "), "{page}");
 }
 
 #[test]
@@ -704,4 +698,44 @@ fn an_entry_under_a_bare_repo_name_still_reads() {
     // The bare name has no owner: any owner's `app` reads it.
     assert_eq!(subjects("other/app"), ["db"]);
     assert!(subjects("acme/api").is_empty());
+}
+
+fn fact(id: &str, author: &str, value: &str, when: i64) -> memory::Fact {
+    memory::Fact {
+        id: id.into(),
+        subject: "launch date".into(),
+        value: value.into(),
+        kind: Kind::Fact,
+        scope: Scope::Team,
+        author: author.into(),
+        when,
+        status: Status::Contested,
+        history: vec![],
+    }
+}
+
+#[test]
+fn the_page_says_contested_only_when_two_people_disagree() {
+    let (_d, s) = store();
+    let names = std::collections::HashMap::new();
+    let two = [
+        fact("a", "ann", "3 March", 1_700_000_000),
+        fact("b", "bo", "10 March", 1_700_100_000),
+    ];
+    let page = memory::page(&s, &two, &[], &names, 10_000);
+    assert!(
+        page.starts_with(
+            "Contested:\nlaunch date: 3 March (ann, 2023-11-14) vs 10 March (bo, 2023-11-16)"
+        ),
+        "{page}"
+    );
+    let one = [
+        fact("a", "ann", "3 March", 1_700_000_000),
+        fact("b", "ann", "10 March", 1_700_100_000),
+    ];
+    let page = memory::page(&s, &one, &[], &names, 10_000);
+    assert_eq!(
+        page,
+        "Current:\nlaunch date: 3 March (ann, 2023-11-14)\nlaunch date: 10 March (ann, 2023-11-16)"
+    );
 }
