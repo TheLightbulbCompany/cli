@@ -21,22 +21,25 @@ use tokio::sync::{mpsc, oneshot};
 
 /// The start's failure when no OpenCode is found (`program`).
 pub const NOT_INSTALLED: &str = "OpenCode is not installed where the daemon can find it";
-/// The start's failure when an OpenCode config it reads allows without asking (`bypass_mode`).
-pub const BYPASS_MODE: &str = "this computer's OpenCode runs without approvals; a worker needs \
-     prompts to reach a person (\"permission\": \"allow\", or \"allow\" for edit, bash, webfetch \
-     or \"*\", in ~/.config/opencode/opencode.json or opencode.jsonc, or the same under \
-     $XDG_CONFIG_HOME/opencode; or one it cannot read)";
+/// The start's failure when an OpenCode config it reads could allow without asking
+/// (`bypass_mode`).
+pub const BYPASS_MODE: &str = "this computer's OpenCode can run without approvals; a worker \
+     needs prompts to reach a person (any \"allow\" under permission, agent.<name>.permission \
+     or mode.<name>.permission, or a tool set true under tools, in config.json, opencode.json \
+     or opencode.jsonc in ~/.config/opencode, $XDG_CONFIG_HOME/opencode or ~/.opencode; an \
+     agent or mode file there whose header allows; or one it cannot read)";
 /// What the turn ends with when OpenCode raises a prompt in its newer shape, which this host
 /// cannot relay (so it can never be allowed).
 pub const ASKS_V2: &str = "this OpenCode asks in a way the worker host does not read yet";
 
 /// Where installers put OpenCode outside a home.
 const SYSTEM: [&str; 2] = ["/opt/homebrew/bin/opencode", "/usr/local/bin/opencode"];
-/// The person's own configs, under a home.
-const USER: [&str; 2] = [
-    ".config/opencode/opencode.json",
-    ".config/opencode/opencode.jsonc",
-];
+/// The person's own config folders, under a home (`$XDG_CONFIG_HOME/opencode` too when set).
+const USER: [&str; 2] = [".config/opencode", ".opencode"];
+/// The configs read in each of them.
+const USER_FILES: [&str; 3] = ["config.json", "opencode.json", "opencode.jsonc"];
+/// Where agents and modes are defined in each of them, as Markdown with a YAML header.
+const AGENT_DIRS: [&str; 4] = ["agent", "agents", "mode", "modes"];
 /// A folder's own configs.
 const FOLDER: [&str; 4] = [
     "opencode.json",
@@ -44,12 +47,20 @@ const FOLDER: [&str; 4] = [
     ".opencode/opencode.json",
     ".opencode/opencode.jsonc",
 ];
-/// Variables that would hand OpenCode a config (or permissions) other than the files checked
-/// here: removed from the child's environment.
+/// Variables that would hand OpenCode a config other than the files checked here: removed from
+/// the child's environment.
 const CONFIG_ENV: [&str; 3] = [
     "OPENCODE_CONFIG",
     "OPENCODE_CONFIG_CONTENT",
-    "OPENCODE_PERMISSION",
+    "OPENCODE_CONFIG_DIR",
+];
+/// What the child is told, over anything inherited: every permission asks (OpenCode's own
+/// default is `{"*": "allow"}`; this is deep-merged over the person's files, whose own allows
+/// `bypass_mode` refuses since a specific key of theirs would still win), and no config from
+/// the worker's folder.
+const FORCED_ENV: [(&str, &str); 2] = [
+    ("OPENCODE_PERMISSION", r#"{"*":"ask"}"#),
+    ("OPENCODE_DISABLE_PROJECT_CONFIG", "1"),
 ];
 /// The server's Basic-auth user, set in the child too so an inherited
 /// `OPENCODE_SERVER_USERNAME` cannot change it.
@@ -109,16 +120,55 @@ pub fn program(
     find(knob, known, store, "opencode", &["opencode"], path)
 }
 
-/// Whether the person's OpenCode config allows without asking (`bypass`): under `home`, or
-/// under `xdg` (`$XDG_CONFIG_HOME`) when set.
+/// Whether the person's OpenCode config could allow without asking: a config file (`bypass`)
+/// or an agent or mode file (`agents_allow`) in a folder of `USER` under `home`, or in
+/// `xdg/opencode` (`$XDG_CONFIG_HOME`) when set.
 pub fn bypass_mode(home: &Path, xdg: Option<&Path>) -> bool {
-    let xdg = xdg
-        .into_iter()
-        .flat_map(|x| ["opencode/opencode.json", "opencode/opencode.jsonc"].map(|f| x.join(f)));
-    USER.iter()
-        .map(|f| home.join(f))
-        .chain(xdg)
-        .any(|p| bypass(&p))
+    let dirs: Vec<PathBuf> = USER
+        .iter()
+        .map(|d| home.join(d))
+        .chain(xdg.map(|x| x.join("opencode")))
+        .collect();
+    dirs.iter().any(|d| {
+        USER_FILES.iter().any(|f| bypass(&d.join(f)))
+            || AGENT_DIRS.iter().any(|a| agents_allow(&d.join(a), 0))
+    })
+}
+
+/// Whether a Markdown agent or mode file under `dir` (to 8 levels) could allow: its YAML
+/// header says `allow` anywhere or `true` in its `tools`, or it (or a folder) cannot be read.
+/// A missing folder is clean.
+// ponytail: a text scan of the header, not a YAML parse; a false match refuses, never allows.
+fn agents_allow(dir: &Path, depth: u8) -> bool {
+    let entries = match std::fs::read_dir(dir) {
+        Err(e) => return e.kind() != std::io::ErrorKind::NotFound,
+        Ok(e) => e,
+    };
+    entries.into_iter().any(|e| {
+        let Ok(e) = e else { return true };
+        let p = e.path();
+        if p.is_dir() {
+            return depth >= 8 || agents_allow(&p, depth + 1);
+        }
+        if p.extension().is_none_or(|x| x != "md") {
+            return false;
+        }
+        let Ok(text) = std::fs::read_to_string(&p) else {
+            return true;
+        };
+        let Some(header) = text.strip_prefix("---") else {
+            return false;
+        };
+        let header = header.split("\n---").next().unwrap_or_default();
+        let mut tools = false;
+        header.contains("allow")
+            || header.lines().any(|l| {
+                if !l.starts_with([' ', '\t']) {
+                    tools = l.starts_with("tools");
+                }
+                tools && l.contains("true")
+            })
+    })
 }
 
 /// Why a worker may not run in `folder`: an `opencode.json[c]` of its own (at its top or under
@@ -128,28 +178,39 @@ pub fn folder_bypass(folder: &Path) -> Option<String> {
     Some(format!("{BYPASS_MODE}: {}", found.display()))
 }
 
-/// Whether the OpenCode config at `path` allows without asking (`allows` on its
-/// `permission`). Only a missing file is clean: one that cannot be read, is not UTF-8, or does
-/// not parse (comments and trailing commas allowed) refuses.
+/// Whether the OpenCode config at `path` could allow without asking (`allows`). Only a missing
+/// file is clean: one that cannot be read, is not UTF-8, or does not parse (comments and
+/// trailing commas allowed) refuses.
 fn bypass(path: &Path) -> bool {
     let text = match std::fs::read_to_string(path) {
         Err(e) => return e.kind() != std::io::ErrorKind::NotFound,
         Ok(t) => t,
     };
     match serde_json::from_str::<Value>(&uncommented(&text)) {
-        Ok(d) => allows(&d["permission"]),
+        Ok(d) => allows(&d),
         Err(_) => true,
     }
 }
 
-/// Whether permission config `p` allows without asking: `"allow"` itself, or `edit`, `bash`,
-/// `webfetch` or `*` set to `"allow"` or to rules whose `*` is `"allow"`.
-fn allows(p: &Value) -> bool {
-    let allow = |v: &Value| *v == "allow" || v["*"] == "allow";
-    allow(p)
-        || ["edit", "bash", "webfetch", "*"]
-            .iter()
-            .any(|k| allow(&p[k]))
+/// Whether config `d` could allow without asking, over the forced `{"*": "ask"}` (a key of its
+/// own, or an agent's rules, are evaluated after it): any `"allow"` under `permission` or an
+/// agent's or mode's `permission`, or any `true` under `tools` or theirs (a tool on is allow).
+fn allows(d: &Value) -> bool {
+    fn any(v: &Value, leaf: fn(&Value) -> bool) -> bool {
+        match v {
+            Value::Object(m) => m.values().any(|v| any(v, leaf)),
+            Value::Array(a) => a.iter().any(|v| any(v, leaf)),
+            v => leaf(v),
+        }
+    }
+    let (allow, on): (fn(&Value) -> bool, fn(&Value) -> bool) =
+        (|v| *v == "allow", |v| *v == true);
+    let agents = ["agent", "mode"]
+        .iter()
+        .flat_map(|k| d[k].as_object().into_iter().flat_map(|m| m.values()));
+    [d].into_iter()
+        .chain(agents)
+        .any(|a| any(&a["permission"], allow) || any(&a["tools"], on))
 }
 
 /// A free loopback port: bound, read, and let go for the server to take.
@@ -186,14 +247,17 @@ impl Driver for OpenCode {
 
     fn env(&self) -> Vec<(&'static str, Option<String>)> {
         let removed = CONFIG_ENV.map(|k| (k, None));
+        let forced = FORCED_ENV.map(|(k, v)| (k, Some(v.to_string())));
         [
             ("OPENCODE_SERVER_USERNAME", Some(USER_NAME.into())),
             ("OPENCODE_SERVER_PASSWORD", Some(self.password.clone())),
         ]
         .into_iter()
+        .chain(forced)
         .chain(removed)
         .collect()
     }
+
 
     fn run(self: Box<Self>, child: Child, first_prompt: String, relay: Relay) -> Run {
         let port = self.port.get().copied().unwrap_or_default();
@@ -780,10 +844,17 @@ mod tests {
         let (k, pw) = &env[1];
         let pw = pw.as_ref().unwrap();
         assert_eq!(*k, "OPENCODE_SERVER_PASSWORD");
-        // A config handed over in the environment is not the child's.
+        // Every permission asks, the folder's own config is off, and a config handed over in
+        // the environment is not the child's.
         assert_eq!(
             env[2..],
-            CONFIG_ENV.map(|k| (k, None))[..],
+            [
+                ("OPENCODE_PERMISSION", Some(r#"{"*":"ask"}"#.into())),
+                ("OPENCODE_DISABLE_PROJECT_CONFIG", Some("1".into())),
+                ("OPENCODE_CONFIG", None),
+                ("OPENCODE_CONFIG_CONTENT", None),
+                ("OPENCODE_CONFIG_DIR", None),
+            ],
             "{:?}",
             &env[2..]
         );
@@ -843,10 +914,10 @@ mod tests {
         let s = Store::open(&d.path().join("state.db")).unwrap();
         let fake = exe(&d.path().join("fake"));
         assert!(here(Some(&fake), d.path(), &s).is_ok());
-        let dir = d.path().join(".config/opencode");
-        std::fs::create_dir_all(&dir).unwrap();
-        for file in USER {
-            let config = d.path().join(file);
+        let files = USER.iter().flat_map(|d| USER_FILES.map(|f| format!("{d}/{f}")));
+        for file in files {
+            let config = d.path().join(&file);
+            std::fs::create_dir_all(config.parent().unwrap()).unwrap();
             for (text, ok) in [
                 (r#"{"permission": "allow"}"#, false),
                 (r#"{"permission": {"edit": "allow"}}"#, false),
@@ -859,11 +930,30 @@ mod tests {
                 (r#"{"permission": {"edit": {"*": "allow"}}}"#, false),
                 (r#"{"permission": {"*": "allow"}}"#, false),
                 ("// mine\n{\"permission\": /* all */ \"allow\",}", false),
+                // Any allow at all: a specific key of the file's wins over the forced `*`.
                 (
                     r#"{"permission": {"bash": {"git status": "allow", "*": "ask"}}}"#,
+                    false,
+                ),
+                (r#"{"permission": {"read": "allow", "edit": "ask"}}"#, false),
+                // An agent's or mode's rules come after it, too; a tool on is allow.
+                (
+                    r#"{"agent": {"build": {"permission": {"bash": "allow"}}}}"#,
+                    false,
+                ),
+                (r#"{"agent": {"x": {"permission": "allow"}}}"#, false),
+                (
+                    r#"{"mode": {"y": {"permission": {"edit": {"*": "allow"}}}}}"#,
+                    false,
+                ),
+                (r#"{"agent": {"x": {"tools": {"bash": true}}}}"#, false),
+                (r#"{"tools": {"*": true}}"#, false),
+                (
+                    r#"{"agent": {"x": {"permission": {"*": "deny"}, "tools": {"bash": false}}}}"#,
                     true,
                 ),
-                (r#"{"permission": {"read": "allow", "edit": "ask"}}"#, true),
+                (r#"{"tools": {"webfetch": false}}"#, true),
+                (r#"{"permission": {"bash": {"*": "ask", "rm *": "deny"}}}"#, true),
                 (r#"{"permission": "ask"}"#, true),
                 (
                     "{\"$schema\": \"https://opencode.ai/config.json\", // see\n\"mcp\": {},}",
@@ -887,13 +977,56 @@ mod tests {
     }
 
     #[test]
+    fn an_agent_file_that_allows_refuses_a_worker() {
+        let d = tempfile::tempdir().unwrap();
+        let h = d.path();
+        let header = |yaml: &str| format!("---\n{yaml}\n---\nYou allow true things.\n");
+        for dir in [".config/opencode", ".opencode"] {
+            for sub in ["agent", "agents/deep/er", "mode", "modes"] {
+                let file = h.join(dir).join(sub).join("a.md");
+                std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+                for (text, ok) in [
+                    // The founder's own: a hidden subagent that denies everything.
+                    (
+                        header("description: x\nmode: subagent\nhidden: true\npermission:\n  \"*\": deny"),
+                        true,
+                    ),
+                    ("no header; allow true\n".into(), true),
+                    (header("tools:\n  bash: false\nhidden: true"), true),
+                    (header("permission:\n  bash: allow"), false),
+                    (header("permission:\n  edit:\n    \"*\": allow"), false),
+                    (header("tools:\n  bash: true"), false),
+                    (header("tools: {write: true}"), false),
+                ] {
+                    std::fs::write(&file, &text).unwrap();
+                    assert_eq!(bypass_mode(h, None), !ok, "{dir}/{sub}: {text}");
+                }
+                std::fs::write(&file, b"---\n\xff\n---\n").unwrap();
+                assert!(bypass_mode(h, None), "{dir}/{sub}: not UTF-8");
+                std::fs::remove_file(&file).unwrap();
+                // Not Markdown: not an agent.
+                std::fs::write(file.with_extension("txt"), header("tools:\n  bash: true")).unwrap();
+                assert!(!bypass_mode(h, None), "{dir}/{sub}");
+                std::fs::remove_file(file.with_extension("txt")).unwrap();
+            }
+        }
+        let xdg = tempfile::tempdir().unwrap();
+        let file = xdg.path().join("opencode/agents/a.md");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, header("permission:\n  bash: allow")).unwrap();
+        assert!(bypass_mode(h, Some(xdg.path())));
+        assert!(!bypass_mode(h, None));
+    }
+
+    #[test]
     fn an_xdg_config_that_allows_without_asking_refuses_a_worker() {
         let (home, xdg) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         let (h, x) = (home.path(), Some(xdg.path()));
         assert!(!bypass_mode(h, x));
         std::fs::create_dir_all(xdg.path().join("opencode")).unwrap();
-        for file in ["opencode/opencode.json", "opencode/opencode.jsonc"] {
-            let config = xdg.path().join(file);
+        for file in USER_FILES.map(|f| format!("opencode/{f}")) {
+            let config = xdg.path().join(&file);
+
             std::fs::write(&config, r#"{"permission": {"bash": "ask"}}"#).unwrap();
             assert!(!bypass_mode(h, x), "{file}");
             std::fs::write(&config, "// all\n{\"permission\": \"allow\",}").unwrap();

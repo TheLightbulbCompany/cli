@@ -1805,7 +1805,8 @@ fn acp_folder_bypass(h: &'static str, file: &str, text: &str) {
     let w = p.workers().remove(0);
     let text = r["text"].as_str().unwrap();
     assert_eq!(r["status"], "failed", "{r}");
-    assert!(text.contains("runs without approvals"), "{text}");
+    assert!(text.contains("run without approvals"), "{text}");
+
     assert!(
         text.ends_with(&format!("{}/{file}", w.folder.display())),
         "{text}"
@@ -2120,7 +2121,10 @@ fn opencode_a_config_in_the_daemons_environment_never_reaches_the_server() {
                     r#"{"permission": "allow"}"#.into(),
                 ),
                 ("OPENCODE_PERMISSION", r#""allow""#.into()),
+                ("OPENCODE_CONFIG_DIR", "/tmp/allow-all".into()),
+                ("OPENCODE_DISABLE_PROJECT_CONFIG", "0".into()),
             ],
+
             ..opencode()
         },
     );

@@ -3,8 +3,10 @@
 an HTTP server speaking what the OpenCode driver uses.
 
 Exit 3 on `--auto`, `--cors`, `--mdns` or a hostname other than 127.0.0.1; exit 2 on any argv
-but the exact one; exit 4 without OPENCODE_SERVER_PASSWORD, or with OPENCODE_CONFIG,
-OPENCODE_CONFIG_CONTENT or OPENCODE_PERMISSION (a config the host did not check).
+but the exact one; exit 4 without OPENCODE_SERVER_PASSWORD, with OPENCODE_CONFIG,
+OPENCODE_CONFIG_CONTENT or OPENCODE_CONFIG_DIR (a config the host did not check), or without
+OPENCODE_PERMISSION={"*":"ask"} and OPENCODE_DISABLE_PROJECT_CONFIG=1 (a worker always asks,
+and never reads its folder's config).
 Every request without Basic auth for OPENCODE_SERVER_USERNAME (default `opencode`) and that
 password gets 401. FAKE_OPENCODE_LOG: each request is appended as a JSON line
 {method, path, auth (whether it was right), body}.
@@ -41,8 +43,11 @@ if argv[:4] != ["serve", "--hostname", "127.0.0.1", "--port"] or len(argv) != 5 
     sys.exit(2)
 password = os.environ.get("OPENCODE_SERVER_PASSWORD")
 if not password or any(os.environ.get(k) is not None for k in (
-        "OPENCODE_CONFIG", "OPENCODE_CONFIG_CONTENT", "OPENCODE_PERMISSION")):
+        "OPENCODE_CONFIG", "OPENCODE_CONFIG_CONTENT", "OPENCODE_CONFIG_DIR")) \
+        or os.environ.get("OPENCODE_PERMISSION") != '{"*":"ask"}' \
+        or os.environ.get("OPENCODE_DISABLE_PROJECT_CONFIG") != "1":
     sys.exit(4)
+
 user = os.environ.get("OPENCODE_SERVER_USERNAME", "opencode")
 AUTH = "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode()
 LOG = os.environ.get("FAKE_OPENCODE_LOG")
