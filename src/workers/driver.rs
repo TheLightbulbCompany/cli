@@ -3,11 +3,12 @@
 //! and the child plumbing.
 
 use crate::net::Knobs;
+use crate::store::Store;
 use crate::Result;
 use std::fs::File;
 use std::future::Future;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
 use tokio::process::Child;
@@ -53,16 +54,19 @@ pub trait Driver: Send {
     fn run(self: Box<Self>, child: Child, first_prompt: String, relay: Relay) -> Run;
 }
 
-/// The driver for `provider`'s harness (Claude Code: `knobs.claude_program`, else `claude` on
-/// `PATH`); none for a harness without one.
-pub fn driver_for(provider: &str, knobs: &Knobs) -> Option<Box<dyn Driver>> {
+/// The driver for `provider`'s harness on this computer (`home` holds `.claude/`): none for a
+/// harness without one; `Err(why)` when it cannot run here (Claude Code: `Claude::here`).
+pub fn driver_for(
+    provider: &str,
+    knobs: &Knobs,
+    home: &Path,
+    store: &Store,
+) -> Option<std::result::Result<Box<dyn Driver>, &'static str>> {
     match provider {
         "claude" => {
-            let program = knobs
-                .claude_program
-                .clone()
-                .unwrap_or_else(|| "claude".into());
-            Some(Box::new(super::claude::Claude::new(program)))
+            let knob = knobs.claude_program.as_deref();
+            let c = super::claude::Claude::here(knob, home, store);
+            Some(c.map(|c| Box::new(c) as Box<dyn Driver>))
         }
         _ => None,
     }
@@ -98,7 +102,49 @@ pub fn spawn(argv: &[String], folder: &Path, log: &Path) -> Result<Child> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(log)
+        .env("PATH", child_path(&argv[0]))
         .kill_on_drop(true)
         .process_group(0)
         .spawn()?)
+}
+
+/// The `PATH` a harness runs with: its own folder, the Homebrew ones and `~/.local/bin` before
+/// the daemon's (a launchd agent's is the bare system one; an npm-installed Claude Code needs
+/// `node`).
+fn child_path(program: &str) -> std::ffi::OsString {
+    let own = Path::new(program).parent().map(Path::to_path_buf);
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let dirs = own
+        .into_iter()
+        .chain(["/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from))
+        .chain(dirs::home_dir().map(|h| h.join(".local/bin")))
+        .chain(std::env::split_paths(&inherited))
+        .filter(|d| !d.as_os_str().is_empty());
+    std::env::join_paths(dirs).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_harness_finds_node_without_a_login_path() {
+        let p = super::child_path("/x/bin/claude");
+        let dirs: Vec<_> = std::env::split_paths(&p).collect();
+        let home = dirs::home_dir().unwrap().join(".local/bin");
+        assert_eq!(
+            dirs[..4],
+            [
+                "/x/bin".into(),
+                "/opt/homebrew/bin".into(),
+                "/usr/local/bin".into(),
+                home
+            ]
+        );
+        // A bare name adds no empty entry.
+        assert_eq!(
+            std::env::split_paths(&super::child_path("claude"))
+                .next()
+                .unwrap(),
+            std::path::PathBuf::from("/opt/homebrew/bin")
+        );
+    }
 }

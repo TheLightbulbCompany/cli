@@ -160,6 +160,22 @@ impl Pair {
         got.unwrap()
     }
 
+    /// The result of `rid` from `from` in A's inbox (waits up to `secs`; other mail is dropped).
+    fn result_from(&self, rid: &str, from: &str, secs: u64) -> Value {
+        let asker = self.asker();
+        let parent = format!("\"replyTo\":\"{rid}\"");
+        let mut got = None;
+        until(secs, &format!("the result of {rid} from {from}"), || {
+            got = self.a.inbox(&asker).into_iter().find(|m| {
+                m["kind"] == "result"
+                    && m["from"] == from
+                    && m["framed"].as_str().is_some_and(|f| f.contains(&parent))
+            });
+            got.is_some()
+        });
+        got.unwrap()
+    }
+
     /// B's worker rows, oldest first.
     fn workers(&self) -> Vec<Worker> {
         self.b.store().workers(false).unwrap()
@@ -420,7 +436,7 @@ fn row_6_deadline_stops_the_worker_and_an_unanswered_start_hold_expires() {
     // Both timers (B: worker deadline, hold expiry; A: its assignments' deadlines) run every
     // second.
     let p = hosted(
-        json!([{"sleep": 60}, {"result": "late"}]),
+        json!([{"say": "half done"}, {"sleep": 60}, {"result": "late"}]),
         Opts {
             always: true,
             env: vec![("LIGHTBULB_CONNECT_DEBUG_OUTBOX_S", "1".into())],
@@ -429,11 +445,13 @@ fn row_6_deadline_stops_the_worker_and_an_unanswered_start_hold_expires() {
         },
     );
     p.assign("as1", "too slow", 3);
-    let pid = running(&p, 1)[0].pid.unwrap();
-    let r = p.result("as1", 15);
+    let w = running(&p, 1).remove(0);
+    let pid = w.pid.unwrap();
+    // The host's own result, from the worker's key, with what the worker had said so far.
+    let r = p.result_from("as1", &w.session, 15);
     assert_eq!(
-        (&r["status"], &r["reason"]),
-        (&json!("failed"), &json!("timed_out")),
+        (&r["status"], &r["reason"], &r["text"]),
+        (&json!("failed"), &json!("timed_out"), &json!("half done")),
         "{r}"
     );
     until(10, "the worker's process is gone", || gone(pid));
@@ -521,9 +539,18 @@ fn row_7_a_fourth_concurrent_assign_is_busy() {
 
 #[test]
 fn row_12_no_bypass_flag_in_argv() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = lightbulb::store::Store::open(&dir.path().join("state.db")).unwrap();
     let knobs = lightbulb::net::Peers::default();
-    let d = workers::driver_for("claude", knobs.knobs()).expect("a Claude Code driver");
+    // The fake is found as a Claude Code would be, under `~/.local/bin`.
+    let bin = dir.path().join(".local/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::os::unix::fs::symlink(FAKE, bin.join("claude")).unwrap();
+    let d = workers::driver_for("claude", knobs.knobs(), dir.path(), &store)
+        .expect("a Claude Code driver")
+        .expect("Claude Code found");
     let argv = d.argv(std::path::Path::new("/w/r1"), "s1");
+    assert_eq!(argv[0], bin.join("claude").display().to_string());
     for flag in [
         "--dangerously-skip-permissions",
         "--dangerously-bypass-approvals-and-sandbox",
@@ -682,4 +709,97 @@ fn row_15_cancel_while_the_dialog_is_up_withdraws_it() {
     let h = lightbulb::holds::get(&p.b.store(), 1).unwrap().unwrap();
     assert_eq!(h.state, "declined");
     assert!(p.workers().is_empty());
+}
+
+#[test]
+fn row_3_decline_on_a_prompt_tells_the_worker() {
+    let p = hosted(
+        json!([bash("rm -rf x"), {"result": "{last}"}]),
+        Opts {
+            always: true,
+            ..Opts::default()
+        },
+    );
+    p.assign("as1", "careful", 300);
+    let (_, text, _) = p.dialog(1);
+    assert!(text.ends_with("wants to: Bash: rm -rf x"), "{text}");
+    p.click("Decline");
+    let r = p.result("as1", 15);
+    assert_eq!(
+        (&r["status"], &r["text"]),
+        (&json!("done"), &json!("declined by bob")),
+        "{r}"
+    );
+    let read = p.harness_read();
+    let answer = read
+        .iter()
+        .find(|l| l["type"] == "control_response")
+        .unwrap();
+    assert_eq!(
+        answer["response"]["response"],
+        json!({"behavior": "deny", "message": "declined by bob"})
+    );
+}
+
+#[test]
+fn a_withdrawn_prompt_closes_its_hold_expired() {
+    let p = hosted(
+        json!([
+            {"ask": {"tool": "Bash", "input": {"command": "rm -rf x"}}, "wait": false},
+            {"sleep": 3}, {"cancel": 0}, {"sleep": 1}, {"result": "carried on"}
+        ]),
+        Opts {
+            always: true,
+            ..Opts::default()
+        },
+    );
+    p.assign("as1", "changes its mind", 300);
+    let (dlg, text, _) = p.dialog(1);
+    assert!(text.ends_with("wants to: Bash: rm -rf x"), "{text}");
+    until(10, "the dialog is withdrawn", || gone(dlg.parse().unwrap()));
+    let r = p.result("as1", 15);
+    assert_eq!(
+        (&r["status"], &r["text"]),
+        (&json!("done"), &json!("carried on")),
+        "{r}"
+    );
+    let h = lightbulb::holds::get(&p.b.store(), 1).unwrap().unwrap();
+    assert_eq!(h.state, "expired");
+    // It was never answered.
+    assert!(!p
+        .harness_read()
+        .iter()
+        .any(|l| l["type"] == "control_response" && l["response"]["request_id"] == "ask-0"));
+}
+
+#[test]
+fn ask_user_question_is_denied_with_the_plan_text() {
+    let p = hosted(
+        json!([
+            {"ask": {"tool": "AskUserQuestion", "input": {"questions": []}}},
+            {"result": "{last}"}
+        ]),
+        Opts {
+            always: true,
+            button: Some(""),
+            ..Opts::default()
+        },
+    );
+    p.assign("as1", "ask me", 300);
+    let r = p.result("as1", 15);
+    assert_eq!(r["text"], workers::claude::NO_PERSON, "{r}");
+    let read = p.harness_read();
+    let answer = read
+        .iter()
+        .find(|l| l["type"] == "control_response")
+        .unwrap();
+    assert_eq!(
+        answer["response"]["response"],
+        json!({"behavior": "deny",
+            "message": "no person is attached to this worker; decide yourself or report what you need"})
+    );
+    assert!(
+        lightbulb::holds::get(&p.b.store(), 1).unwrap().is_none(),
+        "no hold"
+    );
 }

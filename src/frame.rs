@@ -38,9 +38,25 @@ pub fn defang(text: &str) -> String {
         .collect()
 }
 
-/// The first 160 characters of `text` as one printable, defanged line: what cannot be shown
-/// goes first, so nothing hidden can shield a forged prefix from `defang`.
+/// The first 160 characters of `text` as one printable, defanged line (`line`).
 pub fn preview(text: &str) -> String {
+    line(text).take(160).collect()
+}
+
+/// `preview` to 400 characters, with `…` where it was cut: a worker's prompt, whose tail can
+/// matter (`rm -rf` after a long `cd`).
+pub fn preview_long(text: &str) -> String {
+    let mut shown: String = line(text).take(401).collect();
+    if shown.chars().count() > 400 {
+        shown = shown.chars().take(400).collect();
+        shown.push('…');
+    }
+    shown
+}
+
+/// `text` as one printable, defanged line: what cannot be shown goes first, so nothing hidden
+/// can shield a forged prefix from `defang`.
+fn line(text: &str) -> impl Iterator<Item = char> {
     let shown: String = text
         .chars()
         .filter(|c| matches!(c, '\n' | '\t') || crate::label::printable(*c))
@@ -48,8 +64,8 @@ pub fn preview(text: &str) -> String {
     defang(&shown)
         .chars()
         .map(|c| if matches!(c, '\n' | '\t') { ' ' } else { c })
-        .take(160)
-        .collect()
+        .collect::<Vec<_>>()
+        .into_iter()
 }
 
 /// What kind of address a message came from, which is what the frame names.

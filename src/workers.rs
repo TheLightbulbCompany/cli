@@ -2,7 +2,7 @@
 //! start, the registry of running workers, their prompts, stop, deadline and reap, and the
 //! result each sends from its own key.
 
-mod claude;
+pub mod claude;
 mod driver;
 
 pub use driver::{
@@ -342,7 +342,11 @@ pub fn start(d: &Arc<Daemon>, assign_id: &str) -> Result<()> {
     };
     let provider = provider_of(&a.to_key).to_string();
     let now = ipc::now() as i64;
-    let Some(driver) = driver_for(&provider, d.peers.knobs()) else {
+    let driver = {
+        let store = d.store.lock().unwrap();
+        driver_for(&provider, d.peers.knobs(), &d.claude_home, &store)
+    };
+    let Some(driver) = driver else {
         let (from, rid, at) = (&a.from_key, &a.request_id, now as u64);
         let refused = Some("no_worker");
         let store = d.store.lock().unwrap();
@@ -388,7 +392,8 @@ pub fn start(d: &Arc<Daemon>, assign_id: &str) -> Result<()> {
 struct Launch {
     w: Worker,
     a: Message,
-    driver: Box<dyn Driver>,
+    /// Or why its harness cannot run here: the start fails with that.
+    driver: std::result::Result<Box<dyn Driver>, &'static str>,
     label: String,
     conv: String,
     key: Key,
@@ -411,6 +416,18 @@ impl Launch {
             base,
             asker,
         } = self;
+        let driver = match driver {
+            Ok(driver) => driver,
+            Err(why) => {
+                eprintln!("worker {}: not started: no harness", w.id);
+                let o = Outcome {
+                    status: "failed",
+                    reason: Some("error"),
+                    body: why.into(),
+                };
+                return finish(&d, &w, o, None);
+            }
+        };
         let (b, id, meta) = (base.clone(), a.id.clone(), a.meta.clone());
         let made = tokio::task::spawn_blocking(move || workspace(&b, &id, &meta)).await;
         let made = made.unwrap_or_else(|e| Err(e.to_string().into()));
@@ -614,6 +631,14 @@ fn rekey(d: &Daemon, w: &mut Worker, conv: &str) {
     match moved {
         Ok(()) => w.session = key.0,
         Err(e) => eprintln!("worker {}: not re-keyed: {e}", w.id),
+    }
+}
+
+/// `named`, taking the team lock (the caller holds none).
+pub fn named_here(d: &Daemon, who: &str) -> String {
+    match who {
+        "local" | "cli" | "dialog" => named(d, &d.team.lock().unwrap(), who),
+        _ => who.into(),
     }
 }
 
@@ -1242,8 +1267,13 @@ mod tests {
     fn no_launch_argv_contains_a_bypass_flag() {
         let folder = Path::new("/w/r1");
         let peers = crate::net::Peers::default();
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("state.db")).unwrap();
+        assert!(launchable(
+            &claude::Claude::new("claude".into()).argv(folder, "s1")
+        ));
         for provider in ["claude", "codex"] {
-            if let Some(d) = driver_for(provider, peers.knobs()) {
+            if let Some(Ok(d)) = driver_for(provider, peers.knobs(), dir.path(), &s) {
                 let argv = d.argv(folder, "s1");
                 assert!(launchable(&argv), "{provider}: {argv:?}");
             }

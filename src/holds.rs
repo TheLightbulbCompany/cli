@@ -7,7 +7,7 @@ use crate::admission::NOT_OPEN;
 use crate::daemon::ipc::{self, refused, Caller, Response, BAD_REQUEST, INTERNAL, NOT_FOUND};
 use crate::daemon::Daemon;
 use crate::daemon::TeamState;
-use crate::frame::{agent_name, preview, Sender};
+use crate::frame::{agent_name, preview, preview_long, Sender};
 use crate::identity::Identity;
 use crate::mail::{self, State};
 use crate::roster::Roster;
@@ -229,7 +229,7 @@ pub fn dialog(
             "worker {handle} ({}) for {asker} in {} wants to: {}",
             w.provider,
             w.folder.display(),
-            preview(&h.message.body)
+            preview_long(&h.message.body)
         );
         return (text, vec!["Decline", "Allow", "Stop worker"], who);
     }
@@ -442,7 +442,9 @@ pub(crate) fn closed(
     reason: Option<&str>,
     surface: Option<&'static str>,
 ) {
-    d.workers.answered(h.id, verdict, by);
+    // A worker is told who declined it by name (`local` is this computer's person).
+    let by_name = by.map(|b| workers::named_here(d, b));
+    d.workers.answered(h.id, verdict, by_name.as_deref());
     d.dialogs.withdraw(&h.name());
     let mut event = json!({"event": "hold_closed", "id": h.name(), "by": by, "verdict": verdict});
     if let Some(r) = reason {

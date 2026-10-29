@@ -3,8 +3,12 @@
 speaks (`claude -p --input-format stream-json --output-format stream-json ...`).
 
 FAKE_CLAUDE_SCRIPT: a JSON list of steps, run after the initialize handshake and the first
-user turn: {"ask": {"tool": ..., "input": {...}}} sends a can_use_tool request and waits for its
-control_response; {"sleep": seconds}; {"result": text}; {"error": text} (is_error true).
+user turn: {"ask": {"tool": ..., "input": {...}}} sends a can_use_tool request (the n-th ask is
+`ask-<n>`, from 0) and waits for its control_response, unless the step has "wait": false;
+{"cancel": n} withdraws ask n (control_cancel_request) and goes on; {"say": text} is interim
+assistant text; {"sleep": seconds};
+{"result": text}; {"error": text} (is_error true). In a result or error, "{last}" is replaced by
+the last answer's deny message (else its behavior).
 FAKE_CLAUDE_LOG: every stdin line is appended there.
 Refuses to start (exit 3) if a permission-bypass flag is in its argv."""
 import json
@@ -54,19 +58,29 @@ out({"type": "control_response",
 until(lambda e: e.get("type") == "user")
 out({"type": "system", "subtype": "init", "session_id": session})
 
-for n, step in enumerate(steps):
+asks = 0
+last = ""
+for step in steps:
     if "ask" in step:
-        rid = f"ask-{n}"
+        rid = f"ask-{asks}"
+        asks += 1
         out({"type": "control_request", "request_id": rid,
              "request": {"subtype": "can_use_tool", "tool_name": step["ask"]["tool"],
                          "input": step["ask"]["input"], "permission_suggestions": []}})
-        until(lambda e: e.get("type") == "control_response"
-              and e["response"].get("request_id") == rid)
+        if step.get("wait", True):
+            answer = until(lambda e: e.get("type") == "control_response"
+                           and e["response"].get("request_id") == rid)
+            r = answer["response"]["response"]
+            last = r.get("message") or r.get("behavior", "")
+    elif "cancel" in step:
+        out({"type": "control_cancel_request", "request_id": f"ask-{step['cancel']}"})
+    elif "say" in step:
+        out({"type": "assistant", "message": {"content": [{"type": "text", "text": step["say"]}]}})
     elif "sleep" in step:
         time.sleep(step["sleep"])
     elif "result" in step or "error" in step:
         error = "error" in step
-        text = step["error"] if error else step["result"]
+        text = (step["error"] if error else step["result"]).replace("{last}", last)
         out({"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}})
         out({"type": "result", "subtype": "error_during_execution" if error else "success",
              "is_error": error, "result": text, "session_id": session,
