@@ -97,6 +97,8 @@ pub struct Knobs {
     /// The Claude Code a worker runs (`claude` on `PATH` when none), or
     /// `LIGHTBULB_CONNECT_DEBUG_CLAUDE` (a fake harness).
     pub claude_program: Option<PathBuf>,
+    /// The Codex a worker runs, or `LIGHTBULB_CONNECT_DEBUG_CODEX` (a fake harness).
+    pub codex_program: Option<PathBuf>,
 }
 
 /// Off macOS there is no dialog program: an empty one answers nothing (`dialog::Queue`).
@@ -149,6 +151,7 @@ impl Knobs {
             no_default_relays: var("LIGHTBULB_CONNECT_DEBUG_NO_DEFAULT_RELAYS")
                 .is_some_and(|v| v == "1"),
             claude_program: var("LIGHTBULB_CONNECT_DEBUG_CLAUDE").map(Into::into),
+            codex_program: var("LIGHTBULB_CONNECT_DEBUG_CODEX").map(Into::into),
         }
     }
 
@@ -168,6 +171,7 @@ impl Knobs {
             relay_only: false,
             no_default_relays: false,
             claude_program: None,
+            codex_program: None,
         }
     }
 }

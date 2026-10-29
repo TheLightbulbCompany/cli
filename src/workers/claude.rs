@@ -2,30 +2,24 @@
 //! permission prompts asked of the host (`can_use_tool` control requests on stdout, answered on
 //! stdin) and relayed to the person as holds.
 
-use super::driver::{Decision, Driver, Outcome, PermissionRequest, Relay, Run};
+use super::driver::{
+    converse, executable, failed, on_path, registered, send, Decision, Driver, Line, Outcome,
+    PermissionRequest, Relay, Run, INIT_WAIT,
+};
 use crate::frame;
 use crate::store::Store;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::ffi::OsStr;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout};
+use tokio::process::{Child, ChildStdin};
 use tokio::sync::{mpsc, oneshot};
 
 /// The initialize handshake's request id.
 const INIT: &str = "lb-init";
-/// How long the harness has to answer the handshake.
-const INIT_WAIT: Duration = Duration::from_secs(30);
-/// The longest stdout line read; a longer one ends the run.
-const MAX_LINE: usize = 1 << 20;
 
-/// What a worker's `AskUserQuestion` is told: nobody is at its terminal.
-pub const NO_PERSON: &str =
-    "no person is attached to this worker; decide yourself or report what you need";
+pub use super::driver::NO_PERSON;
 /// The start's failure when no Claude Code is found (`program`).
 pub const NOT_INSTALLED: &str = "Claude Code is not installed where the daemon can find it";
 /// The start's failure when the person's Claude Code skips its prompts (`bypass_mode`).
@@ -65,10 +59,6 @@ impl Claude {
     }
 }
 
-fn executable(p: &Path) -> bool {
-    std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-}
-
 /// The Claude Code to run, the first executable file of: the debug knob (when set, the only
 /// one: a test never reaches a real one); `~/.local/bin/claude`, `~/.claude/local/claude`;
 /// `system`; the newest registered Claude session's executable (named `claude`, or under
@@ -86,37 +76,18 @@ pub fn program(
     }
     let homes = [".local/bin/claude", ".claude/local/claude"].map(|p| home.join(p));
     let system = system.iter().map(|p| p.to_path_buf());
-    let on_path = path
-        .into_iter()
-        .flat_map(std::env::split_paths)
-        .map(|d| d.join("claude"));
+    // Registered executables that are Claude Code's.
+    let registered = registered(store, "claude").into_iter().filter(|p| {
+        p.file_name() == Some(OsStr::new("claude"))
+            || p.to_string_lossy()
+                .contains(".local/share/claude/versions/")
+    });
     homes
         .into_iter()
         .chain(system)
-        .chain(registered(store))
-        .chain(on_path)
+        .chain(registered)
+        .chain(on_path(path, "claude"))
         .find(|p| executable(p))
-}
-
-/// The executables registered Claude sessions ran, newest first, that are Claude Code's.
-fn registered(store: &Store) -> Vec<PathBuf> {
-    let rows = (|| -> rusqlite::Result<Vec<String>> {
-        let mut stmt = store.conn().prepare(
-            "SELECT executable FROM sessions WHERE provider = 'claude' \
-             AND executable IS NOT NULL ORDER BY seen_at DESC",
-        )?;
-        let rows = stmt.query_map([], |r| r.get(0))?;
-        rows.collect()
-    })();
-    rows.unwrap_or_default()
-        .into_iter()
-        .map(PathBuf::from)
-        .filter(|p| {
-            p.file_name() == Some(OsStr::new("claude"))
-                || p.to_string_lossy()
-                    .contains(".local/share/claude/versions/")
-        })
-        .collect()
 }
 
 /// Whether `home`'s Claude Code settings skip its prompts (`permissions.defaultMode`
@@ -177,80 +148,33 @@ pub fn asked(request: &Value) -> (String, String) {
     (tool, summary)
 }
 
-/// Writes `v` as one line to the harness.
-async fn send(stdin: &mut ChildStdin, v: &Value) -> std::io::Result<()> {
-    stdin.write_all(format!("{v}\n").as_bytes()).await?;
-    stdin.flush().await
-}
-
 /// The control response to `request_id` carrying `response`.
 fn reply(request_id: &str, response: Value) -> Value {
     json!({"type": "control_response",
         "response": {"subtype": "success", "request_id": request_id, "response": response}})
 }
 
-fn failed(body: impl Into<String>) -> Outcome {
-    Outcome {
-        status: "failed",
-        reason: Some("error"),
-        body: body.into(),
-    }
-}
-
-/// A line of the harness's stdout, or why reading stopped.
-type Line = Result<String, &'static str>;
-
-/// Reads `stdout` line by line into `lines` (on its own task, so the reader loses nothing when
-/// `run`'s select picks another branch) until EOF, an error, or a line over `MAX_LINE`.
-async fn read_lines(stdout: ChildStdout, lines: mpsc::Sender<Line>) {
-    let mut r = BufReader::new(stdout);
-    loop {
-        let mut buf = vec![];
-        let read = (&mut r)
-            .take(MAX_LINE as u64 + 1)
-            .read_until(b'\n', &mut buf)
-            .await;
-        let line = match read {
-            Ok(0) => return,
-            Ok(_) if buf.len() > MAX_LINE => Err("the worker's harness wrote a line over 1 MiB"),
-            Ok(_) => Ok(String::from_utf8_lossy(&buf).trim_end().to_string()),
-            Err(_) => Err("the worker's harness output could not be read"),
-        };
-        let stop = line.is_err();
-        if lines.send(line).await.is_err() || stop {
-            return;
-        }
-    }
-}
-
 /// Speaks stream-json with `child` until its `result` (or its stdout ends): the handshake (30 s),
 /// the first prompt as the user turn of `session`, then each `can_use_tool` relayed (answered
 /// when the person answers; a withdrawn one drops its relay, which closes its hold).
-async fn run(mut child: Child, session: String, prompt: String, relay: Relay) -> Outcome {
-    let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
-        return failed("the worker's harness has no stdio");
-    };
-    let (tx, mut lines) = mpsc::channel(64);
-    let reader = tokio::spawn(read_lines(stdout, tx));
-    let outcome = talk(&mut stdin, &mut lines, session, prompt, relay).await;
-    reader.abort();
-    // Done with it: stdin closed, a moment to exit, then killed (`kill_on_drop`).
-    drop(stdin);
-    let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
-    outcome
+async fn run(child: Child, session: String, prompt: String, relay: Relay) -> Outcome {
+    converse(child, |stdin, lines| {
+        talk(stdin, lines, session, prompt, relay)
+    })
+    .await
 }
 
 /// `run`'s conversation over `stdin` and the harness's `lines`.
 async fn talk(
-    stdin: &mut ChildStdin,
-    lines: &mut mpsc::Receiver<Line>,
+    mut stdin: ChildStdin,
+    mut lines: mpsc::Receiver<Line>,
     session: String,
     prompt: String,
     relay: Relay,
 ) -> Outcome {
     let init = json!({"type": "control_request", "request_id": INIT,
         "request": {"subtype": "initialize"}});
-    if send(stdin, &init).await.is_err() {
+    if send(&mut stdin, &init).await.is_err() {
         return failed("the worker's harness exited at once");
     }
     let handshake = async {
@@ -269,7 +193,7 @@ async fn talk(
     }
     let turn = json!({"type": "user", "session_id": session,
         "message": {"role": "user", "content": prompt}, "parent_tool_use_id": null});
-    if send(stdin, &turn).await.is_err() {
+    if send(&mut stdin, &turn).await.is_err() {
         return failed("the worker's harness took no prompt");
     }
     // Answers to write, from the tasks waiting on the person.
@@ -283,7 +207,7 @@ async fn talk(
                 if let Some(id) = a["response"]["request_id"].as_str() {
                     waiting.remove(id);
                 }
-                if send(stdin, &a).await.is_err() {
+                if send(&mut stdin, &a).await.is_err() {
                     break failed(last);
                 }
                 continue;
@@ -311,7 +235,7 @@ async fn talk(
                 let (tool, summary) = asked(&v["request"]);
                 let no = |why: &str| reply(&id, json!({"behavior": "deny", "message": why}));
                 if tool == "AskUserQuestion" {
-                    if send(stdin, &no(NO_PERSON)).await.is_err() {
+                    if send(&mut stdin, &no(NO_PERSON)).await.is_err() {
                         break failed(last);
                     }
                     continue;
@@ -323,7 +247,7 @@ async fn talk(
                     reply: tx,
                 };
                 if relay.permission.send(ask).await.is_err() {
-                    if send(stdin, &no("the person could not be asked"))
+                    if send(&mut stdin, &no("the person could not be asked"))
                         .await
                         .is_err()
                     {
@@ -377,6 +301,7 @@ async fn talk(
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn argv_runs_headless_with_prompts_to_the_host_and_a_fixed_session_id() {

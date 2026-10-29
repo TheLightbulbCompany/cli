@@ -3,6 +3,7 @@
 //! result each sends from its own key.
 
 pub mod claude;
+pub mod codex;
 mod driver;
 
 pub use driver::{
@@ -543,15 +544,17 @@ async fn drive(
     tokio::pin!(run);
     let (mut stopped, mut stop_seen, mut named_seen) = (None, false, false);
     let outcome = loop {
+        // Biased: a conversation id named before a prompt re-keys the worker before its hold.
         tokio::select! {
-            o = &mut run => break o,
-            Some(ask) = asks.recv() => prompt(&d, &w, ask),
+            biased;
             r = &mut named, if !named_seen => {
                 named_seen = true;
                 if let Ok(conv) = r {
                     rekey(&d, &mut w, &conv);
                 }
             }
+            o = &mut run => break o,
+            Some(ask) = asks.recv() => prompt(&d, &w, ask),
             r = &mut stop, if !stop_seen => {
                 stop_seen = true;
                 stopped = r.ok();

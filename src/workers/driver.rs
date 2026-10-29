@@ -5,14 +5,26 @@
 use crate::net::Knobs;
 use crate::store::Store;
 use crate::Result;
+use serde_json::Value;
+use std::ffi::OsStr;
 use std::fs::File;
 use std::future::Future;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
-use tokio::process::Child;
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::{mpsc, oneshot};
+
+/// What a worker that asks its person a question is told: nobody is at its terminal.
+pub const NO_PERSON: &str =
+    "no person is attached to this worker; decide yourself or report what you need";
+/// How long a harness has to answer each handshake request.
+pub const INIT_WAIT: Duration = Duration::from_secs(30);
+/// The longest stdout line read; a longer one ends the run.
+const MAX_LINE: usize = 1 << 20;
 
 /// The person's answer to a worker's permission prompt.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,8 +80,99 @@ pub fn driver_for(
             let c = super::claude::Claude::here(knob, home, store);
             Some(c.map(|c| Box::new(c) as Box<dyn Driver>))
         }
+        "codex" => {
+            let knob = knobs.codex_program.as_deref();
+            let c = super::codex::Codex::here(knob, home, store);
+            Some(c.map(|c| Box::new(c) as Box<dyn Driver>))
+        }
         _ => None,
     }
+}
+
+pub fn executable(p: &Path) -> bool {
+    std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+/// The executables registered `provider` sessions ran, newest first.
+pub fn registered(store: &Store, provider: &str) -> Vec<PathBuf> {
+    let rows = (|| -> rusqlite::Result<Vec<String>> {
+        let mut stmt = store.conn().prepare(
+            "SELECT executable FROM sessions WHERE provider = ?1 \
+             AND executable IS NOT NULL ORDER BY seen_at DESC",
+        )?;
+        let rows = stmt.query_map([provider], |r| r.get(0))?;
+        rows.collect()
+    })();
+    rows.unwrap_or_default()
+        .into_iter()
+        .map(PathBuf::from)
+        .collect()
+}
+
+/// `name` in each directory of `path`.
+pub fn on_path(path: Option<&OsStr>, name: &str) -> Vec<PathBuf> {
+    path.into_iter()
+        .flat_map(std::env::split_paths)
+        .map(|d| d.join(name))
+        .collect()
+}
+
+/// Writes `v` as one line to the harness.
+pub async fn send(stdin: &mut ChildStdin, v: &Value) -> std::io::Result<()> {
+    stdin.write_all(format!("{v}\n").as_bytes()).await?;
+    stdin.flush().await
+}
+
+pub fn failed(body: impl Into<String>) -> Outcome {
+    Outcome {
+        status: "failed",
+        reason: Some("error"),
+        body: body.into(),
+    }
+}
+
+/// A line of the harness's stdout, or why reading stopped.
+pub type Line = std::result::Result<String, &'static str>;
+
+/// Reads `stdout` line by line into `lines` (on its own task, so the reader loses nothing when
+/// a driver's select picks another branch) until EOF, an error, or a line over `MAX_LINE`.
+async fn read_lines(stdout: ChildStdout, lines: mpsc::Sender<Line>) {
+    let mut r = BufReader::new(stdout);
+    loop {
+        let mut buf = vec![];
+        let read = (&mut r)
+            .take(MAX_LINE as u64 + 1)
+            .read_until(b'\n', &mut buf)
+            .await;
+        let line = match read {
+            Ok(0) => return,
+            Ok(_) if buf.len() > MAX_LINE => Err("the worker's harness wrote a line over 1 MiB"),
+            Ok(_) => Ok(String::from_utf8_lossy(&buf).trim_end().to_string()),
+            Err(_) => Err("the worker's harness output could not be read"),
+        };
+        let stop = line.is_err();
+        if lines.send(line).await.is_err() || stop {
+            return;
+        }
+    }
+}
+
+/// Runs `talk` over `child`'s stdin and its stdout's lines to an `Outcome`; then stdin is
+/// closed (`talk` owns it), the child has a moment to exit, and is killed (`kill_on_drop`).
+pub async fn converse<F, Fut>(mut child: Child, talk: F) -> Outcome
+where
+    F: FnOnce(ChildStdin, mpsc::Receiver<Line>) -> Fut,
+    Fut: Future<Output = Outcome>,
+{
+    let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+        return failed("the worker's harness has no stdio");
+    };
+    let (tx, lines) = mpsc::channel(64);
+    let reader = tokio::spawn(read_lines(stdout, tx));
+    let outcome = talk(stdin, lines).await;
+    reader.abort();
+    let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+    outcome
 }
 
 /// Flags that would let a harness act without its person: never in a launch argv.

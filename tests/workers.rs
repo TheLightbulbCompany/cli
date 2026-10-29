@@ -1,7 +1,7 @@
 //! Network workers, end to end (spec §8 rows 3-7, 11-15): B offers Claude Code workers (a fake
-//! harness, `tests/fixtures/workers/fake-claude.py`, speaking its stream-json protocol), A
-//! assigns work to `<B>/claude:new`. Real daemons; B's dialogs are a fake `osascript` the test
-//! clicks (`Pair::click`), or a fixed answer.
+//! harness, `tests/fixtures/workers/fake-claude.py`, speaking its stream-json protocol) or Codex
+//! ones (`fake-codex.py`, app-server JSON-RPC), A assigns work to `<B>/<harness>:new`. Real
+//! daemons; B's dialogs are a fake `osascript` the test clicks (`Pair::click`), or a fixed answer.
 
 use lightbulb::store::Worker;
 use lightbulb::workers::{self, Policy};
@@ -15,6 +15,10 @@ use common::{dialog, now_s, peers, person, seed_pair, session, until, Env, EXE};
 const FAKE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/workers/fake-claude.py"
+);
+const FAKE_CODEX: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/workers/fake-codex.py"
 );
 
 /// How B is set up.
@@ -32,12 +36,16 @@ struct Opts {
     env: Vec<(&'static str, String)>,
     /// More of A's environment.
     a_env: Vec<(&'static str, String)>,
+    /// B offers Codex workers (`fake-codex.py`) instead of Claude Code ones.
+    codex: bool,
 }
 
 /// A asks, B hosts workers in `work`; `ui` keeps the fake dialogs and the fake harness's log.
 struct Pair {
     a: Env,
     b: Env,
+    /// The harness B offers.
+    harness: &'static str,
     work: tempfile::TempDir,
     ui: tempfile::TempDir,
 }
@@ -80,14 +88,21 @@ fn hosted(script: Value, o: Opts) -> Pair {
             .birth_micros;
         b.pin = Some(format!("{}:{birth}", std::process::id()));
     }
-    let mut env = vec![
-        ("LIGHTBULB_CONNECT_DEBUG_CLAUDE", FAKE.to_string()),
-        ("FAKE_CLAUDE_SCRIPT", script.to_string()),
-        (
-            "FAKE_CLAUDE_LOG",
-            ui.path().join("fake.log").display().to_string(),
-        ),
-    ];
+    let harness = if o.codex { "codex" } else { "claude" };
+    let log = ui.path().join("fake.log").display().to_string();
+    let mut env = if o.codex {
+        vec![
+            ("LIGHTBULB_CONNECT_DEBUG_CODEX", FAKE_CODEX.to_string()),
+            ("FAKE_CODEX_SCRIPT", script.to_string()),
+            ("FAKE_CODEX_LOG", log),
+        ]
+    } else {
+        vec![
+            ("LIGHTBULB_CONNECT_DEBUG_CLAUDE", FAKE.to_string()),
+            ("FAKE_CLAUDE_SCRIPT", script.to_string()),
+            ("FAKE_CLAUDE_LOG", log),
+        ]
+    };
     match o.button {
         Some(button) => env.push(dialog(button)),
         None => env.push((
@@ -97,7 +112,7 @@ fn hosted(script: Value, o: Opts) -> Pair {
     }
     env.extend(o.env);
     let config = format!(
-        "computer = \"mbp\"\nworkers_offer = \"claude\"\nworkers_folder = \"{}\"\n{}",
+        "computer = \"mbp\"\nworkers_offer = \"{harness}\"\nworkers_folder = \"{}\"\n{}",
         work.path().display(),
         o.config
     );
@@ -108,7 +123,13 @@ fn hosted(script: Value, o: Opts) -> Pair {
     until(10, "both online", || {
         a.status()["peers"]["online"] == 1 && b.status()["peers"]["online"] == 1
     });
-    Pair { a, b, work, ui }
+    Pair {
+        a,
+        b,
+        harness,
+        work,
+        ui,
+    }
 }
 
 impl Pair {
@@ -117,9 +138,9 @@ impl Pair {
         session(&self.a, "a1")
     }
 
-    /// A assigns `text` to a fresh Claude Code on B as `rid`, due in `deadline_s`.
+    /// A assigns `text` to a fresh harness on B as `rid`, due in `deadline_s`.
     fn assign(&self, rid: &str, text: &str, deadline_s: u64) {
-        let to = format!("{}/claude:new", self.b.short());
+        let to = format!("{}/{}:new", self.b.short(), self.harness);
         let r = self.a.ask(
             json!({"id": 1, "op": "send", "from": self.asker(), "to": to,
             "kind": "assign", "text": text, "done_when": "done", "deadline_s": deadline_s,
@@ -586,6 +607,21 @@ fn row_12_no_bypass_flag_in_argv() {
         assert_eq!(o.status.code(), Some(3), "{flag}");
     }
     assert!(!argv.iter().any(|a| a == "--permission-mode"), "{argv:?}");
+    // The fake Codex refuses a bypass flag or an approval/sandbox override too.
+    for extra in [
+        &["--dangerously-bypass-approvals-and-sandbox"][..],
+        &["--approve-for-me"],
+        &["--full-auto"],
+        &["-c", "approval_policy=\"never\""],
+        &["-c", "sandbox_mode=\"danger-full-access\""],
+    ] {
+        let o = Command::new(FAKE_CODEX)
+            .arg("app-server")
+            .args(extra)
+            .output()
+            .unwrap();
+        assert_eq!(o.status.code(), Some(3), "{extra:?}");
+    }
 }
 
 #[test]
@@ -855,4 +891,144 @@ fn row_10_workers_off_stops_the_worker_and_unlists_the_host() {
             .iter()
             .any(|s| s["session_id"] == new.as_str())
     });
+}
+
+/// B offers Codex workers (§8 rows 3, 5, 6): the same flow over the app-server protocol.
+fn codex() -> Opts {
+    Opts {
+        codex: true,
+        ..Opts::default()
+    }
+}
+
+#[test]
+fn codex_row_3_allow_starts_a_codex_worker_whose_turn_is_the_result() {
+    let p = hosted(
+        json!([{"ask": "rm -rf x"}, {"result": "all green"}]),
+        codex(),
+    );
+    p.assign("as1", "fix the build", 300);
+    p.wait_state("as1", "held");
+    let (_, text, buttons) = p.dialog(1);
+    assert!(
+        text.contains(&format!("wants to start a codex worker in {}/", p.folder())),
+        "{text}"
+    );
+    assert_eq!(buttons, ["Decline", "Allow", "Always allow"]);
+    p.click("Allow");
+
+    let (_, text, buttons) = p.dialog(2);
+    // Re-keyed to the thread Codex named before the turn started.
+    let w = running(&p, 1).remove(0);
+    let thread = w.session.split_once(':').unwrap().1.to_string();
+    assert!(thread.starts_with("t-"), "{}", w.session);
+    assert!(
+        text.starts_with("worker codex-1 (codex) for prasiddha"),
+        "{text}"
+    );
+    let at = format!(" in {} wants to: Command: rm -rf x", w.folder.display());
+    assert!(text.ends_with(&at), "{text}");
+    assert_eq!(buttons, ["Decline", "Allow", "Stop worker"]);
+    assert!(p.a.inbox(&p.asker()).is_empty());
+    p.click("Allow");
+
+    let r = p.result("as1", 15);
+    assert_eq!(
+        (&r["status"], &r["text"]),
+        (&json!("done"), &json!("all green")),
+        "{r}"
+    );
+    assert_eq!(r["from"], w.session.as_str(), "{r}");
+    until(10, "B's row reads done", || p.workers()[0].state == "done");
+    // The handshake, the thread in the folder, the first prompt as the turn, the answer.
+    let read = p.harness_read();
+    let method = |m: &str| read.iter().find(|l| l["method"] == m).cloned().unwrap();
+    assert_eq!(
+        method("initialize")["params"]["clientInfo"]["name"],
+        "lightbulb"
+    );
+    assert_eq!(method("initialized")["params"], json!({}));
+    let start = method("thread/start");
+    assert_eq!(
+        start["params"]["cwd"],
+        w.folder.display().to_string(),
+        "{start}"
+    );
+    let turn = method("turn/start");
+    assert_eq!(turn["params"]["threadId"], thread.as_str());
+    let input = &turn["params"]["input"][0];
+    assert_eq!(input["type"], "text");
+    assert!(
+        input["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("[Lightbulb assignment from "),
+        "{turn}"
+    );
+    let answer = read.iter().find(|l| l["id"] == 100).unwrap();
+    assert_eq!(answer["result"], json!({"decision": "accept"}), "{answer}");
+    // `show` names the way back into the thread.
+    let o = p.b.detached(&[EXE, "workers", "show", "codex-1"], "");
+    let shown = common::out(&o);
+    assert!(shown.contains("all green"), "{shown}");
+    assert!(
+        shown.contains(&format!(
+            "Resume it: cd {} && codex resume {thread}",
+            w.folder.display()
+        )),
+        "{shown}"
+    );
+}
+
+#[test]
+fn codex_row_5_cancel_stops_it() {
+    let p = hosted(
+        json!([{"sleep": 60}, {"result": "late"}]),
+        Opts {
+            always: true,
+            ..codex()
+        },
+    );
+    p.assign("as1", "take your time", 300);
+    let w = running(&p, 1).remove(0);
+    let pid = w.pid.unwrap();
+    assert!(!gone(pid));
+    p.cancel("as1");
+    until(10, "the worker's process is gone", || gone(pid));
+    until(15, "as1's result reads cancelled", || {
+        p.a.receipt(&p.asker(), "as1")["result"]["status"] == "cancelled"
+    });
+    until(10, "B's row reads cancelled", || {
+        p.workers()[0].state == "cancelled"
+    });
+}
+
+#[test]
+fn codex_row_6_deadline_stops_it() {
+    let p = hosted(
+        json!([{"say": "half done"}, {"sleep": 60}, {"result": "late"}]),
+        Opts {
+            always: true,
+            env: vec![("LIGHTBULB_CONNECT_DEBUG_OUTBOX_S", "1".into())],
+            a_env: vec![("LIGHTBULB_CONNECT_DEBUG_OUTBOX_S", "1".into())],
+            ..codex()
+        },
+    );
+    p.assign("as1", "too slow", 3);
+    let pid = running(&p, 1)[0].pid.unwrap();
+    until(10, "the worker is the thread", || {
+        p.workers()[0].session.contains("/codex:t-")
+    });
+    // The host's own result, from the thread's key, with what the worker had said so far.
+    let r = p.result_from("as1", &p.workers()[0].session, 15);
+    assert_eq!(
+        (&r["status"], &r["reason"], &r["text"]),
+        (&json!("failed"), &json!("timed_out"), &json!("half done")),
+        "{r}"
+    );
+    until(10, "the worker's process is gone", || gone(pid));
+    until(10, "B's row reads failed", || {
+        p.workers()[0].state == "failed"
+    });
+    assert_eq!(p.workers()[0].by.as_deref(), Some("deadline"));
 }
