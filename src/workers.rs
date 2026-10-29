@@ -1048,25 +1048,26 @@ pub fn tick(d: &Arc<Daemon>, now: i64) {
     }
 }
 
-/// Whether worker `w`'s process is still the one it started: its session row's pid and birth,
-/// else its pid alone.
+/// Whether worker `w`'s process is still the one it started: its session row's pid and birth.
+/// No birth time (or no row) is not alive: an unverified pid is never re-adopted or killed.
 fn alive(store: &Store, w: &Worker) -> bool {
     let row = store.session(&w.session).ok().flatten();
-    match row.and_then(|s| {
+    row.and_then(|s| {
         Some((
             u32::try_from(s.pid?).ok()?,
             u64::try_from(s.birth_micros?).ok()?,
         ))
-    }) {
-        Some((pid, birth)) => sessions::alive(pid, birth),
-        None => w.pid.is_some_and(|p| crate::os::process(p).is_ok()),
-    }
+    })
+    .is_some_and(|(pid, birth)| sessions::alive(pid, birth))
 }
 
 /// `reap`'s store half: the unended workers whose process is gone (to `finish` as failed),
 /// and those still alive (to re-adopt). Nothing is written.
 pub fn reaped(store: &Store) -> Result<(Vec<Worker>, Vec<Worker>)> {
-    Ok(store.workers(true)?.into_iter().partition(|w| !alive(store, w)))
+    Ok(store
+        .workers(true)?
+        .into_iter()
+        .partition(|w| !alive(store, w)))
 }
 
 /// At daemon start: each worker whose process is gone ends `failed`/`error` and its asker is
@@ -1390,6 +1391,16 @@ mod tests {
         assert_eq!((w.state.as_str(), w.ended_at), ("running", None));
         // The live one is re-adopted, untouched.
         assert_eq!(adopted.iter().map(|w| w.id).collect::<Vec<_>>(), [live]);
+        // A live pid with no birth time on record is not verified: never re-adopted.
+        s.conn()
+            .execute(
+                "UPDATE sessions SET birth_micros = NULL WHERE key = 'm/claude:w2'",
+                [],
+            )
+            .unwrap();
+        let (dead, adopted) = reaped(&s).unwrap();
+        assert_eq!(dead.len(), 2);
+        assert!(adopted.is_empty());
     }
 
     const BYPASS: [&str; 4] = [
