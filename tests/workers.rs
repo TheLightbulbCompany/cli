@@ -48,6 +48,8 @@ struct Opts {
     /// The harness B offers: `codex` (`fake-codex.py`), `cursor` or `grok` (`fake-acp.py`),
     /// `opencode` (`fake-opencode.py`); empty: Claude Code (`fake-claude.py`).
     harness: &'static str,
+    /// B leaves `network_workers` off (the default) while still offering the harness.
+    flag_off: bool,
 }
 
 /// A asks, B hosts workers in `work`; `ui` keeps the fake dialogs and the fake harness's log.
@@ -153,7 +155,8 @@ fn hosted(script: Value, o: Opts) -> Pair {
     }
     env.extend(o.env);
     let config = format!(
-        "computer = \"mbp\"\nnetwork_workers = true\nworkers_offer = \"{harness}\"\nworkers_folder = \"{}\"\n{}",
+        "computer = \"mbp\"\nnetwork_workers = {}\nworkers_offer = \"{harness}\"\nworkers_folder = \"{}\"\n{}",
+        !o.flag_off,
         work.path().display(),
         o.config
     );
@@ -1591,6 +1594,23 @@ fn acp_row_3_allow(h: &'static str, name: &str, resume: &str) {
         )),
         "{shown}"
     );
+}
+
+/// The flag off at B: an assignment to a fresh Cursor worker is refused `unsupported` before
+/// any dialog, hold or process.
+#[test]
+fn a_cursor_assign_is_unsupported_while_network_workers_is_off() {
+    let p = hosted(
+        json!([{"result": "never"}]),
+        Opts {
+            flag_off: true,
+            ..acp("cursor")
+        },
+    );
+    p.assign("as1", "fix the build", 300);
+    p.wait_state("as1", "refused");
+    assert_eq!(p.a.receipt(&p.asker(), "as1")["reason"], "unsupported");
+    assert!(p.harness_read().is_empty());
 }
 
 #[test]

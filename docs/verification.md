@@ -88,6 +88,19 @@ Spec §8 rows 3–7 and 10–15 (network workers, plan 2), on two real daemons w
 | 14 | A prompt left open is answered later | Holds outlive the dialog (`src/holds.rs`) | `tests/workers.rs::row_14_a_prompt_left_open_is_answered_later` | PASS |
 | 15 | Cancel while the dialog is up withdraws it | `Registry::answered`, `cancel` (`src/workers.rs`) | `tests/workers.rs::row_15_cancel_while_the_dialog_is_up_withdraws_it` | PASS |
 
+Cursor, Grok and OpenCode as worker hosts (network workers, plan 3), on the same two daemons with
+a fake ACP harness (`tests/fixtures/workers/fake-acp.py`, Cursor and Grok) and a fake OpenCode
+server (`fake-opencode.py`). Real Cursor, Grok and OpenCode runs are not done.
+
+| # | Row | Test | Result |
+|---|---|---|---|
+| 3 | Allow starts the worker, its turn is the result; Decline answers the harness `reject_once` / `reject` | `tests/workers.rs::cursor_row_3_allow_starts_a_worker_whose_turn_is_the_result`, `…::grok_row_3_allow_starts_a_worker_whose_turn_is_the_result`, `…::opencode_row_3_allow_starts_a_worker_whose_turn_is_the_result`, `…::cursor_row_3_decline_sends_reject_once`, `…::grok_row_3_decline_sends_reject_once`, `…::opencode_row_3_decline_sends_reject` | PASS (fakes) |
+| 5 | Cancel stops the running worker | `…::cursor_row_5_cancel_stops_it`, `…::grok_row_5_cancel_stops_it`, `…::opencode_row_5_cancel_stops_it` | PASS (fakes) |
+| 6 | The deadline stops it | `…::cursor_row_6_deadline_stops_it`, `…::grok_row_6_deadline_stops_it`, `…::opencode_row_6_deadline_stops_it` | PASS (fakes) |
+| 12 | No bypass flag in argv, and a harness config that skips approvals refuses the start | `…::row_12_no_bypass_flag_in_argv` (exact argv for each), `…::cursor_a_worktree_that_allows_everything_refuses_the_start`, `…::grok_a_worktree_that_skips_approvals_refuses_the_start`, `…::opencode_a_worktree_that_allows_without_asking_refuses_the_start` | PASS |
+| off | `network_workers` off: an assignment to `<m>/cursor:new` is refused `unsupported` | `…::a_cursor_assign_is_unsupported_while_network_workers_is_off` | PASS |
+| ws | A workspace agent (an instance) takes an assignment only when its own config turns `network_workers` on | `tests/embed.rs::an_instance_refuses_assignments_until_its_config_turns_them_on`, `…::an_instance_stores_an_assignment_for_a_declared_agent_when_on` | PASS (engine side) |
+
 ## D. Controls added since 0.2.2 (v0.2.3 – v0.3.7)
 
 Removed since 0.2.2, so no row above depends on them: the relay-list fetch, sign-in renewal and

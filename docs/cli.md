@@ -207,7 +207,7 @@ lightbulb decline <REQUEST>
 
 ### workers
 
-When you use it: to let teammates start Claude Code or Codex workers on this computer, to see what they did, and to say whom you trust. Only you can run these; an agent's shell is refused.
+When you use it: to let teammates start coding-agent workers (Claude Code, Codex, Cursor, Grok CLI or OpenCode) on this computer, to see what they did, and to say whom you trust. Only you can run these; an agent's shell is refused.
 
 Network workers are off by default. Turn them on with `lightbulb config set network_workers true`. While they are off, this computer's agents have no `find_workers`, `assign` or `cancel_assignment` tool, it refuses to send or take any assignment (`unsupported`), it offers no workers, and `workers on` refuses with that command.
 
@@ -222,6 +222,8 @@ lightbulb workers clean
 ```
 
 With no argument, lists the workers: name, who asked, harness, folder, start time, state. `show` prints a worker's result, its folder and the command that resumes its conversation there (`claude --resume <id>`). `stop` ends a running one. `on` offers the harnesses (default `claude`), the folder workers run in and how many at once; it refuses a folder you hid with `folder <path> off`. `off` stops offering and stops every running worker. `policy` lists your teammates as `always`, `ask` or `refused`; `allow`, `refuse` and `revoke` (or `ask`) change one, and `ask self` makes your own assignments ask too. `clean` removes the folders of workers that finished over a week ago, and prints them; a running worker's folder stays.
+
+`--offer` takes any of `claude`, `codex`, `cursor`, `grok` and `opencode` (comma separated). Each needs its own harness installed and signed in on this Mac: Claude Code runs headless over stream-json, Codex over its app-server, Cursor (`cursor-agent acp`) and Grok CLI (`grok agent --no-leader stdio`) over the Agent Client Protocol, and OpenCode through a local server it starts on 127.0.0.1 with a password only the worker knows. Every permission prompt goes to you, never to the asker. A harness whose config skips approvals (Claude `bypassPermissions`, Grok `permission-mode` set to bypass, Cursor or OpenCode allowing everything), whether in your own config or in a repo's committed config in the worker's folder, refuses to host: the asker is told, and nothing starts.
 
 The first assignment from a teammate asks you with a dialog (or `held` and `approve`); Always allow (`approve --always`) lets that teammate's computer start workers here without asking from then on. A dialog that gave up comes back when you run `held`. An Allow that lands while this computer already runs `workers_max` workers starts nothing, and the asker is told `busy`.
 
