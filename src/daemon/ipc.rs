@@ -1678,7 +1678,9 @@ fn fresh_worker(
         eprintln!("workers: {} {}: {e}", p.kind, p.message_id)
     };
     if let Some(Taken::Start) = taken {
-        workers::start(daemon, &p.message_id).unwrap_or_else(log);
+        if let Err(e) = workers::start(daemon, &p.message_id) {
+            log(e);
+        }
     }
     if let Some(assign) = cancelled {
         workers::cancel(daemon, &assign, &p.from.0).unwrap_or_else(log);

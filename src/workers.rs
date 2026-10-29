@@ -245,11 +245,16 @@ fn private_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The first line of a result (and of the first prompt) when a repo hint made no worktree.
+pub const NO_WORKTREE: &str =
+    "no worktree: no clone of that repo here could check it out; the worker ran in an empty folder";
+
 /// Assignment `id`'s folder, `<base>/<id>/`, new and private (`0700`; one that exists already
-/// is an error, `folder exists`): a git worktree on branch `meta.branch` (else `lb/<id>`) when
-/// `meta.repo` names a clone right under `base`, else empty. No fetch; a worktree git refuses
-/// leaves the folder empty. Blocking (git): off the async threads.
-pub fn workspace(base: &Path, id: &str, meta: &Meta) -> Result<PathBuf> {
+/// is an error, `folder exists`): a git worktree when `meta.repo` names a clone right under
+/// `base`, on a new branch `meta.branch` (else `lb/<id>`), or, when `meta.branch` exists
+/// already, on a new `lb/<id>` based on it; else empty. No fetch. The folder, and whether a
+/// repo was hinted but no worktree made. Blocking (git): off the async threads.
+pub fn workspace(base: &Path, id: &str, meta: &Meta) -> Result<(PathBuf, bool)> {
     private_dir(base)?;
     let dir = dir_for(base, id);
     if dir.exists() {
@@ -260,18 +265,26 @@ pub fn workspace(base: &Path, id: &str, meta: &Meta) -> Result<PathBuf> {
         .filter(|r| sessions::word(r, 256) && !r.starts_with('.'))
         .map(|r| base.join(r))
         .filter(|c| c.join(".git").exists());
+    let mut made = false;
     if let Some(clone) = clone {
-        let branch = meta.branch.clone().unwrap_or_else(|| format!("lb/{id}"));
-        let made = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&clone)
-            .args(["worktree", "add", "-q", "-b", &branch])
-            .arg(&dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success());
+        let add = |branch: &str, from: Option<&str>| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&clone)
+                .args(["worktree", "add", "-q", "-b", branch])
+                .arg(&dir)
+                .args(from)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        };
+        let own = format!("lb/{id}");
+        made = match meta.branch.as_deref() {
+            Some(b) => add(b, None) || add(&own, Some(b)),
+            None => add(&own, None),
+        };
         if !made {
             eprintln!("worker {id}: no worktree of its repo; an empty folder");
         }
@@ -280,7 +293,7 @@ pub fn workspace(base: &Path, id: &str, meta: &Meta) -> Result<PathBuf> {
         std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
     }
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
-    Ok(dir)
+    Ok((dir, meta.repo.is_some() && !made))
 }
 
 /// The worker's first prompt: assignment `a` framed as an agent gets it from `label`, then
@@ -338,8 +351,9 @@ pub fn claim(
 /// Starts the worker for stored assignment `assign_id` (called with no lock held): claims it
 /// (`claim`), makes its folder (`workspace`), registers its session `<me>/<provider>:<fresh
 /// id>` and spawns its harness; a task (`drive`) hands it the first prompt and sends its
-/// result. Nothing starts at the cap, or without a driver for the harness (`no_worker`).
-pub fn start(d: &Arc<Daemon>, assign_id: &str) -> Result<()> {
+/// result. Nothing starts at the cap (`busy`), or without a driver for the harness
+/// (`no_worker`): the refusal's reason, sent to the asker, is returned.
+pub fn start(d: &Arc<Daemon>, assign_id: &str) -> Result<Option<&'static str>> {
     let Some(a) = d.store.lock().unwrap().message(assign_id)? else {
         return Err(format!("no assignment {assign_id}").into());
     };
@@ -357,7 +371,7 @@ pub fn start(d: &Arc<Daemon>, assign_id: &str) -> Result<()> {
         drop(store);
         d.peers.outbox.notify_one();
         eprintln!("worker for {assign_id}: no {provider} driver");
-        return Ok(());
+        return Ok(Some("no_worker"));
     };
     let label = ipc::sender_label(d, &a); // takes the team lock
     let conv = crate::telemetry::uuid_v4();
@@ -375,7 +389,14 @@ pub fn start(d: &Arc<Daemon>, assign_id: &str) -> Result<()> {
     let Some(w) = claimed else {
         d.peers.outbox.notify_one(); // a `busy` or `no_worker` refusal goes to its asker
         eprintln!("worker for {assign_id}: not started");
-        return Ok(());
+        let store = d.store.lock().unwrap();
+        let r = mail::receipt(&store, &Key(a.from_key.clone()), &a.request_id)?;
+        let why = r
+            .filter(|r| r.state == State::Refused)
+            .and_then(|r| r.reason);
+        return Ok(["busy", "no_worker"]
+            .into_iter()
+            .find(|w| why.as_deref() == Some(*w)));
     };
     let launch = Launch {
         w,
@@ -388,7 +409,7 @@ pub fn start(d: &Arc<Daemon>, assign_id: &str) -> Result<()> {
         asker,
     };
     tokio::spawn(launch.run(d.clone()));
-    Ok(())
+    Ok(None)
 }
 
 /// A claimed worker, to launch.
@@ -434,15 +455,16 @@ impl Launch {
         let (b, id, meta) = (base.clone(), a.id.clone(), a.meta.clone());
         let made = tokio::task::spawn_blocking(move || workspace(&b, &id, &meta)).await;
         let made = made.unwrap_or_else(|e| Err(e.to_string().into()));
-        let spawned = made.and_then(|dir| {
+        let spawned = made.and_then(|(dir, bare)| {
             let argv = driver.argv(&dir, &conv);
             Ok((
                 driver::spawn(&argv, &dir, &log_for(&base, &a.id))?,
                 dir,
                 argv,
+                bare.then_some(NO_WORKTREE),
             ))
         });
-        let (child, dir, argv) = match spawned {
+        let (child, dir, argv, note) = match spawned {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("worker {}: not started: {e}", w.id);
@@ -493,8 +515,11 @@ impl Launch {
         };
         d.presence.notify_one();
         eprintln!("worker {}: running pid={pid} for {}", w.id, a.id);
-        let prompt = first_prompt(&label, &a);
-        drive(d, w, driver, child, prompt, stop).await;
+        let mut prompt = first_prompt(&label, &a);
+        if let Some(n) = note {
+            prompt = format!("{prompt}\n({n}.)");
+        }
+        drive(d, w, driver, child, prompt, stop, note).await;
     }
 }
 
@@ -532,6 +557,7 @@ async fn drive(
     child: tokio::process::Child,
     first_prompt: String,
     mut stop: oneshot::Receiver<Stop>,
+    note: Option<&str>,
 ) {
     let (permission, mut asks) = tokio::sync::mpsc::channel(8);
     let (session, mut named) = oneshot::channel();
@@ -545,7 +571,7 @@ async fn drive(
     );
     tokio::pin!(run);
     let (mut stopped, mut stop_seen, mut named_seen) = (None, false, false);
-    let outcome = loop {
+    let mut outcome = loop {
         // Biased: a conversation id named before a prompt re-keys the worker before its hold.
         tokio::select! {
             biased;
@@ -566,6 +592,9 @@ async fn drive(
     // A stop that raced the harness's own end still names why it ended.
     if !stop_seen {
         stopped = stop.try_recv().ok();
+    }
+    if let Some(n) = note {
+        outcome.body = format!("{n}\n{}", outcome.body);
     }
     finish(&d, &w, outcome, stopped);
 }
@@ -1171,11 +1200,12 @@ mod tests {
     fn a_worker_folder_is_private_and_per_request() {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("work");
-        let f = workspace(&base, "a1", &Meta::default()).unwrap();
-        assert_eq!(f, base.join("a1"));
+        let (f, bare) = workspace(&base, "a1", &Meta::default()).unwrap();
+        assert_eq!((f, bare), (base.join("a1"), false));
+        let f = base.join("a1");
         assert_eq!((mode(&base), mode(&f)), (0o700, 0o700));
         // A second assignment gets its own folder.
-        let g = workspace(&base, "a2", &Meta::default()).unwrap();
+        let (g, _) = workspace(&base, "a2", &Meta::default()).unwrap();
         assert_eq!(g, base.join("a2"));
     }
 
@@ -1191,7 +1221,8 @@ mod tests {
             repo: Some(repo.into()),
             ..Meta::default()
         };
-        let f = workspace(&base, "a1", &hint("app")).unwrap();
+        let (f, bare) = workspace(&base, "a1", &hint("app")).unwrap();
+        assert!(!bare);
         assert_eq!(mode(&f), 0o700);
         let list = git(&clone, &["worktree", "list"]);
         let shown = f.canonicalize().unwrap();
@@ -1200,10 +1231,21 @@ mod tests {
                 .any(|l| l.starts_with(&*shown.to_string_lossy()) && l.ends_with("[lb/a1]")),
             "{list}"
         );
-        // No clone of that name (nor one outside the folder): an empty folder.
+        // A branch hint naming a branch that exists: a new `lb/<id>` based on it.
+        git(&clone, &["branch", "feature"]);
+        let branch = Meta {
+            branch: Some("feature".into()),
+            ..hint("app")
+        };
+        let (f, bare) = workspace(&base, "a5", &branch).unwrap();
+        assert!(!bare);
+        let head = git(&f, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        assert_eq!(head.trim(), "lb/a5");
+        // No clone of that name (nor one outside the folder): an empty folder, said so.
         for (id, repo) in [("a2", "nope"), ("a3", "../app"), ("a4", "..")] {
-            let f = workspace(&base, id, &hint(repo)).unwrap();
+            let (f, bare) = workspace(&base, id, &hint(repo)).unwrap();
             assert_eq!(std::fs::read_dir(&f).unwrap().count(), 0, "{repo}");
+            assert!(bare, "{repo}");
         }
     }
 
@@ -1221,7 +1263,7 @@ mod tests {
         let w = claim(&s, &config, &a, "m/claude:w1", 10).unwrap().unwrap();
         assert_eq!(w.folder, base.join(&id));
         assert_eq!(folder_for(&config, &id), base.join(&id));
-        let f = workspace(&base, &id, &Meta::default()).unwrap();
+        let (f, _) = workspace(&base, &id, &Meta::default()).unwrap();
         assert_eq!(f, base.join(&id));
         // Nothing outside the workers folder was touched, and only its folder is in it.
         let names = |d: &Path| {

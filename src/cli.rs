@@ -1125,6 +1125,9 @@ pub fn answer(request: &str, allow: bool, always: bool) -> Result<i32> {
     }
     let word = if allow { "Allowed" } else { "Declined" };
     match always {
+        _ if r["note"] == "busy" => println!(
+            "{word} {request}, but this computer is at its workers_max; the asker was told busy."
+        ),
         true => println!("{word} {request} (always)."),
         false => println!("{word} {request}."),
     }
@@ -1341,6 +1344,19 @@ pub fn workers(args: &[String]) -> Result<i32> {
             }
             if !any {
                 println!("Nothing to clean.");
+            }
+            // A removed worktree's entry in its clone (a clone sits right under the folder).
+            for e in std::fs::read_dir(&base).into_iter().flatten().flatten() {
+                if any && e.path().join(".git").is_dir() {
+                    let _ = std::process::Command::new("git")
+                        .arg("-C")
+                        .arg(e.path())
+                        .args(["worktree", "prune"])
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status();
+                }
             }
         }
         _ => {

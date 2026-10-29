@@ -207,8 +207,13 @@ pub fn dialog(
             .and_then(|(_, p)| p.split(':').next())
             .unwrap_or_default();
         let dir = workers::dir_for(folder, &h.message.id);
+        let asker = sessions::member_of(&h.from_session)
+            .and_then(|m| roster.by_short(m))
+            .map_or_else(|| "the asker".into(), label::name);
         let text = format!(
-            "{who} wants to start a {provider} worker in {}: \"{}\"",
+            "{who} wants to start a {} worker in {}: \"{}\". Always allow lets {asker}'s \
+             computer start workers here without asking.",
+            agent_name(provider),
             dir.display(),
             preview(&h.message.body)
         );
@@ -484,7 +489,7 @@ fn answer_here(
     by: &str,
     by_agent: bool,
     surface: &'static str,
-) -> Result<std::result::Result<Closed, &'static str>> {
+) -> Result<std::result::Result<(Closed, Option<&'static str>), &'static str>> {
     let r = {
         let team = d.team.lock().unwrap();
         let store = d.store.lock().unwrap();
@@ -503,18 +508,20 @@ fn answer_here(
             now,
         )?
     };
+    let mut note = None;
     if let Ok(c) = &r {
         closed(d, &c.hold, c.verdict(), Some(by), None, Some(surface));
         if c.hold.kind() == Kind::Worker {
             d.peers.outbox.notify_one(); // its receipt moved
             if c.allow {
-                if let Err(e) = workers::start(d, &c.hold.message.id) {
-                    eprintln!("hold {}: worker not started: {e}", c.hold.name());
+                match workers::start(d, &c.hold.message.id) {
+                    Ok(refused) => note = refused,
+                    Err(e) => eprintln!("hold {}: worker not started: {e}", c.hold.name()),
                 }
             }
         }
     }
-    Ok(r)
+    Ok(r.map(|c| (c, note)))
 }
 
 /// Expires what is due (`expire`) and closes their dialogs; from the 60 s mail timer.
@@ -532,7 +539,7 @@ pub fn on_dialog(d: &Arc<Daemon>, n: i64, button: &str) {
         "Allow" => r(true, "once"),
         "Always allow" => r(true, "always"),
         "Stop worker" => r(false, "once").inspect(|c| {
-            if let Ok(c) = c {
+            if let Ok((c, _)) = c {
                 workers::stop_requested(d, &c.hold.target_session, "local");
             }
         }),
@@ -628,7 +635,7 @@ fn run(
             )
         }
         // `hold.answer {hold, verdict: allow|decline, scope?: once|always}` -> `{id, verdict,
-        // scope}`. A worker hold and a worker's prompt are a person's to answer. On an instance also
+        // scope, note?}`. A worker hold and a worker's prompt are a person's to answer. On an instance also
         // `decided_by`, recorded as the answer's `by` (a computer's is `local`, an agent's its session).
         "hold.answer" => {
             let (by, surface) = match body["decided_by"].as_str() {
@@ -658,9 +665,11 @@ fn run(
                 agent.is_some() && !instance,
                 surface,
             )? {
-                Ok(c) => Response::ok(
+                // `note: "busy"`: allowed, but at `workers_max` nothing started.
+                Ok((c, note)) => Response::ok(
                     id,
-                    json!({"id": c.hold.name(), "verdict": c.verdict(), "scope": scope}),
+                    json!({"id": c.hold.name(), "verdict": c.verdict(), "scope": scope,
+                        "note": note}),
                 ),
                 Err(NOT_FOUND) => Response::err(id, missing),
                 Err(NOT_A_PERSON) => refused(id, NOT_A_PERSON),

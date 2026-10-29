@@ -295,12 +295,15 @@ fn row_3_allow_starts_a_worker_and_its_reply_is_the_result() {
     assert!(text.starts_with("prasiddha"), "{text}");
     assert!(
         text.contains(&format!(
-            "wants to start a claude worker in {}/",
+            "wants to start a Claude Code worker in {}/",
             p.folder()
         )),
         "{text}"
     );
-    assert!(text.ends_with(": \"fix the build\""), "{text}");
+    assert!(
+        text.ends_with(": \"fix the build\". Always allow lets prasiddha's computer start workers here without asking."),
+        "{text}"
+    );
     assert_eq!(buttons, ["Decline", "Allow", "Always allow"]);
     p.click("Allow");
 
@@ -446,7 +449,7 @@ fn row_4_always_allow_skips_the_next_dialog_and_revoke_brings_it_back() {
     p.assign("as3", "three", 300);
     p.wait_state("as3", "held");
     let (_, text, _) = p.dialog(2);
-    assert!(text.ends_with(": \"three\""), "{text}");
+    assert!(text.contains(": \"three\". Always allow"), "{text}");
 }
 
 #[test]
@@ -719,7 +722,7 @@ fn row_13_held_lists_both_worker_hold_kinds_and_an_agent_is_refused() {
     assert!(lines[1].starts_with("H3  worker  prasiddha"), "{lines:?}");
     assert!(
         lines[1].contains(&format!(
-            "wants to start a claude worker in {}/",
+            "wants to start a Claude Code worker in {}/",
             p.folder()
         )),
         "{lines:?}"
@@ -934,6 +937,111 @@ fn a_hook_register_keeps_the_workers_title() {
     assert_eq!((after.title, after.status), (before.title, before.status));
 }
 
+/// An Allow that lands at `workers_max` says so: the asker was told busy.
+#[test]
+fn an_allow_at_the_cap_says_the_asker_was_told_busy() {
+    let p = hosted(
+        json!([{"sleep": 60}, {"result": "late"}]),
+        Opts {
+            button: Some(""),
+            config: "workers_max = 1\n",
+            ..Opts::default()
+        },
+    );
+    p.assign("as1", "one", 300);
+    p.assign("as2", "two", 300);
+    p.wait_state("as2", "held");
+    let o = p.b.detached(&[EXE, "approve", "H1"], "");
+    assert_eq!(common::out(&o).trim(), "Allowed H1.", "{}", common::err(&o));
+    running(&p, 1);
+    let o = p.b.detached(&[EXE, "approve", "H2"], "");
+    assert_eq!(
+        common::out(&o).trim(),
+        "Allowed H2, but this computer is at its workers_max; the asker was told busy.",
+        "{}",
+        common::err(&o)
+    );
+    p.wait_state("as2", "refused");
+    assert_eq!(p.a.receipt(&p.asker(), "as2")["reason"], "busy");
+}
+
+/// A repo hint that names no clone here: the worker runs in an empty folder, and its result
+/// says so on its first line.
+#[test]
+fn a_repo_hint_with_no_clone_says_no_worktree_in_the_result() {
+    let p = hosted(
+        json!([{"result": "all green"}]),
+        Opts {
+            always: true,
+            ..Opts::default()
+        },
+    );
+    let to = format!("{}/claude:new", p.b.short());
+    let r =
+        p.a.ask(json!({"id": 1, "op": "send", "from": p.asker(), "to": to,
+        "kind": "assign", "text": "build it", "done_when": "done", "deadline_s": 300,
+        "repo": "nope", "request_id": "as1"}));
+    assert_eq!(r["ok"], true, "{r}");
+    let r = p.result("as1", 15);
+    let text = r["text"].as_str().unwrap();
+    assert_eq!(
+        text.split_once('\n'),
+        Some((workers::NO_WORKTREE, "all green")),
+        "{r}"
+    );
+}
+
+/// `workers clean` removes a finished worker's worktree folder and prunes its clone's entry.
+#[test]
+fn workers_clean_prunes_the_clones_worktree_entry() {
+    let p = hosted(json!([]), Opts::default());
+    let clone = p.work.path().join("app");
+    std::fs::create_dir_all(&clone).unwrap();
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        let o = Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t", "-C"])
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{args:?}: {o:?}");
+        String::from_utf8(o.stdout).unwrap()
+    };
+    git(&clone, &["init", "-q"]);
+    git(&clone, &["commit", "-q", "--allow-empty", "-m", "first"]);
+    let dir = p.work.path().join("01OLD");
+    git(
+        &clone,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "lb/old",
+            dir.to_str().unwrap(),
+        ],
+    );
+    p.b.store()
+        .insert_worker(&Worker {
+            id: 0,
+            assignment: "01OLD".into(),
+            session: format!("{}/claude:old", p.b.short()),
+            provider: "claude".into(),
+            folder: dir.clone(),
+            pid: None,
+            started_at: 1,
+            ended_at: Some(2),
+            state: "failed".into(),
+            by: None,
+        })
+        .unwrap();
+    let o = p.b.detached(&[EXE, "workers", "clean"], "");
+    assert!(o.status.success(), "{}", common::err(&o));
+    assert!(!dir.exists());
+    let list = git(&clone, &["worktree", "list"]);
+    assert_eq!(list.lines().count(), 1, "{list}");
+}
+
 #[test]
 fn row_10_workers_off_stops_the_worker_and_unlists_the_host() {
     let p = hosted(
@@ -1008,7 +1116,7 @@ fn codex_row_3_allow_starts_a_codex_worker_whose_turn_is_the_result() {
     p.wait_state("as1", "held");
     let (_, text, buttons) = p.dialog(1);
     assert!(
-        text.contains(&format!("wants to start a codex worker in {}/", p.folder())),
+        text.contains(&format!("wants to start a Codex worker in {}/", p.folder())),
         "{text}"
     );
     assert_eq!(buttons, ["Decline", "Allow", "Always allow"]);
