@@ -156,7 +156,7 @@ wrote it.
   `lightbulb sessions turns off` stops it, from your own terminal only, and `recall` stops using
   the turns already stored; `lightbulb sessions forget <ID>` deletes them. A summary, prompt or
   reply that looks like a password or key is stored as `[refused: <what it matched>]` and is
-  never given a vector. An agent's `recall` can show short excerpts of your prompts and replies
+  never given a vector. An agent's `recall` can show excerpts (up to 800 characters each) of your prompts and replies
   from the same repository ([usage](usage.md#memory)). Sessions under a folder hidden with `lightbulb folder <path> off`, or under a dot
   folder in your home folder (`~/.config`), are not captured.
 - **Where it lives.** In `state.db` on this computer. Teammates never receive it.

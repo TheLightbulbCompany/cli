@@ -1440,7 +1440,7 @@ fn tools_json_lists_remember_and_recall() {
     assert_eq!(remember["scope"], "network");
     assert_eq!(
         recall["description"],
-        "Call when a task starts or you need something a teammate may know. The answer also includes excerpts from your own prompts and replies in this repository on this computer, or in every repository when the folder has no git origin."
+        "Call when a task starts or you need something a teammate may know, not on every turn: the answer is one page of about 8,000 tokens, up to about 9,000 on a full page. It also includes excerpts from your own prompts and replies in this repository on this computer, or in every repository when the folder has no git origin."
     );
     assert_eq!(
         remember["description"],
@@ -1499,5 +1499,46 @@ fn remember_through_mcp_stamps_the_session_and_ignores_undeclared_args() {
     assert!(
         page["page"].as_str().unwrap().contains("db: postgres 16"),
         "{page}"
+    );
+}
+
+/// A question's recall through the tool is the one page: no `block`, no `facts` or `turns`
+/// arrays (the daemon's op keeps them for the hook and the benchmark), and a full page stays
+/// within 9,000 tokens by the benchmark's count (characters / 4, rounded up).
+#[test]
+fn a_question_recall_through_mcp_is_one_page() {
+    let e = common::Env::new();
+    e.daemon(false, &common::computer("mac"), &[]);
+    for i in 0..60 {
+        let fact = format!(
+            "the deploy step {i} runs {}",
+            "the vault script again ".repeat(25)
+        );
+        let r = e.ask(
+            json!({"id": 1, "op": "memory.remember", "subject": format!("deploy {i}"),
+            "fact": fact, "kind": "fact"}),
+        );
+        assert_eq!(r["stored"], true, "{r}");
+    }
+    e.ask(
+        json!({"id": 1, "op": "register", "session": {"provider": "claude", "conversation": "c1",
+        "pid": me().pid, "birth_micros": me().birth_micros, "cwd": "/tmp", "repo": "engine"}}),
+    );
+    let mut m = mcp_on(&e, &me());
+    let out = m.tool("recall", json!({"question": "deploy vault script"}));
+    let v = out.json();
+    assert!(v["page"].as_str().unwrap().contains("deploy 0: "), "{v}");
+    for k in ["block", "facts", "turns"] {
+        assert!(v.get(k).is_none(), "{k} in {v}");
+    }
+    assert!(v["counts"]["facts"].as_u64().unwrap() > 40, "{v}");
+    let tokens = out.text.chars().count().div_ceil(4);
+    assert!(tokens <= 9_000, "{tokens} tokens");
+    assert!(tokens > 6_000, "a full page: {tokens} tokens");
+    // The start view (no question) keeps the daemon's whole answer, `block` included.
+    let start = m.tool("recall", json!({"question": ""})).json();
+    assert!(
+        start.get("block").is_some() && start.get("facts").is_some(),
+        "{start}"
     );
 }

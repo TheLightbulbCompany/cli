@@ -296,11 +296,12 @@ pub fn turns(store: &Store, session_id: &str) -> Result<Vec<Turn>> {
     Ok(rows)
 }
 
-/// Longest excerpt of a turn `recall` shows, in characters.
-pub const EXCERPT_MAX: usize = 240;
+/// Longest excerpt of a turn `recall` shows, in characters: long enough to hold the passage
+/// that answers (the benchmark's page).
+pub const EXCERPT_MAX: usize = 800;
 
-/// A turn that matched a `recall` question: its first `EXCERPT_MAX` characters, each run of
-/// whitespace one space.
+/// A turn that matched a `recall` question: the `EXCERPT_MAX` characters of it that hold the
+/// most of the question's words (`excerpt`), each run of whitespace one space.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TurnHit {
     pub session: String,
@@ -319,8 +320,9 @@ impl TurnHit {
 }
 
 /// The best `limit` of this computer's turns for `query`: bm25 over `turns_fts`, fused with the
-/// cosine order of `turns_vec` when there is a model (`memory::fuse`). With `repo`, only the
-/// turns of sessions in that repo; every turn without one. A refused turn is never a candidate.
+/// cosine order of `turns_vec` when there is a model (`memory::fuse`), the newest first where
+/// ranks tie. With `repo`, only the turns of sessions in that repo; every turn without one. A
+/// refused turn is never a candidate.
 pub fn search_turns(
     store: &Store,
     query: &str,
@@ -337,11 +339,11 @@ pub fn search_turns(
          JOIN capture_sessions s ON s.id = t.session_id
          WHERE turns_fts MATCH ?1 AND substr(t.text, 1, length(?2)) != ?2
          AND (?3 IS NULL OR s.repo = ?3 COLLATE NOCASE)
-         ORDER BY bm25(turns_fts) LIMIT ?4",
+         ORDER BY bm25(turns_fts), t.rowid DESC LIMIT ?4",
     )?;
     let ids: Vec<String> = stmt
         .query_map(rusqlite::params![q, REFUSED, repo, limit], |r| {
-            Ok(r.get::<_, i64>(0)?.to_string())
+            Ok(key(r.get(0)?))
         })?
         .collect::<rusqlite::Result<_>>()?;
     let vecs = || -> Result<Vec<(String, Vec<f32>)>> {
@@ -357,7 +359,7 @@ pub fn search_turns(
         let mut out = Vec::new();
         for row in rows {
             let (turn, blob) = row?;
-            out.extend(unblob(&blob).map(|v| (turn.to_string(), v)));
+            out.extend(unblob(&blob).map(|v| (key(turn), v)));
         }
         Ok(out)
     };
@@ -365,7 +367,7 @@ pub fn search_turns(
     for id in fuse(store.dir(), ids, query, vecs, limit)? {
         let hit = conn.query_row(
             "SELECT session_id, seq, role, text, at FROM capture_turns WHERE rowid = ?1",
-            [&id],
+            [rowid(&id)],
             |r| {
                 let text: String = r.get(3)?;
                 Ok(TurnHit {
@@ -373,19 +375,94 @@ pub fn search_turns(
                     seq: r.get(1)?,
                     role: r.get(2)?,
                     at: r.get(4)?,
-                    excerpt: text
-                        .split_whitespace()
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                        .chars()
-                        .take(EXCERPT_MAX)
-                        .collect(),
+                    excerpt: excerpt(&text, query, EXCERPT_MAX),
                 })
             },
         )?;
         out.push(hit);
     }
     Ok(out)
+}
+
+/// A turn's id as `fuse` ranks it: fixed width and descending with the rowid, so the newer turn
+/// sorts first where fused ranks tie (`rrf` breaks ties by id).
+fn key(rowid: i64) -> String {
+    format!("{:020}", i64::MAX - rowid)
+}
+
+/// The rowid a `key` stands for.
+fn rowid(key: &str) -> i64 {
+    i64::MAX - key.parse::<i64>().unwrap_or(i64::MAX)
+}
+
+/// The `max` characters of `text` (each run of whitespace one space) that hold the most of
+/// `query`'s words: the window starting at the word that gives the most distinct query words
+/// (a word of 3 or more characters, not a stopword, matching as a prefix, as
+/// `memory::fts_query` matches), the earliest on a tie, so a turn whose opening matches reads
+/// from its start. "…" marks a window that starts inside the turn.
+pub fn excerpt(text: &str, query: &str, max: usize) -> String {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let clean = |w: &str| {
+        w.trim_matches(|c: char| !c.is_alphanumeric())
+            .to_lowercase()
+    };
+    // ponytail: the first 64 distinct terms count; a question has far fewer.
+    let mut terms: Vec<String> = vec![];
+    for t in query.split_whitespace().map(clean) {
+        let stop = crate::memory::STOPWORDS.contains(&t.as_str());
+        if t.chars().count() >= 3 && !stop && !terms.contains(&t) && terms.len() < 64 {
+            terms.push(t);
+        }
+    }
+    // Each word: its length with the space after it, and the terms it matches as a bit set.
+    let lens: Vec<usize> = words.iter().map(|w| w.chars().count() + 1).collect();
+    let hits: Vec<u64> = words
+        .iter()
+        .map(|w| {
+            let w = clean(w);
+            terms
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| w.starts_with(t.as_str()))
+                .fold(0, |m, (i, _)| m | 1 << i)
+        })
+        .collect();
+    // One pass: the window `start..end` grows while it fits (one character kept for the "…"
+    // lead, so a window that ends on the match is never cut) and drops its first word as
+    // `start` moves, keeping how many of its words match each term.
+    let room = max.saturating_sub(1);
+    let (mut best, mut best_score) = (0, 0);
+    let (mut count, mut distinct) = ([0u32; 64], 0);
+    let (mut end, mut len) = (0, 0);
+    let bits = |h: u64| (0..64).filter(move |i| h & 1 << i != 0);
+    for start in 0..words.len() {
+        if end < start {
+            (end, len) = (start, 0); // the word before was longer than the window alone
+        }
+        while end < words.len() && len + lens[end] <= room + 1 {
+            for i in bits(hits[end]) {
+                distinct += u32::from(count[i] == 0);
+                count[i] += 1;
+            }
+            len += lens[end];
+            end += 1;
+        }
+        if distinct > best_score {
+            (best, best_score) = (start, distinct);
+        }
+        if end > start {
+            for i in bits(hits[start]) {
+                count[i] -= 1;
+                distinct -= u32::from(count[i] == 0);
+            }
+            len -= lens[start];
+        }
+    }
+    let lead = if best > 0 { "…" } else { "" };
+    format!("{lead}{}", words[best..].join(" "))
+        .chars()
+        .take(max)
+        .collect()
 }
 
 /// Deletes the turns recorded more than `days` days before `now`; how many.
@@ -485,4 +562,41 @@ pub fn transcript_tokens(path: &str) -> Option<(i64, i64)> {
             .values()
             .fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1))
     })
+}
+
+#[cfg(test)]
+mod excerpt_tests {
+    use super::{excerpt, EXCERPT_MAX};
+
+    /// The window that holds the question's words, found in one pass even in a very long text
+    /// (a turn is cut to 4 KB, but `excerpt` takes any text), and the opening when nothing
+    /// matches or the opening does.
+    #[test]
+    fn the_excerpt_is_the_window_that_matches_in_a_long_text() {
+        let filler = "lorem ipsum dolor sit amet ".repeat(8_000); // about 216 KB
+        let text = format!("{filler}reset the counters every minute and queue requests {filler}");
+        let t = std::time::Instant::now();
+        let e = excerpt(
+            &text,
+            "how did you recommend queuing requests and counters?",
+            EXCERPT_MAX,
+        );
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(1),
+            "{:?}",
+            t.elapsed()
+        );
+        assert!(e.starts_with('…'), "{e}");
+        assert!(
+            e.contains("reset the counters every minute and queue requests"),
+            "{e}"
+        );
+        assert!(e.chars().count() <= EXCERPT_MAX);
+        assert!(excerpt(&text, "kubernetes", EXCERPT_MAX).starts_with("lorem ipsum"));
+        let opening = excerpt("rotate the deploy keys now", "rotate keys", EXCERPT_MAX);
+        assert_eq!(opening, "rotate the deploy keys now");
+        // A word longer than the window is passed over, not a stall.
+        let long = format!("{} rotate the keys", "x".repeat(EXCERPT_MAX + 10));
+        assert!(excerpt(&long, "rotate keys", EXCERPT_MAX).starts_with("…rotate the keys"));
+    }
 }

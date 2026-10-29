@@ -73,10 +73,13 @@ look them up with `recall`. Each entry is `me` or `team`. `recall` finds entries
 meaning, using the small model setup downloads ([connect](connect/index.md)); without the model it
 finds them by words alone, with no error and no slowdown.
 
-Under `Turns:`, `recall` also shows up to five short excerpts from your own prompts and the agents'
-replies in this repository on this computer (see `lightbulb sessions turns` in [cli](cli.md#sessions));
-a folder with no git origin gets excerpts from every repository. The block handed over at a
-session's start never includes them, and a turn refused for a secret is never shown.
+Under `Turns:`, `recall` also shows up to 50 excerpts from your own prompts and the agents'
+replies in this repository on this computer (see `lightbulb sessions turns` in [cli](cli.md#sessions)),
+each the part of the turn, up to 800 characters, that best matches the question; a folder with no
+git origin gets excerpts from every repository. The block handed over at a session's start never
+includes them, and a turn refused for a secret is never shown. With up to 50 facts as well, a
+recall's answer is one page of about 8,000 tokens, up to about 9,000 on a full page, so agents
+call it when a task needs memory, not on every turn.
 
 - `team` entries go to every member of the team.
 - `me` entries go only to your own signed-in computers. If this computer is not signed in, a `me`

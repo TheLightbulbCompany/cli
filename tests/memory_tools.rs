@@ -157,7 +157,7 @@ fn recall_returns_an_excerpt_from_a_turn() {
     let e = daemon();
     let long = format!(
         "rotate the staging deploy keys \r\n  with the vault script {}",
-        "é".repeat(300)
+        "é".repeat(1000)
     );
     turns(&e, &[("user", "nothing to see here"), ("assistant", &long)]);
     let r = recall(&e, "rotate deploy keys", None);
@@ -168,7 +168,8 @@ fn recall_returns_an_excerpt_from_a_turn() {
     assert_eq!(t[0]["role"], "assistant");
     let excerpt = t[0]["excerpt"].as_str().unwrap();
     assert!(excerpt.starts_with("rotate the staging deploy keys with the vault"));
-    assert_eq!(excerpt.chars().count(), 240);
+    // Cut at `EXCERPT_MAX` characters, on a character boundary (é is two bytes).
+    assert_eq!(excerpt.chars().count(), lightbulb::capture::EXCERPT_MAX);
     let day = &lightbulb::date::utc(t[0]["at"].as_i64().unwrap())[..10];
     let page = r["page"].as_str().unwrap();
     assert!(
@@ -262,5 +263,146 @@ fn turns_from_another_repo_are_not_recalled() {
             .unwrap()
             .len(),
         2
+    );
+}
+
+/// A question's page holds every matching turn up to 50, not 5; turns that rank the same come
+/// newest first.
+#[test]
+fn recall_holds_more_than_five_turns_newest_first_on_a_tie() {
+    let e = daemon();
+    let texts: Vec<String> = (10..22)
+        .map(|i| format!("rotate the deploy keys, note {i}"))
+        .collect();
+    let pairs: Vec<(&str, &str)> = texts.iter().map(|t| ("user", t.as_str())).collect();
+    turns(&e, &pairs);
+    let r = recall(&e, "rotate deploy keys", None);
+    let seqs: Vec<i64> = r["turns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["seq"].as_i64().unwrap())
+        .collect();
+    assert_eq!(seqs, (1..=12).rev().collect::<Vec<i64>>(), "{r}");
+    assert_eq!(r["page"].as_str().unwrap().matches("user, ").count(), 12);
+}
+
+/// The excerpt is the 800-character window that holds the question's words, not the turn's
+/// opening.
+#[test]
+fn an_excerpt_is_the_window_that_matches() {
+    let e = daemon();
+    let filler = "lorem ipsum dolor sit amet ".repeat(60);
+    let text = format!("{filler}reset the counters every minute and queue the requests {filler}");
+    turns(&e, &[("assistant", &text)]);
+    let r = recall(&e, "how should we queue requests and reset counters?", None);
+    let x = r["turns"][0]["excerpt"].as_str().unwrap();
+    assert!(x.starts_with('…'), "{x}");
+    assert!(
+        x.contains("reset the counters every minute and queue the requests"),
+        "{x}"
+    );
+    assert!(
+        x.chars().count() <= lightbulb::capture::EXCERPT_MAX,
+        "{}",
+        x.chars().count()
+    );
+}
+
+/// The evidence stops at 8,000 tokens counted as the benchmark counts them (characters / 4,
+/// rounded up, of `subject: value` and `role: excerpt`): the first result that would overflow
+/// ends the page, and every result kept is a line on it (the trim is the only cutter).
+#[test]
+fn recall_trims_its_evidence_at_8000_tokens() {
+    let e = daemon();
+    for i in 0..5 {
+        let r = remember(
+            &e,
+            &format!("rotate note {i}"),
+            "deploy keys go through the vault",
+            "fact",
+            json!({}),
+        );
+        assert_eq!(r["stored"], true, "{r}");
+    }
+    let texts: Vec<String> = (100..150)
+        .map(|i| format!("rotate the deploy keys {i} {}", "lorem ".repeat(200)))
+        .collect();
+    let pairs: Vec<(&str, &str)> = texts.iter().map(|t| ("assistant", t.as_str())).collect();
+    turns(&e, &pairs);
+    let r = recall(&e, "rotate deploy keys", None);
+    let tokens: Vec<usize> = r["turns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| {
+            format!("assistant: {}", t["excerpt"].as_str().unwrap())
+                .chars()
+                .count()
+                .div_ceil(4)
+        })
+        .collect();
+    // Each is 800 characters: (11 + 800) / 4 rounded up is 203 tokens, so 39 fit, not 50.
+    assert!(tokens.iter().all(|&n| n == 203), "{tokens:?}");
+    assert_eq!(tokens.len(), 39);
+    assert!(tokens.iter().sum::<usize>() <= lightbulb::memory::RECALL_TOKENS);
+    // The counts are the page's lines, author and date included.
+    let page = r["page"].as_str().unwrap();
+    let lines = |prefix: &str| page.lines().filter(|l| l.starts_with(prefix)).count();
+    assert_eq!(r["facts"].as_array().unwrap().len(), 5, "{r}");
+    assert_eq!(lines("rotate note "), 5, "{page}");
+    assert_eq!(lines("assistant, "), 39, "{page}");
+}
+
+/// The session-start block, asked as the hook asks it (hook.rs: no question, the session's repo,
+/// 1,600 characters, its key), is what it was: facts only, within 1,600 characters, never trimmed
+/// to the question page's 100 results, while a question's page runs past it.
+#[test]
+fn the_start_block_keeps_its_1600_characters() {
+    let e = daemon();
+    let me = lightbulb::os::process(std::process::id()).unwrap();
+    let r = e.ask(
+        json!({"id": 1, "op": "register", "session": {"provider": "claude",
+        "conversation": "s1", "pid": me.pid, "birth_micros": me.birth_micros, "cwd": "/tmp",
+        "repo": "engine"}}),
+    );
+    let key = r["key"].as_str().unwrap().to_string();
+    // 120 facts in this repo: past the question page's 100 results.
+    for i in 0..120 {
+        let r = remember(
+            &e,
+            &format!("deploy step {i}"),
+            &format!("the deploy runs the vault script with the staging profile, step {i}"),
+            "fact",
+            json!({ "session": key }),
+        );
+        assert_eq!(r["stored"], true, "{r}");
+    }
+    // A turn in the same repo, which the start block never shows.
+    let start = json!({"id": 3, "op": "capture.session_start", "harness": "claude",
+        "conversation": "s1", "cwd": "/tmp/proj", "repo": "engine"});
+    assert_eq!(e.ask(start)["stored"], true);
+    let turn = json!({"id": 4, "op": "capture.turn", "harness": "claude", "conversation": "s1",
+        "role": "user", "text": "the deploy uses the vault script"});
+    assert_eq!(e.ask(turn)["stored"], true);
+    let start = e.ask(
+        json!({"id": 5, "op": "memory.recall", "question": "", "repo": "engine",
+        "budget_chars": 1600, "session": key}),
+    );
+    let page = start["page"].as_str().unwrap();
+    assert!(
+        page.chars().count() <= 1600 && !page.contains("Turns:"),
+        "{page}"
+    );
+    assert!(start["block"]
+        .as_str()
+        .unwrap()
+        .starts_with("Memory (team and yours):"));
+    assert_eq!(start["facts"].as_array().unwrap().len(), 120, "not trimmed");
+    assert_eq!(start["turns"], json!([]));
+    let asked = recall(&e, "deploy vault script", None);
+    assert!(
+        asked["page"].as_str().unwrap().chars().count() > 1600,
+        "{asked}"
     );
 }
