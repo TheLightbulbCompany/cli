@@ -46,9 +46,14 @@ fn model_dir(state: &Path) -> PathBuf {
     state.join(paths::MODEL)
 }
 
-/// Whether the model is in this computer's state dir.
+/// Whether the model is in this computer's state dir (`doctor`, `setup`).
 pub fn installed() -> bool {
-    model_dir(&paths::state_path()).join(FILES[2].0).is_file()
+    installed_in(&paths::state_path())
+}
+
+/// Whether the model is in the state dir `dir` (a store's: `Store::dir`).
+pub fn installed_in(dir: &Path) -> bool {
+    model_dir(dir).join(FILES[2].0).is_file()
 }
 
 /// How many times this process has tried to load the model (`text`): at most once.
@@ -60,18 +65,25 @@ pub fn load_attempts() -> usize {
     LOADS.load(Ordering::SeqCst)
 }
 
-/// `s` embedded (`DIM` floats, unit length); `None` when no model is installed, or when the
-/// installed one did not load (remembered: no call tries again, none under the store lock).
-/// ponytail: the first load, or its failure, is kept for the process (the state dir never
-/// moves under it); a restart of the service tries again.
+/// `text_in` this computer's state dir.
 pub fn text(s: &str) -> Option<Vec<f32>> {
+    text_in(&paths::state_path(), s)
+}
+
+/// `s` embedded (`DIM` floats, unit length) by the model in state dir `dir`; `None` when none
+/// is installed there, or when the installed one did not load (remembered: no call tries
+/// again, none under the store lock).
+/// ponytail: one model per process, loaded from the first dir asked (the daemon has one state
+/// dir; tests that load the real model have their own binary); the first load, or its failure,
+/// is kept, and a restart of the service tries again.
+pub fn text_in(dir: &Path, s: &str) -> Option<Vec<f32>> {
     static MODEL: OnceLock<Option<StaticModel>> = OnceLock::new();
-    if !installed() {
+    if !installed_in(dir) {
         return None;
     }
     let model = MODEL.get_or_init(|| {
         LOADS.fetch_add(1, Ordering::SeqCst);
-        StaticModel::from_pretrained(model_dir(&paths::state_path()), None, None, None).ok()
+        StaticModel::from_pretrained(model_dir(dir), None, None, None).ok()
     });
     Some(model.as_ref()?.encode_single(s))
 }

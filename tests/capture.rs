@@ -577,7 +577,7 @@ fn a_turn_with_a_secret_is_stored_refused_and_not_embedded() {
     lightbulb::memory::embed_missing(&s, 200).unwrap();
     assert_eq!(turn_vecs(&db, 2), 0, "a refused turn is never embedded");
     assert_eq!(turn_vecs(&db, 3), 0, "nor a marker the hook sent");
-    let embedded = i64::from(lightbulb::embed_model::installed());
+    let embedded = i64::from(lightbulb::embed_model::installed_in(d.path()));
     assert_eq!(turn_vecs(&db, 1), embedded);
     // A long turn is cut to 4 KB at a character boundary.
     let long = "é".repeat(capture::TURN_MAX);

@@ -12,6 +12,13 @@ use serde_json::json;
 
 fn store() -> (tempfile::TempDir, Store) {
     let dir = tempfile::tempdir().unwrap();
+    // Memory looks for the model beside the db: a model `vec_env` installed is linked in.
+    if let Some(home) = std::env::var_os(paths::HOME_ENV) {
+        let model = std::path::Path::new(&home).join(paths::MODEL);
+        if model.is_dir() {
+            std::os::unix::fs::symlink(model, dir.path().join(paths::MODEL)).unwrap();
+        }
+    }
     let s = Store::open(&dir.path().join("state.db")).unwrap();
     (dir, s)
 }
@@ -522,7 +529,7 @@ fn embed_missing_backfills_entries_received_from_peers() {
     let Some(_env) = vec_env(false) else { return };
     let a = identity();
     let (_d1, s1) = team(&a);
-    let (_d2, s2) = team(&a);
+    let (d2, s2) = team(&a);
     let e1 = memory::remember(&s1, &a, rem("db", "postgres 16", &[]), 5).unwrap();
     let e2 = memory::remember(&s1, &a, rem("ci", "github actions", &[]), 6).unwrap();
     // Received with no model installed: no vectors yet.
@@ -530,10 +537,8 @@ fn embed_missing_backfills_entries_received_from_peers() {
     memory::accept(&s2, &e2, 7).unwrap();
     assert!(memory::vectors(&s2).unwrap().is_empty());
     // The model arrives; the backfill honours its limit, then finishes.
-    embed_model::install(std::path::Path::new(
-        &std::env::var(paths::HOME_ENV).unwrap(),
-    ))
-    .unwrap();
+    // Into s2's state dir: memory looks for the model beside the db.
+    embed_model::install(d2.path()).unwrap();
     assert_eq!(memory::embed_missing(&s2, 1).unwrap(), 1);
     assert_eq!(memory::embed_missing(&s2, 200).unwrap(), 1);
     assert_eq!(memory::embed_missing(&s2, 200).unwrap(), 0);
@@ -549,7 +554,7 @@ fn embed_missing_is_not_starved_by_forgets() {
     let Some(_env) = vec_env(false) else { return };
     let a = identity();
     let (_d1, s1) = team(&a);
-    let (_d2, s2) = team(&a);
+    let (d2, s2) = team(&a);
     let e1 = memory::remember(&s1, &a, rem("db", "postgres 16", &[]), 5).unwrap();
     let e2 = memory::remember(&s1, &a, rem("ci", "github actions", &[]), 6).unwrap();
     let e3 = memory::remember(&s1, &a, rem("editor", "helix", &[]), 7).unwrap();
@@ -575,10 +580,8 @@ fn embed_missing_is_not_starved_by_forgets() {
     for e in [&f1, &f2, &e1, &e2, &e3] {
         memory::accept(&s2, e, 10).unwrap();
     }
-    embed_model::install(std::path::Path::new(
-        &std::env::var(paths::HOME_ENV).unwrap(),
-    ))
-    .unwrap();
+    // Into s2's state dir: memory looks for the model beside the db.
+    embed_model::install(d2.path()).unwrap();
     assert_eq!(memory::embed_missing(&s2, 1).unwrap(), 1);
     assert_eq!(memory::embed_missing(&s2, 200).unwrap(), 0);
     let ids: Vec<String> = memory::vectors(&s2)

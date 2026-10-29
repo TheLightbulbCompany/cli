@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::path::Path;
 use std::sync::LazyLock;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -151,7 +152,7 @@ pub fn remember(store: &Store, id: &Identity, op: Op, now: i64) -> Result<Entry>
     if canonical(&e.value()).len() > MAX_ENTRY_BYTES {
         return Err("too_long".into());
     }
-    insert(&tx, &e, now)?;
+    insert(&tx, store.dir(), &e, now)?;
     tx.commit()?;
     Ok(e)
 }
@@ -203,7 +204,7 @@ pub fn accept(store: &Store, e: &Entry, now: i64) -> Result<bool> {
     let secret = secret_in(&e.op);
     let tx = Transaction::new_unchecked(store.conn(), TransactionBehavior::Immediate)?;
     let stored = match secret {
-        None => insert(&tx, e, now)?,
+        None => insert(&tx, store.dir(), e, now)?,
         Some(name) => {
             tx.execute(
                 "INSERT OR IGNORE INTO memory_entries
@@ -221,7 +222,7 @@ pub fn accept(store: &Store, e: &Entry, now: i64) -> Result<bool> {
 /// other, and tombstones its target (any member's forget applies): the target's body is dropped
 /// if held, and if it arrives later it is stored without its text; every `memory_last` block
 /// is cleared.
-fn insert(conn: &rusqlite::Connection, e: &Entry, now: i64) -> Result<bool> {
+fn insert(conn: &rusqlite::Connection, dir: &Path, e: &Entry, now: i64) -> Result<bool> {
     let held = conn
         .prepare_cached("SELECT 1 FROM memory_entries WHERE id = ?1")?
         .exists([&e.id])?;
@@ -241,7 +242,7 @@ fn insert(conn: &rusqlite::Connection, e: &Entry, now: i64) -> Result<bool> {
         params![e.id, e.author, e.seq, body, now, tombstoned],
     )?;
     if let (Op::Remember { subject, fact, .. }, false) = (&e.op, tombstoned) {
-        store_vec(conn, &e.id, subject, fact)?;
+        store_vec(conn, dir, &e.id, subject, fact)?;
     }
     if let Op::Forget { target } = &e.op {
         conn.execute(
@@ -261,9 +262,16 @@ fn insert(conn: &rusqlite::Connection, e: &Entry, now: i64) -> Result<bool> {
     Ok(true)
 }
 
-/// Embeds `subject: fact` into `memory_vec` for `id`; whether it did (false without a model).
-fn store_vec(conn: &rusqlite::Connection, id: &str, subject: &str, fact: &str) -> Result<bool> {
-    let Some(v) = embed_model::text(&format!("{subject}: {fact}")) else {
+/// Embeds `subject: fact` into `memory_vec` for `id` with the model in state dir `dir`; whether
+/// it did (false without a model).
+fn store_vec(
+    conn: &rusqlite::Connection,
+    dir: &Path,
+    id: &str,
+    subject: &str,
+    fact: &str,
+) -> Result<bool> {
+    let Some(v) = embed_model::text_in(dir, &format!("{subject}: {fact}")) else {
         return Ok(false);
     };
     let blob: Vec<u8> = v.iter().flat_map(|f| f.to_le_bytes()).collect();
@@ -349,7 +357,8 @@ pub fn embed_missing_with<'a, S: std::ops::Deref<Target = Store> + 'a>(
     lock: impl Fn() -> S,
     limit: usize,
 ) -> Result<usize> {
-    if !embed_model::installed() {
+    let dir = lock().dir().to_path_buf();
+    if !embed_model::installed_in(&dir) {
         return Ok(0);
     }
     let rows = missing(&lock(), limit)?;
@@ -357,7 +366,7 @@ pub fn embed_missing_with<'a, S: std::ops::Deref<Target = Store> + 'a>(
     for (row, text) in rows {
         // Installed but not loading: no row would embed this pass, and the load is not tried
         // again until the service restarts (`embed_model::text` keeps the failure).
-        let Some(v) = embed_model::text(&text) else {
+        let Some(v) = embed_model::text_in(&dir, &text) else {
             eprintln!("embed: the model did not load; stopping this pass");
             break;
         };
@@ -687,7 +696,7 @@ pub fn search(store: &Store, query: &str, limit: usize) -> Result<Vec<Fact>> {
     let ids: Vec<String> = stmt
         .query_map(params![q, limit], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
-    let ids = fuse(ids, query, || vectors(store), limit)?;
+    let ids = fuse(store.dir(), ids, query, || vectors(store), limit)?;
     let mut all: HashMap<String, Fact> = replay(store)?
         .into_iter()
         .map(|l| (l.fact.id.clone(), l.fact))
@@ -723,14 +732,15 @@ pub(crate) fn fts_query(query: &str) -> Option<String> {
 }
 
 /// The bm25 order `ids`, fused with the cosine order of `query`'s embedding over `vecs` when
-/// there is a model; `ids` as they are without one (`vecs` is then never read).
+/// state dir `dir` has a model; `ids` as they are without one (`vecs` is then never read).
 pub(crate) fn fuse(
+    dir: &Path,
     ids: Vec<String>,
     query: &str,
     vecs: impl FnOnce() -> Result<Vec<(String, Vec<f32>)>>,
     limit: usize,
 ) -> Result<Vec<String>> {
-    let Some(qv) = embed_model::text(query) else {
+    let Some(qv) = embed_model::text_in(dir, query) else {
         return Ok(ids);
     };
     let mut scored: Vec<(f32, String)> = vecs()?

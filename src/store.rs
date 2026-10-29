@@ -1,5 +1,5 @@
 use rusqlite::{params, Connection, OptionalExtension};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Migration `i` takes the db to `user_version` `i + 1`. Forward only; each one only adds
 /// tables or columns, but V12, which drops and recreates `memory_fts` (stemmed) from the
@@ -258,6 +258,8 @@ pub(crate) fn row_message(r: &rusqlite::Row) -> rusqlite::Result<Message> {
 
 pub struct Store {
     conn: Connection,
+    /// The state dir the db is in: where memory looks for the embedding model.
+    dir: PathBuf,
 }
 
 impl Store {
@@ -283,7 +285,13 @@ impl Store {
             tx.pragma_update(None, "user_version", i + 1)?;
             tx.commit()?;
         }
-        Ok(Store { conn })
+        let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+        Ok(Store { conn, dir })
+    }
+
+    /// The state dir this store's db is in (`embed_model` looks for the model there).
+    pub fn dir(&self) -> &Path {
+        &self.dir
     }
 
     /// A consistent copy of the database at `path` (`VACUUM INTO` a temporary file beside it,
