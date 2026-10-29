@@ -671,7 +671,7 @@ pub fn page_since(store: &Store, after: i64, limit: usize) -> Result<Vec<(i64, V
 }
 
 /// Words a question carries that say nothing about what is asked.
-const STOPWORDS: [&str; 37] = [
+pub(crate) const STOPWORDS: [&str; 37] = [
     "how", "do", "does", "we", "i", "you", "the", "a", "an", "of", "to", "in", "on", "is", "are",
     "was", "were", "be", "it", "that", "this", "what", "when", "where", "which", "who", "why",
     "before", "after", "with", "for", "and", "or", "not", "our", "my", "your",

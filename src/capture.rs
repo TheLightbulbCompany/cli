@@ -373,19 +373,55 @@ pub fn search_turns(
                     seq: r.get(1)?,
                     role: r.get(2)?,
                     at: r.get(4)?,
-                    excerpt: text
-                        .split_whitespace()
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                        .chars()
-                        .take(EXCERPT_MAX)
-                        .collect(),
+                    excerpt: excerpt(&text, query),
                 })
             },
         )?;
         out.push(hit);
     }
     Ok(out)
+}
+
+/// The `EXCERPT_MAX` characters of `text` (each run of whitespace one space) that hold the most
+/// of `query`'s words: the window starting at the word that gives the most distinct query words
+/// (a word of 3 or more characters matching as a prefix, as `memory::fts_query` matches), the
+/// earliest on a tie, so a turn whose opening matches reads from its start. "…" marks a window
+/// that starts inside the turn.
+pub fn excerpt(text: &str, query: &str) -> String {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let terms: Vec<String> = query
+        .split_whitespace()
+        .map(|w| {
+            w.trim_matches(|c: char| !c.is_alphanumeric())
+                .to_lowercase()
+        })
+        .filter(|w| w.chars().count() >= 3 && !crate::memory::STOPWORDS.contains(&w.as_str()))
+        .collect();
+    let matches = |w: &str| {
+        let w = w
+            .trim_matches(|c: char| !c.is_alphanumeric())
+            .to_lowercase();
+        terms.iter().position(|t| w.starts_with(t.as_str()))
+    };
+    let (mut best, mut best_score) = (0, 0);
+    for start in 0..words.len() {
+        let (mut len, mut seen) = (0, std::collections::HashSet::new());
+        for w in &words[start..] {
+            len += w.chars().count() + 1;
+            if len > EXCERPT_MAX + 1 {
+                break;
+            }
+            seen.extend(matches(w));
+        }
+        if seen.len() > best_score {
+            (best, best_score) = (start, seen.len());
+        }
+    }
+    let lead = if best > 0 { "…" } else { "" };
+    format!("{lead}{}", words[best..].join(" "))
+        .chars()
+        .take(EXCERPT_MAX)
+        .collect()
 }
 
 /// Deletes the turns recorded more than `days` days before `now`; how many.
@@ -485,4 +521,29 @@ pub fn transcript_tokens(path: &str) -> Option<(i64, i64)> {
             .values()
             .fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1))
     })
+}
+
+#[cfg(test)]
+mod excerpt_tests {
+    use super::{excerpt, EXCERPT_MAX};
+
+    #[test]
+    fn the_excerpt_is_the_part_of_the_turn_that_matches() {
+        let filler = "lorem ipsum dolor sit amet ".repeat(40);
+        let text = format!("{filler}reset the counters every minute and queue requests {filler}");
+        let e = excerpt(
+            &text,
+            "how did you recommend queuing requests and counters?",
+        );
+        assert!(
+            e.starts_with('…') && e.contains("reset the counters every minute and queue requests"),
+            "{e}"
+        );
+        assert!(e.chars().count() <= EXCERPT_MAX);
+        // no match, or a match at the start: the turn's opening, as before
+        assert!(excerpt(&text, "kubernetes").starts_with("lorem ipsum"));
+        assert!(
+            excerpt("rotate the deploy keys now", "rotate keys").starts_with("rotate the deploy")
+        );
+    }
 }
