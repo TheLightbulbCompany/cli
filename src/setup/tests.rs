@@ -187,6 +187,10 @@ fn setup_writes_codex_hooks_and_mcp_and_backs_up_once() {
             .collect::<Vec<_>>(),
         ["mcp"]
     );
+    assert_eq!(
+        server["default_tools_approval_mode"].as_str(),
+        Some("approve")
+    );
 
     assert!(agent(&setup(h, false), "codex").wrote.is_empty());
     backed_up_once(h, ".codex/hooks.json", &hooks);
