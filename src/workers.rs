@@ -304,15 +304,10 @@ pub fn workspace(base: &Path, id: &str, meta: &Meta) -> Result<(PathBuf, bool)> 
     Ok((dir, meta.repo.is_some() && !made))
 }
 
-/// The worker's first prompt: assignment `a` framed as an agent gets it from `label`, then
-/// how to answer it.
+/// The worker's first prompt: assignment `a` framed as an agent gets it from `label`, its
+/// header line saying how to answer it.
 pub fn first_prompt(label: &str, a: &Message) -> String {
-    let framed = frame::framed_kind("assign", label, &a.request_id, None, &a.meta, &a.body);
-    format!(
-        "{framed}\nReply with send_message(reply_to=\"{}\") when done (status failed or \
-         cancelled if not).",
-        a.request_id
-    )
+    frame::framed_kind("assign", label, &a.request_id, None, &a.meta, &a.body)
 }
 
 /// `start`'s half under the store lock, the one place the cap is kept: assignment `a`, not yet
@@ -1391,10 +1386,11 @@ mod tests {
             "{p}"
         );
         assert!(p.contains("\"doneWhen\""), "{p}");
-        assert!(p.ends_with(
-            "\nReply with send_message(reply_to=\"r1\") when done (status failed or cancelled if not)."
-        ));
+        // Exactly one reply line, with the real request id.
+        assert_eq!(p.matches("reply_to=").count(), 1, "{p}");
+        assert!(p.contains("\nReply to this assignment with reply_to=\"r1\" "), "{p}");
     }
+
 
     /// A worker of this process for `assign_id`, as session `key`; `alive` picks this
     /// process's real birth time, else a wrong one.

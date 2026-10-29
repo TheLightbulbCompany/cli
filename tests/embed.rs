@@ -452,7 +452,8 @@ async fn an_instance_stores_an_assignment_for_a_declared_agent_when_on() {
     assert!(r["framed"]
         .as_str()
         .unwrap()
-        .contains("reply_to=\"<requestId>\""));
+        .contains("reply_to=\"as1\""));
+
     // Friday's reply with `reply_to` is the assignment's result at the asker.
     let to = format!("{}/codex:c1", ia.short);
     ok(

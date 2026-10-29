@@ -125,7 +125,7 @@ pub fn framed_kind(
                 ("repo", meta.repo.as_ref().map(|v| json!(v))),
                 ("branch", meta.branch.as_ref().map(|v| json!(v))),
             ],
-            "Reply to this assignment with reply_to=\"<requestId>\" (status failed or cancelled if not done).",
+            "Reply to this assignment with reply_to={rid} (status failed or cancelled if not done).",
         ),
         "result" => (
             "result",
@@ -244,7 +244,8 @@ mod tests {
         };
         let out = framed_kind("assign", "Your Codex", "as1", None, &meta, "run tests");
         assert!(out.starts_with("[Lightbulb assignment from Your Codex {\"requestId\":\"as1\",\"doneWhen\":\"green\",\"deadlineAt\":42}]\n"), "{out}");
-        assert!(out.contains("Reply to this assignment with reply_to=\"<requestId>\" (status failed or cancelled if not done).\n"));
+        assert!(out.contains("\nReply to this assignment with reply_to=\"as1\" (status failed or cancelled if not done).\n"), "{out}");
+
         assert!(!out.contains("send_message"));
         assert!(out.ends_with("\n\nrun tests"));
     }
