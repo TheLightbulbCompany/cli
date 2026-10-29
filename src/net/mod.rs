@@ -848,6 +848,9 @@ impl Net {
                 Ok(wake) => (wake.iter()).for_each(|(k, id)| ipc::stored(d, k, Some(id))),
                 Err(e) => eprintln!("net: outbox: {e}"),
             }
+            if expire {
+                workers::tick(d, ipc::now() as i64); // a worker past its deadline stops
+            }
         }
     }
 

@@ -332,6 +332,16 @@ pub fn answer(
     if scope == "always" {
         workers::set_policy(store, me, &c.hold.from_member, "always", by, now)?;
     }
+    // A worker-start hold's assignment is stored (to start) or refused.
+    if kind == Kind::Worker {
+        let m = &c.hold.message;
+        let (state, reason) = match allow {
+            true => (State::Stored, None),
+            false => (State::Refused, Some("declined")),
+        };
+        let (f, rid, at) = (&m.from_key, &m.request_id, now as u64);
+        mail::advance(store.conn(), f, rid, state, reason, None, at)?;
+    }
     tx.commit()?;
     Ok(Ok(c))
 }
@@ -393,6 +403,21 @@ pub fn expire(store: &Store, now: i64) -> Result<Vec<Hold>> {
     Ok(out)
 }
 
+/// Closes `session`'s open holds `expired` (its worker ended): them.
+pub fn expire_for(store: &Store, session: &str) -> Result<Vec<Hold>> {
+    let open = rows(
+        store,
+        "WHERE h.state = 'open' AND h.target_session = ?1",
+        &session,
+    )?;
+    for (h, _) in &open {
+        store
+            .conn()
+            .execute("UPDATE holds SET state = 'expired' WHERE id = ?1", [h.id])?;
+    }
+    Ok(open.into_iter().map(|(h, _)| h).collect())
+}
+
 /// The daemon's side of a new hold: its dialog text kept (`shown`), subscribers told `held`,
 /// the person shown the dialog.
 pub fn shown(d: &Daemon, team: &TeamState, store: &Store, h: &Hold) {
@@ -421,8 +446,15 @@ pub fn shown(d: &Daemon, team: &TeamState, store: &Store, h: &Hold) {
 
 /// The daemon's side of a closed hold (`verdict` `allow`, `decline` or `expired`; `by` null for
 /// an expiry; `surface` the one that answered, if this computer's): its dialog withdrawn,
-/// subscribers told `hold_closed`.
-fn closed(d: &Daemon, h: &Hold, verdict: &str, by: Option<&str>, surface: Option<&'static str>) {
+/// subscribers told `hold_closed`, a worker waiting on it answered.
+pub(crate) fn closed(
+    d: &Daemon,
+    h: &Hold,
+    verdict: &str,
+    by: Option<&str>,
+    surface: Option<&'static str>,
+) {
+    d.workers.answered(h.id, verdict, by);
     d.dialogs.withdraw(&h.name());
     let event = json!({"event": "hold_closed", "id": h.name(), "by": by, "verdict": verdict});
     let _ = d.events.send(event);
@@ -465,6 +497,14 @@ fn answer_here(
     };
     if let Ok(c) = &r {
         closed(d, &c.hold, c.verdict(), Some(by), Some(surface));
+        if c.hold.kind() == Kind::Worker {
+            d.peers.outbox.notify_one(); // its receipt moved
+            if c.allow {
+                if let Err(e) = workers::start(d, &c.hold.message.id) {
+                    eprintln!("hold {}: worker not started: {e}", c.hold.name());
+                }
+            }
+        }
     }
     Ok(r)
 }

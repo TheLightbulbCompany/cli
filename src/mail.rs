@@ -247,7 +247,7 @@ fn receipt_text(r: &Value, person: Option<&ForPerson>) -> Option<String> {
                 _ => shown("reason").replace('_', " "),
             }
         ),
-        "held" => format!("Sent. {who} has to allow it first (they see a prompt).{check}"),
+        "held" => format!("Not yet sent: held until {who} allows it.{check}"),
         "queued" if remote && r["waking"] == true => {
             format!("Sent. {computer} is waking up and gets it in a moment.{check}")
         }
@@ -691,8 +691,21 @@ pub fn prepare(
     if !sessions::word(request_id, MAX_REQUEST_ID) {
         return unstored("bad_request_id"); // nothing safe to key a receipt on
     }
+    // A running worker's reply naming its assignment (by request id or id) answers that one,
+    // whichever other assignment to its `:new` address shares the request id.
+    let worker = store.worker_by_session(&from.0)?;
+    let worker = worker.filter(|w| w.ended_at.is_none());
+    let own = match (reply_to, &worker) {
+        (Some(r), Some(w)) => store
+            .message(&w.assignment)?
+            .filter(|a| a.request_id == r || a.id == r),
+        _ => None,
+    };
+    // A worker answers no other `:new` assignment.
+    let new_key = new_key_of(&from.0).filter(|_| worker.is_none());
     // The message this answers: a message id, or a request id `from` received.
     let parent: Option<Message> = match reply_to {
+        _ if own.is_some() => own,
         Some(r) => {
             let id: Option<String> = conn
                 .query_row(
@@ -702,7 +715,7 @@ pub fn prepare(
                     "SELECT id FROM messages WHERE id = ?1 OR (request_id = ?1 AND \
                      CASE WHEN ?3 = 'cancel' THEN from_key = ?2 ELSE (to_key = ?2 OR to_key = ?4) \
                      END) ORDER BY id = ?1 DESC, rowid DESC LIMIT 1",
-                    params![r, from.0, kind, new_key_of(&from.0)],
+                    params![r, from.0, kind, new_key],
                     |x| x.get(0),
                 )
                 .optional()?;
@@ -1048,7 +1061,9 @@ pub fn receive(
         sent_at: now as i64,
     };
     let tx = store.conn().unchecked_transaction()?;
-    if is_new_worker(to) {
+    // A cancel reaches the worker module only for an assignment to a fresh worker.
+    let worker_cancel = parent.as_ref().is_some_and(|p| is_new_worker(&p.to_key));
+    if is_new_worker(to) && (kind == "assign" || worker_cancel) {
         // A fresh worker's address has no mailbox: the assignment is refused, held for the
         // person or started; its cancel is stored and reaches the worker module.
         let mut taken = None;
@@ -1370,6 +1385,16 @@ mod tests {
         let r = |state: &str, reason: Option<&str>| serde_json::json!({"state": state, "reason": reason, "person": "aden", "where": "mac"});
         let note = |v| receipt_note(&v, None).unwrap();
         assert_eq!(note(r("held", None)), "held until aden allows it");
+        let to_aden = ForPerson {
+            to: Some("m/claude:new"),
+            rid: "r1",
+            cmd: "lightbulb",
+            check: false,
+        };
+        assert_eq!(
+            receipt_note(&r("held", None), Some(&to_aden)).unwrap(),
+            "Not yet sent: held until aden allows it."
+        );
         assert_eq!(
             note(r("refused", Some("declined"))),
             "not sent: aden declined to start a worker"
@@ -2791,6 +2816,43 @@ mod tests {
             ),
             "policy",
         );
+    }
+
+    #[test]
+    fn a_workers_reply_binds_to_its_own_assignment() {
+        let (_d, s) = setup();
+        // Two askers, one request id, one worker address.
+        let first = assigned_new(&s, "a/codex:1", "m/claude:new", "r1");
+        let second = assigned_new(&s, "b/codex:2", "m/claude:new", "r1");
+        assert_ne!(first.message_id, second.message_id);
+        s.insert_worker(&crate::store::Worker {
+            id: 0,
+            assignment: first.message_id.clone(),
+            session: "m/claude:w1".into(),
+            provider: "claude".into(),
+            folder: "/f".into(),
+            pid: None,
+            started_at: 1,
+            ended_at: None,
+            state: "running".into(),
+            by: None,
+        })
+        .unwrap();
+        // By request id or by message id, the worker's reply is the first assignment's result.
+        for (rid, reply_to) in [("w-1", "r1"), ("w-2", first.message_id.as_str())] {
+            let p = go(prep(
+                &s,
+                "m/claude:w1",
+                None,
+                rid,
+                Some(reply_to),
+                "message",
+                Meta::default(),
+                901,
+            ));
+            assert_eq!((p.kind.as_str(), p.to.0.as_str()), ("result", "a/codex:1"));
+            assert_eq!(p.reply_to.as_deref(), Some(first.message_id.as_str()));
+        }
     }
 
     #[test]

@@ -98,6 +98,8 @@ pub struct Daemon {
     pub latest: Mutex<HashMap<String, crate::presence::Latest>>,
     /// The open streams (`streams`).
     pub streams: crate::streams::Streams,
+    /// The network workers running here (`workers`).
+    pub workers: crate::workers::Registry,
     /// What an embedded (cloud) instance is; `None` on a computer.
     pub cloud: Option<Cloud>,
     /// Each member's sign-in proof from its latest `hello` (`proof`): what a workspace member's
@@ -288,6 +290,8 @@ pub async fn run(dir: &Path) -> Result<()> {
     let _lock = lock_dir(dir, true)?;
     let config = Config::load(dir)?;
     let (daemon, net) = crate::embed::boot(dir, config, None).await?;
+    // Workers whose process went with the last daemon end; live ones are re-adopted.
+    crate::workers::reap(&daemon, ipc::now() as i64);
 
     // We hold the lock, so any socket file left behind is stale.
     let sock = dir.join(paths::SOCKET);

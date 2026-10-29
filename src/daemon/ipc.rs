@@ -1573,7 +1573,6 @@ fn internal(e: impl std::fmt::Display) -> Failed {
     Failed::Internal(e.to_string())
 }
 
-#[allow(dead_code)] // Task 4 sends a worker's result through it
 /// Routes the prepared message `p` from this computer: to the outbox for another member, else
 /// recorded here (`dispatch_locked`); its receipt.
 pub(crate) fn dispatch(daemon: &Arc<Daemon>, p: &mail::Prepared) -> Result<mail::Receipt, Failed> {
@@ -1604,7 +1603,11 @@ fn dispatch_locked(
         daemon.peers.outbox.notify_one();
         return Ok(r);
     }
-    if mail::is_new_worker(&p.to.0) {
+    // An assign to a fresh worker, or the cancel of one (any other cancel is plain mail).
+    let of_worker = |id: &String| store.message(id).ok().flatten();
+    let worker_cancel =
+        (p.reply_to.as_ref().and_then(of_worker)).is_some_and(|a| mail::is_new_worker(&a.to_key));
+    if mail::is_new_worker(&p.to.0) && (p.kind == "assign" || worker_cancel) {
         return fresh_worker(daemon, team, store, p, origin);
     }
     drop(team);

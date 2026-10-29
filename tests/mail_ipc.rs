@@ -500,9 +500,9 @@ async fn a_late_result_after_the_timeout_is_mail_not_a_second_closing() {
 }
 
 /// An assignment to this computer's own `<me>/claude:new` (policy: this key allows itself) is
-/// stored with no mailbox and its worker recorded `starting`; a cancel of it reaches the worker
-/// module, which ends the row `cancelled`. (`workers::start` and `cancel` are still stubs that
-/// only move the row.)
+/// stored with no mailbox and handed to `workers::start`, which (no Claude Code driver in this
+/// build yet: Task 5) refuses it `no_worker` and starts nothing; its cancel is stored, in no
+/// mailbox either. (Task 5's `tests/workers.rs` runs the worker itself.)
 #[tokio::test]
 async fn an_assign_to_my_own_new_claude_is_stored_and_a_cancel_reaches_the_worker_module() {
     let dir = tempfile::tempdir().unwrap();
@@ -541,12 +541,14 @@ async fn an_assign_to_my_own_new_claude_is_stored_and_a_cancel_reaches_the_worke
     assert_eq!(sent["receipt"]["state"], "stored", "{sent}");
     let db = dir.path().join("state.db");
     let store = lightbulb::store::Store::open(&db).unwrap();
-    let ws = store.workers(true).unwrap();
-    let [worker] = &ws[..] else { panic!("{ws:?}") };
+    let receipt = json!({"id": 9, "op": "receipt", "from": asker, "request_id": "as1"});
+    let r = call(&mut l, &mut w, receipt).await;
     assert_eq!(
-        (worker.state.as_str(), worker.provider.as_str()),
-        ("starting", "claude")
+        (&r["receipt"]["state"], &r["receipt"]["reason"]),
+        (&json!("refused"), &json!("no_worker")),
+        "{r}"
     );
+    assert!(store.workers(false).unwrap().is_empty());
     // No mailbox holds it.
     let rows = |sql: &str| {
         rusqlite::Connection::open(&db)
@@ -565,7 +567,6 @@ async fn an_assign_to_my_own_new_claude_is_stored_and_a_cancel_reaches_the_worke
     )
     .await;
     assert_eq!(cancelled["receipt"]["state"], "stored", "{cancelled}");
-    let ws = store.workers(false).unwrap();
-    assert_eq!(ws[0].state, "cancelled", "{ws:?}");
+    assert!(store.workers(false).unwrap().is_empty());
     assert_eq!(rows("SELECT COUNT(*) FROM mailbox"), 0);
 }
