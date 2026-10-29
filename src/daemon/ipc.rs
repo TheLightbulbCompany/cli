@@ -740,7 +740,13 @@ fn memory_recall(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
     if asked {
         memory::trim_evidence(&mut facts, &mut turns);
     }
-    let page = memory::page(&store, &facts, &turns, &names, budget);
+    // The start block caps one subject's lines; a question's page is governed by its trim.
+    let per_subject = if asked {
+        usize::MAX
+    } else {
+        memory::START_LINES_PER_SUBJECT
+    };
+    let page = memory::page(&store, &facts, &turns, &names, budget, per_subject);
     let block = memory::block(&page);
     // Only the start block is kept: an agent's `recall` carries its repo and session too.
     if let (Some(_), Some(session), false, true) = (

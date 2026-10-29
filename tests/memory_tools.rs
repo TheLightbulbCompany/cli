@@ -122,7 +122,7 @@ fn remember_refuses_secret_with_reason() {
 }
 
 #[test]
-fn recall_page_puts_contested_first_and_respects_budget() {
+fn one_persons_values_are_dated_current_lines_and_the_page_cuts_on_a_line() {
     let e = daemon();
     remember(&e, "alpha", "one", "fact", json!({}));
     remember(&e, "beta", "two", "lesson", json!({"scope": "team"}));
@@ -423,4 +423,66 @@ fn the_start_block_keeps_its_1600_characters() {
         asked["page"].as_str().unwrap().chars().count() > 1600,
         "{asked}"
     );
+}
+
+/// The start block, asked as the hook asks it, shows at most three lines of one subject (its
+/// newest), so one subject with 20 values cannot fill the 1,600 characters; a question's page
+/// is not capped.
+#[test]
+fn the_start_block_shows_three_lines_of_one_subject() {
+    let e = daemon();
+    let me = lightbulb::os::process(std::process::id()).unwrap();
+    let r = e.ask(
+        json!({"id": 1, "op": "register", "session": {"provider": "claude",
+        "conversation": "s1", "pid": me.pid, "birth_micros": me.birth_micros, "cwd": "/tmp",
+        "repo": "engine"}}),
+    );
+    let key = r["key"].as_str().unwrap().to_string();
+    for i in 0..20 {
+        let when = 1_700_000_000 + i * 86_400;
+        let r = remember(
+            &e,
+            "deploy window",
+            &format!("window {i}"),
+            "fact",
+            json!({"session": key, "when": when}),
+        );
+        assert_eq!(r["stored"], true, "{r}");
+    }
+    for s in ["db", "ci"] {
+        remember(
+            &e,
+            s,
+            &format!("{s} value"),
+            "fact",
+            json!({"session": key}),
+        );
+    }
+    let start = e.ask(
+        json!({"id": 5, "op": "memory.recall", "question": "", "repo": "engine",
+        "budget_chars": 1600, "session": key}),
+    );
+    let page = start["page"].as_str().unwrap();
+    let windows: Vec<&str> = page
+        .lines()
+        .filter(|l| l.starts_with("deploy window: "))
+        .collect();
+    assert_eq!(windows.len(), 3, "{page}");
+    for (line, i) in windows.iter().zip([19, 18, 17]) {
+        assert!(
+            line.starts_with(&format!("deploy window: window {i} (")),
+            "{page}"
+        );
+    }
+    assert!(
+        page.contains("db: db value (") && page.contains("ci: ci value ("),
+        "{page}"
+    );
+    let asked = recall(&e, "deploy window", None);
+    let all = asked["page"]
+        .as_str()
+        .unwrap()
+        .matches("deploy window: ")
+        .count();
+    assert_eq!(all, 20, "{asked}");
 }

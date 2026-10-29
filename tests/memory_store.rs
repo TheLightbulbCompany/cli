@@ -646,7 +646,7 @@ fn a_long_current_section_does_not_hide_lessons() {
     let lesson = rem_as("tests", "run them twice", Scope::Team, Kind::Lesson);
     memory::remember(&s, &a, lesson, 3).unwrap();
     let f = memory::facts(&s, None, None).unwrap();
-    let page = memory::page(&s, &f, &[], &Default::default(), 200);
+    let page = memory::page(&s, &f, &[], &Default::default(), 200, usize::MAX);
     // The long line does not fit and is left out; the line after it and the lessons are kept.
     assert!(!page.contains("yyy"), "{page}");
     assert!(page.starts_with("Current:\nshort: x ("), "{page}");
@@ -673,11 +673,29 @@ fn a_me_value_does_not_contest_a_team_value() {
     let f = memory::facts(&s, None, None).unwrap();
     assert!(f.iter().all(|x| x.status == Status::Contested), "{f:?}");
     // One author: the page prints each value on its own dated line (Contested needs two people).
-    let page = memory::page(&s, &f, &[], &Default::default(), 1600);
+    let page = memory::page(&s, &f, &[], &Default::default(), 1600, usize::MAX);
     let lines: Vec<&str> = page.lines().collect();
     assert_eq!(lines.len(), 5, "{page}");
     assert_eq!(lines[0], "Current:");
     assert!(!page.contains(" vs "), "{page}");
+    // Each value on its own line, and each in its own scope: me never contests team.
+    for (value, scope) in [
+        ("vim", Scope::Me),
+        ("emacs", Scope::Me),
+        ("vscode", Scope::Team),
+        ("zed", Scope::Team),
+    ] {
+        let prefix = format!("editor: {value} (");
+        assert_eq!(
+            lines.iter().filter(|l| l.starts_with(&prefix)).count(),
+            1,
+            "{page}"
+        );
+        assert!(
+            f.iter().any(|x| x.value == value && x.scope == scope),
+            "{f:?}"
+        );
+    }
 }
 
 #[test]
@@ -708,6 +726,7 @@ fn fact(id: &str, author: &str, value: &str, when: i64) -> memory::Fact {
         kind: Kind::Fact,
         scope: Scope::Team,
         author: author.into(),
+        on_behalf_of: None,
         when,
         status: Status::Contested,
         history: vec![],
@@ -722,7 +741,7 @@ fn the_page_says_contested_only_when_two_people_disagree() {
         fact("a", "ann", "3 March", 1_700_000_000),
         fact("b", "bo", "10 March", 1_700_100_000),
     ];
-    let page = memory::page(&s, &two, &[], &names, 10_000);
+    let page = memory::page(&s, &two, &[], &names, 10_000, usize::MAX);
     assert!(
         page.starts_with(
             "Contested:\nlaunch date: 3 March (ann, 2023-11-14) vs 10 March (bo, 2023-11-16)"
@@ -733,9 +752,76 @@ fn the_page_says_contested_only_when_two_people_disagree() {
         fact("a", "ann", "3 March", 1_700_000_000),
         fact("b", "ann", "10 March", 1_700_100_000),
     ];
-    let page = memory::page(&s, &one, &[], &names, 10_000);
+    let page = memory::page(&s, &one, &[], &names, 10_000, usize::MAX);
     assert_eq!(
         page,
         "Current:\nlaunch date: 3 March (ann, 2023-11-14)\nlaunch date: 10 March (ann, 2023-11-16)"
     );
+}
+
+/// Two people, one with five values: the "vs" line carries each person's newest value only;
+/// that person's older values print as Current lines, in rank order.
+#[test]
+fn a_contested_line_carries_each_persons_newest_value() {
+    let (_d, s) = store();
+    let names = std::collections::HashMap::new();
+    let day = 86_400;
+    let mut facts: Vec<memory::Fact> = (0..5)
+        .map(|i| {
+            fact(
+                &format!("a{i}"),
+                "ann",
+                &format!("{} March", i + 1),
+                1_700_000_000 + i * day,
+            )
+        })
+        .collect();
+    facts.push(fact("b", "bo", "10 March", 1_700_000_000 + 2 * day));
+    let page = memory::page(&s, &facts, &[], &names, 10_000, usize::MAX);
+    assert_eq!(
+        page,
+        "Contested:\nlaunch date: 5 March (ann, 2023-11-18) vs 10 March (bo, 2023-11-16)\n\
+         Current:\nlaunch date: 1 March (ann, 2023-11-14)\nlaunch date: 2 March (ann, 2023-11-15)\n\
+         launch date: 3 March (ann, 2023-11-16)\nlaunch date: 4 March (ann, 2023-11-17)"
+    );
+}
+
+/// The workspace agent signs for many people: two people disagreeing through one signing key
+/// are Contested (`on_behalf_of` is the person).
+#[test]
+fn two_people_through_one_signing_key_are_contested() {
+    let (_d, s) = store();
+    let names = std::collections::HashMap::new();
+    let mut a = fact("a", "workspace", "3 March", 1_700_000_000);
+    a.on_behalf_of = Some("ann".into());
+    let mut b = fact("b", "workspace", "10 March", 1_700_100_000);
+    b.on_behalf_of = Some("bo".into());
+    let page = memory::page(&s, &[a.clone(), b], &[], &names, 10_000, usize::MAX);
+    assert!(
+        page.starts_with("Contested:\nlaunch date: 3 March"),
+        "{page}"
+    );
+    assert!(page.contains(" vs 10 March"), "{page}");
+    // The same person through the workspace twice: notes over time, not a dispute.
+    let mut c = fact("c", "workspace", "10 March", 1_700_100_000);
+    c.on_behalf_of = Some("ann".into());
+    let page = memory::page(&s, &[a, c], &[], &names, 10_000, usize::MAX);
+    assert!(
+        page.starts_with("Current:") && !page.contains(" vs "),
+        "{page}"
+    );
+}
+
+/// The facts of a remember through the workspace carry the person it wrote for.
+#[test]
+fn a_fact_carries_on_behalf_of() {
+    let a = identity();
+    let (_d, s) = team(&a);
+    let mut op = rem("db", "postgres 16", &[]);
+    if let Op::Remember { source, .. } = &mut op {
+        source.on_behalf_of = Some("user_ann".into());
+    }
+    memory::remember(&s, &a, op, 1).unwrap();
+    let f = memory::facts(&s, None, None).unwrap();
+    assert_eq!(f[0].on_behalf_of.as_deref(), Some("user_ann"));
 }
