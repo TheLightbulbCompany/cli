@@ -82,6 +82,7 @@ impl Remote {
         };
         own(peer_short, &self.session_id)
             && agent
+            && (self.free.is_none() || self.session_id.ends_with(":new"))
             && STATUSES.contains(&self.status.as_str())
             && Tier::ALL.iter().any(|t| t.as_str() == self.tier)
             && short(&self.folder)
@@ -335,6 +336,24 @@ pub fn from_peer_ok(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn free_slots_ride_only_a_new_row() {
+        let row = |id: &str| Remote {
+            session_id: id.into(),
+            agent: "claude".into(),
+            repo: None,
+            branch: None,
+            folder: "f".into(),
+            status: "idle".into(),
+            doing: None,
+            tier: "pull".into(),
+            title: None,
+            free: Some(1),
+        };
+        assert!(!row("x/claude:1").valid("x"));
+        assert!(row("x/claude:new").valid("x"));
+    }
 
     #[test]
     fn an_envelope_without_meta_reads_as_empty_and_one_with_it_round_trips() {
