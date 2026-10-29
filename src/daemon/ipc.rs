@@ -1325,6 +1325,16 @@ fn register(id: u64, body: &Value, daemon: &Daemon) -> Response {
         let old = store.session(&key.0).ok().flatten();
         old.map_or((None, None), |o| (o.repo, o.branch))
     };
+    // A running network worker's hooks register it too: it keeps the title and status its
+    // daemon gave it ("<asker>'s worker", busy).
+    let worker = crate::holds::is_workers(&store, &key.0);
+    let kept = worker
+        .then(|| store.session(&key.0).ok().flatten())
+        .flatten();
+    let (title, status) = match kept {
+        Some(o) => (o.title, o.status),
+        None => (r.title, status.into()),
+    };
     let row = store::Session {
         key: key.0.clone(),
         provider: r.provider,
@@ -1332,8 +1342,8 @@ fn register(id: u64, body: &Value, daemon: &Daemon) -> Response {
         pid: Some(r.pid.into()),
         birth_micros: i64::try_from(r.birth_micros).ok(),
         cwd: r.cwd,
-        title: r.title,
-        status: status.into(),
+        title,
+        status,
         seen_at: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs() as i64),

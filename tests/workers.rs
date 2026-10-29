@@ -902,6 +902,38 @@ fn ask_user_question_is_denied_with_the_plan_text() {
 }
 
 /// §8 row 10: `workers off` stops the running worker and A's directory stops listing the host.
+/// A real harness's hooks register the worker's session like any other: its title (who it
+/// works for) and status stay as the daemon set them.
+#[test]
+fn a_hook_register_keeps_the_workers_title() {
+    let p = hosted(
+        json!([{"sleep": 60}, {"result": "late"}]),
+        Opts {
+            always: true,
+            ..Opts::default()
+        },
+    );
+    p.assign("as1", "take your time", 300);
+    let w = running(&p, 1).remove(0);
+    let before = p.b.store().session(&w.session).unwrap().unwrap();
+    assert!(
+        before
+            .title
+            .as_deref()
+            .is_some_and(|t| t.ends_with("'s worker")),
+        "{before:?}"
+    );
+    let conv = w.session.split_once(':').unwrap().1;
+    let r = p.b.ask(
+        json!({"id": 1, "op": "register", "session": {"provider": "claude",
+        "conversation": conv, "pid": before.pid, "birth_micros": before.birth_micros,
+        "cwd": before.cwd, "status": "idle"}}),
+    );
+    assert_eq!(r["ok"], true, "{r}");
+    let after = p.b.store().session(&w.session).unwrap().unwrap();
+    assert_eq!((after.title, after.status), (before.title, before.status));
+}
+
 #[test]
 fn row_10_workers_off_stops_the_worker_and_unlists_the_host() {
     let p = hosted(
