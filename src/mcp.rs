@@ -674,7 +674,7 @@ impl Server {
             }
         }
         match ask(&format!("memory.{name}"), args).await {
-            // A question's answer is the one page (about 8,000 tokens at most): the daemon's
+            // A question's answer is the one page (up to about 9,000 tokens): the daemon's
             // `block` and its `facts` and `turns` arrays repeat it, so only their counts go.
             Ok(r) if r["ok"] == true && asked => {
                 let count = |k: &str| r[k].as_array().map_or(0, Vec::len);

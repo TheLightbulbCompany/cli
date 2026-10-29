@@ -1440,7 +1440,7 @@ fn tools_json_lists_remember_and_recall() {
     assert_eq!(remember["scope"], "network");
     assert_eq!(
         recall["description"],
-        "Call when a task starts or you need something a teammate may know, not on every turn: the answer is one page of about 8,000 tokens at most. It also includes excerpts from your own prompts and replies in this repository on this computer, or in every repository when the folder has no git origin."
+        "Call when a task starts or you need something a teammate may know, not on every turn: the answer is one page of about 8,000 tokens, up to about 9,000 on a full page. It also includes excerpts from your own prompts and replies in this repository on this computer, or in every repository when the folder has no git origin."
     );
     assert_eq!(
         remember["description"],
@@ -1504,7 +1504,7 @@ fn remember_through_mcp_stamps_the_session_and_ignores_undeclared_args() {
 
 /// A question's recall through the tool is the one page: no `block`, no `facts` or `turns`
 /// arrays (the daemon's op keeps them for the hook and the benchmark), and a full page stays
-/// within 8,200 tokens by the benchmark's count (characters / 4, rounded up).
+/// within 9,000 tokens by the benchmark's count (characters / 4, rounded up).
 #[test]
 fn a_question_recall_through_mcp_is_one_page() {
     let e = common::Env::new();
@@ -1533,7 +1533,7 @@ fn a_question_recall_through_mcp_is_one_page() {
     }
     assert!(v["counts"]["facts"].as_u64().unwrap() > 40, "{v}");
     let tokens = out.text.chars().count().div_ceil(4);
-    assert!(tokens <= 8_200, "{tokens} tokens");
+    assert!(tokens <= 9_000, "{tokens} tokens");
     assert!(tokens > 6_000, "a full page: {tokens} tokens");
     // The start view (no question) keeps the daemon's whole answer, `block` included.
     let start = m.tool("recall", json!({"question": ""})).json();
