@@ -1099,10 +1099,14 @@ pub fn signin() -> Result<i32> {
     Ok(2)
 }
 
-/// `approve <id>` / `decline <id>`: answers permission prompt `H<n>`.
-pub fn answer(request: &str, allow: bool) -> Result<i32> {
+/// `approve <id> [--always]` / `decline <id>`: answers hold `H<n>`.
+pub fn answer(request: &str, allow: bool, always: bool) -> Result<i32> {
     let verdict = if allow { "allow" } else { "decline" };
-    let r = connect()?.call("hold.answer", json!({"hold": request, "verdict": verdict}))?;
+    let scope = if always { "always" } else { "once" };
+    let r = connect()?.call(
+        "hold.answer",
+        json!({"hold": request, "verdict": verdict, "scope": scope}),
+    )?;
     if r["ok"] != true {
         let texts = [
             (
@@ -1118,7 +1122,11 @@ pub fn answer(request: &str, allow: bool) -> Result<i32> {
         ];
         return refuse(&r, &texts);
     }
-    println!("{} {request}.", if allow { "Allowed" } else { "Declined" });
+    let word = if allow { "Allowed" } else { "Declined" };
+    match always {
+        true => println!("{word} {request} (always)."),
+        false => println!("{word} {request}."),
+    }
     Ok(0)
 }
 
@@ -1130,8 +1138,13 @@ pub fn held() -> Result<i32> {
     let f = |v: &Value, k: &str| v[k].as_str().map(cell).unwrap_or_default();
     let mut any = false;
     for h in holds["holds"].as_array().into_iter().flatten() {
-        let (id, to, text) = (f(h, "id"), f(h, "target_session"), f(h, "preview"));
-        println!("{id}  {to}  \"{text}\" — {cmd} approve {id}");
+        let (id, shown) = (f(h, "id"), f(h, "shown"));
+        if shown.is_empty() {
+            let (to, text) = (f(h, "target_session"), f(h, "preview"));
+            println!("{id}  {to}  \"{text}\" — {cmd} approve {id}");
+        } else {
+            println!("{id}  {}  {shown}  — {cmd} approve {id}", f(h, "kind"));
+        }
         any = true;
     }
     if !any {

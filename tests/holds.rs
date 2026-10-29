@@ -314,3 +314,293 @@ async fn a_teammates_message_is_stored_not_held() {
     assert_eq!(p.ack(&id).await, ("stored".into(), None));
     assert!(held(&a).is_empty());
 }
+
+// ---- worker holds (network workers, plan 2, task 2) ----
+
+use lightbulb::mail::Meta;
+use lightbulb::store::{Message, Worker};
+use lightbulb::workers::{self, Policy};
+use std::path::Path;
+
+/// A worker-start hold from `from` (a session key) to `<me>/claude:new`, brief `body`.
+fn assign_hold(
+    s: &Store,
+    from: &str,
+    member: &str,
+    to: &str,
+    deadline: Option<i64>,
+) -> holds::Hold {
+    let id = ulid();
+    let m = Message {
+        request_id: format!("r-{id}"),
+        id,
+        from_key: from.into(),
+        to_key: to.into(),
+        kind: "assign".into(),
+        thread: None,
+        hops: 0,
+        origin: None,
+        body: "fix the build".into(),
+        sent_at: 1,
+        reply_to: None,
+        meta: Meta {
+            deadline_at: deadline,
+            ..Default::default()
+        },
+    };
+    s.put_message(&m).unwrap();
+    holds::insert(s, m, member, 1_000).unwrap()
+}
+
+/// A running worker `session` (with a registered row) for the assignment of `hold`.
+fn running_worker(s: &Store, session: &str, hold: &holds::Hold) {
+    let mut r = row(session);
+    r.provider = "claude".into();
+    s.put_session(&r).unwrap();
+    s.insert_worker(&Worker {
+        id: 0,
+        assignment: hold.message.id.clone(),
+        session: session.into(),
+        provider: "claude".into(),
+        folder: "/w/r1".into(),
+        pid: Some(1),
+        started_at: 1,
+        ended_at: None,
+        state: "running".into(),
+        by: None,
+    })
+    .unwrap();
+}
+
+const FOLDER: &str = "/w";
+
+fn dlg(s: &Store, r: &Roster, me: &Identity, h: &holds::Hold) -> (String, Vec<&'static str>) {
+    let (t, b, _) = holds::dialog(s, r, &me.key, h, Path::new(FOLDER));
+    (t, b)
+}
+
+fn ans(
+    s: &Store,
+    r: &Roster,
+    me: &Identity,
+    h: &holds::Hold,
+    scope: &str,
+    by: &str,
+    now: i64,
+) -> Result<(), &'static str> {
+    holds::answer(s, r, me, Path::new(FOLDER), h.id, true, scope, by, now)
+        .unwrap()
+        .map(|_| ())
+}
+
+#[test]
+fn a_hold_on_an_assign_is_a_worker_hold() {
+    let (_d, s, r, me, aden) = lib();
+    let from = format!("{}/codex:a1", aden.short);
+    let h = assign_hold(
+        &s,
+        &from,
+        &aden.key,
+        &format!("{}/claude:new", me.short),
+        None,
+    );
+    assert_eq!(h.kind(), holds::Kind::Worker);
+    let (text, buttons) = dlg(&s, &r, &me, &h);
+    assert!(text.starts_with("aden"), "{text}");
+    assert!(
+        text.contains("wants to start a claude worker in /w/r-"),
+        "{text}"
+    );
+    assert!(text.ends_with(": \"fix the build\""), "{text}");
+    assert_eq!(buttons, ["Decline", "Allow", "Always allow"]);
+}
+
+#[test]
+fn a_worker_prompt_hold_shows_the_worker_and_three_buttons() {
+    let (_d, s, r, me, aden) = lib();
+    let from = format!("{}/codex:a1", aden.short);
+    let w = format!("{}/claude:w1", me.short);
+    let a = assign_hold(
+        &s,
+        &from,
+        &aden.key,
+        &format!("{}/claude:new", me.short),
+        None,
+    );
+    running_worker(&s, &w, &a);
+    let p = holds::file_permission(&s, &w, "Bash: rm -rf build", 1_000).unwrap();
+    assert!(holds::is_workers(&s, &w));
+    let (text, buttons) = dlg(&s, &r, &me, &p);
+    assert!(text.starts_with("aden"), "{text}");
+    assert!(
+        text.ends_with("worker claude-1 (claude) in /w/r1 wants to: Bash: rm -rf build"),
+        "{text}"
+    );
+    assert_eq!(buttons, ["Decline", "Allow", "Stop worker"]);
+}
+
+#[test]
+fn an_allow_after_the_deadline_is_not_open() {
+    let (_d, s, r, me, aden) = lib();
+    let from = format!("{}/codex:a1", aden.short);
+    let h = assign_hold(
+        &s,
+        &from,
+        &aden.key,
+        &format!("{}/claude:new", me.short),
+        Some(2_000),
+    );
+    // Not due yet: still open. At the deadline an Allow is refused even before the timer ran.
+    assert!(holds::expire(&s, 1_999).unwrap().is_empty());
+    assert_eq!(
+        ans(&s, &r, &me, &h, "once", "local", 2_000),
+        Err("not_open")
+    );
+    assert_eq!(ids(holds::expire(&s, 2_000).unwrap()), [h.id]);
+    assert_eq!(holds::get(&s, h.id).unwrap().unwrap().state, "expired");
+    assert_eq!(
+        ans(&s, &r, &me, &h, "once", "local", 2_001),
+        Err("not_open")
+    );
+}
+
+#[test]
+fn a_workers_prompt_hold_outlives_permission_s() {
+    let (_d, s, _r, me, aden) = lib();
+    let from = format!("{}/codex:a1", aden.short);
+    let w = format!("{}/claude:w1", me.short);
+    let a = assign_hold(
+        &s,
+        &from,
+        &aden.key,
+        &format!("{}/claude:new", me.short),
+        None,
+    );
+    running_worker(&s, &w, &a);
+    let p = holds::file_permission(&s, &w, "ok?", 1_000).unwrap();
+    assert!(holds::expire(&s, 1_000 + holds::PERMISSION_S + 1)
+        .unwrap()
+        .is_empty());
+    // Gone with its session.
+    s.end_session(&w, 5_000).unwrap();
+    assert_eq!(ids(holds::expire(&s, 5_001).unwrap()), [p.id]);
+}
+
+#[test]
+fn an_agent_cannot_answer_a_workers_holds() {
+    let (_d, s, r, me, aden) = lib();
+    let from = format!("{}/codex:a1", aden.short);
+    let w = format!("{}/claude:w1", me.short);
+    let agent = format!("{}/claude-3", me.short);
+    let a = assign_hold(
+        &s,
+        &from,
+        &aden.key,
+        &format!("{}/claude:new", me.short),
+        None,
+    );
+    running_worker(&s, &w, &a);
+    let p = holds::file_permission(&s, &w, "ok?", 1_000).unwrap();
+    for h in [&a, &p] {
+        assert_eq!(
+            ans(&s, &r, &me, h, "once", &agent, 1_001),
+            Err("not_a_person")
+        );
+        assert_eq!(
+            ans(&s, &r, &me, h, "once", "agent", 1_001),
+            Err("not_a_person")
+        );
+        assert!(holds::get(&s, h.id).unwrap().unwrap().is_open());
+    }
+    // A plain app-filed prompt still takes an agent, and a person takes a worker's.
+    let k = format!("{}/codex:c1", me.short);
+    s.put_session(&row(&k)).unwrap();
+    let plain = holds::file_permission(&s, &k, "ok?", 1_000).unwrap();
+    assert!(ans(&s, &r, &me, &plain, "once", &agent, 1_001).is_ok());
+    assert!(ans(&s, &r, &me, &p, "once", "local", 1_001).is_ok());
+}
+
+#[test]
+fn always_allow_writes_the_policy() {
+    let (_d, s, r, me, aden) = lib();
+    let from = format!("{}/codex:a1", aden.short);
+    let to = format!("{}/claude:new", me.short);
+    assert_eq!(
+        workers::policy(&s, &me.key, &aden.key).unwrap(),
+        Policy::Ask
+    );
+    let once = assign_hold(&s, &from, &aden.key, &to, None);
+    assert!(ans(&s, &r, &me, &once, "once", "local", 1_001).is_ok());
+    assert_eq!(
+        workers::policy(&s, &me.key, &aden.key).unwrap(),
+        Policy::Ask
+    );
+    let h = assign_hold(&s, &from, &aden.key, &to, None);
+    assert!(ans(&s, &r, &me, &h, "always", "local", 1_002).is_ok());
+    assert_eq!(
+        workers::policy(&s, &me.key, &aden.key).unwrap(),
+        Policy::Allow
+    );
+    let scope: String = rusqlite::Connection::open(_d.path().join("state.db"))
+        .unwrap()
+        .query_row(
+            "SELECT scope FROM approvals WHERE hold_id = ?1",
+            [h.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(scope, "always");
+    // "always" means nothing on a prompt or a decline.
+    let k = format!("{}/codex:c1", me.short);
+    s.put_session(&row(&k)).unwrap();
+    let plain = holds::file_permission(&s, &k, "ok?", 1_000).unwrap();
+    assert_eq!(
+        ans(&s, &r, &me, &plain, "always", "local", 1_003),
+        Err("bad_request")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lightbulb_held_prints_the_dialog_text_and_the_kind() {
+    let a = Env::new();
+    a.daemon(false, "", &[]);
+    let key = register(&a, "claude", "c1", "/tmp/app");
+    let r = person(
+        &a,
+        json!({"id": 1, "op": "hold.file", "kind": "permission", "session": key, "prompt": "ok?"}),
+    );
+    assert_eq!(r["ok"], true, "{r}");
+    let o = a.detached(&[common::EXE, "held"], "");
+    assert_eq!(
+        common::out(&o),
+        "H1  permission  Claude Code asks: \"ok?\"  — lightbulb approve H1\n"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn approve_always_is_an_allow_with_scope_always() {
+    let a = Env::new();
+    // A worker-start hold seeded before the daemon starts (nothing creates one yet).
+    let db = a.state.path().join("state.db");
+    {
+        let s = Store::open(&db).unwrap();
+        assign_hold(&s, "bob/codex:b1", "bobkey", "me/claude:new", None);
+    }
+    a.daemon(false, "", &[]);
+    let o = a.detached(&[common::EXE, "approve", "H1", "--always"], "");
+    assert_eq!(
+        common::out(&o),
+        "Allowed H1 (always).\n",
+        "{}",
+        common::err(&o)
+    );
+    let scope: String = rusqlite::Connection::open(&db)
+        .unwrap()
+        .query_row("SELECT scope FROM approvals WHERE hold_id = 1", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let s = Store::open(&db).unwrap();
+    assert_eq!(scope, "always");
+    assert_eq!(workers::policy(&s, "x", "bobkey").unwrap(), Policy::Allow);
+}

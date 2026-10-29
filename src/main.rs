@@ -220,8 +220,13 @@ enum Command {
         #[arg(long, value_parser = ["on", "off"], conflicts_with = "version")]
         auto: Option<String>,
     },
-    /// Allow a permission prompt (`H<n>`).
-    Approve { request: String },
+    /// Allow a permission prompt or a worker start (`H<n>`); `--always` also allows that member's
+    /// workers from now on.
+    Approve {
+        request: String,
+        #[arg(long)]
+        always: bool,
+    },
     /// Decline a permission prompt (`H<n>`).
     Decline { request: String },
     /// The permission prompts waiting for your answer.
@@ -401,8 +406,8 @@ fn run() -> lightbulb::Result<()> {
             println!("Automatic updates {a}.");
         }
         Command::Update { version, .. } => exit(cli::update(version)?),
-        Command::Approve { request } => exit(cli::answer(&request, true)?),
-        Command::Decline { request } => exit(cli::answer(&request, false)?),
+        Command::Approve { request, always } => exit(cli::answer(&request, true, always)?),
+        Command::Decline { request } => exit(cli::answer(&request, false, false)?),
         Command::Held => exit(cli::held()?),
         Command::Telemetry { state } => exit(lightbulb::telemetry::command(
             &lightbulb::paths::state_dir(),

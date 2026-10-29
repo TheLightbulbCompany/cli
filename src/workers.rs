@@ -84,6 +84,11 @@ pub fn folder(config: &Config) -> PathBuf {
     expand_home(&config.workers_folder)
 }
 
+/// A person asked to stop the worker `session` (the dialog's Stop worker). Task 4 fills it.
+pub fn stop_requested(_d: &std::sync::Arc<crate::daemon::Daemon>, session: &str, by: &str) {
+    eprintln!("worker stop requested session={session} by={by}");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
