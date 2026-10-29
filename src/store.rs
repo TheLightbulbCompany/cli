@@ -262,7 +262,6 @@ fn row_session(r: &rusqlite::Row) -> rusqlite::Result<Session> {
     })
 }
 
-/// A `messages` row, read by column name (so `m.*` in a join reads too).
 /// A headless worker this computer started for an assignment (`workers` table).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Worker {
@@ -293,6 +292,7 @@ fn row_worker(r: &rusqlite::Row) -> rusqlite::Result<Worker> {
     })
 }
 
+/// A `messages` row, read by column name (so `m.*` in a join reads too).
 pub(crate) fn row_message(r: &rusqlite::Row) -> rusqlite::Result<Message> {
     Ok(Message {
         id: r.get("id")?,
@@ -572,7 +572,7 @@ impl Store {
     pub fn insert_worker(&self, w: &Worker) -> rusqlite::Result<i64> {
         self.conn.execute(
             "INSERT INTO workers (assignment, session, provider, folder, pid, started_at, \
-             ended_at, state, by) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             ended_at, state, \"by\") VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 w.assignment,
                 w.session,
@@ -623,13 +623,13 @@ impl Store {
         now: i64,
     ) -> rusqlite::Result<()> {
         self.conn.execute(
-            "UPDATE workers SET state = ?2, by = ?3, ended_at = ?4 WHERE id = ?1",
+            "UPDATE workers SET state = ?2, \"by\" = ?3, ended_at = ?4 WHERE id = ?1",
             params![id, state, by, now],
         )?;
         Ok(())
     }
 
-    pub fn set_worker_running(&self, id: i64, pid: u32, _now: i64) -> rusqlite::Result<()> {
+    pub fn set_worker_running(&self, id: i64, pid: u32) -> rusqlite::Result<()> {
         self.conn.execute(
             "UPDATE workers SET state = 'running', pid = ?2 WHERE id = ?1",
             params![id, pid],
@@ -1358,7 +1358,7 @@ mod tests {
             Some(w.clone())
         );
         assert_eq!(store.worker_by_assignment("a1").unwrap(), Some(w));
-        store.set_worker_running(id, 42, 6).unwrap();
+        store.set_worker_running(id, 42).unwrap();
         assert_eq!(store.workers(true).unwrap()[0].pid, Some(42));
         store.end_worker(id, "done", None, 9).unwrap();
         assert!(store.workers(true).unwrap().is_empty());
