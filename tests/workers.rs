@@ -1816,13 +1816,24 @@ fn acp_folder_bypass(h: &'static str, file: &str, text: &str) {
 }
 
 #[test]
-fn cursor_a_worktree_that_allows_everything_refuses_the_start() {
+fn cursor_a_worktree_that_allows_a_command_refuses_the_start() {
     acp_folder_bypass(
         "cursor",
-        ".cursor/cli-config.json",
-        r#"{"approvalMode": "unrestricted"}"#,
+        ".cursor/cli.json",
+        r#"{"permissions": {"allow": ["Shell(ls)"]}}"#,
     );
 }
+
+#[test]
+fn cursor_a_worktree_with_its_own_hooks_refuses_the_start() {
+    acp_folder_bypass("cursor", ".cursor/hooks.json", r#"{"version": 1, "hooks": {}}"#);
+}
+
+#[test]
+fn cursor_a_worktree_with_its_own_mcp_servers_refuses_the_start() {
+    acp_folder_bypass("cursor", ".cursor/mcp.json", r#"{"mcpServers": {}}"#);
+}
+
 
 #[test]
 fn grok_a_worktree_that_skips_approvals_refuses_the_start() {

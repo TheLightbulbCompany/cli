@@ -25,6 +25,8 @@ pub struct Acp {
     folder: OnceLock<String>,
     /// The harness's check of a worker's folder (`Driver::refuses`).
     folder_check: Option<fn(&Path) -> Option<String>>,
+    /// Its child's environment changes (`Driver::env`).
+    env: Vec<(&'static str, Option<String>)>,
 }
 
 impl Acp {
@@ -35,7 +37,13 @@ impl Acp {
             args,
             folder: OnceLock::new(),
             folder_check: None,
+            env: vec![],
         }
+    }
+
+    /// This driver, its child's environment changed by `env` (`Driver::env`).
+    pub fn with_env(self, env: Vec<(&'static str, Option<String>)>) -> Acp {
+        Acp { env, ..self }
     }
 
     /// This driver, refusing a folder `check` names a reason for.
@@ -61,6 +69,11 @@ impl Driver for Acp {
     fn refuses(&self, folder: &Path) -> Option<String> {
         self.folder_check.and_then(|check| check(folder))
     }
+
+    fn env(&self) -> Vec<(&'static str, Option<String>)> {
+        self.env.clone()
+    }
+
 
     fn run(self: Box<Self>, child: Child, first_prompt: String, relay: Relay) -> Run {
         let folder = self.folder.get().cloned().unwrap_or_default();
