@@ -1,6 +1,8 @@
 //! Codex: hooks in `~/.codex/hooks.json`, trusted in `~/.codex/config.toml`
 //! (`[hooks.state."<hooks.json>:<event>:<group>:0"]`; Codex skips an untrusted group
-//! silently), and `[mcp_servers.<name>]` in the same `config.toml`.
+//! silently), and `[mcp_servers.<name>]` in the same `config.toml`, with
+//! `default_tools_approval_mode = "approve"`: our tools carry no annotations, so Codex's
+//! default ("auto") asks before every call, and `codex exec` (approval "never") refuses them.
 
 use super::{
     edit_json, edit_toml, set_hook_group, set_toml_server, toml_table, AgentReport, Ctx, Owner,
@@ -49,7 +51,11 @@ pub(super) fn configure(ctx: &Ctx, r: &mut AgentReport) -> Result<Owner> {
         owner = set_toml_server(
             ctx,
             doc,
-            &[("command", ctx.exe.into()), ("args", args.into())],
+            &[
+                ("command", ctx.exe.into()),
+                ("args", args.into()),
+                ("default_tools_approval_mode", "approve".into()),
+            ],
         )?;
         for (key, hash) in &trust {
             match hash {
