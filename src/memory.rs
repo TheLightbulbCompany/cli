@@ -103,6 +103,9 @@ pub struct Fact {
     pub kind: Kind,
     pub scope: Scope,
     pub author: String,
+    /// The person the signer wrote for (the workspace agent signs for many); the page counts
+    /// `on_behalf_of`, else `author`, as the person.
+    pub on_behalf_of: Option<String>,
     pub when: i64,
     pub status: Status,
     /// What this replaced, oldest first: (entry id, value, stamp).
@@ -488,6 +491,7 @@ fn replay(store: &Store) -> Result<Vec<Live>> {
                     kind,
                     scope,
                     author: e.author,
+                    on_behalf_of: source.on_behalf_of,
                     when: when.unwrap_or(e.at),
                     status: Status::Current,
                     history: Vec::new(),
@@ -853,10 +857,6 @@ pub fn trim_evidence(facts: &mut Vec<Fact>, turns: &mut Vec<crate::capture::Turn
     turns.truncate(kept - keep_facts);
 }
 
-/// What an agent reads: `Contested:` lines, then `Current:`, then `Lessons:` (replaced facts
-/// left out), then `Turns:` (excerpts of this computer's own session turns), whole lines only,
-/// within `budget` chars. `names` maps a member key to the name
-/// shown (the short key when it is not there).
 /// The heading and the instruction line a session-start block carries around the page.
 pub const BLOCK_HEADING: &str = "Memory (team and yours):";
 pub const BLOCK_INSTRUCTION: &str = "Call `recall` when a task needs something a teammate may know; call `remember` when you finish a task or are told to remember. Personal unless the person says to share.";
@@ -869,12 +869,27 @@ pub fn block(page: &str) -> String {
     format!("{BLOCK_HEADING}\n{page}\n{BLOCK_INSTRUCTION}")
 }
 
+/// Lines of one subject on the session-start block (its newest): one subject with many values
+/// must not fill the 1,600 characters. A question's page has no cap (its trim governs it).
+pub const START_LINES_PER_SUBJECT: usize = 3;
+
+/// What an agent reads, whole lines only, within `budget` chars and at most `per_subject` lines
+/// of one subject (in `facts`' order):
+/// - `Contested:`: a subject on which two or more people (`on_behalf_of`, else the signing
+///   author) hold different values, as one "a vs b" line of each person's newest value;
+/// - `Current:`: every other fact, one dated line each, a contested person's older values
+///   included;
+/// - `Lessons:`; replaced facts are left out;
+/// - `Turns:`: excerpts of this computer's own session turns.
+///
+/// `names` maps a member key to the name shown (the short key when it is not there).
 pub fn page(
     store: &Store,
     facts: &[Fact],
     turns: &[crate::capture::TurnHit],
     names: &HashMap<String, String>,
     budget: usize,
+    per_subject: usize,
 ) -> String {
     let who = |key: &str| {
         names
@@ -892,36 +907,68 @@ pub fn page(
             )
             .map_or_else(|_| "?".into(), |k| who(&k))
     };
+    // A line's date is the whole day, year included: a page can span years.
+    let ymd = |secs: i64| crate::date::utc(secs)[..10].to_string();
+    // A "vs" value is labelled with its person, as the grouping counts them.
     let by = |f: &Fact| {
-        format!(
-            "{} ({}, {})",
-            f.value,
-            who(&f.author),
-            crate::date::day(f.when)
-        )
+        let person = f.on_behalf_of.as_deref().unwrap_or(&f.author);
+        format!("{} ({}, {})", f.value, who(person), ymd(f.when))
+    };
+    // Contested only when two people hold different values. One person's values of one subject
+    // are that person's own notes over time: each prints as its own dated line, in rank order,
+    // instead of one "a vs b vs c" line (BEAM 100K: a broad subject gathered a median 17 values).
+    // In a contested subject the "vs" line carries each person's newest value; their older
+    // values print as Current lines.
+    let key = |f: &Fact| (f.scope == Scope::Team, f.subject.trim().to_lowercase());
+    let person = |f: &Fact| f.on_behalf_of.clone().unwrap_or_else(|| f.author.clone());
+    let mut newest: HashMap<(bool, String), HashMap<String, &Fact>> = HashMap::new();
+    for f in facts.iter().filter(|f| f.status == Status::Contested) {
+        let by_person = newest.entry(key(f)).or_default();
+        let n = by_person.entry(person(f)).or_insert(f);
+        if f.when > n.when {
+            *n = f;
+        }
+    }
+    let in_vs_line = |f: &Fact| {
+        f.status == Status::Contested
+            && newest[&key(f)].len() > 1
+            && std::ptr::eq(newest[&key(f)][&person(f)], f)
     };
     let (mut contested, mut current, mut lessons) = (Vec::new(), Vec::new(), Vec::new());
     let mut groups: Vec<((Scope, String), Vec<String>)> = Vec::new();
+    let mut lines_of: HashMap<(bool, String), usize> = HashMap::new();
     for f in facts {
-        match (f.status, f.kind) {
-            (Status::Replaced, _) => {}
-            (Status::Contested, _) => {
-                let key = (f.scope, f.subject.trim().to_lowercase());
-                match groups.iter_mut().find(|(k, _)| *k == key) {
+        if f.status == Status::Replaced {
+            continue;
+        }
+        let k = key(f);
+        let joins = in_vs_line(f) && groups.iter().any(|(g, _)| *g == (f.scope, k.1.clone()));
+        // A new line of this subject (a fact joining its "vs" line is not one).
+        if !joins {
+            let n = lines_of.entry(k.clone()).or_default();
+            if *n >= per_subject {
+                continue;
+            }
+            *n += 1;
+        }
+        match f.kind {
+            _ if in_vs_line(f) => {
+                let key = (f.scope, k.1);
+                match groups.iter_mut().find(|(g, _)| *g == key) {
                     Some((_, v)) => v.push(by(f)),
                     None => groups.push((key, vec![format!("{}: {}", f.subject, by(f))])),
                 }
             }
-            (_, kind) => {
+            kind => {
                 let was = f.history.last().map_or(String::new(), |(id, v, when)| {
-                    format!("; was {v}, {}, {}", author_of(id), crate::date::day(*when))
+                    format!("; was {v}, {}, {}", author_of(id), ymd(*when))
                 });
                 let line = format!(
                     "{}: {} ({}, {}{was})",
                     f.subject,
                     f.value,
                     who(&f.author),
-                    crate::date::day(f.when)
+                    ymd(f.when)
                 );
                 if kind == Kind::Lesson {
                     &mut lessons

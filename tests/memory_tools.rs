@@ -51,12 +51,28 @@ fn test_remember_conflict_without_replaces_is_contested() {
 
     let r = recall(&e, "launch date", None);
     let page = r["page"].as_str().unwrap();
-    assert!(page.starts_with("Contested:\nlaunch date: "), "{page}");
+    // One author's two values are that author's notes over time: two dated lines, not a
+    // "Contested" one (the facts stay contested in the JSON).
+    let day = |s: i64| lightbulb::date::utc(s)[..10].to_string();
+    assert!(page.starts_with("Current:\n"), "{page}");
     assert!(
-        page.contains("3 March (") && page.contains(") vs 10 March ("),
+        !page.contains("Contested:") && !page.contains(" vs "),
         "{page}"
     );
-    assert!(!page.contains("Current:"), "{page}");
+    assert!(
+        page.contains(&format!(
+            "launch date: 3 March (prasiddha, {})",
+            day(1_700_000_000)
+        )),
+        "{page}"
+    );
+    assert!(
+        page.contains(&format!(
+            "launch date: 10 March (prasiddha, {})",
+            day(1_700_100_000)
+        )),
+        "{page}"
+    );
     assert!(r["facts"]
         .as_array()
         .unwrap()
@@ -106,7 +122,7 @@ fn remember_refuses_secret_with_reason() {
 }
 
 #[test]
-fn recall_page_puts_contested_first_and_respects_budget() {
+fn one_persons_values_are_dated_current_lines_and_the_page_cuts_on_a_line() {
     let e = daemon();
     remember(&e, "alpha", "one", "fact", json!({}));
     remember(&e, "beta", "two", "lesson", json!({"scope": "team"}));
@@ -114,14 +130,16 @@ fn recall_page_puts_contested_first_and_respects_budget() {
         remember(&e, "colour", v, "preference", json!({"when": when}));
     }
     let page = recall(&e, "", None)["page"].as_str().unwrap().to_string();
+    // One person's two colours are two dated lines; Contested needs two people
+    // (memory_store: the_page_says_contested_only_when_two_people_disagree).
     let (c, cur, l) = (
         page.find("Contested:"),
         page.find("Current:"),
         page.find("Lessons:"),
     );
-    assert!(c < cur && cur < l && c == Some(0), "{page}");
+    assert!(c.is_none() && cur == Some(0) && cur < l, "{page}");
     assert!(
-        page.contains("colour: blue (") && page.contains(") vs red ("),
+        page.contains("colour: blue (") && page.contains("colour: red ("),
         "{page}"
     );
     assert!(
@@ -129,14 +147,14 @@ fn recall_page_puts_contested_first_and_respects_budget() {
         "{page}"
     );
 
-    // Cut on a line boundary: room for the contested line only.
+    // Cut on a line boundary: room for the first line only.
     let first_line = page.lines().nth(1).unwrap();
-    let budget = "Contested:\n".len() + first_line.len() + 1;
+    let budget = "Current:\n".len() + first_line.len() + 1;
     let cut = recall(&e, "", Some(budget as u64))["page"]
         .as_str()
         .unwrap()
         .to_string();
-    assert_eq!(cut, format!("Contested:\n{first_line}"));
+    assert_eq!(cut, format!("Current:\n{first_line}"));
     assert_eq!(recall(&e, "", Some(3))["page"], "");
 }
 
@@ -405,4 +423,66 @@ fn the_start_block_keeps_its_1600_characters() {
         asked["page"].as_str().unwrap().chars().count() > 1600,
         "{asked}"
     );
+}
+
+/// The start block, asked as the hook asks it, shows at most three lines of one subject (its
+/// newest), so one subject with 20 values cannot fill the 1,600 characters; a question's page
+/// is not capped.
+#[test]
+fn the_start_block_shows_three_lines_of_one_subject() {
+    let e = daemon();
+    let me = lightbulb::os::process(std::process::id()).unwrap();
+    let r = e.ask(
+        json!({"id": 1, "op": "register", "session": {"provider": "claude",
+        "conversation": "s1", "pid": me.pid, "birth_micros": me.birth_micros, "cwd": "/tmp",
+        "repo": "engine"}}),
+    );
+    let key = r["key"].as_str().unwrap().to_string();
+    for i in 0..20 {
+        let when = 1_700_000_000 + i * 86_400;
+        let r = remember(
+            &e,
+            "deploy window",
+            &format!("window {i}"),
+            "fact",
+            json!({"session": key, "when": when}),
+        );
+        assert_eq!(r["stored"], true, "{r}");
+    }
+    for s in ["db", "ci"] {
+        remember(
+            &e,
+            s,
+            &format!("{s} value"),
+            "fact",
+            json!({"session": key}),
+        );
+    }
+    let start = e.ask(
+        json!({"id": 5, "op": "memory.recall", "question": "", "repo": "engine",
+        "budget_chars": 1600, "session": key}),
+    );
+    let page = start["page"].as_str().unwrap();
+    let windows: Vec<&str> = page
+        .lines()
+        .filter(|l| l.starts_with("deploy window: "))
+        .collect();
+    assert_eq!(windows.len(), 3, "{page}");
+    for (line, i) in windows.iter().zip([19, 18, 17]) {
+        assert!(
+            line.starts_with(&format!("deploy window: window {i} (")),
+            "{page}"
+        );
+    }
+    assert!(
+        page.contains("db: db value (") && page.contains("ci: ci value ("),
+        "{page}"
+    );
+    let asked = recall(&e, "deploy window", None);
+    let all = asked["page"]
+        .as_str()
+        .unwrap()
+        .matches("deploy window: ")
+        .count();
+    assert_eq!(all, 20, "{asked}");
 }
