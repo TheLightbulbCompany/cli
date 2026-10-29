@@ -99,6 +99,10 @@ pub struct Knobs {
     pub claude_program: Option<PathBuf>,
     /// The Codex a worker runs, or `LIGHTBULB_CONNECT_DEBUG_CODEX` (a fake harness).
     pub codex_program: Option<PathBuf>,
+    /// The Cursor Agent a worker runs, or `LIGHTBULB_CONNECT_DEBUG_CURSOR` (a fake harness).
+    pub cursor_program: Option<PathBuf>,
+    /// The Grok CLI a worker runs, or `LIGHTBULB_CONNECT_DEBUG_GROK` (a fake harness).
+    pub grok_program: Option<PathBuf>,
 }
 
 /// Off macOS there is no dialog program: an empty one answers nothing (`dialog::Queue`).
@@ -152,6 +156,8 @@ impl Knobs {
                 .is_some_and(|v| v == "1"),
             claude_program: var("LIGHTBULB_CONNECT_DEBUG_CLAUDE").map(Into::into),
             codex_program: var("LIGHTBULB_CONNECT_DEBUG_CODEX").map(Into::into),
+            cursor_program: var("LIGHTBULB_CONNECT_DEBUG_CURSOR").map(Into::into),
+            grok_program: var("LIGHTBULB_CONNECT_DEBUG_GROK").map(Into::into),
         }
     }
 
@@ -172,6 +178,8 @@ impl Knobs {
             no_default_relays: false,
             claude_program: None,
             codex_program: None,
+            cursor_program: None,
+            grok_program: None,
         }
     }
 }

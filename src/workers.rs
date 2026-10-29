@@ -5,7 +5,9 @@
 pub mod acp;
 pub mod claude;
 pub mod codex;
+pub mod cursor;
 mod driver;
+pub mod grok;
 
 pub use driver::{
     driver_for, launchable, Decision, Driver, Outcome, PermissionRequest, Relay, Run,
@@ -1493,7 +1495,7 @@ mod tests {
         assert!(launchable(
             &claude::Claude::new("claude".into()).argv(folder, "s1")
         ));
-        for provider in ["claude", "codex"] {
+        for provider in ["claude", "codex", "cursor", "grok"] {
             if let Some(Ok(d)) = driver_for(provider, peers.knobs(), dir.path(), &s) {
                 let argv = d.argv(folder, "s1");
                 assert!(launchable(&argv), "{provider}: {argv:?}");

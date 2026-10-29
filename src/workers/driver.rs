@@ -85,6 +85,14 @@ pub fn driver_for(
             let c = super::codex::Codex::here(knob, home, store);
             Some(c.map(|c| Box::new(c) as Box<dyn Driver>))
         }
+        "cursor" => {
+            let c = super::cursor::here(knobs.cursor_program.as_deref(), home, store);
+            Some(c.map(|c| Box::new(c) as Box<dyn Driver>))
+        }
+        "grok" => {
+            let g = super::grok::here(knobs.grok_program.as_deref(), home, store);
+            Some(g.map(|g| Box::new(g) as Box<dyn Driver>))
+        }
         _ => None,
     }
 }
@@ -107,6 +115,30 @@ pub fn registered(store: &Store, provider: &str) -> Vec<PathBuf> {
         .into_iter()
         .map(PathBuf::from)
         .collect()
+}
+
+/// The first executable file of: `knob` (when set, the only one: a test never reaches a real
+/// harness); `known`; the newest registered `provider` session's executable when its file name
+/// is one of `names`; `names[0]` on `path`.
+pub fn find(
+    knob: Option<&Path>,
+    known: Vec<PathBuf>,
+    store: &Store,
+    provider: &str,
+    names: &[&str],
+    path: Option<&OsStr>,
+) -> Option<PathBuf> {
+    if let Some(k) = knob {
+        return executable(k).then(|| k.into());
+    }
+    let registered = registered(store, provider)
+        .into_iter()
+        .filter(|p| p.file_name().is_some_and(|n| names.iter().any(|w| n == *w)));
+    known
+        .into_iter()
+        .chain(registered)
+        .chain(on_path(path, names[0]))
+        .find(|p| executable(p))
 }
 
 /// `name` in each directory of `path`.
@@ -269,8 +301,39 @@ fn child_path(program: &str) -> std::ffi::OsString {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::launchable;
+    use crate::store::Store;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+
+    /// An executable script at `p`.
+    pub fn exe(p: &Path) -> PathBuf {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p.into()
+    }
+
+    /// Registers a `provider` session `key` that ran `exe`, seen at `seen_at`.
+    pub fn session(s: &Store, provider: &str, key: &str, exe: &Path, seen_at: i64) {
+        s.put_session(&crate::store::Session {
+            key: key.into(),
+            provider: provider.into(),
+            conversation: None,
+            pid: None,
+            birth_micros: None,
+            cwd: "/".into(),
+            title: None,
+            status: "idle".into(),
+            seen_at,
+            executable: Some(exe.to_string_lossy().into()),
+            repo: None,
+            branch: None,
+            handle: None,
+        })
+        .unwrap();
+    }
 
     fn argv(args: &[&str]) -> Vec<String> {
         ["x"].iter().chain(args).map(|a| a.to_string()).collect()

@@ -1,6 +1,7 @@
 //! Network workers, end to end (spec §8 rows 3-7, 11-15): B offers Claude Code workers (a fake
 //! harness, `tests/fixtures/workers/fake-claude.py`, speaking its stream-json protocol) or Codex
-//! ones (`fake-codex.py`, app-server JSON-RPC), A assigns work to `<B>/<harness>:new`. Real
+//! ones (`fake-codex.py`, app-server JSON-RPC) or Cursor and Grok ones (`fake-acp.py`, ACP), A
+//! assigns work to `<B>/<harness>:new`. Real
 //! daemons; B's dialogs are a fake `osascript` the test clicks (`Pair::click`), or a fixed answer.
 
 use lightbulb::store::Worker;
@@ -20,6 +21,10 @@ const FAKE_CODEX: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/workers/fake-codex.py"
 );
+const FAKE_ACP: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/workers/fake-acp.py"
+);
 
 /// How B is set up.
 #[derive(Default)]
@@ -36,8 +41,9 @@ struct Opts {
     env: Vec<(&'static str, String)>,
     /// More of A's environment.
     a_env: Vec<(&'static str, String)>,
-    /// B offers Codex workers (`fake-codex.py`) instead of Claude Code ones.
-    codex: bool,
+    /// The harness B offers: `codex` (`fake-codex.py`), `cursor` or `grok` (`fake-acp.py`);
+    /// empty: Claude Code (`fake-claude.py`).
+    harness: &'static str,
 }
 
 /// A asks, B hosts workers in `work`; `ui` keeps the fake dialogs and the fake harness's log.
@@ -88,20 +94,40 @@ fn hosted(script: Value, o: Opts) -> Pair {
             .birth_micros;
         b.pin = Some(format!("{}:{birth}", std::process::id()));
     }
-    let harness = if o.codex { "codex" } else { "claude" };
     let log = ui.path().join("fake.log").display().to_string();
-    let mut env = if o.codex {
-        vec![
-            ("LIGHTBULB_CONNECT_DEBUG_CODEX", FAKE_CODEX.to_string()),
-            ("FAKE_CODEX_SCRIPT", script.to_string()),
-            ("FAKE_CODEX_LOG", log),
-        ]
-    } else {
-        vec![
-            ("LIGHTBULB_CONNECT_DEBUG_CLAUDE", FAKE.to_string()),
-            ("FAKE_CLAUDE_SCRIPT", script.to_string()),
-            ("FAKE_CLAUDE_LOG", log),
-        ]
+    let (harness, mut env) = match o.harness {
+        "codex" => (
+            "codex",
+            vec![
+                ("LIGHTBULB_CONNECT_DEBUG_CODEX", FAKE_CODEX.to_string()),
+                ("FAKE_CODEX_SCRIPT", script.to_string()),
+                ("FAKE_CODEX_LOG", log),
+            ],
+        ),
+        h @ ("cursor" | "grok") => (
+            h,
+            vec![
+                (
+                    if h == "cursor" {
+                        "LIGHTBULB_CONNECT_DEBUG_CURSOR"
+                    } else {
+                        "LIGHTBULB_CONNECT_DEBUG_GROK"
+                    },
+                    FAKE_ACP.to_string(),
+                ),
+                ("FAKE_ACP_HARNESS", h.to_string()),
+                ("FAKE_ACP_SCRIPT", script.to_string()),
+                ("FAKE_ACP_LOG", log),
+            ],
+        ),
+        _ => (
+            "claude",
+            vec![
+                ("LIGHTBULB_CONNECT_DEBUG_CLAUDE", FAKE.to_string()),
+                ("FAKE_CLAUDE_SCRIPT", script.to_string()),
+                ("FAKE_CLAUDE_LOG", log),
+            ],
+        ),
     };
     match o.button {
         Some(button) => env.push(dialog(button)),
@@ -692,6 +718,52 @@ fn row_12_no_bypass_flag_in_argv() {
             .unwrap();
         assert_eq!(o.status.code(), Some(3), "{extra:?}");
     }
+    // Cursor and Grok launch exactly their ACP argv (a fake under `~/.local/bin` is found when
+    // no real one is installed), and their fake refuses any bypass word, and Grok any leader.
+    for (h, name, exact) in [
+        ("cursor", "cursor-agent", &["acp"][..]),
+        ("grok", "grok", &["agent", "--no-leader", "stdio"]),
+    ] {
+        std::os::unix::fs::symlink(FAKE_ACP, bin.join(name)).unwrap();
+        let d = workers::driver_for(h, knobs.knobs(), dir.path(), &store)
+            .expect("an ACP driver")
+            .expect("found");
+        let argv = d.argv(std::path::Path::new("/w/r1"), "s1");
+        assert_eq!(argv[1..], *exact, "{h}");
+        assert!(workers::launchable(&argv), "{argv:?}");
+        let fake = |args: &[&str]| {
+            Command::new(FAKE_ACP)
+                .env("FAKE_ACP_HARNESS", h)
+                .args(args)
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap()
+                .status
+                .code()
+        };
+        assert_eq!(fake(exact), Some(0), "{h}");
+        for flag in [
+            "--force",
+            "--yolo",
+            "--always-approve",
+            "--auto-review",
+            "--approve-mcps",
+            "--trust",
+            "--auto",
+            "--permission-mode=dontAsk",
+            "--permission-mode=bypassPermissions",
+            "--dangerously-skip-permissions",
+        ] {
+            let args: Vec<&str> = exact.iter().copied().chain([flag]).collect();
+            assert_eq!(fake(&args), Some(3), "{h} {flag}");
+        }
+    }
+    let o = Command::new(FAKE_ACP)
+        .env("FAKE_ACP_HARNESS", "grok")
+        .args(["agent", "stdio"])
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(3), "grok without --no-leader");
 }
 
 #[test]
@@ -1166,7 +1238,7 @@ fn row_10_a_start_dialog_up_at_workers_off_is_withdrawn_and_allow_starts_nothing
 /// B offers Codex workers (§8 rows 3, 5, 6): the same flow over the app-server protocol.
 fn codex() -> Opts {
     Opts {
-        codex: true,
+        harness: "codex",
         ..Opts::default()
     }
 }
@@ -1353,4 +1425,267 @@ fn codex_a_withdrawn_request_closes_its_hold_expired() {
     assert_eq!(h.state, "expired");
     // It was never answered.
     assert!(!p.harness_read().iter().any(|l| l["id"] == 100));
+}
+
+/// B offers `h` workers (`cursor` or `grok`, §8 rows 3, 5, 6): the same flow over ACP.
+fn acp(h: &'static str) -> Opts {
+    Opts {
+        harness: h,
+        ..Opts::default()
+    }
+}
+
+/// A command permission request, as Cursor and Grok send one.
+fn acp_ask(command: &str) -> Value {
+    json!({"ask": {"kind": "execute", "title": format!("Run {command}"),
+        "rawInput": {"command": command}}})
+}
+
+/// The answer the fake read to permission request `id`.
+fn acp_answer(p: &Pair, id: u64) -> Value {
+    let read = p.harness_read();
+    let answer = read
+        .iter()
+        .find(|l| l["id"] == id && l.get("method").is_none());
+    answer.expect("an answer")["result"].clone()
+}
+
+fn acp_row_3_allow(h: &'static str, name: &str, resume: &str) {
+    let p = hosted(
+        json!([acp_ask("rm -rf x"), {"result": "all green"}]),
+        acp(h),
+    );
+    p.assign("as1", "fix the build", 300);
+    p.wait_state("as1", "held");
+    let (_, text, buttons) = p.dialog(1);
+    assert!(
+        text.contains(&format!(
+            "wants to start a {name} worker in {}/",
+            p.folder()
+        )),
+        "{text}"
+    );
+    assert_eq!(buttons, ["Decline", "Allow", "Always allow"]);
+    p.click("Allow");
+
+    let (_, text, buttons) = p.dialog(2);
+    // Re-keyed to the session the harness named before the prompt.
+    let w = running(&p, 1).remove(0);
+    let session = w.session.split_once(':').unwrap().1.to_string();
+    assert!(session.starts_with("s-"), "{}", w.session);
+    assert!(
+        text.starts_with(&format!("worker {h}-1 ({h}) for prasiddha")),
+        "{text}"
+    );
+    // What Allow grants: the tool call's title, kind and command.
+    let at = format!(
+        " in {} wants to: execute: Run rm -rf x; execute; rm -rf x",
+        w.folder.display()
+    );
+    assert!(text.ends_with(&at), "{text}");
+    assert_eq!(buttons, ["Decline", "Allow", "Stop worker"]);
+    assert!(p.a.inbox(&p.asker()).is_empty());
+    p.click("Allow");
+
+    let r = p.result("as1", 15);
+    assert_eq!(
+        (&r["status"], &r["text"]),
+        (&json!("done"), &json!("all green")),
+        "{r}"
+    );
+    assert_eq!(r["from"], w.session.as_str(), "{r}");
+    until(10, "B's row reads done", || p.workers()[0].state == "done");
+    // The handshake, the session in the folder, the first prompt, the one-time answer.
+    let read = p.harness_read();
+    let method = |m: &str| read.iter().find(|l| l["method"] == m).cloned().unwrap();
+    let init = method("initialize");
+    assert_eq!(init["params"]["protocolVersion"], 1);
+    assert_eq!(init["params"]["clientInfo"]["name"], "lightbulb");
+    let new = method("session/new");
+    assert_eq!(
+        new["params"],
+        json!({"cwd": w.folder.display().to_string(), "mcpServers": []})
+    );
+    let prompt = method("session/prompt");
+    assert_eq!(prompt["params"]["sessionId"], session.as_str());
+    let text = &prompt["params"]["prompt"][0];
+    assert_eq!(text["type"], "text");
+    assert!(
+        text["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("[Lightbulb assignment from "),
+        "{prompt}"
+    );
+    assert_eq!(
+        acp_answer(&p, 100),
+        json!({"outcome": {"outcome": "selected", "optionId": "allow-once"}})
+    );
+    // `show` names the way back into the session.
+    let o =
+        p.b.detached(&[EXE, "workers", "show", &format!("{h}-1")], "");
+    let shown = common::out(&o);
+    assert!(shown.contains("all green"), "{shown}");
+    assert!(
+        shown.contains(&format!(
+            "Resume it: cd {} && {resume} {session}",
+            w.folder.display()
+        )),
+        "{shown}"
+    );
+}
+
+#[test]
+fn cursor_row_3_allow_starts_a_worker_whose_turn_is_the_result() {
+    acp_row_3_allow("cursor", "Cursor", "cursor-agent --resume");
+}
+
+#[test]
+fn grok_row_3_allow_starts_a_worker_whose_turn_is_the_result() {
+    acp_row_3_allow("grok", "Grok CLI", "grok -r");
+}
+
+fn acp_row_3_decline(h: &'static str) {
+    let p = hosted(
+        json!([acp_ask("rm -rf x"), {"result": "{last}"}]),
+        Opts {
+            always: true,
+            ..acp(h)
+        },
+    );
+    p.assign("as1", "careful", 300);
+    let (_, text, _) = p.dialog(1);
+    assert!(
+        text.ends_with("wants to: execute: Run rm -rf x; execute; rm -rf x"),
+        "{text}"
+    );
+    p.click("Decline");
+    let r = p.result("as1", 15);
+    assert_eq!(
+        (&r["status"], &r["text"]),
+        (&json!("done"), &json!("reject_once")),
+        "{r}"
+    );
+    assert_eq!(
+        acp_answer(&p, 100),
+        json!({"outcome": {"outcome": "selected", "optionId": "reject-once"}})
+    );
+}
+
+#[test]
+fn cursor_row_3_decline_sends_reject_once() {
+    acp_row_3_decline("cursor");
+}
+
+#[test]
+fn grok_row_3_decline_sends_reject_once() {
+    acp_row_3_decline("grok");
+}
+
+fn acp_row_5_cancel(h: &'static str) {
+    let p = hosted(
+        json!([{"sleep": 60}, {"result": "late"}]),
+        Opts {
+            always: true,
+            ..acp(h)
+        },
+    );
+    p.assign("as1", "take your time", 300);
+    let pid = running(&p, 1)[0].pid.unwrap();
+    assert!(!gone(pid));
+    p.cancel("as1");
+    until(10, "the worker's process is gone", || gone(pid));
+    until(15, "as1's result reads cancelled", || {
+        p.a.receipt(&p.asker(), "as1")["result"]["status"] == "cancelled"
+    });
+    until(10, "B's row reads cancelled", || {
+        p.workers()[0].state == "cancelled"
+    });
+}
+
+#[test]
+fn cursor_row_5_cancel_stops_it() {
+    acp_row_5_cancel("cursor");
+}
+
+#[test]
+fn grok_row_5_cancel_stops_it() {
+    acp_row_5_cancel("grok");
+}
+
+fn acp_row_6_deadline(h: &'static str) {
+    let p = hosted(
+        json!([{"say": "half done"}, {"sleep": 60}, {"result": "late"}]),
+        Opts {
+            always: true,
+            env: vec![("LIGHTBULB_CONNECT_DEBUG_OUTBOX_S", "1".into())],
+            a_env: vec![("LIGHTBULB_CONNECT_DEBUG_OUTBOX_S", "1".into())],
+            ..acp(h)
+        },
+    );
+    p.assign("as1", "too slow", 3);
+    let pid = running(&p, 1)[0].pid.unwrap();
+    until(10, "the worker is the session", || {
+        p.workers()[0].session.contains(&format!("/{h}:s-"))
+    });
+    // The host's own result, from the session's key, with what the worker had said so far.
+    let r = p.result_from("as1", &p.workers()[0].session, 15);
+    assert_eq!(
+        (&r["status"], &r["reason"], &r["text"]),
+        (&json!("failed"), &json!("timed_out"), &json!("half done")),
+        "{r}"
+    );
+    until(10, "the worker's process is gone", || gone(pid));
+    until(10, "B's row reads failed", || {
+        p.workers()[0].state == "failed"
+    });
+    assert_eq!(p.workers()[0].by.as_deref(), Some("deadline"));
+}
+
+#[test]
+fn cursor_row_6_deadline_stops_it() {
+    acp_row_6_deadline("cursor");
+}
+
+#[test]
+fn grok_row_6_deadline_stops_it() {
+    acp_row_6_deadline("grok");
+}
+
+/// ACP has no notification withdrawing a permission request: a harness that gives up on one
+/// moves on, and its hold closes when the worker ends.
+fn acp_withdrawn(h: &'static str) {
+    let mut ask = acp_ask("rm -rf x");
+    ask["wait"] = false.into();
+    let p = hosted(
+        json!([ask, {"sleep": 3}, {"cancel": 0}, {"say": "x"}, {"result": " carried on"}]),
+        Opts {
+            always: true,
+            ..acp(h)
+        },
+    );
+    p.assign("as1", "changes its mind", 300);
+    let (dlg, text, _) = p.dialog(1);
+    assert!(text.ends_with("; execute; rm -rf x"), "{text}");
+    let r = p.result("as1", 15);
+    assert_eq!(
+        (&r["status"], &r["text"]),
+        (&json!("done"), &json!("x carried on")),
+        "{r}"
+    );
+    until(10, "the dialog is withdrawn", || gone(dlg.parse().unwrap()));
+    let h = lightbulb::holds::get(&p.b.store(), 1).unwrap().unwrap();
+    assert_eq!(h.state, "expired");
+    // It was never answered.
+    assert!(!p.harness_read().iter().any(|l| l["id"] == 100));
+}
+
+#[test]
+fn cursor_a_withdrawn_request_closes_its_hold() {
+    acp_withdrawn("cursor");
+}
+
+#[test]
+fn grok_a_withdrawn_request_closes_its_hold() {
+    acp_withdrawn("grok");
 }

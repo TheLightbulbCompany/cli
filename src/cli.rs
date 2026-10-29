@@ -1244,6 +1244,8 @@ pub fn workers(args: &[String]) -> Result<i32> {
             if let Some(c) = w["conversation"].as_str() {
                 let resume = match f(&w, "provider").as_str() {
                     "codex" => format!("codex resume {c}"),
+                    "cursor" => format!("cursor-agent --resume {c}"),
+                    "grok" => format!("grok -r {c}"),
                     _ => format!("claude --resume {c}"),
                 };
                 println!("Resume it: cd {} && {resume}", f(&w, "folder"));
