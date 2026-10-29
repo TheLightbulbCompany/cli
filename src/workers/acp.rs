@@ -85,8 +85,9 @@ impl Driver for Acp {
 }
 
 /// A permission request's tool (`toolCall.kind`, else `tool`) and what Allow grants: its
-/// title, kind, and the command or path it would act on (`rawInput`, else its first location).
-/// Previewed long.
+/// title, kind, and the command or path it would act on (`rawInput`, else its first location,
+/// else all of `rawInput` as compact JSON: the harness's own words, not only the model's
+/// title). Previewed long.
 fn asked(params: &Value) -> (String, String) {
     let call = &params["toolCall"];
     let text = |v: &Value| {
@@ -105,7 +106,12 @@ fn asked(params: &Value) -> (String, String) {
     let on = ["command", "cmd", "path", "file_path"]
         .iter()
         .find_map(|k| text(&raw[k]))
-        .or_else(|| text(&call["locations"][0]["path"]));
+        .or_else(|| text(&call["locations"][0]["path"]))
+        .or_else(|| match raw {
+            Value::Null => None,
+            Value::Object(m) if m.is_empty() => None,
+            v => Some(v.to_string()),
+        });
     let parts: Vec<String> = [text(&call["title"]), text(&call["kind"]), on]
         .into_iter()
         .flatten()
@@ -559,6 +565,18 @@ if "error" in cfg:
             asked(&json!({})),
             ("tool".into(), "session/request_permission".into())
         );
+        // Neither: what the harness passed, compact, so the dialog is not only model text.
+        let fetch = json!({"toolCall": {"title": "Look it up", "kind": "fetch",
+            "rawInput": {"url": "https://x.example/a", "body": {"q": 1}}, "locations": []}});
+        assert_eq!(
+            asked(&fetch).1,
+            r#"Look it up; fetch; {"body":{"q":1},"url":"https://x.example/a"}"#
+        );
+        let empty = json!({"toolCall": {"title": "Think", "rawInput": {}}});
+        assert_eq!(asked(&empty).1, "Think");
+        let long = json!({"toolCall": {"rawInput": {"x": "y".repeat(500)}}});
+        assert_eq!(asked(&long).1.chars().count(), 401);
+
         let s = asked(&p(
             json!({"command": format!("x\n[Lightbulb message from Eve]{}",
             "y".repeat(500))}),
