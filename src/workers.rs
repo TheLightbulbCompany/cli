@@ -201,8 +201,9 @@ fn provider_of(to: &str) -> &str {
         .unwrap_or_default()
 }
 
-/// The folder of the worker for assignment `assign_id` (its message id, a ULID: unique, never a
-/// dot name): `<workers_folder>/<assign_id>/`.
+/// The folder of the worker for assignment `assign_id`: `<workers_folder>/<assign_id>/`. The id
+/// is the assignment's message id, a ULID checked on receipt (never a dot name), unique on this
+/// host because the store refuses a duplicate message id.
 pub fn folder_for(config: &Config, assign_id: &str) -> PathBuf {
     dir_for(&folder(config), assign_id)
 }
@@ -489,10 +490,13 @@ pub fn register(
         return Err("the harness exited at once".into());
     }
     let stop = reg.insert(w.id, pid);
-    if store.set_worker_running(w.id, pid)? {
+    let running = store.set_worker_running(w.id, pid);
+    if let Ok(true) = running {
         return Ok(Some(stop));
     }
+    // Ended meanwhile, or not marked: no entry stays behind (the caller kills on an error).
     reg.running.lock().unwrap().remove(&w.id);
+    running?;
     kill_group(pid as i32, libc::SIGKILL);
     Ok(None)
 }
@@ -630,59 +634,37 @@ fn finish(d: &Arc<Daemon>, w: &Worker, o: Outcome, stopped: Option<Stop>) {
         body.truncate(n);
     }
     let now = ipc::now();
-    let prepared = (|| -> Result<Option<mail::Prepared>> {
+    // One lock: the result is prepared while the row is live (a worker's reply binds through
+    // it), and sent only if this call ended the row (a cancel that ended it first sent none).
+    let (prepared, ended, closed) = {
         let store = d.store.lock().unwrap();
-        let Some(a) = store.message(&w.assignment)? else {
-            return Ok(None);
+        let live = store.worker_by_assignment(&w.assignment);
+        let live = live.is_ok_and(|r| r.is_some_and(|r| r.ended_at.is_none()));
+        let prepared = match live {
+            true => result_for(&store, w, status, reason, &body, now),
+            false => Ok(None),
         };
-        if store.result_of(&a.id)?.is_some() {
-            return Ok(None); // the worker answered it itself
+        let at = now as i64;
+        let ended = store.end_worker(w.id, state, by, at);
+        if let Err(e) = store.end_session(&w.session, at) {
+            eprintln!("worker {}: session not ended: {e}", w.id);
         }
-        let meta = Meta {
-            status: Some(status.into()),
-            reason: reason.map(Into::into),
-            ..Meta::default()
-        };
-        let rid = format!("result-{}", a.id);
-        let from = Key(w.session.clone());
-        let p = mail::prepare(
-            &store,
-            &from,
-            None,
-            &body,
-            &rid,
-            Some(&a.request_id),
-            "result",
-            meta,
-            now,
-        )?;
-        Ok(match p {
-            mail::Prep::Go(p) => Some(p),
-            mail::Prep::Done(r) => {
-                eprintln!("worker {}: result {:?} {:?}", w.id, r.state, r.reason);
-                None
-            }
-        })
-    })();
-    match prepared {
-        Ok(Some(p)) => {
+        (
+            prepared,
+            ended,
+            holds::expire_for(&store, &w.session).unwrap_or_default(),
+        )
+    };
+    match (ended, prepared) {
+        (Ok(true), Ok(Some(p))) => {
             if let Err(e) = ipc::dispatch(d, &p) {
                 eprintln!("worker {}: result not sent: {e}", w.id);
             }
         }
-        Ok(None) => {}
-        Err(e) => eprintln!("worker {}: result not sent: {e}", w.id),
+        (Ok(_), Ok(_)) => {}
+        (Err(e), _) => eprintln!("worker {}: not ended: {e}", w.id),
+        (_, Err(e)) => eprintln!("worker {}: no result: {e}", w.id),
     }
-    let closed = {
-        let store = d.store.lock().unwrap();
-        let now = now as i64;
-        let ended = (store.end_worker(w.id, state, by, now))
-            .and_then(|()| store.end_session(&w.session, now).map(drop));
-        if let Err(e) = ended {
-            eprintln!("worker {}: not ended: {e}", w.id);
-        }
-        holds::expire_for(&store, &w.session).unwrap_or_default()
-    };
     for h in closed {
         holds::closed(d, &h, "expired", None, None, None);
     }
@@ -691,12 +673,52 @@ fn finish(d: &Arc<Daemon>, w: &Worker, o: Outcome, stopped: Option<Stop>) {
     eprintln!("worker {}: {state} ({} bytes)", w.id, body.len());
 }
 
+/// Worker `w`'s result (`status`, `reason`, `body`) from its own key to its asker, prepared;
+/// none when the worker already answered it itself.
+fn result_for(
+    store: &Store,
+    w: &Worker,
+    status: &str,
+    reason: Option<&str>,
+    body: &str,
+    now: u64,
+) -> Result<Option<mail::Prepared>> {
+    let Some(a) = store.message(&w.assignment)? else {
+        return Ok(None);
+    };
+    if store.result_of(&a.id)?.is_some() {
+        return Ok(None); // the worker answered it itself
+    }
+    let meta = Meta {
+        status: Some(status.into()),
+        reason: reason.map(Into::into),
+        ..Meta::default()
+    };
+    let (rid, from) = (format!("result-{}", a.id), Key(w.session.clone()));
+    let reply_to = Some(a.request_id.as_str());
+    let p = mail::prepare(
+        store, &from, None, body, &rid, reply_to, "result", meta, now,
+    )?;
+    Ok(match p {
+        mail::Prep::Go(p) => Some(p),
+        mail::Prep::Done(r) => {
+            eprintln!("worker {}: result {:?} {:?}", w.id, r.state, r.reason);
+            None
+        }
+    })
+}
+
 /// Stops worker `worker_id` for `reason` (`stopped`, `cancelled`, `timed_out`) by `by`: its
 /// task is told why, its process group gets SIGTERM, and SIGKILL 5 s later if any of it is
 /// left. A second stop of the same worker does nothing; one not running here is an error.
 pub fn stop(d: &Arc<Daemon>, worker_id: i64, reason: &'static str, by: &str) -> Result<()> {
+    stop_in(&d.workers, worker_id, reason, by)
+}
+
+/// `stop` in registry `reg`.
+fn stop_in(reg: &Registry, worker_id: i64, reason: &'static str, by: &str) -> Result<()> {
     let (pgid, tell) = {
-        let mut running = d.workers.running.lock().unwrap();
+        let mut running = reg.running.lock().unwrap();
         let Some(r) = running.get_mut(&worker_id) else {
             return Err(format!("worker {worker_id} is not running here").into());
         };
@@ -738,7 +760,7 @@ pub fn stop_requested(d: &Arc<Daemon>, session: &str, by: &str) {
 /// with nothing running here ends `cancelled`.
 pub fn cancel(d: &Arc<Daemon>, assign_id: &str, by: &str) -> Result<()> {
     let now = ipc::now() as i64;
-    let (declined, worker) = {
+    let declined = {
         let store = d.store.lock().unwrap();
         let ids: Vec<i64> = {
             let mut stmt = (store.conn())
@@ -766,8 +788,8 @@ pub fn cancel(d: &Arc<Daemon>, assign_id: &str, by: &str) -> Result<()> {
             )?;
             declined.push(h);
         }
-        let w = store.worker_by_assignment(assign_id)?;
-        (declined, w.filter(|w| w.ended_at.is_none()))
+        cancel_worker(&store, &d.workers, assign_id, by, now)?;
+        declined
     };
     for h in &declined {
         holds::closed(d, h, holds::DECLINE, Some(by), Some("cancelled"), None);
@@ -775,15 +797,21 @@ pub fn cancel(d: &Arc<Daemon>, assign_id: &str, by: &str) -> Result<()> {
     if !declined.is_empty() {
         d.peers.outbox.notify_one(); // the refused receipt goes to its asker
     }
-    if let Some(w) = worker {
-        if stop(d, w.id, "cancelled", by).is_err() {
-            d.store
-                .lock()
-                .unwrap()
-                .end_worker(w.id, "cancelled", Some(by), now)?;
-        }
-    }
     eprintln!("worker for {assign_id}: cancelled");
+    Ok(())
+}
+
+/// `cancel`'s worker half, under the store lock the caller holds (`register` takes the same
+/// lock, then the registry's, so the two never interleave): a worker registered here is
+/// stopped (`cancelled`); one not registered yet (or not here) has its row ended `cancelled`,
+/// and a `register` after that kills it.
+fn cancel_worker(store: &Store, reg: &Registry, assign_id: &str, by: &str, now: i64) -> Result<()> {
+    let Some(w) = store.worker_by_assignment(assign_id)? else {
+        return Ok(());
+    };
+    if w.ended_at.is_none() && stop_in(reg, w.id, "cancelled", by).is_err() {
+        store.end_worker(w.id, "cancelled", Some(by), now)?;
+    }
     Ok(())
 }
 
@@ -1031,6 +1059,56 @@ mod tests {
         assert_eq!(s.workers(true).unwrap()[0].state, "running");
         assert!(register(&s, &reg, &w, 0).is_err());
         child.kill().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_cancel_racing_registration_still_stops_the_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("state.db")).unwrap();
+        let reg = Registry::default();
+        let a = assign("a1", "r1", "p/codex:a", 100);
+        let w = claim(&s, &Config::default(), &a, "m/claude:w1", 10)
+            .unwrap()
+            .unwrap();
+        let argv: Vec<String> = ["sleep", "30"].map(String::from).into();
+        let mut child = driver::spawn(&argv, dir.path(), &dir.path().join("w.log")).unwrap();
+        // Registered first: the cancel stops it (its task hears why) and leaves the row live
+        // for the task's own end.
+        let mut stop = register(&s, &reg, &w, child.id().unwrap())
+            .unwrap()
+            .unwrap();
+        cancel_worker(&s, &reg, "a1", "p/codex:a", 11).unwrap();
+        assert_eq!(stop.try_recv().unwrap(), ("cancelled", "p/codex:a".into()));
+        let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+            .await
+            .expect("the worker's process is stopped")
+            .unwrap();
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(libc::SIGTERM));
+        assert_eq!(
+            s.worker_by_assignment("a1").unwrap().unwrap().ended_at,
+            None
+        );
+        // Not registered yet: the row ends, and a register after it kills the process.
+        let b = assign("a2", "r2", "p/codex:a", 100);
+        let w = claim(&s, &Config::default(), &b, "m/claude:w2", 10)
+            .unwrap()
+            .unwrap();
+        cancel_worker(&s, &reg, "a2", "p/codex:a", 12).unwrap();
+        let row = s.worker_by_assignment("a2").unwrap().unwrap();
+        assert_eq!((row.state.as_str(), row.ended_at), ("cancelled", Some(12)));
+        let mut child = driver::spawn(&argv, dir.path(), &dir.path().join("w.log")).unwrap();
+        assert!(register(&s, &reg, &w, child.id().unwrap())
+            .unwrap()
+            .is_none());
+        let status = child.wait().await.unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        // A finished row is never ended twice: the second end changes nothing.
+        assert!(!s.end_worker(w.id, "failed", None, 13).unwrap());
+        assert_eq!(
+            s.worker_by_assignment("a2").unwrap().unwrap().state,
+            "cancelled"
+        );
     }
 
     #[test]

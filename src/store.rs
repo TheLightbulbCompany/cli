@@ -615,18 +615,20 @@ impl Store {
         rows.collect()
     }
 
+    /// Ends worker `id` (`state`, `by`, at `now`) unless it has ended: whether it did.
     pub fn end_worker(
         &self,
         id: i64,
         state: &str,
         by: Option<&str>,
         now: i64,
-    ) -> rusqlite::Result<()> {
-        self.conn.execute(
-            "UPDATE workers SET state = ?2, \"by\" = ?3, ended_at = ?4 WHERE id = ?1",
+    ) -> rusqlite::Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE workers SET state = ?2, \"by\" = ?3, ended_at = ?4 \
+             WHERE id = ?1 AND ended_at IS NULL",
             params![id, state, by, now],
         )?;
-        Ok(())
+        Ok(n == 1)
     }
 
     /// Marks worker `id` running as `pid`, unless its row has ended: whether it did.
