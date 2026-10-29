@@ -284,6 +284,57 @@ async fn a_permission_hold_expires_with_its_session_and_its_dialog_goes() {
     );
 }
 
+/// A dialog that gave up unanswered comes back when the person looks (`lightbulb held`), and
+/// one already on screen is not shown twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dialog_that_gave_up_is_shown_again_by_held() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path().display();
+    // The first dialog gives up at once; any later one stays up.
+    let fake = common::script(
+        dir.path(),
+        &format!(
+            "printf '%s\\n' \"$@\" >{d}/args.$$\necho $$ >>{d}/pids\n\
+             if [ \"$(wc -l <{d}/pids)\" -eq 1 ]; then echo 'button returned:, gave up:true'; exit 0; fi\n\
+             exec sleep 600"
+        ),
+    );
+    let a = Env::new();
+    a.daemon(
+        false,
+        "",
+        &[(
+            "LIGHTBULB_CONNECT_DEBUG_OSASCRIPT",
+            fake.display().to_string(),
+        )],
+    );
+    let key = register(&a, "claude", "c1", "/tmp/app");
+    let r = person(
+        &a,
+        json!({"id": 1, "op": "hold.file", "kind": "permission", "session": key, "prompt": "ok?"}),
+    );
+    assert_eq!(r["ok"], true, "{r}");
+    let pids = || std::fs::read_to_string(dir.path().join("pids")).unwrap_or_default();
+    until(10, "the first dialog gives up", || {
+        pids().lines().next().is_some_and(|p| gone(p.trim()))
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    let o = a.detached(&[common::EXE, "held"], "");
+    assert!(o.status.success(), "{}", common::err(&o));
+    until(10, "the dialog is shown again", || {
+        pids().lines().count() == 2
+    });
+    let second = pids().lines().nth(1).unwrap().to_string();
+    let args = std::fs::read_to_string(dir.path().join(format!("args.{second}"))).unwrap();
+    assert!(args.contains("Claude Code asks: \"ok?\""), "{args}");
+    // On screen now: a second look shows nothing new.
+    let o = a.detached(&[common::EXE, "held"], "");
+    assert!(o.status.success(), "{}", common::err(&o));
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(pids().lines().count(), 2);
+    assert_eq!(held(&a).len(), 1);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hold_answer_on_an_instance_needs_decided_by() {
     let dir = tempfile::tempdir().unwrap();

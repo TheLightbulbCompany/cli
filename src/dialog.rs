@@ -133,6 +133,12 @@ impl Queue {
         }
     }
 
+    /// Whether dialog `id` is queued or on screen.
+    pub fn is_pending(&self, id: &str) -> bool {
+        let s = self.0.state.lock().unwrap();
+        s.waiting.iter().any(|(i, _)| i == id) || s.showing.as_ref().is_some_and(|(i, _)| i == id)
+    }
+
     /// A queue that shows nothing: every dialog answers "not shown" (`None`) at once, so its
     /// question stays open for another way to answer (an embedded instance's).
     pub fn headless() -> (Queue, Answers) {

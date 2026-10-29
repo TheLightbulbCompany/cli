@@ -407,27 +407,42 @@ pub fn expire_for(store: &Store, session: &str) -> Result<Vec<Hold>> {
 /// The daemon's side of a new hold: its dialog text kept (`shown`), subscribers told `held`,
 /// the person shown the dialog.
 pub fn shown(d: &Daemon, team: &TeamState, store: &Store, h: &Hold) {
-    let me = &d.identity.key;
-    let (text, buttons, who) = dialog(store, &team.roster, me, h, &workers::folder(&team.config));
-    let kept = store
-        .conn()
-        .execute(
-            "UPDATE holds SET shown = ?2 WHERE id = ?1",
-            params![h.id, text],
-        )
-        .map(|_| (text, buttons, who));
-    let (text, buttons, who) = match kept {
-        Ok(t) => t,
-        Err(e) => return eprintln!("hold {}: {e}", h.name()),
+    let Some(who) = raise(d, team, store, h) else {
+        return;
     };
     // No preview: subscribers include agents.
     let _ = d
         .events
         .send(json!({"event": "held", "id": h.name(), "kind": h.kind(),
         "target_session": h.target_session, "from": h.from_session, "label": who}));
-    let args = dialog::args("Lightbulb", &text, &buttons);
-    d.dialogs.show(&h.name(), args);
     eprintln!("hold {}: open", h.name());
+}
+
+/// `h`'s dialog queued, its text kept (`shown`): the asking session's label, or none when the
+/// text could not be kept (nothing is shown).
+fn raise(d: &Daemon, team: &TeamState, store: &Store, h: &Hold) -> Option<String> {
+    let me = &d.identity.key;
+    let (text, buttons, who) = dialog(store, &team.roster, me, h, &workers::folder(&team.config));
+    let sql = "UPDATE holds SET shown = ?2 WHERE id = ?1";
+    if let Err(e) = store.conn().execute(sql, params![h.id, text]) {
+        eprintln!("hold {}: {e}", h.name());
+        return None;
+    }
+    d.dialogs
+        .show(&h.name(), dialog::args("Lightbulb", &text, &buttons));
+    Some(who)
+}
+
+/// Every open hold whose dialog is neither queued nor on screen (it gave up, or the daemon
+/// restarted) is shown again; from daemon start and `holds` (`lightbulb held`).
+pub fn reraise(d: &Daemon) {
+    let team = d.team.lock().unwrap();
+    let store = d.store.lock().unwrap();
+    for h in open(&store).unwrap_or_default() {
+        if !d.dialogs.is_pending(&h.name()) && raise(d, &team, &store, &h).is_some() {
+            eprintln!("hold {}: shown again", h.name());
+        }
+    }
 }
 
 /// The daemon's side of a closed hold (`verdict` `allow`, `decline` or `expired`; `by` null for
@@ -572,6 +587,10 @@ fn run(
         // `holds {}` -> `{holds: [{id, kind, target_session, from, label, verified, preview,
         // shown, created_at}]}` (`verified` as the label says it)
         "holds" => {
+            // A person looking: any dialog that gave up comes back (not for a bridge's poll).
+            if !instance {
+                reraise(d);
+            }
             let team = d.team.lock().unwrap();
             let store = d.store.lock().unwrap();
             let list: Vec<Value> = open(&store)?
