@@ -386,6 +386,8 @@ mod tests {
         assert!(REASONS.contains(&"no_worker"));
         // `check_kind` refuses an assignment's bad terms on receipt too.
         assert!(REASONS.contains(&"bad_request"));
+        // A worker host at its cap, and a held assignment its asker cancelled.
+        assert!(REASONS.contains(&"busy") && REASONS.contains(&"cancelled"));
         assert_eq!(
             crate::mail::KINDS,
             ["message", "assign", "result", "cancel"]

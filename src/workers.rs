@@ -237,11 +237,11 @@ fn private_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Assignment `id`'s (request `rid`) folder, `<base>/<id>/`, new and private (`0700`; one
-/// that exists already is an error, `folder exists`): a git worktree on branch `meta.branch`
-/// (else `lb/<rid>`) when `meta.repo` names a clone right under `base`, else empty. No fetch;
-/// a worktree git refuses leaves the folder empty. Blocking (git): off the async threads.
-pub fn workspace(base: &Path, id: &str, rid: &str, meta: &Meta) -> Result<PathBuf> {
+/// Assignment `id`'s folder, `<base>/<id>/`, new and private (`0700`; one that exists already
+/// is an error, `folder exists`): a git worktree on branch `meta.branch` (else `lb/<id>`) when
+/// `meta.repo` names a clone right under `base`, else empty. No fetch; a worktree git refuses
+/// leaves the folder empty. Blocking (git): off the async threads.
+pub fn workspace(base: &Path, id: &str, meta: &Meta) -> Result<PathBuf> {
     private_dir(base)?;
     let dir = dir_for(base, id);
     if dir.exists() {
@@ -253,7 +253,7 @@ pub fn workspace(base: &Path, id: &str, rid: &str, meta: &Meta) -> Result<PathBu
         .map(|r| base.join(r))
         .filter(|c| c.join(".git").exists());
     if let Some(clone) = clone {
-        let branch = meta.branch.clone().unwrap_or_else(|| format!("lb/{rid}"));
+        let branch = meta.branch.clone().unwrap_or_else(|| format!("lb/{id}"));
         let made = std::process::Command::new("git")
             .arg("-C")
             .arg(&clone)
@@ -409,13 +409,8 @@ impl Launch {
             base,
             asker,
         } = self;
-        let (b, id, rid, meta) = (
-            base.clone(),
-            a.id.clone(),
-            a.request_id.clone(),
-            a.meta.clone(),
-        );
-        let made = tokio::task::spawn_blocking(move || workspace(&b, &id, &rid, &meta)).await;
+        let (b, id, meta) = (base.clone(), a.id.clone(), a.meta.clone());
+        let made = tokio::task::spawn_blocking(move || workspace(&b, &id, &meta)).await;
         let made = made.unwrap_or_else(|e| Err(e.to_string().into()));
         let spawned = made.and_then(|dir| {
             let argv = driver.argv(&dir, &conv);
@@ -930,11 +925,11 @@ mod tests {
     fn a_worker_folder_is_private_and_per_request() {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("work");
-        let f = workspace(&base, "a1", "r1", &Meta::default()).unwrap();
+        let f = workspace(&base, "a1", &Meta::default()).unwrap();
         assert_eq!(f, base.join("a1"));
         assert_eq!((mode(&base), mode(&f)), (0o700, 0o700));
-        // A second assignment, even with the same request id, gets its own folder.
-        let g = workspace(&base, "a2", "r1", &Meta::default()).unwrap();
+        // A second assignment gets its own folder.
+        let g = workspace(&base, "a2", &Meta::default()).unwrap();
         assert_eq!(g, base.join("a2"));
     }
 
@@ -950,18 +945,18 @@ mod tests {
             repo: Some(repo.into()),
             ..Meta::default()
         };
-        let f = workspace(&base, "a1", "r1", &hint("app")).unwrap();
+        let f = workspace(&base, "a1", &hint("app")).unwrap();
         assert_eq!(mode(&f), 0o700);
         let list = git(&clone, &["worktree", "list"]);
         let shown = f.canonicalize().unwrap();
         assert!(
             list.lines()
-                .any(|l| l.starts_with(&*shown.to_string_lossy()) && l.ends_with("[lb/r1]")),
+                .any(|l| l.starts_with(&*shown.to_string_lossy()) && l.ends_with("[lb/a1]")),
             "{list}"
         );
         // No clone of that name (nor one outside the folder): an empty folder.
         for (id, repo) in [("a2", "nope"), ("a3", "../app"), ("a4", "..")] {
-            let f = workspace(&base, id, "r2", &hint(repo)).unwrap();
+            let f = workspace(&base, id, &hint(repo)).unwrap();
             assert_eq!(std::fs::read_dir(&f).unwrap().count(), 0, "{repo}");
         }
     }
@@ -980,7 +975,7 @@ mod tests {
         let w = claim(&s, &config, &a, "m/claude:w1", 10).unwrap().unwrap();
         assert_eq!(w.folder, base.join(&id));
         assert_eq!(folder_for(&config, &id), base.join(&id));
-        let f = workspace(&base, &id, "..", &Meta::default()).unwrap();
+        let f = workspace(&base, &id, &Meta::default()).unwrap();
         assert_eq!(f, base.join(&id));
         // Nothing outside the workers folder was touched, and only its folder is in it.
         let names = |d: &Path| {
@@ -996,7 +991,7 @@ mod tests {
         assert_eq!(outside, ["work"]);
         assert_eq!(names(&base), std::slice::from_ref(&id));
         // An existing folder is never reused: the start fails.
-        let again = workspace(&base, &id, "..", &Meta::default()).unwrap_err();
+        let again = workspace(&base, &id, &Meta::default()).unwrap_err();
         assert_eq!(again.to_string(), "folder exists");
         assert_eq!(log_for(&base, &id), base.join(format!("{id}.log")));
     }
