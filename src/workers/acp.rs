@@ -57,7 +57,8 @@ impl Driver for Acp {
 }
 
 /// A permission request's tool (`toolCall.kind`, else `tool`) and what Allow grants: its
-/// title, kind, and the command or path it would act on. Previewed long.
+/// title, kind, and the command or path it would act on (`rawInput`, else its first location).
+/// Previewed long.
 fn asked(params: &Value) -> (String, String) {
     let call = &params["toolCall"];
     let text = |v: &Value| {
@@ -75,7 +76,8 @@ fn asked(params: &Value) -> (String, String) {
     let raw = &call["rawInput"];
     let on = ["command", "cmd", "path", "file_path"]
         .iter()
-        .find_map(|k| text(&raw[k]));
+        .find_map(|k| text(&raw[k]))
+        .or_else(|| text(&call["locations"][0]["path"]));
     let parts: Vec<String> = [text(&call["title"]), text(&call["kind"]), on]
         .into_iter()
         .flatten()
@@ -108,9 +110,8 @@ fn chosen(options: &Value, allow: bool) -> Value {
 /// cancelled, anything else is refused.
 fn unasked(method: &str) -> Value {
     match method {
-        "cursor/ask_question" | "cursor/create_plan" => {
-            json!({"result": {"outcome": {"outcome": "cancelled"}}})
-        }
+        // Cursor's own shape (flat), as the reference client answers it.
+        "cursor/ask_question" | "cursor/create_plan" => json!({"result": {"outcome": "cancelled"}}),
         "elicitation/create" => json!({"result": {"action": "cancel"}}),
         _ => json!({"error": {"code": -32601, "message": "not supported by this host"}}),
     }
@@ -185,6 +186,7 @@ async fn talk(
             }
         };
         let line = match line {
+            None if last.is_empty() => break failed("the worker's harness exited"),
             None => break failed(last),
             Some(Err(why)) if last.is_empty() => break failed(why),
             Some(Err(_)) => break failed(last),
@@ -280,10 +282,11 @@ mod tests {
 
     /// A scripted ACP harness: answers `initialize` (`version`) and `session/new` (`session`),
     /// reads the prompt, then plays `steps` (an object is written as a line, `"read"` reads one,
-    /// any other string is written raw, `{"long": n}` writes a line of `n` bytes) and answers the prompt with `stop` when given. Every
-    /// line it reads goes to `$LOG`.
+    /// any other string is written raw, `{"long": n}` writes a line of `n` bytes, `"close"` closes
+    /// its stdin, `{"sleep": s}` waits) and answers the prompt with `stop` (or `error`) when
+    /// given. Every line it reads goes to `$LOG`.
     const FAKE: &str = r#"
-import json, os, sys
+import json, os, sys, time
 cfg = json.loads(os.environ["FAKE"])
 log = open(os.environ["LOG"], "a")
 def read():
@@ -301,11 +304,15 @@ prompt = read()
 if prompt is None: sys.exit(0)
 for step in cfg.get("steps", []):
     if step == "read": read()
+    elif step == "close": os.close(0)
     elif isinstance(step, str): sys.stdout.write(step); sys.stdout.flush()
+    elif "sleep" in step: time.sleep(step["sleep"])
     elif "long" in step: sys.stdout.write("x" * step["long"] + "\n"); sys.stdout.flush()
     else: out(step)
 if "stop" in cfg:
     out({"jsonrpc": "2.0", "id": prompt["id"], "result": {"stopReason": cfg["stop"]}})
+if "error" in cfg:
+    out({"jsonrpc": "2.0", "id": prompt["id"], "error": {"code": -32000, "message": cfg["error"]}})
 "#;
 
     struct Ran {
@@ -319,6 +326,23 @@ if "stop" in cfg:
 
     /// Runs the driver over the scripted harness `fake`; the person answers with `answers`.
     async fn drive(fake: Value, answers: Vec<Decision>) -> Ran {
+        drive_with(fake, |mut asks| async move {
+            let (mut asked, mut answers) = (vec![], answers.into_iter());
+            while let Some(r) = asks.recv().await {
+                asked.push((r.tool, r.summary));
+                let _ = r.reply.send(answers.next().unwrap());
+            }
+            asked
+        })
+        .await
+    }
+
+    /// Runs the driver over the scripted harness `fake`, its requests to `person`.
+    async fn drive_with<F, Fut>(fake: Value, person: F) -> Ran
+    where
+        F: FnOnce(mpsc::Receiver<PermissionRequest>) -> Fut,
+        Fut: std::future::Future<Output = Vec<(String, String)>> + Send + 'static,
+    {
         let d = tempfile::tempdir().unwrap();
         let log = d.path().join("log");
         let acp = Acp::new("python3".into(), "cursor", &["acp"]);
@@ -329,19 +353,13 @@ if "stop" in cfg:
             .env("LOG", &log)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
             .kill_on_drop(true)
             .spawn()
             .unwrap();
-        let (permission, mut asks) = mpsc::channel::<PermissionRequest>(8);
+        let (permission, asks) = mpsc::channel::<PermissionRequest>(8);
         let (session, named) = oneshot::channel();
-        let person = tokio::spawn(async move {
-            let (mut asked, mut answers) = (vec![], answers.into_iter());
-            while let Some(r) = asks.recv().await {
-                asked.push((r.tool, r.summary));
-                let _ = r.reply.send(answers.next().unwrap());
-            }
-            asked
-        });
+        let person = tokio::spawn(person(asks));
         let relay = Relay {
             permission,
             session,
@@ -506,6 +524,9 @@ if "stop" in cfg:
             asked(&p(json!({"cmd": ["git", "push"]}))).1,
             "Edit; edit; git push"
         );
+        // No command or path: the first location.
+        let l = json!({"toolCall": {"kind": "edit", "locations": [{"path": "/w/b.rs"}]}});
+        assert_eq!(asked(&l).1, "edit; /w/b.rs");
         assert_eq!(
             asked(&json!({})),
             ("tool".into(), "session/request_permission".into())
@@ -533,7 +554,7 @@ if "stop" in cfg:
             "read"
         ]);
         let r = drive(json!({"steps": steps, "stop": "end_turn"}), vec![]).await;
-        let cancelled = json!({"outcome": {"outcome": "cancelled"}});
+        let cancelled = json!({"outcome": "cancelled"});
         assert_eq!(
             r.log[3],
             json!({"jsonrpc": "2.0", "id": 5, "result": cancelled})
@@ -614,5 +635,72 @@ if "stop" in cfg:
         );
         // Nothing named, nothing prompted.
         assert_eq!((r.session, r.log.len()), (None, 2));
+    }
+
+    /// After a moment, the person answers `r` (`Err` when nobody waits for it any more).
+    async fn late(r: PermissionRequest, d: Decision) -> Result<(), Decision> {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        r.reply.send(d)
+    }
+
+    #[tokio::test]
+    async fn a_replaced_ask_gets_no_answer() {
+        // The same request id twice: the first wait is aborted; only the second is answered.
+        let steps = json!([ask(7, &ALL), ask(7, &ALL), "read", {"sleep": 0.5}]);
+        let r = drive_with(
+            json!({"steps": steps, "stop": "end_turn"}),
+            |mut asks| async move {
+                let (first, second) = (asks.recv().await.unwrap(), asks.recv().await.unwrap());
+                assert!(late(first, Decision::Allow).await.is_err());
+                assert!(late(second, Decision::Deny("no".into())).await.is_ok());
+                vec![]
+            },
+        )
+        .await;
+        let selected = json!({"outcome": "selected", "optionId": "ro"});
+        assert_eq!(r.log[3], outcome(7, selected));
+        assert_eq!(r.log.len(), 4, "{:?}", r.log);
+        assert_eq!(r.outcome.status, "done");
+    }
+
+    #[tokio::test]
+    async fn an_ask_open_at_exit_is_dropped() {
+        let r = drive_with(json!({"steps": [ask(7, &ALL)]}), |mut asks| async move {
+            let open = asks.recv().await.unwrap();
+            assert!(asks.recv().await.is_none());
+            assert!(late(open, Decision::Allow).await.is_err());
+            vec![]
+        })
+        .await;
+        assert_eq!(r.log.len(), 3, "{:?}", r.log);
+        assert_eq!(
+            (r.outcome.status, r.outcome.reason, r.outcome.body.as_str()),
+            ("failed", Some("error"), "the worker's harness exited")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_write_error_fails() {
+        // The harness stops reading; the answer cannot be written. Its later text never counts.
+        let steps = json!([chunk("so far"), ask(7, &ALL), "close", {"sleep": 1}, chunk(" later"),
+            {"sleep": 0.5}]);
+        let r = drive(json!({"steps": steps}), vec![Decision::Allow]).await;
+        assert_eq!(
+            (r.outcome.status, r.outcome.reason, r.outcome.body.as_str()),
+            ("failed", Some("error"), "so far")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_prompt_fails() {
+        let r = drive(
+            json!({"steps": [chunk("so far")], "error": "rate limited"}),
+            vec![],
+        )
+        .await;
+        assert_eq!(
+            (r.outcome.status, r.outcome.reason, r.outcome.body.as_str()),
+            ("failed", Some("error"), "rate limited")
+        );
     }
 }

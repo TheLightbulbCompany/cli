@@ -215,13 +215,17 @@ const BYPASS: [&str; 12] = [
     "dontAsk",
 ];
 
-/// Whether `argv` names a program and no permission bypass: a `BYPASS` word as a whole element,
-/// either side of one `=` (`--force=true`, `--permission-mode=dontAsk`); `--automation` is not
-/// `--auto`.
+/// Words that mean a bypass wherever they appear in an argv element.
+const DISTINCTIVE: [&str; 4] = ["dangerously", "bypassPermissions", "always-approve", "yolo"];
+
+/// Whether `argv` names a program and no permission bypass: a `DISTINCTIVE` word anywhere in an
+/// element, or a `BYPASS` word as a whole element or either side of its first `=`
+/// (`--force=true`, `--permission-mode=dontAsk`); `--automation` is not `--auto`.
 pub fn launchable(argv: &[String]) -> bool {
     let bypass = |a: &str| {
         let (flag, value) = a.split_once('=').unwrap_or((a, ""));
         [a, flag, value].iter().any(|w| BYPASS.contains(w))
+            || DISTINCTIVE.iter().any(|d| a.contains(d))
     };
     !argv.is_empty() && !argv.iter().any(|a| bypass(a))
 }
@@ -282,6 +286,9 @@ mod tests {
             &["--permission-mode=bypassPermissions"],
             &["--permission-mode=dontAsk"],
             &["--yolo"],
+            &["--settings={\"defaultMode\":\"bypassPermissions\"}"],
+            &["--dangerously-skip-permissions=1"],
+            &["x--yolo"],
         ] {
             assert!(!launchable(&argv(bad)), "{bad:?}");
         }
