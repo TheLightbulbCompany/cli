@@ -2,6 +2,7 @@
 //! start, the registry of running workers, their prompts, stop, deadline and reap, and the
 //! result each sends from its own key.
 
+pub mod acp;
 pub mod claude;
 pub mod codex;
 mod driver;
@@ -1450,11 +1451,19 @@ mod tests {
         assert!(adopted.is_empty());
     }
 
-    const BYPASS: [&str; 4] = [
+    const BYPASS: [&str; 12] = [
         "--dangerously-skip-permissions",
         "--dangerously-bypass-approvals-and-sandbox",
         "bypassPermissions",
         "--approve-for-me",
+        "--force",
+        "--yolo",
+        "--always-approve",
+        "--auto-review",
+        "--approve-mcps",
+        "--trust",
+        "--auto",
+        "dontAsk",
     ];
 
     /// A driver whose argv is fixed.

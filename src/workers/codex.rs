@@ -3,8 +3,8 @@
 //! relayed to the person as holds.
 
 use super::driver::{
-    converse, executable, failed, on_path, registered, send, Decision, Driver, Line, Outcome,
-    PermissionRequest, Relay, Run, INIT_WAIT, NO_PERSON,
+    converse, executable, failed, on_path, registered, response, send, Decision, Driver, Line,
+    Outcome, PermissionRequest, Relay, Run, NO_PERSON,
 };
 use crate::frame;
 use crate::store::Store;
@@ -213,26 +213,6 @@ fn unasked(method: &str, params: &Value) -> Value {
         // The v1 approvals, should an old server send them.
         "execCommandApproval" | "applyPatchApproval" => json!({"result": {"decision": "abort"}}),
         _ => json!({"error": {"code": -32601, "message": "not supported by this host"}}),
-    }
-}
-
-/// Waits for the response to request `id`: its result, or why there is none.
-async fn response(lines: &mut mpsc::Receiver<Line>, id: u64) -> Result<Value, String> {
-    let wait = async {
-        while let Some(line) = lines.recv().await {
-            let v: Value = serde_json::from_str(&line?).unwrap_or_default();
-            if v["id"] == id && v.get("method").is_none() {
-                return match v.get("error") {
-                    Some(e) => Err(e["message"].as_str().unwrap_or("refused").to_string()),
-                    None => Ok(v["result"].clone()),
-                };
-            }
-        }
-        Err("the worker's harness ended before it started".to_string())
-    };
-    match tokio::time::timeout(INIT_WAIT, wait).await {
-        Ok(r) => r,
-        Err(_) => Err("the worker's harness did not start within 30 s".into()),
     }
 }
 

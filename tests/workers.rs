@@ -659,6 +659,14 @@ fn row_12_no_bypass_flag_in_argv() {
         "--dangerously-bypass-approvals-and-sandbox",
         "bypassPermissions",
         "--approve-for-me",
+        "--force",
+        "--yolo",
+        "--always-approve",
+        "--auto-review",
+        "--approve-mcps",
+        "--trust",
+        "--auto",
+        "dontAsk",
     ] {
         assert!(!argv.iter().any(|a| a.contains(flag)), "{argv:?}");
         // The fake harness itself refuses one.

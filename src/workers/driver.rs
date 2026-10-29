@@ -157,6 +157,29 @@ async fn read_lines(stdout: ChildStdout, lines: mpsc::Sender<Line>) {
     }
 }
 
+/// Waits for the response to request `id`: its result, or why there is none.
+pub async fn response(
+    lines: &mut mpsc::Receiver<Line>,
+    id: u64,
+) -> std::result::Result<Value, String> {
+    let wait = async {
+        while let Some(line) = lines.recv().await {
+            let v: Value = serde_json::from_str(&line?).unwrap_or_default();
+            if v["id"] == id && v.get("method").is_none() {
+                return match v.get("error") {
+                    Some(e) => Err(e["message"].as_str().unwrap_or("refused").to_string()),
+                    None => Ok(v["result"].clone()),
+                };
+            }
+        }
+        Err("the worker's harness ended before it started".to_string())
+    };
+    match tokio::time::timeout(INIT_WAIT, wait).await {
+        Ok(r) => r,
+        Err(_) => Err("the worker's harness did not start within 30 s".into()),
+    }
+}
+
 /// Runs `talk` over `child`'s stdin and its stdout's lines to an `Outcome`; then stdin is
 /// closed (`talk` owns it), the child has a moment to exit, and is killed (`kill_on_drop`).
 pub async fn converse<F, Fut>(mut child: Child, talk: F) -> Outcome
@@ -175,17 +198,32 @@ where
     outcome
 }
 
-/// Flags that would let a harness act without its person: never in a launch argv.
-const BYPASS: [&str; 4] = [
+/// Flags (and `--permission-mode` values) that would let a harness act without its person:
+/// never in a launch argv.
+const BYPASS: [&str; 12] = [
     "--dangerously-skip-permissions",
     "--dangerously-bypass-approvals-and-sandbox",
     "bypassPermissions",
     "--approve-for-me",
+    "--force",
+    "--yolo",
+    "--always-approve",
+    "--auto-review",
+    "--approve-mcps",
+    "--trust",
+    "--auto",
+    "dontAsk",
 ];
 
-/// Whether `argv` names a program and no permission bypass.
+/// Whether `argv` names a program and no permission bypass: a `BYPASS` word as a whole element,
+/// either side of one `=` (`--force=true`, `--permission-mode=dontAsk`); `--automation` is not
+/// `--auto`.
 pub fn launchable(argv: &[String]) -> bool {
-    !argv.is_empty() && !argv.iter().any(|a| BYPASS.iter().any(|b| a.contains(b)))
+    let bypass = |a: &str| {
+        let (flag, value) = a.split_once('=').unwrap_or((a, ""));
+        [a, flag, value].iter().any(|w| BYPASS.contains(w))
+    };
+    !argv.is_empty() && !argv.iter().any(|a| bypass(a))
 }
 
 /// Starts `argv` in `folder`: its own process group (a daemon restart leaves it running),
@@ -228,6 +266,38 @@ fn child_path(program: &str) -> std::ffi::OsString {
 
 #[cfg(test)]
 mod tests {
+    use super::launchable;
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        ["x"].iter().chain(args).map(|a| a.to_string()).collect()
+    }
+
+    #[test]
+    fn launchable_matches_whole_elements() {
+        for bad in [
+            &["--auto-review"][..],
+            &["--auto"],
+            &["--force=true"],
+            &["--permission-mode", "bypassPermissions"],
+            &["--permission-mode=bypassPermissions"],
+            &["--permission-mode=dontAsk"],
+            &["--yolo"],
+        ] {
+            assert!(!launchable(&argv(bad)), "{bad:?}");
+        }
+        for ok in [
+            &["--automation"][..],
+            &["--auto-reviewer"],
+            &["--forced"],
+            &["acp"],
+            &["--permission-mode", "default"],
+            &["--note=trust"],
+        ] {
+            assert!(launchable(&argv(ok)), "{ok:?}");
+        }
+        assert!(!launchable(&[]));
+    }
+
     #[test]
     fn a_harness_finds_node_without_a_login_path() {
         let p = super::child_path("/x/bin/claude");

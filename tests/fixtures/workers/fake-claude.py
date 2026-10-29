@@ -21,6 +21,14 @@ BYPASS = [
     "--dangerously-bypass-approvals-and-sandbox",
     "bypassPermissions",
     "--approve-for-me",
+    "--force",
+    "--yolo",
+    "--always-approve",
+    "--auto-review",
+    "--approve-mcps",
+    "--trust",
+    "--auto",
+    "dontAsk",
 ]
 argv = sys.argv[1:]
 if any(b in a for a in argv for b in BYPASS):
