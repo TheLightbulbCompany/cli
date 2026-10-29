@@ -688,7 +688,8 @@ fn row_7_a_fourth_concurrent_assign_is_busy() {
 #[test]
 fn row_12_no_bypass_flag_in_argv() {
     let dir = tempfile::tempdir().unwrap();
-    let store = lightbulb::store::Store::open(&dir.path().join("state.db")).unwrap();
+    let store =
+        std::sync::Mutex::new(lightbulb::store::Store::open(&dir.path().join("state.db")).unwrap());
     let knobs = lightbulb::net::Peers::default();
     // The fake is found as a Claude Code would be, under `~/.local/bin`.
     let bin = dir.path().join(".local/bin");

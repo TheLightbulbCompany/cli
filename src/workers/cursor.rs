@@ -56,29 +56,30 @@ const FOLDER_OTHER: [&str; 2] = [".cursor/hooks.json", ".cursor/mcp.json"];
 /// own allows everything (`BYPASS_MODE`). `home` holds `.cursor/`; the config folder is read
 /// from the daemon's environment (`config_dir`).
 pub fn here(knob: Option<&Path>, home: &Path, store: &Store) -> Result<Acp, &'static str> {
+    hosting(installed(knob, home, store), home)
+}
+
+/// The program a worker would run (`program` with the system installs and `PATH`): the only
+/// part of the start that reads the store.
+pub fn installed(knob: Option<&Path>, home: &Path, store: &Store) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH");
+    program(knob, home, &SYSTEM.map(Path::new), store, path.as_deref())
+}
+
+/// `here` once the program is found (`installed`, `None`: not found): the person's config is
+/// read, with no store lock held.
+pub fn hosting(program: Option<PathBuf>, home: &Path) -> Result<Acp, &'static str> {
     let (dir, xdg) = (
         std::env::var_os("CURSOR_CONFIG_DIR"),
         std::env::var_os("XDG_CONFIG_HOME"),
     );
-    here_in(
-        knob,
-        home,
-        store,
-        config_dir(home, dir.as_deref(), xdg.as_deref()),
-    )
+    hosting_in(program, config_dir(home, dir.as_deref(), xdg.as_deref()))
 }
 
-/// `here` with the person's config folder `dir`, which the child is pinned to
+/// `hosting` with the person's config folder `dir`, which the child is pinned to
 /// (`CURSOR_CONFIG_DIR`), so it reads the file checked.
-pub fn here_in(
-    knob: Option<&Path>,
-    home: &Path,
-    store: &Store,
-    dir: PathBuf,
-) -> Result<Acp, &'static str> {
-    let path = std::env::var_os("PATH");
-    let system = SYSTEM.map(Path::new);
-    let Some(program) = program(knob, home, &system, store, path.as_deref()) else {
+pub fn hosting_in(program: Option<PathBuf>, dir: PathBuf) -> Result<Acp, &'static str> {
+    let Some(program) = program else {
         return Err(NOT_INSTALLED);
     };
     if bypass(&dir.join(CONFIG)) {
@@ -263,7 +264,11 @@ mod tests {
         write(&home.join(".cursor"), r#"{"approvalMode": "unrestricted"}"#);
         write(&other.join("cursor"), r#"{"approvalMode": "allowlist"}"#);
         let x = Some(other.as_os_str());
-        let a = here_in(Some(&fake), &home, &s, config_dir(&home, None, x)).unwrap();
+        let a = hosting_in(
+            installed(Some(&fake), &home, &s),
+            config_dir(&home, None, x),
+        )
+        .unwrap();
         // The child is pinned to the folder checked.
         let pinned = other.join("cursor").to_string_lossy().into_owned();
         assert_eq!(a.env(), [("CURSOR_CONFIG_DIR", Some(pinned))]);
@@ -271,9 +276,15 @@ mod tests {
             &other.join("cursor"),
             r#"{"permissions": {"allow": ["Shell(*)"]}}"#,
         );
-        let r = here_in(Some(&fake), &home, &s, config_dir(&home, None, x));
+        let r = hosting_in(
+            installed(Some(&fake), &home, &s),
+            config_dir(&home, None, x),
+        );
         assert_eq!(r.err(), Some(BYPASS_MODE));
-        let r = here_in(Some(&fake), &home, &s, config_dir(&home, None, None));
+        let r = hosting_in(
+            installed(Some(&fake), &home, &s),
+            config_dir(&home, None, None),
+        );
         assert_eq!(r.err(), Some(BYPASS_MODE));
     }
 
@@ -283,7 +294,7 @@ mod tests {
         let s = Store::open(&d.path().join("state.db")).unwrap();
         let fake = exe(&d.path().join("fake"));
         let dir = d.path().join(".cursor");
-        let here = |knob: &Path| here_in(Some(knob), d.path(), &s, dir.clone());
+        let here = |knob: &Path| hosting_in(installed(Some(knob), d.path(), &s), dir.clone());
         assert!(here(&fake).is_ok());
         let config = dir.join(CONFIG);
         std::fs::create_dir_all(&dir).unwrap();

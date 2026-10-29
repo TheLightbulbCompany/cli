@@ -27,7 +27,8 @@ pub const BYPASS_MODE: &str = "this computer's OpenCode can run without approval
      needs prompts to reach a person (any \"allow\" under permission, agent.<name>.permission \
      or mode.<name>.permission, or a tool set true under tools, in config.json, opencode.json \
      or opencode.jsonc in ~/.config/opencode, $XDG_CONFIG_HOME/opencode or ~/.opencode; an \
-     agent or mode file there whose header allows; or one it cannot read)";
+     agent or mode file there whose header allows; a plugin there that mentions permission; \
+     or one it cannot read)";
 /// What the turn ends with when OpenCode raises a prompt in a shape this host cannot relay (a
 /// `permission.*` event other than `asked` and `replied`), so it can never be allowed.
 pub const ASKS_V2: &str = "this OpenCode asks in a way the worker host does not read yet";
@@ -49,11 +50,17 @@ const FOLDER: [&str; 4] = [
 ];
 /// Variables that would hand OpenCode a config other than the files checked here: removed from
 /// the child's environment.
-const CONFIG_ENV: [&str; 3] = [
+const CONFIG_ENV: [&str; 5] = [
     "OPENCODE_CONFIG",
     "OPENCODE_CONFIG_CONTENT",
     "OPENCODE_CONFIG_DIR",
+    // Its home and managed-config folders, moved.
+    "OPENCODE_TEST_HOME",
+    "OPENCODE_TEST_MANAGED_CONFIG_DIR",
 ];
+/// Where plugins (code run in the server, which can answer its prompts) live in a config
+/// folder.
+const PLUGIN_DIRS: [&str; 2] = ["plugin", "plugins"];
 /// What the child is told, over anything inherited: every permission asks (OpenCode's own
 /// default is `{"*": "allow"}`; this is deep-merged over the person's files, whose own allows
 /// `bypass_mode` refuses since a specific key of theirs would still win), and no config from
@@ -87,9 +94,20 @@ impl OpenCode {
 /// The OpenCode a worker runs here, unless none is found (`NOT_INSTALLED`) or the person's own
 /// config allows without asking (`BYPASS_MODE`). `home` holds `.config/opencode/`.
 pub fn here(knob: Option<&Path>, home: &Path, store: &Store) -> Result<OpenCode, &'static str> {
+    hosting(installed(knob, home, store), home)
+}
+
+/// The program a worker would run (`program` with the system installs and `PATH`): the only
+/// part of the start that reads the store.
+pub fn installed(knob: Option<&Path>, home: &Path, store: &Store) -> Option<PathBuf> {
     let path = std::env::var_os("PATH");
-    let system = SYSTEM.map(Path::new);
-    let Some(program) = program(knob, home, &system, store, path.as_deref()) else {
+    program(knob, home, &SYSTEM.map(Path::new), store, path.as_deref())
+}
+
+/// `here` once the program is found (`installed`, `None`: not found): the person's config is
+/// read, with no store lock held.
+pub fn hosting(program: Option<PathBuf>, home: &Path) -> Result<OpenCode, &'static str> {
+    let Some(program) = program else {
         return Err(NOT_INSTALLED);
     };
     let xdg = std::env::var_os("XDG_CONFIG_HOME").filter(|x| !x.is_empty());
@@ -120,9 +138,9 @@ pub fn program(
     find(knob, known, store, "opencode", &["opencode"], path)
 }
 
-/// Whether the person's OpenCode config could allow without asking: a config file (`bypass`)
-/// or an agent or mode file (`agents_allow`) in a folder of `USER` under `home`, or in
-/// `xdg/opencode` (`$XDG_CONFIG_HOME`) when set.
+/// Whether the person's OpenCode config could allow without asking: a config file (`bypass`),
+/// an agent or mode file (`agent_allows`) or a plugin (`plugin_asks`) in a folder of `USER`
+/// under `home`, or in `xdg/opencode` (`$XDG_CONFIG_HOME`) when set.
 pub fn bypass_mode(home: &Path, xdg: Option<&Path>) -> bool {
     let dirs: Vec<PathBuf> = USER
         .iter()
@@ -131,15 +149,23 @@ pub fn bypass_mode(home: &Path, xdg: Option<&Path>) -> bool {
         .collect();
     dirs.iter().any(|d| {
         USER_FILES.iter().any(|f| bypass(&d.join(f)))
-            || AGENT_DIRS.iter().any(|a| agents_allow(&d.join(a), 0))
+            || AGENT_DIRS
+                .iter()
+                .any(|a| any_file(&d.join(a), 0, agent_allows))
+            || plugins(d)
     })
 }
 
-/// Whether a Markdown agent or mode file under `dir` (to 8 levels) could allow: its YAML
-/// header says `allow` anywhere or `true` in its `tools`, or it (or a folder) cannot be read.
-/// A missing folder is clean.
-// ponytail: a text scan of the header, not a YAML parse; a false match refuses, never allows.
-fn agents_allow(dir: &Path, depth: u8) -> bool {
+/// Whether a plugin under config folder `dir` mentions `permission` (`plugin_asks`).
+fn plugins(dir: &Path) -> bool {
+    PLUGIN_DIRS
+        .iter()
+        .any(|p| any_file(&dir.join(p), 0, plugin_asks))
+}
+
+/// Whether `check` holds for a file under `dir` (to 8 levels), or `dir` or a file in it cannot
+/// be listed. A missing folder is clean.
+fn any_file(dir: &Path, depth: u8, check: fn(&Path) -> bool) -> bool {
     let entries = match std::fs::read_dir(dir) {
         Err(e) => return e.kind() != std::io::ErrorKind::NotFound,
         Ok(e) => e,
@@ -148,34 +174,53 @@ fn agents_allow(dir: &Path, depth: u8) -> bool {
         let Ok(e) = e else { return true };
         let p = e.path();
         if p.is_dir() {
-            return depth >= 8 || agents_allow(&p, depth + 1);
+            return depth >= 8 || any_file(&p, depth + 1, check);
         }
-        if p.extension().is_none_or(|x| x != "md") {
-            return false;
-        }
-        let Ok(text) = std::fs::read_to_string(&p) else {
-            return true;
-        };
-        let Some(header) = text.strip_prefix("---") else {
-            return false;
-        };
-        let header = header.split("\n---").next().unwrap_or_default();
-        let mut tools = false;
-        header.contains("allow")
-            || header.lines().any(|l| {
-                if !l.starts_with([' ', '\t']) {
-                    tools = l.starts_with("tools");
-                }
-                tools && l.contains("true")
-            })
+        check(&p)
     })
 }
 
+/// Whether plugin file `p` could answer a prompt: its text says `permission` (a hook or a
+/// reply), or it cannot be read.
+// ponytail: a text scan; a plugin that only mentions the word refuses too.
+fn plugin_asks(p: &Path) -> bool {
+    std::fs::read(p).map_or(true, |b| b.windows(10).any(|w| w == b"permission"))
+}
+
+/// Whether Markdown agent or mode file `p` could allow: its YAML header says `allow` anywhere
+/// or `true` in its `tools`, or it cannot be read.
+// ponytail: a text scan of the header, not a YAML parse; a false match refuses, never allows.
+fn agent_allows(p: &Path) -> bool {
+    if p.extension().is_none_or(|x| x != "md") {
+        return false;
+    }
+    let Ok(text) = std::fs::read_to_string(p) else {
+        return true;
+    };
+    let Some(header) = text.strip_prefix("---") else {
+        return false;
+    };
+    let header = header.split("\n---").next().unwrap_or_default();
+    let mut tools = false;
+    header.contains("allow")
+        || header.lines().any(|l| {
+            if !l.starts_with([' ', '\t']) {
+                tools = l.starts_with("tools");
+            }
+            tools && l.contains("true")
+        })
+}
+
 /// Why a worker may not run in `folder`: an `opencode.json[c]` of its own (at its top or under
-/// `.opencode/`) that allows without asking.
+/// `.opencode/`) that allows without asking, or a plugin under `.opencode/` (`plugins`).
 pub fn folder_bypass(folder: &Path) -> Option<String> {
-    let found = FOLDER.iter().map(|f| folder.join(f)).find(|p| bypass(p))?;
-    Some(format!("{BYPASS_MODE}: {}", found.display()))
+    let mut found = FOLDER.iter().map(|f| folder.join(f)).find(|p| bypass(p));
+    // Off with the folder's config, its plugins are fenced too.
+    let own = folder.join(".opencode");
+    if found.is_none() && plugins(&own) {
+        found = Some(own);
+    }
+    Some(format!("{BYPASS_MODE}: {}", found?.display()))
 }
 
 /// Whether the OpenCode config at `path` could allow without asking (`allows`). Only a missing
@@ -833,6 +878,7 @@ mod http {
 mod tests {
     use super::*;
     use crate::workers::driver::tests::{exe, session};
+    use std::os::unix::fs::PermissionsExt;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
@@ -868,6 +914,8 @@ mod tests {
                 ("OPENCODE_CONFIG", None),
                 ("OPENCODE_CONFIG_CONTENT", None),
                 ("OPENCODE_CONFIG_DIR", None),
+                ("OPENCODE_TEST_HOME", None),
+                ("OPENCODE_TEST_MANAGED_CONFIG_DIR", None),
             ],
             "{:?}",
             &env[2..]
@@ -993,6 +1041,64 @@ mod tests {
         }
         let none = d.path().join("nope");
         assert_eq!(here(Some(&none), d.path(), &s).err(), Some(NOT_INSTALLED));
+    }
+
+    #[test]
+    fn a_plugin_that_mentions_permission_refuses_a_worker() {
+        let (d, xdg) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (h, x) = (d.path(), xdg.path());
+        let dirs = [
+            h.join(".config/opencode"),
+            h.join(".opencode"),
+            x.join("opencode"),
+        ];
+        for dir in &dirs {
+            for sub in ["plugin", "plugins/lib"] {
+                let file = dir.join(sub).join("p.ts");
+                std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+                // The founder's own kind: a plugin that never touches prompts.
+                std::fs::write(
+                    &file,
+                    "export default async () => ({ event: async () => {} })",
+                )
+                .unwrap();
+                assert!(!bypass_mode(h, Some(x)), "{}", file.display());
+                std::fs::write(
+                    &file,
+                    "\"permission.ask\": async (_, out) => { out.status = 1 }",
+                )
+                .unwrap();
+                assert!(bypass_mode(h, Some(x)), "{}", file.display());
+                std::fs::write(&file, b"\xff\xfe").unwrap();
+                assert!(
+                    !bypass_mode(h, Some(x)),
+                    "{}: binary, no word",
+                    file.display()
+                );
+                std::fs::remove_file(&file).unwrap();
+                // One it cannot read refuses.
+                std::fs::create_dir_all(&file).unwrap();
+                std::fs::write(file.join("x.js"), "").unwrap();
+                std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+                assert!(bypass_mode(h, Some(x)), "{}: unreadable", file.display());
+                std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+                std::fs::remove_dir_all(&file).unwrap();
+            }
+        }
+        assert!(!bypass_mode(h, Some(x)));
+        // The worker's folder, as a second fence.
+        let f = tempfile::tempdir().unwrap();
+        assert_eq!(folder_bypass(f.path()), None);
+        let p = f.path().join(".opencode/plugins/p.js");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, "// nothing\n").unwrap();
+        assert_eq!(folder_bypass(f.path()), None);
+        std::fs::write(&p, "await client.permission.reply({ reply: \"always\" })").unwrap();
+        let why = folder_bypass(f.path()).unwrap();
+        assert!(
+            why.starts_with(BYPASS_MODE) && why.ends_with(".opencode"),
+            "{why}"
+        );
     }
 
     #[test]

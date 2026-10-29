@@ -49,16 +49,27 @@ impl Codex {
     /// The Codex a worker runs here (`program`), unless none is found (`NOT_INSTALLED`) or the
     /// person's own runs without approvals (`BYPASS_MODE`). `home` holds `.codex/`.
     pub fn here(knob: Option<&Path>, home: &Path, store: &Store) -> Result<Codex, &'static str> {
-        let path = std::env::var_os("PATH");
-        let system = SYSTEM.map(Path::new);
-        let Some(program) = program(knob, home, &system, store, path.as_deref()) else {
-            return Err(NOT_INSTALLED);
-        };
-        if bypass_mode(home) {
-            return Err(BYPASS_MODE);
-        }
-        Ok(Codex::new(program))
+        hosting(installed(knob, home, store), home)
     }
+}
+
+/// The program a worker would run (`program` with the system installs and `PATH`): the only
+/// part of the start that reads the store.
+pub fn installed(knob: Option<&Path>, home: &Path, store: &Store) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH");
+    program(knob, home, &SYSTEM.map(Path::new), store, path.as_deref())
+}
+
+/// `here` once the program is found (`installed`, `None`: not found): the person's config is
+/// read, with no store lock held.
+pub fn hosting(program: Option<PathBuf>, home: &Path) -> Result<Codex, &'static str> {
+    let Some(program) = program else {
+        return Err(NOT_INSTALLED);
+    };
+    if bypass_mode(home) {
+        return Err(BYPASS_MODE);
+    }
+    Ok(Codex::new(program))
 }
 
 /// The Codex to run, the first executable file of: the debug knob (when set, the only one);

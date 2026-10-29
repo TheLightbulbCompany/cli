@@ -16,7 +16,8 @@ pub const BYPASS_MODE: &str = "this computer's Grok CLI runs without approvals; 
      \"auto\" or \"yolo\", at the top or under [ui], or a rule allowing every command or edit \
      under [permission], in ~/.grok/config.toml; defaultMode \"bypassPermissions\", \
      \"acceptEdits\", \"auto\" or \"dontAsk\", or an allow rule such as \"Bash\" or \"Edit(**)\", \
-     in ~/.grok/settings.json or ~/.claude/settings.json, which Grok reads too; or one of \
+     in ~/.grok/settings.json, ~/.claude/settings.json or ~/.claude/settings.local.json, \
+     which Grok reads too; or one of \
      them it cannot read)";
 /// The start's failure when the worker's folder has a Grok config of its own that allows
 /// (`folder_bypass`).
@@ -44,7 +45,11 @@ const BYPASS: [&str; 6] = [
 /// The config under a home or a folder.
 const CONFIG: &str = ".grok/config.toml";
 /// The Claude-style settings Grok reads too, under a home.
-const SETTINGS: [&str; 2] = [".grok/settings.json", ".claude/settings.json"];
+const SETTINGS: [&str; 3] = [
+    ".grok/settings.json",
+    ".claude/settings.json",
+    ".claude/settings.local.json",
+];
 /// The same in a folder, with its local ones.
 const FOLDER_SETTINGS: [&str; 3] = [
     ".grok/settings.json",
@@ -65,14 +70,25 @@ const WILDCARDS: [&str; 7] = [
 ];
 /// Variables that would hand Grok a config other than the one checked: removed from the
 /// child's environment.
-const CONFIG_ENV: [&str; 2] = ["GROK_CONFIG", "GROK_CONFIG_PATH"];
+const CONFIG_ENV: [&str; 3] = ["GROK_CONFIG", "GROK_CONFIG_PATH", "GROK_HOME"];
 
 /// The Grok CLI a worker runs here, unless none is found (`NOT_INSTALLED`) or the person's own
 /// runs without approvals (`BYPASS_MODE`). `home` holds `.grok/`.
 pub fn here(knob: Option<&Path>, home: &Path, store: &Store) -> Result<Acp, &'static str> {
+    hosting(installed(knob, home, store), home)
+}
+
+/// The program a worker would run (`program` with the system installs and `PATH`): the only
+/// part of the start that reads the store.
+pub fn installed(knob: Option<&Path>, home: &Path, store: &Store) -> Option<PathBuf> {
     let path = std::env::var_os("PATH");
-    let system = SYSTEM.map(Path::new);
-    let Some(program) = program(knob, home, &system, store, path.as_deref()) else {
+    program(knob, home, &SYSTEM.map(Path::new), store, path.as_deref())
+}
+
+/// `here` once the program is found (`installed`, `None`: not found): the person's config is
+/// read, with no store lock held.
+pub fn hosting(program: Option<PathBuf>, home: &Path) -> Result<Acp, &'static str> {
+    let Some(program) = program else {
         return Err(NOT_INSTALLED);
     };
     if bypass_mode(home) {
@@ -399,7 +415,14 @@ mod tests {
         let s = Store::open(&d.path().join("state.db")).unwrap();
         let fake = exe(&d.path().join("fake"));
         let g = here(Some(&fake), d.path(), &s).unwrap();
-        assert_eq!(g.env(), [("GROK_CONFIG", None), ("GROK_CONFIG_PATH", None)]);
+        assert_eq!(
+            g.env(),
+            [
+                ("GROK_CONFIG", None),
+                ("GROK_CONFIG_PATH", None),
+                ("GROK_HOME", None)
+            ]
+        );
     }
 
     #[test]

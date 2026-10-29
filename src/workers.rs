@@ -362,10 +362,8 @@ pub fn start(d: &Arc<Daemon>, assign_id: &str) -> Result<Option<&'static str>> {
     };
     let provider = provider_of(&a.to_key).to_string();
     let now = ipc::now() as i64;
-    let driver = {
-        let store = d.store.lock().unwrap();
-        driver_for(&provider, d.peers.knobs(), &d.claude_home, &store)
-    };
+    // Takes the store lock only to find the program; the person's config is read without it.
+    let driver = driver_for(&provider, d.peers.knobs(), &d.claude_home, &d.store);
     let Some(driver) = driver else {
         let (from, rid, at) = (&a.from_key, &a.request_id, now as u64);
         let refused = Some("no_worker");
@@ -1495,7 +1493,7 @@ mod tests {
         let folder = Path::new("/w/r1");
         let peers = crate::net::Peers::default();
         let dir = tempfile::tempdir().unwrap();
-        let s = Store::open(&dir.path().join("state.db")).unwrap();
+        let s = std::sync::Mutex::new(Store::open(&dir.path().join("state.db")).unwrap());
         assert!(launchable(
             &claude::Claude::new("claude".into()).argv(folder, "s1")
         ));

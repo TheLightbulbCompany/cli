@@ -13,6 +13,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
+use std::sync::Mutex;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
@@ -77,38 +78,39 @@ pub trait Driver: Send {
 }
 
 /// The driver for `provider`'s harness on this computer (`home` holds `.claude/`): none for a
-/// harness without one; `Err(why)` when it cannot run here (Claude Code: `Claude::here`).
+/// harness without one; `Err(why)` when it cannot run here (`NOT_INSTALLED`, or the person's
+/// config skips approvals). Only the program lookup (`installed`, registered sessions) holds
+/// the store lock; the person's config files are read after it is let go (`hosting`), so a
+/// slow or large config never stalls the daemon.
 pub fn driver_for(
     provider: &str,
     knobs: &Knobs,
     home: &Path,
-    store: &Store,
+    store: &Mutex<Store>,
 ) -> Option<std::result::Result<Box<dyn Driver>, &'static str>> {
-    match provider {
-        "claude" => {
-            let knob = knobs.claude_program.as_deref();
-            let c = super::claude::Claude::here(knob, home, store);
-            Some(c.map(|c| Box::new(c) as Box<dyn Driver>))
+    use super::{claude, codex, cursor, grok, opencode};
+    let program = {
+        let store = store.lock().unwrap();
+        let s = &*store;
+        match provider {
+            "claude" => claude::installed(knobs.claude_program.as_deref(), home, s),
+            "codex" => codex::installed(knobs.codex_program.as_deref(), home, s),
+            "cursor" => cursor::installed(knobs.cursor_program.as_deref(), home, s),
+            "grok" => grok::installed(knobs.grok_program.as_deref(), home, s),
+            "opencode" => opencode::installed(knobs.opencode_program.as_deref(), home, s),
+            _ => return None,
         }
-        "codex" => {
-            let knob = knobs.codex_program.as_deref();
-            let c = super::codex::Codex::here(knob, home, store);
-            Some(c.map(|c| Box::new(c) as Box<dyn Driver>))
-        }
-        "cursor" => {
-            let c = super::cursor::here(knobs.cursor_program.as_deref(), home, store);
-            Some(c.map(|c| Box::new(c) as Box<dyn Driver>))
-        }
-        "grok" => {
-            let g = super::grok::here(knobs.grok_program.as_deref(), home, store);
-            Some(g.map(|g| Box::new(g) as Box<dyn Driver>))
-        }
-        "opencode" => {
-            let o = super::opencode::here(knobs.opencode_program.as_deref(), home, store);
-            Some(o.map(|o| Box::new(o) as Box<dyn Driver>))
-        }
-        _ => None,
+    };
+    fn boxed<D: Driver + 'static>(d: D) -> Box<dyn Driver> {
+        Box::new(d)
     }
+    Some(match provider {
+        "claude" => claude::hosting(program, home).map(boxed),
+        "codex" => codex::hosting(program, home).map(boxed),
+        "cursor" => cursor::hosting(program, home).map(boxed),
+        "grok" => grok::hosting(program, home).map(boxed),
+        _ => opencode::hosting(program, home).map(boxed),
+    })
 }
 
 pub fn executable(p: &Path) -> bool {
