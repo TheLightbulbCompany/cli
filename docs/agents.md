@@ -31,6 +31,8 @@ it adds two things:
 
 `find_workers` also lists computers that start a fresh worker for you (`<member>/claude:new`). Assign to one and its person is asked once; the worker then runs headless in a folder of its own, its permission prompts go to that person (never to you), and its reply is the result. The person manages them with `lightbulb workers`.
 
+**Workspace agents.** An assignment reaches a workspace agent once its runtime runs an engine with this feature and its `config.toml` turns `network_workers` on; until then it is refused `unsupported`, like on any computer. The frame names no tool, only `reply_to` with the assignment's `requestId`. The bridge half is TheLightbulbCompany/lightbulb#4489.
+
 Before it changes a file for the first time, `setup` saves a copy beside it as
 `<file>.lightbulb-backup`. It never overwrites a backup. It does not touch other entries in
 those files. Setup removes an older `lightbulb-network` entry that runs a `lightbulb` program, with its allow rules. It replaces an entry already called `lightbulb` only when it is ours, the Lightbulb desktop app's old `session-mcp` server, or the hosted Lightbulb MCP (`https://api.thelightbulb.company/mcp`). Any other `lightbulb` entry stays: that agent gets hooks only, and `doctor` says which entry is in the way.

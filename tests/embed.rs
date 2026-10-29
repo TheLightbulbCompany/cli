@@ -301,7 +301,16 @@ type Played = (Identity, Peer, iroh::Endpoint);
 /// An instance whose stored team (before it starts) is A (founder), B, C and itself; returns
 /// its home, it and the three, connected.
 async fn seeded(snapshot: Option<&Path>) -> (tempfile::TempDir, Instance, [Played; 3]) {
+    seeded_with("", snapshot).await
+}
+
+/// `seeded` with `config` as the instance's `config.toml`.
+async fn seeded_with(
+    config: &str,
+    snapshot: Option<&Path>,
+) -> (tempfile::TempDir, Instance, [Played; 3]) {
     let home = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join("config.toml"), config).unwrap();
     let w = Identity::load_or_create(home.path()).unwrap();
     let (ia, ib, ic) = (identity(), identity(), identity());
     let g = genesis(&ia);
@@ -378,6 +387,87 @@ async fn only_listed_computers_reach_its_sessions() {
     // C, listed once its person joins the workspace, gets in.
     declare(&i, &["friday"], &[&ia, &ic]).await;
     assert_eq!(ask(&mut pc, &ic, "c2", &friday).await.0, "stored");
+    i.shutdown().await;
+}
+
+/// `p` sends an assignment from its `<short>/codex:c1` to `to`: the instance's answer.
+async fn assign(p: &mut Peer, who: &Identity, rid: &str, to: &str) -> (String, Option<String>) {
+    let id = ulid();
+    p.send(&Frame::Envelope {
+        id: id.clone(),
+        request_id: rid.into(),
+        kind: "assign".into(),
+        from: format!("{}/codex:c1", who.short),
+        to: to.into(),
+        reply_to: None,
+        thread: None,
+        hops: 0,
+        body: "fix it".into(),
+        files: vec![],
+        sent_at: 0,
+        meta: lightbulb::mail::Meta {
+            done_when: Some("green".into()),
+            deadline_at: Some(now_s() + 300),
+            ..Default::default()
+        },
+    })
+    .await;
+    match p
+        .recv_where(|f| matches!(f, Frame::Ack { id: i, .. } if *i == id))
+        .await
+    {
+        Frame::Ack { state, reason, .. } => (state, reason),
+        _ => unreachable!(),
+    }
+}
+
+/// A workspace agent takes an assignment only when the instance's own `config.toml` turns
+/// `network_workers` on, through the same gate as any computer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_instance_refuses_assignments_until_its_config_turns_them_on() {
+    let (_home, i, [(ia, mut pa, _a), _, _]) = seeded_with("", None).await;
+    declare(&i, &["friday"], &[&ia]).await;
+    let friday = format!("{}/friday", me(&i).await);
+    assert_eq!(
+        assign(&mut pa, &ia, "as1", &friday).await,
+        ("refused".to_string(), Some("unsupported".to_string()))
+    );
+    let peek = ok(&i, "inbox.peek", json!({})).await;
+    assert_eq!(peek["sessions"], json!([]), "{peek}");
+    i.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_instance_stores_an_assignment_for_a_declared_agent_when_on() {
+    let (_home, i, [(ia, mut pa, _a), _, _]) = seeded_with("network_workers = true\n", None).await;
+    declare(&i, &["friday"], &[&ia]).await;
+    let friday = format!("{}/friday", me(&i).await);
+    assert_eq!(assign(&mut pa, &ia, "as1", &friday).await.0, "stored");
+    let peek = ok(&i, "inbox.peek", json!({})).await;
+    let r = &peek["sessions"][0]["records"][0];
+    assert_eq!(peek["sessions"][0]["session"], "friday", "{peek}");
+    assert_eq!(r["kind"], "assign", "{r}");
+    assert_eq!(r["done_when"], "green", "{r}");
+    assert!(r["deadline_at"].as_i64().unwrap() > now_s(), "{r}");
+    assert!(r["framed"]
+        .as_str()
+        .unwrap()
+        .contains("reply_to=\"<requestId>\""));
+    // Friday's reply with `reply_to` is the assignment's result at the asker.
+    let to = format!("{}/codex:c1", ia.short);
+    ok(
+        &i,
+        "send",
+        json!({"from": friday, "to": to, "text": "done", "request_id": "re1", "reply_to": "as1"}),
+    )
+    .await;
+    let f = pa
+        .recv_where(|f| matches!(f, Frame::Envelope { request_id, .. } if request_id == "re1"))
+        .await;
+    let Frame::Envelope { kind, .. } = f else {
+        unreachable!()
+    };
+    assert_eq!(kind, "result");
     i.shutdown().await;
 }
 
