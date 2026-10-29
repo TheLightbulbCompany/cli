@@ -52,12 +52,6 @@ pub fn is_workers(store: &Store, session: &str) -> bool {
     matches!(store.worker_by_session(session), Ok(Some(w)) if w.ended_at.is_none())
 }
 
-/// Whether `by` (an `answer`'s decider) is an agent session (`<member>/<handle>`, or `agent`
-/// before it registers) rather than a person (`local`, `bridge`, or the bridge's person).
-fn is_agent(by: &str) -> bool {
-    by == "agent" || by.contains('/')
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct Hold {
     pub id: i64,
@@ -246,7 +240,7 @@ pub fn dialog(
             .and_then(|s| s.handle)
             .unwrap_or_else(|| w.session.clone());
         let text = format!(
-            "{asker}'s worker {handle} ({}) in {} wants to: {}",
+            "worker {handle} ({}) for {asker} in {} wants to: {}",
             w.provider,
             w.folder.display(),
             preview(&h.message.body)
@@ -280,7 +274,7 @@ impl Closed {
 
 /// The answer to permission or worker hold `id` (`by` `local`, `bridge` or an agent's session):
 /// `Err(not_found)`, `Err(not_open)` once answered or expired (a worker hold at its
-/// assignment's deadline too), `Err(not_a_person)` when an agent answers a worker hold or a
+/// assignment's deadline too), `Err(not_a_person)` when `by_agent` (an agent answers) a worker hold or a
 /// worker's prompt, `Err(bad_request)` for scope `always` on anything but an Allow of a worker
 /// hold (which also records the asker's standing policy). A signed `approvals` record keeps
 /// the text the dialog showed.
@@ -294,6 +288,7 @@ pub fn answer(
     allow: bool,
     scope: &str,
     by: &str,
+    by_agent: bool,
     now: i64,
 ) -> Result<std::result::Result<Closed, &'static str>> {
     let Some(h) = get(store, id)? else {
@@ -306,7 +301,7 @@ pub fn answer(
         return Ok(Err(NOT_OPEN));
     }
     let workers_own = kind == Kind::Worker || is_workers(store, &h.target_session);
-    if workers_own && is_agent(by) {
+    if workers_own && by_agent {
         return Ok(Err(NOT_A_PERSON));
     }
     if scope == "always" && !(allow && kind == Kind::Worker) {
@@ -447,6 +442,7 @@ fn answer_here(
     allow: bool,
     scope: &str,
     by: &str,
+    by_agent: bool,
     surface: &'static str,
 ) -> Result<std::result::Result<Closed, &'static str>> {
     let r = {
@@ -463,6 +459,7 @@ fn answer_here(
             allow,
             scope,
             by,
+            by_agent,
             now,
         )?
     };
@@ -482,17 +479,19 @@ pub fn expire_here(d: &Daemon, store: &Store, now: i64) -> Result<()> {
 
 /// Dialog `H<n>` answered `button`: `Allow`, `Always allow`, `Stop worker`, else a decline.
 pub fn on_dialog(d: &Arc<Daemon>, n: i64, button: &str) {
-    let (allow, scope) = match button {
-        "Allow" => (true, "once"),
-        "Always allow" => (true, "always"),
-        _ => (false, "once"),
+    let r = |allow, scope| answer_here(d, n, allow, scope, "local", false, "dialog");
+    let done = match button {
+        "Allow" => r(true, "once"),
+        "Always allow" => r(true, "always"),
+        "Stop worker" => r(false, "once").inspect(|c| {
+            if let Ok(c) = c {
+                workers::stop_requested(d, &c.hold.target_session, "local");
+            }
+        }),
+        _ => r(false, "once"),
     };
-    match answer_here(d, n, allow, scope, "local", "dialog") {
-        Ok(Ok(c)) if button == "Stop worker" => {
-            workers::stop_requested(d, &c.hold.target_session, "local")
-        }
-        Ok(_) => {}
-        Err(e) => eprintln!("hold H{n}: {e}"),
+    if let Err(e) = done {
+        eprintln!("hold H{n}: {e}");
     }
 }
 
@@ -598,7 +597,15 @@ fn run(
             let Some(n) = hold_id else {
                 return Ok(Response::err(id, missing));
             };
-            match answer_here(d, n, allow, scope, by, surface)? {
+            match answer_here(
+                d,
+                n,
+                allow,
+                scope,
+                by,
+                agent.is_some() && !instance,
+                surface,
+            )? {
                 Ok(c) => Response::ok(
                     id,
                     json!({"id": c.hold.name(), "verdict": c.verdict(), "scope": scope}),

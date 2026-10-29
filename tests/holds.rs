@@ -379,6 +379,7 @@ fn dlg(s: &Store, r: &Roster, me: &Identity, h: &holds::Hold) -> (String, Vec<&'
     (t, b)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn ans(
     s: &Store,
     r: &Roster,
@@ -386,11 +387,23 @@ fn ans(
     h: &holds::Hold,
     scope: &str,
     by: &str,
+    by_agent: bool,
     now: i64,
 ) -> Result<(), &'static str> {
-    holds::answer(s, r, me, Path::new(FOLDER), h.id, true, scope, by, now)
-        .unwrap()
-        .map(|_| ())
+    holds::answer(
+        s,
+        r,
+        me,
+        Path::new(FOLDER),
+        h.id,
+        true,
+        scope,
+        by,
+        by_agent,
+        now,
+    )
+    .unwrap()
+    .map(|_| ())
 }
 
 #[test]
@@ -431,9 +444,12 @@ fn a_worker_prompt_hold_shows_the_worker_and_three_buttons() {
     let p = holds::file_permission(&s, &w, "Bash: rm -rf build", 1_000).unwrap();
     assert!(holds::is_workers(&s, &w));
     let (text, buttons) = dlg(&s, &r, &me, &p);
-    assert!(text.starts_with("aden"), "{text}");
     assert!(
-        text.ends_with("worker claude-1 (claude) in /w/r1 wants to: Bash: rm -rf build"),
+        text.starts_with("worker claude-1 (claude) for aden"),
+        "{text}"
+    );
+    assert!(
+        text.ends_with(" in /w/r1 wants to: Bash: rm -rf build"),
         "{text}"
     );
     assert_eq!(buttons, ["Decline", "Allow", "Stop worker"]);
@@ -453,13 +469,26 @@ fn an_allow_after_the_deadline_is_not_open() {
     // Not due yet: still open. At the deadline an Allow is refused even before the timer ran.
     assert!(holds::expire(&s, 1_999).unwrap().is_empty());
     assert_eq!(
-        ans(&s, &r, &me, &h, "once", "local", 2_000),
+        ans(&s, &r, &me, &h, "once", "local", false, 2_000),
         Err("not_open")
     );
     assert_eq!(ids(holds::expire(&s, 2_000).unwrap()), [h.id]);
     assert_eq!(holds::get(&s, h.id).unwrap().unwrap().state, "expired");
+    let (state, reason): (String, Option<String>) =
+        rusqlite::Connection::open(_d.path().join("state.db"))
+            .unwrap()
+            .query_row(
+                "SELECT state, reason FROM receipts WHERE from_key = ?1 AND request_id = ?2",
+                [&h.from_session, &h.message.request_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
     assert_eq!(
-        ans(&s, &r, &me, &h, "once", "local", 2_001),
+        (state.as_str(), reason.as_deref()),
+        ("expired", Some("timed_out"))
+    );
+    assert_eq!(
+        ans(&s, &r, &me, &h, "once", "local", false, 2_001),
         Err("not_open")
     );
 }
@@ -503,11 +532,11 @@ fn an_agent_cannot_answer_a_workers_holds() {
     let p = holds::file_permission(&s, &w, "ok?", 1_000).unwrap();
     for h in [&a, &p] {
         assert_eq!(
-            ans(&s, &r, &me, h, "once", &agent, 1_001),
+            ans(&s, &r, &me, h, "once", &agent, true, 1_001),
             Err("not_a_person")
         );
         assert_eq!(
-            ans(&s, &r, &me, h, "once", "agent", 1_001),
+            ans(&s, &r, &me, h, "once", "agent", true, 1_001),
             Err("not_a_person")
         );
         assert!(holds::get(&s, h.id).unwrap().unwrap().is_open());
@@ -516,8 +545,10 @@ fn an_agent_cannot_answer_a_workers_holds() {
     let k = format!("{}/codex:c1", me.short);
     s.put_session(&row(&k)).unwrap();
     let plain = holds::file_permission(&s, &k, "ok?", 1_000).unwrap();
-    assert!(ans(&s, &r, &me, &plain, "once", &agent, 1_001).is_ok());
-    assert!(ans(&s, &r, &me, &p, "once", "local", 1_001).is_ok());
+    assert!(ans(&s, &r, &me, &plain, "once", &agent, true, 1_001).is_ok());
+    // The flag decides, not the shape of `by`: a person named `acme/jo` is accepted.
+    assert!(ans(&s, &r, &me, &p, "once", "acme/jo", false, 1_001).is_ok());
+    assert!(ans(&s, &r, &me, &a, "once", "local", false, 1_001).is_ok());
 }
 
 #[test]
@@ -530,13 +561,13 @@ fn always_allow_writes_the_policy() {
         Policy::Ask
     );
     let once = assign_hold(&s, &from, &aden.key, &to, None);
-    assert!(ans(&s, &r, &me, &once, "once", "local", 1_001).is_ok());
+    assert!(ans(&s, &r, &me, &once, "once", "local", false, 1_001).is_ok());
     assert_eq!(
         workers::policy(&s, &me.key, &aden.key).unwrap(),
         Policy::Ask
     );
     let h = assign_hold(&s, &from, &aden.key, &to, None);
-    assert!(ans(&s, &r, &me, &h, "always", "local", 1_002).is_ok());
+    assert!(ans(&s, &r, &me, &h, "always", "local", false, 1_002).is_ok());
     assert_eq!(
         workers::policy(&s, &me.key, &aden.key).unwrap(),
         Policy::Allow
@@ -555,7 +586,7 @@ fn always_allow_writes_the_policy() {
     s.put_session(&row(&k)).unwrap();
     let plain = holds::file_permission(&s, &k, "ok?", 1_000).unwrap();
     assert_eq!(
-        ans(&s, &r, &me, &plain, "always", "local", 1_003),
+        ans(&s, &r, &me, &plain, "always", "local", false, 1_003),
         Err("bad_request")
     );
 }
