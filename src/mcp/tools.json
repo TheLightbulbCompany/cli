@@ -56,7 +56,7 @@
   {
     "name": "recall",
     "scope": "network",
-    "description": "Call when a task starts or you need something a teammate may know, not on every turn: the answer can run to about 8,000 tokens. It also includes excerpts from your own prompts and replies in this repository on this computer, or in every repository when the folder has no git origin.",
+    "description": "Call when a task starts or you need something a teammate may know, not on every turn: the answer is one page of about 8,000 tokens at most. It also includes excerpts from your own prompts and replies in this repository on this computer, or in every repository when the folder has no git origin.",
     "inputSchema": {
       "type": "object",
       "properties": {

@@ -666,13 +666,21 @@ impl Server {
         args["session"] = call.from.0.clone().into();
         // `recall`'s turns come from this repo's sessions only; an empty question (every fact,
         // the hook's view) carries no repo.
-        if name == "recall" && !args["question"].as_str().unwrap_or("").trim().is_empty() {
+        let asked = name == "recall" && !args["question"].as_str().unwrap_or("").trim().is_empty();
+        if asked {
             let cwd = std::env::current_dir().unwrap_or_default();
             if let (Some(repo), _) = git(&cwd.to_string_lossy()) {
                 args["repo"] = repo.into();
             }
         }
         match ask(&format!("memory.{name}"), args).await {
+            // A question's answer is the one page (about 8,000 tokens at most): the daemon's
+            // `block` and its `facts` and `turns` arrays repeat it, so only their counts go.
+            Ok(r) if r["ok"] == true && asked => {
+                let count = |k: &str| r[k].as_array().map_or(0, Vec::len);
+                let counts = json!({ "facts": count("facts"), "turns": count("turns") });
+                Self::done(&call, json!({ "page": r["page"], "counts": counts })).await
+            }
             Ok(mut r) if r["ok"] == true => {
                 if let Some(o) = r.as_object_mut() {
                     o.remove("id");

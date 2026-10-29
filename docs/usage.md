@@ -78,8 +78,8 @@ replies in this repository on this computer (see `lightbulb sessions turns` in [
 each the part of the turn, up to 800 characters, that best matches the question; a folder with no
 git origin gets excerpts from every repository. The block handed over at a session's start never
 includes them, and a turn refused for a secret is never shown. With up to 50 facts as well, a
-recall's answer can run to about 8,000 tokens, so agents call it when a task needs memory, not on
-every turn.
+recall's answer is one page of about 8,000 tokens at most, so agents call it when a task needs
+memory, not on every turn.
 
 - `team` entries go to every member of the team.
 - `me` entries go only to your own signed-in computers. If this computer is not signed in, a `me`
