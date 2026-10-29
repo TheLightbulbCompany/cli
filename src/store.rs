@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 /// tables or columns, but V12, which drops and recreates `memory_fts` (stemmed) from the
 /// entries; each runs once (in the transaction that moves `user_version`).
 const MIGRATIONS: &[&str] = &[
-    V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15, V16,
+    V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15, V16, V17,
 ];
 
 const V1: &str = "
@@ -159,6 +159,17 @@ ALTER TABLE messages ADD COLUMN meta TEXT;
 ALTER TABLE sessions ADD COLUMN stop_guard_at INTEGER;
 CREATE INDEX IF NOT EXISTS messages_reply_to ON messages (reply_to);
 ";
+/// Network workers: one row per headless worker a computer started for an assignment
+/// (`assignment` is the assign message id; `state` is starting, running, done, failed, stopped
+/// or cancelled).
+const V17: &str = "
+CREATE TABLE workers (
+    id INTEGER PRIMARY KEY, assignment TEXT NOT NULL UNIQUE, session TEXT NOT NULL,
+    provider TEXT NOT NULL, folder TEXT NOT NULL, pid INTEGER, started_at INTEGER NOT NULL,
+    ended_at INTEGER, state TEXT NOT NULL, by TEXT
+);
+CREATE INDEX IF NOT EXISTS workers_session ON workers (session);
+";
 /// Memory: signed entries numbered per author, with a full-text index over `subject` and `fact`
 /// (`memory`). `rowid` is explicit so it survives `VACUUM` (the FTS index points at it). A
 /// tombstoned row keeps its id and seq and drops its body (`entry` NULL); `memory_tombstones`
@@ -252,6 +263,36 @@ fn row_session(r: &rusqlite::Row) -> rusqlite::Result<Session> {
 }
 
 /// A `messages` row, read by column name (so `m.*` in a join reads too).
+/// A headless worker this computer started for an assignment (`workers` table).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Worker {
+    pub id: i64,
+    pub assignment: String,
+    pub session: String,
+    pub provider: String,
+    pub folder: PathBuf,
+    pub pid: Option<u32>,
+    pub started_at: i64,
+    pub ended_at: Option<i64>,
+    pub state: String,
+    pub by: Option<String>,
+}
+
+fn row_worker(r: &rusqlite::Row) -> rusqlite::Result<Worker> {
+    Ok(Worker {
+        id: r.get("id")?,
+        assignment: r.get("assignment")?,
+        session: r.get("session")?,
+        provider: r.get("provider")?,
+        folder: PathBuf::from(r.get::<_, String>("folder")?),
+        pid: r.get("pid")?,
+        started_at: r.get("started_at")?,
+        ended_at: r.get("ended_at")?,
+        state: r.get("state")?,
+        by: r.get("by")?,
+    })
+}
+
 pub(crate) fn row_message(r: &rusqlite::Row) -> rusqlite::Result<Message> {
     Ok(Message {
         id: r.get("id")?,
@@ -525,6 +566,74 @@ impl Store {
     pub fn drop_presence(&self, member: &str) -> rusqlite::Result<()> {
         self.conn
             .execute("DELETE FROM peers_sessions WHERE member = ?1", [member])?;
+        Ok(())
+    }
+
+    pub fn insert_worker(&self, w: &Worker) -> rusqlite::Result<i64> {
+        self.conn.execute(
+            "INSERT INTO workers (assignment, session, provider, folder, pid, started_at, \
+             ended_at, state, by) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                w.assignment,
+                w.session,
+                w.provider,
+                w.folder.to_string_lossy(),
+                w.pid,
+                w.started_at,
+                w.ended_at,
+                w.state,
+                w.by
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn worker_by_session(&self, session: &str) -> rusqlite::Result<Option<Worker>> {
+        self.one_worker("session", session)
+    }
+
+    pub fn worker_by_assignment(&self, assignment: &str) -> rusqlite::Result<Option<Worker>> {
+        self.one_worker("assignment", assignment)
+    }
+
+    fn one_worker(&self, column: &str, value: &str) -> rusqlite::Result<Option<Worker>> {
+        self.conn
+            .query_row(
+                &format!("SELECT * FROM workers WHERE {column} = ?1"),
+                [value],
+                row_worker,
+            )
+            .optional()
+    }
+
+    /// Workers, oldest first; `running_only` leaves out the ended ones.
+    pub fn workers(&self, running_only: bool) -> rusqlite::Result<Vec<Worker>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT * FROM workers WHERE (?1 = 0 OR ended_at IS NULL) ORDER BY id ASC")?;
+        let rows = stmt.query_map([running_only], row_worker)?;
+        rows.collect()
+    }
+
+    pub fn end_worker(
+        &self,
+        id: i64,
+        state: &str,
+        by: Option<&str>,
+        now: i64,
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE workers SET state = ?2, by = ?3, ended_at = ?4 WHERE id = ?1",
+            params![id, state, by, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_worker_running(&self, id: i64, pid: u32, _now: i64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE workers SET state = 'running', pid = ?2 WHERE id = ?1",
+            params![id, pid],
+        )?;
         Ok(())
     }
 
@@ -1225,16 +1334,49 @@ mod tests {
     }
 
     #[test]
+    fn v17_adds_the_workers_table_and_a_worker_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let store = Store::open(&path).unwrap();
+        assert_eq!(user_version(&path), 17);
+        let w = Worker {
+            id: 0,
+            assignment: "a1".into(),
+            session: "claude-7".into(),
+            provider: "claude".into(),
+            folder: "/tmp/w/r1".into(),
+            pid: None,
+            started_at: 5,
+            ended_at: None,
+            state: "starting".into(),
+            by: None,
+        };
+        let id = store.insert_worker(&w).unwrap();
+        let w = Worker { id, ..w };
+        assert_eq!(
+            store.worker_by_session("claude-7").unwrap(),
+            Some(w.clone())
+        );
+        assert_eq!(store.worker_by_assignment("a1").unwrap(), Some(w));
+        store.set_worker_running(id, 42, 6).unwrap();
+        assert_eq!(store.workers(true).unwrap()[0].pid, Some(42));
+        store.end_worker(id, "done", None, 9).unwrap();
+        assert!(store.workers(true).unwrap().is_empty());
+        let all = store.workers(false).unwrap();
+        assert_eq!((all[0].ended_at, all[0].state.as_str()), (Some(9), "done"));
+    }
+
+    #[test]
     fn newer_db_refuses_to_open() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db");
         Connection::open(&path)
             .unwrap()
-            .execute_batch("PRAGMA user_version = 17;")
+            .execute_batch("PRAGMA user_version = 18;")
             .unwrap();
         let err = Store::open(&path).err().unwrap().to_string();
-        assert!(err.contains("State is from a newer version (v17)"), "{err}");
-        assert_eq!(user_version(&path), 17);
+        assert!(err.contains("State is from a newer version (v18)"), "{err}");
+        assert_eq!(user_version(&path), 18);
     }
 
     #[test]
@@ -1245,7 +1387,7 @@ mod tests {
             .conn()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 16);
+        assert_eq!(v, 17);
         let meta = crate::mail::Meta {
             done_when: Some("tests pass".into()),
             deadline_at: Some(99),

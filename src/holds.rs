@@ -247,16 +247,26 @@ pub fn answer(
         "UPDATE holds SET state = ?2 WHERE id = ?1",
         params![id, state],
     )?;
-    let nonce = ulid::Ulid::generate().to_string();
-    let mut record = json!({"hold": c.hold.name(), "verdict": verdict, "scope": "once",
-        "by": by, "nonce": nonce, "decided_at": now, "member": me.key, "text": shown});
-    record["sig"] = me.sign(&record).into();
+    let (nonce, record) = signed_record(
+        me,
+        json!({"hold": c.hold.name(), "verdict": verdict, "scope": "once",
+            "by": by, "decided_at": now, "member": me.key, "text": shown}),
+    );
     store.conn().execute(
         "INSERT INTO approvals VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![id, verdict, "once", by, nonce, now, record.to_string()],
+        params![id, verdict, "once", by, nonce, now, record],
     )?;
     tx.commit()?;
     Ok(Ok(c))
+}
+
+/// `fields` plus a fresh `nonce`, signed by `me`: the nonce and the record JSON an `approvals`
+/// row keeps.
+pub(crate) fn signed_record(me: &Identity, mut fields: serde_json::Value) -> (String, String) {
+    let nonce = ulid::Ulid::generate().to_string();
+    fields["nonce"] = nonce.clone().into();
+    fields["sig"] = me.sign(&fields).into();
+    (nonce, fields.to_string())
 }
 
 /// Closes the open holds past their time at `now`: a permission prompt whose session is gone or

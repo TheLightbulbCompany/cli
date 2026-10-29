@@ -238,11 +238,12 @@ fn an_older_index_is_rebuilt_stemmed() {
     let s = Store::open(&path).unwrap();
     memory::remember(&s, &a, rem("test runner", "cargo test", &[]), 1).unwrap();
     drop(s);
-    // Back to v11: the index as V9 made it, no `memory_seen`, no V14, V15 or V16 columns.
+    // Back to v11: the index as V9 made it, no `memory_seen`, no V14, V15 or V16 columns, no V17 table.
     rusqlite::Connection::open(&path)
         .unwrap()
         .execute_batch(
-            "ALTER TABLE capture_sessions DROP COLUMN nudged;
+            "DROP INDEX IF EXISTS workers_session; DROP TABLE IF EXISTS workers;
+             ALTER TABLE capture_sessions DROP COLUMN nudged;
              ALTER TABLE memory_entries DROP COLUMN reason;
              DROP INDEX messages_reply_to;
              ALTER TABLE messages DROP COLUMN reply_to;

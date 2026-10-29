@@ -20,7 +20,7 @@ enum Kind {
 }
 
 /// Every setting: the one list `load` and `set` read.
-const KEYS: [(&str, Kind); 13] = [
+const KEYS: [(&str, Kind); 18] = [
     ("computer", Kind::Str(|c| &mut c.computer)),
     (
         "preview_to_workspace",
@@ -40,6 +40,17 @@ const KEYS: [(&str, Kind); 13] = [
         Kind::Int(|c| &mut c.capture_turns_days),
     ),
     ("memory_model", Kind::Bool(|c| &mut c.memory_model)),
+    ("workers_offer", Kind::Str(|c| &mut c.workers_offer)),
+    ("workers_folder", Kind::Str(|c| &mut c.workers_folder)),
+    ("workers_max", Kind::Int(|c| &mut c.workers_max)),
+    (
+        "workers_deadline_s",
+        Kind::Int(|c| &mut c.workers_deadline_s),
+    ),
+    (
+        "workers_max_deadline_s",
+        Kind::Int(|c| &mut c.workers_max_deadline_s),
+    ),
 ];
 
 fn kind(key: &str) -> Option<Kind> {
@@ -71,6 +82,16 @@ pub struct Config {
     /// Whether `setup` downloads the memory model: `setup --no-model` sets it off, a plain
     /// `setup` on; the automatic setup after an update keeps it.
     pub memory_model: bool,
+    /// Harnesses this computer starts fresh workers for, comma separated (`workers::offers`);
+    /// empty offers none.
+    pub workers_offer: String,
+    /// Where workers run: `<folder>/<request_id>/`.
+    pub workers_folder: String,
+    /// Workers running at once.
+    pub workers_max: i64,
+    /// Seconds a worker runs when the assignment names no deadline, and the most it may be given.
+    pub workers_deadline_s: i64,
+    pub workers_max_deadline_s: i64,
 }
 
 impl Default for Config {
@@ -89,6 +110,11 @@ impl Default for Config {
             capture_turns: true,
             capture_turns_days: 90,
             memory_model: true,
+            workers_offer: String::new(),
+            workers_folder: "~/lightbulb-work".into(),
+            workers_max: 3,
+            workers_deadline_s: 3600,
+            workers_max_deadline_s: 14400,
         }
     }
 }
@@ -171,6 +197,33 @@ fn from_doc(doc: &DocumentMut) -> Result<Config> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn worker_keys_read_write_and_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let c = Config::load(d).unwrap();
+        assert_eq!(
+            (c.workers_offer.as_str(), c.workers_folder.as_str()),
+            ("", "~/lightbulb-work")
+        );
+        assert_eq!(
+            (
+                c.workers_max,
+                c.workers_deadline_s,
+                c.workers_max_deadline_s
+            ),
+            (3, 3600, 14400)
+        );
+        Config::set(d, "workers_offer", "claude,codex,vim").unwrap();
+        Config::set(d, "workers_max", "7").unwrap();
+        let c = Config::load(d).unwrap();
+        assert_eq!(
+            (c.workers_offer.as_str(), c.workers_max),
+            ("claude,codex,vim", 7)
+        );
+        assert_eq!(crate::workers::offers(&c), ["claude", "codex"]);
+    }
 
     #[test]
     fn a_leading_tilde_is_the_home_dir() {

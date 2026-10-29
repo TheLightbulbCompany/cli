@@ -37,5 +37,6 @@ pub mod streams;
 pub mod telemetry;
 pub mod ticket;
 pub mod upload;
+pub mod workers;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
