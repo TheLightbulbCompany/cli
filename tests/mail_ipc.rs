@@ -4,6 +4,11 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
 
+/// `dir`'s `config.toml`: network workers on (assignments are `unsupported` without).
+fn workers_on(dir: &tempfile::TempDir) {
+    std::fs::write(dir.path().join("config.toml"), "network_workers = true\n").unwrap();
+}
+
 async fn connect(sock: &std::path::Path) -> (Lines<BufReader<OwnedReadHalf>>, OwnedWriteHalf) {
     for _ in 0..50 {
         if let Ok(s) = UnixStream::connect(sock).await {
@@ -181,6 +186,61 @@ async fn mail_arriving_after_a_waiting_inbox_hung_up_stays_in_the_mailbox() {
     call(&mut l, &mut w, json!({"id": 4, "op": "shutdown"})).await;
 }
 
+/// Network workers off (the default): a send of any kind but `message`, or with a `status`,
+/// is `unsupported`; a plain message goes as ever.
+#[tokio::test]
+async fn assignments_are_unsupported_until_network_workers_is_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let claude_home = tempfile::tempdir().unwrap();
+    std::env::set_var("LIGHTBULB_CONNECT_CLAUDE_HOME", claude_home.path());
+    let home = dir.path().to_path_buf();
+    tokio::spawn(async move { daemon::run(&home).await.unwrap() });
+    let (mut l, mut w) = connect(&dir.path().join(paths::SOCKET)).await;
+    let birth = os::process(std::process::id()).unwrap().birth_micros;
+    let mut keys = vec![];
+    for (i, (provider, conv)) in [("codex", "a"), ("claude", "b")].into_iter().enumerate() {
+        let reg = call(
+            &mut l,
+            &mut w,
+            json!({"id": i + 1, "op": "register", "session": {
+            "provider": provider, "conversation": conv, "pid": std::process::id(),
+            "birth_micros": birth, "cwd": "/tmp"}}),
+        )
+        .await;
+        keys.push(reg["key"].as_str().unwrap().to_string());
+    }
+    let (a, b) = (keys[0].clone(), keys[1].clone());
+    for (rid, extra) in [
+        ("as1", json!({"kind": "assign", "done_when": "y"})),
+        ("rs1", json!({"kind": "result", "reply_to": "x"})),
+        ("cn1", json!({"kind": "cancel", "reply_to": "x"})),
+        ("st1", json!({"status": "done"})),
+    ] {
+        let mut m = json!({"id": 3, "op": "send", "from": a, "to": b, "text": "x",
+            "request_id": rid});
+        for (k, v) in extra.as_object().unwrap() {
+            m[k] = v.clone();
+        }
+        let r = call(&mut l, &mut w, m).await;
+        assert_eq!(r["error"], "unsupported", "{rid}: {r}");
+    }
+    let r = call(
+        &mut l,
+        &mut w,
+        json!({"id": 4, "op": "send", "from": a, "to": b, "text": "hi", "request_id": "m1"}),
+    )
+    .await;
+    assert_eq!(r["receipt"]["state"], "stored", "{r}");
+    let r = call(
+        &mut l,
+        &mut w,
+        json!({"id": 5, "op": "assignments.guard", "key": b}),
+    )
+    .await;
+    assert!(r["ok"] == true && r.get("block").is_none(), "{r}");
+    call(&mut l, &mut w, json!({"id": 6, "op": "shutdown"})).await;
+}
+
 #[tokio::test]
 async fn send_qualifies_a_bare_name_and_refuses_bad_addresses() {
     let dir = tempfile::tempdir().unwrap();
@@ -268,6 +328,7 @@ async fn an_assignment_is_delivered_with_its_fields_and_its_reply_is_its_result(
     let dir = tempfile::tempdir().unwrap();
     let claude_home = tempfile::tempdir().unwrap();
     std::env::set_var("LIGHTBULB_CONNECT_CLAUDE_HOME", claude_home.path());
+    workers_on(&dir);
     let home = dir.path().to_path_buf();
     tokio::spawn(async move { daemon::run(&home).await.unwrap() });
     let sock = dir.path().join(paths::SOCKET);
@@ -406,6 +467,7 @@ async fn lapsed_assignment(
 ) {
     let claude_home = tempfile::tempdir().unwrap();
     std::env::set_var("LIGHTBULB_CONNECT_CLAUDE_HOME", claude_home.path());
+    workers_on(dir);
     let home = dir.path().to_path_buf();
     tokio::spawn(async move { daemon::run(&home).await.unwrap() });
     let (mut l, mut w) = connect(&dir.path().join(paths::SOCKET)).await;
@@ -514,7 +576,7 @@ async fn an_assign_to_my_own_new_claude_is_stored_and_a_cancel_reaches_the_worke
     std::fs::write(
         dir.path().join("config.toml"),
         format!(
-            "lan = false\nworkers_offer = \"claude\"\nworkers_folder = \"{}\"\n",
+            "lan = false\nnetwork_workers = true\nworkers_offer = \"claude\"\nworkers_folder = \"{}\"\n",
             work.display()
         ),
     )

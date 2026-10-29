@@ -1924,6 +1924,76 @@ fn memory_list_repo_takes_a_bare_name() {
     }
 }
 
+/// `config set` flips a true/false or number setting (a person's only, the daemon reloaded);
+/// `workers on` needs `network_workers` first.
+#[test]
+fn config_set_flips_a_bool_key_and_workers_on_needs_it() {
+    let mut e = Env::new();
+    assert!(e.run(&["who"]).status.success());
+    let o = e.person(&["workers", "on"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(
+        err(&o).trim(),
+        "Network workers are off on this computer. Turn them on with: lightbulb config set network_workers true"
+    );
+    let config = || std::fs::read_to_string(e.state.path().join("config.toml")).unwrap_or_default();
+    assert!(!config().contains("workers_offer"), "{}", config());
+    // Not a true/false or number setting, a wrong value, an unknown key: refused, nothing written.
+    for (args, want) in [
+        (
+            &["config", "set", "relay", "x"][..],
+            "Set that with relay <url>.",
+        ),
+        (
+            &["config", "set", "network_workers", "yes"],
+            "\"yes\" is not a value network_workers takes.",
+        ),
+        (&["config", "set", "nope", "true"], "No setting nope."),
+        (
+            &["config", "get"],
+            "Usage: lightbulb config set <key> <value>",
+        ),
+    ] {
+        let o = e.person(args);
+        assert_eq!(o.status.code(), Some(2), "{args:?}");
+        assert_eq!(err(&o).trim(), want, "{args:?}");
+    }
+    assert!(!config().contains("network_workers"), "{}", config());
+    // An agent's shell is refused before anything is written.
+    let birth = os::process(std::process::id()).unwrap().birth_micros;
+    e.pin = Some(format!("{}:{birth}", std::process::id()));
+    let pin = e.pin.clone().unwrap();
+    let o = e
+        .cmd(&["config", "set", "network_workers", "true"])
+        .env("LIGHTBULB_CONNECT_HOOK_CALLER", &pin)
+        .output()
+        .unwrap();
+    assert!(
+        err(&o).contains("Run this from your own terminal"),
+        "{}",
+        err(&o)
+    );
+    assert!(!config().contains("network_workers"), "{}", config());
+    e.pin = None;
+    let o = e.person(&["config", "set", "network_workers", "true"]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(out(&o).trim(), "network_workers = true");
+    let o = e.person(&["config", "set", "workers_max", "2"]);
+    assert_eq!(out(&o).trim(), "workers_max = 2");
+    let o = e.person(&["workers", "on", "--offer", "claude"]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(
+        config().contains("workers_offer = \"claude\""),
+        "{}",
+        config()
+    );
+    // Off again: `workers on` refuses again.
+    let o = e.person(&["config", "set", "network_workers", "false"]);
+    assert!(o.status.success(), "{}", err(&o));
+    let o = e.person(&["workers", "on"]);
+    assert_eq!(o.status.code(), Some(1));
+}
+
 #[test]
 fn workers_commands_are_person_only_and_print_the_table() {
     let mut e = Env::new();
@@ -1971,6 +2041,8 @@ fn workers_commands_are_person_only_and_print_the_table() {
     }
     let o = e.person(&["workers"]);
     assert!(out(&o).contains("No workers"), "{}", out(&o));
+    let o = e.person(&["config", "set", "network_workers", "true"]);
+    assert!(o.status.success(), "{}", err(&o));
     let o = e.person(&["workers", "on", "--offer", "claude"]);
     assert!(o.status.success(), "{}", err(&o));
     let config = std::fs::read_to_string(e.state.path().join("config.toml")).unwrap();

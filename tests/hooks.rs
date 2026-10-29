@@ -24,10 +24,21 @@ impl Net {
         Net::with_env(&[])
     }
 
+    /// A daemon with network workers on (assignments are `unsupported` without).
+    fn workers() -> Net {
+        Net::with(&[], "network_workers = true\n")
+    }
+
     /// A daemon with `env` set too.
     fn with_env(env: &[(&str, &str)]) -> Net {
+        Net::with(env, "")
+    }
+
+    /// A daemon with `env` set and `config` as its `config.toml`.
+    fn with(env: &[(&str, &str)], config: &str) -> Net {
         let dir = tempfile::tempdir().unwrap();
         let claude = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.toml"), config).unwrap();
         let daemon = Command::new(EXE)
             .arg("daemon")
             .envs(env.iter().copied())
@@ -1160,7 +1171,7 @@ fn a_late_stop_answer_still_nudges() {
 
 #[test]
 fn stop_blocks_once_while_an_assignment_is_open_and_again_when_its_result_lands() {
-    let net = Net::new();
+    let net = Net::workers();
     let me = os::process(std::process::id()).unwrap();
     let conv = "00000000-0000-4000-8000-0000000000c1";
     let c1 = register(&net, conv, me.pid, me.birth_micros);
@@ -1188,6 +1199,32 @@ fn stop_blocks_once_while_an_assignment_is_open_and_again_when_its_result_lands(
     let out: Value = serde_json::from_str(&net.hook("claude", "stop", "claude-stop")).unwrap();
     assert_eq!(out["decision"], "block");
     assert!(out["reason"].as_str().unwrap().contains("done"));
+    assert_eq!(net.hook("claude", "stop", "claude-stop"), "");
+}
+
+/// An assignment still open when network workers are turned off: the Stop guard is silent.
+#[test]
+fn the_stop_guard_is_silent_when_network_workers_is_off() {
+    let net = Net::workers();
+    let me = os::process(std::process::id()).unwrap();
+    let c1 = register(
+        &net,
+        "00000000-0000-4000-8000-0000000000c1",
+        me.pid,
+        me.birth_micros,
+    );
+    let x = register(&net, "target", me.pid, me.birth_micros);
+    let r = net.call(
+        json!({"id": 1, "op": "send", "from": c1, "to": x, "kind": "assign",
+        "text": "do it", "done_when": "done", "deadline_s": 600, "request_id": "as1"}),
+    );
+    assert_eq!(r["receipt"]["state"], "stored", "{r}");
+    std::fs::write(
+        net.dir.path().join("config.toml"),
+        "network_workers = false\n",
+    )
+    .unwrap();
+    assert_eq!(net.call(json!({"id": 2, "op": "reload"}))["ok"], true);
     assert_eq!(net.hook("claude", "stop", "claude-stop"), "");
 }
 

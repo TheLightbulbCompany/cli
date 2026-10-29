@@ -66,6 +66,8 @@ async fn start(
 ) {
     claude_home();
     let dir = tempfile::tempdir().unwrap();
+    // Network workers on: one test pushes an assignment.
+    std::fs::write(dir.path().join("config.toml"), "network_workers = true\n").unwrap();
     let home: PathBuf = dir.path().into();
     tokio::spawn(async move { daemon::run(&home).await.unwrap() });
     let (mut l, mut w) = connect(&dir.path().join(paths::SOCKET)).await;

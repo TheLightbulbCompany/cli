@@ -112,14 +112,14 @@ fn hosted(script: Value, o: Opts) -> Pair {
     }
     env.extend(o.env);
     let config = format!(
-        "computer = \"mbp\"\nworkers_offer = \"{harness}\"\nworkers_folder = \"{}\"\n{}",
+        "computer = \"mbp\"\nnetwork_workers = true\nworkers_offer = \"{harness}\"\nworkers_folder = \"{}\"\n{}",
         work.path().display(),
         o.config
     );
     b.daemon(false, &config, &env);
     let mut a_env = vec![peers(&[&b])];
     a_env.extend(o.a_env);
-    a.daemon(false, "", &a_env);
+    a.daemon(false, "network_workers = true\n", &a_env);
     until(10, "both online", || {
         a.status()["peers"]["online"] == 1 && b.status()["peers"]["online"] == 1
     });

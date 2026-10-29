@@ -751,9 +751,48 @@ fn register(e: &Env, provider: &str, conv: &str) -> String {
     r["key"].as_str().unwrap().to_string()
 }
 
+/// `config.toml`'s line for network workers on (assignments are `unsupported` without).
+const ON: &str = "network_workers = true\n";
+
+/// Two computers of one team, running with configs `a_config` and `b_config`.
+fn workers_pair(a_config: &str, b_config: &str) -> (Env, Env) {
+    let (a, b) = (Env::new(), Env::new());
+    seed_pair(&a, &b);
+    b.daemon(false, b_config, &[]);
+    a.daemon(false, a_config, &[peers(&[&b])]);
+    until(10, "both online", || {
+        a.status()["peers"]["online"] == 1 && b.status()["peers"]["online"] == 1
+    });
+    (a, b)
+}
+
+/// Network workers on at A but off at B (its default): B answers A's assignment
+/// `unsupported`, before anything is stored, whether to a session or a fresh worker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_peer_assign_is_unsupported_where_network_workers_is_off() {
+    let (a, b) = workers_pair(ON, "workers_offer = \"claude\"\n");
+    let asker = session(&a, "a1");
+    let worker = register(&b, "claude", "w1");
+    let new = format!("{}/claude:new", b.short());
+    for (rid, to) in [("as1", worker.clone()), ("as2", new)] {
+        let r = a.ask(
+            json!({"id": 1, "op": "send", "from": asker, "to": to, "kind": "assign",
+            "text": "fix it", "done_when": "green", "deadline_s": 300, "request_id": rid}),
+        );
+        assert_eq!(r["ok"], true, "{r}");
+        wait_state(&a, &asker, rid, "refused");
+        assert_eq!(a.receipt(&asker, rid)["reason"], "unsupported", "{rid}");
+    }
+    assert_eq!(b.unread(&worker), 0);
+    assert!(person(&b, json!({"id": 1, "op": "holds"}))["holds"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_assignment_crosses_the_wire_and_its_result_comes_back() {
-    let (a, b) = pair(&[]);
+    let (a, b) = workers_pair(ON, ON);
     let asker = session(&a, "a1");
     let worker = register(&b, "claude", "w1");
     let r = a.ask(
@@ -806,8 +845,8 @@ async fn an_assignment_crosses_the_wire_and_its_result_comes_back() {
 async fn a_peer_assign_to_a_worker_address_is_held_and_the_receipt_says_so() {
     let (a, b) = (Env::new(), Env::new());
     seed_pair(&a, &b);
-    b.daemon(false, "workers_offer = \"claude\"\n", &[]);
-    a.daemon(false, "", &[peers(&[&b])]);
+    b.daemon(false, &format!("{ON}workers_offer = \"claude\"\n"), &[]);
+    a.daemon(false, ON, &[peers(&[&b])]);
     until(10, "both online", || {
         a.status()["peers"]["online"] == 1 && b.status()["peers"]["online"] == 1
     });

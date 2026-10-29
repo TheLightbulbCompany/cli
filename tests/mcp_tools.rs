@@ -21,8 +21,18 @@ struct Net {
 
 impl Net {
     fn new() -> Net {
+        Net::with_config("")
+    }
+
+    /// A daemon (and its MCP servers) with network workers on.
+    fn workers() -> Net {
+        Net::with_config("network_workers = true\n")
+    }
+
+    fn with_config(config: &str) -> Net {
         let dir = tempfile::tempdir().unwrap();
         let claude = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.toml"), config).unwrap();
         let daemon = Command::new(EXE)
             .arg("daemon")
             .env("LIGHTBULB_CONNECT_DEBUG_NO_DEFAULT_RELAYS", "1")
@@ -1122,10 +1132,15 @@ fn api(method: &str, path: &str) -> (u16, Value) {
 }
 
 /// A signed-in computer named mac, its daemon up, this process its Claude session `c1`.
+/// `config.toml` naming the computer, with network workers on (every tool listed).
+fn mac_workers() -> String {
+    format!("{}network_workers = true\n", common::computer("mac"))
+}
+
 fn signed_in() -> common::Env {
     let e = common::Env::new();
     e.sign_in("user_1", None);
-    e.daemon(false, &common::computer("mac"), &[]);
+    e.daemon(false, &mac_workers(), &[]);
     register_on(&e, "claude", "c1", &me(), "/tmp");
     e
 }
@@ -1158,7 +1173,7 @@ fn tools_json_flag_prints_the_spec() {
 #[test]
 fn workspace_tools_hidden_until_signed_in() {
     let e = common::Env::new();
-    e.daemon(false, &common::computer("mac"), &[]);
+    e.daemon(false, &mac_workers(), &[]);
     register_on(&e, "claude", "c1", &me(), "/tmp");
     let network: Vec<String> = spec()
         .iter()
@@ -1351,7 +1366,7 @@ fn room_targets_go_to_rest_session_targets_stay_p2p() {
 #[test]
 fn the_tool_list_changes_when_the_sign_in_does() {
     let e = common::Env::new();
-    e.daemon(false, &common::computer("mac"), &[]);
+    e.daemon(false, &mac_workers(), &[]);
     register_on(&e, "claude", "c1", &me(), "/tmp");
     let mut m = mcp_on(&e, &me());
     let changes = |m: &mut Mcp| {
@@ -1557,9 +1572,41 @@ fn a_question_recall_through_mcp_is_one_page() {
     );
 }
 
+/// Network workers off (the default): the assignment tools are not listed, and calling one
+/// answers what an unknown tool does; turned on, the next list has them.
+#[test]
+fn the_assignment_tools_are_hidden_until_network_workers_is_on() {
+    let net = Net::new();
+    net.register("claude", "c1", &me());
+    let mut m = net.mcp(&me());
+    let names = |m: &mut Mcp| -> Vec<String> {
+        let listed = m.rpc("tools/list", json!({}));
+        (listed["result"]["tools"].as_array().unwrap().iter())
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let hidden = ["find_workers", "assign", "cancel_assignment"];
+    let off = names(&mut m);
+    assert!(off.iter().all(|n| !hidden.contains(&n.as_str())), "{off:?}");
+    assert!(off.iter().any(|n| n == "send_message"), "{off:?}");
+    let unknown = m.tool("no_such_tool", json!({}));
+    for n in hidden {
+        let out = m.tool(n, json!({"request_id": "r1", "assignment": "a"}));
+        assert!(out.error, "{n}");
+        assert_eq!(out.text, unknown.text, "{n}");
+    }
+    std::fs::write(
+        net.dir.path().join("config.toml"),
+        "network_workers = true\n",
+    )
+    .unwrap();
+    let on = names(&mut m);
+    assert!(hidden.iter().all(|n| on.iter().any(|o| o == n)), "{on:?}");
+}
+
 #[test]
 fn the_three_assignment_tools_are_listed_and_assign_round_trips() {
-    let net = Net::new();
+    let net = Net::workers();
     let codex = Other::new();
     net.register("claude", "c1", &me());
     let t = net.register("codex", "t1", &codex.1);
@@ -1612,7 +1659,7 @@ fn the_three_assignment_tools_are_listed_and_assign_round_trips() {
 
 #[test]
 fn find_workers_lists_always_on_sessions_only() {
-    let net = Net::new();
+    let net = Net::workers();
     let codex = Other::new();
     net.register("claude", "c1", &me());
     let t = net.register("codex", "t1", &codex.1);
@@ -1639,12 +1686,14 @@ fn find_workers_lists_always_on_sessions_only() {
 fn find_workers_shows_a_teammates_worker_host() {
     let (b, a) = (common::Env::new(), common::Env::new());
     common::seed_pair(&b, &a);
-    common::start_pair(
-        &b,
-        &a,
-        "computer = \"mbp\"\nworkers_offer = \"claude\"\nworkers_max = 2\n",
-        &[],
-    );
+    // Network workers on at both: B hosts, A's agent lists it.
+    a.daemon(false, "network_workers = true\n", &[]);
+    let b_config =
+        "computer = \"mbp\"\nnetwork_workers = true\nworkers_offer = \"claude\"\nworkers_max = 2\n";
+    b.daemon(false, b_config, &[common::peers(&[&a])]);
+    common::until(10, "both online", || {
+        a.status()["peers"]["online"] == 1 && b.status()["peers"]["online"] == 1
+    });
     let key = format!("{}/claude:new", b.short());
     common::until(15, "A sees B's worker host", || common::sees(&a, &key));
     register_on(&a, "claude", "c1", &me(), "/tmp");

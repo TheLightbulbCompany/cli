@@ -58,7 +58,10 @@ impl World {
     async fn instance(&self) -> Instance {
         self.a.sign_in("user_aden", None);
         self.b.sign_in("user_quinn", None);
-        self.b.daemon(false, "", &[]);
+        // Assignments need network workers on, at both ends.
+        let on = "network_workers = true\n";
+        std::fs::write(self.w1.path().join("config.toml"), on).unwrap();
+        self.b.daemon(false, on, &[]);
         let i = common::instance(self.w1.path(), &[&self.b], NAME, None, &[])
             .await
             .unwrap();
@@ -365,7 +368,8 @@ mod linked {
             listener.local_addr().unwrap()
         );
         e.sign_in("user_aden", Some(&url));
-        e.daemon(false, "", &[]);
+        // Network workers on: one test assigns over the link.
+        e.daemon(false, "network_workers = true\n", &[]);
         let (tcp, _) = tokio::time::timeout(Duration::from_secs(30), listener.accept())
             .await
             .unwrap()

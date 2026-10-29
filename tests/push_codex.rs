@@ -52,6 +52,8 @@ fn fake_codex(rel: &str) -> PathBuf {
 async fn start(conv: &str, exe: &Path) -> (tempfile::TempDir, Conn, String) {
     home();
     let dir = tempfile::tempdir().unwrap();
+    // Network workers on: one test pushes an assignment.
+    std::fs::write(dir.path().join("config.toml"), "network_workers = true\n").unwrap();
     let state = dir.path().to_path_buf();
     tokio::spawn(async move { daemon::run(&state).await.unwrap() });
     let sock = dir.path().join(paths::SOCKET);

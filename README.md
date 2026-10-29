@@ -79,7 +79,7 @@ lightbulb who --all
 From any Claude Code, Codex, Cursor, Grok CLI or OpenCode session, ask the agent: "Use the lightbulb tools to
 find sam's sessions and send their Claude a message." The tools are `find_sessions`,
 `send_message`, `message_receipt`, `check_inbox`, `find_workers`, `assign` and
-`cancel_assignment`. A teammate's computer can also start a worker for your assignment once its person allows it (`lightbulb workers`).
+`cancel_assignment`. A teammate's computer can also start a worker for your assignment once its person allows it (`lightbulb workers`). The three assignment tools are off by default: `lightbulb config set network_workers true` turns them on.
 
 Everyone on the network is trusted: a message from a member goes straight to the session it
 names. Membership is the only gate. To stop someone, run `lightbulb remove <name>`.
