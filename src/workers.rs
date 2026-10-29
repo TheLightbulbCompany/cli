@@ -182,6 +182,7 @@ impl Registry {
     }
 
     fn insert(&self, id: i64, pid: u32) -> oneshot::Receiver<Stop> {
+        debug_assert!(pid != 0, "a worker's pid is never 0");
         let (tx, rx) = oneshot::channel();
         let run = Running {
             pid,
@@ -200,6 +201,31 @@ fn provider_of(to: &str) -> &str {
         .unwrap_or_default()
 }
 
+/// The folder of the worker for assignment `assign_id` (its message id, a ULID: unique, never a
+/// dot name): `<workers_folder>/<assign_id>/`.
+pub fn folder_for(config: &Config, assign_id: &str) -> PathBuf {
+    dir_for(&folder(config), assign_id)
+}
+
+/// `folder_for` under the workers folder `base`.
+pub fn dir_for(base: &Path, assign_id: &str) -> PathBuf {
+    base.join(assign_id)
+}
+
+/// The worker's stderr: beside its folder (`<base>/<assign_id>.log`), so a worktree never
+/// commits it.
+pub fn log_for(base: &Path, assign_id: &str) -> PathBuf {
+    base.join(format!("{assign_id}.log"))
+}
+
+/// Kills process group `pgid` (`signal`); never group 0 (the daemon's own).
+fn kill_group(pgid: i32, signal: i32) {
+    if pgid > 0 {
+        // SAFETY: a plain syscall on a process group id.
+        unsafe { libc::killpg(pgid, signal) };
+    }
+}
+
 /// Creates `dir` (and its parents) `0700` when it does not exist.
 fn private_dir(dir: &Path) -> Result<()> {
     if !dir.exists() {
@@ -211,18 +237,22 @@ fn private_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Request `rid`'s folder, `<base>/<rid>/`, private (`0700`): a git worktree on branch
-/// `meta.branch` (else `lb/<rid>`) when `meta.repo` names a clone right under `base`, else
-/// empty. No fetch; a worktree git refuses leaves the folder empty.
-pub fn workspace(base: &Path, rid: &str, meta: &Meta) -> Result<PathBuf> {
+/// Assignment `id`'s (request `rid`) folder, `<base>/<id>/`, new and private (`0700`; one
+/// that exists already is an error, `folder exists`): a git worktree on branch `meta.branch`
+/// (else `lb/<rid>`) when `meta.repo` names a clone right under `base`, else empty. No fetch;
+/// a worktree git refuses leaves the folder empty. Blocking (git): off the async threads.
+pub fn workspace(base: &Path, id: &str, rid: &str, meta: &Meta) -> Result<PathBuf> {
     private_dir(base)?;
-    let dir = base.join(rid);
+    let dir = dir_for(base, id);
+    if dir.exists() {
+        return Err("folder exists".into());
+    }
     // One plain name: never a path out of `base`.
     let clone = (meta.repo.as_deref())
         .filter(|r| sessions::word(r, 256) && !r.starts_with('.'))
         .map(|r| base.join(r))
         .filter(|c| c.join(".git").exists());
-    if let (Some(clone), false) = (clone, dir.exists()) {
+    if let Some(clone) = clone {
         let branch = meta.branch.clone().unwrap_or_else(|| format!("lb/{rid}"));
         let made = std::process::Command::new("git")
             .arg("-C")
@@ -235,10 +265,12 @@ pub fn workspace(base: &Path, rid: &str, meta: &Meta) -> Result<PathBuf> {
             .status()
             .is_ok_and(|s| s.success());
         if !made {
-            eprintln!("worker {rid}: no worktree of its repo; an empty folder");
+            eprintln!("worker {id}: no worktree of its repo; an empty folder");
         }
     }
-    private_dir(&dir)?;
+    if !dir.exists() {
+        std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+    }
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
     Ok(dir)
 }
@@ -287,7 +319,7 @@ pub fn claim(
         assignment: a.id.clone(),
         session: session.into(),
         provider: provider_of(&a.to_key).into(),
-        folder: folder(config).join(&a.request_id),
+        folder: folder_for(config, &a.id),
         pid: None,
         started_at: now,
         ended_at: None,
@@ -336,53 +368,138 @@ pub fn start(d: &Arc<Daemon>, assign_id: &str) -> Result<()> {
         eprintln!("worker for {assign_id}: not started");
         return Ok(());
     };
-    let spawned = workspace(&base, &a.request_id, &a.meta).and_then(|dir| {
-        let argv = driver.argv(&dir, &conv);
-        Ok((driver::spawn(&argv, &dir)?, dir, argv))
-    });
-    let (child, dir, argv) = match spawned {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("worker {}: not started: {e}", w.id);
-            let o = Outcome {
-                status: "failed",
-                reason: Some("error"),
-                body: "the worker could not be started".into(),
-            };
-            finish(d, &w, o, None);
-            return Ok(());
-        }
+    let launch = Launch {
+        w,
+        a,
+        driver,
+        label,
+        conv,
+        key,
+        base,
+        asker,
     };
-    let pid = child.id().unwrap_or_default();
-    let stop = d.workers.insert(w.id, pid);
-    {
-        let store = d.store.lock().unwrap();
-        let birth = crate::os::process(pid).ok().map(|p| p.birth_micros as i64);
-        store.put_session(&crate::store::Session {
-            key: key.0.clone(),
-            provider,
-            conversation: Some(conv),
-            pid: Some(pid.into()),
-            birth_micros: birth,
-            cwd: dir.to_string_lossy().into(),
-            title: Some(format!(
-                "{}'s worker",
-                asker.as_deref().unwrap_or("a teammate")
-            )),
-            status: "live".into(),
-            seen_at: now,
-            executable: argv.first().cloned(),
-            repo: None,
-            branch: None,
-            handle: None,
-        })?;
-        store.set_worker_running(w.id, pid)?;
-    }
-    d.presence.notify_one();
-    eprintln!("worker {}: running pid={pid} for {assign_id}", w.id);
-    let prompt = first_prompt(&label, &a);
-    tokio::spawn(drive(d.clone(), w, driver, child, prompt, stop));
+    tokio::spawn(launch.run(d.clone()));
     Ok(())
+}
+
+/// A claimed worker, to launch.
+struct Launch {
+    w: Worker,
+    a: Message,
+    driver: Box<dyn Driver>,
+    label: String,
+    conv: String,
+    key: Key,
+    base: PathBuf,
+    asker: Option<String>,
+}
+
+impl Launch {
+    /// Makes the folder (`workspace`, blocking), spawns the harness and registers it
+    /// (`register`), then drives it (`drive`); a folder or spawn that fails ends it
+    /// `failed`/`error`.
+    async fn run(self, d: Arc<Daemon>) {
+        let Launch {
+            w,
+            a,
+            driver,
+            label,
+            conv,
+            key,
+            base,
+            asker,
+        } = self;
+        let (b, id, rid, meta) = (
+            base.clone(),
+            a.id.clone(),
+            a.request_id.clone(),
+            a.meta.clone(),
+        );
+        let made = tokio::task::spawn_blocking(move || workspace(&b, &id, &rid, &meta)).await;
+        let made = made.unwrap_or_else(|e| Err(e.to_string().into()));
+        let spawned = made.and_then(|dir| {
+            let argv = driver.argv(&dir, &conv);
+            Ok((
+                driver::spawn(&argv, &dir, &log_for(&base, &a.id))?,
+                dir,
+                argv,
+            ))
+        });
+        let (child, dir, argv) = match spawned {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("worker {}: not started: {e}", w.id);
+                let o = Outcome {
+                    status: "failed",
+                    reason: Some("error"),
+                    body: format!("the worker could not be started: {e}"),
+                };
+                return finish(&d, &w, o, None);
+            }
+        };
+        let pid = child.id().unwrap_or_default();
+        let now = ipc::now() as i64;
+        let stop = {
+            let store = d.store.lock().unwrap();
+            let Some(stop) = register(&store, &d.workers, &w, pid).unwrap_or_else(|e| {
+                eprintln!("worker {}: not registered: {e}", w.id);
+                kill_group(pid as i32, libc::SIGKILL);
+                None
+            }) else {
+                // Cancelled while it started: killed, and the cancel already closed it.
+                eprintln!("worker {}: ended before it ran; killed pid={pid}", w.id);
+                return;
+            };
+            let birth = crate::os::process(pid).ok().map(|p| p.birth_micros as i64);
+            let row = store.put_session(&crate::store::Session {
+                key: key.0.clone(),
+                provider: w.provider.clone(),
+                conversation: Some(conv),
+                pid: Some(pid.into()),
+                birth_micros: birth,
+                cwd: dir.to_string_lossy().into(),
+                title: Some(format!(
+                    "{}'s worker",
+                    asker.as_deref().unwrap_or("a teammate")
+                )),
+                status: "live".into(),
+                seen_at: now,
+                executable: argv.first().cloned(),
+                repo: None,
+                branch: None,
+                handle: None,
+            });
+            if let Err(e) = row {
+                eprintln!("worker {}: no session row: {e}", w.id);
+            }
+            stop
+        };
+        d.presence.notify_one();
+        eprintln!("worker {}: running pid={pid} for {}", w.id, a.id);
+        let prompt = first_prompt(&label, &a);
+        drive(d, w, driver, child, prompt, stop).await;
+    }
+}
+
+/// Registers spawned worker `w` (process `pid`, its group's leader): its registry entry, then
+/// its row `running`. When the row ended meanwhile (a cancel during the start) its process
+/// group is killed, the entry removed, and `None` returned: nothing is to drive or report.
+pub fn register(
+    store: &Store,
+    reg: &Registry,
+    w: &Worker,
+    pid: u32,
+) -> Result<Option<oneshot::Receiver<Stop>>> {
+    if pid == 0 {
+        return Err("the harness exited at once".into());
+    }
+    let stop = reg.insert(w.id, pid);
+    if store.set_worker_running(w.id, pid)? {
+        return Ok(Some(stop));
+    }
+    reg.running.lock().unwrap().remove(&w.id);
+    kill_group(pid as i32, libc::SIGKILL);
+    Ok(None)
 }
 
 /// Runs worker `w`'s driver to its end: each permission prompt becomes a hold on the worker's
@@ -572,7 +689,7 @@ fn finish(d: &Arc<Daemon>, w: &Worker, o: Outcome, stopped: Option<Stop>) {
         holds::expire_for(&store, &w.session).unwrap_or_default()
     };
     for h in closed {
-        holds::closed(d, &h, "expired", None, None);
+        holds::closed(d, &h, "expired", None, None, None);
     }
     d.workers.running.lock().unwrap().remove(&w.id);
     d.presence.notify_one();
@@ -594,14 +711,14 @@ pub fn stop(d: &Arc<Daemon>, worker_id: i64, reason: &'static str, by: &str) -> 
         return Ok(());
     };
     let _ = tell.send((reason, by.into()));
-    // SAFETY: plain syscalls on a process group id.
-    unsafe { libc::killpg(pgid, libc::SIGTERM) };
+    kill_group(pgid, libc::SIGTERM);
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(5)).await;
         // ponytail: a group id is reused only once all of its processes are gone and a new
         // leader gets that pid; within 5 s that is not a risk worth a pidfd.
-        if unsafe { libc::killpg(pgid, 0) } == 0 {
-            unsafe { libc::killpg(pgid, libc::SIGKILL) };
+        // SAFETY: signal 0 only asks whether the group exists.
+        if pgid > 0 && unsafe { libc::killpg(pgid, 0) } == 0 {
+            kill_group(pgid, libc::SIGKILL);
         }
     });
     eprintln!("worker {worker_id}: stopping ({reason})");
@@ -621,7 +738,8 @@ pub fn stop_requested(d: &Arc<Daemon>, session: &str, by: &str) {
 }
 
 /// The asker `by` cancelled assignment `assign_id` addressed to a fresh worker: an open start
-/// hold is declined and its dialog withdrawn; a running worker is stopped (`cancelled`); a row
+/// hold is declined (reason `cancelled`, its receipt `refused`/`cancelled`) and its dialog
+/// withdrawn; a running worker is stopped (`cancelled`); a row
 /// with nothing running here ends `cancelled`.
 pub fn cancel(d: &Arc<Daemon>, assign_id: &str, by: &str) -> Result<()> {
     let now = ipc::now() as i64;
@@ -636,13 +754,31 @@ pub fn cancel(d: &Arc<Daemon>, assign_id: &str, by: &str) -> Result<()> {
         let mut declined = vec![];
         for id in ids {
             (store.conn()).execute("UPDATE holds SET state = 'declined' WHERE id = ?1", [id])?;
-            declined.extend(holds::get(&store, id)?);
+            let Some(h) = holds::get(&store, id)? else {
+                continue;
+            };
+            // Its asker hears the held assignment went nowhere.
+            let (m, at) = (&h.message, now as u64);
+            let why = Some("cancelled");
+            mail::advance(
+                store.conn(),
+                &m.from_key,
+                &m.request_id,
+                State::Refused,
+                why,
+                None,
+                at,
+            )?;
+            declined.push(h);
         }
         let w = store.worker_by_assignment(assign_id)?;
         (declined, w.filter(|w| w.ended_at.is_none()))
     };
     for h in &declined {
-        holds::closed(d, h, holds::DECLINE, Some(by), None);
+        holds::closed(d, h, holds::DECLINE, Some(by), Some("cancelled"), None);
+    }
+    if !declined.is_empty() {
+        d.peers.outbox.notify_one(); // the refused receipt goes to its asker
     }
     if let Some(w) = worker {
         if stop(d, w.id, "cancelled", by).is_err() {
@@ -718,7 +854,7 @@ pub fn reap(d: &Arc<Daemon>, now: i64) {
         Err(e) => return eprintln!("workers: reap: {e}"),
     };
     for h in closed {
-        holds::closed(d, &h, "expired", None, None);
+        holds::closed(d, &h, "expired", None, None, None);
     }
     for w in adopted {
         let Some(pid) = w.pid else { continue };
@@ -794,14 +930,12 @@ mod tests {
     fn a_worker_folder_is_private_and_per_request() {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("work");
-        let f = workspace(&base, "r1", &Meta::default()).unwrap();
-        assert_eq!(f, base.join("r1"));
+        let f = workspace(&base, "a1", "r1", &Meta::default()).unwrap();
+        assert_eq!(f, base.join("a1"));
         assert_eq!((mode(&base), mode(&f)), (0o700, 0o700));
-        // A second request gets its own folder.
-        assert_eq!(
-            workspace(&base, "r2", &Meta::default()).unwrap(),
-            base.join("r2")
-        );
+        // A second assignment, even with the same request id, gets its own folder.
+        let g = workspace(&base, "a2", "r1", &Meta::default()).unwrap();
+        assert_eq!(g, base.join("a2"));
     }
 
     #[test]
@@ -816,7 +950,7 @@ mod tests {
             repo: Some(repo.into()),
             ..Meta::default()
         };
-        let f = workspace(&base, "r1", &hint("app")).unwrap();
+        let f = workspace(&base, "a1", "r1", &hint("app")).unwrap();
         assert_eq!(mode(&f), 0o700);
         let list = git(&clone, &["worktree", "list"]);
         let shown = f.canonicalize().unwrap();
@@ -826,10 +960,82 @@ mod tests {
             "{list}"
         );
         // No clone of that name (nor one outside the folder): an empty folder.
-        for repo in ["nope", "../app", ".."] {
-            let f = workspace(&base, "r2", &hint(repo)).unwrap();
+        for (id, repo) in [("a2", "nope"), ("a3", "../app"), ("a4", "..")] {
+            let f = workspace(&base, id, "r2", &hint(repo)).unwrap();
             assert_eq!(std::fs::read_dir(&f).unwrap().count(), 0, "{repo}");
         }
+    }
+
+    #[test]
+    fn the_folder_is_named_by_the_assignment_id_and_refuses_dot_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("work");
+        let config = Config {
+            workers_folder: base.to_string_lossy().into(),
+            ..Config::default()
+        };
+        let s = Store::open(&dir.path().join("state.db")).unwrap();
+        let id = ulid::Ulid::generate().to_string();
+        let a = assign(&id, "..", "p/codex:a", 100);
+        let w = claim(&s, &config, &a, "m/claude:w1", 10).unwrap().unwrap();
+        assert_eq!(w.folder, base.join(&id));
+        assert_eq!(folder_for(&config, &id), base.join(&id));
+        let f = workspace(&base, &id, "..", &Meta::default()).unwrap();
+        assert_eq!(f, base.join(&id));
+        // Nothing outside the workers folder was touched, and only its folder is in it.
+        let names = |d: &Path| {
+            let mut v: Vec<String> = std::fs::read_dir(d)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into())
+                .collect();
+            v.sort();
+            v
+        };
+        let mut outside = names(dir.path());
+        outside.retain(|n| !n.starts_with("state.db"));
+        assert_eq!(outside, ["work"]);
+        assert_eq!(names(&base), std::slice::from_ref(&id));
+        // An existing folder is never reused: the start fails.
+        let again = workspace(&base, &id, "..", &Meta::default()).unwrap_err();
+        assert_eq!(again.to_string(), "folder exists");
+        assert_eq!(log_for(&base, &id), base.join(format!("{id}.log")));
+    }
+
+    #[tokio::test]
+    async fn a_cancel_during_the_start_window_kills_the_worker() {
+        use std::os::unix::process::ExitStatusExt;
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("state.db")).unwrap();
+        let reg = Registry::default();
+        let config = Config::default();
+        let a = assign("a1", "r1", "p/codex:a", 100);
+        let w = claim(&s, &config, &a, "m/claude:w1", 10).unwrap().unwrap();
+        // The cancel lands after the claim, before the spawned worker registers.
+        s.end_worker(w.id, "cancelled", Some("p/codex:a"), 11)
+            .unwrap();
+        let argv: Vec<String> = ["sleep", "30"].map(String::from).into();
+        let log = dir.path().join("w.log");
+        let mut child = driver::spawn(&argv, dir.path(), &log).unwrap();
+        let pid = child.id().unwrap();
+        assert!(register(&s, &reg, &w, pid).unwrap().is_none());
+        let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+            .await
+            .expect("the worker's process is killed")
+            .unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        assert!(reg.running.lock().unwrap().is_empty());
+        let row = s.worker_by_assignment("a1").unwrap().unwrap();
+        assert_eq!((row.state.as_str(), row.pid), ("cancelled", None));
+        assert!(s.workers(true).unwrap().is_empty());
+        // Not cancelled: registered and running; a pid 0 is never registered (nor killed).
+        let b = assign("a2", "r2", "p/codex:a", 100);
+        let w = claim(&s, &config, &b, "m/claude:w2", 10).unwrap().unwrap();
+        let mut child = driver::spawn(&argv, dir.path(), &log).unwrap();
+        let pid = child.id().unwrap();
+        assert!(register(&s, &reg, &w, pid).unwrap().is_some());
+        assert_eq!(s.workers(true).unwrap()[0].state, "running");
+        assert!(register(&s, &reg, &w, 0).is_err());
+        child.kill().await.unwrap();
     }
 
     #[test]

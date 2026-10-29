@@ -71,8 +71,8 @@ pub fn launchable(argv: &[String]) -> bool {
 }
 
 /// Starts `argv` in `folder`: its own process group (a daemon restart leaves it running),
-/// killed if its handle drops, stdin and stdout piped, stderr appended to `worker.log` there.
-pub fn spawn(argv: &[String], folder: &Path) -> Result<Child> {
+/// killed if its handle drops, stdin and stdout piped, stderr appended to `log`.
+pub fn spawn(argv: &[String], folder: &Path, log: &Path) -> Result<Child> {
     if !launchable(argv) {
         return Err("refused: the launch argv has no program or names a bypass".into());
     }
@@ -80,7 +80,7 @@ pub fn spawn(argv: &[String], folder: &Path) -> Result<Child> {
         .create(true)
         .append(true)
         .mode(0o600)
-        .open(folder.join("worker.log"))?;
+        .open(log)?;
     Ok(tokio::process::Command::new(&argv[0])
         .args(&argv[1..])
         .current_dir(folder)

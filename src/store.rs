@@ -629,12 +629,13 @@ impl Store {
         Ok(())
     }
 
-    pub fn set_worker_running(&self, id: i64, pid: u32) -> rusqlite::Result<()> {
-        self.conn.execute(
-            "UPDATE workers SET state = 'running', pid = ?2 WHERE id = ?1",
+    /// Marks worker `id` running as `pid`, unless its row has ended: whether it did.
+    pub fn set_worker_running(&self, id: i64, pid: u32) -> rusqlite::Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE workers SET state = 'running', pid = ?2 WHERE id = ?1 AND ended_at IS NULL",
             params![id, pid],
         )?;
-        Ok(())
+        Ok(n == 1)
     }
 
     /// The `request_id` and `status` of the result that answers message `message_id`: the
@@ -1358,7 +1359,7 @@ mod tests {
             Some(w.clone())
         );
         assert_eq!(store.worker_by_assignment("a1").unwrap(), Some(w));
-        store.set_worker_running(id, 42).unwrap();
+        assert!(store.set_worker_running(id, 42).unwrap());
         assert_eq!(store.workers(true).unwrap()[0].pid, Some(42));
         store.end_worker(id, "done", None, 9).unwrap();
         assert!(store.workers(true).unwrap().is_empty());

@@ -16,7 +16,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub const MAX_FRAME: usize = 1 << 20;
 
 /// The reasons a peer may give for `refused`.
-pub const REASONS: [&str; 9] = [
+pub const REASONS: [&str; 11] = [
     "loop",
     "policy",
     "declined",
@@ -26,6 +26,9 @@ pub const REASONS: [&str; 9] = [
     "unsupported",
     "no_worker",
     "bad_request",
+    // A worker host at its cap; an assignment its asker cancelled while it was held.
+    "busy",
+    "cancelled",
 ];
 
 /// A session as a peer publishes it (Task 7).

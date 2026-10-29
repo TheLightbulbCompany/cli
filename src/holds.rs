@@ -220,7 +220,7 @@ pub fn dialog(
         let provider = sessions::split_addr(to)
             .and_then(|(_, p)| p.split(':').next())
             .unwrap_or_default();
-        let dir = folder.join(&h.message.request_id);
+        let dir = workers::dir_for(folder, &h.message.id);
         let text = format!(
             "{who} wants to start a {provider} worker in {}: \"{}\"",
             dir.display(),
@@ -445,18 +445,23 @@ pub fn shown(d: &Daemon, team: &TeamState, store: &Store, h: &Hold) {
 }
 
 /// The daemon's side of a closed hold (`verdict` `allow`, `decline` or `expired`; `by` null for
-/// an expiry; `surface` the one that answered, if this computer's): its dialog withdrawn,
-/// subscribers told `hold_closed`, a worker waiting on it answered.
+/// an expiry; `reason` why, when it is not an answer: `cancelled`; `surface` the one that
+/// answered, if this computer's): its dialog withdrawn, subscribers told `hold_closed`, a
+/// worker waiting on it answered.
 pub(crate) fn closed(
     d: &Daemon,
     h: &Hold,
     verdict: &str,
     by: Option<&str>,
+    reason: Option<&str>,
     surface: Option<&'static str>,
 ) {
     d.workers.answered(h.id, verdict, by);
     d.dialogs.withdraw(&h.name());
-    let event = json!({"event": "hold_closed", "id": h.name(), "by": by, "verdict": verdict});
+    let mut event = json!({"event": "hold_closed", "id": h.name(), "by": by, "verdict": verdict});
+    if let Some(r) = reason {
+        event["reason"] = r.into();
+    }
     let _ = d.events.send(event);
     match surface {
         Some(s) => {
@@ -496,7 +501,7 @@ fn answer_here(
         )?
     };
     if let Ok(c) = &r {
-        closed(d, &c.hold, c.verdict(), Some(by), Some(surface));
+        closed(d, &c.hold, c.verdict(), Some(by), None, Some(surface));
         if c.hold.kind() == Kind::Worker {
             d.peers.outbox.notify_one(); // its receipt moved
             if c.allow {
@@ -512,7 +517,7 @@ fn answer_here(
 /// Expires what is due (`expire`) and closes their dialogs; from the 60 s mail timer.
 pub fn expire_here(d: &Daemon, store: &Store, now: i64) -> Result<()> {
     for h in expire(store, now)? {
-        closed(d, &h, "expired", None, None);
+        closed(d, &h, "expired", None, None, None);
     }
     Ok(())
 }

@@ -420,10 +420,8 @@ fn a_hold_on_an_assign_is_a_worker_hold() {
     assert_eq!(h.kind(), holds::Kind::Worker);
     let (text, buttons) = dlg(&s, &r, &me, &h);
     assert!(text.starts_with("aden"), "{text}");
-    assert!(
-        text.contains("wants to start a claude worker in /w/r-"),
-        "{text}"
-    );
+    let dir = format!("wants to start a claude worker in /w/{}:", h.message.id);
+    assert!(text.contains(&dir), "{text}");
     assert!(text.ends_with(": \"fix the build\""), "{text}");
     assert_eq!(buttons, ["Decline", "Allow", "Always allow"]);
 }
