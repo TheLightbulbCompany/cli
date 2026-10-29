@@ -1002,6 +1002,10 @@ pub fn receive(
     {
         return refused("unsupported");
     }
+    // Network workers off: plain messages only (the rule before assignments existed).
+    if kind != "message" && !config.network_workers {
+        return refused("unsupported");
+    }
     if !address(to) {
         return refused("policy");
     }
@@ -1390,6 +1394,14 @@ pub fn expire(store: &Store, now: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A config with network workers on (assignments are refused `unsupported` without).
+    fn workers_on() -> Config {
+        Config {
+            network_workers: true,
+            ..Config::default()
+        }
+    }
 
     #[test]
     fn a_no_worker_refusal_has_a_note() {
@@ -2094,7 +2106,7 @@ mod tests {
             "m",
             None,
             None,
-            &Config::default(),
+            &workers_on(),
             1000,
         )
         .unwrap();
@@ -2126,7 +2138,7 @@ mod tests {
             "m",
             None,
             None,
-            &Config::default(),
+            &workers_on(),
             1000,
         )
         .unwrap();
@@ -2172,7 +2184,7 @@ mod tests {
             "m",
             None,
             None,
-            &Config::default(),
+            &workers_on(),
             1000,
         )
         .unwrap();
@@ -2188,7 +2200,7 @@ mod tests {
             "m",
             None,
             None,
-            &Config::default(),
+            &workers_on(),
             1000,
         )
         .unwrap();
@@ -2209,7 +2221,7 @@ mod tests {
             "m",
             None,
             None,
-            &Config::default(),
+            &workers_on(),
             1000,
         )
         .unwrap();
@@ -2228,7 +2240,7 @@ mod tests {
             "m",
             None,
             None,
-            &Config::default(),
+            &workers_on(),
             1000,
         )
         .unwrap();
@@ -2251,7 +2263,7 @@ mod tests {
             "m",
             None,
             None,
-            &Config::default(),
+            &workers_on(),
             1000,
         )
         .unwrap();
@@ -2274,7 +2286,7 @@ mod tests {
                 "m",
                 None,
                 None,
-                &Config::default(),
+                &workers_on(),
                 1000,
             )
             .unwrap();
@@ -2303,7 +2315,7 @@ mod tests {
                 "m",
                 None,
                 None,
-                &Config::default(),
+                &workers_on(),
                 1001,
             )
             .unwrap();
@@ -2317,7 +2329,7 @@ mod tests {
             "m",
             None,
             None,
-            &Config::default(),
+            &workers_on(),
             1000,
         )
         .unwrap();
@@ -2894,7 +2906,7 @@ mod tests {
             "m",
             None,
             None,
-            &Config::default(),
+            &workers_on(),
             1000,
         )
         .unwrap();
@@ -2984,12 +2996,32 @@ mod tests {
     }
 
     #[test]
-    fn a_replayed_assign_to_a_worker_address_is_answered_held_once() {
+    fn a_peers_assign_is_unsupported_while_network_workers_is_off() {
         let (_d, s) = setup();
         let (peer, roster, _) = peer_mail("m/claude:new", "x");
         let config = Config {
             workers_offer: "claude".into(),
             ..Config::default()
+        };
+        for kind in ["assign", "result", "cancel"] {
+            let env = peer_env("p/codex:a", "m/claude:new", "r1", kind, terms("x", 1060));
+            let got = receive(&s, &env, &peer, &roster, "m", None, None, &config, 1000).unwrap();
+            assert_eq!(
+                (got.state, got.reason.as_deref()),
+                (State::Refused, Some("unsupported")),
+                "{kind}"
+            );
+        }
+        assert!(crate::holds::open(&s).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_replayed_assign_to_a_worker_address_is_answered_held_once() {
+        let (_d, s) = setup();
+        let (peer, roster, _) = peer_mail("m/claude:new", "x");
+        let config = Config {
+            workers_offer: "claude".into(),
+            ..workers_on()
         };
         let env = peer_env(
             "p/codex:a",

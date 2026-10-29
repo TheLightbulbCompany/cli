@@ -28,6 +28,7 @@ Everyday:
   held      Permission prompts waiting for your answer
   approve   Allow one: approve H1
   decline   Decline one: decline H1
+  config    Set a true/false or number setting: config set network_workers true
 
 Workers:
   workers   Let teammates start Claude Code or Codex workers here: workers on|off, workers show <name>,
@@ -235,6 +236,11 @@ enum Command {
     Decline { request: String },
     /// The permission prompts waiting for your answer.
     Held,
+    /// Set a true/false or number setting: config set <key> <value>.
+    Config {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Workers teammates start here: list, show, stop, on, off, policy, clean.
     Workers {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -419,6 +425,7 @@ fn run() -> lightbulb::Result<()> {
         Command::Decline { request } => exit(cli::answer(&request, false, false)?),
         Command::Held => exit(cli::held()?),
         Command::Workers { args } => exit(cli::workers(&args)?),
+        Command::Config { args } => exit(cli::config(&args)?),
         Command::Telemetry { state } => exit(lightbulb::telemetry::command(
             &lightbulb::paths::state_dir(),
             state.as_deref().filter(|s| *s != "status"),

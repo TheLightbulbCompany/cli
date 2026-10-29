@@ -20,7 +20,7 @@ enum Kind {
 }
 
 /// Every setting: the one list `load` and `set` read.
-const KEYS: [(&str, Kind); 17] = [
+const KEYS: [(&str, Kind); 18] = [
     ("computer", Kind::Str(|c| &mut c.computer)),
     (
         "preview_to_workspace",
@@ -40,6 +40,7 @@ const KEYS: [(&str, Kind); 17] = [
         Kind::Int(|c| &mut c.capture_turns_days),
     ),
     ("memory_model", Kind::Bool(|c| &mut c.memory_model)),
+    ("network_workers", Kind::Bool(|c| &mut c.network_workers)),
     ("workers_offer", Kind::Str(|c| &mut c.workers_offer)),
     ("workers_folder", Kind::Str(|c| &mut c.workers_folder)),
     ("workers_max", Kind::Int(|c| &mut c.workers_max)),
@@ -48,6 +49,24 @@ const KEYS: [(&str, Kind); 17] = [
         Kind::Int(|c| &mut c.workers_max_deadline_s),
     ),
 ];
+
+/// Why `config set` does not set `key`: `None` for a `true`/`false` or integer setting (it
+/// does), else the error to print (another command sets it, or no such setting).
+pub fn settable(key: &str) -> Option<String> {
+    let other = match key {
+        "relay" => "relay <url>",
+        "folders_off" => "folder <path> off",
+        "capture_upload" => "sessions upload off|metadata|full",
+        "workers_offer" => "workers on --offer <harnesses>",
+        "workers_folder" => "workers on --folder <path>",
+        _ => "your config.toml",
+    };
+    match kind(key) {
+        Some(Kind::Bool(_) | Kind::Int(_)) => None,
+        Some(_) => Some(format!("Set that with {other}.")),
+        None => Some(format!("No setting {key}.")),
+    }
+}
 
 fn kind(key: &str) -> Option<Kind> {
     KEYS.iter().find(|(k, _)| *k == key).map(|&(_, kind)| kind)
@@ -78,6 +97,9 @@ pub struct Config {
     /// Whether `setup` downloads the memory model: `setup --no-model` sets it off, a plain
     /// `setup` on; the automatic setup after an update keeps it.
     pub memory_model: bool,
+    /// Network workers (assignments, worker hosts) at all: off, the daemon lists none of the
+    /// assignment tools, refuses any kind but `message` as `unsupported`, and hosts nothing.
+    pub network_workers: bool,
     /// Harnesses this computer starts fresh workers for, comma separated (`workers::offers`);
     /// empty offers none.
     pub workers_offer: String,
@@ -105,6 +127,7 @@ impl Default for Config {
             capture_turns: true,
             capture_turns_days: 90,
             memory_model: true,
+            network_workers: false,
             workers_offer: String::new(),
             workers_folder: "~/lightbulb-work".into(),
             workers_max: 3,

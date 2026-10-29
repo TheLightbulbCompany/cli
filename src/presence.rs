@@ -109,12 +109,16 @@ fn remote(s: &Session, share_paths: bool) -> Remote {
 }
 
 /// This computer's worker-host rows: one `<short>/<harness>:new` per harness `workers_offer`
-/// names, with the slots left under `workers_max` (all harnesses share the cap).
+/// names, with the slots left under `workers_max` (all harnesses share the cap); none while
+/// `network_workers` is off.
 fn hosts(d: &Daemon) -> Vec<Remote> {
     let (offered, max, folder) = {
         let t = d.team.lock().unwrap();
         (
-            crate::workers::offers(&t.config),
+            match t.config.network_workers {
+                true => crate::workers::offers(&t.config),
+                false => vec![],
+            },
             t.config.workers_max.max(0),
             crate::workers::folder(&t.config),
         )

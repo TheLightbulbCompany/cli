@@ -88,6 +88,21 @@ fn spec() -> &'static [Value] {
     SPEC.get_or_init(|| serde_json::from_str(TOOLS).expect("tools.json is a list"))
 }
 
+/// The assignment tools: listed (and callable) only while `network_workers` is on.
+const WORKER_TOOLS: [&str; 3] = ["find_workers", "assign", "cancel_assignment"];
+
+/// Whether tool `t` is listed: an assignment tool only while `workers` (this computer's
+/// `network_workers`), a workspace tool only while `workspace` (signed in).
+fn listed(t: &Value, workspace: bool, workers: bool) -> bool {
+    let assignment = WORKER_TOOLS.iter().any(|n| t["name"] == *n);
+    (workspace || t["scope"] == "network") && (workers || !assignment)
+}
+
+/// This computer's `network_workers` setting.
+fn workers_on() -> bool {
+    crate::config::Config::load(&paths::state_path()).is_ok_and(|c| c.network_workers)
+}
+
 /// Whether this computer has a sign-in that has not ended: the workspace tools exist only then.
 fn signed_in() -> bool {
     let dir = paths::state_path();
@@ -584,7 +599,9 @@ pub(crate) fn rest(
 impl Server {
     /// `tool`, called with `args` for the session `meta` names.
     async fn call(&self, name: &str, args: Value, meta: RequestMetaObject) -> CallToolResult {
-        let Some(tool) = spec().iter().find(|t| t["name"] == name) else {
+        // A hidden assignment tool is as unknown as any other name.
+        let hidden = WORKER_TOOLS.contains(&name) && !workers_on();
+        let Some(tool) = spec().iter().find(|t| t["name"] == name && !hidden) else {
             return code("unknown_tool");
         };
         let call = match self.source(meta).await {
@@ -996,7 +1013,8 @@ impl ServerHandler for Server {
         .with_instructions(INSTRUCTIONS.to_string())
     }
 
-    /// The network tools, and the workspace tools while this computer is signed in.
+    /// The network tools (the assignment ones while `network_workers` is on), and the
+    /// workspace tools while this computer is signed in.
     async fn list_tools(
         &self,
         _: Option<PaginatedRequestParams>,
@@ -1004,9 +1022,10 @@ impl ServerHandler for Server {
     ) -> Result<ListToolsResult, ErrorData> {
         let workspace = signed_in();
         self.signed.store(workspace, Ordering::SeqCst);
+        let workers = workers_on();
         let tools: Vec<Value> = spec()
             .iter()
-            .filter(|t| workspace || t["scope"] == "network")
+            .filter(|t| listed(t, workspace, workers))
             .map(|t| {
                 json!({"name": t["name"], "description": t["description"],
                     "inputSchema": t["inputSchema"]})

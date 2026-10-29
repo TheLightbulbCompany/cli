@@ -1187,11 +1187,15 @@ pub(crate) fn refused(id: u64, reason: &str) -> Response {
 /// tell the session) is set only when `key` has open assignments (no result, deadline ahead)
 /// and something changed since the last block (a new assignment or a result for one); the
 /// answer is given once per change, so a session can end on its second Stop with nothing new.
-/// With `caller`, only the session's own process may ask (as `inbox`).
+/// With `caller`, only the session's own process may ask (as `inbox`). Network workers off:
+/// `{}`.
 fn assignments_guard(id: u64, body: &Value, daemon: &Daemon) -> Response {
     let (Some(key), Ok(caller)) = (body["key"].as_str(), caller(body)) else {
         return Response::err(id, BAD_REQUEST);
     };
+    if !daemon.team.lock().unwrap().config.network_workers {
+        return Response::ok(id, json!({}));
+    }
     if let Some(c) = caller {
         match owner_process(daemon, key) {
             Ok(Some(owner)) if owner == c => {}
@@ -1491,6 +1495,11 @@ pub(crate) fn send_as(
             None => return Err(Response::err(id, UNSUPPORTED)),
         },
     };
+    // Network workers off: plain messages only, as before assignments existed.
+    let plain = kind == "message" && body.get("status").is_none_or(Value::is_null);
+    if !plain && !daemon.team.lock().unwrap().config.network_workers {
+        return Err(Response::err(id, UNSUPPORTED));
+    }
     let text_of = |k: &str| body[k].as_str().map(String::from);
     let mut meta = mail::Meta {
         done_when: text_of("done_when"),

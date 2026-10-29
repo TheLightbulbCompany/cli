@@ -1100,6 +1100,30 @@ pub fn signin() -> Result<i32> {
     Ok(2)
 }
 
+/// `config set <key> <value>`: a `true`/`false` or integer setting (`Config::settable`), then
+/// the daemon reloads. A person's only.
+pub fn config(args: &[String]) -> Result<i32> {
+    let ["set", key, value] = args.iter().map(String::as_str).collect::<Vec<_>>()[..] else {
+        eprintln!("Usage: {} config set <key> <value>", command());
+        return Ok(2);
+    };
+    if let Some(why) = crate::config::settable(key) {
+        eprintln!("{why}");
+        return Ok(2);
+    }
+    let mut conn = connect()?;
+    // A person's only: the daemon refuses an agent before the key is written.
+    ask(&mut conn, "workers.policy", json!({}))?;
+    let dir = crate::paths::state_dir();
+    if crate::config::Config::set(&dir, key, value).is_err() {
+        eprintln!("{value:?} is not a value {key} takes.");
+        return Ok(2);
+    }
+    ask(&mut conn, "reload", json!({}))?;
+    println!("{key} = {value}");
+    Ok(0)
+}
+
 /// `approve <id> [--always]` / `decline <id>`: answers hold `H<n>`.
 pub fn answer(request: &str, allow: bool, always: bool) -> Result<i32> {
     let verdict = if allow { "allow" } else { "decline" };
@@ -1267,6 +1291,13 @@ pub fn workers(args: &[String]) -> Result<i32> {
             // A person's only: the daemon refuses an agent before any key is written.
             ask(&mut conn, "workers.policy", json!({}))?;
             let cfg = crate::config::Config::load(&dir)?;
+            if !cfg.network_workers {
+                eprintln!(
+                    "Network workers are off on this computer. Turn them on with: {} config set network_workers true",
+                    command()
+                );
+                return Ok(1);
+            }
             let offer = offer.unwrap_or_else(|| match cfg.workers_offer.is_empty() {
                 true => "claude".into(),
                 false => cfg.workers_offer.clone(),
