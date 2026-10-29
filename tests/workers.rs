@@ -490,10 +490,15 @@ fn a_worker_killed_with_its_daemon_sends_a_failed_result_on_restart() {
     let w = running(&p, 1).remove(0);
     let pid = w.pid.unwrap();
     let daemon = std::fs::read_to_string(p.b.state.path().join("daemon.lock")).unwrap();
-    for target in [daemon.trim().to_string(), format!("-{pid}")] {
-        let killed = Command::new("kill").args(["-9", &target]).status().unwrap();
-        assert!(killed.success(), "kill -9 {target}");
-    }
+    let killed = Command::new("kill")
+        .args(["-9", daemon.trim()])
+        .status()
+        .unwrap();
+    assert!(killed.success(), "kill -9 the daemon");
+    // The worker may already have exited on its closed pipes; either way its group goes.
+    let _ = Command::new("kill")
+        .args(["-9", &format!("-{pid}")])
+        .status();
     until(10, "B and its worker are gone", || {
         gone(pid) && std::os::unix::net::UnixStream::connect(p.b.state.path().join("sock")).is_err()
     });
@@ -976,6 +981,45 @@ fn an_allow_at_the_cap_says_the_asker_was_told_busy() {
     );
     p.wait_state("as2", "refused");
     assert_eq!(p.a.receipt(&p.asker(), "as2")["reason"], "busy");
+}
+
+/// Network workers turned off while start holds wait: an Allow starts nothing and says why,
+/// and `held` declines the rest (`no_worker`) instead of showing them again.
+#[test]
+fn a_stale_start_hold_starts_nothing_once_network_workers_is_off() {
+    let p = hosted(
+        json!([{"result": "never"}]),
+        Opts {
+            button: Some(""),
+            ..Opts::default()
+        },
+    );
+    p.assign("as1", "one", 300);
+    p.assign("as2", "two", 300);
+    p.wait_state("as2", "held");
+    lightbulb::config::Config::set(p.b.state.path(), "network_workers", "false").unwrap();
+    assert_eq!(p.b.ask(json!({"id": 1, "op": "reload"}))["ok"], true);
+    let o = p.b.detached(&[EXE, "approve", "H1"], "");
+    assert_eq!(
+        common::out(&o).trim(),
+        "Allowed H1, but this computer no longer offers that worker; the asker was told no_worker.",
+        "{}",
+        common::err(&o)
+    );
+    p.wait_state("as1", "refused");
+    assert_eq!(p.a.receipt(&p.asker(), "as1")["reason"], "no_worker");
+    let o = p.b.detached(&[EXE, "held"], "");
+    assert!(o.status.success(), "{}", common::err(&o));
+    p.wait_state("as2", "refused");
+    assert_eq!(p.a.receipt(&p.asker(), "as2")["reason"], "no_worker");
+    assert_eq!(
+        lightbulb::holds::get(&p.b.store(), 2)
+            .unwrap()
+            .unwrap()
+            .state,
+        "declined"
+    );
+    assert!(p.workers().is_empty());
 }
 
 /// A repo hint that names no clone here: the worker runs in an empty folder, and its result

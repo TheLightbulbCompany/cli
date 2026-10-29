@@ -1152,6 +1152,9 @@ pub fn answer(request: &str, allow: bool, always: bool) -> Result<i32> {
         _ if r["note"] == "busy" => println!(
             "{word} {request}, but this computer is at its workers_max; the asker was told busy."
         ),
+        _ if r["note"] == "no_worker" => println!(
+            "{word} {request}, but this computer no longer offers that worker; the asker was told no_worker."
+        ),
         true => println!("{word} {request} (always)."),
         false => println!("{word} {request}."),
     }
@@ -1161,7 +1164,7 @@ pub fn answer(request: &str, allow: bool, always: bool) -> Result<i32> {
 /// `held`: the permission prompts waiting for an answer, one per line with the command that
 /// answers it.
 pub fn held() -> Result<i32> {
-    let holds = ask(&mut connect()?, "holds", json!({}))?;
+    let holds = ask(&mut connect()?, "holds", json!({"reshow": true}))?;
     let cmd = command();
     let f = |v: &Value, k: &str| v[k].as_str().map(cell).unwrap_or_default();
     let mut any = false;

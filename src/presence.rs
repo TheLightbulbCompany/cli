@@ -115,10 +115,7 @@ fn hosts(d: &Daemon) -> Vec<Remote> {
     let (offered, max, folder) = {
         let t = d.team.lock().unwrap();
         (
-            match t.config.network_workers {
-                true => crate::workers::offers(&t.config),
-                false => vec![],
-            },
+            crate::workers::offers(&t.config),
             t.config.workers_max.max(0),
             crate::workers::folder(&t.config),
         )

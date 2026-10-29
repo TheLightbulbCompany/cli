@@ -2931,7 +2931,7 @@ mod tests {
             reply_to: None,
             meta: terms("x", 100),
         };
-        let mut config = Config::default();
+        let mut config = workers_on();
         let take =
             |config: &Config, a: &Message| workers::take_assign(&s, config, "m", a, 10).unwrap();
         let st = |a: &Message| state(&s, &a.request_id);

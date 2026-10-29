@@ -675,7 +675,14 @@ async fn approve_always_is_an_allow_with_scope_always() {
         let s = Store::open(&db).unwrap();
         assign_hold(&s, "bob/codex:b1", "bobkey", "me/claude:new", None);
     }
-    a.daemon(false, "", &[]);
+    // Offered (a start hold for a harness not offered is declined at start); never the real
+    // Claude Code.
+    let config = "network_workers = true\nworkers_offer = \"claude\"\n";
+    let never = (
+        "LIGHTBULB_CONNECT_DEBUG_CLAUDE",
+        "/nonexistent/claude".to_string(),
+    );
+    a.daemon(false, config, &[never]);
     let o = a.detached(&[common::EXE, "approve", "H1", "--always"], "");
     assert_eq!(
         common::out(&o),

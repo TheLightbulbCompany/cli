@@ -86,8 +86,12 @@ pub fn set_policy(
     Ok(())
 }
 
-/// The harnesses `workers_offer` names that this build knows.
+/// The harnesses `workers_offer` names that this build knows; none while `network_workers`
+/// is off (the one gate for taking, starting and publishing workers).
 pub fn offers(config: &Config) -> Vec<String> {
+    if !config.network_workers {
+        return vec![];
+    }
     config
         .workers_offer
         .split(',')
@@ -202,7 +206,7 @@ impl Registry {
 }
 
 /// The provider of a `<member>/<provider>:new` address.
-fn provider_of(to: &str) -> &str {
+pub(crate) fn provider_of(to: &str) -> &str {
     sessions::split_addr(to)
         .and_then(|(_, rest)| rest.strip_suffix(":new"))
         .unwrap_or_default()
@@ -1014,7 +1018,7 @@ pub fn cancel(d: &Arc<Daemon>, assign_id: &str, by: &str) -> Result<()> {
 
 /// Declines open start holds `ids` (the caller holds the store lock): each asker's receipt is
 /// `refused`/`why`. The holds declined.
-fn decline(store: &Store, ids: &[i64], why: &str, now: i64) -> Result<Vec<holds::Hold>> {
+pub(crate) fn decline(store: &Store, ids: &[i64], why: &str, now: i64) -> Result<Vec<holds::Hold>> {
     let mut declined = vec![];
     for &id in ids {
         let sql = "UPDATE holds SET state = 'declined' WHERE id = ?1 AND state = 'open'";
@@ -1035,7 +1039,7 @@ fn decline(store: &Store, ids: &[i64], why: &str, now: i64) -> Result<Vec<holds:
 
 /// `decline`'s daemon side, with no lock held: the dialogs withdrawn (declined by `by`), the
 /// refused receipts sent.
-fn declined_here(d: &Daemon, declined: &[holds::Hold], by: &str, reason: Option<&str>) {
+pub(crate) fn declined_here(d: &Daemon, declined: &[holds::Hold], by: &str, reason: Option<&str>) {
     for h in declined {
         holds::closed(d, h, holds::DECLINE, Some(by), reason, None);
     }
@@ -1176,6 +1180,7 @@ mod tests {
     /// A config offering Claude Code workers (the tests' assignments are to `m/claude:new`).
     fn offering() -> Config {
         Config {
+            network_workers: true,
             workers_offer: "claude".into(),
             ..Config::default()
         }
@@ -1555,9 +1560,11 @@ mod tests {
         let a = assign("a1", "r1", "p/codex:a", 100);
         s.put_message(&a).unwrap();
         mail::advance(s.conn(), &a.from_key, "r1", State::Held, None, None, 1).unwrap();
-        // `workers off` (or an offer of Codex only) since the assignment was held.
-        for offer in ["", "codex"] {
+        // `workers off`, an offer of Codex only, or network workers turned off since the
+        // assignment was held.
+        for (offer, on) in [("", true), ("codex", true), ("claude", false)] {
             let config = Config {
+                network_workers: on,
                 workers_offer: offer.into(),
                 ..Config::default()
             };
@@ -1568,7 +1575,7 @@ mod tests {
             assert_eq!(
                 (r.state, r.reason.as_deref()),
                 (State::Refused, Some("no_worker")),
-                "{offer:?}"
+                "{offer:?} {on}"
             );
         }
         assert!(s.workers(false).unwrap().is_empty());

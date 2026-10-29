@@ -232,6 +232,10 @@ mod tests {
             (c.workers_offer.as_str(), c.workers_max),
             ("claude,codex,vim", 7)
         );
+        // None while network workers are off, the default.
+        assert!(crate::workers::offers(&c).is_empty());
+        Config::set(d, "network_workers", "true").unwrap();
+        let c = Config::load(d).unwrap();
         assert_eq!(crate::workers::offers(&c), ["claude", "codex"]);
     }
 

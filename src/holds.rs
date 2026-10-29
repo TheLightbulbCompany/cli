@@ -439,14 +439,27 @@ fn raise(d: &Daemon, team: &TeamState, store: &Store, h: &Hold) -> Option<String
 }
 
 /// Every open hold whose dialog is neither queued nor on screen (it gave up, or the daemon
-/// restarted) is shown again; from daemon start and `holds` (`lightbulb held`).
+/// restarted) is shown again; from daemon start and `holds {reshow: true}` (`lightbulb
+/// held`). A start hold for a harness no longer offered is declined instead (`no_worker`).
 pub fn reraise(d: &Daemon) {
-    let team = d.team.lock().unwrap();
-    let store = d.store.lock().unwrap();
-    for h in open(&store).unwrap_or_default() {
-        if !d.dialogs.is_pending(&h.name()) && raise(d, &team, &store, &h).is_some() {
-            eprintln!("hold {}: shown again", h.name());
+    let declined = {
+        let team = d.team.lock().unwrap();
+        let store = d.store.lock().unwrap();
+        let offered = workers::offers(&team.config);
+        let mut stale = vec![];
+        for h in open(&store).unwrap_or_default() {
+            let provider = workers::provider_of(&h.message.to_key);
+            if h.kind() == Kind::Worker && !offered.iter().any(|p| p == provider) {
+                stale.push(h.id);
+            } else if !d.dialogs.is_pending(&h.name()) && raise(d, &team, &store, &h).is_some() {
+                eprintln!("hold {}: shown again", h.name());
+            }
         }
+        workers::decline(&store, &stale, "no_worker", ipc::now() as i64)
+    };
+    match declined {
+        Ok(h) => workers::declined_here(d, &h, "local", None),
+        Err(e) => eprintln!("holds: not declined: {e}"),
     }
 }
 
@@ -591,11 +604,11 @@ fn run(
     let missing = if instance { HOLD_NOT_FOUND } else { NOT_FOUND };
     let hold_id = body["hold"].as_str().and_then(|s| dialog::number(s, 'H'));
     Ok(match op {
-        // `holds {}` -> `{holds: [{id, kind, target_session, from, label, verified, preview,
+        // `holds {reshow?}` -> `{holds: [{id, kind, target_session, from, label, verified, preview,
         // shown, created_at}]}` (`verified` as the label says it)
         "holds" => {
-            // A person looking: any dialog that gave up comes back (not for a bridge's poll).
-            if !instance {
+            // `lightbulb held` asks: any dialog that gave up comes back (never a bridge's poll).
+            if !instance && body["reshow"] == true {
                 reraise(d);
             }
             let team = d.team.lock().unwrap();
