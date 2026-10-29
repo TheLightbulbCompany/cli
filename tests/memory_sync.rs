@@ -249,7 +249,7 @@ async fn a_restored_node_numbers_past_what_peers_hold() {
     }
     rusqlite::Connection::open(a.state.path().join("state.db"))
         .unwrap()
-        .execute("DELETE FROM memory_entries", [])
+        .execute_batch("DELETE FROM memory_vec; DELETE FROM memory_entries;")
         .unwrap();
     a.daemon(false, "", &[]);
     let ep = endpoint(&b.identity()).await;

@@ -362,7 +362,7 @@ pub fn search_turns(
         Ok(out)
     };
     let mut out = Vec::new();
-    for id in fuse(ids, query, vecs, limit)? {
+    for id in fuse(store.dir(), ids, query, vecs, limit)? {
         let hit = conn.query_row(
             "SELECT session_id, seq, role, text, at FROM capture_turns WHERE rowid = ?1",
             [&id],
