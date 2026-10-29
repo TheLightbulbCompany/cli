@@ -15,6 +15,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Child;
 use tokio::sync::{mpsc, oneshot};
 
@@ -23,7 +24,11 @@ pub const NOT_INSTALLED: &str = "OpenCode is not installed where the daemon can 
 /// The start's failure when an OpenCode config it reads allows without asking (`bypass_mode`).
 pub const BYPASS_MODE: &str = "this computer's OpenCode runs without approvals; a worker needs \
      prompts to reach a person (\"permission\": \"allow\", or \"allow\" for edit, bash, webfetch \
-     or \"*\", in ~/.config/opencode/opencode.json or opencode.jsonc; or one it cannot read)";
+     or \"*\", in ~/.config/opencode/opencode.json or opencode.jsonc, or the same under \
+     $XDG_CONFIG_HOME/opencode; or one it cannot read)";
+/// What the turn ends with when OpenCode raises a prompt in its newer shape, which this host
+/// cannot relay (so it can never be allowed).
+pub const ASKS_V2: &str = "this OpenCode asks in a way the worker host does not read yet";
 
 /// Where installers put OpenCode outside a home.
 const SYSTEM: [&str; 2] = ["/opt/homebrew/bin/opencode", "/usr/local/bin/opencode"];
@@ -38,6 +43,13 @@ const FOLDER: [&str; 4] = [
     "opencode.jsonc",
     ".opencode/opencode.json",
     ".opencode/opencode.jsonc",
+];
+/// Variables that would hand OpenCode a config (or permissions) other than the files checked
+/// here: removed from the child's environment.
+const CONFIG_ENV: [&str; 3] = [
+    "OPENCODE_CONFIG",
+    "OPENCODE_CONFIG_CONTENT",
+    "OPENCODE_PERMISSION",
 ];
 /// The server's Basic-auth user, set in the child too so an inherited
 /// `OPENCODE_SERVER_USERNAME` cannot change it.
@@ -69,7 +81,8 @@ pub fn here(knob: Option<&Path>, home: &Path, store: &Store) -> Result<OpenCode,
     let Some(program) = program(knob, home, &system, store, path.as_deref()) else {
         return Err(NOT_INSTALLED);
     };
-    if bypass_mode(home) {
+    let xdg = std::env::var_os("XDG_CONFIG_HOME").filter(|x| !x.is_empty());
+    if bypass_mode(home, xdg.as_deref().map(Path::new)) {
         return Err(BYPASS_MODE);
     }
     Ok(OpenCode::new(program))
@@ -96,9 +109,16 @@ pub fn program(
     find(knob, known, store, "opencode", &["opencode"], path)
 }
 
-/// Whether `home`'s OpenCode config allows without asking (`bypass`).
-pub fn bypass_mode(home: &Path) -> bool {
-    USER.iter().any(|f| bypass(&home.join(f)))
+/// Whether the person's OpenCode config allows without asking (`bypass`): under `home`, or
+/// under `xdg` (`$XDG_CONFIG_HOME`) when set.
+pub fn bypass_mode(home: &Path, xdg: Option<&Path>) -> bool {
+    let xdg = xdg
+        .into_iter()
+        .flat_map(|x| ["opencode/opencode.json", "opencode/opencode.jsonc"].map(|f| x.join(f)));
+    USER.iter()
+        .map(|f| home.join(f))
+        .chain(xdg)
+        .any(|p| bypass(&p))
 }
 
 /// Why a worker may not run in `folder`: an `opencode.json[c]` of its own (at its top or under
@@ -164,30 +184,50 @@ impl Driver for OpenCode {
         folder_bypass(folder)
     }
 
-    fn env(&self) -> Vec<(&'static str, String)> {
-        vec![
-            ("OPENCODE_SERVER_USERNAME", USER_NAME.into()),
-            ("OPENCODE_SERVER_PASSWORD", self.password.clone()),
+    fn env(&self) -> Vec<(&'static str, Option<String>)> {
+        let removed = CONFIG_ENV.map(|k| (k, None));
+        [
+            ("OPENCODE_SERVER_USERNAME", Some(USER_NAME.into())),
+            ("OPENCODE_SERVER_PASSWORD", Some(self.password.clone())),
         ]
+        .into_iter()
+        .chain(removed)
+        .collect()
     }
 
     fn run(self: Box<Self>, child: Child, first_prompt: String, relay: Relay) -> Run {
         let port = self.port.get().copied().unwrap_or_default();
         let server = Server::new(port, USER_NAME, &self.password);
-        Box::pin(serve(child, server, first_prompt, relay))
+        Box::pin(serve(child, port, server, first_prompt, relay))
     }
 }
 
 /// Runs the turn on `child`'s server (`talk`); then its process group is told to end, and it is
-/// killed if it has not within 5 s (`kill_on_drop`). Its stdout is drained, its stdin held open.
-async fn serve(mut child: Child, server: Server, prompt: String, relay: Relay) -> Outcome {
+/// killed if it has not within 5 s (`kill_on_drop`). Its stdout is read (for its listening line
+/// on `port`) to the end, its stdin held open.
+async fn serve(
+    mut child: Child,
+    port: u16,
+    server: Server,
+    prompt: String,
+    relay: Relay,
+) -> Outcome {
     let stdin = child.stdin.take();
-    if let Some(mut out) = child.stdout.take() {
+    let (heard, listening) = oneshot::channel();
+    if let Some(out) = child.stdout.take() {
+        let want = format!("listening on http://127.0.0.1:{port}");
         tokio::spawn(async move {
-            let _ = tokio::io::copy(&mut out, &mut tokio::io::sink()).await;
+            let (mut lines, mut heard) = (BufReader::new(out).lines(), Some(heard));
+            while let Ok(Some(l)) = lines.next_line().await {
+                if l.contains(&want) {
+                    if let Some(h) = heard.take() {
+                        let _ = h.send(());
+                    }
+                }
+            }
         });
     }
-    let outcome = talk(&mut child, &server, prompt, relay).await;
+    let outcome = talk(&mut child, listening, &server, prompt, relay).await;
     drop(stdin);
     if let Some(pid) = child.id().filter(|&p| p > 0) {
         // SAFETY: a plain syscall on the server's own process group (`spawn` made it leader).
@@ -203,9 +243,19 @@ fn valid_id(id: &str) -> bool {
     crate::sessions::word(id, 128) && id != "new"
 }
 
-/// Waits for the server to answer `/global/health` with `healthy: true` (30 s).
-async fn ready(child: &mut Child, server: &Server) -> Result<(), &'static str> {
+/// Waits (30 s in all) for the server to say it listens (`listening`; its stdout closing first
+/// means it exited), then to answer `/global/health` with `healthy: true`.
+async fn ready(
+    child: &mut Child,
+    listening: oneshot::Receiver<()>,
+    server: &Server,
+) -> Result<(), &'static str> {
     let until = tokio::time::Instant::now() + INIT_WAIT;
+    match tokio::time::timeout_at(until, listening).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => return Err("the worker's OpenCode exited before it served"),
+        Err(_) => return Err("the worker's OpenCode did not start within 30 s"),
+    }
     loop {
         if let Ok(Some(_)) = child.try_wait() {
             return Err("the worker's OpenCode exited before it served");
@@ -289,8 +339,14 @@ fn fail(last: &str, why: &str) -> Outcome {
 /// the message with `prompt`; each permission request relayed (answered when the person
 /// answers, withdrawn when the server says it was answered) until the message's response, an
 /// error, or the event stream ends.
-async fn talk(child: &mut Child, server: &Server, prompt: String, relay: Relay) -> Outcome {
-    if let Err(why) = ready(child, server).await {
+async fn talk(
+    child: &mut Child,
+    listening: oneshot::Receiver<()>,
+    server: &Server,
+    prompt: String,
+    relay: Relay,
+) -> Outcome {
+    if let Err(why) = ready(child, listening, server).await {
         return failed(why);
     }
     let title = json!({"title": "Lightbulb worker"});
@@ -320,6 +376,8 @@ async fn talk(child: &mut Child, server: &Server, prompt: String, relay: Relay) 
     // Answers to send, from the tasks waiting on the person.
     let (answers, mut answered) = mpsc::unbounded_channel::<(String, Decision)>();
     let mut waiting: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
+    // The status of each answer sent.
+    let (statuses, mut replied) = mpsc::unbounded_channel::<u16>();
     // The assistant's messages, and its latest text part (id, text) so far.
     let mut assistant: HashSet<String> = HashSet::new();
     let (mut part, mut last) = (String::new(), String::new());
@@ -338,11 +396,21 @@ async fn talk(child: &mut Child, server: &Server, prompt: String, relay: Relay) 
                     Decision::Allow => json!({"reply": "once"}),
                     Decision::Deny(why) => json!({"reply": "reject", "message": why}),
                 };
-                let s = server.clone();
+                let (s, statuses) = (server.clone(), statuses.clone());
                 tokio::spawn(async move {
                     let path = format!("/permission/{id}/reply");
-                    let _ = s.request("POST", &path, Some(&reply)).await;
+                    if let Ok((status, _)) = s.request("POST", &path, Some(&reply)).await {
+                        let _ = statuses.send(status);
+                    }
                 });
+                continue;
+            }
+            // A 404: the request was already answered or gone (`permission.replied`).
+            Some(status) = replied.recv() => {
+                if status != 200 && status != 404 {
+                    let why = format!("the worker's OpenCode refused an answer: HTTP {status}");
+                    break fail(&last, &why);
+                }
                 continue;
             }
             e = events.recv() => e,
@@ -350,12 +418,17 @@ async fn talk(child: &mut Child, server: &Server, prompt: String, relay: Relay) 
         let Some(e) = e else {
             break fail(&last, "the worker's OpenCode event stream ended");
         };
+        let kind = e["type"].as_str().unwrap_or_default();
+        // Its newer prompts are not relayed: unanswerable, so the turn ends rather than waits.
+        if kind.starts_with("permission.v2.") {
+            break failed(ASKS_V2);
+        }
         let p = &e["properties"];
         if p["sessionID"] != session.as_str() {
             continue;
         }
         let id = p["id"].as_str().filter(|i| valid_id(i)).map(String::from);
-        match e["type"].as_str().unwrap_or_default() {
+        match kind {
             "permission.asked" => {
                 let Some(id) = id else { continue };
                 let (tool, summary) = asked(p);
@@ -700,13 +773,27 @@ mod tests {
         assert!(crate::workers::launchable(&argv));
         // The password is the child's alone: 32 random bytes, never in the argv.
         let env = d.env();
-        assert_eq!(env[0], ("OPENCODE_SERVER_USERNAME", "opencode".into()));
+        assert_eq!(
+            env[0],
+            ("OPENCODE_SERVER_USERNAME", Some("opencode".into()))
+        );
         let (k, pw) = &env[1];
+        let pw = pw.as_ref().unwrap();
         assert_eq!(*k, "OPENCODE_SERVER_PASSWORD");
+        // A config handed over in the environment is not the child's.
+        assert_eq!(
+            env[2..],
+            CONFIG_ENV.map(|k| (k, None))[..],
+            "{:?}",
+            &env[2..]
+        );
         assert_eq!(pw.len(), 64);
         assert!(pw.bytes().all(|b| b.is_ascii_hexdigit()));
         assert!(!argv.iter().any(|a| a.contains(pw.as_str())));
-        assert_ne!(OpenCode::new("/x/opencode".into()).env()[1].1, *pw);
+        assert_ne!(
+            OpenCode::new("/x/opencode".into()).env()[1].1.as_ref(),
+            Some(pw)
+        );
     }
 
     #[test]
@@ -800,6 +887,27 @@ mod tests {
     }
 
     #[test]
+    fn an_xdg_config_that_allows_without_asking_refuses_a_worker() {
+        let (home, xdg) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (h, x) = (home.path(), Some(xdg.path()));
+        assert!(!bypass_mode(h, x));
+        std::fs::create_dir_all(xdg.path().join("opencode")).unwrap();
+        for file in ["opencode/opencode.json", "opencode/opencode.jsonc"] {
+            let config = xdg.path().join(file);
+            std::fs::write(&config, r#"{"permission": {"bash": "ask"}}"#).unwrap();
+            assert!(!bypass_mode(h, x), "{file}");
+            std::fs::write(&config, "// all\n{\"permission\": \"allow\",}").unwrap();
+            assert!(bypass_mode(h, x), "{file}");
+            // Unset, it is not read.
+            assert!(!bypass_mode(h, None), "{file}");
+            // One it cannot parse refuses.
+            std::fs::write(&config, "{").unwrap();
+            assert!(bypass_mode(h, x), "{file}");
+            std::fs::remove_file(&config).unwrap();
+        }
+    }
+
+    #[test]
     fn a_folder_that_allows_without_asking_refuses_a_worker() {
         let d = tempfile::tempdir().unwrap();
         assert_eq!(folder_bypass(d.path()), None);
@@ -858,6 +966,26 @@ mod tests {
         );
         let o = finished(&json!({"info": {"error": {"name": "MessageAbortedError"}}}));
         assert_eq!(o.body, "MessageAbortedError");
+    }
+
+    #[tokio::test]
+    async fn no_health_poll_before_it_says_it_listens() {
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("5")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        // A server whose stdout ends before its listening line: never polled (port 1 would
+        // otherwise be retried for 30 s).
+        let (said, listening) = oneshot::channel();
+        drop(said);
+        let server = Server::new(1, "opencode", "pw");
+        let r = tokio::time::timeout(
+            Duration::from_secs(2),
+            ready(&mut child, listening, &server),
+        )
+        .await;
+        assert_eq!(r, Ok(Err("the worker's OpenCode exited before it served")));
     }
 
     /// A one-connection server on a free port: it reads the request, then writes `pieces` with

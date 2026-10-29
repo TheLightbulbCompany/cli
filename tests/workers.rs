@@ -2087,6 +2087,78 @@ fn opencode_the_prompts_own_text_is_not_what_the_worker_said() {
 }
 
 #[test]
+fn opencode_a_config_in_the_daemons_environment_never_reaches_the_server() {
+    // The fake exits 4 if any of these reaches it.
+    let p = hosted(
+        json!([{"result": "clean"}]),
+        Opts {
+            always: true,
+            env: vec![
+                ("OPENCODE_CONFIG", "/tmp/allow-all.json".into()),
+                (
+                    "OPENCODE_CONFIG_CONTENT",
+                    r#"{"permission": "allow"}"#.into(),
+                ),
+                ("OPENCODE_PERMISSION", r#""allow""#.into()),
+            ],
+            ..opencode()
+        },
+    );
+    p.assign("as1", "behave", 300);
+    let r = p.result("as1", 15);
+    assert_eq!(
+        (&r["status"], &r["text"]),
+        (&json!("done"), &json!("clean")),
+        "{r}"
+    );
+}
+
+#[test]
+fn opencode_a_prompt_in_the_v2_shape_fails_the_turn() {
+    let p = hosted(
+        json!([{"say": "so far"}, {"v2": true}, {"sleep": 60}, {"result": "late"}]),
+        Opts {
+            always: true,
+            ..opencode()
+        },
+    );
+    p.assign("as1", "asks anew", 300);
+    let r = p.result("as1", 15);
+    assert_eq!(
+        (&r["status"], &r["reason"], &r["text"]),
+        (
+            &json!("failed"),
+            &json!("error"),
+            &json!("this OpenCode asks in a way the worker host does not read yet")
+        ),
+        "{r}"
+    );
+    assert!(p.pids().is_empty(), "no dialog");
+}
+
+#[test]
+fn opencode_a_refused_answer_fails_the_turn() {
+    let mut ask = opencode_ask("rm -rf x");
+    ask["reply_status"] = 500.into();
+    let p = hosted(
+        json!([{"say": "so far"}, ask, {"sleep": 60}, {"result": "late"}]),
+        Opts {
+            always: true,
+            ..opencode()
+        },
+    );
+    p.assign("as1", "careful", 300);
+    p.dialog(1);
+    p.click("Allow");
+    let r = p.result("as1", 15);
+    assert_eq!(
+        (&r["status"], &r["reason"], &r["text"]),
+        (&json!("failed"), &json!("error"), &json!("so far")),
+        "{r}"
+    );
+}
+
+#[test]
 fn opencode_a_worktree_that_allows_without_asking_refuses_the_start() {
     acp_folder_bypass(
         "opencode",

@@ -3,7 +3,8 @@
 an HTTP server speaking what the OpenCode driver uses.
 
 Exit 3 on `--auto`, `--cors`, `--mdns` or a hostname other than 127.0.0.1; exit 2 on any argv
-but the exact one; exit 4 without OPENCODE_SERVER_PASSWORD.
+but the exact one; exit 4 without OPENCODE_SERVER_PASSWORD, or with OPENCODE_CONFIG,
+OPENCODE_CONFIG_CONTENT or OPENCODE_PERMISSION (a config the host did not check).
 Every request without Basic auth for OPENCODE_SERVER_USERNAME (default `opencode`) and that
 password gets 401. FAKE_OPENCODE_LOG: each request is appended as a JSON line
 {method, path, auth (whether it was right), body}.
@@ -11,7 +12,8 @@ Routes: GET /global/health; POST /session (session `ses_<pid>`); GET /event (SSE
 event split across two chunks); POST /permission/{id}/reply; POST /question/{id}/reject;
 POST /session/{id}/message runs FAKE_OPENCODE_SCRIPT, a JSON list of steps:
 {"ask": {"type", "pattern", "title"}} emits `permission.asked` (the n-th ask has id `p<n>`, from
-0) and waits for its reply, unless the step has "wait": false;
+0) and waits for its reply, unless the step has "wait": false; with "reply_status": n its
+reply is answered HTTP n; {"v2": true} emits `permission.v2.asked`;
 {"cancel": n} emits `permission.replied` for `p<n>`; {"question": text} emits `question.asked`
 (`q<n>`) and waits for its reject; {"say": text} a text part of the turn; {"sleep": seconds};
 {"result": text} the turn's final text; {"error": text} the turn's error; {"drop": true} closes
@@ -38,7 +40,8 @@ if argv[:4] != ["serve", "--hostname", "127.0.0.1", "--port"] or len(argv) != 5 
         or not argv[4].isdigit():
     sys.exit(2)
 password = os.environ.get("OPENCODE_SERVER_PASSWORD")
-if not password:
+if not password or any(os.environ.get(k) is not None for k in (
+        "OPENCODE_CONFIG", "OPENCODE_CONFIG_CONTENT", "OPENCODE_PERMISSION")):
     sys.exit(4)
 user = os.environ.get("OPENCODE_SERVER_USERNAME", "opencode")
 AUTH = "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode()
@@ -48,6 +51,7 @@ SESSION = f"ses_{os.getpid()}"
 lock = threading.Lock()
 streams = []  # one queue per open /event stream; None closes it
 waits = {}  # request id -> [threading.Event, the body it was answered with]
+statuses = {}  # request id -> the status its reply gets
 
 
 def log(entry):
@@ -85,6 +89,7 @@ def turn(prompt):
             asks += 1
             a = step["ask"]
             ask(rid)
+            statuses[rid] = step.get("reply_status", 200)
             emit("permission.asked", {
                 "id": rid, "sessionID": SESSION, "permission": a.get("type"),
                 "patterns": [a["pattern"]] if a.get("pattern") else [],
@@ -93,6 +98,9 @@ def turn(prompt):
             if step.get("wait", True):
                 waits[rid][0].wait()
                 last = (waits[rid][1] or {}).get("reply", "")
+        elif "v2" in step:
+            emit("permission.v2.asked", {"id": "per_v2", "sessionID": SESSION,
+                                         "action": "bash", "resources": ["rm -rf x"]})
         elif "cancel" in step:
             emit("permission.replied", {"sessionID": SESSION,
                                         "requestID": f"p{step['cancel']}", "reply": "reject"})
@@ -189,7 +197,8 @@ class Handler(BaseHTTPRequestHandler):
                 and parts[1] in waits:
             waits[parts[1]][1] = body
             waits[parts[1]][0].set()
-            return self.answer(200, True)
+            status = statuses.get(parts[1], 200)
+            return self.answer(status, True if status == 200 else {"message": "no"})
         return self.answer(404, {"message": f"no route {method} {self.path}"})
 
     def do_GET(self):

@@ -69,8 +69,9 @@ pub trait Driver: Send {
     fn refuses(&self, _folder: &Path) -> Option<String> {
         None
     }
-    /// What the harness's environment adds (OpenCode's server password), set in its child only.
-    fn env(&self) -> Vec<(&'static str, String)> {
+    /// How the harness's environment differs from the daemon's, in its child only: a variable
+    /// set (OpenCode's server password), or removed (`None`).
+    fn env(&self) -> Vec<(&'static str, Option<String>)> {
         vec![]
     }
 }
@@ -278,11 +279,12 @@ pub fn launchable(argv: &[String]) -> bool {
     !argv.is_empty() && !argv.iter().any(|a| bypass(a))
 }
 
-/// Starts `argv` in `folder` with `env` added: its own process group (a daemon restart leaves it
-/// running), killed if its handle drops, stdin and stdout piped, stderr appended to `log`.
+/// Starts `argv` in `folder` with `env` set or removed (`Driver::env`): its own process group (a
+/// daemon restart leaves it running), killed if its handle drops, stdin and stdout piped, stderr
+/// appended to `log`.
 pub fn spawn(
     argv: &[String],
-    env: &[(&'static str, String)],
+    env: &[(&'static str, Option<String>)],
     folder: &Path,
     log: &Path,
 ) -> Result<Child> {
@@ -294,14 +296,20 @@ pub fn spawn(
         .append(true)
         .mode(0o600)
         .open(log)?;
-    Ok(tokio::process::Command::new(&argv[0])
+    let mut command = tokio::process::Command::new(&argv[0]);
+    for (k, v) in env {
+        match v {
+            Some(v) => command.env(k, v),
+            None => command.env_remove(k),
+        };
+    }
+    Ok(command
         .args(&argv[1..])
         .current_dir(folder)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(log)
         .env("PATH", child_path(&argv[0]))
-        .envs(env.iter().map(|(k, v)| (k, v)))
         .kill_on_drop(true)
         .process_group(0)
         .spawn()?)
