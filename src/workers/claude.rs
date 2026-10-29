@@ -101,7 +101,9 @@ pub fn bypass_mode(home: &Path) -> bool {
 
 impl Driver for Claude {
     /// Headless, stream-json both ways, prompts asked of this host on stdio, in the person's
-    /// own permission mode (none is passed).
+    /// own permission mode (none is passed), from the person's user settings only
+    /// (`--setting-sources user`): a repo branch's own `.claude/settings.json` cannot change
+    /// the mode or the allowlists.
     fn argv(&self, _folder: &Path, session_id: &str) -> Vec<String> {
         let _ = self.session.set(session_id.into());
         let mut argv = vec![self.program.to_string_lossy().into_owned()];
@@ -117,6 +119,8 @@ impl Driver for Claude {
                 "host",
                 "--permission-prompt-tool",
                 "stdio",
+                "--setting-sources",
+                "user",
                 "--session-id",
                 session_id,
             ]
@@ -321,6 +325,8 @@ mod tests {
                 "host",
                 "--permission-prompt-tool",
                 "stdio",
+                "--setting-sources",
+                "user",
                 "--session-id",
                 "3f0c1d52-7a4e-4b8e-9a39-1f2e3d4c5b6a",
             ]
