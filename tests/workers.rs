@@ -501,13 +501,26 @@ fn a_worker_killed_with_its_daemon_sends_a_failed_result_on_restart() {
     let config = std::fs::read_to_string(p.b.state.path().join("config.toml")).unwrap();
     let config = config.split_once('\n').unwrap().1;
     p.b.daemon(false, config, &[peers(&[&p.a])]);
-    let r = p.result_from("as1", &w.session, 20);
-    assert_eq!(r["status"], "failed", "{r}");
+    // The result is sent from the worker's key (B's side: whether A's link to the killed B
+    // has timed out yet is the network's business, not this test's).
+    let mut got = None;
+    until(10, "B sends the result", || {
+        got = p.b.store().result_message(&w.assignment).unwrap();
+        got.is_some()
+    });
+    let r = got.unwrap();
+    assert_eq!(
+        (
+            r.from_key.as_str(),
+            r.meta.status.as_deref(),
+            r.meta.reason.as_deref()
+        ),
+        (w.session.as_str(), Some("failed"), Some("error"))
+    );
     assert!(
-        r["text"]
-            .as_str()
-            .is_some_and(|t| t.contains("the worker's daemon restarted")),
-        "{r}"
+        r.body.contains("the worker's daemon restarted"),
+        "{}",
+        r.body
     );
     let row = &p.workers()[0];
     assert_eq!(
