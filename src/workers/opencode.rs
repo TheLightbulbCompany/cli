@@ -28,8 +28,8 @@ pub const BYPASS_MODE: &str = "this computer's OpenCode can run without approval
      or mode.<name>.permission, or a tool set true under tools, in config.json, opencode.json \
      or opencode.jsonc in ~/.config/opencode, $XDG_CONFIG_HOME/opencode or ~/.opencode; an \
      agent or mode file there whose header allows; or one it cannot read)";
-/// What the turn ends with when OpenCode raises a prompt in its newer shape, which this host
-/// cannot relay (so it can never be allowed).
+/// What the turn ends with when OpenCode raises a prompt in a shape this host cannot relay (a
+/// `permission.*` event other than `asked` and `replied`), so it can never be allowed.
 pub const ASKS_V2: &str = "this OpenCode asks in a way the worker host does not read yet";
 
 /// Where installers put OpenCode outside a home.
@@ -405,9 +405,9 @@ fn fail(last: &str, why: &str) -> Outcome {
 }
 
 /// Speaks to the server: ready, a session (its id to `relay.session`), the event stream, then
-/// the message with `prompt`; each permission request relayed (answered when the person
-/// answers, withdrawn when the server says it was answered) until the message's response, an
-/// error, or the event stream ends.
+/// the message with `prompt`; each permission request of the session or a subagent's session
+/// under it relayed (answered when the person answers, withdrawn when the server says it was
+/// answered) until the message's response, an error, or the event stream ends.
 async fn talk(
     child: &mut Child,
     listening: oneshot::Receiver<()>,
@@ -447,6 +447,9 @@ async fn talk(
     let mut waiting: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
     // The status of each answer sent.
     let (statuses, mut replied) = mpsc::unbounded_channel::<u16>();
+    // The session and its subagents' sessions (a parent among them), as OpenCode's own `run`
+    // follows them.
+    let mut ours: HashSet<String> = HashSet::from([session.clone()]);
     // The assistant's messages, and its latest text part (id, text) so far.
     let mut assistant: HashSet<String> = HashSet::new();
     let (mut part, mut last) = (String::new(), String::new());
@@ -488,14 +491,26 @@ async fn talk(
             break fail(&last, "the worker's OpenCode event stream ended");
         };
         let kind = e["type"].as_str().unwrap_or_default();
-        // Its newer prompts are not relayed: unanswerable, so the turn ends rather than waits.
-        if kind.starts_with("permission.v2.") {
+        // Prompts in any other shape (`permission.v2.*`, `permission.updated`) are not relayed:
+        // unanswerable, so the turn ends rather than waits.
+        let read = ["permission.asked", "permission.replied"];
+        if kind.starts_with("permission.") && !read.contains(&kind) {
             break failed(ASKS_V2);
         }
         let p = &e["properties"];
-        if p["sessionID"] != session.as_str() {
+        if matches!(kind, "session.created" | "session.updated") {
+            let info = &p["info"];
+            let parent = info["parentID"].as_str().is_some_and(|i| ours.contains(i));
+            if let Some(child) = info["id"].as_str().filter(|_| parent) {
+                ours.insert(child.into());
+            }
             continue;
         }
+        let Some(from) = p["sessionID"].as_str().filter(|s| ours.contains(*s)) else {
+            continue;
+        };
+        // The worker's own words are its session's, never a subagent's.
+        let root = from == session;
         let id = p["id"].as_str().filter(|i| valid_id(i)).map(String::from);
         match kind {
             "permission.asked" => {
@@ -536,12 +551,12 @@ async fn talk(
                         .await;
                 });
             }
-            "message.updated" if p["info"]["role"] == "assistant" => {
+            "message.updated" if root && p["info"]["role"] == "assistant" => {
                 if let Some(m) = p["info"]["id"].as_str() {
                     assistant.insert(m.into());
                 }
             }
-            "message.part.updated" => {
+            "message.part.updated" if root => {
                 let t = &p["part"];
                 let mine = t["messageID"]
                     .as_str()
@@ -551,7 +566,8 @@ async fn talk(
                     last = t["text"].as_str().unwrap_or_default().into();
                 }
             }
-            "message.part.delta" if p["field"] == "text" => {
+            "message.part.delta" if root && p["field"] == "text" => {
+
                 let mine = p["messageID"]
                     .as_str()
                     .is_some_and(|m| assistant.contains(m));

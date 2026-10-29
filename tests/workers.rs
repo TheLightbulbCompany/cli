@@ -2184,7 +2184,84 @@ fn opencode_a_prompt_in_the_v2_shape_fails_the_turn() {
 }
 
 #[test]
+fn opencode_a_subagents_prompt_reaches_the_person() {
+    let mut stranger = opencode_ask("curl evil");
+    stranger["stranger"] = true.into();
+    let mut sub = opencode_ask("rm -rf x");
+    sub["sub"] = true.into();
+    let p = hosted(
+        json!([{"say": "mine"}, stranger, sub, {"sub_say": "the subagent's"}, {"sleep": 0.5},
+            {"result": "{last}"}]),
+        Opts {
+            always: true,
+            ..opencode()
+        },
+    );
+    p.assign("as1", "delegate", 300);
+    // One dialog: the subagent's, not another session's.
+    let (_, text, _) = p.dialog(1);
+    assert!(
+        text.ends_with("wants to: bash: Run rm -rf x; bash; rm -rf x"),
+        "{text}"
+    );
+    p.click("Allow");
+    let r = p.result("as1", 15);
+    assert_eq!(
+        (&r["status"], &r["text"]),
+        (&json!("done"), &json!("once")),
+        "{r}"
+    );
+    assert_eq!(p.pids().len(), 1, "one dialog");
+    assert!(served(&p, "/permission/p0/reply").is_empty());
+    let reply = &served(&p, "/permission/p1/reply")[0]["body"];
+    assert_eq!(reply["reply"], "once", "{reply}");
+}
+
+#[test]
+fn opencode_a_subagents_words_are_not_the_workers() {
+    let p = hosted(
+        json!([{"say": "mine"}, {"sub_say": "the subagent's"}, {"drop": true}, {"sleep": 60}]),
+        Opts {
+            always: true,
+            ..opencode()
+        },
+    );
+    p.assign("as1", "delegate", 300);
+    let r = p.result("as1", 15);
+    assert_eq!(
+        (&r["status"], &r["text"]),
+        (&json!("failed"), &json!("mine")),
+        "{r}"
+    );
+}
+
+#[test]
+fn opencode_an_unknown_permission_event_fails_the_turn() {
+    let p = hosted(
+        json!([{"say": "so far"}, {"event": "permission.updated"}, {"sleep": 60},
+            {"result": "late"}]),
+        Opts {
+            always: true,
+            ..opencode()
+        },
+    );
+    p.assign("as1", "asks oddly", 300);
+    let r = p.result("as1", 15);
+    assert_eq!(
+        (&r["status"], &r["reason"], &r["text"]),
+        (
+            &json!("failed"),
+            &json!("error"),
+            &json!("this OpenCode asks in a way the worker host does not read yet")
+        ),
+        "{r}"
+    );
+    assert!(p.pids().is_empty(), "no dialog");
+}
+
+#[test]
 fn opencode_a_refused_answer_fails_the_turn() {
+
     let mut ask = opencode_ask("rm -rf x");
     ask["reply_status"] = 500.into();
     let p = hosted(

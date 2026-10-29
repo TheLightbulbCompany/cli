@@ -15,7 +15,12 @@ event split across two chunks); POST /permission/{id}/reply; POST /question/{id}
 POST /session/{id}/message runs FAKE_OPENCODE_SCRIPT, a JSON list of steps:
 {"ask": {"type", "pattern", "title"}} emits `permission.asked` (the n-th ask has id `p<n>`, from
 0) and waits for its reply, unless the step has "wait": false; with "reply_status": n its
-reply is answered HTTP n; {"v2": true} emits `permission.v2.asked`;
+reply is answered HTTP n; with "sub": true it is a subagent's: `session.created` for a child
+session (`<session>_sub`, parentID the session) first, and the ask is that session's; with
+"stranger": true it is another session's (no parent), never waited for;
+{"v2": true} emits `permission.v2.asked`; {"event": type} emits that event type;
+{"sub_say": text} a text part of the subagent's session;
+
 {"cancel": n} emits `permission.replied` for `p<n>`; {"question": text} emits `question.asked`
 (`q<n>`) and waits for its reject; {"say": text} a text part of the turn; {"sleep": seconds};
 {"result": text} the turn's final text; {"error": text} the turn's error; {"drop": true} closes
@@ -95,15 +100,33 @@ def turn(prompt):
             a = step["ask"]
             ask(rid)
             statuses[rid] = step.get("reply_status", 200)
+            sid = SESSION
+            if step.get("sub"):
+                sid = SESSION + "_sub"
+                emit("session.created", {"sessionID": sid, "info": {
+                    "id": sid, "parentID": SESSION, "title": "a subagent"}})
+            if step.get("stranger"):
+                sid = "ses_stranger"
+                emit("session.created", {"sessionID": sid, "info": {"id": sid, "title": "x"}})
             emit("permission.asked", {
-                "id": rid, "sessionID": SESSION, "permission": a.get("type"),
+                "id": rid, "sessionID": sid, "permission": a.get("type"),
                 "patterns": [a["pattern"]] if a.get("pattern") else [],
                 "metadata": {"title": a["title"]} if a.get("title") else {},
                 "always": [], "tool": {"messageID": "msg_1", "callID": f"c{rid}"}})
-            if step.get("wait", True):
+            if step.get("wait", True) and not step.get("stranger"):
                 waits[rid][0].wait()
                 last = (waits[rid][1] or {}).get("reply", "")
+        elif "sub_say" in step:
+            sid = SESSION + "_sub"
+            emit("message.updated", {"sessionID": sid, "info": {
+                "id": "msg_sub", "sessionID": sid, "role": "assistant"}})
+            emit("message.part.updated", {"sessionID": sid, "time": 0, "part": {
+                "id": "prt_sub", "sessionID": sid, "messageID": "msg_sub", "type": "text",
+                "text": step["sub_say"]}})
+        elif "event" in step:
+            emit(step["event"], {"id": "per_x", "sessionID": SESSION})
         elif "v2" in step:
+
             emit("permission.v2.asked", {"id": "per_v2", "sessionID": SESSION,
                                          "action": "bash", "resources": ["rm -rf x"]})
         elif "cancel" in step:
