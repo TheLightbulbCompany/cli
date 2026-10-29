@@ -1949,7 +1949,26 @@ fn workers_commands_are_person_only_and_print_the_table() {
     assert!(!std::fs::read_to_string(e.state.path().join("config.toml"))
         .unwrap_or_default()
         .contains("workers_offer"));
+    let o = e
+        .cmd(&["workers", "show", "claude-1"])
+        .env("LIGHTBULB_CONNECT_HOOK_CALLER", &pin)
+        .output()
+        .unwrap();
+    assert!(
+        err(&o).contains("Run this from your own terminal"),
+        "{}",
+        err(&o)
+    );
     e.pin = None;
+    for (args, want) in [
+        (&["workers", "on", "--offer", "foo"][..], "\"foo\""),
+        (&["workers", "on", "--offer", "claude,"], "\"\""),
+        (&["workers", "on", "--max", "0"], "max must be at least 1"),
+    ] {
+        let o = e.person(args);
+        assert_eq!(o.status.code(), Some(2), "{args:?}");
+        assert!(err(&o).contains(want), "{}", err(&o));
+    }
     let o = e.person(&["workers"]);
     assert!(out(&o).contains("No workers"), "{}", out(&o));
     let o = e.person(&["workers", "on", "--offer", "claude"]);

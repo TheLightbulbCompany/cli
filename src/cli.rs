@@ -955,8 +955,9 @@ pub fn sessions(cmd: Sessions) -> Result<i32> {
 
 /// Prints the text `texts` maps `r`'s error code to (else `refusal`'s); returns the exit code 1.
 fn refuse(r: &Value, texts: &[(&str, String)]) -> Result<i32> {
-    let code = r["error"].as_str().unwrap_or_default();
-    match texts.iter().find(|(c, _)| *c == code) {
+    let (error, reason) = (r["error"].as_str(), r["reason"].as_str());
+    let hit = |code: Option<&str>| texts.iter().find(|(c, _)| Some(*c) == code);
+    match hit(reason).or_else(|| hit(error)) {
         Some((_, text)) => eprintln!("{text}"),
         None => eprintln!("{}", refusal(r)),
     }
@@ -1189,14 +1190,11 @@ pub fn workers(args: &[String]) -> Result<i32> {
             table(&t);
         }
         ["show", handle] => {
-            let r = ask(&mut conn, "workers.show", json!({"worker": handle}));
-            let w = match r {
-                Ok(w) => w,
-                Err(_) => {
-                    eprintln!("No worker {handle}.");
-                    return Ok(1);
-                }
-            };
+            let r = conn.call("workers.show", json!({"worker": handle}))?;
+            if r["ok"] != true {
+                return refuse(&r, &[(ipc::NOT_FOUND, format!("No worker {handle}."))]);
+            }
+            let w = r;
             println!(
                 "{} for {}: {}",
                 f(&w, "handle"),
@@ -1205,7 +1203,12 @@ pub fn workers(args: &[String]) -> Result<i32> {
             );
             println!("Folder: {}", f(&w, "folder"));
             match w["result"].as_str() {
-                Some(body) => println!("Result ({}):\n{body}", f(&w, "result_status")),
+                Some(body) => {
+                    println!("Result ({}):", f(&w, "result_status"));
+                    for line in body.lines() {
+                        println!("{}", crate::label::plain(line, usize::MAX));
+                    }
+                }
                 None => println!("No result yet."),
             }
             if let Some(c) = w["conversation"].as_str() {
@@ -1241,6 +1244,21 @@ pub fn workers(args: &[String]) -> Result<i32> {
                         return Ok(2);
                     }
                 }
+            }
+            if max.as_deref().is_some_and(|m| m.parse::<u32>() == Ok(0)) {
+                eprintln!("max must be at least 1");
+                return Ok(2);
+            }
+            if let Some(bad) = offer.as_deref().and_then(|o| {
+                o.split(',')
+                    .map(str::trim)
+                    .find(|w| !crate::sessions::PROVIDERS.contains(w))
+            }) {
+                eprintln!(
+                    "{bad:?} is not a harness I know; use one of {}.",
+                    crate::sessions::PROVIDERS.join(", ")
+                );
+                return Ok(2);
             }
             let dir = crate::paths::state_dir();
             // A person's only: the daemon refuses an agent before any key is written.
