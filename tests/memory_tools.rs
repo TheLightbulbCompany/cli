@@ -53,7 +53,7 @@ fn test_remember_conflict_without_replaces_is_contested() {
     let page = r["page"].as_str().unwrap();
     assert!(page.starts_with("Contested:\nlaunch date: "), "{page}");
     assert!(
-        page.contains("3 March (") && page.contains(") vs 10 March ("),
+        page.contains("10 March (") && page.contains(") vs 3 March ("), // newest first
         "{page}"
     );
     assert!(!page.contains("Current:"), "{page}");
@@ -285,4 +285,33 @@ fn recall_can_ask_for_longer_excerpts() {
     let r = e.ask(json!({"id": 2, "op": "memory.recall", "question": "rotate deploy keys", "excerpt_chars": 600}));
     let n = r["turns"][0]["excerpt"].as_str().unwrap().chars().count();
     assert!(n > 240 && n <= 600, "{n}");
+}
+
+#[test]
+fn recalled_facts_carry_their_date_and_the_newer_of_one_subject_comes_first() {
+    let e = daemon();
+    remember(
+        &e,
+        "launch date",
+        "3 March",
+        "fact",
+        json!({"when": 1_700_000_000}),
+    );
+    remember(
+        &e,
+        "launch date",
+        "10 March",
+        "fact",
+        json!({"when": 1_700_900_000}),
+    );
+    let r = recall(&e, "launch date", None);
+    let facts = r["facts"].as_array().unwrap();
+    assert_eq!(facts[0]["value"], "10 March", "{r}");
+    let day = &lightbulb::date::utc(1_700_900_000)[..10];
+    assert_eq!(facts[0]["line"], format!("launch date: 10 March ({day})"));
+    let page = r["page"].as_str().unwrap();
+    assert!(
+        page.find("10 March").unwrap() < page.find("3 March").unwrap(),
+        "{page}"
+    );
 }

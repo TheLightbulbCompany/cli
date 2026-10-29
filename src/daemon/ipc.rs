@@ -728,6 +728,7 @@ fn memory_recall(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
         return Response::err(id, INTERNAL);
     };
     facts.retain(|f| f.status != Status::Replaced);
+    memory::newest_first(&mut facts);
     // The session-start block (an empty question) never carries turns.
     let turns = if q.trim().is_empty() || !turns_on {
         Ok(Vec::new())
@@ -750,8 +751,22 @@ fn memory_recall(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
     }
     Response::ok(
         id,
-        json!({ "page": page, "block": block, "facts": facts.iter().map(fact_json).collect::<Vec<_>>(), "turns": turns }),
+        json!({ "page": page, "block": block, "facts": facts.iter().map(recalled_fact).collect::<Vec<_>>(), "turns": turns }),
     )
+}
+
+/// A recalled fact: `fact_json` plus `line`, "subject: value (YYYY-MM-DD)", so a reader that
+/// takes only the text still knows when it was true.
+fn recalled_fact(f: &crate::memory::Fact) -> Value {
+    let mut j = fact_json(f);
+    j["line"] = format!(
+        "{}: {} ({})",
+        f.subject,
+        f.value,
+        &crate::date::utc(f.when)[..10]
+    )
+    .into();
+    j
 }
 
 /// Member key -> the name shown for it.

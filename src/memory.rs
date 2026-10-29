@@ -677,6 +677,25 @@ pub(crate) const STOPWORDS: [&str; 37] = [
     "before", "after", "with", "for", "and", "or", "not", "our", "my", "your",
 ];
 
+/// Facts that share a subject (in one scope) keep the places they ranked at, newest first
+/// among them: when nobody marked an update as `replaces`, the current value still reads first.
+pub fn newest_first(facts: &mut [Fact]) {
+    let mut groups: HashMap<(bool, String), Vec<usize>> = HashMap::new();
+    for (i, f) in facts.iter().enumerate() {
+        groups
+            .entry((f.scope == Scope::Team, f.subject.trim().to_lowercase()))
+            .or_default()
+            .push(i);
+    }
+    for places in groups.into_values().filter(|p| p.len() > 1) {
+        let mut same: Vec<Fact> = places.iter().map(|&i| facts[i].clone()).collect();
+        same.sort_by_key(|f| std::cmp::Reverse(f.when));
+        for (&i, f) in places.iter().zip(same) {
+            facts[i] = f;
+        }
+    }
+}
+
 /// The best `limit` matches for `query` (FTS5 `bm25`, subject and fact, stemmed), as `facts`
 /// shows them; a match that has since been replaced says so. Any word but a stopword may match,
 /// a word of 3 or more characters as a prefix too; a query of stopwords only is matched as the
