@@ -459,7 +459,7 @@ fn review_required(root: &Path) -> ApiError {
     ApiError::new(
         "review_required",
         "Publish needs a passing review recorded for this commit.",
-        &format!("run the reviewer or ask your workspace agent to review the preview{at}, then record it: lightbulb app evidence --kind review --verdict pass --file <screenshot> --note \"<what was checked>\""),
+        &format!("run the reviewer or ask your workspace agent to review the preview{at} (lightbulb app test-link --json gets past its door), then record it: lightbulb app evidence --kind review --verdict pass --file <screenshot> --note \"<what was checked>\""),
     )
 }
 
@@ -792,6 +792,33 @@ pub(crate) fn destroy(root: &Path, auth: &Auth, json: bool) -> Result<i32> {
         }
         Err(e) => Ok(failure(json, e)),
     }
+}
+
+/// `lightbulb app test-link`: prints the preview's builder link. It holds a pass, so it is only
+/// printed: never written to `.lightbulb/`, never logged.
+pub(crate) fn test_link(root: &Path, auth: &Auth, json: bool) -> Result<i32> {
+    let id = match app_id(root, json) {
+        Ok(id) => id,
+        Err(code) => return Ok(code),
+    };
+    let r = match api::call(auth, "POST", &format!("/{id}/test-link"), Some(&json!({}))) {
+        Ok(r) => r,
+        Err(e) => return Ok(failure(json, e)),
+    };
+    let Some(url) = r["url"].as_str() else {
+        return Ok(fail(
+            json,
+            "no_url",
+            "Lightbulb did not return a link.",
+            "try again in a minute",
+        ));
+    };
+    if json {
+        println!("{}", json!({ "url": url }));
+    } else {
+        println!("{url}");
+    }
+    Ok(0)
 }
 
 fn pick(v: &Value, keys: &[&str]) -> Value {

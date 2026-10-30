@@ -26,6 +26,7 @@ and **done** (the preview was checked by a person). JSON keeps the backend's sta
 | `app status [--errors]` | Where the app is: state, URLs, versions, resources, spend, and the done gate. `--errors` adds the last client and server errors. |
 | `app destroy` | Asks for removal and prints the state the backend returns: `awaiting_owner` until the owner removes it in Canvas by typing the app's name. |
 | `app check [--publish]` | Runs `pnpm check` (type check, lint, design lint) and parses the errors. Without `node_modules` it fails with `not_installed` (`next: "run pnpm install, then try again"`), which is not counted toward the fix caps. `--publish` runs `pnpm check:publish`, which adds `pnpm audit --prod --audit-level high`. |
+| `app test-link` | Prints `{"url"}`: a link past the preview's door, for the builder's and its reviewer's own check only. The pass in it must be opened within 5 minutes and gives a 30-minute session on the preview, as "Builder agent" (no email). It is never accepted on the live address. A public app gets its plain preview address. It is printed only, never written to `.lightbulb/` or a log; never post it anywhere, or put it in an evidence note (`note_has_pass`). No preview yet: `not_ready`. People open the app from Canvas. |
 | `app evidence --kind <browser\|review> --file <FILE> [--note <TEXT>] [--verdict <pass\|fail>]` | Records a browser pass or a review for HEAD. The file stays on your computer; only its path and sha256 are kept. A review needs `--verdict` (else `verdict_required`). A browser record defaults to `pass`. |
 | `app report-broken-tool <TOOL> <WHAT>` | Appends a line to `.lightbulb/lessons.md` under `## Broken tools`. Once per `up`. |
 
@@ -136,6 +137,11 @@ shadcn/ui, Drizzle on Postgres), with exact-pinned dependencies and `minimum-rel
   session route `/api/_lightbulb/session`, the door's own pages and Next's assets skip it; error
   reports (`/api/_lightbulb/errors`) need a session unless the app is public. Do not remove or
   loosen it.
+- **The builder's pass.** `app test-link` mints a pass whose `sub` is `builder:<id>`, whose `email`
+  is empty and whose `app` is `<name>:preview`. Only `LIGHTBULB_PREVIEW_APP`, which Lightbulb sets
+  on the preview and never on live, accepts it, so neither the pass nor its session opens the live
+  address. An app made before this door refuses the pass as `wrong_app`, everywhere, until its
+  `src/lib/door.ts` is updated.
 - **The door page.** Someone without a session gets status 401 and a page that names the app
   and workspace (`LIGHTBULB_APP_NAME`, `LIGHTBULB_WORKSPACE_NAME`; dropped when unset), says "Open
   this from Canvas in Lightbulb to get in.", has one "Open Canvas" button

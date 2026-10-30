@@ -1,7 +1,7 @@
 # Building this app
 
 This is a Next.js app that a Lightbulb workspace asked for. You build it, check it, and hand the
-room a preview link. `app.yaml` says what kind of app it is (`kind`), who can open it (`open_to`)
+room a preview in Canvas. `app.yaml` says what kind of app it is (`kind`), who can open it (`open_to`)
 and which services it gets (`services`). Read this file, then `playbooks/<kind>.md`, before you
 change anything.
 
@@ -17,24 +17,29 @@ change anything.
 4. **Check, cheapest first:** run `pnpm install` once (and after changing `package.json`;
    `check` and `up` answer `not_installed` until you do), then `lightbulb app check` (type check, lint, design lint), then
    `lightbulb app up` (deploys the preview, runs the health check, reads the logs). When `up` asks
-   for it, open the preview in the shared browser, walk the flow, and record it with
+   for it, run `lightbulb app test-link --json`, open the `url` it prints in the shared browser
+   (the plain preview address only reaches the door), walk the flow, and record it with
    `lightbulb app evidence --kind browser --file .lightbulb/evidence/<name>.png`. Keep the file
    under `.lightbulb/evidence/` (git ignores it) or outside the app, so it never changes the
    version. `lightbulb app status` shows `done` without redeploying.
-5. **Post nothing until `up` says `done: true`.** Then post the preview link and what you built,
-   in two or three plain sentences.
+5. **Post nothing until `up` says `done: true`.** Then post the Canvas line (`canvas_url`) and what
+   you built, in two or three plain sentences. People open the app from Canvas: never post the
+   preview address, and never post a test link anywhere; it lets its holder in as the builder.
 6. **Same error twice: stop patching.** When `up` or `check` says `next: "diagnose"`, read the
    logs (`lightbulb app status --errors`), check `.lightbulb/known-fixes.md`, and write a fresh
    plan before touching code. When it says `next: "undo"`, roll back and tell the room plainly what
    failed. If a Lightbulb command itself is broken, run `lightbulb app report-broken-tool` and stop.
 7. **Write a lesson** in `.lightbulb/lessons.md` after every failure you resolve: what broke, why,
-   what fixed it. Read the lessons for an area before you touch it.
+   what fixed it. Read the lessons for an area before you touch it. Never put a test link or its token in
+   a lesson: they are committed and uploaded.
 8. **One commit per turn**, with a message that says what changed for the person.
 
 ## Safety rules (never break these)
 
 - **No secret in code, in a commit, or in the room.** Keys arrive as environment variables through
   Lightbulb. If you need one, ask for it through a form card, never in the thread.
+- **A test link is for your own check.** Don't save it, log it, or put it in a note, a commit or
+  the room. It lasts 5 minutes; a new one is one command away.
 - **Never remove or loosen the door** (`src/proxy.ts`, `src/lib/door.ts`, `src/app/%5Flightbulb/`,
   `src/app/api/%5Flightbulb/`). Every page and route sits behind it.
 - **Files in `public/` are served without the door.** Nothing private goes there.
