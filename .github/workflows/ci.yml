@@ -19,6 +19,9 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+      # The BEAM benchmark's ops (docs/benchmark.md): compiled only with --features bench.
+      - run: cargo clippy --all-targets --features bench -- -D warnings
+      - run: cargo test --features bench --test bench_ops
       # The real memory model (one download); the other ignored tests are helpers, not run.
       - run: cargo test --test embed_model --test memory_store -- --include-ignored
         env:

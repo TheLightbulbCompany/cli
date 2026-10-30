@@ -23,10 +23,7 @@ fn remember(e: &common::Env, subject: &str, fact: &str, when: i64, replaces: Val
 }
 
 fn recall(e: &common::Env, question: &str, as_of: Option<i64>) -> Value {
-    e.ask(
-        json!({"id": 3, "op": "memory.recall", "question": question, "as_of": as_of,
-        "turn_limit": 50}),
-    )
+    e.ask(json!({"id": 3, "op": "memory.recall", "question": question, "as_of": as_of}))
 }
 
 #[test]

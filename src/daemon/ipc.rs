@@ -712,7 +712,7 @@ fn memory_recall(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
     let budget = body["budget_chars"]
         .as_u64()
         .map_or(if asked { usize::MAX } else { 1_600 }, |b| b as usize);
-    let (as_of, _) = bench_knobs(body);
+    let as_of = bench_as_of(body);
     let names = member_names(daemon);
     // From the file, before the lock: `sessions turns off` also stops recall using the turns
     // already stored (they stay for `sessions show` and `sessions forget`).
@@ -769,19 +769,16 @@ fn memory_recall(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
     Response::ok(id, out)
 }
 
-/// `memory.recall`'s benchmark knobs, `(as_of, turn_limit)`: read only in a `bench` build;
-/// a release recalls as of now with 5 turns.
+/// `memory.recall`'s benchmark knob, `as_of` (unix seconds): read only in a `bench` build;
+/// a release recalls as of now.
 #[cfg(feature = "bench")]
-fn bench_knobs(body: &Value) -> (Option<i64>, usize) {
-    (
-        body["as_of"].as_i64(),
-        body["turn_limit"].as_u64().map_or(5, |n| n as usize),
-    )
+fn bench_as_of(body: &Value) -> Option<i64> {
+    body["as_of"].as_i64()
 }
 
 #[cfg(not(feature = "bench"))]
-fn bench_knobs(_: &Value) -> (Option<i64>, usize) {
-    (None, 5)
+fn bench_as_of(_: &Value) -> Option<i64> {
+    None
 }
 
 /// `bench.ingest_turns {session, turns: [{role, text, at}]}` -> `{stored}`: a benchmark's turns,
