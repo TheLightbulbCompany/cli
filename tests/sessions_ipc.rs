@@ -260,17 +260,11 @@ fn the_listing_feeds_sessions_and_when_claude_fails_nothing_alive_ends() {
     assert_eq!(log.matches("claude agents: no answer").count(), 1, "{log}");
 }
 
-/// A hook's `waiting` is newer than a listing that still says `busy`; the next hook moves it
-/// on, and a later listing saying `idle` clears a new `waiting`.
-#[test]
-fn a_hook_waiting_stands_over_a_stale_listing() {
-    let c = "e1b2c3d4-0000-4000-8000-000000000005";
-    let row = |status: &str| {
-        json!([{"pid": std::process::id(), "cwd": "/tmp/p", "kind": "interactive", "name": "shim",
-            "startedAt": 1, "sessionId": c, "status": status}])
-        .to_string()
-    };
-    let (shim, path) = claude_shim(&row("busy"));
+/// A daemon whose listing says `c`, as `shim`, is `status`, and a row of it.
+fn busy_listing(c: &str) -> (Env, tempfile::TempDir) {
+    let row = json!([{"pid": std::process::id(), "cwd": "/tmp/p", "kind": "interactive",
+        "name": "shim", "startedAt": 1, "sessionId": c, "status": "busy"}]);
+    let (shim, path) = claude_shim(&row.to_string());
     let e = Env::new();
     e.daemon(
         false,
@@ -280,11 +274,23 @@ fn a_hook_waiting_stands_over_a_stale_listing() {
             ("LIGHTBULB_CONNECT_DEBUG_LISTING", "1".into()),
         ],
     );
-    register_claude(&e, c, "waiting", Some("permission prompt"));
+    (e, shim)
+}
+
+/// A hook's `waiting` is newer than a listing read before it that still says `busy`.
+#[test]
+fn a_hook_waiting_stands_over_a_stale_listing() {
+    let c = "e1b2c3d4-0000-4000-8000-000000000005";
+    let (e, _shim) = busy_listing(c);
+    register_claude(&e, c, "busy", None);
     // The listing's `name` shows it has been read.
     until(10, "the listing is read", || {
         by(&listed(&e), c).is_some_and(|s| s["title"] == "shim")
     });
+    // Past the second that read began in. The look below answers from it: a read this starts
+    // lands later.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    register_claude(&e, c, "waiting", Some("permission prompt"));
     let s = listed(&e);
     let w = by(&s, c).unwrap();
     assert_eq!(
@@ -293,31 +299,47 @@ fn a_hook_waiting_stands_over_a_stale_listing() {
     );
     register_claude(&e, c, "busy", None);
     assert_eq!(by(&listed(&e), c).unwrap()["status"], "live");
-
-    std::fs::write(shim.path().join("listing.json"), row("idle")).unwrap();
-    register_claude(&e, c, "waiting", Some("permission prompt"));
-    until(15, "the listing's idle clears it", || {
-        by(&listed(&e), c).is_some_and(|s| s["status"] == "idle")
-    });
 }
 
-/// Only the listing clears a hook's `waiting`: a pid file saying `idle` may just be behind it.
+/// The person approved and a long tool runs, so no hook fires: a listing read after the hook
+/// saying `busy` clears the `waiting`.
 #[test]
-fn a_pid_file_saying_idle_leaves_a_hook_waiting() {
+fn a_listing_read_after_the_hook_clears_waiting() {
+    let c = "e1b2c3d4-0000-4000-8000-000000000006";
+    let (e, _shim) = busy_listing(c);
+    register_claude(&e, c, "waiting", Some("permission prompt"));
+    // The hook's own news may start a read within its second, which says nothing against it.
+    // Another session's asks for a read in a later second, sooner than the idle cadence.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    register_claude(&e, "another", "idle", None);
+    until(10, "the listing's busy clears it", || {
+        by(&listed(&e), c).is_some_and(|s| s["status"] == "live")
+    });
+    assert!(by(&listed(&e), c).unwrap()["waiting_for"].is_null());
+}
+
+/// A pid file saying `idle` may just be behind a hook's `waiting`, unless Claude updated it after.
+#[test]
+fn a_pid_file_clears_a_hook_waiting_only_if_updated_after_it() {
     let e = Env::new();
     let sessions = e.home.path().join(".claude/sessions");
     std::fs::create_dir_all(&sessions).unwrap();
     let pid = std::process::id();
-    std::fs::write(
-        sessions.join("a.json"),
-        json!({"pid": pid, "sessionId": "w", "cwd": "/tmp/p", "status": "idle",
-            "startedAt": os::started_ms(pid).unwrap()})
-        .to_string(),
-    )
-    .unwrap();
+    let write = |updated_at: i64| {
+        std::fs::write(
+            sessions.join("a.json"),
+            json!({"pid": pid, "sessionId": "w", "cwd": "/tmp/p", "status": "idle",
+                "startedAt": os::started_ms(pid).unwrap(), "updatedAt": updated_at})
+            .to_string(),
+        )
+        .unwrap();
+    };
+    write(1_000);
     e.daemon(false, "", &[]);
     register_claude(&e, "w", "waiting", Some("input needed"));
     assert_eq!(by(&listed(&e), "w").unwrap()["status"], "waiting");
+    write((common::now_s() + 5) * 1000);
+    assert_eq!(by(&listed(&e), "w").unwrap()["status"], "idle");
 }
 
 /// A test daemon whose `PATH` has a `claude` leaves it alone unless told to ask it.
@@ -444,7 +466,10 @@ fn a_listed_session_that_disappears_becomes_an_ended_row_with_its_title() {
     let moved = by(&over, a).unwrap();
     assert_eq!(moved["reason"], "moved-on");
     assert_eq!(moved["title"], "Fix the list");
-    assert_eq!(moved["resume"], format!("claude --resume {a}"));
+    assert_eq!(
+        moved["resume"],
+        format!("cd '/tmp/p' && claude --resume {a}")
+    );
     assert!(moved["ended_at"].as_i64().unwrap() >= common::now_s() - 60);
     assert_eq!(by(&over, b).unwrap()["reason"], "process-exited");
 }
@@ -514,7 +539,7 @@ fn a_finished_job_ends_once_and_is_not_reborn() {
     assert_eq!(row["reason"], "job-done");
     assert_eq!(row["cwd"], "/tmp/p");
     assert_eq!(row["title"], "the job");
-    assert_eq!(row["resume"], format!("claude --resume {j}"));
+    assert_eq!(row["resume"], format!("cd '/tmp/p' && claude --resume {j}"));
     assert!(row["handle"].is_null(), "an old job uses up no number");
     assert!(by(&listed(&e), j).is_none());
     std::thread::sleep(std::time::Duration::from_secs(3));

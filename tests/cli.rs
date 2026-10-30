@@ -149,7 +149,10 @@ fn who_prints_waiting_done_and_a_recent_section_with_resume() {
         .unwrap();
     assert_eq!(t2_row["status"], "ended", "{json}");
     assert_eq!(t2_row["reason"], "session-end", "{json}");
-    assert_eq!(t2_row["resume"], "codex resume t2", "{json}");
+    assert_eq!(
+        t2_row["resume"], "cd '/tmp/proj' && codex resume t2",
+        "{json}"
+    );
     assert!(t2_row["ended_at"].is_u64(), "{json}");
 
     // `--all` says the same of this computer's, and only ended rows: Recent alone.

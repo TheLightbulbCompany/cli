@@ -1711,7 +1711,7 @@ fn ended_json(r: &store::Session) -> Value {
         "branch": r.branch,
         "reason": r.reason,
         "ended_at": r.ended_at,
-        "resume": r.conversation.as_deref().and_then(|c| sessions::resume(&r.provider, c)),
+        "resume": r.conversation.as_deref().and_then(|c| sessions::resume(&r.provider, c, &r.cwd)),
     })
 }
 

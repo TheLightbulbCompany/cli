@@ -58,6 +58,8 @@ impl Env {
         c.env("LIGHTBULB_CONNECT_HOME", self.state.path())
             .env("LIGHTBULB_CONNECT_CLAUDE_HOME", self.home.path())
             .env("LIGHTBULB_CONNECT_NO_LAUNCHCTL", "1")
+            // A suite run from `claude -p` must not read as one: hooks would register nothing.
+            .env_remove("CLAUDE_CODE_ENTRYPOINT")
             .env("LIGHTBULB_CONNECT_DEBUG_NO_DEFAULT_RELAYS", "1")
             .env("LIGHTBULB_CONNECT_DEBUG_NO_TELEMETRY", "1")
             // Never the real model download: a closed port (`embed_model`).

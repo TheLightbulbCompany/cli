@@ -111,9 +111,8 @@ pub(crate) fn remote(s: &Session, share_paths: bool) -> Remote {
         title: s.title.clone(),
         // Claude may not say what for: without this it would read as plain busy over there.
         waiting_for: waiting.then(|| {
-            s.waiting_for
-                .clone()
-                .unwrap_or_else(|| "input needed".into())
+            let what = s.waiting_for.as_deref().unwrap_or_default();
+            crate::agents::listing::waiting_word(what).into()
         }),
     }
     .clamp()
@@ -656,7 +655,7 @@ pub fn directory(d: &Daemon, query: Option<&str>) -> Value {
             v["resume"] = row
                 .conversation
                 .as_deref()
-                .and_then(|c| sessions::resume(&row.provider, c))
+                .and_then(|c| sessions::resume(&row.provider, c, &row.cwd))
                 .into();
             out.push(v);
         }

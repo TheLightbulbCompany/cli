@@ -289,7 +289,10 @@ async fn a_teammates_ended_session_is_seen_for_a_week_and_never_its_resume() {
 
     let mine = row(&a, None).unwrap();
     assert_eq!(mine["status"], "ended", "{mine}");
-    assert_eq!(mine["resume"], "claude --resume a1", "{mine}");
+    assert_eq!(
+        mine["resume"], "cd '/tmp/work/api' && claude --resume a1",
+        "{mine}"
+    );
     assert_eq!(mine["cwd"], "/tmp/work/api", "{mine}");
 
     // The same conversation live again is one live row, on both sides.

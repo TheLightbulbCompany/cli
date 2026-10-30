@@ -81,7 +81,10 @@ impl Ended {
         own(peer_short, &self.session_id)
             && matches!(Sender::of(peer_short, &self.session_id), Sender::Agent(p) if p == self.agent)
             && (1..=32).contains(&self.reason.len())
-            && self.reason.bytes().all(|b| b.is_ascii_lowercase() || b == b'-')
+            && self
+                .reason
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b == b'-')
             && short(&self.folder)
             && [&self.title, &self.repo, &self.branch]
                 .into_iter()

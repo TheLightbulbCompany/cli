@@ -176,14 +176,21 @@ pub fn run(agent: &str, event: &str, stdin: &str) -> Result<Option<String>> {
         }
         return Ok(None);
     }
+    // A `claude -p` or Agent SDK run is a tool's process, not a session: no row, so no mail and
+    // no nudge. Its capture and memory block need no row and stay.
+    let sdk_run = agent == "claude"
+        && std::env::var("CLAUDE_CODE_ENTRYPOINT").is_ok_and(|e| e.starts_with("sdk-"));
     let caller = calling_agent(Some(agent));
     if h.event == Event::SessionEnd {
         // The agent may have exited before its SessionEnd hook ran, so the caller check
         // can fail; then the daemon ends the row only if its recorded process is gone too.
         daemon::ensure_running()?;
         let mut conn = Conn::open()?;
-        let key = crate::sessions::Key::new(&conn.member()?, h.provider, &h.conversation);
         capture(&h, &payload, &json!({}));
+        if sdk_run {
+            return Ok(None);
+        }
+        let key = crate::sessions::Key::new(&conn.member()?, h.provider, &h.conversation);
         let reason = match (h.provider, payload["reason"].as_str()) {
             ("claude", Some("clear" | "resume")) => "moved-on",
             _ => "session-end",
@@ -208,8 +215,6 @@ pub fn run(agent: &str, event: &str, stdin: &str) -> Result<Option<String>> {
         Err(CallerError::NotThatAgent) => return Ok(None),
         Err(CallerError::Lookup(e)) => return Err(e.into()),
     };
-    daemon::ensure_running()?;
-    let mut conn = Conn::open()?;
     // A permission or input prompt reads `waiting` the moment the agent asks; other
     // notification types say nothing about waiting and register nothing.
     let (status, waiting_for) = match h.event {
@@ -225,6 +230,8 @@ pub fn run(agent: &str, event: &str, stdin: &str) -> Result<Option<String>> {
         Event::UserPromptSubmit | Event::PostToolUse => ("busy", None),
         _ => ("idle", None),
     };
+    daemon::ensure_running()?;
+    let mut conn = Conn::open()?;
     // Read here, in the agent's process, which has the folder access the person gave it: the
     // folder resolved (what `folders_off` is matched against) and, at a session's start and
     // each prompt, its repo and branch (absent otherwise: the daemon keeps the last).
@@ -239,14 +246,18 @@ pub fn run(agent: &str, event: &str, stdin: &str) -> Result<Option<String>> {
         let (repo, branch) = crate::mcp::git(&h.cwd);
         (session["repo"], session["branch"]) = (repo.into(), branch.into());
     }
-    let r = conn.call(
-        "register",
-        json!({ "session": session, "caller": proc_json(&me) }),
-    )?;
-    let key = r["key"].clone();
-    if !key.is_string() {
-        return Err(format!("register: {r}").into());
-    }
+    let key = if sdk_run {
+        Value::Null
+    } else {
+        let r = conn.call(
+            "register",
+            json!({ "session": session, "caller": proc_json(&me) }),
+        )?;
+        if !r["key"].is_string() {
+            return Err(format!("register: {r}").into());
+        }
+        r["key"].clone()
+    };
     if h.event.waits() {
         return Ok(None);
     }
@@ -276,7 +287,7 @@ pub fn run(agent: &str, event: &str, stdin: &str) -> Result<Option<String>> {
     } else {
         "inbox"
     };
-    let r = if block_only {
+    let r = if block_only || sdk_run {
         json!({ "messages": [] })
     } else {
         conn.call(op, json!({ "key": key, "caller": proc_json(&me) }))?

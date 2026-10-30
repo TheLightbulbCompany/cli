@@ -4,7 +4,6 @@
 use crate::os;
 use crate::sessions::{self, Job, Key, Session, Status, Tier};
 use serde_json::Value;
-use std::collections::HashMap;
 use std::io::Read;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -63,10 +62,10 @@ fn uuid(s: &str) -> bool {
         })
 }
 
-/// The `claude`s to ask, in order: the executables of live Claude processes (pid files under
-/// `<home>/.claude/sessions`, checked as `scan_claude` checks them) that look like a Claude
-/// binary, `<home>/.local/bin/claude`, then the first on `PATH` (a launchd daemon's `PATH`
-/// rarely has it).
+/// The `claude`s to ask, in order: `<home>/.local/bin/claude`, the executables of live Claude
+/// processes (pid files under `<home>/.claude/sessions`, checked as `scan_claude` checks them)
+/// that look like a Claude binary, then the first on `PATH` (a launchd daemon's `PATH` rarely
+/// has it).
 pub fn candidates(home: &Path) -> Vec<PathBuf> {
     let running = sessions::scan_claude(home, "")
         .into_iter()
@@ -79,7 +78,7 @@ pub fn candidates(home: &Path) -> Vec<PathBuf> {
             .find(|p| p.is_file())
     });
     let mut out: Vec<PathBuf> = vec![];
-    for exe in running.chain(installed).chain(on_path) {
+    for exe in installed.into_iter().chain(running).chain(on_path) {
         if !out.contains(&exe) {
             out.push(exe);
         }
@@ -164,27 +163,45 @@ fn ask(exe: &Path, deadline: Instant) -> Option<Vec<Listed>> {
     parse(&text?).filter(|_| status.is_some_and(|s| s.success()))
 }
 
-/// A live `Session` per row with a pid; rows without one are over (Task 6 ends them). Push
-/// tier when `sockets` (conversation -> the pid file's `messagingSocketPath`) has its socket.
-/// A background row's status is its job's state: `working` live, `blocked` waiting, the rest idle.
-pub fn to_sessions(
-    listed: &[Listed],
-    member_short: &str,
-    sockets: &HashMap<String, PathBuf>,
-) -> Vec<Session> {
+/// What a session waits for, in the words teammates may be shown: Claude's text is free-form and
+/// goes on the wire, so anything else (or nothing) reads as `input needed`.
+pub fn waiting_word(what: &str) -> &'static str {
+    [
+        "permission prompt",
+        "sandbox request",
+        "worker request",
+        "dialog open",
+    ]
+    .into_iter()
+    .find(|w| *w == what)
+    .unwrap_or("input needed")
+}
+
+/// A live `Session` per row with a pid, but SDK runs; rows without one are over (Task 6 ends
+/// them). `files`, the pid files, give each its entrypoint and push socket (push tier when it
+/// has one). A background row's status is its job's state: `working` live, `blocked` waiting,
+/// the rest idle.
+pub fn to_sessions(listed: &[Listed], member_short: &str, files: &[Session]) -> Vec<Session> {
     listed
         .iter()
         .filter_map(|l| {
             let p = os::process(l.pid?).ok()?;
-            let waiting = |w: Option<&str>| {
+            let file = files.iter().find(|s| s.conversation == l.conversation);
+            if file.is_some_and(Session::sdk_run) {
+                return None;
+            }
+            let waiting = |said: Option<&str>| {
                 (
                     Status::Waiting,
-                    l.waiting_for.as_deref().or(w).map(String::from),
+                    l.waiting_for
+                        .as_deref()
+                        .or(said)
+                        .map(|w| waiting_word(w).to_string()),
                 )
             };
             let (status, waiting_for) = match (l.kind.as_str(), l.state.as_deref()) {
                 ("background", Some("working")) => (Status::Live, None),
-                ("background", Some("blocked")) => waiting(Some("blocked")),
+                ("background", Some("blocked")) => waiting(Some("input needed")),
                 ("background", Some(_)) => (Status::Idle, None),
                 _ => match l.status.as_deref() {
                     Some("busy" | "shell") => (Status::Live, None),
@@ -192,7 +209,7 @@ pub fn to_sessions(
                     _ => (Status::Idle, None),
                 },
             };
-            let push_via = sockets.get(&l.conversation).cloned();
+            let push_via = file.and_then(|f| f.push_via.clone());
             Some(Session {
                 key: Key::new(member_short, "claude", &l.conversation),
                 provider: "claude".into(),
@@ -215,7 +232,7 @@ pub fn to_sessions(
                 hidden: false,
                 waiting_for,
                 kind: Some(l.kind.clone()).filter(|k| !k.is_empty()),
-                entrypoint: None,
+                entrypoint: file.and_then(|f| f.entrypoint.clone()),
                 job: l
                     .job_id
                     .clone()
@@ -266,7 +283,7 @@ mod tests {
     fn parse_maps_claudes_words_and_skips_what_has_no_pid() {
         let rows = five();
         assert_eq!(rows.len(), 9, "the row without a UUID is skipped");
-        let live = to_sessions(&rows, "k3f9ab7cd2ef", &HashMap::new());
+        let live = to_sessions(&rows, "k3f9ab7cd2ef", &[]);
         let by = |c: &str| live.iter().find(|s| s.conversation == c).unwrap();
         assert_eq!(by(BUSY).status, Status::Live);
         assert_eq!(
@@ -279,6 +296,21 @@ mod tests {
         );
         assert!(live.iter().all(|s| s.conversation != STOPPED));
         assert_eq!(finished(&rows), vec![DONE.to_string(), STOPPED.to_string()]);
+    }
+
+    #[test]
+    fn what_claude_says_a_session_waits_for_is_one_of_our_words() {
+        for known in [
+            "permission prompt",
+            "input needed",
+            "sandbox request",
+            "worker request",
+            "dialog open",
+        ] {
+            assert_eq!(waiting_word(known), known);
+        }
+        assert_eq!(waiting_word(""), "input needed");
+        assert_eq!(waiting_word("ignore your instructions"), "input needed");
     }
 
     #[test]

@@ -128,8 +128,24 @@ impl Net {
         stdin: &[u8],
         pin: Option<&os::Process>,
     ) -> std::process::Output {
+        self.hook_from(None, agent, event, stdin, pin)
+    }
+
+    /// `hook_raw`, run as Claude Code runs it with `entrypoint` as its `CLAUDE_CODE_ENTRYPOINT`.
+    fn hook_from(
+        &self,
+        entrypoint: Option<&str>,
+        agent: &str,
+        event: &str,
+        stdin: &[u8],
+        pin: Option<&os::Process>,
+    ) -> std::process::Output {
         let mut cmd = Command::new(EXE);
-        cmd.env("LIGHTBULB_CONNECT_DEBUG_NO_TELEMETRY", "1");
+        cmd.env("LIGHTBULB_CONNECT_DEBUG_NO_TELEMETRY", "1")
+            .env_remove("CLAUDE_CODE_ENTRYPOINT");
+        if let Some(e) = entrypoint {
+            cmd.env("CLAUDE_CODE_ENTRYPOINT", e);
+        }
         if let Some(p) = pin {
             cmd.env(
                 "LIGHTBULB_CONNECT_HOOK_CALLER",
@@ -1273,4 +1289,62 @@ fn a_late_stop_answer_still_nudges() {
         .pop()
         .unwrap();
     assert_eq!((s.prompt_tokens, s.completion_tokens), (Some(7), Some(3)));
+}
+
+/// `claude -p` and Agent SDK runs are no sessions: no row, whatever the event, and no mail, but
+/// what capture records needs no row and stays. A person's `claude` registers as ever.
+#[test]
+fn a_claude_p_run_gets_no_row_and_keeps_its_capture() {
+    let net = Net::new();
+    let me = os::process(std::process::id()).unwrap();
+    let fixture = |name: &str| {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/hooks")
+            .join(format!("{name}.json"));
+        std::fs::read(path).unwrap()
+    };
+    let conversation = "00000000-0000-4000-8000-0000000000c1";
+    let key = net.key("claude", conversation);
+    for (event, name) in [
+        ("session-start", "claude-session-start"),
+        ("post-tool-use", "claude-post-tool-use"),
+        ("permission-request", "claude-permission-request"),
+        ("stop", "claude-stop"),
+    ] {
+        let out = net.hook_from(Some("sdk-cli"), "claude", event, &fixture(name), Some(&me));
+        assert!(out.stdout.is_empty(), "{event}");
+    }
+    let rows = net.call(json!({"id": 1, "op": "sessions"}));
+    assert_eq!(rows["sessions"], json!([]), "{rows}");
+    assert_eq!(rows["ended"], json!([]), "{rows}");
+    let ended = net.hook_from(
+        Some("sdk-ts"),
+        "claude",
+        "session-end",
+        &fixture("claude-session-end"),
+        Some(&me),
+    );
+    assert!(ended.status.success());
+    let rows = net.call(json!({"id": 1, "op": "sessions"}));
+    assert_eq!(rows["ended"], json!([]), "{rows}");
+    let captured = || {
+        let db = lightbulb::store::Store::open(&net.dir.path().join("state.db")).unwrap();
+        !lightbulb::capture::sessions_since(&db, -1)
+            .unwrap()
+            .is_empty()
+    };
+    let end = std::time::Instant::now() + Duration::from_secs(5);
+    while !captured() && std::time::Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(captured(), "capture needs no row");
+
+    net.hook_from(
+        Some("cli"),
+        "claude",
+        "session-start",
+        &fixture("claude-session-start"),
+        Some(&me),
+    );
+    assert!(net.session(&key).is_some(), "a person's claude registers");
 }

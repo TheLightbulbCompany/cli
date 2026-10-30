@@ -3,6 +3,7 @@
 use crate::agents::{codex, listing};
 use crate::{doing, os, store};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// `"<member_key_short>/<provider>:<conversation>"`.
@@ -130,6 +131,16 @@ pub struct Session {
     pub job: Option<Job>,
 }
 
+impl Session {
+    /// A `claude -p` or Agent SDK run (Claude's entrypoint `sdk-*`), by its pid file: a tool's
+    /// process, not a session anyone would message or resume.
+    pub fn sdk_run(&self) -> bool {
+        self.entrypoint
+            .as_deref()
+            .is_some_and(|e| e.starts_with("sdk-"))
+    }
+}
+
 /// A background job of a session: its id and state.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Job {
@@ -202,14 +213,14 @@ fn from_row(r: &store::Session, home: &Path) -> Option<Session> {
 pub fn scan_claude(home: &Path, member_short: &str) -> Vec<Session> {
     let files = pid_files(home, member_short).into_iter();
     files
-        .filter(|(_, parked)| !parked)
-        .map(|(s, _)| s)
+        .filter(|(_, parked, _)| !parked)
+        .map(|(s, ..)| s)
         .collect()
 }
 
-/// Every verified pid file as a session, and whether it is parked into the agent view: then the
-/// terminal is not the session any more.
-fn pid_files(home: &Path, member_short: &str) -> Vec<(Session, bool)> {
+/// Every verified pid file as a session, whether it is parked into the agent view (then the
+/// terminal is not the session any more), and the unix second Claude last updated it.
+fn pid_files(home: &Path, member_short: &str) -> Vec<(Session, bool, Option<i64>)> {
     let Ok(dir) = std::fs::read_dir(home.join(".claude/sessions")) else {
         return vec![];
     };
@@ -254,10 +265,10 @@ fn pid_files(home: &Path, member_short: &str) -> Vec<(Session, bool)> {
             title: v["name"].as_str().map(String::from),
             doing: None,
             // `shell`: Claude itself reports it as busy.
-            status: if v["status"] == "busy" || v["status"] == "shell" {
-                Status::Live
-            } else {
-                Status::Idle
+            status: match v["status"].as_str() {
+                Some("busy" | "shell") => Status::Live,
+                Some("waiting") => Status::Waiting,
+                _ => Status::Idle,
             },
             tier: if socket.is_some() {
                 Tier::Push
@@ -269,18 +280,28 @@ fn pid_files(home: &Path, member_short: &str) -> Vec<(Session, bool)> {
             repo: None,
             branch: None,
             hidden: false,
-            waiting_for: None,
+            waiting_for: v["waitingFor"]
+                .as_str()
+                .filter(|_| v["status"] == "waiting")
+                .map(|w| listing::waiting_word(w).into()),
             kind: v["kind"].as_str().map(String::from),
             entrypoint: v["entrypoint"].as_str().map(String::from),
             job: None,
         };
-        out.push((session, parked));
+        let updated = v["updatedAt"].as_i64().map(|ms| ms / 1000);
+        out.push((session, parked, updated));
     }
     out
 }
 
-/// The command that resumes an ended conversation, on its owner's computer.
-pub fn resume(provider: &str, conversation: &str) -> Option<String> {
+/// `s` as one shell word.
+pub fn shell_quoted(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// The command that resumes an ended conversation, on its owner's computer, from any folder: an
+/// agent looks its conversations up by the folder it starts in.
+pub fn resume(provider: &str, conversation: &str, cwd: &str) -> Option<String> {
     let command = match provider {
         "claude" => "claude --resume",
         "codex" => "codex resume",
@@ -289,7 +310,11 @@ pub fn resume(provider: &str, conversation: &str) -> Option<String> {
         "opencode" => "opencode -s",
         _ => return None,
     };
-    Some(format!("{command} {conversation}"))
+    Some(if cwd.is_empty() {
+        format!("{command} {conversation}")
+    } else {
+        format!("cd {} && {command} {conversation}", shell_quoted(cwd))
+    })
 }
 
 /// How long after a row's last word a listing without it counts against it: a conversation just
@@ -314,13 +339,15 @@ pub fn any_pid_file(home: &Path) -> bool {
 }
 
 /// Registered rows that are still theirs plus Claude discoveries, deduplicated by key (a discovery wins for its
-/// status, which is fresher, except that a hook's `waiting` stands until the listing says `idle`;
+/// status, except that a hook's `waiting` stands over anything read before the hook: a listing
+/// read that began after it, or a pid file updated after it, is the newer word;
 /// the row for its folder, which its hook reported resolved, and its handle, repo and branch),
 /// `Gone` dropped, `title`/`doing` filled from the transcript. Discoveries are Claude's listing
 /// (`listing::to_sessions`) when `listed` is `Some`, the pid files (`scan_claude`) when `None`.
 /// The pid files supply the push socket and entrypoint either way, and the listing ends nothing
-/// they say is alive: a verified pid file (not an SDK run's) it has no live row for stays, so
-/// `[]`, or a Claude that stops listing a kind of row, degrades to them. A session found only
+/// they say is alive: a verified pid file it has no live row for stays, so `[]`, or a Claude that
+/// stops listing a kind of row, degrades to them. An SDK run (`Session::sdk_run`) is no session,
+/// whichever says it. A session found only
 /// by discovery keeps Claude's own cwd as given (not resolved) and has no handle until its hook
 /// registers it (`ipc::live_sessions` writes its row, which gives it one).
 /// `listed` comes with the unix second its read began. A live process alone does not keep a
@@ -334,27 +361,19 @@ pub fn all(
     member_short: &str,
 ) -> Vec<Session> {
     let files = pid_files(home, member_short);
-    let filed_pids: Vec<u32> = files.iter().map(|(s, _)| s.pid).collect();
-    let scanned: Vec<Session> = files
+    let filed_pids: Vec<u32> = files.iter().map(|(s, ..)| s.pid).collect();
+    let updated: HashMap<String, i64> = files
+        .iter()
+        .filter_map(|(s, _, at)| Some((s.conversation.clone(), (*at)?)))
+        .collect();
+    let mut scanned: Vec<Session> = files
         .into_iter()
-        .filter(|(_, parked)| !parked)
-        .map(|(s, _)| s)
+        .filter(|(_, parked, _)| !parked)
+        .map(|(s, ..)| s)
         .collect();
     let read_at = listed.map(|(_, at)| at);
-    let live = listed.map(|(listed, _)| {
-        let sockets = scanned
-            .iter()
-            .filter_map(|s| Some((s.conversation.clone(), s.push_via.clone()?)))
-            .collect();
-        let mut live = listing::to_sessions(listed, member_short, &sockets);
-        for f in &mut live {
-            f.entrypoint = scanned
-                .iter()
-                .find(|s| s.conversation == f.conversation)
-                .and_then(|s| s.entrypoint.clone());
-        }
-        live
-    });
+    let live = listed.map(|(listed, _)| listing::to_sessions(listed, member_short, &scanned));
+    scanned.retain(|s| !s.sdk_run());
     let held = |c: &str| {
         let mut holders = live.iter().flatten().chain(&scanned);
         holders.any(|s| s.conversation == c)
@@ -380,11 +399,6 @@ pub fn all(
         Some(live) => {
             let kept: Vec<Session> = scanned
                 .into_iter()
-                .filter(|s| {
-                    !s.entrypoint
-                        .as_deref()
-                        .is_some_and(|e| e.starts_with("sdk-"))
-                })
                 .filter(|s| live.iter().all(|f| f.key != s.key))
                 .collect();
             let live = live.into_iter().map(|s| (s, true));
@@ -395,8 +409,15 @@ pub fn all(
     for (found, from_listing) in found {
         match out.iter_mut().find(|s| s.key == found.key) {
             Some(s) => {
-                let hook_waits =
-                    s.status == Status::Waiting && !(from_listing && found.status == Status::Idle);
+                // The unix second this discovery's status is known as of.
+                let known_at = if from_listing {
+                    read_at
+                } else {
+                    updated.get(&found.conversation).copied()
+                };
+                let row = rows.iter().find(|r| r.key == found.key.0);
+                let newer = known_at.zip(row).is_some_and(|(at, r)| at > r.seen_at);
+                let hook_waits = s.status == Status::Waiting && !newer;
                 *s = Session {
                     title: found.title.or(s.title.take()),
                     cwd: std::mem::take(&mut s.cwd),
@@ -408,10 +429,11 @@ pub fn all(
                     } else {
                         found.status
                     },
-                    waiting_for: if hook_waits {
-                        s.waiting_for.take()
+                    // Still waiting, by Claude's word too: the hook may know what for.
+                    waiting_for: if hook_waits || found.status == Status::Waiting {
+                        found.waiting_for.or(s.waiting_for.take())
                     } else {
-                        found.waiting_for
+                        None
                     },
                     ..found
                 }
@@ -548,12 +570,85 @@ mod tests {
             r#","sessionId":"old","parkedJobId":"ab12""#,
         );
         assert_eq!(live_of(&rows, None, home.path()), ["c"]);
-        // An SDK run's pid file is not discovered under a listing, but it holds its row.
+        // An SDK run's pid file holds nothing, and is not discovered: not a session.
         pid_file(home.path(), "old", r#","entrypoint":"sdk-ts""#);
+        assert_eq!(live_of(&rows, Some((&[], seen + 15)), home.path()), ["c"]);
+        assert_eq!(live_of(&rows, None, home.path()), ["c"]);
+    }
+
+    /// One listed Claude session of this test process.
+    fn listed_row(conversation: &str, status: &str) -> listing::Listed {
+        listing::Listed {
+            conversation: conversation.into(),
+            pid: Some(std::process::id()),
+            kind: "interactive".into(),
+            status: Some(status.into()),
+            waiting_for: None,
+            state: None,
+            job_id: None,
+            name: None,
+            cwd: "/tmp".into(),
+            started_ms: 0,
+        }
+    }
+
+    /// A listed SDK run is dropped by its pid file's entrypoint.
+    #[test]
+    fn the_listing_drops_an_sdk_run() {
+        let home = tempfile::tempdir().unwrap();
+        pid_file(home.path(), "sdk", r#","entrypoint":"sdk-cli""#);
+        pid_file(home.path(), "term", r#","entrypoint":"cli""#);
+        let rows = [listed_row("sdk", "busy"), listed_row("term", "busy")];
+        assert_eq!(live_of(&[], Some((&rows, 0)), home.path()), ["term"]);
+    }
+
+    /// A hook's `waiting` holds over a read that began before it, whatever the read says, and
+    /// gives way to one that began after it.
+    #[test]
+    fn a_hook_waiting_gives_way_only_to_a_newer_word() {
+        let home = tempfile::tempdir().unwrap();
+        let waits = [store::Session {
+            status: "waiting".into(),
+            waiting_for: Some("permission prompt".into()),
+            seen_at: 100,
+            ..row("w", "claude")
+        }];
+        let status = |word: &str, at: i64| {
+            let rows = [listed_row("w", word)];
+            let s = all(&waits, Some((&rows, at)), home.path(), "m");
+            (s[0].status, s[0].waiting_for.clone())
+        };
+        let held = (Status::Waiting, Some("permission prompt".to_string()));
+        assert_eq!(status("busy", 99), held);
+        assert_eq!(status("busy", 100), held);
+        assert_eq!(status("idle", 100), held);
+        assert_eq!(status("busy", 101), (Status::Live, None));
+        assert_eq!(status("idle", 101), (Status::Idle, None));
+        // Claude says waiting too, with no word for what: the hook's stays.
+        assert_eq!(status("waiting", 101), held);
+
+        // No listing: a pid file updated after the hook wins; one with no stamp, or older, not.
+        let pid_status = |extra: &str| {
+            pid_file(home.path(), "w", extra);
+            all(&waits, None, home.path(), "m")[0].status
+        };
+        assert_eq!(pid_status(""), Status::Waiting);
+        assert_eq!(pid_status(r#","updatedAt":100900"#), Status::Waiting);
+        assert_eq!(pid_status(r#","updatedAt":101000"#), Status::Live);
+    }
+
+    #[test]
+    fn resume_starts_in_the_conversations_folder() {
         assert_eq!(
-            live_of(&rows, Some((&[], seen + 15)), home.path()),
-            ["c", "old"]
+            resume("claude", "c1", "/tmp/my proj").as_deref(),
+            Some("cd '/tmp/my proj' && claude --resume c1")
         );
+        assert_eq!(
+            resume("codex", "t1", "/tmp/it's").as_deref(),
+            Some(r"cd '/tmp/it'\''s' && codex resume t1")
+        );
+        assert_eq!(resume("grok", "g", "").as_deref(), Some("grok -r g"));
+        assert_eq!(resume("vim", "x", "/tmp"), None);
     }
 
     #[test]
