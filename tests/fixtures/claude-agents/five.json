@@ -1,0 +1,98 @@
+[
+  {
+    "pid": 4242,
+    "cwd": "/Users/p/Lightbulb",
+    "kind": "interactive",
+    "startedAt": 1793220239304,
+    "sessionId": "4374580d-5ef8-454f-9896-a36e07a3108a",
+    "name": "lightbulb-24",
+    "status": "busy"
+  },
+  {
+    "pid": 4242,
+    "cwd": "/Users/p/Lightbulb",
+    "kind": "interactive",
+    "startedAt": 1793376341004,
+    "sessionId": "b716a2d6-d6a2-4d06-9146-796e771d38cd",
+    "name": "lightbulb-fd",
+    "status": "waiting",
+    "waitingFor": "input needed"
+  },
+  {
+    "pid": 4242,
+    "cwd": "/Users/p/Lightbulb",
+    "kind": "interactive",
+    "startedAt": 1793319741745,
+    "sessionId": "f78e3bae-7560-42a5-be50-7044f58d024b",
+    "name": "lightbulb-e7",
+    "status": "idle"
+  },
+  {
+    "pid": 4242,
+    "cwd": "/Users/p/Lightbulb",
+    "kind": "interactive",
+    "startedAt": 1793382854872,
+    "sessionId": "1ea0837d-e094-41e8-949b-679a8669cb9f",
+    "name": "lightbulb-47",
+    "status": "busy"
+  },
+  {
+    "pid": 4242,
+    "cwd": "/Users/p/Desktop/isol8.nosync",
+    "kind": "interactive",
+    "startedAt": 1793341381713,
+    "sessionId": "8f880960-2faa-47c1-94b2-6b865f4659e2",
+    "name": "Polymarket trading bot research",
+    "status": "idle"
+  },
+  {
+    "id": "a1b2c3d4",
+    "pid": 4242,
+    "cwd": "/Users/p/Lightbulb",
+    "kind": "background",
+    "startedAt": 1793383000000,
+    "sessionId": "a1b2c3d4-0000-4000-8000-000000000001",
+    "name": "Working job",
+    "status": "busy",
+    "state": "working"
+  },
+  {
+    "id": "b1b2c3d4",
+    "pid": 4242,
+    "cwd": "/Users/p/Lightbulb",
+    "kind": "background",
+    "startedAt": 1793383000001,
+    "sessionId": "b1b2c3d4-0000-4000-8000-000000000002",
+    "name": "Blocked job",
+    "status": "waiting",
+    "waitingFor": "permission prompt",
+    "state": "blocked"
+  },
+  {
+    "id": "c1b2c3d4",
+    "pid": 4242,
+    "cwd": "/Users/p/Lightbulb",
+    "kind": "background",
+    "startedAt": 1793383000002,
+    "sessionId": "c1b2c3d4-0000-4000-8000-000000000003",
+    "name": "Done job",
+    "status": "idle",
+    "state": "done"
+  },
+  {
+    "id": "d1b2c3d4",
+    "cwd": "/Users/p/Lightbulb",
+    "kind": "background",
+    "startedAt": 1791091396239,
+    "sessionId": "d1b2c3d4-0000-4000-8000-000000000004",
+    "name": "Stopped job",
+    "state": "stopped"
+  },
+  {
+    "cwd": "/Users/p/Lightbulb",
+    "kind": "interactive",
+    "startedAt": 1791091396239,
+    "sessionId": "not-a-uuid",
+    "status": "idle"
+  }
+]

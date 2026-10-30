@@ -1,6 +1,7 @@
 pub mod ipc;
 pub mod net_ops;
 
+use crate::agents::listing::{self, Listed};
 use crate::agents::{claude, codex};
 use crate::config::Config;
 use crate::identity::Identity;
@@ -109,6 +110,40 @@ pub struct Daemon {
     /// daemon ends, so no second engine starts on this home while one still runs. The socket
     /// daemon holds its own across `run`.
     pub home_lock: Option<File>,
+    /// Claude's own session listing, last read (`current`).
+    pub listing: Mutex<ListingCache>,
+}
+
+/// `claude agents --json --all` as last read; `rows` is `None` when it could not be.
+#[derive(Default)]
+pub struct ListingCache {
+    pub at: Option<Instant>,
+    pub rows: Option<Vec<Listed>>,
+    /// A hook event since `at`: read again sooner.
+    pub dirty: bool,
+}
+
+/// Claude's listing, read again when older than 10 s, or 2 s after a hook event (`dirty`).
+/// One that could not be read is kept as `None` as long: a hanging `claude` costs its 3 s at
+/// most once per 10 s, not on every call. `None` when the Claude home is not `HOME` (an
+/// embedded instance's, a test's): `claude` lists `HOME`'s sessions, not those.
+pub(crate) fn current(daemon: &Daemon) -> Option<Vec<Listed>> {
+    if dirs::home_dir().as_ref() != Some(&daemon.claude_home) {
+        return None;
+    }
+    // A debug build (a test) never runs a `claude` it was not told to: never the person's real one.
+    if cfg!(debug_assertions) && std::env::var_os("LIGHTBULB_CONNECT_DEBUG_LISTING").is_none() {
+        return None;
+    }
+    let mut c = daemon.listing.lock().unwrap();
+    let age = c.at.map(|t| t.elapsed());
+    let older = |s| age.is_none_or(|a| a > Duration::from_secs(s));
+    if older(10) || (c.dirty && older(2)) {
+        c.rows = listing::claude_exe(&daemon.claude_home).and_then(|exe| listing::read(&exe));
+        c.at = Some(Instant::now());
+        c.dirty = false;
+    }
+    c.rows.clone()
 }
 
 /// An embedded instance: a Lightbulb workspace's member.
@@ -199,7 +234,8 @@ impl Daemon {
 /// send, or handed over by the next hook.
 pub async fn deliver(daemon: Arc<Daemon>, to: Key) {
     let rows = daemon.store.lock().unwrap().sessions().unwrap_or_default();
-    let Some(session) = sessions::all(&rows, &daemon.claude_home, &daemon.identity.short)
+    // The pid files name every push socket: no need to wait on Claude's listing here.
+    let Some(session) = sessions::all(&rows, None, &daemon.claude_home, &daemon.identity.short)
         .into_iter()
         .find(|s| s.key == to && s.tier == Tier::Push)
     else {

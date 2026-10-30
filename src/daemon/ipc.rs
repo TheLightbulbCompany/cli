@@ -1276,6 +1276,9 @@ fn end(id: u64, key: &str, body: &Value, daemon: &Daemon) -> Response {
     match store.end_session(key, now() as i64, reason, None) {
         Ok(true) => {
             daemon.presence.notify_one();
+            // Not under the store lock: a listing read holds its own for up to 3 s.
+            drop(store);
+            daemon.listing.lock().unwrap().dirty = true;
             Response::ok(id, json!({ "ended": true }))
         }
         Ok(false) => Response::err(id, NOT_FOUND),
@@ -1388,6 +1391,9 @@ fn register(id: u64, body: &Value, daemon: &Daemon) -> Response {
     // Every hook event registers: mail delivered before it has been seen.
     match put_row(daemon, &store, &row).and_then(|()| mail::mark_read_for(&store, &key, now())) {
         Ok(()) => {
+            // A hook event: Claude's listing has news too (not under the store lock).
+            drop(store);
+            daemon.listing.lock().unwrap().dirty = true;
             // A `read` owed to a sender goes now (`Net::flush_loop`).
             daemon.peers.outbox.notify_one();
             Response::ok(id, json!({ "key": key }))
@@ -1429,7 +1435,13 @@ pub(crate) fn live_sessions(daemon: &Daemon) -> Vec<sessions::Session> {
         (rows, store.hidden_keys().unwrap_or_default())
     };
     let off = daemon.team.lock().unwrap().off.clone();
-    let mut all = sessions::all(&rows, &daemon.claude_home, &daemon.identity.short);
+    let listed = super::current(daemon);
+    let mut all = sessions::all(
+        &rows,
+        listed.as_deref(),
+        &daemon.claude_home,
+        &daemon.identity.short,
+    );
     let failed = daemon.push_failed.lock().unwrap();
     for s in &mut all {
         if s.tier == sessions::Tier::Push && failed.contains(&s.key.0) {

@@ -146,3 +146,129 @@ fn register_takes_waiting_with_what_for_and_end_takes_a_reason() {
     let r = e.ask(json!({"id": 1, "op": "end", "key": key, "reason": "session-end"}));
     assert_eq!(r["ended"], true, "{r}");
 }
+
+/// A `claude` on a fresh dir first on `PATH`, printing `listing`; keep the dir alive while in
+/// use. Returns it with the `PATH` to give the daemon (launchd's minimal one after it).
+fn claude_shim(listing: &str) -> (tempfile::TempDir, String) {
+    let shim = tempfile::tempdir().unwrap();
+    std::fs::write(shim.path().join("listing.json"), listing).unwrap();
+    set_shim(
+        shim.path(),
+        &format!("cat '{}'", shim.path().join("listing.json").display()),
+    );
+    let path = format!("{}:/usr/bin:/bin", shim.path().display());
+    (shim, path)
+}
+
+fn set_shim(dir: &std::path::Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = dir.join("claude");
+    let tmp = dir.join("claude.new");
+    std::fs::write(&tmp, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::rename(tmp, bin).unwrap();
+}
+
+fn register_claude(e: &Env, conversation: &str, status: &str, waiting_for: Option<&str>) {
+    let pid = std::process::id();
+    let birth = os::process(pid).unwrap().birth_micros;
+    let r = e.ask(
+        json!({"id": 1, "op": "register", "session": {"provider": "claude",
+        "conversation": conversation, "pid": pid, "birth_micros": birth, "cwd": "/tmp/p",
+        "status": status, "waiting_for": waiting_for}}),
+    );
+    assert_eq!(r["ok"], true, "{r}");
+}
+
+fn listed(e: &Env) -> Vec<Value> {
+    let r = e.ask(json!({"id": 1, "op": "sessions"}));
+    r["sessions"].as_array().unwrap().clone()
+}
+
+fn by<'a>(sessions: &'a [Value], conversation: &str) -> Option<&'a Value> {
+    sessions.iter().find(|s| s["conversation"] == conversation)
+}
+
+#[test]
+fn the_listing_feeds_sessions_and_a_failing_claude_falls_back_to_pid_files() {
+    let five = include_str!("fixtures/claude-agents/five.json")
+        .replace("\"pid\": 4242", &format!("\"pid\": {}", std::process::id()));
+    let (shim, path) = claude_shim(&five);
+    let e = Env::new();
+    e.daemon(
+        false,
+        "",
+        &[
+            ("PATH", path),
+            ("LIGHTBULB_CONNECT_DEBUG_LISTING", "1".into()),
+        ],
+    );
+    register_claude(&e, "mine", "idle", None);
+    let s = listed(&e);
+    assert_eq!(
+        s.len(),
+        9,
+        "eight live listed rows and the registered one: {s:?}"
+    );
+    let blocked = by(&s, "b1b2c3d4-0000-4000-8000-000000000002").unwrap();
+    assert_eq!(
+        (blocked["status"].as_str(), blocked["waiting_for"].as_str()),
+        (Some("waiting"), Some("permission prompt"))
+    );
+    let done = by(&s, "c1b2c3d4-0000-4000-8000-000000000003").unwrap();
+    assert_eq!(done["job"]["state"], "done");
+    assert!(by(&s, "d1b2c3d4-0000-4000-8000-000000000004").is_none());
+
+    // Claude fails: the pid files (none here) and the registered rows are the list again.
+    set_shim(shim.path(), "exit 1");
+    register_claude(&e, "mine", "busy", None);
+    std::thread::sleep(std::time::Duration::from_millis(2100));
+    let s = listed(&e);
+    assert_eq!(s.len(), 1, "{s:?}");
+    assert_eq!(s[0]["conversation"], "mine");
+    assert_eq!(s[0]["status"], "live");
+}
+
+/// A hook's `waiting` is newer than a listing that still says `busy`; the next hook moves it on.
+#[test]
+fn a_hook_waiting_stands_over_a_stale_listing() {
+    let c = "e1b2c3d4-0000-4000-8000-000000000005";
+    let row = json!([{"pid": std::process::id(), "cwd": "/tmp/p", "kind": "interactive",
+        "startedAt": 1, "sessionId": c, "status": "busy"}]);
+    let (_shim, path) = claude_shim(&row.to_string());
+    let e = Env::new();
+    e.daemon(
+        false,
+        "",
+        &[
+            ("PATH", path),
+            ("LIGHTBULB_CONNECT_DEBUG_LISTING", "1".into()),
+        ],
+    );
+    register_claude(&e, c, "waiting", Some("permission prompt"));
+    let s = listed(&e);
+    let w = by(&s, c).unwrap();
+    assert_eq!(
+        (w["status"].as_str(), w["waiting_for"].as_str()),
+        (Some("waiting"), Some("permission prompt"))
+    );
+    register_claude(&e, c, "busy", None);
+    assert_eq!(by(&listed(&e), c).unwrap()["status"], "live");
+}
+
+/// A test daemon whose `PATH` has a `claude` leaves it alone unless told to ask it.
+#[test]
+fn a_debug_daemon_never_runs_a_claude_it_was_not_told_to() {
+    let shim = tempfile::tempdir().unwrap();
+    let ran = shim.path().join("ran");
+    set_shim(
+        shim.path(),
+        &format!("touch '{}'\necho '[]'", ran.display()),
+    );
+    let e = Env::new();
+    let path = format!("{}:/usr/bin:/bin", shim.path().display());
+    e.daemon(false, "", &[("PATH", path)]);
+    register_claude(&e, "mine", "idle", None);
+    assert_eq!(listed(&e).len(), 1);
+    assert!(!ran.exists());
+}

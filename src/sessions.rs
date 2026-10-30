@@ -1,6 +1,6 @@
 //! Sessions: the coding-agent conversations on this machine, registered or discovered.
 
-use crate::agents::codex;
+use crate::agents::{codex, listing};
 use crate::{doing, os, store};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -257,8 +257,8 @@ pub fn scan_claude(home: &Path, member_short: &str) -> Vec<Session> {
             branch: None,
             hidden: false,
             waiting_for: None,
-            kind: None,
-            entrypoint: None,
+            kind: v["kind"].as_str().map(String::from),
+            entrypoint: v["entrypoint"].as_str().map(String::from),
             job: None,
         });
     }
@@ -266,21 +266,58 @@ pub fn scan_claude(home: &Path, member_short: &str) -> Vec<Session> {
 }
 
 /// Registered rows plus Claude discoveries, deduplicated by key (a discovery wins for its
-/// status, which is fresher; the row for its folder, which its hook reported resolved, and its
-/// handle, repo and branch), `Gone` dropped, `title`/`doing` filled from the transcript. A
-/// session found only by discovery keeps Claude's own cwd as given (not resolved) and has no
-/// handle until its hook registers it.
-pub fn all(rows: &[store::Session], home: &Path, member_short: &str) -> Vec<Session> {
+/// status, which is fresher, except that a hook's `waiting` stands until the discovery says
+/// `idle`; the row for its folder, which its hook reported resolved, and its handle, repo and
+/// branch), `Gone` dropped, `title`/`doing` filled from the transcript. Discoveries are Claude's
+/// listing (`listing::to_sessions`) when `listed` is `Some`, the pid files (`scan_claude`) when
+/// `None`; the pid files supply the push socket and entrypoint either way. A session found only
+/// by discovery keeps Claude's own cwd as given (not resolved) and has no handle until its hook
+/// registers it.
+pub fn all(
+    rows: &[store::Session],
+    listed: Option<&[listing::Listed]>,
+    home: &Path,
+    member_short: &str,
+) -> Vec<Session> {
     let mut out: Vec<Session> = rows.iter().filter_map(|r| from_row(r, home)).collect();
-    for found in scan_claude(home, member_short) {
+    let scanned = scan_claude(home, member_short);
+    let found = match listed {
+        Some(listed) => {
+            let sockets = scanned
+                .iter()
+                .filter_map(|s| Some((s.conversation.clone(), s.push_via.clone()?)))
+                .collect();
+            let mut found = listing::to_sessions(listed, member_short, &sockets);
+            for f in &mut found {
+                f.entrypoint = scanned
+                    .iter()
+                    .find(|s| s.conversation == f.conversation)
+                    .and_then(|s| s.entrypoint.clone());
+            }
+            found
+        }
+        None => scanned,
+    };
+    for found in found {
         match out.iter_mut().find(|s| s.key == found.key) {
             Some(s) => {
+                let hook_waits = s.status == Status::Waiting && found.status != Status::Idle;
                 *s = Session {
                     title: found.title.or(s.title.take()),
                     cwd: std::mem::take(&mut s.cwd),
                     handle: s.handle.take(),
                     repo: s.repo.take(),
                     branch: s.branch.take(),
+                    status: if hook_waits {
+                        Status::Waiting
+                    } else {
+                        found.status
+                    },
+                    waiting_for: if hook_waits {
+                        s.waiting_for.take()
+                    } else {
+                        found.waiting_for
+                    },
                     ..found
                 }
             }
