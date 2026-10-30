@@ -331,12 +331,12 @@ fn failures_print_the_json_shape_on_stdout_when_piped() {
             .unwrap()
     };
     // Piped stdout is not a TTY: JSON is the default.
-    let o = run(&["app", "status"]);
+    let o = run(&["app", "destroy"]);
     assert_eq!(o.status.code(), Some(1));
     let v: Value = serde_json::from_slice(&o.stdout).unwrap();
     assert_eq!(v["code"], "not_implemented");
     assert!(v["next"].is_string());
-    assert!(!run(&["app", "up"]).stdout.is_empty());
+    assert!(!run(&["app", "check"]).stdout.is_empty());
 }
 
 #[test]
@@ -411,4 +411,176 @@ fn starter_table_contains_agents_md() {
     assert!(!paths
         .iter()
         .any(|p| p.starts_with("node_modules/") || p.starts_with(".next/")));
+}
+
+/// `app new` in `dir`, with a git identity.
+fn app_new(e: &Env, dir: &std::path::Path, args: &[&str]) -> std::process::Output {
+    e.base_cmd(Command::new(common::EXE))
+        .current_dir(dir)
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@example.com")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@example.com")
+        .args(["app", "new"])
+        .args(args)
+        .arg("--json")
+        .output()
+        .unwrap()
+}
+
+fn git(dir: &std::path::Path, args: &[&str]) -> String {
+    let o = Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&o.stdout).to_string()
+}
+
+#[test]
+fn new_writes_the_starter_and_one_commit() {
+    let e = Env::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let o = app_new(&e, tmp.path(), &["team-lunch"]);
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stdout)
+    );
+    let v: Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["name"], "team-lunch");
+    assert_eq!(
+        v["files"].as_u64().unwrap() as usize,
+        lightbulb::apps::starter::FILES.len()
+    );
+    let dir = tmp.path().join("team-lunch");
+    assert_eq!(
+        std::fs::canonicalize(v["dir"].as_str().unwrap()).unwrap(),
+        std::fs::canonicalize(&dir).unwrap()
+    );
+    assert!(dir.join("src/app/%5Flightbulb").is_dir());
+    let cfg = AppConfig::load(&dir).unwrap();
+    assert_eq!(cfg.name, "team-lunch");
+    assert_eq!(cfg.open_to, OpenTo::Workspace);
+    assert_eq!(cfg.origin.kind, "ask");
+    let pkg = std::fs::read_to_string(dir.join("package.json")).unwrap();
+    assert!(!pkg.contains("{{name}}"));
+    assert_eq!(git(&dir, &["rev-list", "--count", "HEAD"]).trim(), "1");
+    assert_eq!(
+        git(&dir, &["log", "-1", "--format=%s"]).trim(),
+        "lightbulb app new team-lunch"
+    );
+    assert_eq!(git(&dir, &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn new_refuses_a_non_empty_dir() {
+    let e = Env::new();
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(tmp.path().join("team-lunch")).unwrap();
+    std::fs::write(tmp.path().join("team-lunch/keep.txt"), "mine").unwrap();
+    let o = app_new(&e, tmp.path(), &["team-lunch"]);
+    assert_eq!(o.status.code(), Some(1));
+    let v: Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["code"], "dir_not_empty");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("team-lunch/keep.txt")).unwrap(),
+        "mine"
+    );
+    assert!(!tmp.path().join("team-lunch/app.yaml").exists());
+}
+
+#[test]
+fn new_sets_kind_and_plan_from_the_playbook() {
+    let e = Env::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let o = app_new(
+        &e,
+        tmp.path(),
+        &["pay-us", "--kind", "payments", "--room", "r-1"],
+    );
+    assert_eq!(o.status.code(), Some(0));
+    let dir = tmp.path().join("pay-us");
+    let cfg = AppConfig::load(&dir).unwrap();
+    assert_eq!(cfg.kind, Kind::Payments);
+    assert_eq!(cfg.open_to, OpenTo::Room);
+    let app: Value =
+        serde_json::from_slice(&std::fs::read(dir.join(".lightbulb/app.json")).unwrap()).unwrap();
+    assert_eq!(app, json!({"room_id": "r-1"}));
+    let playbook = std::fs::read_to_string(dir.join("playbooks/payments.md")).unwrap();
+    let plan = std::fs::read_to_string(dir.join(".lightbulb/plan.md")).unwrap();
+    assert!(plan.starts_with(&playbook));
+    assert!(plan.contains("## What was asked"));
+}
+
+#[test]
+fn up_outside_an_app_refuses() {
+    let e = Env::new();
+    let tmp = tempfile::tempdir().unwrap();
+    git(tmp.path(), &["init", "-q"]);
+    let o = e
+        .base_cmd(Command::new(common::EXE))
+        .current_dir(tmp.path())
+        .args(["app", "up"])
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(1));
+    let v: Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["code"], "not_an_app");
+    let names: Vec<_> = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(names, vec![std::ffi::OsString::from(".git")]);
+}
+
+#[test]
+fn status_reads_the_app_id_and_asks_the_backend() {
+    let e = Env::new();
+    let tmp = tempfile::tempdir().unwrap();
+    app_new(&e, tmp.path(), &["team-lunch"]);
+    let dir = tmp.path().join("team-lunch");
+    let run = |args: &[&str], base: &str| {
+        e.base_cmd(Command::new(common::EXE))
+            .current_dir(&dir)
+            .env("OPENCLAW_HOOK_TOKEN", "tok")
+            .env("ISOL8_API_URL", base)
+            .env("ISOL8_OWNER_ID", "o1")
+            .args(["app", "status"])
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let o = run(&[], "http://127.0.0.1:9");
+    assert_eq!(o.status.code(), Some(1));
+    let v: Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["code"], "not_up_yet");
+    assert_eq!(v["next"], "run lightbulb app up");
+
+    std::fs::write(dir.join(".lightbulb/app.json"), r#"{"app_id":"a-9"}"#).unwrap();
+    let (base, seen) = stub(200, json!({"state": "ready"}), 0);
+    let o = run(&["--errors"], &base);
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stdout)
+    );
+    let v: Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["status"]["state"], "ready");
+    assert!(v["errors"].is_object());
+    let lines: Vec<String> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|r| r.line.clone())
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "GET /api/v1/apps/build/a-9/status HTTP/1.1",
+            "GET /api/v1/apps/build/a-9/errors HTTP/1.1"
+        ]
+    );
 }

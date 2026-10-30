@@ -117,22 +117,180 @@ pub fn valid_name(n: &str) -> bool {
 }
 
 pub fn run(cmd: AppCommand, json: bool) -> Result<i32> {
-    if let AppCommand::New { name, .. } = &cmd {
-        if !valid_name(name) {
-            return Ok(fail(
-                json,
-                "bad_name",
-                "An app's name is 3 to 40 lowercase letters, digits and dashes, starting with a letter.",
-                "pick another name",
-            ));
+    match cmd {
+        AppCommand::New { name, room, kind } => {
+            if !valid_name(&name) {
+                return Ok(fail(
+                    json,
+                    "bad_name",
+                    "An app's name is 3 to 40 lowercase letters, digits and dashes, starting with a letter.",
+                    "pick another name",
+                ));
+            }
+            new(&name, room.as_deref(), kind, json)
         }
+        AppCommand::Status { errors } => status(errors, json),
+        AppCommand::Up => match preflight(json) {
+            Err(code) => Ok(code),
+            Ok(_) => Ok(not_implemented(json)),
+        },
+        _ => Ok(not_implemented(json)),
     }
-    Ok(fail(
+}
+
+fn not_implemented(json: bool) -> i32 {
+    fail(
         json,
         "not_implemented",
         "That app command is not built yet.",
         "update lightbulb",
-    ))
+    )
+}
+
+/// `./{name}`: the starter, `app.yaml`, the plan, and one git commit.
+pub fn new(name: &str, room: Option<&str>, kind: Kind, json: bool) -> Result<i32> {
+    let dir = std::env::current_dir()?.join(name);
+    if dir.exists() && (!dir.is_dir() || std::fs::read_dir(&dir)?.next().is_some()) {
+        return Ok(fail(
+            json,
+            "dir_not_empty",
+            &format!("{name} already exists and is not empty."),
+            "pick another name or an empty folder",
+        ));
+    }
+    for (path, bytes) in starter::FILES {
+        let to = dir.join(path);
+        std::fs::create_dir_all(to.parent().unwrap())?;
+        // Binary files pass through untouched.
+        match std::str::from_utf8(bytes) {
+            Ok(t) => std::fs::write(to, t.replace("{{name}}", name))?,
+            Err(_) => std::fs::write(to, bytes)?,
+        }
+    }
+    AppConfig {
+        name: name.into(),
+        services: vec![],
+        open_to: if room.is_some() {
+            OpenTo::Room
+        } else {
+            OpenTo::Workspace
+        },
+        budget_usd: 10,
+        kind,
+        origin: Origin {
+            kind: "ask".into(),
+            r#ref: None,
+        },
+    }
+    .write(&dir)?;
+    // The playbook is the plan's first section.
+    let plan = dir.join(".lightbulb/plan.md");
+    let playbook = std::fs::read_to_string(dir.join(format!("playbooks/{}.md", word(&kind))))?;
+    let headings = std::fs::read_to_string(&plan)?;
+    std::fs::write(&plan, format!("{}\n\n{headings}", playbook.trim_end()))?;
+    if let Some(room) = room {
+        std::fs::write(
+            dir.join(".lightbulb/app.json"),
+            json!({"room_id": room}).to_string(),
+        )?;
+    }
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .current_dir(&dir)
+            .args(args)
+            .output()
+    };
+    let msg = format!("lightbulb app new {name}");
+    git(&["init", "-q"])?;
+    git(&["add", "-A"])?;
+    if !git(&["commit", "-qm", &msg])?.status.success() {
+        // No git identity on this computer: commit as Lightbulb.
+        let o = git(&[
+            "-c",
+            "user.name=Lightbulb",
+            "-c",
+            "user.email=app@thelightbulb.company",
+            "commit",
+            "-qm",
+            &msg,
+        ])?;
+        if !o.status.success() {
+            return Err(
+                format!("git commit failed: {}", String::from_utf8_lossy(&o.stderr)).into(),
+            );
+        }
+    }
+    let files = starter::FILES.len();
+    if json {
+        println!("{}", json!({"name": name, "dir": dir, "files": files}));
+    } else {
+        println!("Started {name} in {} ({files} files).", dir.display());
+    }
+    Ok(0)
+}
+
+/// The app's folder (the git root), its `app.yaml`, and how to call the backend. Writes nothing.
+pub fn preflight(json: bool) -> std::result::Result<(PathBuf, AppConfig, api::Auth), i32> {
+    let top = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()));
+    let Some(root) = top.filter(|r| r.join("app.yaml").is_file()) else {
+        return Err(fail(
+            json,
+            "not_an_app",
+            "This folder is not an app: there is no app.yaml at the top of the git repo.",
+            "run lightbulb app new <name>, then work inside it",
+        ));
+    };
+    match AppConfig::load(&root) {
+        Ok(c) => Ok((root, c, api::Auth::detect())),
+        Err(e) => Err(fail(json, "bad_config", &e.to_string(), "fix app.yaml")),
+    }
+}
+
+/// `GET /{app_id}/status`, and with `errors` also `/errors`.
+pub fn status(errors: bool, json: bool) -> Result<i32> {
+    let (root, _, auth) = match preflight(json) {
+        Ok(p) => p,
+        Err(code) => return Ok(code),
+    };
+    let id = std::fs::read(root.join(".lightbulb/app.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .and_then(|v| v["app_id"].as_str().map(String::from));
+    let Some(id) = id else {
+        return Ok(fail(
+            json,
+            "not_up_yet",
+            "This app has not been built yet, so it has no status.",
+            "run lightbulb app up",
+        ));
+    };
+    let get = |what: &str| api::call(&auth, "GET", &format!("/{id}/{what}"), None);
+    let out = get("status").and_then(|s| {
+        if errors {
+            Ok(json!({"status": s, "errors": get("errors")?}))
+        } else {
+            Ok(s)
+        }
+    });
+    match out {
+        Ok(v) => {
+            println!(
+                "{}",
+                if json {
+                    v.to_string()
+                } else {
+                    format!("{v:#}")
+                }
+            );
+            Ok(0)
+        }
+        Err(e) => Ok(fail(json, &e.code, &e.message, &e.next)),
+    }
 }
 
 /// The six keys of `app.yaml`.
