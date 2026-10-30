@@ -118,6 +118,10 @@ pub struct Session {
     /// hidden, or its register was refused for one). Local listings show it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hidden: bool,
+    /// A `claude -p` or Agent SDK run with a row (`store::Session::headless`): it can be told
+    /// apart and messaged, and no list shows it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub headless: bool,
     /// What a `waiting` session waits for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waiting_for: Option<String>,
@@ -132,8 +136,8 @@ pub struct Session {
 }
 
 impl Session {
-    /// A `claude -p` or Agent SDK run (Claude's entrypoint `sdk-*`), by its pid file: a tool's
-    /// process, not a session anyone would message or resume.
+    /// A `claude -p` or Agent SDK run (Claude's entrypoint `sdk-*`), by its pid file: never
+    /// discovered. Its hook registers it, headless.
     pub fn sdk_run(&self) -> bool {
         self.entrypoint
             .as_deref()
@@ -183,6 +187,7 @@ fn from_row(r: &store::Session, home: &Path) -> Option<Session> {
         repo: r.repo.clone(),
         branch: r.branch.clone(),
         hidden: false,
+        headless: r.headless,
         waiting_for: r.waiting_for.clone(),
         kind: None,
         entrypoint: None,
@@ -280,6 +285,7 @@ fn pid_files(home: &Path, member_short: &str) -> Vec<(Session, bool, Option<i64>
             repo: None,
             branch: None,
             hidden: false,
+            headless: false,
             waiting_for: v["waitingFor"]
                 .as_str()
                 .filter(|_| v["status"] == "waiting")
@@ -353,7 +359,7 @@ pub fn any_pid_file(home: &Path) -> bool {
 /// `listed` comes with the unix second its read began. A live process alone does not keep a
 /// Claude row, since `/clear`, `/resume` and the agent view leave it running on another
 /// conversation; but a row needs evidence to go (`moved_on`). Other providers' rows live with
-/// their process.
+/// their process, as does a headless row.
 pub fn all(
     rows: &[store::Session],
     listed: Option<(&[listing::Listed], i64)>,
@@ -383,6 +389,7 @@ pub fn all(
         .filter_map(|r| Some((from_row(r, home)?, r.seen_at)))
         .filter(|(s, seen_at)| {
             s.provider != "claude"
+                || s.headless
                 || s.status == Status::Gone
                 || held(&s.conversation)
                 || !moved_on(
@@ -424,6 +431,7 @@ pub fn all(
                     handle: s.handle.take(),
                     repo: s.repo.take(),
                     branch: s.branch.take(),
+                    headless: s.headless,
                     status: if hook_waits {
                         Status::Waiting
                     } else {
@@ -521,6 +529,7 @@ mod tests {
             reason: None,
             ended_at: None,
             waiting_for: None,
+            headless: false,
         }
     }
 
@@ -574,6 +583,15 @@ mod tests {
         pid_file(home.path(), "old", r#","entrypoint":"sdk-ts""#);
         assert_eq!(live_of(&rows, Some((&[], seen + 15)), home.path()), ["c"]);
         assert_eq!(live_of(&rows, None, home.path()), ["c"]);
+        // Registered by its hook, headless: it lives with its process, whatever its pid file says.
+        let headless = [store::Session {
+            headless: true,
+            ..rows[0].clone()
+        }];
+        assert_eq!(
+            live_of(&headless, Some((&[], seen + 15)), home.path()),
+            ["old"]
+        );
     }
 
     /// One listed Claude session of this test process.

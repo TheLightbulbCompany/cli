@@ -427,7 +427,7 @@ fn session_identity() -> bool {
 /// The session of the agent above this invocation, resolved as the MCP server resolves it.
 fn calling_session(conn: &mut Conn) -> Option<String> {
     let me = hook::calling_agent(None).ok()?;
-    let sessions = ask(conn, "sessions", json!({})).ok()?["sessions"].clone();
+    let sessions = ask(conn, "sessions", json!({ "headless": true })).ok()?["sessions"].clone();
     let sessions: Vec<crate::sessions::Session> = serde_json::from_value(sessions).ok()?;
     crate::agents::source::resolve(&me, &json!({}), &sessions)
         .ok()

@@ -436,6 +436,7 @@ mod tests {
             repo: None,
             branch: None,
             hidden: false,
+            headless: false,
             waiting_for: waiting_for.map(String::from),
             kind: None,
             entrypoint: None,

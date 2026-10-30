@@ -224,7 +224,9 @@ fn build(d: &Daemon, seq: u64) -> Frame {
     // on` it stays hidden until its next hook event, or pruned a week after its last renewal
     // once no live session carries it; a discovery that never registered is matched by
     // Claude's cwd as given.
-    live.retain(|s| !s.hidden);
+    // A headless run stays out of the list; its address still goes in `kept`, so a teammate can
+    // answer it.
+    live.retain(|s| !s.hidden && !s.headless);
     live.sort_by_key(|s| std::cmp::Reverse(s.birth_micros));
     live.truncate(MAX);
     let live_keys: HashSet<&str> = live.iter().map(|s| s.key.0.as_str()).collect();
@@ -580,7 +582,7 @@ pub fn directory(d: &Daemon, query: Option<&str>) -> Value {
     let (live, declared, mut own_ended) = match &d.cloud {
         Some(c) => (vec![], c.declared().sessions.to_vec(), vec![]),
         None => (
-            ipc::live_sessions(d),
+            ipc::listed_sessions(d),
             crate::link::apps(d),
             ipc::ended_sessions(d),
         ),

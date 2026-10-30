@@ -176,21 +176,14 @@ pub fn run(agent: &str, event: &str, stdin: &str) -> Result<Option<String>> {
         }
         return Ok(None);
     }
-    // A `claude -p` or Agent SDK run is a tool's process, not a session: no row, so no mail and
-    // no nudge. Its capture and memory block need no row and stay.
-    let sdk_run = agent == "claude"
-        && std::env::var("CLAUDE_CODE_ENTRYPOINT").is_ok_and(|e| e.starts_with("sdk-"));
     let caller = calling_agent(Some(agent));
     if h.event == Event::SessionEnd {
         // The agent may have exited before its SessionEnd hook ran, so the caller check
         // can fail; then the daemon ends the row only if its recorded process is gone too.
         daemon::ensure_running()?;
         let mut conn = Conn::open()?;
-        capture(&h, &payload, &json!({}));
-        if sdk_run {
-            return Ok(None);
-        }
         let key = crate::sessions::Key::new(&conn.member()?, h.provider, &h.conversation);
+        capture(&h, &payload, &json!({}));
         let reason = match (h.provider, payload["reason"].as_str()) {
             ("claude", Some("clear" | "resume")) => "moved-on",
             _ => "session-end",
@@ -246,18 +239,21 @@ pub fn run(agent: &str, event: &str, stdin: &str) -> Result<Option<String>> {
         let (repo, branch) = crate::mcp::git(&h.cwd);
         (session["repo"], session["branch"]) = (repo.into(), branch.into());
     }
-    let key = if sdk_run {
-        Value::Null
-    } else {
-        let r = conn.call(
-            "register",
-            json!({ "session": session, "caller": proc_json(&me) }),
-        )?;
-        if !r["key"].is_string() {
-            return Err(format!("register: {r}").into());
-        }
-        r["key"].clone()
-    };
+    // A `claude -p` or Agent SDK run (automation, a network worker): it sends and is sent to as
+    // any session, and no list shows it.
+    if h.provider == "claude"
+        && std::env::var("CLAUDE_CODE_ENTRYPOINT").is_ok_and(|e| e.starts_with("sdk-"))
+    {
+        session["headless"] = true.into();
+    }
+    let r = conn.call(
+        "register",
+        json!({ "session": session, "caller": proc_json(&me) }),
+    )?;
+    let key = r["key"].clone();
+    if !key.is_string() {
+        return Err(format!("register: {r}").into());
+    }
     if h.event.waits() {
         return Ok(None);
     }
@@ -287,7 +283,7 @@ pub fn run(agent: &str, event: &str, stdin: &str) -> Result<Option<String>> {
     } else {
         "inbox"
     };
-    let r = if block_only || sdk_run {
+    let r = if block_only {
         json!({ "messages": [] })
     } else {
         conn.call(op, json!({ "key": key, "caller": proc_json(&me) }))?

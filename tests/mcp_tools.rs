@@ -383,6 +383,33 @@ fn me() -> os::Process {
     os::process(std::process::id()).unwrap()
 }
 
+/// A headless run sends as itself, and `find_sessions` does not show it.
+#[test]
+fn a_headless_run_can_send_and_is_not_found() {
+    let net = Net::new();
+    let other = Other::new();
+    let codex = net.register("codex", "t1", &other.1);
+    let p = me();
+    let r = net.call(
+        json!({"id": 1, "op": "register", "session": {"provider": "claude",
+        "conversation": "run", "pid": p.pid, "birth_micros": p.birth_micros, "cwd": "/tmp",
+        "headless": true}}),
+    );
+    let run = r["key"].as_str().unwrap().to_string();
+    let mut m = net.mcp(&me());
+    let v = m.tool("find_sessions", json!({})).json();
+    assert_eq!(v["total"], 1, "{v}");
+    assert_eq!(v["sessions"][0]["session_id"], codex.as_str(), "{v}");
+    let out = m.tool(
+        "send_message",
+        json!({"request_id": "r-headless", "text": "hi", "session_id": codex}),
+    );
+    assert!(!out.error, "{}", out.text);
+    assert_eq!(out.json()["state"], "stored");
+    let r = net.call(json!({"id": 1, "op": "inbox", "key": codex}));
+    assert_eq!(r["messages"][0]["from"], run.as_str(), "{r}");
+}
+
 #[test]
 fn send_message_from_claude_to_codex_returns_stored_and_receipt_follows() {
     let net = Net::new();

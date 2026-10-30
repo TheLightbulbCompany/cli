@@ -140,6 +140,7 @@ mod tests {
             repo: None,
             branch: None,
             hidden: false,
+            headless: false,
             waiting_for: None,
             kind: None,
             entrypoint: None,

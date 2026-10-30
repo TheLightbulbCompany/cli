@@ -308,11 +308,8 @@ fn a_listing_read_after_the_hook_clears_waiting() {
     let c = "e1b2c3d4-0000-4000-8000-000000000006";
     let (e, _shim) = busy_listing(c);
     register_claude(&e, c, "waiting", Some("permission prompt"));
-    // The hook's own news may start a read within its second, which says nothing against it.
-    // Another session's asks for a read in a later second, sooner than the idle cadence.
-    std::thread::sleep(std::time::Duration::from_millis(1100));
-    register_claude(&e, "another", "idle", None);
-    until(10, "the listing's busy clears it", || {
+    // Nothing else happens: while it waits, a read comes due 5 s after the last began.
+    until(12, "the listing's busy clears it", || {
         by(&listed(&e), c).is_some_and(|s| s["status"] == "live")
     });
     assert!(by(&listed(&e), c).unwrap()["waiting_for"].is_null());

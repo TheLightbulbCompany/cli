@@ -135,10 +135,44 @@ pub struct ListingCache {
 
 /// How often Claude's listing is read while a pid file says Claude is running and no hook has news.
 const IDLE_READ: u64 = 30;
+/// How long after a read began the next is due while a session waits: an approved long tool has
+/// no hook to say so. From when it began, so the 5 s tick takes each one.
+const WAITING_READ: i64 = 5;
+
+/// Whether a session still waits as far as anyone knows: for a row a hook says waits
+/// (`store::waiting_rows`), no read has begun since, or the last one says it waits too. Once a
+/// newer read says otherwise it no longer shows as waiting, though the row says so until its next
+/// hook: a long tool is not polled every 5 s for its whole run.
+fn still_waits(waiting: &[(String, i64)], rows: Option<&[Listed]>, read_at: i64) -> bool {
+    waiting.iter().any(|(conversation, seen_at)| {
+        read_at <= *seen_at
+            || rows.into_iter().flatten().any(|l| {
+                l.conversation == *conversation
+                    && (l.status.as_deref() == Some("waiting")
+                        || l.state.as_deref() == Some("blocked"))
+            })
+    })
+}
+
+/// Whether a read is due, `age` after the last ended (`None`: there has been none), `began_ago`
+/// seconds after it began.
+fn read_due(
+    age: Option<Duration>,
+    began_ago: i64,
+    dirty: bool,
+    running: bool,
+    waits: bool,
+) -> bool {
+    let older = |s| age.is_none_or(|a| a > Duration::from_secs(s));
+    (dirty && older(2))
+        || older(60)
+        || (running && older(IDLE_READ))
+        || (waits && began_ago >= WAITING_READ)
+}
 
 /// Claude's listing as last read, at once: never runs `claude` here, and never holds the lock
-/// across it. Starts a read when the last is older than 30 s, or 2 s after a hook event that
-/// changes what the listing says (`dirty`), or 60 s while no pid file says Claude is running (each
+/// across it. Starts a read when the last is older than 30 s, 5 s while a session waits
+/// (`still_waits`), or 2 s after a hook event that changes what the listing says (`dirty`), or 60 s while no pid file says Claude is running (each
 /// read costs about 0.2 s of CPU and a 155 MB spike); until the first ends, `None` (the pid
 /// files). A failed read counts as a read: a hung `claude` is asked once per 30 s, or 60 s with
 /// no pid file, so what this returns may be up to 60 s old. Ends of live rows do not wait for
@@ -162,8 +196,18 @@ pub(crate) fn current_at(daemon: &Daemon) -> Option<(Vec<Listed>, i64)> {
     // every session read takes.
     let at = daemon.listing.lock().unwrap().at;
     let running = older(at, IDLE_READ) && sessions::any_pid_file(&daemon.claude_home);
+    let waiting = daemon.store.lock().unwrap().waiting_rows();
+    let waiting = waiting.unwrap_or_default();
     let mut c = daemon.listing.lock().unwrap();
-    let due = (c.dirty && older(c.at, 2)) || older(c.at, 60) || (older(c.at, IDLE_READ) && running);
+    let waits = still_waits(&waiting, c.rows.as_deref(), c.read_at);
+    let began_ago = ipc::now() as i64 - c.read_at;
+    let due = read_due(
+        c.at.map(|t| t.elapsed()),
+        began_ago,
+        c.dirty,
+        running,
+        waits,
+    );
     if !c.refreshing && due {
         let (cache, home) = (daemon.listing.clone(), daemon.claude_home.clone());
         let started = std::thread::Builder::new()
@@ -578,6 +622,55 @@ fn answers_ping(sock: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_read_is_due_sooner_while_a_session_waits() {
+        let secs = |s| Some(Duration::from_secs(s));
+        let due =
+            |age, began_ago, dirty, running, waits| read_due(age, began_ago, dirty, running, waits);
+        assert!(due(None, 0, false, false, false), "the first read");
+        assert!(!due(secs(59), 59, false, false, false));
+        assert!(due(secs(61), 61, false, false, false));
+        assert!(!due(secs(29), 29, false, true, false));
+        assert!(due(secs(31), 31, false, true, false));
+        assert!(!due(secs(1), 1, true, true, false));
+        assert!(due(secs(3), 3, true, true, false));
+        // Waiting: 5 s after the last read began, though it ended later.
+        assert!(!due(secs(3), 4, false, true, true));
+        assert!(due(secs(4), 5, false, true, true));
+    }
+
+    #[test]
+    fn a_session_stops_waiting_once_a_newer_read_says_so() {
+        let row = |status: &str, state: Option<&str>| Listed {
+            conversation: "c".into(),
+            pid: Some(1),
+            kind: String::new(),
+            status: Some(status.into()),
+            waiting_for: None,
+            state: state.map(String::from),
+            job_id: None,
+            name: None,
+            cwd: String::new(),
+            started_ms: 0,
+        };
+        let waiting = [("c".to_string(), 100)];
+        assert!(!still_waits(&[], None, 0), "no row waits");
+        // No read since the hook (strict, as `sessions::all` is).
+        assert!(still_waits(&waiting, Some(&[row("busy", None)]), 100));
+        assert!(still_waits(&waiting, None, 99));
+        // A newer read: Claude's word.
+        assert!(!still_waits(&waiting, Some(&[row("busy", None)]), 101));
+        assert!(still_waits(&waiting, Some(&[row("waiting", None)]), 101));
+        assert!(still_waits(
+            &waiting,
+            Some(&[row("busy", Some("blocked"))]),
+            101
+        ));
+        // A failed read, or one without it, says nothing worth hammering Claude for.
+        assert!(!still_waits(&waiting, None, 101));
+        assert!(!still_waits(&waiting, Some(&[]), 101));
+    }
 
     /// A read that panics counts as a failed one: the next look may start another.
     #[test]

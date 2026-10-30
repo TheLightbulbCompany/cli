@@ -230,6 +230,7 @@ pub fn to_sessions(listed: &[Listed], member_short: &str, files: &[Session]) -> 
                 repo: None,
                 branch: None,
                 hidden: false,
+                headless: false,
                 waiting_for,
                 kind: Some(l.kind.clone()).filter(|k| !k.is_empty()),
                 entrypoint: file.and_then(|f| f.entrypoint.clone()),

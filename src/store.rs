@@ -213,6 +213,8 @@ pub struct Session {
     pub ended_at: Option<i64>,
     /// What a `waiting` session waits for its person on.
     pub waiting_for: Option<String>,
+    /// A `claude -p` or Agent SDK run: messageable, listed nowhere, deleted when it ends.
+    pub headless: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -247,6 +249,7 @@ fn row_session(r: &rusqlite::Row) -> rusqlite::Result<Session> {
         reason: r.get("reason")?,
         ended_at: r.get("ended_at")?,
         waiting_for: r.get("waiting_for")?,
+        headless: r.get::<_, Option<i64>>("headless")?.is_some_and(|h| h != 0),
     })
 }
 
@@ -267,19 +270,23 @@ pub(crate) fn row_message(r: &rusqlite::Row) -> rusqlite::Result<Message> {
     })
 }
 
-/// Why a session ended and what a waiting one waits for: nullable columns added on open, not by
-/// a migration, so `user_version` stays and an older build can still open this db (it ignores
+/// Why a session ended, what a waiting one waits for, and whether it is headless: nullable columns
+/// added on open, not by a migration, so `user_version` stays and an older build can still open this db (it ignores
 /// them).
 fn add_session_columns(conn: &Connection) -> crate::Result<()> {
     let has = |column: &str| -> rusqlite::Result<bool> {
         conn.prepare("SELECT 1 FROM pragma_table_info('sessions') WHERE name = ?1")?
             .exists([column])
     };
-    for column in ["reason", "waiting_for"] {
+    for (column, kind) in [
+        ("reason", "TEXT"),
+        ("waiting_for", "TEXT"),
+        ("headless", "INTEGER"),
+    ] {
         if has(column)? {
             continue;
         }
-        let add = format!("ALTER TABLE sessions ADD COLUMN {column} TEXT");
+        let add = format!("ALTER TABLE sessions ADD COLUMN {column} {kind}");
         // A second connection opening beside this one may have just added it.
         if let Err(e) = conn.execute_batch(&add) {
             if !has(column)? {
@@ -348,21 +355,23 @@ impl Store {
     }
 
     /// Writes `s` as a live row (an ended one is live again). A new agent session's row gets the
-    /// handle `<provider>-<n>`, one past its provider's highest, which it then keeps.
+    /// handle `<provider>-<n>`, one past its provider's highest, which it then keeps; a headless
+    /// one none, since `who` never shows it. A row a person's session wrote stays not headless
+    /// (`claude -p --resume` must not cost that conversation its place in Recent).
     /// ponytail: a number frees up again only when its row is purged (a week after it ended)
     /// and it was the highest.
     pub fn put_session(&self, s: &Session) -> rusqlite::Result<()> {
         self.conn.execute(
             "INSERT INTO sessions (key, provider, conversation, pid, birth_micros, cwd, title, \
-             status, seen_at, executable, repo, branch, waiting_for, handle) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, \
-             CASE WHEN ?2 = '' THEN NULL ELSE ?2 || '-' || (SELECT 1 + coalesce(max( \
+             status, seen_at, executable, repo, branch, waiting_for, headless, handle) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, \
+             CASE WHEN ?2 = '' OR ?14 IS NOT NULL THEN NULL ELSE ?2 || '-' || (SELECT 1 + coalesce(max( \
              CAST(substr(handle, length(?2) + 2) AS INTEGER)), 0) FROM sessions \
              WHERE provider = ?2) END) \
              ON CONFLICT(key) DO UPDATE SET provider = ?2, conversation = ?3, pid = ?4, \
              birth_micros = ?5, cwd = ?6, title = ?7, status = ?8, seen_at = ?9, \
              executable = ?10, repo = ?11, branch = ?12, waiting_for = ?13, ended_at = NULL, \
-             reason = NULL, \
+             reason = NULL, headless = headless AND excluded.headless, \
              handle = coalesce(handle, excluded.handle)",
             params![
                 s.key,
@@ -377,7 +386,8 @@ impl Store {
                 s.executable,
                 s.repo,
                 s.branch,
-                s.waiting_for
+                s.waiting_for,
+                s.headless.then_some(1)
             ],
         )?;
         Ok(())
@@ -497,7 +507,9 @@ impl Store {
     }
 
     /// Ends `key`'s row at `now` with `reason` (and `title`, when given); `false` when there is
-    /// no live one.
+    /// no live one. A headless row is deleted instead: it never reaches `ended` or Recent.
+    /// Left for the rebase onto CLI #105: a headless row whose key matches a declared worker (none
+    /// on this branch yet) is the exception to that deletion.
     pub fn end_session(
         &self,
         key: &str,
@@ -505,11 +517,28 @@ impl Store {
         reason: &str,
         title: Option<&str>,
     ) -> rusqlite::Result<bool> {
+        let deleted = self.conn.execute(
+            "DELETE FROM sessions WHERE key = ?1 AND headless = 1 AND ended_at IS NULL",
+            [key],
+        )?;
+        if deleted > 0 {
+            return Ok(true);
+        }
         Ok(self.conn.execute(
             "UPDATE sessions SET ended_at = ?2, reason = ?3, \
              title = coalesce(?4, title) WHERE key = ?1 AND ended_at IS NULL",
             params![key, now, reason, title],
         )? > 0)
+    }
+
+    /// The live Claude rows a hook says wait for their person: `(conversation, seen_at)`.
+    pub fn waiting_rows(&self) -> rusqlite::Result<Vec<(String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT conversation, seen_at FROM sessions WHERE provider = 'claude' \
+             AND status = 'waiting' AND ended_at IS NULL AND conversation IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect()
     }
 
     /// `title` on `key`'s live row, if it has none.
@@ -1067,6 +1096,7 @@ mod tests {
             reason: None,
             ended_at: None,
             waiting_for: None,
+            headless: false,
         };
         store.put_session(&session).unwrap();
         let handle = Some("claude-1".into());
@@ -1191,6 +1221,7 @@ mod tests {
             reason: None,
             ended_at: None,
             waiting_for: None,
+            headless: false,
         }
     }
 
@@ -1267,6 +1298,7 @@ mod tests {
             reason: None,
             ended_at: None,
             waiting_for: None,
+            headless: false,
         };
         for (k, p) in [
             ("a", "codex"),
@@ -1336,7 +1368,36 @@ mod tests {
             reason: None,
             ended_at: None,
             waiting_for: None,
+            headless: false,
         }
+    }
+
+    #[test]
+    fn a_headless_row_has_no_handle_and_is_gone_when_it_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("state.db")).unwrap();
+        let headless = Session {
+            headless: true,
+            ..sample("h")
+        };
+        store.put_session(&headless).unwrap();
+        let row = store.session("h").unwrap().unwrap();
+        assert!(row.headless);
+        assert_eq!(row.handle, None);
+        assert!(store.end_session("h", 5, "session-end", None).unwrap());
+        assert!(!store.holds("h").unwrap());
+        assert!(!store.end_session("h", 6, "session-end", None).unwrap());
+        // `claude -p --resume` of a person's conversation: the row stays theirs.
+        store.put_session(&sample("p")).unwrap();
+        store
+            .put_session(&Session {
+                headless: true,
+                ..sample("p")
+            })
+            .unwrap();
+        assert!(!store.session("p").unwrap().unwrap().headless);
+        assert!(store.end_session("p", 5, "session-end", None).unwrap());
+        assert!(store.holds("p").unwrap());
     }
 
     #[test]

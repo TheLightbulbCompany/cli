@@ -285,11 +285,16 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
             Response::ok(id, json!({}))
         }
         "register" => register(id, body, daemon),
-        // `sessions {handle?}`: with a handle, the live session of it (`not_found` when none
+        // `sessions {handle?, headless?}`: `headless` adds the runs no list shows, for telling who
+        // is calling; with a handle, the live session of it (`not_found` when none
         // is; `bad_request` for a string that is no handle, which is a name).
         "sessions" => match body["handle"].as_str() {
             None => {
-                let live = live_sessions(daemon);
+                let live = if body["headless"] == true {
+                    live_sessions(daemon)
+                } else {
+                    listed_sessions(daemon)
+                };
                 // A row that ended yet is seen live again (no hook said so) is shown live.
                 let ended: Vec<Value> = ended_sessions(daemon)
                     .iter()
@@ -1319,9 +1324,10 @@ struct Register {
     repo: Option<String>,
     branch: Option<String>,
     waiting_for: Option<String>,
+    headless: Option<bool>,
 }
 
-/// `register {session: {provider, conversation, pid, birth_micros, cwd, title?, status?, waiting_for?, executable?, repo?, branch?}, caller?}`
+/// `register {session: {provider, conversation, pid, birth_micros, cwd, title?, status?, waiting_for?, executable?, repo?, branch?, headless?}, caller?}`
 /// upserts by key; the daemon supplies the member prefix. A `cwd` under `folders_off` is
 /// answered `{key, ignored: true}` and nothing is written. A key whose row names another
 /// live process is refused (`bad_request`, reason `owned_by_live_process`). `status` is `idle` (default),
@@ -1414,6 +1420,7 @@ fn register(id: u64, body: &Value, daemon: &Daemon) -> Response {
         reason: None,
         ended_at: None,
         waiting_for: r.waiting_for.filter(|_| status == "waiting"),
+        headless: r.headless == Some(true),
     };
     // Every hook event registers: mail delivered before it has been seen.
     match put_row(daemon, &store, &row).and_then(|()| mail::mark_read_for(&store, &key, now())) {
@@ -1481,6 +1488,13 @@ pub(crate) fn live_sessions(daemon: &Daemon) -> Vec<sessions::Session> {
     let listed = listed.as_ref().map(|(l, _)| l.as_slice());
     record(daemon, &rows, &mut all, listed, &hidden);
     all
+}
+
+/// `live_sessions` as a list shows them: no headless run.
+pub(crate) fn listed_sessions(daemon: &Daemon) -> Vec<sessions::Session> {
+    let mut live = live_sessions(daemon);
+    live.retain(|s| !s.headless);
+    live
 }
 
 /// The most rows of finished jobs written per read of the listing: hundreds of old jobs arrive
@@ -1686,6 +1700,7 @@ fn discovered_row(s: &sessions::Session, now: i64) -> store::Session {
         reason: None,
         ended_at: None,
         waiting_for: None,
+        headless: false,
     }
 }
 
@@ -1756,7 +1771,7 @@ fn is_handle(s: &str) -> bool {
 }
 
 fn live_count(daemon: &Daemon) -> usize {
-    live_sessions(daemon).len()
+    listed_sessions(daemon).len()
 }
 
 /// `m`'s sender as this computer's agents are told it (`label::sender`).
@@ -2163,6 +2178,7 @@ async fn inbox(
                 reason: None,
                 ended_at: None,
                 waiting_for: None,
+                headless: false,
             };
             if put_row(daemon, &daemon.store.lock().unwrap(), &row).is_err() {
                 return Response::err(id, INTERNAL);

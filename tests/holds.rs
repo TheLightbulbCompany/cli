@@ -168,6 +168,7 @@ fn row(key: &str) -> Session {
         reason: None,
         ended_at: None,
         waiting_for: None,
+        headless: false,
     }
 }
 

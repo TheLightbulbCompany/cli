@@ -525,6 +525,40 @@ async fn off_folder_sessions_are_not_published() {
     assert_eq!((flag("h2"), flag("o1")), (json!(true), Value::Null));
 }
 
+/// A headless run is on no one's list and never in `ended`; its address alone is published.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_headless_run_is_listed_nowhere() {
+    let (a, b) = (Env::new(), Env::new());
+    let [_, admit] = seed_pair(&a, &b);
+    a.daemon(false, "", &[]);
+    let p = os::process(std::process::id()).unwrap();
+    let r = a.ask(
+        json!({"id": 1, "op": "register", "session": {"provider": "claude",
+        "conversation": "run", "pid": p.pid, "birth_micros": p.birth_micros, "cwd": "/tmp/p",
+        "headless": true}}),
+    );
+    let run = r["key"].as_str().unwrap().to_string();
+    assert_eq!(directory(&a, None), Vec::<Value>::new());
+    let (_ep, mut peer) = played(&b.identity(), &a, &admit).await;
+    let Frame::Presence {
+        sessions,
+        kept,
+        ended,
+        ..
+    } = peer.presence().await
+    else {
+        unreachable!()
+    };
+    assert!(sessions.is_empty() && ended.is_empty(), "{sessions:?}");
+    assert_eq!(kept, std::slice::from_ref(&run));
+
+    let r = a.ask(json!({"id": 1, "op": "end", "key": run, "reason": "session-end"}));
+    assert_eq!(r["ended"], true, "{r}");
+    assert_eq!(directory(&a, None), Vec::<Value>::new());
+    let db = a.state.path().join("state.db");
+    assert_eq!(common::count(&db, "SELECT count(*) FROM sessions"), 0);
+}
+
 /// Months of finished jobs reach their owner's Recent, not teammates: the first read of Claude's
 /// listing stamps the line. A job that ends after it is news.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

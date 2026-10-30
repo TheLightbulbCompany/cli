@@ -1291,10 +1291,10 @@ fn a_late_stop_answer_still_nudges() {
     assert_eq!((s.prompt_tokens, s.completion_tokens), (Some(7), Some(3)));
 }
 
-/// `claude -p` and Agent SDK runs are no sessions: no row, whatever the event, and no mail, but
-/// what capture records needs no row and stays. A person's `claude` registers as ever.
+/// `claude -p` and Agent SDK runs (automation, network workers) keep an identity and their mail,
+/// but no list shows them and they leave no ended row. A person's `claude` registers as ever.
 #[test]
-fn a_claude_p_run_gets_no_row_and_keeps_its_capture() {
+fn a_claude_p_run_is_identified_listed_nowhere_and_gone_when_it_ends() {
     let net = Net::new();
     let me = os::process(std::process::id()).unwrap();
     let fixture = |name: &str| {
@@ -1303,48 +1303,39 @@ fn a_claude_p_run_gets_no_row_and_keeps_its_capture() {
             .join(format!("{name}.json"));
         std::fs::read(path).unwrap()
     };
+    let run = |entrypoint, event, name: &str| {
+        net.hook_from(Some(entrypoint), "claude", event, &fixture(name), Some(&me))
+    };
     let conversation = "00000000-0000-4000-8000-0000000000c1";
     let key = net.key("claude", conversation);
-    for (event, name) in [
-        ("session-start", "claude-session-start"),
-        ("post-tool-use", "claude-post-tool-use"),
-        ("permission-request", "claude-permission-request"),
-        ("stop", "claude-stop"),
-    ] {
-        let out = net.hook_from(Some("sdk-cli"), "claude", event, &fixture(name), Some(&me));
-        assert!(out.stdout.is_empty(), "{event}");
-    }
+    run("sdk-cli", "session-start", "claude-session-start");
+    run("sdk-cli", "post-tool-use", "claude-post-tool-use");
+
     let rows = net.call(json!({"id": 1, "op": "sessions"}));
     assert_eq!(rows["sessions"], json!([]), "{rows}");
-    assert_eq!(rows["ended"], json!([]), "{rows}");
-    let ended = net.hook_from(
-        Some("sdk-ts"),
-        "claude",
-        "session-end",
-        &fixture("claude-session-end"),
-        Some(&me),
-    );
-    assert!(ended.status.success());
-    let rows = net.call(json!({"id": 1, "op": "sessions"}));
-    assert_eq!(rows["ended"], json!([]), "{rows}");
-    let captured = || {
-        let db = lightbulb::store::Store::open(&net.dir.path().join("state.db")).unwrap();
-        !lightbulb::capture::sessions_since(&db, -1)
-            .unwrap()
-            .is_empty()
-    };
-    let end = std::time::Instant::now() + Duration::from_secs(5);
-    while !captured() && std::time::Instant::now() < end {
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    assert!(captured(), "capture needs no row");
+    let dir = net.call(json!({"id": 1, "op": "directory"}));
+    assert_eq!(dir["sessions"], json!([]), "{dir}");
+    assert_eq!(net.call(json!({"id": 1, "op": "status"}))["sessions"], 0);
+    // Who is calling can still tell: this is how the MCP server finds it.
+    let mine = net.call(json!({"id": 1, "op": "sessions", "headless": true}));
+    assert_eq!(mine["sessions"][0]["key"], key.as_str(), "{mine}");
+    assert_eq!(mine["sessions"][0]["headless"], true, "{mine}");
+    // Mail reaches it.
+    net.send(&key, "for the run", "r-run");
+    let out = run("sdk-cli", "post-tool-use", "claude-post-tool-use");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("for the run"));
 
-    net.hook_from(
-        Some("cli"),
-        "claude",
-        "session-start",
-        &fixture("claude-session-start"),
-        Some(&me),
-    );
+    run("sdk-ts", "session-end", "claude-session-end");
+    let rows = net.call(json!({"id": 1, "op": "sessions", "headless": true}));
+    assert_eq!(rows["sessions"], json!([]), "{rows}");
+    assert_eq!(rows["ended"], json!([]), "{rows}");
+    let db = lightbulb::store::Store::open(&net.dir.path().join("state.db")).unwrap();
+    assert!(!db.holds(&key).unwrap(), "the row is deleted, not kept");
+    drop(db);
+
+    run("cli", "session-start", "claude-session-start");
     assert!(net.session(&key).is_some(), "a person's claude registers");
+    run("cli", "session-end", "claude-session-end");
+    let rows = net.call(json!({"id": 1, "op": "sessions"}));
+    assert_eq!(rows["ended"][0]["key"], key.as_str(), "{rows}");
 }
