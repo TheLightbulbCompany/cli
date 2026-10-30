@@ -338,3 +338,49 @@ fn failures_print_the_json_shape_on_stdout_when_piped() {
     assert!(v["next"].is_string());
     assert!(!run(&["app", "up"]).stdout.is_empty());
 }
+
+#[test]
+fn signed_out_multipart_says_run_lightbulb_login_and_a_missing_file_is_named() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let e = Env::new();
+    std::env::set_var("LIGHTBULB_CONNECT_HOME", e.state.path());
+    let file = e.state.path().join("src.tgz");
+    std::fs::write(&file, b"x").unwrap();
+    let err = api::form(
+        &Auth::Proof,
+        "/source",
+        &[("name", "x")],
+        Some(("archive", &file)),
+    )
+    .unwrap_err();
+    assert_eq!(
+        (err.code.as_str(), err.next.as_str()),
+        ("not_signed_in", "run lightbulb login")
+    );
+    let gone = e.state.path().join("nope.tgz");
+    let err = api::form(&Auth::Proof, "/source", &[], Some(("archive", &gone))).unwrap_err();
+    assert_eq!(err.code, "bad_file");
+}
+
+#[test]
+fn evidence_kind_is_a_flag_browser_or_review() {
+    let e = Env::new();
+    let run = |a: &[&str]| {
+        e.base_cmd(Command::new(common::EXE))
+            .args(a)
+            .output()
+            .unwrap()
+    };
+    for k in ["browser", "review"] {
+        let o = run(&["app", "evidence", "--kind", k, "--note", "ok"]);
+        let v: Value = serde_json::from_slice(&o.stdout).unwrap();
+        assert_eq!(v["code"], "not_implemented", "{k}");
+    }
+    assert_eq!(
+        run(&["app", "evidence", "--kind", "recording"])
+            .status
+            .code(),
+        Some(2)
+    );
+    assert_eq!(run(&["app", "evidence", "browser"]).status.code(), Some(2));
+}

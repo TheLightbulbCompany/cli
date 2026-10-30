@@ -110,19 +110,40 @@ pub fn form(
     file: Option<(&str, &Path)>,
 ) -> Result<Value, ApiError> {
     let path = format!("{BUILD}{path}");
-    let answer = match auth {
-        Auth::HookToken { api, owner, token } => {
-            let h = vec![
-                ("Authorization".to_string(), format!("Bearer {token}")),
-                ("X-Lightbulb-Owner".to_string(), owner.clone()),
-            ];
-            login::request_form(api, &path, fields, file, |_| Ok(h))
+    if let Some((_, f)) = file {
+        if let Err(e) = std::fs::File::open(f) {
+            return Err(ApiError::new(
+                "bad_file",
+                &format!("Could not read {}: {e}", f.display()),
+                "check the path",
+            ));
         }
-        Auth::Proof => login::request_form(&login::api(), &path, fields, file, |body| {
-            let h = proof("POST", &path, body).map_err(|e| e.message)?;
-            Ok(h.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
-        }),
-    };
+    }
+    // A proof that cannot be made is kept here, so it is not reported as unreachable.
+    let refused = std::cell::RefCell::new(None);
+    let answer =
+        match auth {
+            Auth::HookToken { api, owner, token } => {
+                let h = vec![
+                    ("Authorization".to_string(), format!("Bearer {token}")),
+                    ("X-Lightbulb-Owner".to_string(), owner.clone()),
+                ];
+                login::request_form(api, &path, fields, file, |_| Ok(h))
+            }
+            Auth::Proof => login::request_form(&login::api(), &path, fields, file, |body| {
+                match proof("POST", &path, body) {
+                    Ok(h) => Ok(h.into_iter().map(|(k, v)| (k.to_string(), v)).collect()),
+                    Err(e) => {
+                        let msg = e.message.clone();
+                        *refused.borrow_mut() = Some(e);
+                        Err(msg.into())
+                    }
+                }
+            }),
+        };
+    if let Some(e) = refused.into_inner() {
+        return Err(e);
+    }
     answered(answer)
 }
 

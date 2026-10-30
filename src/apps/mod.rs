@@ -35,7 +35,7 @@ pub enum OpenTo {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum EvidenceKind {
     Browser,
-    Recording,
+    Review,
 }
 
 /// What asked for the app: `kind` (`idea`, `issue`, ...) and its `ref`.
@@ -82,7 +82,7 @@ pub enum AppCommand {
     },
     /// Record a browser pass for the preview.
     Evidence {
-        #[arg(value_enum)]
+        #[arg(long, value_enum)]
         kind: EvidenceKind,
         #[arg(long)]
         file: Option<PathBuf>,
