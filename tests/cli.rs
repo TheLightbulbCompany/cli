@@ -1958,7 +1958,10 @@ fn memory_list_repo_takes_a_bare_name() {
 #[test]
 fn config_set_flips_a_bool_key_and_workers_on_needs_it() {
     let mut e = Env::new();
-    assert!(e.run(&["who"]).status.success());
+    // Pinned before the daemon starts: it is the daemon that refuses an agent (`common::Env`).
+    let birth = os::process(std::process::id()).unwrap().birth_micros;
+    e.pin = Some(format!("{}:{birth}", std::process::id()));
+    e.daemon(false, "", &[]);
     let o = e.person(&["workers", "on"]);
     assert_eq!(o.status.code(), Some(1));
     assert_eq!(
@@ -1989,8 +1992,6 @@ fn config_set_flips_a_bool_key_and_workers_on_needs_it() {
     }
     assert!(!config().contains("network_workers"), "{}", config());
     // An agent's shell is refused before anything is written.
-    let birth = os::process(std::process::id()).unwrap().birth_micros;
-    e.pin = Some(format!("{}:{birth}", std::process::id()));
     let pin = e.pin.clone().unwrap();
     let o = e
         .cmd(&["config", "set", "network_workers", "true"])
@@ -2026,10 +2027,10 @@ fn config_set_flips_a_bool_key_and_workers_on_needs_it() {
 #[test]
 fn workers_commands_are_person_only_and_print_the_table() {
     let mut e = Env::new();
-    assert!(e.run(&["who"]).status.success());
-    // An agent's shell: this process, pinned as the caller.
+    // Pinned before the daemon starts: it is the daemon that refuses an agent (`common::Env`).
     let birth = os::process(std::process::id()).unwrap().birth_micros;
     e.pin = Some(format!("{}:{birth}", std::process::id()));
+    e.daemon(false, "", &[]);
     let pin = e.pin.clone().unwrap();
     for args in [&["workers"][..], &["workers", "off"], &["workers", "on"]] {
         let o = e
