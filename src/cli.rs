@@ -1924,6 +1924,34 @@ pub fn install_job(home: &Path, exe: &Path) -> Result<i32> {
     Ok(0)
 }
 
+/// The job half of `setup --refresh`, which only the daemon runs, as its own child, after an
+/// auto-update (`refresh_setup`). It writes the plist when it changed and never touches
+/// launchctl: `install_job`'s bootout would kill this process along with the daemon it runs
+/// under, before its bootstrap, leaving no job loaded. launchd already runs the new binary (the
+/// plist names the canonical path, which an update overwrites), and a changed plist is read at
+/// the next load: login, or a person's `setup`.
+fn refresh_job(home: &Path, exe: &Path) -> Result<i32> {
+    let path = plist_path(home);
+    let want = plist(exe, &paths::state_dir().join("daemon.log"));
+    if fs::read_to_string(&path).ok().as_deref() != Some(want.as_str()) {
+        fs::create_dir_all(path.parent().unwrap())?;
+        fs::write(&path, want)?;
+    }
+    println!("Background service: left running (starts at login).");
+    Ok(0)
+}
+
+/// Whether `launchctl print-disabled` output marks `label` disabled (`=> disabled`, or
+/// `=> true` on older macOS). A label it does not list is enabled.
+fn disabled_in(listing: &str, label: &str) -> bool {
+    let key = format!("\"{label}\"");
+    listing.lines().any(|l| {
+        let mut parts = l.trim().splitn(2, "=>");
+        parts.next().map(str::trim) == Some(key.as_str())
+            && matches!(parts.next().map(str::trim), Some("disabled" | "true"))
+    })
+}
+
 pub fn daemon_uninstall() -> Result<i32> {
     if !cfg!(target_os = "macos") {
         eprintln!("{NO_SERVICE}");
@@ -2019,15 +2047,29 @@ pub fn doctor() -> Result<i32> {
         row("Local network", false, "", "blocked by macOS", fix);
     }
     if cfg!(target_os = "macos") {
-        let loaded = if use_launchctl() {
-            launchctl(&[
-                "print",
-                &format!("gui/{}/{LABEL}", unsafe { libc::getuid() }),
-            ])
+        // Installed to start at login: the plist is there and launchd has not disabled it.
+        // Loaded now is a separate fact, shown so a job that is not running under launchd
+        // (no KeepAlive until the next login) is visible.
+        let installed = plist_path(&home).exists();
+        let (enabled, loaded) = if use_launchctl() {
+            let uid = unsafe { libc::getuid() };
+            let listing = Command::new("launchctl")
+                .args(["print-disabled", &format!("gui/{uid}")])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                .unwrap_or_default();
+            let loaded = launchctl(&["print", &format!("gui/{uid}/{LABEL}")]);
+            (!disabled_in(&listing, LABEL), loaded)
         } else {
-            plist_path(&home).exists()
+            (true, true)
         };
-        row("Starts at login", loaded, "yes", "no", &setup);
+        let good = if loaded {
+            "yes"
+        } else {
+            "yes (not loaded now; run lightbulb setup to load it)"
+        };
+        let bad = if installed { "no (disabled)" } else { "no" };
+        row("Starts at login", installed && enabled, good, bad, &setup);
     }
     if crate::login::stored(&dir).is_some() {
         let now = crate::daemon::ipc::now() as i64;
@@ -2217,6 +2259,7 @@ pub fn setup(
         files(a);
     }
     let dir = paths::state_dir();
+    let refresh = model.is_none();
     let model = match model {
         Some(on) => {
             // A config.toml that will not take the key is a line, not a failed setup.
@@ -2237,7 +2280,11 @@ pub fn setup(
         }
     }
     if cfg!(target_os = "macos") {
-        let code = install_job(&home, &executable)?;
+        let code = if refresh {
+            refresh_job(&home, &executable)?
+        } else {
+            install_job(&home, &executable)?
+        };
         if code != 0 {
             return Ok(code);
         }
@@ -2270,6 +2317,16 @@ pub fn setup(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn print_disabled_marks_only_the_disabled_label() {
+        let l = "\tdisabled services = {\n\t\t\"a.b\" => disabled\n\t\t\"c.d\" => enabled\n\t\t\"e.f\" => true\n\t}\n";
+        assert!(super::disabled_in(l, "a.b"));
+        assert!(super::disabled_in(l, "e.f"));
+        assert!(!super::disabled_in(l, "c.d"));
+        assert!(!super::disabled_in(l, "missing"));
+        assert!(!super::disabled_in(l, "a"));
+    }
+
     #[test]
     fn a_checksum_verifies_only_under_its_signing_key() {
         use ed25519_dalek::{Signer, SigningKey};

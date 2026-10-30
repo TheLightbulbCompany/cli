@@ -1,0 +1,81 @@
+{
+  "mode": "reanswer",
+  "categories": {
+    "abstention": {
+      "questions": 40,
+      "ours": 0.975,
+      "past": 0.9875,
+      "delta": -0.012500000000000067,
+      "pastPublished": 0.9875
+    },
+    "contradiction_resolution": {
+      "questions": 40,
+      "ours": 0.69375,
+      "past": 0.78125,
+      "delta": -0.08750000000000002,
+      "pastPublished": 0.78125
+    },
+    "event_ordering": {
+      "questions": 40,
+      "ours": 0.9877777777777779,
+      "past": 1.0,
+      "delta": -0.012222222222222134,
+      "pastPublished": 1.0
+    },
+    "information_extraction": {
+      "questions": 40,
+      "ours": 0.896875,
+      "past": 0.95,
+      "delta": -0.05312499999999998,
+      "pastPublished": 0.95
+    },
+    "instruction_following": {
+      "questions": 40,
+      "ours": 0.91875,
+      "past": 0.9625,
+      "delta": -0.04375000000000007,
+      "pastPublished": 0.9625
+    },
+    "knowledge_update": {
+      "questions": 40,
+      "ours": 0.85625,
+      "past": 0.89375,
+      "delta": -0.03750000000000009,
+      "pastPublished": 0.89375
+    },
+    "multi_session_reasoning": {
+      "questions": 40,
+      "ours": 0.6462797619047619,
+      "past": 0.6894642857142858,
+      "delta": -0.04318452380952387,
+      "pastPublished": 0.6894642857142858
+    },
+    "preference_following": {
+      "questions": 40,
+      "ours": 0.98125,
+      "past": 1.0,
+      "delta": -0.018750000000000044,
+      "pastPublished": 1.0
+    },
+    "summarization": {
+      "questions": 40,
+      "ours": 0.9824999999999999,
+      "past": 0.99375,
+      "delta": -0.011250000000000093,
+      "pastPublished": 0.99375
+    },
+    "temporal_reasoning": {
+      "questions": 40,
+      "ours": 0.925,
+      "past": 0.95,
+      "delta": -0.02499999999999991,
+      "pastPublished": 0.95
+    }
+  },
+  "overall": {
+    "questions": 400,
+    "ours": 0.8863432539682541,
+    "past": 0.9208214285714286,
+    "delta": -0.034478174603174525
+  }
+}

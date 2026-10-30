@@ -19,10 +19,23 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+      # The BEAM benchmark's ops (docs/benchmark.md): compiled only with --features bench.
+      - run: cargo clippy --all-targets --features bench -- -D warnings
+      - run: cargo test --features bench --test bench_ops
       # The real memory model (one download); the other ignored tests are helpers, not run.
       - run: cargo test --test embed_model --test memory_store -- --include-ignored
         env:
           LIGHTBULB_TEST_MODEL: "1"
+  # The BEAM runner's tests (bench/beam): offline, fake backend and stubbed model calls.
+  beam-runner:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: bench/beam
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v6
+      - run: uv run --locked --with pytest pytest -q
   gitleaks:
     runs-on: ubuntu-latest
     steps:
