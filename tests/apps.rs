@@ -27,6 +27,14 @@ struct Req {
 
 /// A stub backend answering every request `(status, json)` after `delay_ms`.
 fn stub(status: u16, answer: Value, delay_ms: u64) -> (String, Arc<Mutex<Vec<Req>>>) {
+    stub_with(move |_| (status, answer.clone()), delay_ms)
+}
+
+/// A stub backend that answers each request by its request line, e.g. `POST /api/v1/...`.
+fn stub_with(
+    answer: impl Fn(&str) -> (u16, Value) + Send + 'static,
+    delay_ms: u64,
+) -> (String, Arc<Mutex<Vec<Req>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let seen: Arc<Mutex<Vec<Req>>> = Arc::default();
@@ -59,6 +67,8 @@ fn stub(status: u16, answer: Value, delay_ms: u64) -> (String, Arc<Mutex<Vec<Req
                 body,
             });
             std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            let line = log.lock().unwrap().last().unwrap().line.clone();
+            let (status, answer) = answer(&line);
             let text = answer.to_string();
             let _ = write!(
                 s,
@@ -332,7 +342,7 @@ fn failures_print_the_json_shape_on_stdout_when_piped() {
             .unwrap()
     };
     // Piped stdout is not a TTY: JSON is the default.
-    let o = run(&["app", "destroy"]);
+    let o = run(&["app", "evidence", "--kind", "browser"]);
     assert_eq!(o.status.code(), Some(1));
     let v: Value = serde_json::from_slice(&o.stdout).unwrap();
     assert_eq!(v["code"], "not_implemented");
@@ -915,7 +925,8 @@ fn up_stops_on_a_destructive_migration_unless_approved() {
             .unwrap();
         serde_json::from_slice::<Value>(&o.stdout).unwrap()
     };
-    assert_eq!(run(&[])["code"], "not_implemented");
+    // Past the gate: whatever fails next, it is not the migration.
+    assert_ne!(run(&[])["code"], "destructive_migration");
     std::fs::write(dir.join("drizzle/0001_drop.sql"), "DROP TABLE \"items\";").unwrap();
     let v = run(&[]);
     assert_eq!(v["code"], "destructive_migration");
@@ -924,7 +935,10 @@ fn up_stops_on_a_destructive_migration_unless_approved() {
         v["next"],
         "rewrite add-only (add a column, copy data), or ask the owner and pass --approved <card id>"
     );
-    assert_eq!(run(&["--approved", "card-1"])["code"], "not_implemented");
+    assert_ne!(
+        run(&["--approved", "card-1"])["code"],
+        "destructive_migration"
+    );
 }
 
 #[test]
@@ -995,4 +1009,357 @@ fn an_empty_approval_is_refused() {
     assert_eq!(o.status.code(), Some(1));
     let v: Value = serde_json::from_slice(&o.stdout).unwrap();
     assert_eq!(v["code"], "bad_args");
+}
+
+// ---- up, publish, rollback, destroy ----
+
+const BUILD: &str = "/api/v1/apps/build";
+
+fn waiting() -> Value {
+    json!({"app_id": "a-1", "state": "awaiting_approval", "canvas_url": "https://x/chat?panel=canvas&app=a-1",
+        "cards": [{"workflow_id": "w1", "provider": "stripe", "service": "payments", "state": "pending",
+            "token": "sk_live_SECRET123"}],
+        "sample_data": true, "token": "sk_live_SECRET123",
+        "DATABASE_URL": "postgres://u:SECRET@h/db"})
+}
+
+fn ship_stub(up: Value) -> (String, Arc<Mutex<Vec<Req>>>) {
+    stub_with(
+        move |line| {
+            let route = line.trim_end_matches(" HTTP/1.1");
+            match route.strip_prefix(&format!("POST {BUILD}")).unwrap_or("") {
+                "/source" => (200, json!({"app_id": "a-1", "source_id": "s-1"})),
+                "/up" | "/a-1/publish" => (200, up.clone()),
+                "/a-1/destroy" => (
+                    200,
+                    json!({"state": "awaiting_owner", "next": "the owner removes it from Canvas",
+                    "DATABASE_URL": "postgres://u:SECRET@h/db"}),
+                ),
+                _ => (
+                    404,
+                    json!({"code": "no_route", "message": route, "next": ""}),
+                ),
+            }
+        },
+        0,
+    )
+}
+
+impl Checked {
+    /// `lightbulb app <args> --json` against `base`, with a check that passes or fails.
+    fn app(&self, args: &[&str], base: &str, check_ok: bool) -> (i32, Value) {
+        let path = format!(
+            "{}:{}",
+            self.bin.path().display(),
+            std::env::var("PATH").unwrap()
+        );
+        let (out, code) = if check_ok {
+            ("design.txt", "0")
+        } else {
+            ("tsc.txt", "1")
+        };
+        let o = self
+            .e
+            .base_cmd(Command::new(common::EXE))
+            .current_dir(&self.dir)
+            .env("PATH", path)
+            .env("FAKE_PNPM_OUT", fixture(out))
+            .env("FAKE_PNPM_EXIT", code)
+            .env("FAKE_PNPM_ARGS", self.bin.path().join("args"))
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .env("OPENCLAW_HOOK_TOKEN", "tok")
+            .env("ISOL8_API_URL", base)
+            .env("ISOL8_OWNER_ID", "o1")
+            .arg("app")
+            .args(args)
+            .arg("--json")
+            .output()
+            .unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        );
+        assert!(!text.contains("SECRET"), "a credential was printed: {text}");
+        let v = serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{text}"));
+        (o.status.code().unwrap(), v)
+    }
+
+    fn head(&self) -> String {
+        git(&self.dir, &["rev-parse", "HEAD"]).trim().to_string()
+    }
+
+    fn app_json(&self) -> Value {
+        serde_json::from_slice(&std::fs::read(self.dir.join(".lightbulb/app.json")).unwrap())
+            .unwrap()
+    }
+}
+
+fn lines(seen: &Arc<Mutex<Vec<Req>>>) -> Vec<String> {
+    let seen = seen.lock().unwrap();
+    seen.iter()
+        .map(|r| r.line.trim_end_matches(" HTTP/1.1").to_string())
+        .collect()
+}
+
+fn body(r: &Req) -> Value {
+    serde_json::from_slice(&r.body).unwrap()
+}
+
+#[test]
+fn archive_excludes_env_and_build_dirs() {
+    let c = Checked::new();
+    for f in [
+        ".env",
+        ".env.local",
+        "sub/.env.production",
+        "node_modules/x/a.js",
+        "sub/node_modules/b.js",
+        ".next/b",
+        ".vercel/c",
+        "keep.txt",
+        "src/ok.ts",
+    ] {
+        let p = c.dir.join(f);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, "x").unwrap();
+    }
+    // Even forced into git, they stay out of the archive.
+    git(&c.dir, &["add", "-f", "-A"]);
+    git(
+        &c.dir,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.com",
+            "commit",
+            "-qm",
+            "forced",
+        ],
+    );
+    let (tgz, sha) = lightbulb::apps::archive(&c.dir).unwrap();
+    assert_eq!(sha, c.head());
+    let o = Command::new("tar").arg("-tzf").arg(&tgz).output().unwrap();
+    let names = String::from_utf8_lossy(&o.stdout).to_string();
+    for want in ["keep.txt", "src/ok.ts", "app.yaml"] {
+        assert!(names.lines().any(|n| n == want), "{want} missing: {names}");
+    }
+    for bad in [".env", "node_modules", ".next", ".vercel", ".git/"] {
+        assert!(!names.contains(bad), "{bad} shipped: {names}");
+    }
+    std::fs::remove_file(tgz).unwrap();
+}
+
+#[test]
+fn up_commits_a_dirty_tree_first() {
+    let c = Checked::new();
+    std::fs::write(c.dir.join("notes.txt"), "hi").unwrap();
+    let (base, seen) = ship_stub(waiting());
+    let (code, _) = c.app(&["up"], &base, true);
+    assert_eq!(code, 0);
+    assert_eq!(git(&c.dir, &["rev-list", "--count", "HEAD"]).trim(), "2");
+    let subject = git(&c.dir, &["log", "-1", "--format=%s"]);
+    assert!(
+        subject.starts_with("lightbulb: ") && subject.contains("notes.txt"),
+        "{subject}"
+    );
+    assert_eq!(git(&c.dir, &["status", "--porcelain"]), "");
+    let seen = seen.lock().unwrap();
+    let form = String::from_utf8_lossy(&seen[0].body).to_string();
+    assert!(form.contains(&c.head()), "the commit is sent");
+    assert!(form.contains("name=\"archive\""));
+}
+
+#[test]
+fn up_prints_cards_and_exits_zero_when_waiting() {
+    let c = Checked::new();
+    let (base, seen) = ship_stub(waiting());
+    let (code, v) = c.app(&["up", "--room", "r-9"], &base, true);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["state"], "awaiting_approval");
+    assert_eq!(v["app_id"], "a-1");
+    assert_eq!(v["cards"][0]["provider"], "stripe");
+    assert_eq!(v["done"], false);
+    assert!(v["next"].as_str().unwrap().contains("Inbox"), "{v}");
+    assert_eq!(c.app_json(), json!({"app_id": "a-1", "room_id": "r-9"}));
+    assert_eq!(
+        lines(&seen),
+        [format!("POST {BUILD}/source"), format!("POST {BUILD}/up")]
+    );
+    let seen = seen.lock().unwrap();
+    assert!(String::from_utf8_lossy(&seen[0].body).contains("r-9"));
+    let up = body(&seen[1]);
+    assert_eq!(up["name"], "team-lunch");
+    assert_eq!(up["room_id"], "r-9");
+    assert_eq!(up["source_id"], "s-1");
+    assert_eq!(up["services"], json!(["vercel/project", "neon/postgres"]));
+    assert_eq!(up["open_to"], "workspace");
+    assert_eq!(up["budget_usd"], 10);
+    assert_eq!(up["origin"]["kind"], "ask");
+    assert!(up.get("approved_destructive").is_none());
+    drop(seen);
+    // A failed build exits 1 and still says what to do.
+    let (base, _) = ship_stub(json!({"app_id": "a-1", "state": "failed",
+        "error": {"code": "build", "message": "it broke", "next": "fix the build"}}));
+    let (code, v) = c.app(&["up", "--approved", "card-1"], &base, true);
+    assert_eq!((code, &v["next"]), (1, &json!("fix the build")));
+    assert_eq!(v["done"], false);
+    // No room: null.
+    std::fs::remove_file(c.dir.join(".lightbulb/app.json")).unwrap();
+    let (base, seen) = ship_stub(waiting());
+    c.app(&["up", "--approved", "card-1"], &base, true);
+    let up = body(&seen.lock().unwrap()[1]);
+    assert_eq!(up["room_id"], Value::Null);
+    assert_eq!(up["approved_destructive"], "card-1");
+}
+
+#[test]
+fn up_refuses_when_check_fails() {
+    let c = Checked::new();
+    let (base, seen) = ship_stub(waiting());
+    let (code, v) = c.app(&["up"], &base, false);
+    assert_eq!((code, &v["code"]), (1, &json!("check_failed")));
+    assert!(v["message"].as_str().unwrap().contains("src/app/page.tsx"));
+    assert_eq!(v["next"], "fix");
+    assert!(lines(&seen).is_empty());
+}
+
+#[test]
+fn publish_requires_review_evidence() {
+    let c = Checked::new();
+    std::fs::write(c.dir.join(".lightbulb/app.json"), r#"{"app_id":"a-1"}"#).unwrap();
+    let (base, seen) = ship_stub(json!({"app_id": "a-1", "state": "ready", "version": 2}));
+    let review = |commit: &str, verdict: &str, kind: &str| {
+        std::fs::write(
+            c.dir.join(".lightbulb/progress.json"),
+            json!({"evidence": [{"kind": kind, "commit": commit, "verdict": verdict}]}).to_string(),
+        )
+        .unwrap();
+    };
+    for (commit, verdict, kind) in [
+        ("old", "pass", "review"),
+        (c.head().as_str(), "fail", "review"),
+        (c.head().as_str(), "pass", "browser"),
+    ] {
+        review(commit, verdict, kind);
+        let (code, v) = c.app(&["publish"], &base, true);
+        assert_eq!((code, &v["code"]), (1, &json!("review_required")));
+        assert!(v["next"].as_str().unwrap().contains("--kind review"));
+    }
+    assert!(lines(&seen).is_empty());
+
+    review(&c.head(), "pass", "review");
+    let (code, v) = c.app(&["publish", "--reason", "launch"], &base, true);
+    assert_eq!((code, &v["state"]), (0, &json!("ready")), "{v}");
+    assert_eq!(v["version"], 2);
+    assert_eq!(
+        lines(&seen),
+        [
+            format!("POST {BUILD}/source"),
+            format!("POST {BUILD}/a-1/publish")
+        ]
+    );
+    let p = body(&seen.lock().unwrap()[1]);
+    assert_eq!(
+        (&p["source_id"], &p["reason"]),
+        (&json!("s-1"), &json!("launch"))
+    );
+    // The migrations in this source are now recorded.
+    let m: Value =
+        serde_json::from_slice(&std::fs::read(c.dir.join(".lightbulb/migrations.json")).unwrap())
+            .unwrap();
+    assert!(!m["applied"].as_array().unwrap().is_empty(), "{m}");
+}
+
+#[test]
+fn publish_before_up_says_not_up_yet() {
+    let c = Checked::new();
+    let (base, _) = ship_stub(waiting());
+    let (code, v) = c.app(&["publish"], &base, true);
+    assert_eq!((code, &v["code"]), (1, &json!("not_up_yet")));
+}
+
+#[test]
+fn rollback_is_a_new_commit_not_a_reset() {
+    let c = Checked::new();
+    std::fs::write(c.dir.join(".lightbulb/app.json"), r#"{"app_id":"a-1"}"#).unwrap();
+    let c1 = c.head();
+    let mut commits = vec![c1.clone()];
+    for n in 2..=3 {
+        std::fs::write(c.dir.join("f.txt"), format!("v{n}")).unwrap();
+        git(&c.dir, &["add", "-A"]);
+        git(
+            &c.dir,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "-qm",
+                &format!("v{n}"),
+            ],
+        );
+        commits.push(c.head());
+    }
+    let versions: Vec<Value> = commits
+        .iter()
+        .enumerate()
+        .map(|(i, c)| json!({"n": i + 1, "commit": c}))
+        .collect();
+    let rolled = json!({"app_id": "a-1", "state": "ready", "version": 1,
+        "error": {"code": "data_unchanged", "message": "Code only.", "next": "Data is unchanged: the app's data stays as it is."}});
+    let (base, seen) = stub_with(
+        move |line| {
+            if line.starts_with("GET") {
+                (200, json!({"live_version": 3, "versions": versions}))
+            } else {
+                (200, rolled.clone())
+            }
+        },
+        0,
+    );
+    let (code, v) = c.app(&["rollback", "1"], &base, true);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(
+        v["next"],
+        "Data is unchanged: the app's data stays as it is."
+    );
+    assert_eq!(
+        body(&seen.lock().unwrap()[1]),
+        json!({"version": 1}),
+        "{:?}",
+        lines(&seen)
+    );
+    // The tree is version 1's, history is intact, and HEAD moved forward.
+    assert_eq!(git(&c.dir, &["diff", &c1, "HEAD"]), "");
+    assert_ne!(c.head(), c1);
+    for old in &commits {
+        let ok = Command::new("git")
+            .current_dir(&c.dir)
+            .args(["merge-base", "--is-ancestor", old, "HEAD"])
+            .status()
+            .unwrap();
+        assert!(ok.success(), "{old} is no longer in history");
+    }
+    assert_eq!(git(&c.dir, &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn destroy_prints_next_and_no_secret_in_any_output() {
+    let c = Checked::new();
+    std::fs::write(c.dir.join(".lightbulb/app.json"), r#"{"app_id":"a-1"}"#).unwrap();
+    // `app` fails the test if SECRET shows up in stdout or stderr.
+    let (base, _) = ship_stub(waiting());
+    let (code, v) = c.app(&["destroy"], &base, true);
+    assert_eq!(code, 0);
+    assert_eq!(v["state"], "awaiting_owner");
+    assert_eq!(v["next"], "the owner removes it from Canvas");
+    let (code, v) = c.app(&["up"], &base, true);
+    assert_eq!(code, 0);
+    assert!(v.get("token").is_none() && v["cards"][0].get("token").is_none());
 }

@@ -5,7 +5,10 @@
 pub mod api;
 pub mod check;
 pub mod migrations;
+mod ship;
 pub mod starter;
+
+pub use ship::archive;
 
 use crate::Result;
 use clap::{Subcommand, ValueEnum};
@@ -65,6 +68,9 @@ pub enum AppCommand {
         /// An approved card for a destructive migration.
         #[arg(long)]
         approved: Option<String>,
+        /// The room it is built for (saved in .lightbulb/app.json).
+        #[arg(long)]
+        room: Option<String>,
     },
     /// Put the preview live.
     Publish {
@@ -73,6 +79,9 @@ pub enum AppCommand {
         /// An approved card for a destructive migration.
         #[arg(long)]
         approved: Option<String>,
+        /// The room it is built for (saved in .lightbulb/app.json).
+        #[arg(long)]
+        room: Option<String>,
     },
     /// Go back to an earlier version (code only; data is unchanged).
     Rollback { version: Option<u32> },
@@ -140,20 +149,50 @@ pub fn run(cmd: AppCommand, json: bool) -> Result<i32> {
         }
         AppCommand::Status { errors } => status(errors, json),
         AppCommand::Check { publish } => check::check(publish, json),
-        AppCommand::Up { approved } | AppCommand::Publish { approved, .. } => {
-            let root = match preflight(json) {
-                Ok((root, _, _)) => root,
+        AppCommand::Up { approved, room } => {
+            let (root, config, auth, approved) = match gated(approved, json) {
+                Ok(g) => g,
                 Err(code) => return Ok(code),
             };
-            // Task 6 sends this as `approved_destructive`.
-            let _approved = match destructive_gate(&root, approved, json) {
-                Ok(a) => a,
+            ship::up(&root, &config, &auth, approved, room, json)
+        }
+        AppCommand::Publish {
+            reason,
+            approved,
+            room,
+        } => {
+            let (root, config, auth, approved) = match gated(approved, json) {
+                Ok(g) => g,
                 Err(code) => return Ok(code),
             };
-            Ok(not_implemented(json))
+            ship::publish(&root, &config, &auth, reason, approved, room, json)
+        }
+        AppCommand::Rollback { version } => {
+            let (root, _, auth) = match preflight(json) {
+                Ok(p) => p,
+                Err(code) => return Ok(code),
+            };
+            ship::rollback(&root, &auth, version, json)
+        }
+        AppCommand::Destroy => {
+            let (root, _, auth) = match preflight(json) {
+                Ok(p) => p,
+                Err(code) => return Ok(code),
+            };
+            ship::destroy(&root, &auth, json)
         }
         _ => Ok(not_implemented(json)),
     }
+}
+
+/// The app, and the approved card id once the migration gate has passed.
+fn gated(
+    approved: Option<String>,
+    json: bool,
+) -> std::result::Result<(PathBuf, AppConfig, api::Auth, Option<String>), i32> {
+    let (root, config, auth) = preflight(json)?;
+    let approved = destructive_gate(&root, approved, json)?;
+    Ok((root, config, auth, approved))
 }
 
 /// Stops on a destructive migration unless `approved` names the card; returns that id.
@@ -187,6 +226,7 @@ fn destructive_gate(
     ))
 }
 
+/// Commands still to come (`evidence`).
 fn not_implemented(json: bool) -> i32 {
     fail(
         json,

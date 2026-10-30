@@ -321,7 +321,6 @@ pub fn gate(root: &Path) -> Result<GateResult, ApiError> {
 }
 
 /// Marks `files` as shipped. Called by `publish` once the backend accepted them.
-#[allow(dead_code)] // Task 6 (publish) is the caller.
 pub(crate) fn record(root: &Path, files: &[String]) -> Result<(), ApiError> {
     let (mut v, mut list) = applied(root)?;
     for f in files {
