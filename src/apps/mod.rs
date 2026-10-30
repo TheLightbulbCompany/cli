@@ -162,6 +162,14 @@ fn destructive_gate(
     approved: Option<String>,
     json: bool,
 ) -> std::result::Result<Option<String>, i32> {
+    if approved.as_deref().is_some_and(|a| a.trim().is_empty()) {
+        return Err(fail(
+            json,
+            "bad_args",
+            "--approved needs the id of an approved card.",
+            "pass --approved <card id>, or leave it out",
+        ));
+    }
     let g = migrations::gate(root).map_err(|e| fail(json, &e.code, &e.message, &e.next))?;
     if g.findings.is_empty() || approved.is_some() {
         return Ok(approved);

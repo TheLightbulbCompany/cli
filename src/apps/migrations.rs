@@ -40,7 +40,7 @@ pub const NEXT: &str =
 pub struct Finding {
     pub statement: String,
     /// `drop_table`, `drop_column`, `rename_table`, `rename_column`, `alter_type`,
-    /// `set_not_null`, `truncate` or `delete`.
+    /// `set_not_null`, `truncate`, `delete` or `dynamic_sql`.
     pub kind: &'static str,
 }
 
@@ -98,8 +98,17 @@ fn split(sql: &str) -> Vec<(String, String)> {
             // Quoted text; a doubled quote is an escaped one. Identifiers stay visible in the
             // mask (a column called "delete" is still not a DELETE: rules look at keywords only).
             let start = i;
+            // E'...' strings treat a backslash as an escape (E is not the end of a name).
+            let escapes = ch == '\''
+                && i > 0
+                && matches!(c[i - 1], 'E' | 'e')
+                && (i < 2 || !(c[i - 2].is_alphanumeric() || matches!(c[i - 2], '_' | '$')));
             i += 1;
             while i < c.len() {
+                if escapes && c[i] == '\\' {
+                    i += 2;
+                    continue;
+                }
                 if c[i] == ch {
                     if c.get(i + 1) == Some(&ch) {
                         i += 1;
@@ -159,64 +168,100 @@ fn dollar_tag(c: &[char], i: usize) -> Option<Vec<char>> {
     Some(c[i..=j].to_vec())
 }
 
-/// Every statement in `sql` that can lose data.
+/// Every statement in `sql` that can lose data. Fails closed: code the gate cannot read
+/// (`DO`, `CALL`, `EXECUTE`, `PREPARE`) is `dynamic_sql`.
 pub fn classify(sql: &str) -> Vec<Finding> {
     let re = |p: &str| Regex::new(&format!("(?is){p}")).unwrap();
-    let drop_table = re(r"^DROP\s+(TABLE|SCHEMA)\b");
-    let truncate = re(r"^TRUNCATE\b");
-    let delete = re(r"^DELETE\b");
-    let alter_table = re(r"^ALTER\s+TABLE\b");
-    let drop_target = re(r"\bDROP\s+(?:IF\s+EXISTS\s+)?(\w+|\x22)");
-    let rename_table = re(r"\bRENAME\s+TO\b");
-    let rename_column = re(r"\bRENAME\s+(?:COLUMN\s+)?(?:\w+|\x22x\x22)\s+TO\b");
-    let alter_type = re(r"\bALTER\s+COLUMN\b.*?\b(?:SET\s+DATA\s+)?TYPE\b");
-    let set_not_null = re(r"\bSET\s+NOT\s+NULL\b");
-    // After DROP, these are not a column (ALTER TABLE DROP CONSTRAINT / DEFAULT / NOT NULL ...).
-    let not_columns = [
-        "CONSTRAINT",
-        "DEFAULT",
-        "EXPRESSION",
-        "IDENTITY",
-        "INHERIT",
-        "NOT",
-        "OF",
-        "REPLICA",
-    ];
+    let r = Rules {
+        drop_table: re(r"^DROP\s+(?:TABLE|SCHEMA|DATABASE|OWNED)\b|^DROP\b.*\bCASCADE\b"),
+        dynamic: re(r"^(?:DO|CALL|EXECUTE|PREPARE)\b"),
+        truncate: re(r"^TRUNCATE\b"),
+        delete: re(r"^DELETE\b|^(?:WITH|MERGE)\b.*\bDELETE\b"),
+        explain: re(
+            r"^EXPLAIN\s+(?:\((?:[^)]*\bANALY[SZ]E\b[^)]*)\)|ANALY[SZ]E\b(?:\s+VERBOSE\b)?)\s*",
+        ),
+        alter_table: re(r"^ALTER\s+TABLE\b"),
+        drop_target: re(r"\bDROP\s+(?:IF\s+EXISTS\s+)?(\w+|\x22)"),
+        rename_table: re(r"\bRENAME\s+TO\b"),
+        rename_column: re(r"\bRENAME\s+(?:COLUMN\s+)?(?:\w+|\x22x\x22)\s+TO\b"),
+        alter_type: re(r"\bALTER\s+(?:COLUMN\s+)?(?:\w+|\x22x\x22)\s+(?:SET\s+DATA\s+)?TYPE\b"),
+        set_not_null: re(r"\bSET\s+NOT\s+NULL\b"),
+    };
     let mut found = vec![];
     for (text, mask) in split(sql) {
-        let mut kinds = vec![];
-        if drop_table.is_match(&mask) {
-            // A dropped schema takes its tables with it.
-            kinds.push("drop_table");
-        } else if truncate.is_match(&mask) {
-            kinds.push("truncate");
-        } else if delete.is_match(&mask) {
-            kinds.push("delete");
-        } else if alter_table.is_match(&mask) {
-            if drop_target.captures_iter(&mask).any(|c| {
-                let w = c[1].to_uppercase();
-                w == "COLUMN" || !not_columns.contains(&w.as_str())
-            }) {
-                kinds.push("drop_column");
-            }
-            if rename_table.is_match(&mask) {
-                kinds.push("rename_table");
-            } else if rename_column.is_match(&mask) {
-                kinds.push("rename_column");
-            }
-            if alter_type.is_match(&mask) {
-                kinds.push("alter_type");
-            }
-            if set_not_null.is_match(&mask) {
-                kinds.push("set_not_null");
-            }
-        }
-        found.extend(kinds.into_iter().map(|kind| Finding {
+        found.extend(r.kinds(&mask).into_iter().map(|kind| Finding {
             statement: text.clone(),
             kind,
         }));
     }
     found
+}
+
+struct Rules {
+    drop_table: Regex,
+    dynamic: Regex,
+    truncate: Regex,
+    delete: Regex,
+    explain: Regex,
+    alter_table: Regex,
+    drop_target: Regex,
+    rename_table: Regex,
+    rename_column: Regex,
+    alter_type: Regex,
+    set_not_null: Regex,
+}
+
+impl Rules {
+    fn kinds(&self, mask: &str) -> Vec<&'static str> {
+        // After DROP, these are not a column (ALTER TABLE DROP CONSTRAINT / DEFAULT / NOT NULL ...).
+        const NOT_COLUMNS: [&str; 8] = [
+            "CONSTRAINT",
+            "DEFAULT",
+            "EXPRESSION",
+            "IDENTITY",
+            "INHERIT",
+            "NOT",
+            "OF",
+            "REPLICA",
+        ];
+        // EXPLAIN ANALYZE runs the statement: look at the statement.
+        if let Some(m) = self.explain.find(mask) {
+            return self.kinds(&mask[m.end()..]);
+        }
+        if self.drop_table.is_match(mask) {
+            return vec!["drop_table"];
+        }
+        if self.dynamic.is_match(mask) {
+            return vec!["dynamic_sql"];
+        }
+        if self.truncate.is_match(mask) {
+            return vec!["truncate"];
+        }
+        if self.delete.is_match(mask) {
+            return vec!["delete"];
+        }
+        let mut kinds = vec![];
+        if self.alter_table.is_match(mask) {
+            if self.drop_target.captures_iter(mask).any(|c| {
+                let w = c[1].to_uppercase();
+                w == "COLUMN" || !NOT_COLUMNS.contains(&w.as_str())
+            }) {
+                kinds.push("drop_column");
+            }
+            if self.rename_table.is_match(mask) {
+                kinds.push("rename_table");
+            } else if self.rename_column.is_match(mask) {
+                kinds.push("rename_column");
+            }
+            if self.alter_type.is_match(mask) {
+                kinds.push("alter_type");
+            }
+            if self.set_not_null.is_match(mask) {
+                kinds.push("set_not_null");
+            }
+        }
+        kinds
+    }
 }
 
 fn bad(why: String) -> ApiError {

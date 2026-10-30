@@ -858,7 +858,7 @@ fn drop_table_lists_the_statement() {
     // A semicolon inside a string or dollar quote does not split.
     assert_eq!(
         kinds("DO $$ BEGIN DELETE FROM t; END $$; SELECT ';'; DROP TABLE t;"),
-        ["drop_table"]
+        ["dynamic_sql", "drop_table"]
     );
 }
 
@@ -925,4 +925,74 @@ fn up_stops_on_a_destructive_migration_unless_approved() {
         "rewrite add-only (add a column, copy data), or ask the owner and pass --approved <card id>"
     );
     assert_eq!(run(&["--approved", "card-1"])["code"], "not_implemented");
+}
+
+#[test]
+fn code_the_gate_cannot_read_fails_closed() {
+    for sql in ["CALL wipe();", "EXECUTE p;", "PREPARE p AS DELETE FROM t;"] {
+        assert_eq!(kinds(sql), ["dynamic_sql"], "{sql}");
+    }
+    assert_eq!(
+        kinds("WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d;"),
+        ["delete"]
+    );
+    assert_eq!(
+        kinds("MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE;"),
+        ["delete"]
+    );
+    assert_eq!(kinds("EXPLAIN ANALYZE DELETE FROM t;"), ["delete"]);
+    assert_eq!(
+        kinds("EXPLAIN (ANALYZE, VERBOSE) DROP TABLE t;"),
+        ["drop_table"]
+    );
+    assert!(kinds("EXPLAIN DELETE FROM t;").is_empty());
+    assert!(kinds("WITH x AS (SELECT 1) SELECT * FROM x;").is_empty());
+}
+
+#[test]
+fn drop_database_owned_and_cascade_are_drop_table() {
+    for sql in [
+        "DROP DATABASE d;",
+        "DROP OWNED BY u;",
+        "DROP VIEW v CASCADE;",
+        "DROP TYPE t CASCADE;",
+    ] {
+        assert_eq!(kinds(sql), ["drop_table"], "{sql}");
+    }
+    assert!(kinds("DROP INDEX i;").is_empty());
+}
+
+#[test]
+fn e_string_escapes_do_not_hide_a_statement() {
+    assert_eq!(
+        kinds("SELECT E'\\'' ; DROP TABLE x; SELECT 'a';"),
+        ["drop_table"]
+    );
+    // A name ending in e is not an E-string: the quote closes normally.
+    assert_eq!(kinds("SELECT name'\\'; DROP TABLE x;"), ["drop_table"]);
+}
+
+#[test]
+fn alter_type_without_the_word_column() {
+    assert_eq!(kinds("ALTER TABLE t ALTER c TYPE int;"), ["alter_type"]);
+    assert_eq!(
+        kinds("ALTER TABLE t ALTER c SET DATA TYPE int;"),
+        ["alter_type"]
+    );
+}
+
+#[test]
+fn an_empty_approval_is_refused() {
+    let e = Env::new();
+    let tmp = tempfile::tempdir().unwrap();
+    assert_eq!(app_new(&e, tmp.path(), &["empty"]).status.code(), Some(0));
+    let o = e
+        .base_cmd(Command::new(common::EXE))
+        .current_dir(tmp.path().join("empty"))
+        .args(["app", "up", "--json", "--approved", "  "])
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(1));
+    let v: Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["code"], "bad_args");
 }
