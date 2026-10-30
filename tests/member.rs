@@ -840,3 +840,85 @@ async fn a_revoked_key_is_refused_even_with_a_valid_proof() {
     ok(&sock, &token, "stop", json!({}));
     exits_zero(child);
 }
+
+/// `who` signed in as `user`, dialing the member behind `sock` with a `hello` that syncs
+/// memory and empty heads: every memory entry the member sends it within 2 s.
+async fn memory_from(sock: &Path, token: &str, who: &Identity, user: &str) -> Vec<String> {
+    use lightbulb::net::frames;
+    let key = ok(sock, token, "identity.get", json!({}))["member_key"].clone();
+    let port = ok(sock, token, "status", json!({}))["port"]
+        .as_u64()
+        .unwrap();
+    let ep = common::endpoint(who).await;
+    let conn = ep
+        .connect(
+            common::loopback(key.as_str().unwrap(), port),
+            lightbulb::net::ALPN,
+        )
+        .await
+        .unwrap();
+    let (send, recv) = conn.open_bi().await.unwrap();
+    let mut p = Peer { conn, send, recv };
+    let proof = common::issuer::proof(&who.key, user, common::now_s());
+    p.hello_full(vec![], Some(proof), true).await;
+    p.send(&Frame::MemoryHeads {
+        heads: Default::default(),
+    })
+    .await;
+    let mut got = vec![];
+    let end = tokio::time::Instant::now() + Duration::from_secs(2);
+    while let Ok(Ok(f)) = tokio::time::timeout_at(end, frames::read(&mut p.recv)).await {
+        if let Frame::Memory { entries, .. } = f {
+            got.extend(entries.into_iter().map(|e| e.id));
+        }
+    }
+    got
+}
+
+/// A workspace member's own entries (the facts it imports from its rooms) go only to the
+/// computers its workspace admits, by the gate its mail uses; a laptop's team entry it holds
+/// still goes to every member.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn workspace_entries_reach_only_workspace_members() {
+    use lightbulb::memory::{self, Kind as Fact, Op, Scope, Source};
+    let dir = tempfile::tempdir().unwrap();
+    let a = seed(dir.path());
+    let home = dir.path().join("home");
+    let w = Identity::load_or_create(&home).unwrap();
+    let b = identity();
+    let store = Store::open(&home.join("state.db")).unwrap();
+    let head = roster::entries(&store).unwrap().pop().unwrap();
+    roster::accept(&store, &common::admit(&a, &head, &b, "b", json!({})), 10).unwrap();
+    let team = |fact: &str| Op::Remember {
+        subject: "s".into(),
+        fact: fact.into(),
+        kind: Fact::Fact,
+        scope: Scope::Team,
+        when: None,
+        source: Source {
+            harness: "test".into(),
+            repo: None,
+            session: None,
+            on_behalf_of: None,
+            shared_from: None,
+        },
+        replaces: vec![],
+    };
+    let room = memory::remember(&store, &w, team("from a workspace room"), 5).unwrap();
+    let laptop = memory::remember(&store, &a, team("from a's laptop"), 5).unwrap();
+    drop(store);
+    let file = json!({"workspace": NAME, "sessions": friday(), "members": ["user_a"]});
+    let (child, token, sock) = common::member_with(dir.path(), file);
+
+    let to_a = memory_from(&sock, &token, &a, "user_a").await;
+    assert!(
+        to_a.contains(&room.id) && to_a.contains(&laptop.id),
+        "{to_a:?}"
+    );
+    let to_b = memory_from(&sock, &token, &b, "user_b").await;
+    assert!(to_b.contains(&laptop.id), "{to_b:?}");
+    assert!(!to_b.contains(&room.id), "{to_b:?}");
+
+    ok(&sock, &token, "stop", json!({}));
+    exits_zero(child);
+}

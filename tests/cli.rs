@@ -131,6 +131,7 @@ fn help_hides_the_agent_plumbing() {
             "{help}"
         );
     }
+    assert!(help.contains("Apps you build:\n  app "), "{help}");
     // Still accepted.
     assert!(e.run(&["daemon", "--help"]).status.success());
 }
@@ -703,6 +704,34 @@ fn no_model_survives_a_refresh() {
     );
     let config = lightbulb::config::Config::load(e.state.path()).unwrap();
     assert!(!config.memory_model);
+}
+
+/// The daemon's own `setup --refresh` (after an auto-update) never boots out the job it runs
+/// under (that killed it before the reload); it only rewrites the plist, so the job still
+/// starts at login.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_refresh_leaves_the_loaded_job_alone() {
+    let e = Env::new();
+    let plist = e
+        .home
+        .path()
+        .join("Library/LaunchAgents/company.thelightbulb.connect.plist");
+    assert!(e.run(&["setup", "--no-model"]).status.success());
+    let first = std::fs::read_to_string(&plist).unwrap();
+    std::fs::remove_file(&plist).unwrap();
+    let o = e.run(&["setup", "--refresh"]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(!out(&o).contains("would run: bootout"), "{}", out(&o));
+    assert!(
+        out(&o).contains("Background service: left running"),
+        "{}",
+        out(&o)
+    );
+    assert_eq!(std::fs::read_to_string(&plist).unwrap(), first);
+    let d = out(&e.run(&["doctor"]));
+    let row = d.lines().find(|l| l.contains("Starts at login")).unwrap();
+    assert!(row.contains("yes"), "{d}");
 }
 
 /// A person's plain `setup` turns the model back on, and the refresh then follows that.

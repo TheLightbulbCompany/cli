@@ -1,0 +1,12 @@
+node_modules
+.next
+.env*
+.vercel
+.lightbulb/progress.json
+.lightbulb/evidence/
+next-env.d.ts
+*.tsbuildinfo
+.DS_Store
+.lightbulb/app.json
+.lightbulb/migrations.json
+/media

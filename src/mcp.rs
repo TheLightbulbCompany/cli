@@ -550,6 +550,25 @@ pub(crate) fn rest(
     body: Option<&Value>,
     label: &str,
 ) -> Result<Value, Value> {
+    let body = body.map(Value::to_string).unwrap_or_default();
+    let headers = proof_headers(method, path, body.as_bytes(), label)?;
+    let headers: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let body = (!body.is_empty()).then_some(body.as_str());
+    match login::request(method, path, body, &headers) {
+        Ok((code, v)) if (200..300).contains(&code) => Ok(v),
+        Ok((code, v)) => Err(json!({"error": login::said(code, &v), "status": code})),
+        Err(_) => Err(json!({"error": "unreachable"})),
+    }
+}
+
+/// The three signed headers for one call whose raw body is `body` (see `rest`), or the error
+/// result: not signed in, or this computer's identity is unavailable.
+pub(crate) fn proof_headers(
+    method: &str,
+    path: &str,
+    body: &[u8],
+    label: &str,
+) -> Result<Vec<(&'static str, String)>, Value> {
     let dir = paths::state_path();
     let Some(proof) = login::stored_proof(&dir) else {
         return Err(json!({"error": "not_signed_in", "hint": "run lightbulb login"}));
@@ -563,8 +582,7 @@ pub(crate) fn rest(
     }
     let id = login::identity()
         .map_err(|e| json!({"error": "identity_unavailable", "hint": e.to_string()}))?;
-    let body = body.map(Value::to_string).unwrap_or_default();
-    let hash: String = Sha256::digest(body.as_bytes())
+    let hash: String = Sha256::digest(body)
         .iter()
         .map(|x| format!("{x:02x}"))
         .collect();
@@ -583,17 +601,11 @@ pub(crate) fn rest(
         .unwrap_or_default()
         .to_string();
     let challenge = data_encoding::BASE64URL_NOPAD.encode(challenge.as_bytes());
-    let headers = [
-        ("X-Lightbulb-Proof", proof.as_str()),
-        ("X-Lightbulb-Challenge", challenge.as_str()),
-        ("X-Lightbulb-Sig", sig.as_str()),
-    ];
-    let body = (!body.is_empty()).then_some(body.as_str());
-    match login::request(method, path, body, &headers) {
-        Ok((code, v)) if (200..300).contains(&code) => Ok(v),
-        Ok((code, v)) => Err(json!({"error": login::said(code, &v), "status": code})),
-        Err(_) => Err(json!({"error": "unreachable"})),
-    }
+    Ok(vec![
+        ("X-Lightbulb-Proof", proof),
+        ("X-Lightbulb-Challenge", challenge),
+        ("X-Lightbulb-Sig", sig),
+    ])
 }
 
 impl Server {

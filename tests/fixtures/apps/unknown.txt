@@ -1,0 +1,2 @@
+pnpm audit running
+audit: 1 high vulnerability

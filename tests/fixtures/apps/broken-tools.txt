@@ -1,0 +1,5 @@
+
+> team-lunch@0.1.0 check /work/team-lunch
+> tsc --noEmit
+
+Error: the server hit broken tools while building.

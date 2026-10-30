@@ -832,7 +832,7 @@ impl Net {
             let _ = tokio::task::spawn_blocking(move || {
                 for (key, conn, tx, theirs) in dd.peers.memory_links() {
                     dd.peers.send_heads(&key, &conn, &ours);
-                    match memsync::send_pages(&dd, &tx, &theirs, memsync::same_person(&dd, &key)) {
+                    match memsync::send_pages(&dd, &tx, &theirs, &key) {
                         Ok(ours) => dd.peers.peer_holds(&key, &conn, &ours),
                         Err(e) => eprintln!("net: memory pages: {e}"),
                     }
@@ -1220,7 +1220,7 @@ impl Net {
                     }
                 }
                 // No answer with our own heads: they are sent when they change.
-                match memsync::send_pages(&d, &tx, &theirs, memsync::same_person(&d, &key)) {
+                match memsync::send_pages(&d, &tx, &theirs, &key) {
                     Ok(ours) => {
                         d.peers.peer_holds(&key, &conn, &theirs);
                         d.peers.peer_holds(&key, &conn, &ours);
