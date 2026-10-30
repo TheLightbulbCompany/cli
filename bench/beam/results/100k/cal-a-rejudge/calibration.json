@@ -1,0 +1,103 @@
+{
+  "mode": "rejudge",
+  "categories": {
+    "abstention": {
+      "questions": 40,
+      "ours": 0.95,
+      "past": 0.9875,
+      "delta": -0.03750000000000009,
+      "pastPublished": 0.9875,
+      "agreement": 0.95,
+      "verdicts": 40
+    },
+    "contradiction_resolution": {
+      "questions": 40,
+      "ours": 0.7125,
+      "past": 0.78125,
+      "delta": -0.06874999999999998,
+      "pastPublished": 0.78125,
+      "agreement": 0.86875,
+      "verdicts": 160
+    },
+    "event_ordering": {
+      "questions": 40,
+      "ours": 1.0,
+      "past": 1.0,
+      "delta": 0.0,
+      "pastPublished": 1.0,
+      "agreement": 1.0,
+      "verdicts": 40
+    },
+    "information_extraction": {
+      "questions": 40,
+      "ours": 0.9375,
+      "past": 0.95,
+      "delta": -0.012499999999999956,
+      "pastPublished": 0.95,
+      "agreement": 0.967391304347826,
+      "verdicts": 92
+    },
+    "instruction_following": {
+      "questions": 40,
+      "ours": 0.96875,
+      "past": 0.9625,
+      "delta": 0.006249999999999978,
+      "pastPublished": 0.9625,
+      "agreement": 0.9491525423728814,
+      "verdicts": 59
+    },
+    "knowledge_update": {
+      "questions": 40,
+      "ours": 0.89375,
+      "past": 0.89375,
+      "delta": 0.0,
+      "pastPublished": 0.89375,
+      "agreement": 1.0,
+      "verdicts": 42
+    },
+    "multi_session_reasoning": {
+      "questions": 40,
+      "ours": 0.6775892857142857,
+      "past": 0.6894642857142858,
+      "delta": -0.01187500000000008,
+      "pastPublished": 0.6894642857142858,
+      "agreement": 0.9504950495049505,
+      "verdicts": 101
+    },
+    "preference_following": {
+      "questions": 40,
+      "ours": 1.0,
+      "past": 1.0,
+      "delta": 0.0,
+      "pastPublished": 1.0,
+      "agreement": 1.0,
+      "verdicts": 74
+    },
+    "summarization": {
+      "questions": 40,
+      "ours": 0.9916666666666666,
+      "past": 0.99375,
+      "delta": -0.002083333333333437,
+      "pastPublished": 0.99375,
+      "agreement": 0.9948717948717949,
+      "verdicts": 195
+    },
+    "temporal_reasoning": {
+      "questions": 40,
+      "ours": 0.9375,
+      "past": 0.95,
+      "delta": -0.012499999999999956,
+      "pastPublished": 0.95,
+      "agreement": 0.9733333333333334,
+      "verdicts": 75
+    }
+  },
+  "overall": {
+    "questions": 400,
+    "ours": 0.9069255952380952,
+    "past": 0.9208214285714286,
+    "delta": -0.013895833333333343,
+    "agreement": 0.9578587699316629,
+    "verdicts": 878
+  }
+}

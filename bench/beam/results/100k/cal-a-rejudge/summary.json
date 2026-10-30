@@ -1,0 +1,72 @@
+{
+  "dataset": "BEAM",
+  "split": "100k",
+  "datasetRevision": "3205395e897e7318c7b094ef4e6047b9b82dbb03",
+  "conversations": 20,
+  "questions": 400,
+  "failedQuestions": 0,
+  "failedVerdicts": 0,
+  "microAverage": 0.9069255952380952,
+  "macroAverage": 0.9069255952380952,
+  "categories": {
+    "abstention": {
+      "questions": 40,
+      "mean": 0.95
+    },
+    "contradiction_resolution": {
+      "questions": 40,
+      "mean": 0.7125
+    },
+    "event_ordering": {
+      "questions": 40,
+      "mean": 1.0
+    },
+    "information_extraction": {
+      "questions": 40,
+      "mean": 0.9375
+    },
+    "instruction_following": {
+      "questions": 40,
+      "mean": 0.96875
+    },
+    "knowledge_update": {
+      "questions": 40,
+      "mean": 0.89375
+    },
+    "multi_session_reasoning": {
+      "questions": 40,
+      "mean": 0.6775892857142857
+    },
+    "preference_following": {
+      "questions": 40,
+      "mean": 1.0
+    },
+    "summarization": {
+      "questions": 40,
+      "mean": 0.9916666666666666
+    },
+    "temporal_reasoning": {
+      "questions": 40,
+      "mean": 0.9375
+    }
+  },
+  "answerModel": "gpt-5.6-luna",
+  "judgeModel": "gpt-5.6-luna",
+  "reasoningEffort": "none",
+  "prompts": {
+    "source": "https://fabric.so/p/beam-3VjBcqEVRofZyA5CeazeX",
+    "sha256": "584b672d957f3e6f75e96f881ec31da22e1039da1df5fbedb53dc6a9145cfc43"
+  },
+  "calibration": "rejudge",
+  "pastResults": "pastdotdev/benchmarks@a712cd993e249cadd214168c3c3ee674f89bd5e4:beam/results/100k/results.jsonl",
+  "usage": {
+    "calls": 1050,
+    "cacheHits": 0,
+    "input_tokens": 8266312,
+    "cached_input_tokens": 6877184,
+    "output_tokens": 41303,
+    "reasoning_output_tokens": 0
+  },
+  "finishedAt": "2026-10-29T00:26:13.981282Z",
+  "codexMemoriesEmpty": true
+}
