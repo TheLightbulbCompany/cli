@@ -107,6 +107,13 @@ pub enum AppCommand {
         #[arg(long)]
         publish: bool,
     },
+    /// Note a tool that failed you in .lightbulb/lessons.md (once per `up`).
+    ReportBrokenTool {
+        /// The tool that broke.
+        tool: String,
+        /// What happened.
+        what: String,
+    },
     /// Record a browser pass for the preview.
     Evidence {
         #[arg(long, value_enum)]
@@ -193,6 +200,13 @@ pub fn run(cmd: AppCommand, json: bool) -> Result<i32> {
             };
             ship::destroy(&root, &auth, json)
         }
+        AppCommand::ReportBrokenTool { tool, what } => {
+            let (root, _, _) = match preflight(json) {
+                Ok(p) => p,
+                Err(code) => return Ok(code),
+            };
+            report_broken_tool(&root, &tool, &what, json)
+        }
         AppCommand::Evidence {
             kind,
             file,
@@ -206,6 +220,64 @@ pub fn run(cmd: AppCommand, json: bool) -> Result<i32> {
             evidence::record(&root, &auth, kind, verdict, &file, &note, json)
         }
     }
+}
+
+/// Appends `- DATE tool: what` under `## Broken tools` in lessons.md; once per `up` cycle.
+fn report_broken_tool(root: &Path, tool: &str, what: &str, json: bool) -> Result<i32> {
+    let one_line = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut progress = match check::read_progress(root) {
+        Ok(p) => p,
+        Err(e) => return Ok(fail(json, &e.code, &e.message, &e.next)),
+    };
+    let cycle = progress["up_cycle"].as_u64().unwrap_or(0);
+    if progress["broken_tool_reported_cycle"].as_u64() == Some(cycle) {
+        return Ok(fail(
+            json,
+            "already_reported",
+            "A broken tool was already reported since the last `up`.",
+            "run lightbulb app up first; one report per cycle",
+        ));
+    }
+    let path = root.join(".lightbulb/lessons.md");
+    let mut text = std::fs::read_to_string(&path).unwrap_or_default();
+    let line = format!(
+        "- {} {}: {}\n",
+        &crate::date::utc(crate::daemon::ipc::now() as i64)[..10],
+        one_line(tool),
+        one_line(what)
+    );
+    let head = "## Broken tools\n";
+    let found = if text.starts_with(head) {
+        Some(0)
+    } else {
+        text.find(&format!("\n{head}")).map(|i| i + 1)
+    };
+    if let Some(at) = found {
+        // After the section's last entry, before the next heading.
+        let start = at + head.len();
+        let end = text[start..].find("\n#").map_or(text.len(), |i| start + i);
+        let at = start + text[start..end].trim_end().len();
+        text.insert_str(at, &format!("\n{}", line.trim_end()));
+    } else {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&format!("\n{head}{line}"));
+    }
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    std::fs::write(&path, text)?;
+    progress["broken_tool_reported_cycle"] = cycle.into();
+    if let Err(e) = check::write_progress(root, &progress) {
+        return Ok(fail(json, &e.code, &e.message, &e.next));
+    }
+    if json {
+        println!("{}", json!({"ok": true}));
+    } else {
+        println!("Noted in .lightbulb/lessons.md.");
+    }
+    Ok(0)
 }
 
 /// The app, and the approved card id once the migration gate has passed.

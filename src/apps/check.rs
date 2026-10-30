@@ -35,14 +35,62 @@ pub struct CheckResult {
     pub next: Option<&'static str>,
 }
 
+/// Entries of a lessons file: a `## `/`### ` heading with the lines under it, or a `- **Title.**`
+/// bullet with its indented continuation lines. Returns (title, body).
+fn entries(text: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = vec![];
+    for line in text.lines() {
+        let heading = line
+            .strip_prefix("### ")
+            .or_else(|| line.strip_prefix("## "));
+        let bullet = line
+            .strip_prefix("- **")
+            .and_then(|r| r.split_once("**"))
+            .map(|(t, _)| t);
+        if let Some(t) = heading.or(bullet) {
+            let t = t.trim_matches(|c: char| c == '.' || c == '"' || c == '`' || c.is_whitespace());
+            let body = if bullet.is_some() { line } else { "" };
+            out.push((t.to_lowercase(), body.to_string()));
+        } else if let Some((_, body)) = out.last_mut() {
+            body.push('\n');
+            body.push_str(line);
+        }
+    }
+    out.into_iter()
+        .map(|(t, b)| (t, b.trim().to_string()))
+        .collect()
+}
+
+/// The entry of `.lightbulb/known-fixes.md` or `lessons.md` that matches `p`, if any. A title
+/// matches when it is a substring of the problem's code or message (case-insensitive), or contains
+/// the code (`TS2307 Cannot find module`). Missing files give no hint.
+pub(crate) fn hint(root: &Path, p: &Problem) -> Option<String> {
+    let code = p.code.as_deref().unwrap_or("").to_lowercase();
+    let message = p.message.to_lowercase();
+    ["known-fixes.md", "lessons.md"].iter().find_map(|f| {
+        let text = std::fs::read_to_string(root.join(".lightbulb").join(f)).ok()?;
+        entries(&text).into_iter().find_map(|(t, body)| {
+            let hit = !t.is_empty()
+                && (code.contains(&t)
+                    || message.contains(&t)
+                    || (!code.is_empty() && t.contains(&code)));
+            (hit && !body.is_empty()).then_some(body)
+        })
+    })
+}
+
 impl CheckResult {
-    fn to_json(&self) -> Value {
+    fn to_json(&self, root: &Path) -> Value {
         let problems: Vec<Value> = self
             .problems
             .iter()
             .map(|p| {
-                json!({"file": p.file, "line": p.line, "column": p.column,
-                "code": p.code, "message": p.message})
+                let mut v = json!({"file": p.file, "line": p.line, "column": p.column,
+                "code": p.code, "message": p.message});
+                if let Some(h) = hint(root, p) {
+                    v["hint"] = h.into();
+                }
+                v
             })
             .collect();
         json!({"ok": self.ok, "problems": problems, "next": self.next})
@@ -252,7 +300,7 @@ pub fn check(publish: bool, json: bool) -> Result<i32> {
     match run_check(&root, publish) {
         Err(e) => Ok(fail(json, &e.code, &e.message, &e.next)),
         Ok(r) => {
-            let v = r.to_json();
+            let v = r.to_json(&root);
             if json {
                 println!("{v}");
             } else if r.ok {
@@ -260,6 +308,9 @@ pub fn check(publish: bool, json: bool) -> Result<i32> {
             } else {
                 for p in &r.problems {
                     println!("{}:{}: {}", p.file, p.line, p.message);
+                    if let Some(h) = hint(&root, p) {
+                        println!("  Hint: {h}");
+                    }
                 }
                 println!("Next: {}", r.next.unwrap_or(""));
             }

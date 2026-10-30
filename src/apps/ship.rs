@@ -351,7 +351,10 @@ fn check_first(root: &Path, publish: bool, json: bool) -> std::result::Result<()
     let problems: Vec<String> = r
         .problems
         .iter()
-        .map(|p| format!("{}:{}: {}", p.file, p.line, p.message))
+        .map(|p| {
+            let h = check::hint(root, p).map_or(String::new(), |h| format!("\nHint: {h}"));
+            format!("{}:{}: {}{h}", p.file, p.line, p.message)
+        })
         .collect();
     Err(fail(
         json,
@@ -370,6 +373,14 @@ pub(crate) fn up(
     json: bool,
 ) -> Result<i32> {
     let room = room_for(root, room)?;
+    // One report of a broken tool is allowed per cycle; each `up` starts a new one.
+    let counted = check::read_progress(root).and_then(|mut p| {
+        p["up_cycle"] = (p["up_cycle"].as_u64().unwrap_or(0) + 1).into();
+        check::write_progress(root, &p)
+    });
+    if let Err(e) = counted {
+        return Ok(failure(json, e));
+    }
     if let Err(code) = check_first(root, false, json) {
         return Ok(code);
     }

@@ -97,7 +97,7 @@ fn help_lists_app_under_apps_you_build() {
         .unwrap();
     let help = String::from_utf8_lossy(&o.stdout);
     assert!(
-        help.contains("Apps you build:\n  app       Build, check, preview, publish and undo apps: app new|up|publish|rollback|status|destroy|check|evidence\n"),
+        help.contains("Apps you build:\n  app       Build, check, preview, publish and undo apps: app new|up|publish|rollback|status|destroy|check|evidence|report-broken-tool\n"),
         "{help}"
     );
 }
@@ -1889,4 +1889,79 @@ fn a_preview_for_another_commit_is_not_named_in_evidence() {
     c.app(&["up"], &base, true);
     let (code, v) = c.evidence(&base, &[]);
     assert_eq!((code, &v["deployment_id"]), (0, &Value::Null));
+}
+
+#[test]
+fn known_fix_is_printed_as_hint() {
+    let c = Checked::new();
+    std::fs::write(
+        c.dir.join(".lightbulb/known-fixes.md"),
+        "# Known fixes\n\n- **Cannot find name 'sql'.** Import it from drizzle-orm.\n  Then rerun.\n- **Unrelated thing.** nope\n",
+    )
+    .unwrap();
+    std::fs::write(
+        c.dir.join(".lightbulb/lessons.md"),
+        "# Lessons\n\n## TS2322 wrong prop type\nCast at the boundary.\n\n## Other\nx\n",
+    )
+    .unwrap();
+    let (_, v) = c.check("tsc.txt", 1, &[]);
+    let p = v["problems"].as_array().unwrap();
+    assert!(
+        p[0]["hint"]
+            .as_str()
+            .unwrap()
+            .contains("Cast at the boundary"),
+        "{v}"
+    );
+    assert!(!p[0]["hint"].as_str().unwrap().contains("Other"), "{v}");
+    assert!(
+        p[1]["hint"].as_str().unwrap().contains("Then rerun."),
+        "{v}"
+    );
+    assert!(!p[1]["hint"].as_str().unwrap().contains("nope"), "{v}");
+    // No files: no hint, no error.
+    std::fs::remove_file(c.dir.join(".lightbulb/known-fixes.md")).unwrap();
+    std::fs::remove_file(c.dir.join(".lightbulb/lessons.md")).unwrap();
+    let (_, v) = c.check("tsc.txt", 1, &[]);
+    assert!(v["problems"][0].get("hint").is_none(), "{v}");
+}
+
+#[test]
+fn broken_tool_report_is_rate_limited_to_one_per_cycle() {
+    let c = Checked::new();
+    let report = |tool: &str, what: &str| {
+        let o =
+            c.e.base_cmd(Command::new(common::EXE))
+                .current_dir(&c.dir)
+                .args(["app", "report-broken-tool", tool, what, "--json"])
+                .output()
+                .unwrap();
+        (
+            o.status.code().unwrap(),
+            serde_json::from_slice::<Value>(&o.stdout).unwrap(),
+        )
+    };
+    let (code, _) = report("browser", "timed out\n## Fake heading");
+    assert_eq!(code, 0);
+    let lessons = std::fs::read_to_string(c.dir.join(".lightbulb/lessons.md")).unwrap();
+    assert_eq!(lessons.matches("## Broken tools").count(), 1, "{lessons}");
+    assert!(
+        lessons.contains(" browser: timed out ## Fake heading\n"),
+        "{lessons}"
+    );
+    assert!(!lessons.contains("\n## Fake"), "{lessons}");
+    let (code, v) = report("browser", "again");
+    assert_eq!(code, 1);
+    assert_eq!(v["code"], "already_reported");
+    assert_eq!(
+        v["next"],
+        "run lightbulb app up first; one report per cycle"
+    );
+    // A new cycle (up increments up_cycle) allows another.
+    let mut p = c.progress();
+    p["up_cycle"] = 1.into();
+    std::fs::write(c.dir.join(".lightbulb/progress.json"), p.to_string()).unwrap();
+    assert_eq!(report("browser", "again").0, 0);
+    let lessons = std::fs::read_to_string(c.dir.join(".lightbulb/lessons.md")).unwrap();
+    assert_eq!(lessons.matches("## Broken tools").count(), 1, "{lessons}");
 }

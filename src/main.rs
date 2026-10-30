@@ -40,7 +40,7 @@ Team:
   telemetry Show or set anonymous usage counts: telemetry on|off|status
 
 Apps you build:
-  app       Build, check, preview, publish and undo apps: app new|up|publish|rollback|status|destroy|check|evidence
+  app       Build, check, preview, publish and undo apps: app new|up|publish|rollback|status|destroy|check|evidence|report-broken-tool
 
 With the Lightbulb app on this Mac: claude, codex, continue '<link>', share on|off and pair
 
