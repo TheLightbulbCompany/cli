@@ -127,7 +127,8 @@ impl Env {
                     && line.contains("\"ok\":true")
             })
         };
-        until(10, "the daemon starts", || {
+        // 20 s: a cold start right after a rebuild can take a while.
+        until(20, "the daemon starts", || {
             assert!(child.try_wait().unwrap().is_none(), "the daemon exited");
             ping()
         });

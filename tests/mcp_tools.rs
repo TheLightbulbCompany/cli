@@ -38,7 +38,8 @@ impl Net {
             claude,
             daemon,
         };
-        for _ in 0..50 {
+        // 20 s: a cold start right after a rebuild can take a while.
+        for _ in 0..200 {
             if UnixStream::connect(net.dir.path().join(paths::SOCKET)).is_ok() {
                 return net;
             }
@@ -120,8 +121,18 @@ impl Net {
 
 impl Drop for Net {
     fn drop(&mut self) {
-        let _ = UnixStream::connect(self.dir.path().join(paths::SOCKET))
+        let sent = UnixStream::connect(self.dir.path().join(paths::SOCKET))
             .and_then(|mut s| s.write_all(b"{\"id\":0,\"op\":\"shutdown\"}\n"));
+        // Never an unbounded wait: a daemon that did not hear it (one that had not come up when
+        // the test panicked) would hang the whole suite.
+        let end = std::time::Instant::now() + Duration::from_secs(10);
+        while sent.is_ok() && std::time::Instant::now() < end {
+            if !matches!(self.daemon.try_wait(), Ok(None)) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = self.daemon.kill();
         let _ = self.daemon.wait();
     }
 }

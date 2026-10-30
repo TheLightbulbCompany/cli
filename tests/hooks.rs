@@ -44,7 +44,8 @@ impl Net {
             claude,
             daemon,
         };
-        for _ in 0..50 {
+        // 20 s: a cold start right after a rebuild can take a while.
+        for _ in 0..200 {
             if UnixStream::connect(net.dir.path().join(paths::SOCKET)).is_ok() {
                 return net;
             }
@@ -170,8 +171,18 @@ impl Net {
 
 impl Drop for Net {
     fn drop(&mut self) {
-        let _ = UnixStream::connect(self.dir.path().join(paths::SOCKET))
+        let sent = UnixStream::connect(self.dir.path().join(paths::SOCKET))
             .and_then(|mut s| s.write_all(b"{\"id\":0,\"op\":\"shutdown\"}\n"));
+        // Never an unbounded wait: a daemon that did not hear it (one that had not come up when
+        // the test panicked) would hang the whole suite.
+        let end = std::time::Instant::now() + Duration::from_secs(10);
+        while sent.is_ok() && std::time::Instant::now() < end {
+            if !matches!(self.daemon.try_wait(), Ok(None)) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = self.daemon.kill();
         let _ = self.daemon.wait();
     }
 }
@@ -1338,4 +1349,20 @@ fn a_claude_p_run_is_identified_listed_nowhere_and_gone_when_it_ends() {
     run("cli", "session-end", "claude-session-end");
     let rows = net.call(json!({"id": 1, "op": "sessions"}));
     assert_eq!(rows["ended"][0]["key"], key.as_str(), "{rows}");
+}
+
+/// A daemon that never came up cannot hear `shutdown`: dropping its `Net` must not wait for it.
+#[test]
+fn dropping_a_net_whose_daemon_never_came_up_does_not_hang() {
+    let daemon = Command::new("/bin/sleep").arg("60").spawn().unwrap();
+    let pid = daemon.id();
+    let net = Net {
+        dir: tempfile::tempdir().unwrap(),
+        claude: tempfile::tempdir().unwrap(),
+        daemon,
+    };
+    let t = std::time::Instant::now();
+    drop(net);
+    assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+    assert!(os::process(pid).is_err(), "killed");
 }
