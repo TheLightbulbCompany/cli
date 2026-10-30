@@ -938,6 +938,29 @@ fn a_refresh_leaves_the_loaded_job_alone() {
     assert!(row.contains("yes"), "{d}");
 }
 
+/// An install from before the waiting hooks gets `Notification` and `PermissionRequest` from the
+/// daemon's `setup --refresh` alone.
+#[test]
+fn a_refresh_adds_the_waiting_hooks() {
+    let e = Env::new();
+    let h = e.home.path();
+    std::fs::create_dir(h.join(".claude")).unwrap();
+    assert!(e.run(&["setup", "--no-model"]).status.success());
+    let file = h.join(".claude/settings.json");
+    let mut doc: Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    for ev in ["Notification", "PermissionRequest"] {
+        assert!(doc["hooks"][ev].is_array(), "setup writes {ev}");
+        doc["hooks"].as_object_mut().unwrap().remove(ev);
+    }
+    std::fs::write(&file, doc.to_string()).unwrap();
+    let o = e.run(&["setup", "--refresh"]);
+    assert!(o.status.success(), "{}", err(&o));
+    let doc: Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    for ev in ["Notification", "PermissionRequest"] {
+        assert!(doc["hooks"][ev].is_array(), "refresh restores {ev}");
+    }
+}
+
 /// A person's plain `setup` turns the model back on, and the refresh then follows that.
 #[cfg(target_os = "macos")]
 #[test]
