@@ -104,7 +104,7 @@ computer with `minishlab/potion-base-8M`, recalled by text and meaning.
 - **The page.** The answerer reads the daemon's `page` text for the question, exactly what an agent
   gets from `recall`: up to 50 facts and 50 turn excerpts (800-character windows around the
   question's words), each line with its author and date, cut by the daemon's own 100-result /
-  8,000-token trim. Pages averaged 7,980 tokens.
+  8,000-token trim.
 - **Which code.** The run used `loop/contested-line` at `94d73ff` with the `bench` ops on top. That
   change shipped as #95 (`d94c917`) in v0.7.2. The merged version adds two things: a "vs" value is
   labelled with the person an entry was written for, and the session-start block shows at most three
@@ -152,8 +152,8 @@ than the free engine's:
 
 ## What was not run
 
-- **BEAM 500K, 1M and 10M.** Only 100K was run. The larger splits have more conversations and much
-  longer ones, and the note-taker reads every turn, so each costs many more model calls. 100K came
+- **BEAM 500K, 1M and 10M.** Only 100K was run. The larger splits have much longer conversations,
+  and the note-taker reads every turn, so each costs many more model calls. 100K came
   first to measure the model-path offset and to fix the recall page. Nothing here says how either
   engine behaves at 1M or 10M tokens.
 - **Repeats.** Each column is one run with one judgement per question. Run-to-run and judge noise
