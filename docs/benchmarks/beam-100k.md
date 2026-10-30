@@ -59,7 +59,7 @@ like-for-like column for our engines. Compare our engines with (b), not with the
 BEAM 100K, 20 conversations, 400 questions. Mean x 100 with a bootstrap 95% interval over questions.
 Every column except the first uses `gpt-5.6-luna` through the Codex CLI as answerer and judge.
 
-| Category | Published (1) | (a) Our judge, published answers | (b) Our answerer + judge, published pages | Free engine, page as shipped in v0.7.2 | Workspace engine (2) |
+| Category | Published (1) | (a) Our judge, published answers | (b) Our answerer + judge, published pages | Free engine, page as shipped in v0.7.2 | Workspace engine, Lightbulb-internal (2) |
 |---|---:|---:|---:|---:|---:|
 | abstention | 98.75 [96.2, 100.0] | 95.00 [87.5, 100.0] | 97.50 [92.5, 100.0] | 98.75 [96.2, 100.0] | 100.00 [100.0, 100.0] |
 | contradiction_resolution | 78.12 [74.4, 81.9] | 71.25 [68.1, 74.4] | 69.38 [65.9, 72.5] | 67.81 [64.1, 71.2] | 65.94 [60.9, 70.6] |
@@ -169,12 +169,13 @@ than the free engine's:
 | Part | Where | Commit |
 |---|---|---|
 | Free engine and `bench` ops | this repository | measured: `94d73ff` plus the bench commit `7dd1535`; current: v0.7.3 plus the same ops (this document's pull request) |
-| Runner (harness fork, adapters, note-taker, calibration, verifier, table) | `benchmarks/beam/` in Lightbulb's monorepo | `9453eca96` |
-| Per-question results, stripped | `benchmarks/beam/results/100k/` in the monorepo | `9453eca96` |
-| Workspace engine and its bench routes | Lightbulb's monorepo | `eae5d4b6a`, routes `1f8906af2` and `323e26ef9` |
+| Runner (harness fork, free-engine adapter, note-taker, calibration, verifier, table) | [`bench/beam/`](../../bench/beam/README.md) in this repository | as measured, apart from removing the workspace adapter |
+| Per-question results, stripped | [`bench/beam/results/100k/`](../../bench/beam/results/100k/README.md) in this repository | as measured |
+| Workspace engine, its adapter and its bench routes | Lightbulb's internal backend (not public) | `eae5d4b6a`, routes `1f8906af2` and `323e26ef9` |
 
-The monorepo is private. The runner and the stripped results will be published. Until they are,
-this document is the method and the numbers cannot be checked by anyone outside Lightbulb.
+Everything except the workspace column can be checked from this repository:
+`bench/beam/results/100k/README.md` says which folder holds which column, and `verify.py`
+recomputes each one from its saved verdicts.
 
 The stripped results hold, per question, only ids, category, as-of time, the model's answer, the
 judge's verdicts and the score: no questions, gold answers or recall pages. Event-ordering verdicts
@@ -185,7 +186,8 @@ keep BEAM's reference topic lists, so those files are CC BY-SA 4.0.
 The bench binary and its container are in [../benchmark.md](../benchmark.md). To build exactly the
 measured binary, check out `94d73ff` and cherry-pick `7dd1535` before building.
 
-From `benchmarks/beam/`, with the Codex CLI signed in to an isolated home:
+From `bench/beam/`, with the Codex CLI signed in to an isolated home (prerequisites, call caps and
+the OpenRouter alternative are in [its README](../../bench/beam/README.md)):
 
 ```sh
 export BEAM_LLM=codex BEAM_CODEX_HOME=/path/to/codex-home
@@ -195,11 +197,11 @@ uv run python calibrate.py rejudge  --past <published>/results.jsonl --output ru
 uv run python calibrate.py reanswer --past <published>/results.jsonl --output runs/cal-b-reanswer
 
 # Free engine, the daemon's page text as an agent gets it (container lb-bench running)
-BEAM_FREE_SHIPPED=1 uv run python run.py --backend free --split 100k --output runs/free-100k
+BEAM_FREE_SHIPPED=1 uv run python run.py --backend free --split 100k --output runs/free
 
 # Check every number, then print the table
-uv run python verify.py runs/free-100k
-uv run python table.py published=<published beam/results/100k folder> cal-a=runs/cal-a-rejudge cal-b=runs/cal-b-reanswer free=runs/free-100k
+uv run python verify.py runs/free
+uv run python table.py published=<published beam/results/100k folder> cal-a=runs/cal-a-rejudge cal-b=runs/cal-b-reanswer free=runs/free
 ```
 
 `--budget-calls N` stops a run before model call N+1, and a rerun resumes from the saved replies.

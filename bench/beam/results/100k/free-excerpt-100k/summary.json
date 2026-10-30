@@ -1,0 +1,84 @@
+{
+  "dataset": "BEAM",
+  "split": "100k",
+  "datasetRevision": "3205395e897e7318c7b094ef4e6047b9b82dbb03",
+  "conversations": 20,
+  "questions": 400,
+  "failedQuestions": 0,
+  "failedVerdicts": 0,
+  "microAverage": 0.8764712301587302,
+  "macroAverage": 0.8764712301587302,
+  "categories": {
+    "abstention": {
+      "questions": 40,
+      "mean": 0.975
+    },
+    "contradiction_resolution": {
+      "questions": 40,
+      "mean": 0.671875
+    },
+    "event_ordering": {
+      "questions": 40,
+      "mean": 0.9961111111111111
+    },
+    "information_extraction": {
+      "questions": 40,
+      "mean": 0.8083333333333333
+    },
+    "instruction_following": {
+      "questions": 40,
+      "mean": 0.93125
+    },
+    "knowledge_update": {
+      "questions": 40,
+      "mean": 0.81875
+    },
+    "multi_session_reasoning": {
+      "questions": 40,
+      "mean": 0.6321428571428571
+    },
+    "preference_following": {
+      "questions": 40,
+      "mean": 0.99375
+    },
+    "summarization": {
+      "questions": 40,
+      "mean": 0.98125
+    },
+    "temporal_reasoning": {
+      "questions": 40,
+      "mean": 0.95625
+    }
+  },
+  "answerModel": "gpt-5.6-luna",
+  "judgeModel": "gpt-5.6-luna",
+  "reasoningEffort": "none",
+  "recall": {
+    "limit": 100,
+    "maxTokens": 8000
+  },
+  "prompts": {
+    "source": "https://fabric.so/p/beam-3VjBcqEVRofZyA5CeazeX",
+    "sha256": "584b672d957f3e6f75e96f881ec31da22e1039da1df5fbedb53dc6a9145cfc43"
+  },
+  "backend": "free",
+  "backendStats": {
+    "turns": 5732,
+    "noteCalls": 296,
+    "noteFailures": 0,
+    "remembered": 3164,
+    "refused": 0
+  },
+  "projectTag": "1029-021005",
+  "harnessVersion": "lb-1",
+  "modelPath": "codex-cli",
+  "usage": {
+    "calls": 1174,
+    "cacheHits": 278,
+    "input_tokens": 11735379,
+    "cached_input_tokens": 8312832,
+    "output_tokens": 96849,
+    "reasoning_output_tokens": 0
+  },
+  "finishedAt": "2026-10-29T02:35:32.764837Z"
+}

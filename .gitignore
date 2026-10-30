@@ -1,1 +1,8 @@
 /target
+
+# BEAM runner (bench/beam): the venv, the downloaded ExaBase prompts, and local runs
+/bench/beam/.venv
+/bench/beam/.cache
+/bench/beam/runs
+/bench/beam/.pytest_cache
+__pycache__/
