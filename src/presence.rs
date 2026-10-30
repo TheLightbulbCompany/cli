@@ -422,7 +422,7 @@ fn stored(d: &Daemon) -> Vec<(Member, Latest)> {
 /// A directory record (architecture §9); `cwd` is empty for another computer's session.
 /// `verified` as its label says it (`label::verified`); `online`, whether its computer is
 /// connected now (this one always is).
-fn record(m: &Member, me: &str, s: &Remote, cwd: &str, verified: bool, online: bool) -> Value {
+fn record(m: &Member, s: &Remote, cwd: &str, verified: bool, online: bool) -> Value {
     json!({
         "session_id": s.session_id,
         "person": m.name,
@@ -438,8 +438,6 @@ fn record(m: &Member, me: &str, s: &Remote, cwd: &str, verified: bool, online: b
         "title": s.title,
         "tier": s.tier,
         "online": online,
-        "can_send": true,
-        "needs_owner_ok": m.person_id != me,
     })
 }
 
@@ -466,10 +464,10 @@ pub fn directory(d: &Daemon, query: Option<&str>) -> Value {
             .collect(),
     };
     let remote_ones = stored(d);
-    let (me, own) = {
+    let own = {
         let t = d.team.lock().unwrap();
         let own = t.roster.members.get(&d.identity.key).cloned();
-        let own = own.unwrap_or_else(|| Member {
+        own.unwrap_or_else(|| Member {
             key: d.identity.key.clone(),
             short: d.identity.short.clone(),
             name: crate::daemon::user_name(),
@@ -478,8 +476,7 @@ pub fn directory(d: &Daemon, query: Option<&str>) -> Value {
             role: Role::Member,
             admitted_at: 0,
             by: None,
-        });
-        (my_person(d, &t.roster), own)
+        })
     };
     let q = query.map(str::to_lowercase).filter(|q| !q.is_empty());
     let hit = |m: &Member, s: &Remote, cwd: &str| {
@@ -507,7 +504,7 @@ pub fn directory(d: &Daemon, query: Option<&str>) -> Value {
                 .is_some_and(|h| h.to_lowercase().contains(q))
         };
         if hit(&own, r, cwd) || q.as_ref().is_some_and(named) {
-            let mut v = record(&own, &me, r, cwd, true, true);
+            let mut v = record(&own, r, cwd, true, true);
             v["handle"] = handle.clone().into();
             if *hidden {
                 v["hidden"] = true.into();
@@ -518,7 +515,7 @@ pub fn directory(d: &Daemon, query: Option<&str>) -> Value {
     for (m, l) in &remote_ones {
         let (verified, up) = (crate::label::verified(m, key), d.peers.is_online(&m.key));
         for r in l.sessions.iter().filter(|r| hit(m, r, "")) {
-            out.push(record(m, &me, r, "", verified, up));
+            out.push(record(m, r, "", verified, up));
         }
     }
     json!({ "sessions": out })

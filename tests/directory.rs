@@ -85,7 +85,12 @@ async fn each_member_sees_the_whole_directory() {
         (&mine["cwd"], &mine["person"], &mine["computer"]),
         (&json!("/tmp/work/api"), &json!("prasiddha"), &json!("mac"))
     );
-    assert_eq!(mine["needs_owner_ok"], false);
+    for r in &on_a {
+        assert!(
+            r.get("can_send").is_none() && r.get("needs_owner_ok").is_none(),
+            "{r}"
+        );
+    }
     for (field, want) in [
         ("cwd", json!("")),
         ("person", json!("bob")),
@@ -93,8 +98,6 @@ async fn each_member_sees_the_whole_directory() {
         ("computer", json!("mbp")),
         ("agent", json!("claude")),
         ("status", json!("idle")),
-        ("can_send", json!(true)),
-        ("needs_owner_ok", json!(true)),
     ] {
         assert_eq!(theirs[field], want, "{field}: {theirs}");
     }

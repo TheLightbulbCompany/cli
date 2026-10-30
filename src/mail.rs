@@ -17,7 +17,7 @@ pub const NOT_A_MEMBER: &str =
     "This workspace answers its members. Ask an admin to add you, then run `lightbulb login`";
 /// Offline mail (and, later, the outbox) waits this long.
 pub const HOLD_S: u64 = 86_400;
-/// A held message waits this long for the person (nothing holds in Plan A).
+/// A row is kept this long after its final state; nothing is held (owner ruling 2026-10-26).
 pub const HELD_S: u64 = 604_800;
 pub const MAX_TEXT: usize = 65_536;
 pub const MAX_REQUEST_ID: usize = 128;
@@ -178,7 +178,7 @@ fn receipt_text(r: &Value, person: Option<&ForPerson>) -> Option<String> {
         _ => "paused by a loop limit".into(),
     };
     let Some(p) = person else {
-        let (computer, person) = (at("where"), at("person"));
+        let computer = at("where");
         return Some(match at("state") {
             "refused" if at("reason") == "loop" => limit(),
             "queued" if remote && r["waking"] == true => {
@@ -193,7 +193,6 @@ fn receipt_text(r: &Value, person: Option<&ForPerson>) -> Option<String> {
                 format!("queued: {computer} {why}. Will retry until {}.", until())
             }
             "stored" if remote => format!("stored on {computer}."),
-            "held" if remote => format!("held: waiting for {person} to approve"),
             _ => return None,
         });
     };
@@ -219,7 +218,6 @@ fn receipt_text(r: &Value, person: Option<&ForPerson>) -> Option<String> {
                 _ => shown("reason").replace('_', " "),
             }
         ),
-        "held" => format!("Sent. {who} has to allow it first (they see a prompt).{check}"),
         "queued" if remote && r["waking"] == true => {
             format!("Sent. {computer} is waking up and gets it in a moment.{check}")
         }

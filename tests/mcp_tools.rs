@@ -534,8 +534,6 @@ fn find_sessions_marks_is_this_session() {
     assert_eq!(by_name["total"], 1, "{by_name}");
     assert_eq!(by_name["sessions"][0]["session_id"], theirs.as_str());
     assert_eq!(b["online"], true);
-    assert_eq!(b["can_send"], true);
-    assert_eq!(b["needs_owner_ok"], false);
     assert_eq!(b["tier"], "next_step");
     assert!(b["computer"].as_str().is_some_and(|c| !c.is_empty()));
     assert!(b["person"].as_str().is_some_and(|c| !c.is_empty()));
@@ -747,7 +745,6 @@ fn find_sessions_lists_teammates_with_person_and_computer() {
         (&json!("bob"), &json!("mbp"), &json!(false)),
         "{bob}"
     );
-    assert_eq!(bob["needs_owner_ok"], true, "{bob}");
     assert_eq!(bob["is_this_session"], false, "{bob}");
     assert_eq!(bob["cwd"], "", "a teammate's path stays on their computer");
     // The query reaches teammates too: by person, by computer.
