@@ -1,6 +1,6 @@
 mod common;
 
-use common::Env;
+use common::{until, Env};
 use lightbulb::{daemon, os, paths};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
@@ -190,7 +190,7 @@ fn by<'a>(sessions: &'a [Value], conversation: &str) -> Option<&'a Value> {
 }
 
 #[test]
-fn the_listing_feeds_sessions_and_a_failing_claude_falls_back_to_pid_files() {
+fn the_listing_feeds_sessions_and_when_claude_fails_only_the_registered_row_stays() {
     let five = include_str!("fixtures/claude-agents/five.json")
         .replace("\"pid\": 4242", &format!("\"pid\": {}", std::process::id()));
     let (shim, path) = claude_shim(&five);
@@ -204,12 +204,9 @@ fn the_listing_feeds_sessions_and_a_failing_claude_falls_back_to_pid_files() {
         ],
     );
     register_claude(&e, "mine", "idle", None);
+    // Read on its own thread: the first answers come from the rows alone.
+    until(10, "the listing is read", || listed(&e).len() == 9);
     let s = listed(&e);
-    assert_eq!(
-        s.len(),
-        9,
-        "eight live listed rows and the registered one: {s:?}"
-    );
     let blocked = by(&s, "b1b2c3d4-0000-4000-8000-000000000002").unwrap();
     assert_eq!(
         (blocked["status"].as_str(), blocked["waiting_for"].as_str()),
@@ -219,23 +216,46 @@ fn the_listing_feeds_sessions_and_a_failing_claude_falls_back_to_pid_files() {
     assert_eq!(done["job"]["state"], "done");
     assert!(by(&s, "d1b2c3d4-0000-4000-8000-000000000004").is_none());
 
-    // Claude fails: the pid files (none here) and the registered rows are the list again.
-    set_shim(shim.path(), "exit 1");
+    // Claude fails, and there are no pid files here: the registered row is the whole list.
+    let tries = shim.path().join("tries");
+    set_shim(
+        shim.path(),
+        &format!("echo x >> '{}'\nexit 1", tries.display()),
+    );
     register_claude(&e, "mine", "busy", None);
-    std::thread::sleep(std::time::Duration::from_millis(2100));
+    until(15, "the failed read lands", || listed(&e).len() == 1);
     let s = listed(&e);
-    assert_eq!(s.len(), 1, "{s:?}");
     assert_eq!(s[0]["conversation"], "mine");
     assert_eq!(s[0]["status"], "live");
+
+    // One line in the daemon's log for the streak, however many reads fail.
+    let count = || {
+        std::fs::read_to_string(&tries)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    until(15, "a second failed read", || {
+        register_claude(&e, "mine", "busy", None);
+        listed(&e);
+        count() >= 2
+    });
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let log = std::fs::read_to_string(e.state.path().join("daemon.log")).unwrap();
+    assert_eq!(log.matches("claude agents: no answer").count(), 1, "{log}");
 }
 
-/// A hook's `waiting` is newer than a listing that still says `busy`; the next hook moves it on.
+/// A hook's `waiting` is newer than a listing that still says `busy`; the next hook moves it
+/// on, and a later listing saying `idle` clears a new `waiting`.
 #[test]
 fn a_hook_waiting_stands_over_a_stale_listing() {
     let c = "e1b2c3d4-0000-4000-8000-000000000005";
-    let row = json!([{"pid": std::process::id(), "cwd": "/tmp/p", "kind": "interactive",
-        "startedAt": 1, "sessionId": c, "status": "busy"}]);
-    let (_shim, path) = claude_shim(&row.to_string());
+    let row = |status: &str| {
+        json!([{"pid": std::process::id(), "cwd": "/tmp/p", "kind": "interactive", "name": "shim",
+            "startedAt": 1, "sessionId": c, "status": status}])
+        .to_string()
+    };
+    let (shim, path) = claude_shim(&row("busy"));
     let e = Env::new();
     e.daemon(
         false,
@@ -246,6 +266,10 @@ fn a_hook_waiting_stands_over_a_stale_listing() {
         ],
     );
     register_claude(&e, c, "waiting", Some("permission prompt"));
+    // The listing's `name` shows it has been read.
+    until(10, "the listing is read", || {
+        by(&listed(&e), c).is_some_and(|s| s["title"] == "shim")
+    });
     let s = listed(&e);
     let w = by(&s, c).unwrap();
     assert_eq!(
@@ -254,6 +278,31 @@ fn a_hook_waiting_stands_over_a_stale_listing() {
     );
     register_claude(&e, c, "busy", None);
     assert_eq!(by(&listed(&e), c).unwrap()["status"], "live");
+
+    std::fs::write(shim.path().join("listing.json"), row("idle")).unwrap();
+    register_claude(&e, c, "waiting", Some("permission prompt"));
+    until(15, "the listing's idle clears it", || {
+        by(&listed(&e), c).is_some_and(|s| s["status"] == "idle")
+    });
+}
+
+/// Only the listing clears a hook's `waiting`: a pid file saying `idle` may just be behind it.
+#[test]
+fn a_pid_file_saying_idle_leaves_a_hook_waiting() {
+    let e = Env::new();
+    let sessions = e.home.path().join(".claude/sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let pid = std::process::id();
+    std::fs::write(
+        sessions.join("a.json"),
+        json!({"pid": pid, "sessionId": "w", "cwd": "/tmp/p", "status": "idle",
+            "startedAt": os::started_ms(pid).unwrap()})
+        .to_string(),
+    )
+    .unwrap();
+    e.daemon(false, "", &[]);
+    register_claude(&e, "w", "waiting", Some("input needed"));
+    assert_eq!(by(&listed(&e), "w").unwrap()["status"], "waiting");
 }
 
 /// A test daemon whose `PATH` has a `claude` leaves it alone unless told to ask it.
@@ -271,4 +320,34 @@ fn a_debug_daemon_never_runs_a_claude_it_was_not_told_to() {
     register_claude(&e, "mine", "idle", None);
     assert_eq!(listed(&e).len(), 1);
     assert!(!ran.exists());
+}
+
+/// The refresh runs on its own thread: a `claude` that hangs delays no caller.
+#[test]
+fn a_hanging_claude_delays_neither_sessions_nor_register() {
+    let (shim, path) = claude_shim("[]");
+    set_shim(shim.path(), "exec sleep 10");
+    let e = Env::new();
+    e.daemon(
+        false,
+        "",
+        &[
+            ("PATH", path),
+            ("LIGHTBULB_CONNECT_DEBUG_LISTING", "1".into()),
+        ],
+    );
+    let quick = |what: &str, f: &dyn Fn()| {
+        let t = std::time::Instant::now();
+        f();
+        assert!(
+            t.elapsed() < std::time::Duration::from_millis(900),
+            "{what}: {:?}",
+            t.elapsed()
+        );
+    };
+    quick("the first sessions", &|| {
+        listed(&e);
+    });
+    quick("register", &|| register_claude(&e, "mine", "busy", None));
+    quick("sessions", &|| assert_eq!(listed(&e).len(), 1));
 }

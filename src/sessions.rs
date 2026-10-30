@@ -196,7 +196,8 @@ fn from_row(r: &store::Session, home: &Path) -> Option<Session> {
 }
 
 /// Claude Code writes `<home>/.claude/sessions/<pid>.json` for each running process.
-/// Lists those whose pid is alive and was born when the file says it started (±10 s).
+/// Lists those whose pid is alive and was born when the file says it started (±10 s), and that
+/// are not parked into the agent view.
 /// Dead ones are skipped and left alone: Claude owns the files.
 pub fn scan_claude(home: &Path, member_short: &str) -> Vec<Session> {
     let Ok(dir) = std::fs::read_dir(home.join(".claude/sessions")) else {
@@ -221,6 +222,10 @@ pub fn scan_claude(home: &Path, member_short: &str) -> Vec<Session> {
         ) else {
             continue;
         };
+        // Parked into the agent view: the terminal is not the session any more.
+        if v["parkedJobId"].as_str().is_some_and(|j| !j.is_empty()) {
+            continue;
+        }
         let (Ok(p), Ok(started)) = (os::process(pid), os::started_ms(pid)) else {
             continue;
         };
@@ -266,11 +271,13 @@ pub fn scan_claude(home: &Path, member_short: &str) -> Vec<Session> {
 }
 
 /// Registered rows plus Claude discoveries, deduplicated by key (a discovery wins for its
-/// status, which is fresher, except that a hook's `waiting` stands until the discovery says
-/// `idle`; the row for its folder, which its hook reported resolved, and its handle, repo and
-/// branch), `Gone` dropped, `title`/`doing` filled from the transcript. Discoveries are Claude's
-/// listing (`listing::to_sessions`) when `listed` is `Some`, the pid files (`scan_claude`) when
-/// `None`; the pid files supply the push socket and entrypoint either way. A session found only
+/// status, which is fresher, except that a hook's `waiting` stands until the listing says `idle`;
+/// the row for its folder, which its hook reported resolved, and its handle, repo and branch),
+/// `Gone` dropped, `title`/`doing` filled from the transcript. Discoveries are Claude's listing
+/// (`listing::to_sessions`) when `listed` is `Some`, the pid files (`scan_claude`) when `None`.
+/// The pid files supply the push socket and entrypoint either way, and the listing ends nothing
+/// they say is alive: a verified pid file (not an SDK run's) it has no live row for stays, so
+/// `[]`, or a Claude that stops listing a kind of row, degrades to them. A session found only
 /// by discovery keeps Claude's own cwd as given (not resolved) and has no handle until its hook
 /// registers it.
 pub fn all(
@@ -281,27 +288,39 @@ pub fn all(
 ) -> Vec<Session> {
     let mut out: Vec<Session> = rows.iter().filter_map(|r| from_row(r, home)).collect();
     let scanned = scan_claude(home, member_short);
-    let found = match listed {
+    // Each discovery, and whether it is the listing's word.
+    let found: Vec<(Session, bool)> = match listed {
         Some(listed) => {
             let sockets = scanned
                 .iter()
                 .filter_map(|s| Some((s.conversation.clone(), s.push_via.clone()?)))
                 .collect();
-            let mut found = listing::to_sessions(listed, member_short, &sockets);
-            for f in &mut found {
+            let mut live = listing::to_sessions(listed, member_short, &sockets);
+            for f in &mut live {
                 f.entrypoint = scanned
                     .iter()
                     .find(|s| s.conversation == f.conversation)
                     .and_then(|s| s.entrypoint.clone());
             }
-            found
+            let kept: Vec<Session> = scanned
+                .into_iter()
+                .filter(|s| {
+                    !s.entrypoint
+                        .as_deref()
+                        .is_some_and(|e| e.starts_with("sdk-"))
+                })
+                .filter(|s| live.iter().all(|f| f.key != s.key))
+                .collect();
+            let live = live.into_iter().map(|s| (s, true));
+            live.chain(kept.into_iter().map(|s| (s, false))).collect()
         }
-        None => scanned,
+        None => scanned.into_iter().map(|s| (s, false)).collect(),
     };
-    for found in found {
+    for (found, from_listing) in found {
         match out.iter_mut().find(|s| s.key == found.key) {
             Some(s) => {
-                let hook_waits = s.status == Status::Waiting && found.status != Status::Idle;
+                let hook_waits =
+                    s.status == Status::Waiting && !(from_listing && found.status == Status::Idle);
                 *s = Session {
                     title: found.title.or(s.title.take()),
                     cwd: std::mem::take(&mut s.cwd),
@@ -351,6 +370,37 @@ mod tests {
             Key::new("k3f9ab7cd2ef", "codex", "01a1").0,
             "k3f9ab7cd2ef/codex:01a1"
         );
+    }
+
+    /// A pid file of this test process in `home`, with `extra` JSON fields.
+    fn pid_file(home: &Path, conversation: &str, extra: &str) {
+        let dir = home.join(".claude/sessions");
+        fs::create_dir_all(&dir).unwrap();
+        let me = std::process::id();
+        fs::write(
+            dir.join(format!("{conversation}.json")),
+            format!(
+                r#"{{"pid":{me},"sessionId":"{conversation}","cwd":"/tmp","startedAt":{},"status":"busy"{extra}}}"#,
+                os::started_ms(me).unwrap()
+            ),
+        )
+        .unwrap();
+    }
+
+    /// The listing cannot end a process Claude's own pid file says is alive; `[]` degrades to
+    /// the pid files. Parked terminals and SDK runs are not such sessions.
+    #[test]
+    fn what_the_listing_leaves_out_stays_if_its_pid_file_is_verified() {
+        let home = tempfile::tempdir().unwrap();
+        pid_file(home.path(), "kept", "");
+        pid_file(home.path(), "empty-park", r#","parkedJobId":"""#);
+        pid_file(home.path(), "parked", r#","parkedJobId":"ab12""#);
+        pid_file(home.path(), "sdk", r#","entrypoint":"sdk-ts""#);
+        let live = all(&[], Some(&[]), home.path(), "m");
+        let mut names: Vec<&str> = live.iter().map(|s| s.conversation.as_str()).collect();
+        names.sort();
+        assert_eq!(names, ["empty-park", "kept"]);
+        assert!(live.iter().all(|s| s.status == Status::Live));
     }
 
     #[test]

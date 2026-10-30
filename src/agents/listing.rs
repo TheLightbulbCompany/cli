@@ -6,6 +6,7 @@ use crate::sessions::{self, Job, Key, Session, Status, Tier};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::io::Read;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -26,30 +27,31 @@ pub struct Listed {
     pub started_ms: u64,
 }
 
-/// The listing's rows; `None` when `text` is not a JSON array. Rows without a UUID
+/// The listing's rows; `None` when `text` is not a JSON array, or is one with rows of which
+/// none could be read (not an empty list: an answer we do not understand). Rows without a UUID
 /// `sessionId` are skipped.
 pub fn parse(text: &str) -> Option<Vec<Listed>> {
     let rows: Vec<Value> = serde_json::from_str(text).ok()?;
     let s = |v: &Value, f: &str| v[f].as_str().map(String::from);
-    Some(
-        rows.iter()
-            .filter_map(|v| {
-                let conversation = s(v, "sessionId").filter(|c| uuid(c))?;
-                Some(Listed {
-                    conversation,
-                    pid: v["pid"].as_u64().and_then(|p| u32::try_from(p).ok()),
-                    kind: s(v, "kind").unwrap_or_default(),
-                    status: s(v, "status"),
-                    waiting_for: s(v, "waitingFor"),
-                    state: s(v, "state"),
-                    job_id: s(v, "id"),
-                    name: s(v, "name"),
-                    cwd: s(v, "cwd").unwrap_or_default(),
-                    started_ms: v["startedAt"].as_u64().unwrap_or_default(),
-                })
+    let listed: Vec<Listed> = rows
+        .iter()
+        .filter_map(|v| {
+            let conversation = s(v, "sessionId").filter(|c| uuid(c))?;
+            Some(Listed {
+                conversation,
+                pid: v["pid"].as_u64().and_then(|p| u32::try_from(p).ok()),
+                kind: s(v, "kind").unwrap_or_default(),
+                status: s(v, "status"),
+                waiting_for: s(v, "waitingFor"),
+                state: s(v, "state"),
+                job_id: s(v, "id"),
+                name: s(v, "name"),
+                cwd: s(v, "cwd").unwrap_or_default(),
+                started_ms: v["startedAt"].as_u64().unwrap_or_default(),
             })
-            .collect(),
-    )
+        })
+        .collect();
+    (rows.is_empty() || !listed.is_empty()).then_some(listed)
 }
 
 /// `8-4-4-4-12` hex digits.
@@ -61,29 +63,61 @@ fn uuid(s: &str) -> bool {
         })
 }
 
-/// The `claude` to ask: the executable of a live Claude process (its pid file under
-/// `<home>/.claude/sessions`, checked as `scan_claude` checks it), else
-/// `<home>/.local/bin/claude`, else the first on `PATH` (a launchd daemon's `PATH` rarely has it).
-pub fn claude_exe(home: &Path) -> Option<PathBuf> {
+/// The `claude`s to ask, in order: the executables of live Claude processes (pid files under
+/// `<home>/.claude/sessions`, checked as `scan_claude` checks them) that look like a Claude
+/// binary, `<home>/.local/bin/claude`, then the first on `PATH` (a launchd daemon's `PATH`
+/// rarely has it).
+pub fn candidates(home: &Path) -> Vec<PathBuf> {
     let running = sessions::scan_claude(home, "")
         .into_iter()
-        .find_map(|s| os::process(s.pid).ok().map(|p| p.executable));
-    let on_path = || {
-        std::env::split_paths(&std::env::var_os("PATH")?)
+        .filter_map(|s| os::process(s.pid).ok().map(|p| p.executable))
+        .filter(|e| looks_like_claude(e));
+    let installed = Some(home.join(".local/bin/claude")).filter(|p| p.is_file());
+    let on_path = std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path)
             .map(|d| d.join("claude"))
             .find(|p| p.is_file())
-    };
-    running
-        .or_else(|| Some(home.join(".local/bin/claude")).filter(|p| p.is_file()))
-        .or_else(on_path)
+    });
+    let mut out: Vec<PathBuf> = vec![];
+    for exe in running.chain(installed).chain(on_path) {
+        if !out.contains(&exe) {
+            out.push(exe);
+        }
+    }
+    out
 }
 
-/// Runs `exe agents --json --all`; `None` on a non-zero exit, unparsable output, or no
-/// answer within 3 s (then it is killed).
-pub fn read(exe: &Path) -> Option<Vec<Listed>> {
+/// A process's executable worth asking: an npm Claude's is `node`, which cannot answer. Claude's
+/// are named `claude` or sit in a `claude` folder (`.../claude/versions/2.1.312`,
+/// `.../claude.app/Contents/MacOS/claude`).
+fn looks_like_claude(exe: &Path) -> bool {
+    let name = exe.file_name().map(|n| n.to_string_lossy().to_lowercase());
+    if matches!(
+        name.as_deref(),
+        None | Some("node" | "nodejs" | "bun" | "deno")
+    ) {
+        return false;
+    }
+    exe.components().any(|c| {
+        let c = c.as_os_str().to_string_lossy().to_lowercase();
+        c == "claude" || c == "claude.app"
+    }) || name.is_some_and(|n| n.starts_with("claude"))
+}
+
+/// The first answer to `<exe> agents --json --all` of `exes`, tried in turn within one 3 s
+/// limit; `None` when each exits non-zero, cannot start, answers unreadably, or time runs out.
+pub fn read(exes: &[PathBuf]) -> Option<Vec<Listed>> {
     let deadline = Instant::now() + Duration::from_secs(3);
+    exes.iter()
+        .take_while(|_| Instant::now() < deadline)
+        .find_map(|exe| ask(exe, deadline))
+}
+
+/// One `exe`; killed with its process group if it has not finished by `deadline`.
+fn ask(exe: &Path, deadline: Instant) -> Option<Vec<Listed>> {
     let mut child = Command::new(exe)
         .args(["agents", "--json", "--all"])
+        .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -110,7 +144,9 @@ pub fn read(exe: &Path) -> Option<Vec<Listed>> {
         }
     };
     if status.is_none() {
-        let _ = child.kill();
+        // SAFETY: a plain syscall; `process_group(0)` made the child's pid its group's id, and
+        // it is not yet reaped, so the id is still that group's.
+        unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGKILL) };
         let _ = child.wait();
     }
     parse(&text?).filter(|_| status.is_some_and(|s| s.success()))
@@ -231,18 +267,98 @@ mod tests {
     }
 
     #[test]
-    fn a_hanging_claude_is_none_within_three_seconds() {
+    fn an_array_with_no_row_we_read_is_none_but_an_empty_one_is_an_answer() {
+        assert!(parse(r#"[{"foo":1}]"#).is_none());
+        assert_eq!(parse("[]"), Some(vec![]));
+    }
+
+    /// An executable script in `dir`.
+    fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let exe = dir.path().join("claude");
-        std::fs::write(&exe, "#!/bin/sh\nexec sleep 10\n").unwrap();
+        let exe = dir.join(name);
+        std::fs::write(&exe, format!("#!/bin/sh\n{body}\n")).unwrap();
         std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let t = std::time::Instant::now();
-        assert!(read(&exe).is_none());
-        assert!(
-            t.elapsed() < std::time::Duration::from_secs(4),
-            "{:?}",
-            t.elapsed()
+        exe
+    }
+
+    #[test]
+    fn a_hanging_claude_and_its_children_are_gone_within_three_seconds() {
+        let dir = tempfile::tempdir().unwrap();
+        let child = dir.path().join("child");
+        let exe = script(
+            dir.path(),
+            "claude",
+            &format!("sleep 10 &\necho $! > '{}'\nwait", child.display()),
         );
+        let t = Instant::now();
+        assert!(read(&[exe]).is_none());
+        assert!(t.elapsed() < Duration::from_secs(4), "{:?}", t.elapsed());
+        let pid: u32 = std::fs::read_to_string(child)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let end = Instant::now() + Duration::from_secs(2);
+        while os::process(pid).is_ok() && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(os::process(pid).is_err(), "the group was killed");
+    }
+
+    #[test]
+    fn a_candidate_that_cannot_answer_falls_through_to_the_next() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        let fails = script(dir.path(), "fails", "exit 1");
+        let garbage = script(dir.path(), "garbage", "echo nonsense");
+        let works = script(dir.path(), "works", "echo '[]'");
+        assert_eq!(
+            read(&[missing, fails.clone(), garbage, works]),
+            Some(vec![])
+        );
+        assert_eq!(read(&[fails]), None);
+    }
+
+    #[test]
+    fn only_a_claude_binary_counts_as_one() {
+        for yes in [
+            "/Users/p/.local/share/claude/versions/2.1.312",
+            "/Applications/Claude.app/Contents/MacOS/Claude",
+            "/opt/x/claude.app/Contents/MacOS/claude",
+            "/usr/local/bin/claude",
+        ] {
+            assert!(looks_like_claude(Path::new(yes)), "{yes}");
+        }
+        for no in [
+            "/usr/local/bin/node",
+            "/opt/claude/node",
+            "/Users/p/.bun/bin/bun",
+            "/repo/target/debug/deps/mcp_tools-85428a",
+        ] {
+            assert!(!looks_like_claude(Path::new(no)), "{no}");
+        }
+    }
+
+    /// A live process that is not Claude's binary is passed over for the installed one.
+    #[test]
+    fn candidates_skip_a_running_executable_that_is_no_claude() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions = home.path().join(".claude/sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let me = std::process::id();
+        std::fs::write(
+            sessions.join("a.json"),
+            format!(
+                r#"{{"pid":{me},"sessionId":"s","cwd":"/","startedAt":{}}}"#,
+                os::started_ms(me).unwrap()
+            ),
+        )
+        .unwrap();
+        let bin = home.path().join(".local/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let installed = script(&bin, "claude", "exit 0");
+        let found = candidates(home.path());
+        assert_eq!(found.first(), Some(&installed));
+        assert!(!found.contains(&std::env::current_exe().unwrap()));
     }
 }

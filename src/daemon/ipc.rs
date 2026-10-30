@@ -1276,8 +1276,6 @@ fn end(id: u64, key: &str, body: &Value, daemon: &Daemon) -> Response {
     match store.end_session(key, now() as i64, reason, None) {
         Ok(true) => {
             daemon.presence.notify_one();
-            // Not under the store lock: a listing read holds its own for up to 3 s.
-            drop(store);
             daemon.listing.lock().unwrap().dirty = true;
             Response::ok(id, json!({ "ended": true }))
         }
@@ -1391,8 +1389,7 @@ fn register(id: u64, body: &Value, daemon: &Daemon) -> Response {
     // Every hook event registers: mail delivered before it has been seen.
     match put_row(daemon, &store, &row).and_then(|()| mail::mark_read_for(&store, &key, now())) {
         Ok(()) => {
-            // A hook event: Claude's listing has news too (not under the store lock).
-            drop(store);
+            // A hook event: Claude's listing has news too.
             daemon.listing.lock().unwrap().dirty = true;
             // A `read` owed to a sender goes now (`Net::flush_loop`).
             daemon.peers.outbox.notify_one();

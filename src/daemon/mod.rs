@@ -111,22 +111,28 @@ pub struct Daemon {
     /// daemon holds its own across `run`.
     pub home_lock: Option<File>,
     /// Claude's own session listing, last read (`current`).
-    pub listing: Mutex<ListingCache>,
+    pub listing: Arc<Mutex<ListingCache>>,
 }
 
-/// `claude agents --json --all` as last read; `rows` is `None` when it could not be.
+/// `claude agents --json --all` as last read; `rows` is `None` before the first read ends and
+/// after one fails.
 #[derive(Default)]
 pub struct ListingCache {
     pub at: Option<Instant>,
     pub rows: Option<Vec<Listed>>,
-    /// A hook event since `at`: read again sooner.
+    /// A hook event since the last read began: read again sooner.
     pub dirty: bool,
+    /// A read is running (at most one, on its own thread).
+    pub refreshing: bool,
+    /// The last read failed and has been logged: one line per streak.
+    pub failing: bool,
 }
 
-/// Claude's listing, read again when older than 10 s, or 2 s after a hook event (`dirty`).
-/// One that could not be read is kept as `None` as long: a hanging `claude` costs its 3 s at
-/// most once per 10 s, not on every call. `None` when the Claude home is not `HOME` (an
-/// embedded instance's, a test's): `claude` lists `HOME`'s sessions, not those.
+/// Claude's listing as last read, at once: never runs `claude` here, and never holds the lock
+/// across it. Starts a read when the last is older than 10 s, or 2 s after a hook event
+/// (`dirty`); until the first ends, `None` (the pid files). A failed read counts as a read: a
+/// hung `claude` is asked once per 10 s. `None` when the Claude home is not `HOME` (an embedded
+/// instance's, a test's): `claude` lists `HOME`'s sessions, not those.
 pub(crate) fn current(daemon: &Daemon) -> Option<Vec<Listed>> {
     if dirs::home_dir().as_ref() != Some(&daemon.claude_home) {
         return None;
@@ -138,12 +144,32 @@ pub(crate) fn current(daemon: &Daemon) -> Option<Vec<Listed>> {
     let mut c = daemon.listing.lock().unwrap();
     let age = c.at.map(|t| t.elapsed());
     let older = |s| age.is_none_or(|a| a > Duration::from_secs(s));
-    if older(10) || (c.dirty && older(2)) {
-        c.rows = listing::claude_exe(&daemon.claude_home).and_then(|exe| listing::read(&exe));
-        c.at = Some(Instant::now());
-        c.dirty = false;
+    if !c.refreshing && (older(10) || (c.dirty && older(2))) {
+        let (cache, home) = (daemon.listing.clone(), daemon.claude_home.clone());
+        let started = std::thread::Builder::new()
+            .name("claude-listing".into())
+            .spawn(move || refresh(&cache, &home));
+        // Cleared at the start: a hook event during the read is news for the next one.
+        c.refreshing = started.is_ok();
+        c.dirty = c.dirty && started.is_err();
     }
     c.rows.clone()
+}
+
+/// One read of the listing, its result swapped into `cache`.
+fn refresh(cache: &Mutex<ListingCache>, home: &Path) {
+    let exes = listing::candidates(home);
+    let rows = listing::read(&exes);
+    let mut c = cache.lock().unwrap();
+    if rows.is_some() {
+        c.failing = false;
+    } else if !exes.is_empty() && !c.failing {
+        c.failing = true;
+        eprintln!("claude agents: no answer from {exes:?}; using the pid files");
+    }
+    c.rows = rows;
+    c.at = Some(Instant::now());
+    c.refreshing = false;
 }
 
 /// An embedded instance: a Lightbulb workspace's member.
