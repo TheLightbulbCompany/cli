@@ -39,6 +39,9 @@ Team:
   relay     The relays used when no direct path exists; relay <url> sets yours
   telemetry Show or set anonymous usage counts: telemetry on|off|status
 
+Apps you build:
+  app       Build, check, preview, publish and undo apps: app new|up|publish|rollback|status|destroy|check|evidence|report-broken-tool
+
 With the Lightbulb app on this Mac: claude, codex, continue '<link>', share on|off and pair
 
 Run lightbulb <command> --help for its options; lightbulb --version for the version.
@@ -258,6 +261,14 @@ enum Command {
         #[arg(long)]
         local: bool,
     },
+    /// Apps you build: new, up, publish, rollback, status, destroy, check, evidence.
+    App {
+        #[command(subcommand)]
+        command: lightbulb::apps::AppCommand,
+        /// Print JSON (the default when stdout is not a terminal).
+        #[arg(long, global = true)]
+        json: bool,
+    },
     #[command(external_subcommand)]
     External(Vec<OsString>),
     /// Run by an agent's hook config: `hook <claude|codex|cursor|grok|opencode> <session-start|user-prompt-submit|post-tool-use|stop|session-end>`.
@@ -431,6 +442,14 @@ fn run() -> lightbulb::Result<()> {
         Command::Folder { path, state } => exit(cli::folder(&path, state == "on")?),
         Command::Relay { url, clear, local } => {
             exit(cli::relay(clear.then(String::new).or(url), local)?)
+        }
+        Command::App { command, json } => {
+            use std::io::IsTerminal;
+            let json = json || !std::io::stdout().is_terminal();
+            // Every app failure has the `{code, message, next}` shape, even an unexpected one.
+            exit(lightbulb::apps::run(command, json).unwrap_or_else(|e| {
+                lightbulb::apps::fail(json, "failed", &e.to_string(), "try again")
+            }))
         }
         Command::External(args) if cli::APP_WORDS.iter().any(|w| args[0] == *w) => {
             exit(cli::app_command(&args)?)

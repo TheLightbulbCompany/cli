@@ -1,0 +1,5 @@
+
+> team-lunch@0.1.0 check /work/team-lunch
+> tsc --noEmit && eslint . && node scripts/design-lint.mjs
+
+Error: You're importing a module that depends on server-only. It only works in a Server Component.

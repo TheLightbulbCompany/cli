@@ -1,0 +1,8 @@
+
+> team-lunch@0.1.0 check /work/team-lunch
+> tsc --noEmit && eslint . && node scripts/design-lint.mjs
+
+src/app/page.tsx(12,7): error TS2322: Type 'number' is not assignable to type 'string'.
+  The expected type comes from property 'title'.
+src/lib/db.ts(3,1): error TS2304: Cannot find name 'sql'.
+ ELIFECYCLE  Command failed with exit code 2.

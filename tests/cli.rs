@@ -131,6 +131,7 @@ fn help_hides_the_agent_plumbing() {
             "{help}"
         );
     }
+    assert!(help.contains("Apps you build:\n  app "), "{help}");
     // Still accepted.
     assert!(e.run(&["daemon", "--help"]).status.success());
 }
