@@ -17,12 +17,18 @@ export function doorOpen(): boolean {
   return process.env.LIGHTBULB_OPEN_TO === "public";
 }
 
-/** Checks a Lightbulb pass (EdDSA, signed by the issuer key, for this app); null when it is not good. */
+/** Checks a Lightbulb pass (EdDSA, the issuer key's kid, at most 15 minutes old, for this app); null when it is not good. */
 export async function verifyPass(token: string, now = new Date()): Promise<Viewer | null> {
   try {
-    const key = await importJWK(JSON.parse(process.env.LIGHTBULB_ISSUER_KEY ?? ""), "EdDSA");
-    const { payload } = await jwtVerify(token, key, { algorithms: ["EdDSA"], currentDate: now });
-    return toViewer(payload);
+    const jwk = JSON.parse(process.env.LIGHTBULB_ISSUER_KEY ?? "");
+    const key = await importJWK(jwk, "EdDSA");
+    const { payload, protectedHeader } = await jwtVerify(token, key, {
+      algorithms: ["EdDSA"],
+      maxTokenAge: "900s",
+      clockTolerance: 30,
+      currentDate: now,
+    });
+    return protectedHeader.kid === jwk.kid ? toViewer(payload) : null;
   } catch {
     return null;
   }
@@ -41,7 +47,12 @@ export async function sessionCookie(v: Viewer): Promise<string> {
 /** Reads a session cookie value; null when it is missing, forged, expired or for another app. */
 export async function readSession(value: string, now = new Date()): Promise<Viewer | null> {
   try {
-    const { payload } = await jwtVerify(value, cookieSecret(), { algorithms: ["HS256"], currentDate: now });
+    const { payload } = await jwtVerify(value, cookieSecret(), {
+      algorithms: ["HS256"],
+      maxTokenAge: `${DAY}s`,
+      clockTolerance: 30,
+      currentDate: now,
+    });
     return toViewer(payload);
   } catch {
     return null;

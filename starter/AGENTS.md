@@ -36,6 +36,7 @@ change anything.
   Lightbulb. If you need one, ask for it through a form card, never in the thread.
 - **Never remove or loosen the door** (`src/proxy.ts`, `src/lib/door.ts`, `src/app/%5Flightbulb/`,
   `src/app/api/%5Flightbulb/`). Every page and route sits behind it.
+- **Files in `public/` are served without the door.** Nothing private goes there.
 - **The schema only grows.** Add tables and columns; never drop, rename or narrow one. If a change
   needs that, `up` turns it into an owner card that shows the SQL; wait for the owner.
 - **Data access is server-only.** Only server components, route handlers and server actions import
