@@ -493,6 +493,37 @@ fn tool_results_carry_the_unread_note_for_pull_tier() {
 }
 
 #[test]
+fn find_sessions_lists_ended_ones_after_the_live_with_their_resume() {
+    let net = Net::new();
+    let other = Other::new();
+    let gone = Other::new();
+    let mine = net.register("claude", "c1", &me());
+    let live = net.register("codex", "t1", &other.1);
+    let ended = net.register("codex", "t2", &gone.1);
+    let r = net.call(json!({"id": 1, "op": "end", "key": ended, "reason": "session-end"}));
+    assert_eq!(r["ended"], true, "{r}");
+    let mut m = net.mcp(&me());
+
+    let v = m.tool("find_sessions", json!({})).json();
+    assert_eq!(v["total"], 3, "{v}");
+    let list = v["sessions"].as_array().unwrap();
+    let ids: Vec<&str> = list
+        .iter()
+        .map(|s| s["session_id"].as_str().unwrap())
+        .collect();
+    assert!(
+        ids[..2].contains(&mine.as_str()) && ids[..2].contains(&live.as_str()),
+        "{v}"
+    );
+    assert_eq!(ids[2], ended, "{v}");
+    assert_eq!(list[2]["status"], "ended", "{v}");
+    assert_eq!(list[2]["reason"], "session-end", "{v}");
+    assert_eq!(list[2]["resume"], "codex resume t2", "{v}");
+    assert!(list[2]["ended_at"].is_u64(), "{v}");
+    assert!(list[0].get("resume").is_none(), "{v}");
+}
+
+#[test]
 fn find_sessions_marks_is_this_session() {
     let net = Net::new();
     let other = Other::new();

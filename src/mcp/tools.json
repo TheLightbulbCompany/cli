@@ -2,7 +2,7 @@
   {
     "name": "find_sessions",
     "scope": "network",
-    "description": "The coding sessions you can message on your team's lightbulb network (Claude Code, Codex, Cursor, Grok CLI, OpenCode): this computer's, then your teammates'. Pass one's session_id as send_message session_id; is_this_session marks your own: never message it.",
+    "description": "The coding sessions you can message on your team's lightbulb network (Claude Code, Codex, Cursor, Grok CLI, OpenCode): this computer's, then your teammates'. status is busy, waiting (waiting_for says for what; its person must answer), idle, or ended. Ended sessions stay seven days with ended_at and reason; this computer's carry resume, the command that resumes them. online false with seen_at is a computer that is offline (messages wait); wakes true is a parked workspace that a message wakes. Pass one's session_id as send_message session_id; is_this_session marks your own: never message it.",
     "inputSchema": {
       "type": "object",
       "properties": {

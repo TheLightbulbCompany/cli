@@ -136,7 +136,8 @@ pub struct ListingCache {
 /// across it. Starts a read when the last is older than 10 s, or 2 s after a hook event
 /// (`dirty`), or 60 s while no pid file says Claude is running (an idle computer does not keep
 /// running `claude`); until the first ends, `None` (the pid files). A failed read counts as a
-/// read: a hung `claude` is asked once per 10 s. `None` when the Claude home is not `HOME` (an embedded
+/// read: a hung `claude` is asked once per 10 s, or 60 s with no pid file, so what this returns
+/// may be up to 60 s old. `None` when the Claude home is not `HOME` (an embedded
 /// instance's, a test's): `claude` lists `HOME`'s sessions, not those.
 pub(crate) fn current(daemon: &Daemon) -> Option<Vec<Listed>> {
     current_at(daemon).map(|(rows, _)| rows)
@@ -151,12 +152,12 @@ pub(crate) fn current_at(daemon: &Daemon) -> Option<(Vec<Listed>, i64)> {
     if cfg!(debug_assertions) && std::env::var_os("LIGHTBULB_CONNECT_DEBUG_LISTING").is_none() {
         return None;
     }
+    // Reads each pid file and checks its process: off the lock every session read takes.
+    let running = sessions::any_pid_file(&daemon.claude_home);
     let mut c = daemon.listing.lock().unwrap();
     let age = c.at.map(|t| t.elapsed());
     let older = |s| age.is_none_or(|a| a > Duration::from_secs(s));
-    let due = (c.dirty && older(2))
-        || older(60)
-        || (older(10) && sessions::any_pid_file(&daemon.claude_home));
+    let due = (c.dirty && older(2)) || older(60) || (older(10) && running);
     if !c.refreshing && due {
         let (cache, home) = (daemon.listing.clone(), daemon.claude_home.clone());
         let started = std::thread::Builder::new()

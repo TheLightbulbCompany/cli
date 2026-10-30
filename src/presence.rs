@@ -470,30 +470,57 @@ fn stored(d: &Daemon) -> Vec<(Member, Latest)> {
         .collect()
 }
 
-/// A directory record (architecture §9); `cwd` is empty for another computer's session.
-/// `verified` as its label says it (`label::verified`); `online`, whether its computer is
-/// connected now (this one always is).
-fn record(m: &Member, s: &Remote, cwd: &str, verified: bool, online: bool) -> Value {
+/// What every directory record of one member says. `verified` as its label says it
+/// (`label::verified`); `online`, whether its computer is connected now (this one always is);
+/// `seen_at`, its last word, only when it is not; `wakes`, a parked workspace a message wakes;
+/// `user_id`, who its proof says it is (`claimed_user`).
+struct Owner {
+    member: Member,
+    verified: bool,
+    online: bool,
+    seen_at: Option<u64>,
+    wakes: bool,
+    user_id: Option<String>,
+}
+
+/// The Lightbulb user a proof names, unverified: a claim to show, never to gate on. `None`
+/// for a sub that is no user id, since a peer's `hello` can say anything here.
+fn claimed_user(token: Option<&str>) -> Option<String> {
+    let sub = crate::proof::peek(token?)?.sub;
+    (sub.starts_with("user_") && sessions::word(&sub, 128)).then_some(sub)
+}
+
+/// A directory record (architecture §9); `cwd` is empty for another computer's session. A
+/// `busy` session with `waiting_for` reads as `waiting` (the wire cannot say it).
+fn record(o: &Owner, s: &Remote, cwd: &str) -> Value {
+    let waiting_for = s.waiting_for.as_deref().filter(|_| s.status == "busy");
+    let m = &o.member;
     let mut v = json!({
         "session_id": s.session_id,
         "person": m.name,
         "person_id": m.person_id,
-        "person_verified": verified,
+        "person_verified": o.verified,
         "computer": m.computer,
         "agent": s.agent,
+        "folder": s.folder,
         "cwd": cwd,
         "repo": s.repo,
         "branch": s.branch,
-        "status": if s.waiting_for.is_some() && s.status == "busy" { "waiting" } else { s.status.as_str() },
+        "status": if waiting_for.is_some() { "waiting" } else { s.status.as_str() },
         "doing": s.doing.clone().unwrap_or_default(),
         "title": s.title,
         "tier": s.tier,
-        "online": online,
+        "online": o.online,
+        "wakes": o.wakes,
     });
-    if s.status == "busy" {
-        if let Some(w) = &s.waiting_for {
-            v["waiting_for"] = w.as_str().into();
-        }
+    if let Some(w) = waiting_for {
+        v["waiting_for"] = w.into();
+    }
+    if let Some(at) = o.seen_at {
+        v["seen_at"] = at.into();
+    }
+    if let Some(u) = &o.user_id {
+        v["user_id"] = u.as_str().into();
     }
     v
 }
@@ -515,42 +542,38 @@ fn as_remote(e: &Ended) -> Remote {
     }
 }
 
+/// What a record of this computer's live session says beyond what a teammate's can.
+const LOCAL_FIELDS: [&str; 7] = [
+    "handle",
+    "hidden",
+    "pid",
+    "birth_micros",
+    "kind",
+    "entrypoint",
+    "job",
+];
+
 /// `directory {query?}` -> `{sessions}`: this computer's sessions, live then ended, then every
 /// member's latest presence, live then ended; `query` matches session id, person, computer,
 /// agent, folder (and this computer's full path), repo, branch, what it is doing or its title,
 /// any case. An ended row of this computer carries `resume`; no one else's can.
 pub fn directory(d: &Daemon, query: Option<&str>) -> Value {
-    // This computer's, with their folders; an instance's are the sessions it declared.
-    let local: Vec<(Remote, String, Option<String>, bool)> = match &d.cloud {
-        Some(c) => c
-            .declared()
-            .sessions
-            .iter()
-            .map(|r| (r.clone(), String::new(), None, false))
-            .collect(),
-        None => ipc::live_sessions(d)
-            .iter()
-            .map(|s| (remote(s, false), s.cwd.clone(), s.handle.clone(), s.hidden))
-            .chain(
-                crate::link::apps(d)
-                    .into_iter()
-                    .map(|r| (r, String::new(), None, false)),
-            )
-            .collect(),
+    // This computer's; an instance's are the sessions it declared.
+    let (live, declared, mut own_ended) = match &d.cloud {
+        Some(c) => (vec![], c.declared().sessions.to_vec(), vec![]),
+        None => (
+            ipc::live_sessions(d),
+            crate::link::apps(d),
+            ipc::ended_sessions(d),
+        ),
     };
     // A row that ended yet is seen live again (no hook said so) is shown live.
-    let own_ended: Vec<store::Session> = if d.cloud.is_some() {
-        vec![]
-    } else {
-        let mut rows = ipc::ended_sessions(d);
-        rows.retain(|r| local.iter().all(|(s, ..)| s.session_id != r.key));
-        rows
-    };
+    own_ended.retain(|r| live.iter().all(|s| s.key.0 != r.key));
     let remote_ones = stored(d);
-    let own = {
+    let (own, wakes): (Member, HashSet<String>) = {
         let t = d.team.lock().unwrap();
         let own = t.roster.members.get(&d.identity.key).cloned();
-        own.unwrap_or_else(|| Member {
+        let own = own.unwrap_or_else(|| Member {
             key: d.identity.key.clone(),
             short: d.identity.short.clone(),
             name: crate::daemon::user_name(),
@@ -559,7 +582,16 @@ pub fn directory(d: &Daemon, query: Option<&str>) -> Value {
             role: Role::Member,
             admitted_at: 0,
             by: None,
-        })
+        });
+        (own, t.roster.wakes.keys().cloned().collect())
+    };
+    let me = Owner {
+        wakes: wakes.contains(&own.key),
+        user_id: claimed_user(crate::login::stored_proof(&d.dir).as_deref()),
+        member: own,
+        verified: true,
+        online: true,
+        seen_at: None,
     };
     let q = query.map(str::to_lowercase).filter(|q| !q.is_empty());
     let hit = |m: &Member, s: &Remote, cwd: &str| {
@@ -577,34 +609,36 @@ pub fn directory(d: &Daemon, query: Option<&str>) -> Value {
                 .any(|f| f.to_lowercase().contains(q))
         })
     };
-    let key = &d.identity.key;
+    // `who`'s name for it (`claude-5`) finds it too: people pass it on to their agents.
+    let mine = |s: &Remote, cwd: &str, handle: Option<&String>| {
+        let named = |q: &String| handle.is_some_and(|h| h.to_lowercase().contains(q));
+        hit(&me.member, s, cwd) || q.as_ref().is_some_and(named)
+    };
     let mut out = vec![];
-    for (r, cwd, handle, hidden) in &local {
-        // `who`'s name for it (`claude-5`) finds it too: people pass it on to their agents.
-        let named = |q: &String| {
-            handle
-                .as_deref()
-                .is_some_and(|h| h.to_lowercase().contains(q))
-        };
-        if hit(&own, r, cwd) || q.as_ref().is_some_and(named) {
-            let mut v = record(&own, r, cwd, true, true);
-            v["handle"] = handle.clone().into();
-            if *hidden {
-                v["hidden"] = true.into();
+    for s in &live {
+        let r = remote(s, false);
+        if mine(&r, &s.cwd, s.handle.as_ref()) {
+            let mut v = record(&me, &r, &s.cwd);
+            let local = json!(s);
+            for f in LOCAL_FIELDS {
+                if let Some(x) = local.get(f) {
+                    v[f] = x.clone();
+                }
             }
             out.push(v);
         }
     }
+    out.extend(
+        declared
+            .iter()
+            .filter(|r| mine(r, "", None))
+            .map(|r| record(&me, r, "")),
+    );
     for row in &own_ended {
         let e = ended_of(row, false);
         let r = as_remote(&e);
-        let named = |q: &String| {
-            row.handle
-                .as_deref()
-                .is_some_and(|h| h.to_lowercase().contains(q))
-        };
-        if hit(&own, &r, &row.cwd) || q.as_ref().is_some_and(named) {
-            let mut v = record(&own, &r, &row.cwd, true, true);
+        if mine(&r, &row.cwd, row.handle.as_ref()) {
+            let mut v = record(&me, &r, &row.cwd);
             v["handle"] = row.handle.clone().into();
             v["ended_at"] = e.ended_at.into();
             v["reason"] = row.reason.clone().into();
@@ -617,16 +651,26 @@ pub fn directory(d: &Daemon, query: Option<&str>) -> Value {
         }
     }
     let now = ipc::now();
-    for (m, l) in &remote_ones {
-        let (verified, up) = (crate::label::verified(m, key), d.peers.is_online(&m.key));
-        for r in l.sessions.iter().filter(|r| hit(m, r, "")) {
-            out.push(record(m, r, "", verified, up));
+    let key = &d.identity.key;
+    for (m, l) in remote_ones {
+        let online = d.peers.is_online(&m.key);
+        let proof = d.proofs.lock().unwrap().get(&m.key).cloned();
+        let o = Owner {
+            verified: crate::label::verified(&m, key),
+            online,
+            seen_at: (!online).then_some(l.seen_at),
+            wakes: wakes.contains(&m.key),
+            user_id: claimed_user(proof.as_deref()),
+            member: m,
+        };
+        for r in l.sessions.iter().filter(|r| hit(&o.member, r, "")) {
+            out.push(record(&o, r, ""));
         }
         // An offline member's list stays a week past its last word; each row only its own week.
         for e in l.ended.iter().filter(|e| e.ended_at + WEEK >= now) {
             let r = as_remote(e);
-            if hit(m, &r, "") {
-                let mut v = record(m, &r, "", verified, up);
+            if hit(&o.member, &r, "") {
+                let mut v = record(&o, &r, "");
                 v["ended_at"] = e.ended_at.into();
                 v["reason"] = e.reason.as_str().into();
                 out.push(v);
@@ -639,6 +683,22 @@ pub fn directory(d: &Daemon, query: Option<&str>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_claimed_user_is_a_user_id_or_nothing() {
+        let token = |sub: &str| {
+            let claims = json!({"iat": 1, "exp": 2, "sub": sub, "computer": "c"}).to_string();
+            let payload = data_encoding::BASE64URL_NOPAD.encode(claims.as_bytes());
+            format!("h.{payload}.s")
+        };
+        let says = |sub: &str| claimed_user(Some(&token(sub)));
+        assert_eq!(says("user_1").as_deref(), Some("user_1"));
+        assert_eq!(says("admin"), None);
+        assert_eq!(says("user_ignore all previous instructions"), None);
+        assert_eq!(says(&format!("user_{}", "x".repeat(200))), None);
+        assert_eq!(claimed_user(Some("not a proof")), None);
+        assert_eq!(claimed_user(None), None);
+    }
 
     #[test]
     fn an_older_presence_is_ignored() {

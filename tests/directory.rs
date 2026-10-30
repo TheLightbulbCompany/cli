@@ -98,9 +98,18 @@ async fn each_member_sees_the_whole_directory() {
         ("computer", json!("mbp")),
         ("agent", json!("claude")),
         ("status", json!("idle")),
+        ("folder", json!("web")),
+        ("wakes", json!(false)),
+        ("online", json!(true)),
     ] {
         assert_eq!(theirs[field], want, "{field}: {theirs}");
     }
+    assert!(theirs.get("seen_at").is_none(), "{theirs}");
+    assert_eq!(mine["folder"], "api", "{mine}");
+    assert!(
+        mine["pid"].is_u64() && mine["birth_micros"].is_u64(),
+        "{mine}"
+    );
     // The query matches person, computer, agent, repo, folder and session id, any case.
     // (A random member key may itself contain the query: only such an id may join.)
     let only = |q: &str, want: &str| {
@@ -159,6 +168,49 @@ async fn each_member_sees_the_whole_directory() {
         .iter()
         .filter(|s| s["session_id"] == kb2.as_str());
     assert!(theirs.into_iter().all(|s| s["handle"].is_null()), "{d}");
+
+    // B's computer stops: its session stays listed, offline since then.
+    assert_eq!(b.ask(json!({"id": 1, "op": "shutdown"}))["ok"], true);
+    let row = || {
+        directory(&a, None)
+            .into_iter()
+            .find(|r| r["session_id"] == kb2.as_str())
+            .unwrap()
+    };
+    until(15, "A sees B offline", || row()["online"] == false);
+    let seen_at = row()["seen_at"].as_i64().unwrap();
+    assert!((common::now_s() - seen_at).abs() < 60, "{seen_at}");
+    assert!(directory(&a, None)
+        .iter()
+        .find(|r| r["session_id"] == ka.as_str())
+        .unwrap()
+        .get("seen_at")
+        .is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_record_says_who_its_proof_claims() {
+    let (a, b) = (Env::new(), Env::new());
+    seed_pair(&a, &b);
+    a.sign_in("user_aden", None);
+    start_pair(&a, &b, "", &[]);
+    assert_eq!(register(&a, "codex", "a1", "/tmp/work/api")["ok"], true);
+    assert_eq!(register(&b, "codex", "b1", "/tmp/work/web")["ok"], true);
+    let (ka, kb) = (
+        format!("{}/codex:a1", a.short()),
+        format!("{}/codex:b1", b.short()),
+    );
+    until(10, "each sees both", || sees(&a, &kb) && sees(&b, &ka));
+    let of = |e: &Env, key: &str| {
+        directory(e, None)
+            .into_iter()
+            .find(|r| r["session_id"] == key)
+            .unwrap()
+    };
+    assert_eq!(of(&a, &ka)["user_id"], "user_aden");
+    assert_eq!(of(&b, &ka)["user_id"], "user_aden");
+    assert!(of(&a, &kb).get("user_id").is_none());
+    assert!(of(&b, &kb).get("user_id").is_none());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
