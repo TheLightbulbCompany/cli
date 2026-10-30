@@ -1246,13 +1246,18 @@ pub(crate) fn refused(id: u64, reason: &str) -> Response {
 }
 
 /// `end {key, caller?, if_gone?, reason?}` -> `{ended}`: ends the session row (kept, ended);
-/// `reason` is `process-exited` (default), `moved-on`, `job-done` or `job-failed`;
+/// `reason` is `process-exited` (default), `moved-on`, `job-done` or `session-end`;
 /// its mail stays for the hold. With `caller`, only the row's own process may end it; with `if_gone`, also
 /// anyone once the row's process is dead. `ended: false` when refused. Neither field (the
 /// CLI) ends it outright.
 fn end(id: u64, key: &str, body: &Value, daemon: &Daemon) -> Response {
     let Ok(caller) = caller(body) else {
         return Response::err(id, BAD_REQUEST);
+    };
+    let reason = match body["reason"].as_str() {
+        None => "process-exited",
+        Some(r @ ("process-exited" | "moved-on" | "job-done" | "session-end")) => r,
+        Some(_) => return Response::err(id, BAD_REQUEST),
     };
     let if_gone = body["if_gone"] == true;
     let store = daemon.store.lock().unwrap();
@@ -1267,11 +1272,6 @@ fn end(id: u64, key: &str, body: &Value, daemon: &Daemon) -> Response {
             return Response::ok(id, json!({ "ended": false }));
         }
     }
-    let reason = match body["reason"].as_str() {
-        None => "process-exited",
-        Some(r @ ("process-exited" | "moved-on" | "job-done" | "job-failed")) => r,
-        Some(_) => return Response::err(id, BAD_REQUEST),
-    };
     // The row stays, ended, with its reason: its address is kept (`presence`).
     match store.end_session(key, now() as i64, reason, None) {
         Ok(true) => {

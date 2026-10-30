@@ -133,4 +133,16 @@ fn register_takes_waiting_with_what_for_and_end_takes_a_reason() {
         "status": "waiting", "waiting_for": "x".repeat(65)}}),
     );
     assert_eq!(r["error"], "bad_request", "{r}");
+    // Exactly 64 is accepted.
+    let r = e.ask(
+        json!({"id": 1, "op": "register", "session": {"provider": "claude",
+        "conversation": "w3", "pid": pid, "birth_micros": birth, "cwd": "/tmp/p",
+        "status": "waiting", "waiting_for": "x".repeat(64)}}),
+    );
+    assert_eq!(r["ok"], true, "{r}");
+    let key = r["key"].clone();
+    let r = e.ask(json!({"id": 1, "op": "end", "key": key, "reason": "job-failed"}));
+    assert_eq!(r["error"], "bad_request", "{r}");
+    let r = e.ask(json!({"id": 1, "op": "end", "key": key, "reason": "session-end"}));
+    assert_eq!(r["ended"], true, "{r}");
 }
