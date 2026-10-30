@@ -6,6 +6,20 @@ const nextConfig: NextConfig = {
   serverExternalPackages: ["@electric-sql/pglite"],
   // Sample mode reads the migrations and seed from disk.
   outputFileTracingIncludes: { "/**": ["./drizzle/*.sql"] },
+  // Only Lightbulb (Canvas) may frame the app.
+  async headers() {
+    return [
+      {
+        source: "/:path*",
+        headers: [
+          {
+            key: "Content-Security-Policy",
+            value: "frame-ancestors 'self' https://thelightbulb.company https://*.thelightbulb.company",
+          },
+        ],
+      },
+    ];
+  },
 };
 
 export default nextConfig;

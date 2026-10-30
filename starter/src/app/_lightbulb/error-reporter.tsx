@@ -4,7 +4,14 @@
 import { useEffect } from "react";
 import { capArgs } from "./caps";
 
+const MAX_REPORTS = 20;
+const sent = new Set<string>();
+
+// Each distinct error once per page load, and at most 20 in all, so a loop cannot flood the log.
 function report(args: unknown[]) {
+  const key = `${args[0]}@${args[1]}`;
+  if (sent.has(key) || sent.size >= MAX_REPORTS) return;
+  sent.add(key);
   void fetch("/api/_lightbulb/errors", {
     method: "POST",
     headers: { "content-type": "application/json" },

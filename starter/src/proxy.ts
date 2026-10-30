@@ -1,8 +1,14 @@
-import { NextResponse } from "next/server";
+import { NextResponse, type NextRequest } from "next/server";
+import { doorOpen, readSession, SESSION_COOKIE } from "./lib/door";
 
-// The request gate. Every request will pass the door here.
-// TODO(Task 9): verify the Lightbulb session cookie, send closed visitors to /_lightbulb/closed,
-// and set the frame-ancestors header. Until then every request passes through.
-export function proxy() {
-  return NextResponse.next();
+// The request gate. Every page and API route passes the door here, except the door's own pages,
+// /api/_lightbulb/* (health and error reports) and Next's assets. Never remove it (AGENTS.md).
+export async function proxy(req: NextRequest) {
+  if (doorOpen()) return NextResponse.next();
+  if (await readSession(req.cookies.get(SESSION_COOKIE)?.value ?? "")) return NextResponse.next();
+  return NextResponse.rewrite(new URL("/_lightbulb/closed", req.url));
 }
+
+export const config = {
+  matcher: ["/((?!_lightbulb/|api/_lightbulb/|_next/|favicon\\.ico$).*)"],
+};

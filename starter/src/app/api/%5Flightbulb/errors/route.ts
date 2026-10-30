@@ -9,6 +9,7 @@ export async function POST(req: Request) {
     return Response.json({ error: "expected JSON" }, { status: 400 });
   }
   const args = Array.isArray(body.args) ? body.args : [];
-  console.error("[client error]", String(body.page ?? "").slice(0, 200), JSON.stringify(capArgs(args)));
+  // JSON-encoded so a newline in `page` cannot forge a log line.
+  console.error("[client error]", JSON.stringify(String(body.page ?? "").slice(0, 200)), JSON.stringify(capArgs(args)));
   return new Response(null, { status: 204 });
 }
