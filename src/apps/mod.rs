@@ -4,11 +4,12 @@
 
 pub mod api;
 pub mod check;
+pub(crate) mod evidence;
 pub mod migrations;
 mod ship;
 pub mod starter;
 
-pub use ship::archive;
+pub use ship::{archive, has_passing_review};
 
 use crate::Result;
 use clap::{Subcommand, ValueEnum};
@@ -42,6 +43,13 @@ pub enum OpenTo {
 pub enum EvidenceKind {
     Browser,
     Review,
+}
+
+/// What the pass or reviewer found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum Verdict {
+    Pass,
+    Fail,
 }
 
 /// What asked for the app: `kind` (`idea`, `issue`, ...) and its `ref`.
@@ -103,10 +111,14 @@ pub enum AppCommand {
     Evidence {
         #[arg(long, value_enum)]
         kind: EvidenceKind,
+        /// The recording or screenshot; it stays on this computer.
         #[arg(long)]
-        file: Option<PathBuf>,
+        file: PathBuf,
         #[arg(long, default_value = "")]
         note: String,
+        /// Required for a review; a browser pass defaults to pass.
+        #[arg(long, value_enum)]
+        verdict: Option<Verdict>,
     },
 }
 
@@ -181,7 +193,18 @@ pub fn run(cmd: AppCommand, json: bool) -> Result<i32> {
             };
             ship::destroy(&root, &auth, json)
         }
-        _ => Ok(not_implemented(json)),
+        AppCommand::Evidence {
+            kind,
+            file,
+            note,
+            verdict,
+        } => {
+            let (root, _, auth) = match preflight(json) {
+                Ok(p) => p,
+                Err(code) => return Ok(code),
+            };
+            evidence::record(&root, &auth, kind, verdict, &file, &note, json)
+        }
     }
 }
 
@@ -224,16 +247,6 @@ fn destructive_gate(
         &sql.join("\n"),
         migrations::NEXT,
     ))
-}
-
-/// Commands still to come (`evidence`).
-fn not_implemented(json: bool) -> i32 {
-    fail(
-        json,
-        "not_implemented",
-        "That app command is not built yet.",
-        "update lightbulb",
-    )
 }
 
 /// `./{name}`: the starter, `app.yaml`, the plan, and one git commit.

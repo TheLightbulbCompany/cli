@@ -342,10 +342,10 @@ fn failures_print_the_json_shape_on_stdout_when_piped() {
             .unwrap()
     };
     // Piped stdout is not a TTY: JSON is the default.
-    let o = run(&["app", "evidence", "--kind", "browser"]);
+    let o = run(&["app", "evidence", "--kind", "browser", "--file", "x.png"]);
     assert_eq!(o.status.code(), Some(1));
     let v: Value = serde_json::from_slice(&o.stdout).unwrap();
-    assert_eq!(v["code"], "not_implemented");
+    assert_eq!(v["code"], "not_an_app");
     assert!(v["next"].is_string());
     assert!(!run(&["app", "check"]).stdout.is_empty());
 }
@@ -383,12 +383,12 @@ fn evidence_kind_is_a_flag_browser_or_review() {
             .unwrap()
     };
     for k in ["browser", "review"] {
-        let o = run(&["app", "evidence", "--kind", k, "--note", "ok"]);
+        let o = run(&["app", "evidence", "--kind", k, "--file", "x.png"]);
         let v: Value = serde_json::from_slice(&o.stdout).unwrap();
-        assert_eq!(v["code"], "not_implemented", "{k}");
+        assert_eq!(v["code"], "not_an_app", "{k}");
     }
     assert_eq!(
-        run(&["app", "evidence", "--kind", "recording"])
+        run(&["app", "evidence", "--kind", "recording", "--file", "x"])
             .status
             .code(),
         Some(2)
@@ -557,6 +557,7 @@ fn status_reads_the_app_id_and_asks_the_backend() {
     let run = |args: &[&str], base: &str| {
         e.base_cmd(Command::new(common::EXE))
             .current_dir(&dir)
+            .env("LIGHTBULB_APP_POLL_SCALE_MS", "1")
             .env("OPENCLAW_HOOK_TOKEN", "tok")
             .env("ISOL8_API_URL", base)
             .env("ISOL8_OWNER_ID", "o1")
@@ -1092,6 +1093,11 @@ impl Checked {
         git(&self.dir, &["rev-parse", "HEAD"]).trim().to_string()
     }
 
+    fn progress_file(&self) -> Value {
+        serde_json::from_slice(&std::fs::read(self.dir.join(".lightbulb/progress.json")).unwrap())
+            .unwrap()
+    }
+
     fn app_json(&self) -> Value {
         serde_json::from_slice(&std::fs::read(self.dir.join(".lightbulb/app.json")).unwrap())
             .unwrap()
@@ -1471,5 +1477,301 @@ fn status_prints_contract_fields_only() {
     assert_eq!(
         v["errors"]["client"][0],
         json!({"at": "t", "message": "boom"})
+    );
+}
+
+/// A backend whose status is `status()` and whose preview (itself) answers health with `health`.
+fn gate_stub(
+    up: Value,
+    status: impl Fn(usize) -> Value + Send + 'static,
+    health: Value,
+) -> (String, Arc<Mutex<Vec<Req>>>) {
+    let polls = std::sync::atomic::AtomicUsize::new(0);
+    stub_with(
+        move |line| {
+            let route = line.trim_end_matches(" HTTP/1.1");
+            if route == "GET /api/_lightbulb/health" {
+                return (200, health.clone());
+            }
+            match route.strip_prefix(&format!("POST {BUILD}")).unwrap_or("") {
+                "/source" => return (200, json!({"app_id": "a-1", "source_id": "s-1"})),
+                "/up" => return (200, up.clone()),
+                _ => {}
+            }
+            if route == format!("GET {BUILD}/a-1/status") {
+                let n = polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return (200, status(n));
+            }
+            (
+                404,
+                json!({"code": "no_route", "message": route, "next": ""}),
+            )
+        },
+        0,
+    )
+}
+
+fn ready_status(base: &str, commit: &str, ready_at: &str) -> Value {
+    json!({"app_id": "a-1", "state": "ready", "preview_url": base,
+        "preview": {"deployment_id": "d-1", "commit": commit, "ready_at": ready_at}})
+}
+
+impl Checked {
+    fn shot(&self) -> std::path::PathBuf {
+        let p = self.bin.path().join("shot.png");
+        std::fs::write(&p, b"png bytes").unwrap();
+        p
+    }
+
+    fn evidence(&self, base: &str, extra: &[&str]) -> (i32, Value) {
+        self.evidence_as(base, "browser", extra)
+    }
+
+    fn evidence_as(&self, base: &str, kind: &str, extra: &[&str]) -> (i32, Value) {
+        let shot = self.shot();
+        let mut a = vec!["evidence", "--kind", kind, "--file", shot.to_str().unwrap()];
+        a.extend(extra);
+        self.app(&a, base, true)
+    }
+}
+
+#[test]
+fn done_needs_ready_health_and_browser_evidence_for_head() {
+    let c = Checked::new();
+    let head = c.head();
+    let (base, seen) = {
+        let (h1, h2) = (head.clone(), head.clone());
+        let cell = Arc::new(Mutex::new(String::new()));
+        let c2 = cell.clone();
+        let (b, s) = gate_stub(
+            json!({"app_id": "a-1", "state": "ready"}),
+            move |_| ready_status(&c2.lock().unwrap(), &h1, "2020-01-01T00:00:00Z"),
+            json!({"commit": h2}),
+        );
+        *cell.lock().unwrap() = b.clone();
+        (b, s)
+    };
+    // Ready, healthy, but nobody has looked at it.
+    let (code, v) = c.app(&["up"], &base, true);
+    assert_eq!((code, &v["done"]), (0, &json!(false)), "{v}");
+    assert_eq!(v["missing"], json!(["browser_evidence"]));
+    let want = format!(
+        "open {base} in the browser, check the main flow, then lightbulb app evidence --kind browser --file …"
+    );
+    assert_eq!(v["next"], want.as_str());
+    assert!(lines(&seen).contains(&"GET /api/_lightbulb/health".to_string()));
+    {
+        let seen = seen.lock().unwrap();
+        let health = seen.iter().find(|r| r.line.contains("/health")).unwrap();
+        assert!(!health.headers.contains_key("authorization"));
+    }
+
+    // Record it.
+    let (code, v) = c.evidence(&base, &["--note", "main flow ok"]);
+    assert_eq!(code, 0, "{v}");
+    let ev = &c.progress_file()["evidence"][0];
+    assert_eq!(ev["kind"], "browser");
+    assert_eq!(ev["verdict"], "pass");
+    assert_eq!(ev["commit"], head.as_str());
+    assert_eq!(ev["deployment_id"], "d-1");
+    assert_eq!(ev["sha256"], sha(b"png bytes").as_str());
+    assert_eq!(ev["note"], "main flow ok");
+    assert!(ev["file"].as_str().unwrap().ends_with("shot.png"));
+    assert!(ev["at"].as_str().unwrap().ends_with('Z'));
+    // Now it is done, and a review record from the same command lets publish through.
+    let (code, v) = c.app(&["up"], &base, true);
+    assert_eq!(
+        (code, &v["done"], &v["missing"]),
+        (0, &json!(true), &json!([])),
+        "{v}"
+    );
+    let (code, v) = c.evidence_as(&base, "review", &[]);
+    assert_eq!((code, &v["code"]), (1, &json!("verdict_required")));
+    let (code, _) = c.evidence_as(&base, "review", &["--verdict", "pass"]);
+    assert_eq!(code, 0);
+    let p = c.progress_file();
+    assert!(lightbulb::apps::has_passing_review(&c.dir, &head), "{p}");
+}
+
+#[test]
+fn evidence_for_an_old_commit_does_not_satisfy_the_gate() {
+    let c = Checked::new();
+    let head = c.head();
+    let make = |ready_at: &'static str| {
+        let cell = Arc::new(Mutex::new(String::new()));
+        let c2 = cell.clone();
+        let h = head.clone();
+        let (b, _) = gate_stub(
+            json!({"app_id": "a-1", "state": "ready"}),
+            move |_| ready_status(&c2.lock().unwrap(), &h, ready_at),
+            json!({"commit": head}),
+        );
+        *cell.lock().unwrap() = b.clone();
+        b
+    };
+    let base = make("2020-01-01T00:00:00Z");
+    let put = |e: Value| {
+        std::fs::write(
+            c.dir.join(".lightbulb/progress.json"),
+            json!({"evidence": [e]}).to_string(),
+        )
+        .unwrap()
+    };
+    // Old commit, failing verdict, wrong kind, and recorded before the deployment was ready.
+    for e in [
+        json!({"kind": "browser", "verdict": "pass", "commit": "old", "at": "2030-01-01T00:00:00Z"}),
+        json!({"kind": "browser", "verdict": "fail", "commit": head, "at": "2030-01-01T00:00:00Z"}),
+        json!({"kind": "review", "verdict": "pass", "commit": head, "at": "2030-01-01T00:00:00Z"}),
+        json!({"kind": "browser", "verdict": "pass", "commit": head, "at": "2019-12-31T23:59:59Z"}),
+    ] {
+        put(e.clone());
+        let (_, v) = c.app(&["up"], &base, true);
+        assert_eq!(v["done"], false, "{e}");
+        assert_eq!(v["missing"], json!(["browser_evidence"]), "{e}");
+    }
+    put(
+        json!({"kind": "browser", "verdict": "pass", "commit": head, "at": "2020-01-01T00:00:00Z"}),
+    );
+    let (_, v) = c.app(&["up"], &base, true);
+    assert_eq!(v["done"], true, "{v}");
+    // A preview for another commit is not done, whatever the evidence.
+    let cell = Arc::new(Mutex::new(String::new()));
+    let c2 = cell.clone();
+    let (b, _) = gate_stub(
+        json!({"app_id": "a-1", "state": "ready"}),
+        move |_| ready_status(&c2.lock().unwrap(), "older", "2020-01-01T00:00:00Z"),
+        json!({"commit": "older"}),
+    );
+    *cell.lock().unwrap() = b.clone();
+    let (_, v) = c.app(&["up"], &b, true);
+    assert_eq!(
+        (&v["done"], &v["missing"]),
+        (&json!(false), &json!(["preview_commit"]))
+    );
+    assert!(v["next"].as_str().unwrap().contains("lightbulb app up"));
+}
+
+#[test]
+fn health_commit_mismatch_is_not_done() {
+    let c = Checked::new();
+    let head = c.head();
+    std::fs::write(
+        c.dir.join(".lightbulb/progress.json"),
+        json!({"evidence": [{"kind": "browser", "verdict": "pass", "commit": head, "at": "2030-01-01T00:00:00Z"}]}).to_string(),
+    )
+    .unwrap();
+    let cell = Arc::new(Mutex::new(String::new()));
+    let c2 = cell.clone();
+    let h = head.clone();
+    let (base, _) = gate_stub(
+        json!({"app_id": "a-1", "state": "ready"}),
+        move |_| ready_status(&c2.lock().unwrap(), &h, "2020-01-01T00:00:00Z"),
+        json!({"commit": "somethingelse"}),
+    );
+    *cell.lock().unwrap() = base.clone();
+    let (code, v) = c.app(&["up"], &base, true);
+    assert_eq!(
+        (code, &v["done"], &v["missing"]),
+        (0, &json!(false), &json!(["health"])),
+        "{v}"
+    );
+    assert!(v["next"]
+        .as_str()
+        .unwrap()
+        .contains("/api/_lightbulb/health"));
+}
+
+#[test]
+fn next_names_the_missing_piece() {
+    let c = Checked::new();
+    let head = c.head();
+    let head2 = head.clone();
+    // Building twice, then ready: up waits, with no preview reported at all.
+    let (base, seen) = gate_stub(
+        json!({"app_id": "a-1", "state": "building"}),
+        |n| {
+            json!({"app_id": "a-1", "state": if n < 2 { "building" } else { "ready" },
+                "preview_url": "http://127.0.0.1:1"})
+        },
+        json!({"commit": "x"}),
+    );
+    let (code, v) = c.app(&["up"], &base, true);
+    assert_eq!(
+        (code, &v["state"], &v["done"]),
+        (0, &json!("ready"), &json!(false)),
+        "{v}"
+    );
+    assert_eq!(v["missing"], json!(["preview"]));
+    assert_eq!(
+        v["next"],
+        "the backend did not report the preview deployment"
+    );
+    let status_gets = lines(&seen)
+        .iter()
+        .filter(|l| l.ends_with("/a-1/status"))
+        .count();
+    assert_eq!(status_gets, 4, "{:?}", lines(&seen));
+    // Failed stops the wait.
+    let (base, seen) = gate_stub(
+        json!({"app_id": "a-1", "state": "building"}),
+        |_| json!({"app_id": "a-1", "state": "failed"}),
+        json!({}),
+    );
+    let (code, v) = c.app(&["up"], &base, true);
+    assert_eq!(
+        (code, &v["state"], &v["done"]),
+        (1, &json!("failed"), &json!(false))
+    );
+    assert_eq!(
+        lines(&seen)
+            .iter()
+            .filter(|l| l.ends_with("/status"))
+            .count(),
+        1
+    );
+    // Ready with no ready_at: the time up first saw ready stands in, and is kept.
+    let cell = Arc::new(Mutex::new(String::new()));
+    let c2 = cell.clone();
+    let (base, _) = gate_stub(
+        json!({"app_id": "a-1", "state": "ready"}),
+        move |_| {
+            json!({"app_id": "a-1", "state": "ready", "preview_url": *c2.lock().unwrap(),
+                "preview": {"deployment_id": "d-1", "commit": head2}})
+        },
+        json!({"commit": head}),
+    );
+    *cell.lock().unwrap() = base.clone();
+    let (_, v) = c.app(&["up"], &base, true);
+    assert_eq!(v["missing"], json!(["browser_evidence"]), "{v}");
+    let seen_at = c.progress_file()["preview_seen"].clone();
+    assert_eq!(seen_at["commit"], c.head().as_str());
+    let (code, _) = c.evidence(&base, &[]);
+    assert_eq!(code, 0);
+    let (_, v) = c.app(&["up"], &base, true);
+    assert_eq!(v["done"], true, "{v}");
+    assert_eq!(c.progress_file()["preview_seen"], seen_at);
+}
+
+#[test]
+fn evidence_needs_a_real_file_and_works_offline() {
+    let c = Checked::new();
+    let (code, v) = c.app(
+        &[
+            "evidence",
+            "--kind",
+            "browser",
+            "--file",
+            "/no/such/file.png",
+        ],
+        "http://127.0.0.1:1",
+        true,
+    );
+    assert_eq!((code, &v["code"]), (1, &json!("bad_file")));
+    // The backend is down: the record is still made, with no deployment.
+    let (code, v) = c.evidence("http://127.0.0.1:1", &[]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(
+        c.progress_file()["evidence"][0]["deployment_id"],
+        Value::Null
     );
 }

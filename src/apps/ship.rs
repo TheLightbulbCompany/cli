@@ -2,7 +2,7 @@
 //! what the backend says. Only contract fields are printed, never the backend's JSON as is.
 
 use super::api::{self, ApiError, Auth};
-use super::{check, fail, migrations, AppConfig};
+use super::{check, evidence, fail, migrations, AppConfig};
 use crate::Result;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -24,7 +24,7 @@ fn git(root: &Path, args: &[&str]) -> std::result::Result<Output, ApiError> {
         })
 }
 
-fn git_ok(root: &Path, args: &[&str]) -> std::result::Result<String, ApiError> {
+pub(super) fn git_ok(root: &Path, args: &[&str]) -> std::result::Result<String, ApiError> {
     let o = git(root, args)?;
     if o.status.success() {
         return Ok(String::from_utf8_lossy(&o.stdout).trim().to_string());
@@ -191,7 +191,7 @@ fn save_app_json(root: &Path, v: &Value) -> Result<()> {
 }
 
 /// A review record for `head` with verdict pass (R10), in `.lightbulb/progress.json`.
-pub(crate) fn has_passing_review(root: &Path, head: &str) -> bool {
+pub fn has_passing_review(root: &Path, head: &str) -> bool {
     std::fs::read(root.join(".lightbulb/progress.json"))
         .ok()
         .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
@@ -256,6 +256,9 @@ fn print(v: &Value, json: bool) {
         if let Some(u) = v[k].as_str() {
             println!("{k}: {u}");
         }
+    }
+    if let Some(d) = v["done"].as_bool() {
+        println!("Done: {}", if d { "yes" } else { "no" });
     }
     println!("Next: {}", v["next"].as_str().unwrap_or(""));
 }
@@ -389,8 +392,57 @@ pub(crate) fn up(
         a["app_id"] = id.into();
         save_app_json(root, &a)?;
     }
-    // ponytail: the done gate and the wait for READY are Task 7; until then done is false.
-    Ok(show(&r, json!({"done": false, "next": next_for(&r)}), json))
+    let mut r = r;
+    let id = r["app_id"].as_str().unwrap_or_default().to_string();
+    if matches!(r["state"].as_str(), Some("building" | "provisioning")) {
+        match wait(auth, &id, &mut r) {
+            Ok(()) => {}
+            Err(e) => return Ok(failure(json, e)),
+        }
+    }
+    let extra = if r["state"] == "ready" {
+        let state = git_ok(root, &["rev-parse", "HEAD"])
+            .and_then(|head| evidence::done(root, auth, &id, &head));
+        match state {
+            Ok(d) => json!({"done": d.done, "missing": d.missing, "next": d.next}),
+            Err(e) => return Ok(failure(json, e)),
+        }
+    } else {
+        json!({"done": false, "next": next_for(&r)})
+    };
+    Ok(show(&r, extra, json))
+}
+
+/// Polls the status (2, 4, 8, 15, 15... s, up to 10 minutes) until the app is no longer
+/// building; `LIGHTBULB_APP_POLL_SCALE_MS` is the unit of those seconds (1000).
+/// The backend never waits inside a request, so the waiting is here.
+fn wait(auth: &Auth, id: &str, r: &mut Value) -> std::result::Result<(), ApiError> {
+    let unit: u64 = std::env::var("LIGHTBULB_APP_POLL_SCALE_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1000);
+    let mut waited = 0;
+    for secs in [2, 4, 8].into_iter().chain(std::iter::repeat(15)) {
+        if waited + secs > 600 {
+            break;
+        }
+        eprintln!(
+            "The app is {}; checking again in {secs}s.",
+            r["state"].as_str().unwrap_or("building")
+        );
+        std::thread::sleep(std::time::Duration::from_millis(secs * unit));
+        waited += secs;
+        let s = api::call(auth, "GET", &format!("/{id}/status"), None)?;
+        for k in ["state", "preview_url", "live_url"] {
+            if !s[k].is_null() {
+                r[k] = s[k].clone();
+            }
+        }
+        if !matches!(r["state"].as_str(), Some("building" | "provisioning")) {
+            break;
+        }
+    }
+    Ok(())
 }
 
 fn app_id(root: &Path, json: bool) -> std::result::Result<String, i32> {

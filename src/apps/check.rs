@@ -176,6 +176,36 @@ pub(crate) fn run_check(root: &Path, publish: bool) -> std::result::Result<Check
     Ok(CheckResult { ok, problems, next })
 }
 
+fn bad_progress(why: String) -> ApiError {
+    ApiError::new(
+        "bad_progress",
+        &format!("Could not use .lightbulb/progress.json: {why}"),
+        "fix or delete .lightbulb/progress.json, then run the check again",
+    )
+}
+
+/// `.lightbulb/progress.json` (`{}` when there is none). Evidence lives in this file: an
+/// unreadable one is an error, never overwritten.
+pub(crate) fn read_progress(root: &Path) -> std::result::Result<Value, ApiError> {
+    match std::fs::read(root.join(".lightbulb/progress.json")) {
+        Ok(b) => serde_json::from_slice(&b)
+            .ok()
+            .filter(Value::is_object)
+            .ok_or_else(|| bad_progress("it is not a JSON object".into())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(json!({})),
+        Err(e) => Err(bad_progress(e.to_string())),
+    }
+}
+
+pub(crate) fn write_progress(root: &Path, v: &Value) -> std::result::Result<(), ApiError> {
+    let path = root.join(".lightbulb/progress.json");
+    let tmp = path.with_extension("json.tmp");
+    std::fs::create_dir_all(root.join(".lightbulb"))
+        .and_then(|_| std::fs::write(&tmp, v.to_string()))
+        .and_then(|_| std::fs::rename(&tmp, &path))
+        .map_err(|e| bad_progress(e.to_string()))
+}
+
 /// Counts this run's problems in `progress.json` (other keys stay) and picks `next`.
 fn update_progress(
     root: &Path,
@@ -183,23 +213,7 @@ fn update_progress(
     publish: bool,
     problems: &[Problem],
 ) -> std::result::Result<Option<&'static str>, ApiError> {
-    let path = root.join(".lightbulb/progress.json");
-    let bad = |why: String| {
-        ApiError::new(
-            "bad_progress",
-            &format!("Could not use .lightbulb/progress.json: {why}"),
-            "fix or delete .lightbulb/progress.json, then run the check again",
-        )
-    };
-    // Evidence lives in this file: never overwrite what cannot be read.
-    let mut progress: Value = match std::fs::read(&path) {
-        Ok(b) => serde_json::from_slice(&b)
-            .ok()
-            .filter(Value::is_object)
-            .ok_or_else(|| bad("it is not a JSON object".into()))?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!({}),
-        Err(e) => return Err(bad(e.to_string())),
-    };
+    let mut progress = read_progress(root)?;
     let mut attempts = progress["attempts"]
         .as_object()
         .cloned()
@@ -220,11 +234,7 @@ fn update_progress(
     }
     progress["attempts"] = Value::Object(attempts);
     progress["last_check"] = json!({"ok": ok, "publish": publish, "problems": problems.len()});
-    let tmp = path.with_extension("json.tmp");
-    std::fs::create_dir_all(root.join(".lightbulb"))
-        .and_then(|_| std::fs::write(&tmp, progress.to_string()))
-        .and_then(|_| std::fs::rename(&tmp, &path))
-        .map_err(|e| bad(e.to_string()))?;
+    write_progress(root, &progress)?;
     Ok(match worst {
         0 => None,
         1 => Some("fix"),
