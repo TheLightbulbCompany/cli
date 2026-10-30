@@ -17,10 +17,9 @@ use std::time::{Duration, Instant};
 
 /// At most this many sessions, `known` and `kept` addresses each per presence.
 pub const MAX: usize = 100;
-/// How long an ended session's or a name's address stays kept, and how long an offline
-/// member's presence is listed.
+/// How long an ended session's or a name's address stays kept.
 pub const DAY: u64 = 86_400;
-/// How long an ended session stays listed.
+/// How long an ended session stays listed, and an offline member's presence.
 pub const WEEK: u64 = 7 * DAY;
 /// Changes this close together go out as one presence.
 const COALESCE: Duration = Duration::from_millis(250);
@@ -157,14 +156,14 @@ fn build(d: &Daemon, seq: u64) -> Frame {
     };
     let publishable = |cwd: &str| !hidden(&off, cwd);
     let mut live = ipc::live_sessions(d);
-    let (rows, ended, waiting) = {
+    let ended = ipc::ended_sessions(d);
+    let (rows, waiting) = {
         let store = d.store.lock().unwrap();
         let since = now.saturating_sub(DAY) as i64;
         let live_keys = live.iter().map(|s| s.key.0.as_str()).collect();
         let _ = store.prune_hidden(since, &live_keys);
         (
             store.sessions().unwrap_or_default(),
-            store.ended_since(since, &[]).unwrap_or_default(),
             mail::waiting_keys(&store, now).unwrap_or_default(),
         )
     };
@@ -386,7 +385,7 @@ pub fn put(d: &Daemon, member: &str, f: &Frame, now: u64, first: bool) {
     }
 }
 
-/// `member` was last seen now (its connection closed): its presence is listed a day more.
+/// `member` was last seen now (its connection closed): its presence is listed a week more.
 pub fn seen(d: &Daemon, member: &str) {
     let now = ipc::now();
     if let Some(l) = d.latest.lock().unwrap().get_mut(member) {
@@ -395,7 +394,7 @@ pub fn seen(d: &Daemon, member: &str) {
     let _ = d.store.lock().unwrap().touch_presence(member, now as i64);
 }
 
-/// The latest presences of current members; one offline and unseen for a day is dropped.
+/// The latest presences of current members; one offline and unseen for a week is dropped.
 fn stored(d: &Daemon) -> Vec<(Member, Latest)> {
     let online: HashSet<String> = d.peers.online().into_iter().collect();
     let now = ipc::now();
@@ -403,7 +402,7 @@ fn stored(d: &Daemon) -> Vec<(Member, Latest)> {
     let held: Vec<(String, Latest)> = {
         let mut held = d.latest.lock().unwrap();
         held.retain(|m, l| {
-            let keep = l.seen_at + DAY >= now || online.contains(m);
+            let keep = l.seen_at + WEEK >= now || online.contains(m);
             if !keep {
                 stale.push(m.clone());
             }

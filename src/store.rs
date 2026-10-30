@@ -480,6 +480,24 @@ impl Store {
         )? > 0)
     }
 
+    /// A row born ended at `at`, for a job first seen finished: no process, and no handle (one
+    /// comes if it is ever resumed), since hundreds of old jobs must not use up `who`'s numbers.
+    /// `false`, changing nothing, when `key` has a row: a job ends once.
+    pub fn put_ended_job(
+        &self,
+        key: &str,
+        conversation: &str,
+        cwd: &str,
+        title: Option<&str>,
+        at: i64,
+    ) -> rusqlite::Result<bool> {
+        Ok(self.conn.execute(
+            "INSERT OR IGNORE INTO sessions (key, provider, conversation, cwd, title, status, \
+             seen_at, reason, ended_at) VALUES (?1, 'claude', ?2, ?3, ?4, 'idle', ?5, 'job-done', ?5)",
+            params![key, conversation, cwd, title, at],
+        )? > 0)
+    }
+
     /// The ended rows, newest end first; deletes those that ended before `since` unless their
     /// key is in `keep` (a listing still shows it).
     pub fn ended_since(&self, since: i64, keep: &[&str]) -> rusqlite::Result<Vec<Session>> {

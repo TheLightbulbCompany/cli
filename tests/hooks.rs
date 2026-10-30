@@ -438,6 +438,30 @@ fn a_session_end_after_the_agent_exited_still_ends_the_session() {
     assert_eq!(r["error"], "not_found", "the row was already ended");
 }
 
+/// `/clear` ends the old conversation while its process lives on: it moved on, nothing more.
+#[test]
+fn a_session_end_after_clear_ends_the_row_as_moved_on() {
+    let net = Net::new();
+    let me = os::process(std::process::id()).unwrap();
+    let c = "00000000-0000-4000-8000-0000000000c1";
+    register(&net, c, me.pid, me.birth_micros);
+    net.hook("claude", "session-end", "claude-session-end-clear");
+    let r = net.call(json!({"id": 1, "op": "sessions"}));
+    assert_eq!(r["ended"][0]["conversation"], c, "{r}");
+    assert_eq!(r["ended"][0]["reason"], "moved-on");
+}
+
+#[test]
+fn a_session_end_on_exit_ends_the_row_as_session_end() {
+    let net = Net::new();
+    let me = os::process(std::process::id()).unwrap();
+    let c = "00000000-0000-4000-8000-0000000000c1";
+    register(&net, c, me.pid, me.birth_micros);
+    net.hook("claude", "session-end", "claude-session-end");
+    let r = net.call(json!({"id": 1, "op": "sessions"}));
+    assert_eq!(r["ended"][0]["reason"], "session-end", "{r}");
+}
+
 #[test]
 fn a_hand_run_session_end_cannot_end_a_live_session() {
     let net = Net::new();

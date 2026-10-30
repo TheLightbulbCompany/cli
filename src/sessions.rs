@@ -200,6 +200,16 @@ fn from_row(r: &store::Session, home: &Path) -> Option<Session> {
 /// are not parked into the agent view.
 /// Dead ones are skipped and left alone: Claude owns the files.
 pub fn scan_claude(home: &Path, member_short: &str) -> Vec<Session> {
+    let files = pid_files(home, member_short).into_iter();
+    files
+        .filter(|(_, parked)| !parked)
+        .map(|(s, _)| s)
+        .collect()
+}
+
+/// Every verified pid file as a session, and whether it is parked into the agent view: then the
+/// terminal is not the session any more.
+fn pid_files(home: &Path, member_short: &str) -> Vec<(Session, bool)> {
     let Ok(dir) = std::fs::read_dir(home.join(".claude/sessions")) else {
         return vec![];
     };
@@ -222,10 +232,7 @@ pub fn scan_claude(home: &Path, member_short: &str) -> Vec<Session> {
         ) else {
             continue;
         };
-        // Parked into the agent view: the terminal is not the session any more.
-        if v["parkedJobId"].as_str().is_some_and(|j| !j.is_empty()) {
-            continue;
-        }
+        let parked = v["parkedJobId"].as_str().is_some_and(|j| !j.is_empty());
         let (Ok(p), Ok(started)) = (os::process(pid), os::started_ms(pid)) else {
             continue;
         };
@@ -237,7 +244,7 @@ pub fn scan_claude(home: &Path, member_short: &str) -> Vec<Session> {
             .as_str()
             .map(PathBuf::from)
             .filter(|s| os::PEER_PID && s.exists());
-        out.push(Session {
+        let session = Session {
             key: Key::new(member_short, "claude", conversation),
             provider: "claude".into(),
             conversation: conversation.into(),
@@ -246,7 +253,8 @@ pub fn scan_claude(home: &Path, member_short: &str) -> Vec<Session> {
             cwd: v["cwd"].as_str().unwrap_or_default().into(),
             title: v["name"].as_str().map(String::from),
             doing: None,
-            status: if v["status"] == "busy" {
+            // `shell`: Claude itself reports it as busy.
+            status: if v["status"] == "busy" || v["status"] == "shell" {
                 Status::Live
             } else {
                 Status::Idle
@@ -265,12 +273,26 @@ pub fn scan_claude(home: &Path, member_short: &str) -> Vec<Session> {
             kind: v["kind"].as_str().map(String::from),
             entrypoint: v["entrypoint"].as_str().map(String::from),
             job: None,
-        });
+        };
+        out.push((session, parked));
     }
     out
 }
 
-/// Registered rows plus Claude discoveries, deduplicated by key (a discovery wins for its
+/// The command that resumes an ended conversation, on its owner's computer.
+pub fn resume(provider: &str, conversation: &str) -> Option<String> {
+    let command = match provider {
+        "claude" => "claude --resume",
+        "codex" => "codex resume",
+        "cursor" => "cursor-agent --resume",
+        "grok" => "grok -r",
+        "opencode" => "opencode -s",
+        _ => return None,
+    };
+    Some(format!("{command} {conversation}"))
+}
+
+/// Registered rows that are still theirs plus Claude discoveries, deduplicated by key (a discovery wins for its
 /// status, which is fresher, except that a hook's `waiting` stands until the listing says `idle`;
 /// the row for its folder, which its hook reported resolved, and its handle, repo and branch),
 /// `Gone` dropped, `title`/`doing` filled from the transcript. Discoveries are Claude's listing
@@ -279,29 +301,54 @@ pub fn scan_claude(home: &Path, member_short: &str) -> Vec<Session> {
 /// they say is alive: a verified pid file (not an SDK run's) it has no live row for stays, so
 /// `[]`, or a Claude that stops listing a kind of row, degrades to them. A session found only
 /// by discovery keeps Claude's own cwd as given (not resolved) and has no handle until its hook
-/// registers it.
+/// registers it (`ipc::live_sessions` writes its row, which gives it one).
+/// A live process alone does not keep a Claude row: `/clear`, `/resume` and the agent view leave
+/// it running on another conversation. When the listing answered, or a pid file speaks for that
+/// process, a row held by neither a live listed row nor a verified pid file is not live. With
+/// neither (a hook registered it under another home, or the listing is out) nothing is known
+/// against it and it stays. Other providers' rows live with their process.
 pub fn all(
     rows: &[store::Session],
     listed: Option<&[listing::Listed]>,
     home: &Path,
     member_short: &str,
 ) -> Vec<Session> {
-    let mut out: Vec<Session> = rows.iter().filter_map(|r| from_row(r, home)).collect();
-    let scanned = scan_claude(home, member_short);
-    // Each discovery, and whether it is the listing's word.
-    let found: Vec<(Session, bool)> = match listed {
-        Some(listed) => {
-            let sockets = scanned
+    let files = pid_files(home, member_short);
+    let spoken_for: Vec<u32> = files.iter().map(|(s, _)| s.pid).collect();
+    let scanned: Vec<Session> = files
+        .into_iter()
+        .filter(|(_, parked)| !parked)
+        .map(|(s, _)| s)
+        .collect();
+    let live = listed.map(|listed| {
+        let sockets = scanned
+            .iter()
+            .filter_map(|s| Some((s.conversation.clone(), s.push_via.clone()?)))
+            .collect();
+        let mut live = listing::to_sessions(listed, member_short, &sockets);
+        for f in &mut live {
+            f.entrypoint = scanned
                 .iter()
-                .filter_map(|s| Some((s.conversation.clone(), s.push_via.clone()?)))
-                .collect();
-            let mut live = listing::to_sessions(listed, member_short, &sockets);
-            for f in &mut live {
-                f.entrypoint = scanned
-                    .iter()
-                    .find(|s| s.conversation == f.conversation)
-                    .and_then(|s| s.entrypoint.clone());
-            }
+                .find(|s| s.conversation == f.conversation)
+                .and_then(|s| s.entrypoint.clone());
+        }
+        live
+    });
+    let held = |c: &str| {
+        let mut holders = live.iter().flatten().chain(&scanned);
+        holders.any(|s| s.conversation == c)
+    };
+    let mut out: Vec<Session> = rows
+        .iter()
+        .filter_map(|r| from_row(r, home))
+        .filter(|s| {
+            let known = listed.is_some() || spoken_for.contains(&s.pid);
+            s.provider != "claude" || !known || held(&s.conversation)
+        })
+        .collect();
+    // Each discovery, and whether it is the listing's word.
+    let found: Vec<(Session, bool)> = match live {
+        Some(live) => {
             let kept: Vec<Session> = scanned
                 .into_iter()
                 .filter(|s| {
@@ -393,14 +440,67 @@ mod tests {
     fn what_the_listing_leaves_out_stays_if_its_pid_file_is_verified() {
         let home = tempfile::tempdir().unwrap();
         pid_file(home.path(), "kept", "");
+        pid_file(home.path(), "in-a-shell", r#","status":"shell""#);
         pid_file(home.path(), "empty-park", r#","parkedJobId":"""#);
         pid_file(home.path(), "parked", r#","parkedJobId":"ab12""#);
         pid_file(home.path(), "sdk", r#","entrypoint":"sdk-ts""#);
         let live = all(&[], Some(&[]), home.path(), "m");
         let mut names: Vec<&str> = live.iter().map(|s| s.conversation.as_str()).collect();
         names.sort();
-        assert_eq!(names, ["empty-park", "kept"]);
+        assert_eq!(names, ["empty-park", "in-a-shell", "kept"]);
         assert!(live.iter().all(|s| s.status == Status::Live));
+    }
+
+    fn row(conversation: &str, provider: &str) -> store::Session {
+        let me = os::process(std::process::id()).unwrap();
+        store::Session {
+            key: format!("m/{provider}:{conversation}"),
+            provider: provider.into(),
+            conversation: Some(conversation.into()),
+            pid: Some(me.pid.into()),
+            birth_micros: Some(me.birth_micros as i64),
+            cwd: "/tmp".into(),
+            title: None,
+            status: "idle".into(),
+            seen_at: 1,
+            executable: None,
+            repo: None,
+            branch: None,
+            handle: None,
+            reason: None,
+            ended_at: None,
+            waiting_for: None,
+        }
+    }
+
+    fn live_of(
+        rows: &[store::Session],
+        listed: Option<&[listing::Listed]>,
+        home: &Path,
+    ) -> Vec<String> {
+        let mut names: Vec<String> = all(rows, listed, home, "m")
+            .into_iter()
+            .map(|s| s.conversation)
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The process lives on after `/clear`: only knowing better ends its old conversation.
+    #[test]
+    fn a_live_process_keeps_its_claude_row_only_while_nothing_says_otherwise() {
+        let home = tempfile::tempdir().unwrap();
+        let rows = [row("old", "claude"), row("c", "codex")];
+        // Nothing known: the listing is out and no pid file speaks for the process.
+        assert_eq!(live_of(&rows, None, home.path()), ["c", "old"]);
+        // The listing answered without it.
+        assert_eq!(live_of(&rows, Some(&[]), home.path()), ["c"]);
+        // The pid file names the process on another conversation.
+        pid_file(home.path(), "new", "");
+        assert_eq!(live_of(&rows, None, home.path()), ["c", "new"]);
+        // An SDK run's pid file is not discovered under a listing, but it holds its row.
+        pid_file(home.path(), "old", r#","entrypoint":"sdk-ts""#);
+        assert_eq!(live_of(&rows, Some(&[]), home.path()), ["c", "new", "old"]);
     }
 
     #[test]

@@ -126,6 +126,8 @@ pub struct ListingCache {
     pub refreshing: bool,
     /// The last read failed and has been logged: one line per streak.
     pub failing: bool,
+    /// The read whose finished jobs have been written (`ipc::live_sessions`).
+    pub recorded: Option<Instant>,
 }
 
 /// Claude's listing as last read, at once: never runs `claude` here, and never holds the lock
@@ -156,20 +158,36 @@ pub(crate) fn current(daemon: &Daemon) -> Option<Vec<Listed>> {
     c.rows.clone()
 }
 
+/// Ends a refresh however it ends: a read that panics counts as a failed one, so the listing is
+/// neither left stale nor stuck "refreshing".
+struct Refreshed<'a> {
+    cache: &'a Mutex<ListingCache>,
+    rows: Option<Vec<Listed>>,
+}
+
+impl Drop for Refreshed<'_> {
+    fn drop(&mut self) {
+        let mut c = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        c.rows = self.rows.take();
+        c.at = Some(Instant::now());
+        c.refreshing = false;
+    }
+}
+
 /// One read of the listing, its result swapped into `cache`.
 fn refresh(cache: &Mutex<ListingCache>, home: &Path) {
+    let mut done = Refreshed { cache, rows: None };
     let exes = listing::candidates(home);
-    let rows = listing::read(&exes);
-    let mut c = cache.lock().unwrap();
-    if rows.is_some() {
-        c.failing = false;
-    } else if !exes.is_empty() && !c.failing {
-        c.failing = true;
+    done.rows = listing::read(&exes);
+    let first_failure = {
+        let mut c = cache.lock().unwrap();
+        let first = done.rows.is_none() && !exes.is_empty() && !c.failing;
+        c.failing = done.rows.is_none() && (c.failing || first);
+        first
+    };
+    if first_failure {
         eprintln!("claude agents: no answer from {exes:?}; using the pid files");
     }
-    c.rows = rows;
-    c.at = Some(Instant::now());
-    c.refreshing = false;
 }
 
 /// An embedded instance: a Lightbulb workspace's member.
@@ -531,4 +549,31 @@ fn answers_ping(sock: &Path) -> bool {
     stream.write_all(b"{\"id\":0,\"op\":\"ping\"}\n").is_ok()
         && BufReader::new(stream).read_line(&mut line).is_ok()
         && line.contains("\"ok\":true")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A read that panics counts as a failed one: the next look may start another.
+    #[test]
+    fn a_panicking_read_leaves_the_listing_usable() {
+        let cache = Mutex::new(ListingCache {
+            refreshing: true,
+            rows: Some(vec![]),
+            ..Default::default()
+        });
+        std::thread::scope(|s| {
+            let read = s.spawn(|| {
+                let _done = Refreshed {
+                    cache: &cache,
+                    rows: None,
+                };
+                panic!("the read");
+            });
+            assert!(read.join().is_err());
+        });
+        let c = cache.lock().unwrap();
+        assert!(!c.refreshing && c.rows.is_none() && c.at.is_some());
+    }
 }

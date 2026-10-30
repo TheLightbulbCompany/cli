@@ -130,23 +130,35 @@ fn ask(exe: &Path, deadline: Instant) -> Option<Vec<Listed>> {
         let mut text = String::new();
         let _ = tx.send(out.read_to_string(&mut text).map(|_| text));
     });
-    let text = rx
-        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-        .ok()
-        .and_then(Result::ok);
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) if text.is_some() => break Some(status),
-            Ok(None) if text.is_some() && Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(10))
+    let kill_group = |pid: u32| {
+        // SAFETY: a plain syscall; `process_group(0)` made the child's pid its group's id. A
+        // reaped child's id is not reused while its group has members; with none this is ESRCH.
+        unsafe { libc::killpg(pid as libc::pid_t, libc::SIGKILL) };
+    };
+    let mut status = None;
+    let text = loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(left.min(Duration::from_millis(20))) {
+            Ok(text) => break text.ok(),
+            Err(mpsc::RecvTimeoutError::Timeout) if !left.is_zero() => {}
+            Err(_) => break None,
+        }
+        if status.is_none() {
+            status = child.try_wait().ok().flatten();
+            // It has answered and gone; a helper it left holding the pipe must not cost the answer.
+            if status.is_some() {
+                kill_group(child.id());
             }
-            _ => break None,
         }
     };
+    while status.is_none() && text.is_some() && Instant::now() < deadline {
+        status = child.try_wait().ok().flatten();
+        if status.is_none() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
     if status.is_none() {
-        // SAFETY: a plain syscall; `process_group(0)` made the child's pid its group's id, and
-        // it is not yet reaped, so the id is still that group's.
-        unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGKILL) };
+        kill_group(child.id());
         let _ = child.wait();
     }
     parse(&text?).filter(|_| status.is_some_and(|s| s.success()))
@@ -218,9 +230,18 @@ pub fn to_sessions(
 pub fn finished(listed: &[Listed]) -> Vec<String> {
     listed
         .iter()
-        .filter(|l| matches!(l.state.as_deref(), Some("done" | "failed" | "stopped")))
+        .filter(|l| job_over(l))
         .map(|l| l.conversation.clone())
         .collect()
+}
+
+/// The finished jobs with no process left: ended. One whose process lives is idle, not ended.
+pub fn ended_jobs(listed: &[Listed]) -> impl Iterator<Item = &Listed> {
+    listed.iter().filter(|l| job_over(l) && l.pid.is_none())
+}
+
+fn job_over(l: &Listed) -> bool {
+    matches!(l.state.as_deref(), Some("done" | "failed" | "stopped"))
 }
 
 #[cfg(test)]
@@ -303,6 +324,16 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(os::process(pid).is_err(), "the group was killed");
+    }
+
+    /// Its output is complete, but a helper it left behind still holds the pipe open.
+    #[test]
+    fn a_claude_that_answered_and_exited_is_read_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = script(dir.path(), "claude", "sleep 10 &\necho '[]'");
+        let t = Instant::now();
+        assert_eq!(read(&[exe]), Some(vec![]));
+        assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
     }
 
     #[test]

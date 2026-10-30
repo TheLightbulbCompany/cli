@@ -185,12 +185,17 @@ fn listed(e: &Env) -> Vec<Value> {
     r["sessions"].as_array().unwrap().clone()
 }
 
+fn ended(e: &Env) -> Vec<Value> {
+    let r = e.ask(json!({"id": 1, "op": "sessions"}));
+    r["ended"].as_array().unwrap().clone()
+}
+
 fn by<'a>(sessions: &'a [Value], conversation: &str) -> Option<&'a Value> {
     sessions.iter().find(|s| s["conversation"] == conversation)
 }
 
 #[test]
-fn the_listing_feeds_sessions_and_when_claude_fails_only_the_registered_row_stays() {
+fn the_listing_feeds_sessions_and_when_claude_fails_nothing_alive_ends() {
     let five = include_str!("fixtures/claude-agents/five.json")
         .replace("\"pid\": 4242", &format!("\"pid\": {}", std::process::id()));
     let (shim, path) = claude_shim(&five);
@@ -204,29 +209,45 @@ fn the_listing_feeds_sessions_and_when_claude_fails_only_the_registered_row_stay
         ],
     );
     register_claude(&e, "mine", "idle", None);
-    // Read on its own thread: the first answers come from the rows alone.
-    until(10, "the listing is read", || listed(&e).len() == 9);
+    // Read on its own thread: the first answers come from the rows alone. Once read, a row the
+    // listing does not hold is over, its process alive or not.
+    until(10, "the listing is read", || {
+        let s = listed(&e);
+        s.len() == 8 && by(&s, "mine").is_none()
+    });
     let s = listed(&e);
     let blocked = by(&s, "b1b2c3d4-0000-4000-8000-000000000002").unwrap();
     assert_eq!(
         (blocked["status"].as_str(), blocked["waiting_for"].as_str()),
         (Some("waiting"), Some("permission prompt"))
     );
+    // A finished job whose process lives is idle, not ended; one with none is ended.
     let done = by(&s, "c1b2c3d4-0000-4000-8000-000000000003").unwrap();
     assert_eq!(done["job"]["state"], "done");
     assert!(by(&s, "d1b2c3d4-0000-4000-8000-000000000004").is_none());
+    let over = ended(&e);
+    assert!(by(&over, "c1b2c3d4-0000-4000-8000-000000000003").is_none());
+    // The pid-less job started long before the window in this fixture, so it never shows.
+    assert!(by(&over, "d1b2c3d4-0000-4000-8000-000000000004").is_none());
+    assert_eq!(by(&over, "mine").unwrap()["reason"], "moved-on");
 
-    // Claude fails, and there are no pid files here: the registered row is the whole list.
+    // Claude fails and there are no pid files here: nothing says these are over.
     let tries = shim.path().join("tries");
     set_shim(
         shim.path(),
         &format!("echo x >> '{}'\nexit 1", tries.display()),
     );
-    register_claude(&e, "mine", "busy", None);
-    until(15, "the failed read lands", || listed(&e).len() == 1);
+    until(15, "the failed read lands", || {
+        register_claude(&e, "mine", "busy", None);
+        // Listing them first: a look is what starts a read.
+        listed(&e).len() == 9 && tries.exists()
+    });
     let s = listed(&e);
-    assert_eq!(s[0]["conversation"], "mine");
-    assert_eq!(s[0]["status"], "live");
+    assert_eq!(by(&s, "mine").unwrap()["status"], "live");
+    assert!(
+        by(&ended(&e), "mine").is_none(),
+        "its next hook brought it back"
+    );
 
     // One line in the daemon's log for the streak, however many reads fail.
     let count = || {
@@ -350,4 +371,241 @@ fn a_hanging_claude_delays_neither_sessions_nor_register() {
     });
     quick("register", &|| register_claude(&e, "mine", "busy", None));
     quick("sessions", &|| assert_eq!(listed(&e).len(), 1));
+}
+
+const LISTING: &str = "LIGHTBULB_CONNECT_DEBUG_LISTING";
+
+/// A daemon asking a `claude` that prints `listing`.
+fn listing_daemon(listing: &str) -> (Env, tempfile::TempDir) {
+    let (shim, path) = claude_shim(listing);
+    let e = Env::new();
+    e.daemon(false, "", &[("PATH", path), (LISTING, "1".into())]);
+    (e, shim)
+}
+
+/// A live interactive row of `pid`, as Claude lists it.
+fn live_row(conversation: &str, pid: u32) -> Value {
+    json!({"pid": pid, "cwd": "/tmp/p", "kind": "interactive", "startedAt": 1,
+        "sessionId": conversation, "status": "busy"})
+}
+
+fn set_listing(shim: &tempfile::TempDir, rows: Value) {
+    let (tmp, file) = (shim.path().join("new"), shim.path().join("listing.json"));
+    std::fs::write(&tmp, rows.to_string()).unwrap();
+    std::fs::rename(tmp, file).unwrap();
+}
+
+/// A hook event: the daemon reads the listing again within 2 s. A Codex row, which the listing
+/// says nothing about.
+fn poke(e: &Env) {
+    let pid = std::process::id();
+    let r = e.ask(
+        json!({"id": 1, "op": "register", "session": {"provider": "codex", "conversation": "poke",
+        "pid": pid, "birth_micros": os::process(pid).unwrap().birth_micros, "cwd": "/tmp/p"}}),
+    );
+    assert_eq!(r["ok"], true, "{r}");
+}
+
+#[test]
+fn a_listed_session_that_disappears_becomes_an_ended_row_with_its_title() {
+    let a = "a1b2c3d4-0000-4000-8000-00000000000a";
+    let b = "a1b2c3d4-0000-4000-8000-00000000000b";
+    let mut child = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .unwrap();
+    let me = std::process::id();
+    let (e, shim) = listing_daemon(&json!([live_row(a, me), live_row(b, child.id())]).to_string());
+    let projects = e.home.path().join(".claude/projects/-tmp-p");
+    std::fs::create_dir_all(&projects).unwrap();
+    std::fs::write(
+        projects.join(format!("{a}.jsonl")),
+        "{\"type\":\"ai-title\",\"aiTitle\":\"Fix the list\"}\n",
+    )
+    .unwrap();
+    until(10, "the listing is read", || listed(&e).len() == 2);
+    // Every session seen has a row, so a handle: `who` needs no hook for it.
+    assert!(by(&listed(&e), a).unwrap()["handle"].is_string());
+    assert!(e
+        .store()
+        .holds(&format!("{}/claude:{b}", e.short()))
+        .unwrap());
+
+    child.kill().unwrap();
+    child.wait().unwrap();
+    set_listing(&shim, json!([]));
+    poke(&e);
+    until(15, "both end", || ended(&e).len() == 2);
+    assert!(by(&listed(&e), a).is_none());
+    let over = ended(&e);
+    // This test's process lives: the harness moved on.
+    let moved = by(&over, a).unwrap();
+    assert_eq!(moved["reason"], "moved-on");
+    assert_eq!(moved["title"], "Fix the list");
+    assert_eq!(moved["resume"], format!("claude --resume {a}"));
+    assert!(moved["ended_at"].as_i64().unwrap() >= common::now_s() - 60);
+    assert_eq!(by(&over, b).unwrap()["reason"], "process-exited");
+}
+
+/// `/clear`: the same process, on a new conversation in the pid file and the listing.
+#[test]
+fn a_live_pid_whose_conversation_left_the_listing_and_pid_file_ends_moved_on() {
+    let (old, new) = (
+        "a1b2c3d4-0000-4000-8000-00000000000a",
+        "a1b2c3d4-0000-4000-8000-00000000000b",
+    );
+    let me = std::process::id();
+    let (e, shim) = listing_daemon(&json!([live_row(old, me)]).to_string());
+    let sessions = e.home.path().join(".claude/sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let pid_file = |conversation: &str| {
+        std::fs::write(
+            sessions.join(format!("{me}.json")),
+            json!({"pid": me, "sessionId": conversation, "cwd": "/tmp/p", "status": "shell",
+                "startedAt": os::started_ms(me).unwrap()})
+            .to_string(),
+        )
+        .unwrap();
+    };
+    pid_file(old);
+    until(10, "the row is written", || {
+        by(&listed(&e), old).is_some_and(|s| s["handle"].is_string())
+    });
+    pid_file(new);
+    set_listing(&shim, json!([live_row(new, me)]));
+    until(15, "the old one ends", || !ended(&e).is_empty());
+    let over = ended(&e);
+    assert_eq!(by(&over, old).unwrap()["reason"], "moved-on");
+    assert_eq!(by(&listed(&e), new).unwrap()["status"], "live");
+    assert!(by(&listed(&e), old).is_none());
+}
+
+/// No listing and no pid file say nothing against a live process; a dead one still ends.
+#[test]
+fn with_no_listing_and_no_pid_files_a_live_pid_ends_nothing() {
+    let e = Env::new();
+    e.daemon(false, "", &[]);
+    register_claude(&e, "alive", "busy", None);
+    let r = e.ask(
+        json!({"id": 1, "op": "register", "session": {"provider": "claude",
+        "conversation": "dead", "pid": 999_999, "birth_micros": 1, "cwd": "/tmp/p"}}),
+    );
+    assert_eq!(r["ok"], true, "{r}");
+    for _ in 0..3 {
+        assert!(by(&listed(&e), "alive").is_some());
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    let over = ended(&e);
+    assert_eq!(over.len(), 1, "{over:?}");
+    assert_eq!(by(&over, "dead").unwrap()["reason"], "process-exited");
+}
+
+#[test]
+fn a_finished_job_ends_once_and_is_not_reborn() {
+    let j = "a1b2c3d4-0000-4000-8000-00000000000a";
+    let job = json!([{"cwd": "/tmp/p", "kind": "background", "id": "ab12", "state": "done",
+        "name": "the job", "startedAt": common::now_s() * 1000, "sessionId": j}]);
+    let (e, _shim) = listing_daemon(&job.to_string());
+    until(10, "the job is seen", || !ended(&e).is_empty());
+    let first = ended(&e);
+    let row = by(&first, j).unwrap();
+    assert_eq!(row["reason"], "job-done");
+    assert_eq!(row["cwd"], "/tmp/p");
+    assert_eq!(row["title"], "the job");
+    assert_eq!(row["resume"], format!("claude --resume {j}"));
+    assert!(row["handle"].is_null(), "an old job uses up no number");
+    assert!(by(&listed(&e), j).is_none());
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    poke(&e);
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    assert_eq!(ended(&e), first);
+}
+
+/// Jobs Claude has listed for months arrive a read at a time, stay hidden past the window, and
+/// are not deleted and born again while they are listed.
+#[test]
+fn a_finished_job_past_the_window_never_shows_and_is_not_recreated() {
+    let started = common::now_s() - 8 * 86_400;
+    let jobs: Vec<Value> = (0..201)
+        .map(|i| {
+            json!({"cwd": "/tmp/p", "kind": "background", "id": "ab12", "state": "done",
+            "startedAt": started * 1000,
+            "sessionId": format!("a1b2c3d4-0000-4000-8000-{i:012}")})
+        })
+        .collect();
+    let (e, shim) = listing_daemon(&json!(jobs).to_string());
+    let db = e.state.path().join("state.db");
+    let rows = || {
+        common::count(
+            &db,
+            "SELECT count(*) FROM sessions WHERE reason = 'job-done'",
+        )
+    };
+    until(10, "the first read's jobs", || {
+        assert!(ended(&e).is_empty());
+        rows() > 0
+    });
+    assert_eq!(rows(), 200, "the first read's");
+    assert_eq!(
+        common::count(&db, "SELECT min(ended_at) FROM sessions"),
+        started
+    );
+    until(15, "the next read's", || {
+        assert!(ended(&e).is_empty());
+        rows() == 201
+    });
+    // Still listed: kept, however often the ended list and the listing are read.
+    poke(&e);
+    for _ in 0..30 {
+        assert!(ended(&e).is_empty());
+        assert_eq!(rows(), 201);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    // Off the listing it goes at the next look.
+    set_listing(&shim, json!([]));
+    poke(&e);
+    until(15, "its rows go", || {
+        ended(&e);
+        rows() == 0
+    });
+}
+
+/// As `register` refuses them: a session or a job under a hidden folder gets no row.
+#[test]
+fn a_hidden_folder_gets_no_row() {
+    let j = "a1b2c3d4-0000-4000-8000-00000000000a";
+    let e = Env::new();
+    let off = e.home.path().canonicalize().unwrap().join("off");
+    std::fs::create_dir_all(&off).unwrap();
+    let cwd = off.to_str().unwrap();
+    let me = std::process::id();
+    let (_shim, path) = claude_shim(
+        &json!([{"cwd": cwd, "kind": "background", "id": "ab12", "state": "done",
+            "startedAt": common::now_s() * 1000, "sessionId": j}])
+        .to_string(),
+    );
+    let sessions = e.home.path().join(".claude/sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    std::fs::write(
+        sessions.join("a.json"),
+        json!({"pid": me, "sessionId": "seen", "cwd": cwd, "status": "busy",
+            "startedAt": os::started_ms(me).unwrap()})
+        .to_string(),
+    )
+    .unwrap();
+    e.daemon(
+        false,
+        &format!("folders_off = [{cwd:?}]\n"),
+        &[("PATH", path), (LISTING, "1".into())],
+    );
+    let db = e.state.path().join("state.db");
+    // The `claude` is read within the first look; a later job would show by now.
+    let reads = std::time::Instant::now();
+    while reads.elapsed() < std::time::Duration::from_secs(2) {
+        let s = listed(&e);
+        assert_eq!(by(&s, "seen").unwrap()["hidden"], true);
+        assert!(ended(&e).is_empty());
+        assert_eq!(common::count(&db, "SELECT count(*) FROM sessions"), 0);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }

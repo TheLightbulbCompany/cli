@@ -1,9 +1,10 @@
 //! Newline-delimited JSON over the daemon's Unix socket.
 
 use super::Daemon;
+use crate::agents::listing::{self, Listed};
 use crate::sessions::{self, Key};
 use crate::store;
-use crate::{frame, label, mail, outbox, presence};
+use crate::{doing, frame, label, mail, outbox, presence};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -287,7 +288,16 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
         // `sessions {handle?}`: with a handle, the live session of it (`not_found` when none
         // is; `bad_request` for a string that is no handle, which is a name).
         "sessions" => match body["handle"].as_str() {
-            None => Response::ok(id, json!({ "sessions": live_sessions(daemon) })),
+            None => {
+                let live = live_sessions(daemon);
+                // A row that ended yet is seen live again (no hook said so) is shown live.
+                let ended: Vec<Value> = ended_sessions(daemon)
+                    .iter()
+                    .filter(|r| live.iter().all(|s| s.key.0 != r.key))
+                    .map(ended_json)
+                    .collect();
+                Response::ok(id, json!({ "sessions": live, "ended": ended }))
+            }
             Some(h) if !is_handle(h) => Response::err(id, BAD_REQUEST),
             Some(h) => match live_sessions(daemon)
                 .into_iter()
@@ -1422,8 +1432,8 @@ fn put_row(daemon: &Daemon, store: &store::Store, row: &store::Session) -> crate
     Ok(())
 }
 
-/// Registered and discovered sessions, `gone` ones left out (their rows stay until `end`).
-/// A session whose last push failed reads `next_step`: its mail waits for the next step. One
+/// Registered and discovered sessions; a discovered one gains a row and a row no longer live
+/// ends (`record`). A session whose last push failed reads `next_step`: its mail waits for the next step. One
 /// under a hidden folder, or marked by a register a hidden folder refused, reads `hidden`.
 pub(crate) fn live_sessions(daemon: &Daemon) -> Vec<sessions::Session> {
     let (rows, marked) = {
@@ -1446,7 +1456,215 @@ pub(crate) fn live_sessions(daemon: &Daemon) -> Vec<sessions::Session> {
         }
         s.hidden = marked.contains(&s.key.0) || presence::hidden(&off, &s.cwd);
     }
+    drop(failed);
+    let hidden = |key: &str, cwd: &str| marked.contains(key) || presence::hidden(&off, cwd);
+    record(daemon, &rows, &mut all, listed.as_deref(), &hidden);
     all
+}
+
+/// The most rows of finished jobs written per read of the listing: hundreds of old jobs arrive
+/// over a minute or so, not at once.
+const JOBS_PER_READ: usize = 200;
+
+/// The one writer of rows from what was seen: a live Claude session with no row gets one, a row
+/// `all` no longer finds live ends with its reason and title, and a finished job with no process
+/// and no row gets one, ended. Reads transcripts only for rows it ends or creates ended, and
+/// outside the store lock.
+fn record(
+    daemon: &Daemon,
+    rows: &[store::Session],
+    live: &mut [sessions::Session],
+    listed: Option<&[Listed]>,
+    hidden: &dyn Fn(&str, &str) -> bool,
+) {
+    let (home, now) = (&daemon.claude_home, now() as i64);
+    let is_live = |key: &str| live.iter().any(|s| s.key.0 == key);
+    let title = |provider: &str, cwd: &str, conversation: &str| {
+        (provider == "claude")
+            .then(|| doing::title(home, cwd, conversation))
+            .flatten()
+    };
+    let gone: Vec<(&store::Session, &str, Option<String>)> = rows
+        .iter()
+        .filter(|r| !r.provider.is_empty() && !is_live(&r.key))
+        .map(|r| {
+            let conversation = r.conversation.as_deref().unwrap_or_default();
+            (
+                r,
+                ended_reason(r, listed),
+                title(&r.provider, &r.cwd, conversation),
+            )
+        })
+        .collect();
+    let jobs = new_ended_jobs(daemon, listed, &is_live, hidden);
+    let jobs: Vec<(String, &Listed, i64, Option<String>)> = jobs
+        .into_iter()
+        .map(|(key, l)| {
+            // Over long before this computer looked: never "just ended".
+            let started = (l.started_ms / 1000) as i64;
+            if started + (presence::WEEK as i64) < now {
+                (key, l, started, None)
+            } else {
+                let found = title("claude", &l.cwd, &l.conversation);
+                (key, l, now, found.or(l.name.clone()))
+            }
+        })
+        .collect();
+    let store = daemon.store.lock().unwrap();
+    let mut changed = false;
+    for s in live.iter_mut() {
+        if s.provider != "claude" || s.hidden || store.holds(&s.key.0).unwrap_or(true) {
+            continue;
+        }
+        if store.put_session(&discovered_row(s, now)).is_ok() {
+            changed = true;
+            s.handle = store
+                .session(&s.key.0)
+                .ok()
+                .flatten()
+                .and_then(|r| r.handle);
+        }
+    }
+    for (r, reason, title) in &gone {
+        // A hook wrote it after `rows` was read: it is the newer word.
+        if store.session(&r.key).ok().flatten().as_ref() == Some(*r) {
+            changed |= store
+                .end_session(&r.key, now, reason, title.as_deref())
+                .unwrap_or(false);
+        }
+    }
+    for (key, l, at, title) in &jobs {
+        changed |= store
+            .put_ended_job(key, &l.conversation, &l.cwd, title.as_deref(), *at)
+            .unwrap_or(false);
+    }
+    drop(store);
+    if changed {
+        daemon.presence.notify_one();
+    }
+}
+
+/// Why `r`, no longer live, ended.
+fn ended_reason(r: &store::Session, listed: Option<&[Listed]>) -> &'static str {
+    let job_done = r.provider == "claude"
+        && listed.is_some_and(|l| {
+            listing::ended_jobs(l)
+                .any(|j| Some(j.conversation.as_str()) == r.conversation.as_deref())
+        });
+    let alive = || {
+        r.pid
+            .zip(r.birth_micros)
+            .is_some_and(|(p, b)| sessions::alive(p as u32, b as u64))
+    };
+    if job_done {
+        "job-done"
+    } else if alive() {
+        // The process lives but the harness left the conversation (`/clear`, `/resume`, the
+        // agent view).
+        "moved-on"
+    } else {
+        "process-exited"
+    }
+}
+
+/// The first `JOBS_PER_READ` finished jobs of a read not yet looked at, with their keys, that
+/// have no row and may have one. Each read is looked at once.
+fn new_ended_jobs<'a>(
+    daemon: &Daemon,
+    listed: Option<&'a [Listed]>,
+    is_live: &dyn Fn(&str) -> bool,
+    hidden: &dyn Fn(&str, &str) -> bool,
+) -> Vec<(String, &'a Listed)> {
+    let Some(listed) = listed else {
+        return vec![];
+    };
+    {
+        let mut c = daemon.listing.lock().unwrap();
+        if c.recorded == c.at {
+            return vec![];
+        }
+        c.recorded = c.at;
+    }
+    let store = daemon.store.lock().unwrap();
+    listing::ended_jobs(listed)
+        .map(|l| {
+            (
+                Key::new(&daemon.identity.short, "claude", &l.conversation).0,
+                l,
+            )
+        })
+        .filter(|(key, l)| {
+            !is_live(key) && !hidden(key, &l.cwd) && !store.holds(key).unwrap_or(true)
+        })
+        .take(JOBS_PER_READ)
+        .collect()
+}
+
+/// A discovered session's first row. `waiting` is left to the hooks, its one writer: the
+/// discovery's own status is laid over the row on every read.
+fn discovered_row(s: &sessions::Session, now: i64) -> store::Session {
+    store::Session {
+        key: s.key.0.clone(),
+        provider: s.provider.clone(),
+        conversation: Some(s.conversation.clone()),
+        pid: Some(s.pid.into()),
+        birth_micros: i64::try_from(s.birth_micros).ok(),
+        cwd: s.cwd.clone(),
+        title: s.title.clone(),
+        status: if s.status == sessions::Status::Live {
+            "live".into()
+        } else {
+            "idle".into()
+        },
+        seen_at: now,
+        executable: None,
+        repo: None,
+        branch: None,
+        handle: None,
+        reason: None,
+        ended_at: None,
+        waiting_for: None,
+    }
+}
+
+/// The sessions that ended within the week, newest first, hidden folders left out. Rows past it
+/// go, except the finished jobs Claude still lists: they stay, unseen, so that they are not
+/// born again as just ended.
+pub(crate) fn ended_sessions(daemon: &Daemon) -> Vec<store::Session> {
+    let since = now().saturating_sub(presence::WEEK) as i64;
+    let keep: Vec<String> = super::current(daemon)
+        .iter()
+        .flat_map(|l| listing::finished(l))
+        .map(|c| Key::new(&daemon.identity.short, "claude", &c).0)
+        .collect();
+    let keep: Vec<&str> = keep.iter().map(String::as_str).collect();
+    let off = daemon.team.lock().unwrap().off.clone();
+    let store = daemon.store.lock().unwrap();
+    let marked = store.hidden_keys().unwrap_or_default();
+    let mut ended = store.ended_since(since, &keep).unwrap_or_default();
+    ended.retain(|r| {
+        r.ended_at.is_some_and(|at| at >= since)
+            && !marked.contains(&r.key)
+            && !presence::hidden(&off, &r.cwd)
+    });
+    ended
+}
+
+/// An ended row as `sessions` answers it, with the owner's resume command.
+fn ended_json(r: &store::Session) -> Value {
+    json!({
+        "key": r.key,
+        "provider": r.provider,
+        "conversation": r.conversation,
+        "cwd": r.cwd,
+        "title": r.title,
+        "handle": r.handle,
+        "repo": r.repo,
+        "branch": r.branch,
+        "reason": r.reason,
+        "ended_at": r.ended_at,
+        "resume": r.conversation.as_deref().and_then(|c| sessions::resume(&r.provider, c)),
+    })
 }
 
 /// `status`'s `dropped`: frames `from_peer_ok` dropped, by kind, and viewer `input` frames.

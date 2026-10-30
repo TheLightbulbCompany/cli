@@ -4,7 +4,7 @@ use crate::sessions::Session;
 use serde_json::Value;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const TAIL_BYTES: u64 = 256 * 1024;
 /// The most characters of a `doing` or `title` (or a published folder) a teammate is sent.
@@ -16,17 +16,23 @@ pub fn title_and_todo(home: &Path, s: &Session) -> (Option<String>, Option<Strin
     if s.provider != "claude" {
         return (None, None);
     }
+    tail(&transcript(home, &s.cwd, &s.conversation)).map_or((None, None), |t| scan(&t))
+}
+
+/// A Claude conversation's title from its transcript, its process gone or not.
+pub fn title(home: &Path, cwd: &str, conversation: &str) -> Option<String> {
+    scan(&tail(&transcript(home, cwd, conversation)).ok()?).0
+}
+
+fn transcript(home: &Path, cwd: &str, conversation: &str) -> PathBuf {
     // Claude names the project dir after the cwd with every non-alphanumeric as '-'.
-    let dir: String = s
-        .cwd
+    let dir: String = cwd
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
-    let path = home
-        .join(".claude/projects")
+    home.join(".claude/projects")
         .join(dir)
-        .join(format!("{}.jsonl", s.conversation));
-    tail(&path).map_or((None, None), |t| scan(&t))
+        .join(format!("{conversation}.jsonl"))
 }
 
 fn tail(path: &Path) -> std::io::Result<String> {
@@ -106,7 +112,6 @@ fn scan(text: &str) -> (Option<String>, Option<String>) {
 mod tests {
     use super::*;
     use crate::sessions::{Status, Tier};
-    use std::path::PathBuf;
 
     fn session(cwd: &str, conversation: &str) -> Session {
         Session {

@@ -184,9 +184,19 @@ pub fn run(agent: &str, event: &str, stdin: &str) -> Result<Option<String>> {
         let mut conn = Conn::open()?;
         let key = crate::sessions::Key::new(&conn.member()?, h.provider, &h.conversation);
         capture(&h, &payload, &json!({}));
+        let reason = match (h.provider, payload["reason"].as_str()) {
+            ("claude", Some("clear" | "resume")) => "moved-on",
+            _ => "session-end",
+        };
         let r = match &caller {
-            Ok(me) => conn.call("end", json!({ "key": key, "caller": proc_json(me) }))?,
-            Err(_) => conn.call("end", json!({ "key": key, "if_gone": true }))?,
+            Ok(me) => conn.call(
+                "end",
+                json!({ "key": key, "caller": proc_json(me), "reason": reason }),
+            )?,
+            Err(_) => conn.call(
+                "end",
+                json!({ "key": key, "if_gone": true, "reason": reason }),
+            )?,
         };
         if r["ok"] != true && r["error"] != "not_found" {
             return Err(format!("end: {r}").into());
