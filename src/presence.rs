@@ -311,6 +311,12 @@ async fn send_once(
     sent_at: &mut Option<Instant>,
 ) {
     if d.peers.online().is_empty() {
+        // `build` below is what ends sessions, and with no one to tell it does not run; a closed
+        // terminal still ends when it closes, not at the next look. An instance declares its own.
+        if d.cloud.is_none() {
+            let d = d.clone();
+            let _ = tokio::task::spawn_blocking(move || ipc::live_sessions(&d)).await;
+        }
         return;
     }
     if let Some(at) = *built_at {

@@ -209,12 +209,9 @@ fn the_listing_feeds_sessions_and_when_claude_fails_nothing_alive_ends() {
         ],
     );
     register_claude(&e, "mine", "idle", None);
-    // Read on its own thread: the first answers come from the rows alone. Once read, a row the
-    // listing does not hold is over, its process alive or not.
-    until(10, "the listing is read", || {
-        let s = listed(&e);
-        s.len() == 8 && by(&s, "mine").is_none()
-    });
+    // Read on its own thread: the first answers come from the rows alone. Then 8 live listed
+    // rows, and the row registered just now, which so young a listing says nothing against.
+    until(10, "the listing is read", || listed(&e).len() == 9);
     let s = listed(&e);
     let blocked = by(&s, "b1b2c3d4-0000-4000-8000-000000000002").unwrap();
     assert_eq!(
@@ -229,7 +226,7 @@ fn the_listing_feeds_sessions_and_when_claude_fails_nothing_alive_ends() {
     assert!(by(&over, "c1b2c3d4-0000-4000-8000-000000000003").is_none());
     // The pid-less job started long before the window in this fixture, so it never shows.
     assert!(by(&over, "d1b2c3d4-0000-4000-8000-000000000004").is_none());
-    assert_eq!(by(&over, "mine").unwrap()["reason"], "moved-on");
+    assert!(by(&over, "mine").is_none());
 
     // Claude fails and there are no pid files here: nothing says these are over.
     let tries = shim.path().join("tries");
@@ -244,10 +241,7 @@ fn the_listing_feeds_sessions_and_when_claude_fails_nothing_alive_ends() {
     });
     let s = listed(&e);
     assert_eq!(by(&s, "mine").unwrap()["status"], "live");
-    assert!(
-        by(&ended(&e), "mine").is_none(),
-        "its next hook brought it back"
-    );
+    assert!(by(&ended(&e), "mine").is_none());
 
     // One line in the daemon's log for the streak, however many reads fail.
     let count = || {
@@ -395,6 +389,13 @@ fn set_listing(shim: &tempfile::TempDir, rows: Value) {
     std::fs::rename(tmp, file).unwrap();
 }
 
+/// Every row's last word as `secs` older, in place of waiting for it.
+fn age_rows(e: &Env, secs: i64) {
+    let c = rusqlite::Connection::open(e.state.path().join("state.db")).unwrap();
+    c.execute("UPDATE sessions SET seen_at = seen_at - ?1", [secs])
+        .unwrap();
+}
+
 /// A hook event: the daemon reads the listing again within 2 s. A Codex row, which the listing
 /// says nothing about.
 fn poke(e: &Env) {
@@ -434,6 +435,7 @@ fn a_listed_session_that_disappears_becomes_an_ended_row_with_its_title() {
     child.kill().unwrap();
     child.wait().unwrap();
     set_listing(&shim, json!([]));
+    age_rows(&e, 60);
     poke(&e);
     until(15, "both end", || ended(&e).len() == 2);
     assert!(by(&listed(&e), a).is_none());
@@ -608,4 +610,62 @@ fn a_hidden_folder_gets_no_row() {
         assert_eq!(common::count(&db, "SELECT count(*) FROM sessions"), 0);
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+}
+
+/// A listing read before a row's last word has settled says nothing: a just-started
+/// conversation or a just-fired hook may not be listed yet.
+#[test]
+fn a_fresh_row_absent_from_the_listing_stays_until_a_listing_15_s_later_lacks_it() {
+    let (shim, path) = claude_shim("[]");
+    let reads = shim.path().join("reads");
+    set_shim(
+        shim.path(),
+        &format!("echo x >> '{}'\necho '[]'", reads.display()),
+    );
+    let e = Env::new();
+    e.daemon(false, "", &[("PATH", path), (LISTING, "1".into())]);
+    let read_count = || {
+        let text = std::fs::read_to_string(&reads).unwrap_or_default();
+        text.lines().count()
+    };
+    until(10, "the first read", || {
+        listed(&e);
+        read_count() >= 1
+    });
+    register_claude(&e, "fresh", "busy", None);
+    assert_eq!(by(&listed(&e), "fresh").unwrap()["status"], "live");
+    // A later read, within the 15 s, still lacks it: it stays.
+    let before = read_count();
+    until(10, "a read after the register", || {
+        listed(&e);
+        read_count() > before
+    });
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(by(&listed(&e), "fresh").is_some());
+    assert!(ended(&e).is_empty());
+    // Fifteen seconds of quiet later, one more read lacks it.
+    age_rows(&e, 15);
+    poke(&e);
+    until(15, "it ends", || !ended(&e).is_empty());
+    assert_eq!(by(&ended(&e), "fresh").unwrap()["reason"], "moved-on");
+    assert!(by(&listed(&e), "fresh").is_none());
+}
+
+/// Ending does not wait for anyone to ask, with no teammate online either. Read from the store:
+/// nothing here looks at `sessions`.
+#[test]
+fn a_session_ends_with_nobody_asking() {
+    let c = "a1b2c3d4-0000-4000-8000-00000000000a";
+    let (e, shim) = listing_daemon(&json!([live_row(c, std::process::id())]).to_string());
+    register_claude(&e, c, "busy", None);
+    set_listing(&shim, json!([]));
+    age_rows(&e, 60);
+    poke(&e);
+    let db = e.state.path().join("state.db");
+    until(15, "it ends", || {
+        common::count(
+            &db,
+            "SELECT count(*) FROM sessions WHERE provider = 'claude' AND ended_at IS NOT NULL",
+        ) == 1
+    });
 }

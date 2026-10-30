@@ -292,6 +292,21 @@ pub fn resume(provider: &str, conversation: &str) -> Option<String> {
     Some(format!("{command} {conversation}"))
 }
 
+/// How long after a row's last word a listing without it counts against it: a conversation just
+/// started or a hook just fired may not be listed yet.
+const QUIET_SECS: i64 = 15;
+
+/// Whether a live process has left a Claude conversation that no live listed row and no verified
+/// pid file holds: its own verified pid file names another or is parked (at once); or it has no
+/// such file and a listing read `QUIET_SECS` after the row's `seen_at` lacks it. With neither,
+/// nothing is known against it and it stays.
+/// ponytail: a session under a custom `CLAUDE_CONFIG_DIR` is not in the default listing, so it
+/// ends after 15 s quiet and revives on its next hook. Ask each config dir's listing if that
+/// shows up in use.
+fn moved_on(has_pid_file: bool, read_at: Option<i64>, seen_at: i64) -> bool {
+    has_pid_file || read_at.is_some_and(|at| at >= seen_at + QUIET_SECS)
+}
+
 /// Registered rows that are still theirs plus Claude discoveries, deduplicated by key (a discovery wins for its
 /// status, which is fresher, except that a hook's `waiting` stands until the listing says `idle`;
 /// the row for its folder, which its hook reported resolved, and its handle, repo and branch),
@@ -302,25 +317,25 @@ pub fn resume(provider: &str, conversation: &str) -> Option<String> {
 /// `[]`, or a Claude that stops listing a kind of row, degrades to them. A session found only
 /// by discovery keeps Claude's own cwd as given (not resolved) and has no handle until its hook
 /// registers it (`ipc::live_sessions` writes its row, which gives it one).
-/// A live process alone does not keep a Claude row: `/clear`, `/resume` and the agent view leave
-/// it running on another conversation. When the listing answered, or a pid file speaks for that
-/// process, a row held by neither a live listed row nor a verified pid file is not live. With
-/// neither (a hook registered it under another home, or the listing is out) nothing is known
-/// against it and it stays. Other providers' rows live with their process.
+/// `listed` comes with the unix second its read began. A live process alone does not keep a
+/// Claude row, since `/clear`, `/resume` and the agent view leave it running on another
+/// conversation; but a row needs evidence to go (`moved_on`). Other providers' rows live with
+/// their process.
 pub fn all(
     rows: &[store::Session],
-    listed: Option<&[listing::Listed]>,
+    listed: Option<(&[listing::Listed], i64)>,
     home: &Path,
     member_short: &str,
 ) -> Vec<Session> {
     let files = pid_files(home, member_short);
-    let spoken_for: Vec<u32> = files.iter().map(|(s, _)| s.pid).collect();
+    let filed_pids: Vec<u32> = files.iter().map(|(s, _)| s.pid).collect();
     let scanned: Vec<Session> = files
         .into_iter()
         .filter(|(_, parked)| !parked)
         .map(|(s, _)| s)
         .collect();
-    let live = listed.map(|listed| {
+    let read_at = listed.map(|(_, at)| at);
+    let live = listed.map(|(listed, _)| {
         let sockets = scanned
             .iter()
             .filter_map(|s| Some((s.conversation.clone(), s.push_via.clone()?)))
@@ -340,11 +355,14 @@ pub fn all(
     };
     let mut out: Vec<Session> = rows
         .iter()
-        .filter_map(|r| from_row(r, home))
-        .filter(|s| {
-            let known = listed.is_some() || spoken_for.contains(&s.pid);
-            s.provider != "claude" || !known || held(&s.conversation)
+        .filter_map(|r| Some((from_row(r, home)?, r.seen_at)))
+        .filter(|(s, seen_at)| {
+            s.provider != "claude"
+                || s.status == Status::Gone
+                || held(&s.conversation)
+                || !moved_on(filed_pids.contains(&s.pid), read_at, *seen_at)
         })
+        .map(|(s, _)| s)
         .collect();
     // Each discovery, and whether it is the listing's word.
     let found: Vec<(Session, bool)> = match live {
@@ -444,7 +462,7 @@ mod tests {
         pid_file(home.path(), "empty-park", r#","parkedJobId":"""#);
         pid_file(home.path(), "parked", r#","parkedJobId":"ab12""#);
         pid_file(home.path(), "sdk", r#","entrypoint":"sdk-ts""#);
-        let live = all(&[], Some(&[]), home.path(), "m");
+        let live = all(&[], Some((&[], 0)), home.path(), "m");
         let mut names: Vec<&str> = live.iter().map(|s| s.conversation.as_str()).collect();
         names.sort();
         assert_eq!(names, ["empty-park", "in-a-shell", "kept"]);
@@ -475,7 +493,7 @@ mod tests {
 
     fn live_of(
         rows: &[store::Session],
-        listed: Option<&[listing::Listed]>,
+        listed: Option<(&[listing::Listed], i64)>,
         home: &Path,
     ) -> Vec<String> {
         let mut names: Vec<String> = all(rows, listed, home, "m")
@@ -493,14 +511,29 @@ mod tests {
         let rows = [row("old", "claude"), row("c", "codex")];
         // Nothing known: the listing is out and no pid file speaks for the process.
         assert_eq!(live_of(&rows, None, home.path()), ["c", "old"]);
-        // The listing answered without it.
-        assert_eq!(live_of(&rows, Some(&[]), home.path()), ["c"]);
-        // The pid file names the process on another conversation.
+        // A listing without it, read too soon after the row's last word (`seen_at` 1) to count.
+        let seen = rows[0].seen_at;
+        assert_eq!(
+            live_of(&rows, Some((&[], seen + 14)), home.path()),
+            ["c", "old"]
+        );
+        assert_eq!(live_of(&rows, Some((&[], seen + 15)), home.path()), ["c"]);
+        // The pid file names the process on another conversation: at once, listing or not.
         pid_file(home.path(), "new", "");
         assert_eq!(live_of(&rows, None, home.path()), ["c", "new"]);
+        // Parked on the row's own conversation: the terminal has left it.
+        pid_file(
+            home.path(),
+            "new",
+            r#","sessionId":"old","parkedJobId":"ab12""#,
+        );
+        assert_eq!(live_of(&rows, None, home.path()), ["c"]);
         // An SDK run's pid file is not discovered under a listing, but it holds its row.
         pid_file(home.path(), "old", r#","entrypoint":"sdk-ts""#);
-        assert_eq!(live_of(&rows, Some(&[]), home.path()), ["c", "new", "old"]);
+        assert_eq!(
+            live_of(&rows, Some((&[], seen + 15)), home.path()),
+            ["c", "old"]
+        );
     }
 
     #[test]

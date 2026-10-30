@@ -1442,10 +1442,10 @@ pub(crate) fn live_sessions(daemon: &Daemon) -> Vec<sessions::Session> {
         (rows, store.hidden_keys().unwrap_or_default())
     };
     let off = daemon.team.lock().unwrap().off.clone();
-    let listed = super::current(daemon);
+    let listed = super::current_at(daemon);
     let mut all = sessions::all(
         &rows,
-        listed.as_deref(),
+        listed.as_ref().map(|(l, at)| (l.as_slice(), *at)),
         &daemon.claude_home,
         &daemon.identity.short,
     );
@@ -1458,7 +1458,8 @@ pub(crate) fn live_sessions(daemon: &Daemon) -> Vec<sessions::Session> {
     }
     drop(failed);
     let hidden = |key: &str, cwd: &str| marked.contains(key) || presence::hidden(&off, cwd);
-    record(daemon, &rows, &mut all, listed.as_deref(), &hidden);
+    let listed = listed.as_ref().map(|(l, _)| l.as_slice());
+    record(daemon, &rows, &mut all, listed, &hidden);
     all
 }
 

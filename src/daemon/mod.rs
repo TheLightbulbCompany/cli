@@ -120,6 +120,8 @@ pub struct Daemon {
 pub struct ListingCache {
     pub at: Option<Instant>,
     pub rows: Option<Vec<Listed>>,
+    /// The unix second the last read began: what `rows` can know about.
+    pub read_at: i64,
     /// A hook event since the last read began: read again sooner.
     pub dirty: bool,
     /// A read is running (at most one, on its own thread).
@@ -136,6 +138,11 @@ pub struct ListingCache {
 /// hung `claude` is asked once per 10 s. `None` when the Claude home is not `HOME` (an embedded
 /// instance's, a test's): `claude` lists `HOME`'s sessions, not those.
 pub(crate) fn current(daemon: &Daemon) -> Option<Vec<Listed>> {
+    current_at(daemon).map(|(rows, _)| rows)
+}
+
+/// `current`, with the unix second that read began.
+pub(crate) fn current_at(daemon: &Daemon) -> Option<(Vec<Listed>, i64)> {
     if dirs::home_dir().as_ref() != Some(&daemon.claude_home) {
         return None;
     }
@@ -155,7 +162,7 @@ pub(crate) fn current(daemon: &Daemon) -> Option<Vec<Listed>> {
         c.refreshing = started.is_ok();
         c.dirty = c.dirty && started.is_err();
     }
-    c.rows.clone()
+    c.rows.clone().map(|rows| (rows, c.read_at))
 }
 
 /// Ends a refresh however it ends: a read that panics counts as a failed one, so the listing is
@@ -163,12 +170,14 @@ pub(crate) fn current(daemon: &Daemon) -> Option<Vec<Listed>> {
 struct Refreshed<'a> {
     cache: &'a Mutex<ListingCache>,
     rows: Option<Vec<Listed>>,
+    began: i64,
 }
 
 impl Drop for Refreshed<'_> {
     fn drop(&mut self) {
         let mut c = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         c.rows = self.rows.take();
+        c.read_at = self.began;
         c.at = Some(Instant::now());
         c.refreshing = false;
     }
@@ -176,7 +185,11 @@ impl Drop for Refreshed<'_> {
 
 /// One read of the listing, its result swapped into `cache`.
 fn refresh(cache: &Mutex<ListingCache>, home: &Path) {
-    let mut done = Refreshed { cache, rows: None };
+    let mut done = Refreshed {
+        cache,
+        rows: None,
+        began: ipc::now() as i64,
+    };
     let exes = listing::candidates(home);
     done.rows = listing::read(&exes);
     let first_failure = {
@@ -568,6 +581,7 @@ mod tests {
                 let _done = Refreshed {
                     cache: &cache,
                     rows: None,
+                    began: 0,
                 };
                 panic!("the read");
             });
