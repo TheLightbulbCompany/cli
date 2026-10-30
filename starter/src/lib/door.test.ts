@@ -195,6 +195,50 @@ describe("door", () => {
     expect(await closedTo(new NextRequest("https://demo-app.example.com/reports"))).toBeNull();
   });
 
+  describe("builder test pass", () => {
+    // What POST /apps/build/{id}/test-link mints: not a person, no email, app = "<name>:preview".
+    const claims = { sub: "builder:agt_1", name: "Builder agent", email: "", app: "demo-app:preview" };
+    const post = (token: string) =>
+      openSession(
+        new Request("https://demo-app.example.com/api/_lightbulb/session", {
+          method: "POST",
+          headers: { origin: "https://demo-app.example.com", "content-type": "application/json" },
+          body: JSON.stringify({ token }),
+        }),
+      );
+
+    it("opens the preview, with no real email, for 30 minutes", async () => {
+      vi.stubEnv("LIGHTBULB_PREVIEW_APP", "demo-app:preview");
+      const res = await post(await pass(claims));
+      expect(res.status).toBe(204);
+      const cookie = res.headers.get("set-cookie")!;
+      expect(cookie).toContain("Max-Age=1800");
+      const v = await readSession(cookie.split(";")[0].slice("lb_session=".length));
+      expect(v).toMatchObject({ sub: "builder:agt_1", email: "", room: "room_1" });
+      const after = await readSession(cookie.split(";")[0].slice("lb_session=".length), new Date(Date.now() + 1_900_000));
+      expect(after).toBeNull();
+    });
+
+    it("is refused on live, which has no LIGHTBULB_PREVIEW_APP", async () => {
+      const res = await post(await pass(claims));
+      expect(res.status).toBe(401);
+      expect(await res.json()).toMatchObject({ reason: "wrong_app" });
+    });
+
+    it("its session from the preview is refused on live, though both share the cookie secret", async () => {
+      vi.stubEnv("LIGHTBULB_PREVIEW_APP", "demo-app:preview");
+      const cookie = (await post(await pass(claims))).headers.get("set-cookie")!;
+      vi.stubEnv("LIGHTBULB_PREVIEW_APP", "");
+      expect(await readSession(cookie.split(";")[0].slice("lb_session=".length))).toBeNull();
+    });
+
+    it("a member's pass keeps its 24 hours on the preview", async () => {
+      vi.stubEnv("LIGHTBULB_PREVIEW_APP", "demo-app:preview");
+      const res = await post(await pass());
+      expect(res.headers.get("set-cookie")).toContain("Max-Age=86400");
+    });
+  });
+
   it("invite pass names the email", async () => {
     const token = await pass({ sub: "invite:client@example.org", name: "client@example.org", email: "client@example.org", room: "" });
     expect(await verifyPass(token)).toMatchObject({

@@ -117,6 +117,8 @@ pub enum AppCommand {
         /// What happened.
         what: String,
     },
+    /// A short-lived link past the preview's door, for your own check. Never post it.
+    TestLink,
     /// Record a browser pass for the preview.
     Evidence {
         #[arg(long, value_enum)]
@@ -234,6 +236,13 @@ pub fn run(cmd: AppCommand, json: bool) -> Result<i32> {
                 Err(code) => return Ok(code),
             };
             ship::destroy(&root, &auth, json)
+        }
+        AppCommand::TestLink => {
+            let (root, _, auth) = match preflight(json) {
+                Ok(p) => p,
+                Err(code) => return Ok(code),
+            };
+            ship::test_link(&root, &auth, json)
         }
         AppCommand::ReportBrokenTool { tool, what } => {
             let (root, _, _) = match preflight(json) {
