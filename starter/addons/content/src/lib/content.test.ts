@@ -16,7 +16,7 @@ const { sessionCookie } = await import("./door");
 const { proxy } = await import("../proxy");
 const { default: sitemap } = await import("../app/sitemap");
 const { run: content } = await import("../../scripts/content.mjs");
-const { REST_DELETE, REST_PATCH } = await import("@payloadcms/next/routes");
+const { REST_DELETE, REST_PATCH, REST_POST } = await import("@payloadcms/next/routes");
 
 const payload = await getPayload({ config });
 
@@ -84,7 +84,16 @@ describe("content", () => {
 
     expect(await call("PATCH", editor, "", { title: "About us", _status: "published" })).toBe(403);
     expect(await call("DELETE", editor, "")).toBe(403);
+    // No live edit without a status, and no unpublishing.
+    expect(await call("PATCH", editor, "", { title: "Live edit" })).toBe(403);
+    expect(await call("PATCH", editor, "", { _status: "draft" })).toBe(403);
     expect(await live()).toBe("About");
+    expect((await payload.findByID({ collection: "pages", id: pageId }))._status).toBe("published");
+    // Nor restoring an old version live.
+    const old = (await payload.findVersions({ collection: "pages", where: { parent: { equals: pageId } }, sort: "createdAt", limit: 1 })).docs[0];
+    const restore = new Request(`https://demo-app.example.com/api/pages/versions/${old.id}`, { method: "POST", headers: { cookie: editor } });
+    const restored = await REST_POST(config)(restore, { params: Promise.resolve({ slug: ["pages", "versions", String(old.id)] }) });
+    expect(restored.status).toBe(403);
 
     expect(await call("PATCH", publisher, "", { title: "About us", _status: "published" })).toBe(200);
     expect(await live()).toBe("About us");

@@ -515,6 +515,13 @@ fn new_content_site_overlays_payload() {
     let pkg = std::fs::read_to_string(dir.join("package.json")).unwrap();
     assert!(pkg.contains("\"payload\": \"3.92.1\""));
     assert!(pkg.contains("\"name\": \"news-room\""));
+    let layout = std::fs::read_to_string(dir.join("src/app/(site)/layout.tsx")).unwrap();
+    assert!(layout.contains("title: \"news-room\""));
+    // Nothing from the scratch app the starter was built in.
+    for f in git(&dir, &["ls-files"]).lines() {
+        let text = String::from_utf8_lossy(&std::fs::read(dir.join(f)).unwrap()).to_string();
+        assert!(!text.contains("demo-content"), "{f} names demo-content");
+    }
     assert_eq!(git(&dir, &["status", "--porcelain"]), "");
 }
 
@@ -526,7 +533,8 @@ fn new_form_has_no_content_switch() {
     assert_eq!(o.status.code(), Some(0));
     let dir = tmp.path().join("sign-up");
     assert!(!dir.join("addons").exists());
-    assert!(dir.join("src/app/layout.tsx").is_file());
+    let layout = std::fs::read_to_string(dir.join("src/app/layout.tsx")).unwrap();
+    assert!(layout.contains("title: \"sign-up\""));
     assert!(!git(&dir, &["ls-files"]).to_lowercase().contains("payload"));
     let pkg = std::fs::read_to_string(dir.join("package.json")).unwrap();
     assert!(!pkg.contains("payload"));

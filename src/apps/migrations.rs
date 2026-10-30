@@ -4,6 +4,10 @@
 //! `.lightbulb/migrations.json` is `{"applied": ["0000_init.sql", ...]}`: the files a successful
 //! publish has shipped (`record`). Files in it are never looked at again. `seed.sql` is sample
 //! data, not schema, so it is not a migration.
+//!
+//! A site with the content switch also has Payload's migrations, `src/migrations/*.ts`, which run
+//! when the app starts in production. Their `up` SQL (the `` sql`...` `` bodies) is gated the same
+//! way and recorded as `src/migrations/<file>.ts`.
 
 // Derived from Dyad (https://github.com/dyad-sh/dyad), commit 0ee4a524, src/ipc/utils/migration_utils.ts. Copyright (c) Dyad contributors. Apache-2.0. Modified by The Lightbulb Company.
 // (The drop table / truncate / drop column / alter column type patterns, as Rust regexes.)
@@ -294,25 +298,70 @@ fn applied(root: &Path) -> Result<(Value, Vec<String>), ApiError> {
     Ok((v, list))
 }
 
-/// Looks at every `drizzle/*.sql` (not `seed.sql`) that is not in `migrations.json`.
-pub fn gate(root: &Path) -> Result<GateResult, ApiError> {
-    let (_, done) = applied(root)?;
-    let mut files = vec![];
-    let dir = root.join("drizzle");
+/// The names of `dir`'s files that `keep` accepts, sorted; none when `dir` is missing.
+fn list(dir: &Path, keep: impl Fn(&str) -> bool) -> Result<Vec<String>, ApiError> {
+    let mut names = vec![];
     if dir.is_dir() {
-        for e in std::fs::read_dir(&dir).map_err(|e| bad(e.to_string()))? {
+        for e in std::fs::read_dir(dir).map_err(|e| bad(e.to_string()))? {
             let name = e.map_err(|e| bad(e.to_string()))?.file_name();
             let name = name.to_string_lossy().into_owned();
-            if name.ends_with(".sql") && name != "seed.sql" && !done.contains(&name) {
-                files.push(name);
+            if keep(&name) {
+                names.push(name);
             }
         }
     }
-    files.sort();
+    names.sort();
+    Ok(names)
+}
+
+/// The SQL a Payload migration runs going up: every `` sql`...` `` body in `up`, not in `down`.
+fn payload_up_sql(ts: &str) -> String {
+    let up = ts.find("function up").map_or("", |i| &ts[i..]);
+    let up = up.find("function down").map_or(up, |i| &up[..i]);
+    let mut out = String::new();
+    for (i, _) in up.match_indices("sql`") {
+        let body = &up[i + 4..];
+        let mut end = body.len();
+        let mut escaped = false;
+        for (j, c) in body.char_indices() {
+            match c {
+                '\\' if !escaped => escaped = true,
+                '`' if !escaped => {
+                    end = j;
+                    break;
+                }
+                _ => escaped = false,
+            }
+        }
+        out.push_str(&body[..end]);
+        out.push_str(";\n");
+    }
+    out
+}
+
+/// Looks at every `drizzle/*.sql` (not `seed.sql`) and Payload `src/migrations/*.ts` (not
+/// `index.ts`) that is not in `migrations.json`.
+pub fn gate(root: &Path) -> Result<GateResult, ApiError> {
+    let (_, done) = applied(root)?;
+    let read = |p: &Path, f: &str| std::fs::read_to_string(p).map_err(|e| bad(format!("{f}: {e}")));
+    let mut files = vec![];
     let mut findings = vec![];
-    for f in &files {
-        let sql = std::fs::read_to_string(dir.join(f)).map_err(|e| bad(format!("{f}: {e}")))?;
-        findings.extend(classify(&sql).into_iter().map(|x| (f.clone(), x)));
+    let drizzle = root.join("drizzle");
+    for f in list(&drizzle, |n| n.ends_with(".sql") && n != "seed.sql")? {
+        if !done.contains(&f) {
+            let sql = read(&drizzle.join(&f), &f)?;
+            findings.extend(classify(&sql).into_iter().map(|x| (f.clone(), x)));
+            files.push(f);
+        }
+    }
+    let payload = root.join("src/migrations");
+    for name in list(&payload, |n| n.ends_with(".ts") && n != "index.ts")? {
+        let f = format!("src/migrations/{name}");
+        if !done.contains(&f) {
+            let sql = payload_up_sql(&read(&payload.join(&name), &f)?);
+            findings.extend(classify(&sql).into_iter().map(|x| (f.clone(), x)));
+            files.push(f);
+        }
     }
     Ok(GateResult {
         unrecorded: files,
@@ -340,6 +389,35 @@ pub(crate) fn record(root: &Path, files: &[String]) -> Result<(), ApiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn payload_migrations_are_gated_by_their_up_sql_only() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("src/migrations");
+        std::fs::create_dir_all(&dir).unwrap();
+        let migration = |up: &str, down: &str| {
+            format!(
+                "import {{ sql }} from '@payloadcms/db-postgres'\n\
+                 export async function up({{ db }}) {{\n  await db.execute(sql`\n   {up}`)\n}}\n\
+                 export async function down({{ db }}) {{\n  await db.execute(sql`\n   {down}`)\n}}\n"
+            )
+        };
+        let drop = "ALTER TABLE \"pages\" DROP COLUMN \"title\";";
+        let add = "ALTER TABLE \"pages\" ADD COLUMN \"title\" varchar;";
+        std::fs::write(dir.join("1_drop.ts"), migration(drop, add)).unwrap();
+        std::fs::write(dir.join("2_add.ts"), migration(add, drop)).unwrap();
+        std::fs::write(dir.join("index.ts"), "export const migrations = []").unwrap();
+        let g = gate(d.path()).unwrap();
+        assert_eq!(
+            g.unrecorded,
+            ["src/migrations/1_drop.ts", "src/migrations/2_add.ts"]
+        );
+        let files: Vec<&str> = g.findings.iter().map(|(f, _)| f.as_str()).collect();
+        assert_eq!(files, ["src/migrations/1_drop.ts"]);
+        assert_eq!(g.findings[0].1.kind, "drop_column");
+        record(d.path(), &g.unrecorded).unwrap();
+        assert!(gate(d.path()).unwrap().findings.is_empty());
+    }
 
     #[test]
     fn record_merges_and_keeps_other_keys() {

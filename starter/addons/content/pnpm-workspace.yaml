@@ -5,7 +5,10 @@ allowBuilds:
   esbuild: false
   sharp: false
   unrs-resolver: false
-# Patched versions of what Payload pulls in, so `pnpm audit --prod --audit-level high` passes.
+# Patched versions of what Payload pulls in, so `pnpm audit --prod --audit-level high` (check:publish)
+# passes. dompurify 3.4.17 (critical/high XSS, via Payload's code editor, monaco); happy-dom 21.0.4
+# (high, via @lexical/headless; a major bump); graphql-scalars 2.0.1 (high, via @payloadcms/graphql;
+# a major bump, and GraphQL is off in src/payload.config.ts). Drop each once Payload ships the fix.
 overrides:
   dompurify: 3.4.17
   graphql-scalars: 2.0.1

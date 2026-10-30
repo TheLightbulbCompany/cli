@@ -1,10 +1,10 @@
 import "server-only";
 
 // The content switch's glue: Payload's database, who may edit, and who may publish.
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { getPayload, type Access, type AuthStrategy } from "payload";
+import { Forbidden, getPayload, type Access, type AuthStrategy, type CollectionBeforeChangeHook } from "payload";
 import { dbMode } from "@/lib/db";
 import { readSession, SESSION_COOKIE } from "@/lib/door";
 
@@ -49,8 +49,12 @@ async function startSample(): Promise<string> {
     maxConnections: 20,
   });
   await server.start();
-  // Don't keep `next build` or a script alive for it.
+  // Don't keep `next build` or a script alive for it, and leave no socket folder behind.
   (server as unknown as { server: { unref(): void } }).server.unref();
+  process.once("exit", () => {
+    void server.stop();
+    rmSync(dir, { recursive: true, force: true });
+  });
   return `postgres://postgres@localhost/postgres?host=${encodeURIComponent(dir)}`;
 }
 
@@ -75,6 +79,17 @@ export const publishers: Access = ({ req }) => isPublisher(req.user);
 /** Editors save drafts; only publishers write `_status: published`. */
 export const draftsOrPublishers: Access = ({ req, data }) =>
   !!req.user && (isPublisher(req.user) || data?._status !== "published");
+
+/**
+ * Editors change pages and posts only by saving a draft (`?draft=true`): no live edit, no
+ * unpublish, no restoring a version live. Covers create, update and version restore; publishers and
+ * the builder's scripts (no signed-in user) pass.
+ */
+export const draftsOnlyForEditors: CollectionBeforeChangeHook = ({ req, data }) => {
+  if (!req.user || isPublisher(req.user)) return data;
+  if (String(req.query?.draft) === "true" && data._status === "draft") return data;
+  throw new Forbidden(req.t);
+};
 
 /** Signed-in people see drafts; everyone else sees published documents only. */
 export const publishedOrEditors: Access = ({ req }) =>

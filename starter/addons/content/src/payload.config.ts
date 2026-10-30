@@ -14,6 +14,7 @@ import { dbMode } from "@/lib/db";
 import {
   contentDatabaseUrl,
   doorStrategy,
+  draftsOnlyForEditors,
   draftsOrPublishers,
   editors,
   publishedOrEditors,
@@ -66,8 +67,9 @@ const richText: Block = {
 const slug = { name: "slug", type: "text", required: true, unique: true, index: true } as const;
 
 // Drafts are on; editors save drafts, publishers publish (src/lib/content.ts).
-const drafted: Pick<CollectionConfig, "access" | "versions"> = {
+const drafted: Pick<CollectionConfig, "access" | "hooks" | "versions"> = {
   access: { read: publishedOrEditors, create: draftsOrPublishers, update: draftsOrPublishers, delete: publishers },
+  hooks: { beforeChange: [draftsOnlyForEditors] },
   versions: { drafts: true },
 };
 
@@ -98,7 +100,11 @@ const Media: CollectionConfig = {
   slug: "media",
   access: { read: () => true, create: editors, update: publishers, delete: publishers },
   // Local disk until the app has Vercel Blob (BLOB_READ_WRITE_TOKEN).
-  upload: { staticDir: path.resolve(dirname, "../media") },
+  // Images and PDFs only: an uploaded SVG or HTML file could run script on the site.
+  upload: {
+    staticDir: path.resolve(dirname, "../media"),
+    mimeTypes: ["image/png", "image/jpeg", "image/webp", "image/gif", "application/pdf"],
+  },
   fields: [{ name: "alt", type: "text", required: true }],
 };
 
@@ -139,8 +145,12 @@ export default buildConfig({
     formBuilderPlugin({
       fields: { payment: false },
       formOverrides: { access: { read: () => true, create: publishers, update: publishers, delete: publishers } },
+      formSubmissionOverrides: { access: { update: publishers, delete: publishers } },
     }),
-    searchPlugin({ collections: ["pages", "posts"] }),
+    searchPlugin({
+      collections: ["pages", "posts"],
+      searchOverrides: { access: { update: publishers, delete: publishers } },
+    }),
     vercelBlobStorage({
       enabled: !!process.env.BLOB_READ_WRITE_TOKEN,
       collections: { media: true },
