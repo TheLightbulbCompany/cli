@@ -416,6 +416,42 @@ answered within 10 ms (250 ms for the end-of-turn answer that decides the nudge)
 | `upload [off\|metadata\|full]` | Choose what, if anything, is sent to Lightbulb (`capture_upload` in `config.toml`). `off` is the default: nothing leaves this computer. (The one request memory makes is setup's download of the memory model; `setup --no-model` skips it.) `metadata` sends, for each finished session, the agent, repository, branch, times and token counts, and for each tool call its number, time, tool, duration and whether it worked, without the summary. `full` adds the summary. Uploads are signed with this computer's identity, only while it is signed in, only for sessions that finish after you turn them on, and never for a hidden folder; signed out, it says nothing is sent until `lightbulb login`. Setting a mode must be run from your own terminal (an agent's shell is refused); with no mode it says which is set, from anywhere. `lightbulb login` asks once. |
 | `turns [on\|off]` | Records your prompts and replies on your computer only; never uploaded, in any mode (`capture_turns` in `config.toml`, on by default). Each is cut to 4 KB and deleted after 90 days (`capture_turns_days`). `sessions turns off` stops it, and `recall` stops using the turns already stored (they stay until you delete them with `sessions forget <ID>`); setting it must be run from your own terminal (an agent's shell is refused); with no state it says which is set. |
 
+## Apps you build
+
+### app
+
+When you use it: to build a small web app for your workspace, check it, preview it, publish it and undo it. Not the hosted assistants; see [apps you build](apps.md).
+
+```
+lightbulb app new <NAME> [--room <ROOM>] [--kind <KIND>]
+lightbulb app up [--room <ROOM>] [--approved <CARD>]
+lightbulb app publish [--reason <TEXT>] [--room <ROOM>] [--approved <CARD>]
+lightbulb app rollback [VERSION]
+lightbulb app status [--errors]
+lightbulb app destroy
+lightbulb app check [--publish]
+lightbulb app evidence --kind <browser|review> --file <FILE> [--note <TEXT>] [--verdict <pass|fail>]
+lightbulb app report-broken-tool <TOOL> <WHAT>
+```
+
+`--help`: Build, check, preview, publish and undo apps. Every subcommand takes `--json` (the default when stdout is not a terminal); a failure prints `{"code","message","next"}` and exits 1.
+
+| Command | What it does |
+|---|---|
+| `new` | Creates `./<NAME>` from the starter with one git commit. `--kind` is `site` (default), `content-site`, `form`, `internal-tool`, `dashboard`, `portal`, `payments` or `automation`. `--room` is saved in `.lightbulb/app.json`. |
+| `up` | Sends HEAD, waits for the preview build and reports `done` or what is `missing`. `--approved` is the approved card for a destructive migration. |
+| `publish` | Puts the preview live as a new version. Needs `check --publish` to pass and a passing review for HEAD. |
+| `rollback` | Makes an earlier version live (default: the one before) and adds one commit with its files. Code only; data is unchanged. Refuses with uncommitted changes. |
+| `status` | State, URLs, versions and the done gate. `--errors` adds the last client and server errors. |
+| `destroy` | Asks for removal; the owner confirms in Canvas. |
+| `check` | `pnpm check`, errors parsed. `--publish` runs `pnpm check:publish`, which adds a high-severity audit. |
+| `evidence` | Records a browser pass or a review for HEAD. A review needs `--verdict`. The file stays on this computer. |
+| `report-broken-tool` | Notes a failing tool in `.lightbulb/lessons.md`, once per `up`. |
+
+Run all but `new` inside the app's folder. Auth is a workspace agent's hook token when
+`OPENCLAW_HOOK_TOKEN`, `ISOL8_API_URL` and `ISOL8_OWNER_ID` are all set; otherwise `lightbulb login`.
+Details: [apps you build](apps.md).
+
 ## Commands the agents and macOS run
 
 `hook`, `mcp` and `daemon` are not for typing. The agents run `lightbulb hook <agent> <event>`
