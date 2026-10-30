@@ -11,12 +11,16 @@ Every command calls the Lightbulb builder routes. The CLI never runs the Stripe 
 ## Commands
 
 Every command takes `--json` (the default when stdout is not a terminal). A failure prints
-`{"code","message","next"}` and exits 1. Run all commands except `new` inside the app's folder.
+`{"code","message","next"}` and exits 1 (in a terminal: the message, then a `Next:` line). An
+`up` or `publish` still building after 10 minutes exits 2 with `code: "timeout"`: not done, not
+failed; run `status` later. Run all commands except `new` inside the app's folder. Output for a
+person uses three words: the **preview** (built from your latest commit), **live** (published),
+and **done** (the preview was checked by a person). JSON keeps the backend's states.
 
 | Command | What it does |
 |---|---|
-| `app new <NAME> [--room <ROOM>] [--kind <KIND>]` | Creates `./<NAME>` from the starter, with one git commit. Next: `cd <NAME> && pnpm install`, then `app check`. `NAME` is a DNS label: `^[a-z][a-z0-9-]{1,38}[a-z0-9]$`. `--kind` is `site` (default), `content-site`, `form`, `internal-tool`, `dashboard`, `portal`, `payments` or `automation`. `--room` is saved in `.lightbulb/app.json`. |
-| `app up [--room <ROOM>] [--approved <CARD>]` | Sends HEAD to Lightbulb, waits for the preview build (up to 10 minutes), and reports `done` or what is missing. If it is still building after that, `next` says to run `status`, not `up` again. A `failed` build prints `{"code","message","next"}` (`build_failed` when the backend gave no error) and exits 1. |
+| `app new <NAME> [--room <ROOM>] [--kind <KIND>]` | Creates `./<NAME>` from the starter, with one git commit, and says who can open it. Next: `cd <NAME> && pnpm install`, then `lightbulb app up` to get a preview. `NAME` is a DNS label: `^[a-z][a-z0-9-]{1,38}[a-z0-9]$`, and may not end in `-preview` (the preview's address is `<name>-preview.<apps domain>`). `--kind` is `site` (default), `content-site`, `form`, `internal-tool`, `dashboard`, `portal`, `payments` or `automation`. `--room` is saved in `.lightbulb/app.json`. |
+| `app up [--room <ROOM>] [--approved <CARD>] [--requested-by <ID>]` | Sends HEAD to Lightbulb (a source over 9 MiB packed is refused first with `source_too_large`), waits for the preview build (up to 10 minutes), and reports `done` or what is missing. Still building after that: `timeout`, exit 2. A `failed` build prints `{"code","message","next"}` (`build_failed` when the backend gave no error) and exits 1. `--requested-by` names the person who asked (sent with the first `up`). After the first `up`, who can open the app and its budget change in Canvas: when `app.yaml`'s `open_to` or `budget_usd` differ from Lightbulb's, `up` adds a `note` saying the app.yaml values are ignored. `--approved-destructive` is another name for `--approved`. |
 | `app publish [--reason <TEXT>] [--room <ROOM>] [--approved <CARD>]` | Puts the preview live as a new version, waiting for the build like `up`. Needs a passing `check --publish` and a passing review record for HEAD (see below). `ready` and `live` both mean done. |
 | `app rollback [VERSION]` | Goes back to an earlier version (default: the one before live). Code only. |
 | `app status [--errors]` | Where the app is: state, URLs, versions, resources, spend, and the done gate. `--errors` adds the last client and server errors. |
@@ -93,7 +97,10 @@ Before `up` and `publish` send the source, the CLI reads new migration files: `d
 Payload's `src/migrations/*.ts`. It flags `drop_table`, `drop_column`, `rename_table`, `rename_column`,
 `alter_type`, `set_not_null`, `truncate` and `delete`. `DO`, `CALL`, `EXECUTE` and `PREPARE` blocks are
 `dynamic_sql`: they cannot be read, so they fail closed. A `.ts` migration that is not plain SQL
-also fails closed. On a finding the command fails with `destructive_migration` and shows the SQL.
+also fails closed. On a finding the command fails with `destructive_migration`. The message says
+in words what each change would do ("This change would drop the `contacts` table (data loss).",
+one line each, then "Nothing was applied."); the SQL is under `details` (`file: statement`), or
+indented under the message in a terminal.
 The owner approves a card in Inbox, then you run `up --approved <card id>` (or `publish
 --approved <card id>`). The backend checks the card is approved for this owner. Migrations
 already recorded in `migrations.json` are not gated again.
@@ -101,8 +108,10 @@ already recorded in `migrations.json` are not gated again.
 ## Publish, rollback, destroy
 
 `publish` needs `check --publish` to pass and a review record for the exact HEAD with
-`--verdict pass` (`lightbulb app evidence --kind review --verdict pass --file … --note …`). If
-HEAD moved after the review, it fails with `review_required`.
+`--verdict pass`. Without one it fails with `review_required`, "Publish needs a passing review
+recorded for this commit.", and a `next` with the reviewer step, the preview address `up` last
+saw, and the exact command: `lightbulb app evidence --kind review --verdict pass --file
+<screenshot> --note "<what was checked>"`. If HEAD moved after the review, it fails the same way.
 
 `rollback` is code only: Lightbulb makes the earlier version live again, and the CLI adds one new
 commit on top whose files match that version. HEAD never moves backwards. Data and schema are
@@ -121,12 +130,24 @@ shadcn/ui, Drizzle on Postgres), with exact-pinned dependencies and `minimum-rel
 - `AGENTS.md` (the rules for the builder) and `playbooks/<kind>.md`.
 - **The door.** `src/proxy.ts` and `src/lib/door.ts` verify the Lightbulb pass (an EdDSA JWS
   checked against `LIGHTBULB_ISSUER_KEY`, with `app` equal to `LIGHTBULB_APP`), then set an
-  `lb_session` cookie. `LIGHTBULB_OPEN_TO=public` turns it off. Every response sends a
+  `lb_session` cookie. The pass's header has `typ: "lightbulb-app-pass"`; its `app` claim is the
+  app's name. `LIGHTBULB_OPEN_TO=public` turns it off. Every response sends a
   `frame-ancestors` policy for `thelightbulb.company`. Only `/api/_lightbulb/health`, the
   session route `/api/_lightbulb/session`, the door's own pages and Next's assets skip it; error
   reports (`/api/_lightbulb/errors`) need a session unless the app is public. Do not remove or
   loosen it.
-- **Sample data.** `drizzle/seed.sql` seeds sample mode and the preview database.
+- **The door page.** Someone without a session gets status 401 and a page that names the app
+  and workspace (`LIGHTBULB_APP_NAME`, `LIGHTBULB_WORKSPACE_NAME`; dropped when unset), says "Open
+  this from Canvas in Lightbulb to get in.", has one "Open Canvas" button
+  (`https://thelightbulb.company/chat?panel=canvas&app=<LIGHTBULB_APP_ID>`) and the line "Invited
+  by email? Use the link in your invitation." An expired link, a link for another app, and no
+  connection (with Try again) each have their own sentence. An email invite is used only after the
+  person clicks Continue, so a link scanner cannot spend it.
+- **Error reports.** The browser's errors are logged with the prefix `[lightbulb:client]`, which
+  is what `status --errors` reads.
+- **Sample data.** `drizzle/seed.sql` seeds sample mode and the preview database. Every page of a
+  sample-data preview shows "Preview with sample data — nothing you enter here is kept." (not
+  Payload's `/admin`), and the CLI says "(sample data)" after the preview address.
 - **Server-only data.** The browser never gets a database credential.
 - **Checks.** `pnpm check` runs `tsc`, `eslint` and a design lint (no raw colours or one-off sizes).
 

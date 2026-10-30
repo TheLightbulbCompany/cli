@@ -74,8 +74,11 @@ pub enum AppCommand {
     /// Build the preview and say when it is done.
     Up {
         /// An approved card for a destructive migration.
-        #[arg(long)]
+        #[arg(long, alias = "approved-destructive")]
         approved: Option<String>,
+        /// Who asked for the app (sent with the first `up`).
+        #[arg(long)]
+        requested_by: Option<String>,
         /// The room it is built for (saved in .lightbulb/app.json).
         #[arg(long)]
         room: Option<String>,
@@ -85,7 +88,7 @@ pub enum AppCommand {
         #[arg(long)]
         reason: Option<String>,
         /// An approved card for a destructive migration.
-        #[arg(long)]
+        #[arg(long, alias = "approved-destructive")]
         approved: Option<String>,
         /// The room it is built for (saved in .lightbulb/app.json).
         #[arg(long)]
@@ -130,23 +133,43 @@ pub enum AppCommand {
 }
 
 /// Prints a failure and returns the exit code 1: `{"code","message","next"}` on stdout in
-/// JSON mode, else a sentence on stderr.
+/// JSON mode, else the message and a `Next:` line on stderr.
 pub fn fail(json: bool, code: &str, message: &str, next: &str) -> i32 {
+    fail_with(json, code, message, next, &[])
+}
+
+/// `fail` with `details` (one line each): a JSON list, or indented lines under the message.
+pub fn fail_with(json: bool, code: &str, message: &str, next: &str, details: &[String]) -> i32 {
     if json {
-        println!(
-            "{}",
-            json!({"code": code, "message": message, "next": next})
-        );
+        let mut v = json!({"code": code, "message": message, "next": next});
+        if !details.is_empty() {
+            v["details"] = json!(details);
+        }
+        println!("{v}");
     } else {
-        eprintln!("{message} ({next})");
+        for l in failure_lines(message, next, details) {
+            eprintln!("{l}");
+        }
     }
     1
 }
 
-/// A DNS label: `^[a-z][a-z0-9-]{1,38}[a-z0-9]$`.
+/// A failure for a person: the message, the details indented, then `Next:` when there is one.
+fn failure_lines(message: &str, next: &str, details: &[String]) -> Vec<String> {
+    let mut out = vec![message.to_string()];
+    out.extend(details.iter().map(|d| format!("  {d}")));
+    if !next.trim().is_empty() {
+        out.push(format!("Next: {next}"));
+    }
+    out
+}
+
+/// A DNS label: `^[a-z][a-z0-9-]{1,38}[a-z0-9]$`, not ending in `-preview` (the preview's
+/// address is `{name}-preview.<apps domain>`).
 pub fn valid_name(n: &str) -> bool {
     let b = n.as_bytes();
-    (3..=40).contains(&b.len())
+    !n.ends_with("-preview")
+        && (3..=40).contains(&b.len())
         && b[0].is_ascii_lowercase()
         && b[b.len() - 1] != b'-'
         && b.iter()
@@ -156,6 +179,14 @@ pub fn valid_name(n: &str) -> bool {
 pub fn run(cmd: AppCommand, json: bool) -> Result<i32> {
     match cmd {
         AppCommand::New { name, room, kind } => {
+            if name.ends_with("-preview") {
+                return Ok(fail(
+                    json,
+                    "bad_name",
+                    &format!("An app's name cannot end in -preview: Lightbulb gives every app a preview at <name>-preview, so {name} would clash with another app's preview."),
+                    "pick a name that does not end in -preview",
+                ));
+            }
             if !valid_name(&name) {
                 return Ok(fail(
                     json,
@@ -168,12 +199,16 @@ pub fn run(cmd: AppCommand, json: bool) -> Result<i32> {
         }
         AppCommand::Status { errors } => status(errors, json),
         AppCommand::Check { publish } => check::check(publish, json),
-        AppCommand::Up { approved, room } => {
+        AppCommand::Up {
+            approved,
+            requested_by,
+            room,
+        } => {
             let (root, config, auth, approved) = match gated(approved, json) {
                 Ok(g) => g,
                 Err(code) => return Ok(code),
             };
-            ship::up(&root, &config, &auth, approved, room, json)
+            ship::up(&root, &config, &auth, approved, requested_by, room, json)
         }
         AppCommand::Publish {
             reason,
@@ -308,16 +343,24 @@ fn destructive_gate(
     if g.findings.is_empty() || approved.is_some() {
         return Ok(approved);
     }
-    let sql: Vec<&str> = g
+    let mut words: Vec<String> = g
         .findings
         .iter()
-        .map(|(_, f)| f.statement.as_str())
+        .map(|(_, f)| format!("This change would {}.", migrations::describe(f)))
         .collect();
-    Err(fail(
+    words.dedup();
+    words.push("Nothing was applied.".into());
+    let sql: Vec<String> = g
+        .findings
+        .iter()
+        .map(|(file, f)| format!("{file}: {}", f.statement))
+        .collect();
+    Err(fail_with(
         json,
         "destructive_migration",
-        &sql.join("\n"),
+        &words.join("\n"),
         migrations::NEXT,
+        &sql,
     ))
 }
 
@@ -378,20 +421,26 @@ pub fn new(name: &str, room: Option<&str>, kind: Kind, json: bool) -> Result<i32
             .output()
     };
     let msg = format!("lightbulb app new {name}");
+    let git_failed = |what: &str, o: Option<std::process::Output>| {
+        let why = o.map_or("git is not installed".into(), |o| {
+            String::from_utf8_lossy(&o.stderr).trim().to_string()
+        });
+        fail(
+            json,
+            "git_failed",
+            &format!("The app's files are written, but git {what} failed: {why}"),
+            &format!("install git, delete {name}, then run lightbulb app new again"),
+        )
+    };
     for args in [["init", "-q"], ["add", "-A"]] {
-        let o = git(&args)?;
-        if !o.status.success() {
-            return Err(format!(
-                "git {} failed: {}",
-                args[0],
-                String::from_utf8_lossy(&o.stderr)
-            )
-            .into());
+        match git(&args) {
+            Ok(o) if o.status.success() => {}
+            o => return Ok(git_failed(args[0], o.ok())),
         }
     }
-    if !git(&["commit", "-qm", &msg])?.status.success() {
+    if !git(&["commit", "-qm", &msg]).is_ok_and(|o| o.status.success()) {
         // No git identity on this computer: commit as Lightbulb.
-        let o = git(&[
+        match git(&[
             "-c",
             "user.name=Lightbulb",
             "-c",
@@ -399,21 +448,27 @@ pub fn new(name: &str, room: Option<&str>, kind: Kind, json: bool) -> Result<i32
             "commit",
             "-qm",
             &msg,
-        ])?;
-        if !o.status.success() {
-            return Err(
-                format!("git commit failed: {}", String::from_utf8_lossy(&o.stderr)).into(),
-            );
+        ]) {
+            Ok(o) if o.status.success() => {}
+            o => return Ok(git_failed("commit", o.ok())),
         }
     }
-    let next = format!("cd {name} && pnpm install, then lightbulb app check");
+    let next = format!("cd {name} && pnpm install, then `lightbulb app up` to get a preview");
     if json {
         println!(
             "{}",
             json!({"name": name, "dir": dir, "files": files, "next": next})
         );
     } else {
-        println!("Started {name} in {} ({files} files).", dir.display());
+        println!("Started {name} in {}.", dir.display());
+        println!(
+            "Who can open it: {}",
+            if room.is_some() {
+                "the people in its room"
+            } else {
+                "everyone in your workspace"
+            }
+        );
         println!("Next: {next}");
     }
     Ok(0)
@@ -524,34 +579,54 @@ pub fn status(errors: bool, json: bool) -> Result<i32> {
             Ok(0)
         }
         Ok(v) => {
-            let s = if errors { &v["status"] } else { &v };
-            println!("State: {}", s["state"].as_str().unwrap_or("unknown"));
-            for k in ["preview_url", "live_url", "canvas_url"] {
-                if let Some(u) = s[k].as_str() {
-                    println!("{k}: {u}");
-                }
+            for l in status_lines(&v, errors) {
+                println!("{l}");
             }
-            let versions = s["versions"].as_array().map_or(0, Vec::len);
-            match s["live_version"].as_u64() {
-                Some(l) => println!("Versions: {versions} (live: {l})"),
-                None => println!("Versions: {versions}"),
-            }
-            if errors {
-                for side in ["client", "server"] {
-                    for e in v["errors"][side].as_array().into_iter().flatten() {
-                        println!(
-                            "Error ({side}) {}: {}",
-                            e["at"].as_str().unwrap_or(""),
-                            e["message"].as_str().unwrap_or("")
-                        );
-                    }
-                }
-            }
-            ship::done_lines(&v);
             Ok(0)
         }
         Err(e) => Ok(fail(json, &e.code, &e.message, &e.next)),
     }
+}
+
+/// `status` for a person: preview / live / done, never a JSON key or enum.
+pub(crate) fn status_lines(v: &Value, errors: bool) -> Vec<String> {
+    let s = if errors { &v["status"] } else { v };
+    let url = |k: &str| s[k].as_str().filter(|u| !u.is_empty());
+    let mut out = vec![match s["state"].as_str() {
+        Some("awaiting_approval") => {
+            "Preview: waiting for the owner to approve the cards in Inbox".to_string()
+        }
+        Some("provisioning" | "building") => "Preview: building".into(),
+        Some("failed") => "Preview: the last build failed".into(),
+        _ => format!("Preview: {}", url("preview_url").unwrap_or("none yet")),
+    }];
+    if let Some(u) = url("live_url") {
+        let version = s["live_version"]
+            .as_u64()
+            .map_or(String::new(), |n| format!(" (version {n})"));
+        out.push(format!("Live: {u}{version}"));
+    }
+    if let Some(u) = url("canvas_url") {
+        out.push(format!("Canvas: {u}"));
+    }
+    if errors {
+        for side in ["client", "server"] {
+            let word = if side == "client" {
+                "browser"
+            } else {
+                "server"
+            };
+            for e in v["errors"][side].as_array().into_iter().flatten() {
+                out.push(format!(
+                    "Error in the {word} at {}: {}",
+                    e["at"].as_str().unwrap_or("?"),
+                    e["message"].as_str().unwrap_or("")
+                ));
+            }
+        }
+    }
+    out.extend(ship::done_lines(v));
+    out
 }
 
 /// The six keys of `app.yaml`.
@@ -642,5 +717,54 @@ impl AppConfig {
         );
         std::fs::write(dir.join("app.yaml"), text)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failure_for_a_person_has_no_empty_next() {
+        assert_eq!(failure_lines("It broke.", "", &[]), ["It broke."]);
+        assert_eq!(
+            failure_lines("Stopped.", "run again", &["a.sql: DROP TABLE t".into()]),
+            ["Stopped.", "  a.sql: DROP TABLE t", "Next: run again"]
+        );
+    }
+
+    #[test]
+    fn status_in_words() {
+        let v = json!({"status": {"state": "ready", "preview_url": "https://p", "live_url": "https://l",
+            "live_version": 2, "canvas_url": "https://c"},
+            "errors": {"client": [{"at": "t1", "message": "boom"}], "server": []},
+            "done": true, "missing": [], "next": "tell the room"});
+        assert_eq!(
+            status_lines(&v, true),
+            [
+                "Preview: https://p",
+                "Live: https://l (version 2)",
+                "Canvas: https://c",
+                "Error in the browser at t1: boom",
+                "Done: yes",
+                "Next: tell the room",
+            ]
+        );
+        let building =
+            json!({"state": "building", "done": false, "missing": ["ready"], "next": ""});
+        assert_eq!(
+            status_lines(&building, false),
+            [
+                "Preview: building",
+                "Done: no",
+                "Missing: a finished preview"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_name_ending_in_preview_is_not_valid() {
+        assert!(valid_name("team-lunch"));
+        assert!(!valid_name("team-lunch-preview"));
     }
 }

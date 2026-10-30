@@ -8,7 +8,8 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-const MAX_ARCHIVE: u64 = 100 * 1024 * 1024;
+/// The backend refuses a bigger source archive.
+const MAX_ARCHIVE: u64 = 9 * 1024 * 1024;
 
 fn git(root: &Path, args: &[&str]) -> std::result::Result<Output, ApiError> {
     Command::new("git")
@@ -162,12 +163,16 @@ pub fn archive(root: &Path) -> std::result::Result<(PathBuf, String), ApiError> 
             "check that tar works",
         ));
     }
-    if std::fs::metadata(&tgz).map_or(0, |m| m.len()) > MAX_ARCHIVE {
+    let size = std::fs::metadata(&tgz).map_or(0, |m| m.len());
+    if size > MAX_ARCHIVE {
         let _ = std::fs::remove_file(&tgz);
         return Err(ApiError::new(
-            "archive_too_big",
-            "The app is over 100 MB.",
-            "remove large files from git (media, build output), then try again",
+            "source_too_large",
+            &format!(
+                "The app's source is {:.1} MiB packed; Lightbulb takes at most 9 MiB.",
+                size as f64 / (1024.0 * 1024.0)
+            ),
+            "keep large media and assets out of git (add them to .gitignore, or use external storage) and do not commit generated files, then try again",
         ));
     }
     Ok((tgz, head))
@@ -238,43 +243,100 @@ fn contract(v: &Value) -> Value {
     out
 }
 
-fn print(v: &Value, json: bool) {
+/// The result of `cmd` (`up`, `publish`, `rollback`): JSON, or lines for a person.
+fn print(v: &Value, cmd: &str, json: bool) {
     if json {
         println!("{v}");
-        return;
+    } else {
+        for l in human(v, cmd) {
+            println!("{l}");
+        }
     }
-    println!("State: {}", v["state"].as_str().unwrap_or("unknown"));
+}
+
+/// An `UpResult` in the words preview / live / done; never a JSON key or enum.
+pub(crate) fn human(v: &Value, cmd: &str) -> Vec<String> {
+    let mut out = vec![];
+    let url = |k: &str| v[k].as_str().filter(|u| !u.is_empty());
+    match v["state"].as_str() {
+        Some("awaiting_approval") => {
+            out.push("Preview: waiting for the owner to approve the cards in Inbox".into())
+        }
+        Some("provisioning" | "building") => out.push("Preview: building".into()),
+        _ if cmd == "up" => {
+            let sample = if v["sample_data"] == true {
+                " (sample data)"
+            } else {
+                ""
+            };
+            out.push(format!(
+                "Preview: {}{sample}",
+                url("preview_url").unwrap_or("built")
+            ));
+        }
+        _ => {
+            let version = v["version"]
+                .as_u64()
+                .map_or(String::new(), |n| format!(" (version {n})"));
+            out.push(format!(
+                "Live: {}{version}",
+                url("live_url").unwrap_or("yes")
+            ));
+        }
+    }
     for c in v["cards"].as_array().into_iter().flatten() {
-        println!(
-            "  {} {}: {}",
+        out.push(format!(
+            "Approval card: {} {} ({})",
             c["provider"].as_str().unwrap_or(""),
             c["service"].as_str().unwrap_or(""),
             c["state"].as_str().unwrap_or("")
-        );
+        ));
     }
-    for k in ["preview_url", "live_url", "canvas_url"] {
-        if let Some(u) = v[k].as_str() {
-            println!("{k}: {u}");
-        }
+    if let Some(m) = v["error"]["message"].as_str().filter(|m| !m.is_empty()) {
+        out.push(format!("Note: {m}"));
     }
-    done_lines(v);
+    if let Some(n) = v["note"].as_str() {
+        out.push(format!("Note: {n}"));
+    }
+    if let Some(u) = url("canvas_url") {
+        out.push(format!("Canvas: {u}"));
+    }
+    out.extend(done_lines(v));
+    out
 }
 
-/// `Done:`, `Missing:` (when not done) and `Next:` lines.
-pub(crate) fn done_lines(v: &Value) {
+/// A missing piece of the done gate, for a person.
+fn missing_words(m: &str) -> &str {
+    match m {
+        "ready" => "a finished preview",
+        "preview" => "the preview's address from Lightbulb",
+        "preview_commit" => "a preview of this commit",
+        "health" => "a passing health check",
+        "browser_evidence" => "a person checking the preview in the browser",
+        other => other,
+    }
+}
+
+/// `Done:`, `Missing:` (when not done) and `Next:` (when there is one).
+pub(crate) fn done_lines(v: &Value) -> Vec<String> {
+    let mut out = vec![];
     if let Some(d) = v["done"].as_bool() {
-        println!("Done: {}", if d { "yes" } else { "no" });
+        out.push(format!("Done: {}", if d { "yes" } else { "no" }));
     }
     let missing: Vec<&str> = v["missing"]
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
+        .map(missing_words)
         .collect();
     if !missing.is_empty() {
-        println!("Missing: {}", missing.join(", "));
+        out.push(format!("Missing: {}", missing.join(", ")));
     }
-    println!("Next: {}", v["next"].as_str().unwrap_or(""));
+    if let Some(n) = v["next"].as_str().filter(|n| !n.trim().is_empty()) {
+        out.push(format!("Next: {n}"));
+    }
+    out
 }
 
 fn failure(json: bool, e: ApiError) -> i32 {
@@ -316,9 +378,29 @@ fn next_for(cmd: &str, r: &Value) -> String {
     }
 }
 
-/// The result's printed form and exit code. A `failed` result is a failure:
+/// Still building when the wait gave up.
+fn building(r: &Value) -> bool {
+    matches!(r["state"].as_str(), Some("building" | "provisioning"))
+}
+
+/// The result's printed form and exit code. A `failed` result is a failure (1):
 /// `{code, message, next}` from the backend's error, else what to do about a failed build.
-fn show(r: &Value, extra: Value, json: bool) -> i32 {
+/// `up` or `publish` still building after the wait is a `timeout` (2): not done, not failed (R25).
+fn show(r: &Value, cmd: &str, extra: Value, json: bool) -> i32 {
+    if cmd != "rollback" && building(r) {
+        let (what, end) = if cmd == "up" {
+            ("The preview", "the preview")
+        } else {
+            ("The new version", "the publish")
+        };
+        fail(
+            json,
+            "timeout",
+            &format!("{what} is still building after 10 minutes."),
+            &format!("run `lightbulb app status`; {end} may still finish"),
+        );
+        return 2;
+    }
     if r["state"] == "failed" {
         let e = &r["error"];
         let said = |k: &str| e[k].as_str().filter(|s| !s.is_empty());
@@ -333,7 +415,7 @@ fn show(r: &Value, extra: Value, json: bool) -> i32 {
     for (k, v) in extra.as_object().into_iter().flatten() {
         out[k] = v.clone();
     }
-    print(&out, json);
+    print(&out, cmd, json);
     0
 }
 
@@ -348,7 +430,7 @@ fn upload(
     let (tgz, head) = archive(root)?;
     let sent = (|| {
         if expect.is_some_and(|e| e != head) {
-            return Err(review_required());
+            return Err(review_required(root));
         }
         let mut fields = vec![("name", config.name.as_str()), ("commit", head.as_str())];
         fields.extend(room.map(|r| ("room_id", r)));
@@ -367,11 +449,17 @@ fn upload(
         })
 }
 
-fn review_required() -> ApiError {
+/// The preview address `up` last saw (kept in app.json), if any.
+fn last_preview(root: &Path) -> Option<String> {
+    app_json(root)["preview_url"].as_str().map(String::from)
+}
+
+fn review_required(root: &Path) -> ApiError {
+    let at = last_preview(root).map_or(String::new(), |u| format!(" at {u}"));
     ApiError::new(
         "review_required",
-        "No passing review is recorded for this version of the app.",
-        "a separate reviewer checks the preview, then lightbulb app evidence --kind review --verdict pass --file … --note …",
+        "Publish needs a passing review recorded for this commit.",
+        &format!("run the reviewer or ask your workspace agent to review the preview{at}, then record it: lightbulb app evidence --kind review --verdict pass --file <screenshot> --note \"<what was checked>\""),
     )
 }
 
@@ -411,10 +499,12 @@ pub(crate) fn up(
     config: &AppConfig,
     auth: &Auth,
     approved: Option<String>,
+    requested_by: Option<String>,
     room: Option<String>,
     json: bool,
 ) -> Result<i32> {
     let room = room_for(root, room)?;
+    let existed = app_json(root)["app_id"].is_string();
     // One report of a broken tool is allowed per cycle; each `up` starts a new one.
     let counted = check::read_progress(root).and_then(|mut p| {
         p["up_cycle"] = (p["up_cycle"].as_u64().unwrap_or(0) + 1).into();
@@ -434,6 +524,9 @@ pub(crate) fn up(
         if let Some(a) = approved {
             body["approved_destructive"] = a.into();
         }
+        if let Some(p) = requested_by {
+            body["requested_by"] = p.into();
+        }
         api::call(auth, "POST", "/up", Some(&body))
     });
     let r = match result {
@@ -450,7 +543,15 @@ pub(crate) fn up(
     if let Err(e) = wait(auth, &id, &mut r) {
         return Ok(failure(json, e));
     }
-    let extra = if finished(&r["state"]) {
+    if r["state"] == "failed" || building(&r) {
+        return Ok(show(&r, "up", json!({}), json));
+    }
+    if let Some(u) = r["preview_url"].as_str() {
+        let mut a = app_json(root);
+        a["preview_url"] = u.into();
+        save_app_json(root, &a)?;
+    }
+    let mut extra = if finished(&r["state"]) {
         let state = git_ok(root, &["rev-parse", "HEAD"])
             .and_then(|head| evidence::done(root, auth, &id, &head));
         match state {
@@ -460,7 +561,23 @@ pub(crate) fn up(
     } else {
         json!({"done": false, "next": next_for("up", &r)})
     };
-    Ok(show(&r, extra, json))
+    if existed {
+        if let Some(n) = settings_note(auth, &id, config) {
+            extra["note"] = n.into();
+        }
+    }
+    Ok(show(&r, "up", extra, json))
+}
+
+/// After the first `up` the backend's record of who can open the app and its budget wins
+/// (they change in Canvas); says so when app.yaml has drifted from it.
+fn settings_note(auth: &Auth, id: &str, config: &AppConfig) -> Option<&'static str> {
+    let s = api::call(auth, "GET", &format!("/{id}/status"), None).ok()?;
+    let open_to = s["open_to"].as_str()?;
+    let budget = s["budget_usd"].as_f64()?;
+    (open_to != super::word(&config.open_to) || budget != f64::from(config.budget_usd)).then_some(
+        "Sharing and budget changes go through Canvas; app.yaml changes to them are ignored after the first up.",
+    )
 }
 
 /// While `r` is building, polls the status (2, 4, 8, 15, 15... s, up to 10 minutes) until it no
@@ -531,7 +648,7 @@ pub(crate) fn publish(
     }
     let head = match git_ok(root, &["rev-parse", "HEAD"]) {
         Ok(h) if has_passing_review(root, &h) => h,
-        Ok(_) => return Ok(failure(json, review_required())),
+        Ok(_) => return Ok(failure(json, review_required(root))),
         Err(e) => return Ok(failure(json, e)),
     };
     let result = migrations::gate(root).and_then(|g| {
@@ -553,7 +670,12 @@ pub(crate) fn publish(
         Ok(r)
     });
     match result {
-        Ok(r) => Ok(show(&r, json!({"next": next_for("publish", &r)}), json)),
+        Ok(r) => Ok(show(
+            &r,
+            "publish",
+            json!({"next": next_for("publish", &r)}),
+            json,
+        )),
         Err(e) => Ok(failure(json, e)),
     }
 }
@@ -611,12 +733,17 @@ pub(crate) fn rollback(root: &Path, auth: &Auth, version: Option<u32>, json: boo
         Err(e) => return Ok(failure(json, e)),
     };
     if r["state"] == "failed" {
-        return Ok(show(&r, json!({}), json));
+        return Ok(show(&r, "rollback", json!({}), json));
     }
     if let Err(e) = restore(root, &target, n) {
         return Ok(failure(json, e));
     }
-    Ok(show(&r, json!({"next": next_for("rollback", &r)}), json))
+    Ok(show(
+        &r,
+        "rollback",
+        json!({"next": next_for("rollback", &r)}),
+        json,
+    ))
 }
 
 /// One new commit on top whose tree is `target`'s. HEAD never moves backwards.
@@ -648,7 +775,19 @@ pub(crate) fn destroy(root: &Path, auth: &Auth, json: bool) -> Result<i32> {
     match api::call(auth, "POST", &format!("/{id}/destroy"), Some(&json!({}))) {
         Ok(r) => {
             let v = json!({"state": r["state"], "next": r["next"]});
-            print(&v, json);
+            if json {
+                println!("{v}");
+            } else {
+                match r["state"].as_str() {
+                    Some("awaiting_owner") => println!(
+                        "Removal: waiting for the owner to confirm in Canvas. Nothing is removed until they do."
+                    ),
+                    s => println!("Removal: {}", s.unwrap_or("asked")),
+                }
+                if let Some(n) = r["next"].as_str().filter(|n| !n.trim().is_empty()) {
+                    println!("Next: {n}");
+                }
+            }
             Ok(0)
         }
         Err(e) => Ok(failure(json, e)),
@@ -711,4 +850,51 @@ pub(crate) fn status_contract(v: &Value) -> Value {
 pub(crate) fn errors_contract(v: &Value) -> Value {
     json!({"client": pick_each(&v["client"], &["at", "message"]),
         "server": pick_each(&v["server"], &["at", "message"])})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn up_in_words_says_preview_sample_data_and_what_is_missing() {
+        let v = json!({"state": "ready", "preview_url": "https://p.example", "sample_data": true,
+            "canvas_url": "https://c.example", "cards": [], "done": false,
+            "missing": ["browser_evidence"], "next": "open it"});
+        assert_eq!(
+            human(&v, "up"),
+            [
+                "Preview: https://p.example (sample data)",
+                "Canvas: https://c.example",
+                "Done: no",
+                "Missing: a person checking the preview in the browser",
+                "Next: open it",
+            ]
+        );
+    }
+
+    #[test]
+    fn publish_in_words_says_live_and_never_an_empty_next() {
+        let v = json!({"state": "ready", "live_url": "https://l.example", "version": 3,
+            "error": {"code": "code_only", "message": "Data is unchanged."}, "next": ""});
+        assert_eq!(
+            human(&v, "publish"),
+            [
+                "Live: https://l.example (version 3)",
+                "Note: Data is unchanged."
+            ]
+        );
+        let waiting = json!({"state": "awaiting_approval",
+            "cards": [{"provider": "stripe", "service": "payments", "state": "pending"}]});
+        assert_eq!(
+            human(&waiting, "up"),
+            [
+                "Preview: waiting for the owner to approve the cards in Inbox",
+                "Approval card: stripe payments (pending)",
+            ]
+        );
+        for l in human(&v, "publish").iter().chain(&human(&waiting, "up")) {
+            assert!(!l.contains("ready") && !l.contains('_'), "{l}");
+        }
+    }
 }

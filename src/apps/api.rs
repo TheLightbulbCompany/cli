@@ -172,16 +172,18 @@ fn answered(r: crate::Result<(u16, Value)>) -> Result<Value, ApiError> {
     } else {
         &v["error"]
     };
+    // Every failure says what to do: the backend's next, else one by the HTTP status.
+    let next = e["next"]
+        .as_str()
+        .filter(|n| !n.trim().is_empty())
+        .unwrap_or(match status {
+            401 => "run lightbulb login",
+            404 => "check the app with lightbulb app status",
+            500.. => "try again in a minute",
+            _ => "fix that and try again",
+        });
     if let (Some(code), Some(message)) = (e["code"].as_str(), e["message"].as_str()) {
-        return Err(ApiError::new(
-            code,
-            message,
-            e["next"].as_str().unwrap_or(""),
-        ));
+        return Err(ApiError::new(code, message, next));
     }
-    Err(ApiError::new(
-        "refused",
-        &login::said(status, &v),
-        "fix that and try again",
-    ))
+    Err(ApiError::new("refused", &login::said(status, &v), next))
 }

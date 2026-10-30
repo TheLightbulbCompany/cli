@@ -12,7 +12,7 @@ export async function proxy(req: NextRequest) {
   if (req.nextUrl.pathname.startsWith("/api/")) {
     return NextResponse.json({ code: "closed", message: "Open this from Canvas in Lightbulb." }, { status: 401 });
   }
-  return NextResponse.rewrite(new URL("/_lightbulb/closed", req.url));
+  return NextResponse.rewrite(new URL("/_lightbulb/closed", req.url), { status: 401 });
 }
 
 export const config = {

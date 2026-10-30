@@ -2,6 +2,7 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import { ErrorReporter } from "@/app/_lightbulb/error-reporter";
+import { SampleBanner } from "@/app/_lightbulb/sample-banner";
 import "@/app/globals.css";
 
 const geistSans = Geist({
@@ -27,6 +28,7 @@ export default function RootLayout({
     <html lang="en">
       <body className={`${geistSans.variable} ${geistMono.variable} font-sans antialiased`}>
         <ErrorReporter />
+        <SampleBanner />
         {children}
       </body>
     </html>

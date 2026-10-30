@@ -12,7 +12,7 @@ const { POST: openSession } = await import("../app/api/%5Flightbulb/session/rout
 
 let issuer: CryptoKey;
 
-async function pass(claims: Record<string, unknown> = {}, key = issuer, kid = "k1") {
+async function pass(claims: Record<string, unknown> = {}, key = issuer, kid = "k1", typ: string | null = "lightbulb-app-pass") {
   const now = Math.floor(Date.now() / 1000);
   return new SignJWT({
     iat: now,
@@ -25,7 +25,7 @@ async function pass(claims: Record<string, unknown> = {}, key = issuer, kid = "k
     app: "demo-app",
     ...claims,
   })
-    .setProtectedHeader({ alg: "EdDSA", kid })
+    .setProtectedHeader({ alg: "EdDSA", kid, ...(typ ? { typ } : {}) })
     .sign(key);
 }
 
@@ -77,6 +77,11 @@ describe("door", () => {
     expect(await verifyPass(token)).toBeNull();
   });
 
+  it("rejects a pass without the lightbulb-app-pass typ", async () => {
+    expect(await verifyPass(await pass({}, issuer, "k1", null))).toBeNull();
+    expect(await verifyPass(await pass({}, issuer, "k1", "JWT"))).toBeNull();
+  });
+
   it("rejects a pass whose kid is not the issuer key's", async () => {
     expect(await verifyPass(await pass({}, issuer, "k2"))).toBeNull();
   });
@@ -111,11 +116,11 @@ describe("door", () => {
     expect(await readSession(value)).toBeNull();
   });
 
-  it("closed without a cookie", async () => {
+  it("closed without a cookie, with status 401", async () => {
     expect(doorOpen()).toBe(false);
-    expect(await closedTo(new NextRequest("https://demo-app.example.com/reports"))).toBe(
-      "https://demo-app.example.com/_lightbulb/closed",
-    );
+    const res = await proxy(new NextRequest("https://demo-app.example.com/reports"));
+    expect(res.headers.get("x-middleware-rewrite")).toBe("https://demo-app.example.com/_lightbulb/closed");
+    expect(res.status).toBe(401);
   });
 
   it("closed api routes answer 401 json", async () => {
@@ -166,6 +171,22 @@ describe("door", () => {
     expect(ok.status).toBe(204);
     expect(ok.headers.get("set-cookie")).toMatch(/^lb_session=/);
     expect((await post({ ...json, "sec-fetch-site": "same-origin" })).status).toBe(204);
+  });
+
+  it("session route says whether a refused pass is for another app", async () => {
+    const post = async (token: string) =>
+      (
+        await openSession(
+          new Request("https://demo-app.example.com/api/_lightbulb/session", {
+            method: "POST",
+            headers: { "content-type": "application/json", origin: "https://demo-app.example.com" },
+            body: JSON.stringify({ token }),
+          }),
+        )
+      ).json();
+    expect((await post(await pass({ app: "other-app" }))).reason).toBe("wrong_app");
+    expect((await post(await pass({ iat: Math.floor(Date.now() / 1000) - 2000 }))).reason).toBe("expired");
+    expect((await post("not-a-pass")).reason).toBe("expired");
   });
 
   it("public mode needs no cookie", async () => {

@@ -36,8 +36,44 @@ use serde_json::{json, Value};
 use std::path::Path;
 
 /// What `fail` prints when the gate stops `up` or `publish`.
-pub const NEXT: &str =
-    "rewrite add-only (add a column, copy data), or ask the owner and pass --approved <card id>";
+pub const NEXT: &str = "make the change additive (add a new column or table and copy the data) and run again, or ask the owner to approve the card in Inbox, then run again with --approved <card id>";
+
+/// A finding in words for a person: "drop the `contacts` table (data loss)".
+pub fn describe(f: &Finding) -> String {
+    let name = |re: &str| {
+        Regex::new(re)
+            .unwrap()
+            .captures(&f.statement)
+            .map(|c| format!("`{}`", c[1].trim_matches('"')))
+    };
+    let table = name(
+        r#"(?i)\b(?:TABLE|INTO|FROM|TRUNCATE)\s+(?:ONLY\s+)?(?:IF\s+(?:NOT\s+)?EXISTS\s+)?("[^"]+"|[\w.]+)"#,
+    );
+    let column = name(r#"(?i)\bCOLUMN\s+(?:IF\s+EXISTS\s+)?("[^"]+"|\w+)"#);
+    let the_t = table
+        .as_deref()
+        .map_or("a table".to_string(), |t| format!("the {t} table"));
+    let of_t = table
+        .as_deref()
+        .map_or(String::new(), |t| format!(" of the {t} table"));
+    match f.kind {
+        "drop_table" if table.is_some() => format!("drop {the_t} (data loss)"),
+        "drop_table" => {
+            "drop a schema, a database or everything that depends on it (data loss)".into()
+        }
+        "drop_column" => format!(
+            "remove the {} column{of_t} (data loss)",
+            column.as_deref().unwrap_or("a")
+        ),
+        "rename_table" => format!("rename {the_t} (the running app would lose it)"),
+        "rename_column" => format!("rename a column{of_t} (the running app would lose it)"),
+        "alter_type" => format!("change the type of a column{of_t} (can lose data)"),
+        "set_not_null" => format!("make a column{of_t} required (fails if a row has none)"),
+        "truncate" => format!("empty {the_t} (data loss)"),
+        "delete" => format!("delete rows from {the_t} (data loss)"),
+        _ => "run SQL that cannot be checked before it runs".into(),
+    }
+}
 
 /// One statement that can lose data.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -498,5 +534,35 @@ mod tests {
         let (v, list) = applied(d.path()).unwrap();
         assert_eq!(list, ["a.sql", "b.sql"]);
         assert_eq!(v["x"], 1);
+    }
+}
+
+#[cfg(test)]
+mod words {
+    use super::*;
+
+    #[test]
+    fn findings_in_words_name_the_table_and_column() {
+        let say = |sql: &str| classify(sql).iter().map(describe).collect::<Vec<_>>();
+        assert_eq!(
+            say("DROP TABLE \"contacts\";"),
+            ["drop the `contacts` table (data loss)"]
+        );
+        assert_eq!(
+            say("ALTER TABLE \"items\" DROP COLUMN \"price\";"),
+            ["remove the `price` column of the `items` table (data loss)"]
+        );
+        assert_eq!(
+            say("TRUNCATE items;"),
+            ["empty the `items` table (data loss)"]
+        );
+        assert_eq!(
+            say("DELETE FROM items;"),
+            ["delete rows from the `items` table (data loss)"]
+        );
+        assert_eq!(
+            say("CALL wipe();"),
+            ["run SQL that cannot be checked before it runs"]
+        );
     }
 }

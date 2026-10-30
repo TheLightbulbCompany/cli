@@ -169,7 +169,7 @@ pub(crate) fn done_with(
     Ok(DoneState {
         done: true,
         missing: vec![],
-        next: "tell the room it is ready to look at".into(),
+        next: "tell the room the preview is done and send them the link".into(),
     })
 }
 
@@ -244,10 +244,14 @@ pub(crate) fn record(
         println!("{rec}");
     } else {
         println!(
-            "Recorded a {} for {}.",
-            rec["kind"].as_str().unwrap_or(""),
+            "Recorded a {} for commit {}.",
+            match kind {
+                EvidenceKind::Browser => "browser check",
+                EvidenceKind::Review => "review",
+            },
             &head[..head.len().min(8)]
         );
+        println!("Next: run lightbulb app status to see whether the preview is done");
     }
     Ok(0)
 }

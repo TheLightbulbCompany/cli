@@ -302,6 +302,24 @@ fn backend_errors_pass_through_and_unreachable_is_named() {
     let (base, _) = stub(403, json!({"detail": "Not yours."}), 0);
     let err = api::call(&auth(base), "GET", "/x", None).unwrap_err();
     assert_eq!(err.message, "Not yours.");
+    // No next from the backend: one by the HTTP status, never empty.
+    for (status, next) in [
+        (401, "run lightbulb login"),
+        (404, "check the app with lightbulb app status"),
+        (502, "try again in a minute"),
+        (422, "fix that and try again"),
+    ] {
+        let (base, _) = stub(
+            status,
+            json!({"code": "x", "message": "No.", "next": ""}),
+            0,
+        );
+        let err = api::call(&auth(base), "GET", "/x", None).unwrap_err();
+        assert_eq!(err.next, next, "{status}");
+        let (base, _) = stub(status, json!({"detail": "No."}), 0);
+        let err = api::call(&auth(base), "GET", "/x", None).unwrap_err();
+        assert_eq!(err.next, next, "{status}");
+    }
     let err = api::call(&auth("http://127.0.0.1:9".into()), "GET", "/x", None).unwrap_err();
     assert_eq!(err.code, "unreachable");
 }
@@ -463,7 +481,7 @@ fn new_writes_the_starter_and_one_commit() {
     assert_eq!(v["name"], "team-lunch");
     assert_eq!(
         v["next"],
-        "cd team-lunch && pnpm install, then lightbulb app check"
+        "cd team-lunch && pnpm install, then `lightbulb app up` to get a preview"
     );
     let dir = tmp.path().join("team-lunch");
     assert_eq!(
@@ -1014,15 +1032,19 @@ fn up_stops_on_a_destructive_migration_unless_approved() {
     std::fs::write(dir.join("drizzle/0001_drop.sql"), "DROP TABLE \"items\";").unwrap();
     let v = run(&[]);
     assert_eq!(v["code"], "destructive_migration");
-    assert_eq!(v["message"], "DROP TABLE \"items\"");
+    // In words for a person; the SQL is under details.
+    assert_eq!(
+        v["message"],
+        "This change would drop the `items` table (data loss).\nNothing was applied."
+    );
+    assert_eq!(v["details"], json!(["0001_drop.sql: DROP TABLE \"items\""]));
     assert_eq!(
         v["next"],
-        "rewrite add-only (add a column, copy data), or ask the owner and pass --approved <card id>"
+        "make the change additive (add a new column or table and copy the data) and run again, or ask the owner to approve the card in Inbox, then run again with --approved <card id>"
     );
-    assert_ne!(
-        run(&["--approved", "card-1"])["code"],
-        "destructive_migration"
-    );
+    for flag in ["--approved", "--approved-destructive"] {
+        assert_ne!(run(&[flag, "card-1"])["code"], "destructive_migration");
+    }
 }
 
 #[test]
@@ -1509,16 +1531,16 @@ fn a_building_publish_records_no_migrations() {
             .to_string(),
     )
     .unwrap();
-    // Still building when the wait gives up: nothing recorded, and the next step is status.
+    // Still building when the wait gives up: a timeout (exit 2), nothing recorded (R25).
     let (base, seen) = building_stub(json!({"app_id": "a-1", "state": "building"}));
     let (code, v) = c.app(&["publish"], &base, true);
-    assert_eq!((code, &v["state"]), (0, &json!("building")), "{v}");
-    assert!(!c.dir.join(".lightbulb/migrations.json").exists());
-    let next = v["next"].as_str().unwrap();
-    assert!(
-        next.contains("lightbulb app status") && !next.contains("again"),
-        "{next}"
+    assert_eq!(code, 2, "{v}");
+    assert_eq!(
+        v,
+        json!({"code": "timeout", "message": "The new version is still building after 10 minutes.",
+            "next": "run `lightbulb app status`; the publish may still finish"})
     );
+    assert!(!c.dir.join(".lightbulb/migrations.json").exists());
     assert!(
         lines(&seen)
             .iter()
@@ -1543,17 +1565,15 @@ fn a_building_publish_records_no_migrations() {
 }
 
 #[test]
-fn an_up_still_building_says_status_not_up_again() {
+fn an_up_still_building_times_out_with_exit_2_and_says_status() {
     let c = Checked::new();
     let (base, _) = building_stub(json!({"app_id": "a-1", "state": "provisioning"}));
     let (code, v) = c.app(&["up"], &base, true);
+    assert_eq!(code, 2, "{v}");
     assert_eq!(
-        (code, &v["state"], &v["done"]),
-        (0, &json!("provisioning"), &json!(false))
-    );
-    assert_eq!(
-        v["next"],
-        "it is still building; run lightbulb app status to see when it is done"
+        v,
+        json!({"code": "timeout", "message": "The preview is still building after 10 minutes.",
+            "next": "run `lightbulb app status`; the preview may still finish"})
     );
 }
 
@@ -2209,4 +2229,124 @@ fn shipped_known_fixes_give_a_hint_and_short_or_broken_tools_titles_do_not() {
     .unwrap();
     let (_, v) = c.check("broken-tools.txt", 1, &[]);
     assert!(v["problems"][0].get("hint").is_none(), "{v}");
+}
+
+#[test]
+fn publish_without_a_review_gives_the_exact_command_and_the_preview() {
+    let c = Checked::new();
+    std::fs::write(
+        c.dir.join(".lightbulb/app.json"),
+        r#"{"app_id":"a-1","preview_url":"https://p.example"}"#,
+    )
+    .unwrap();
+    let (base, seen) = ship_stub(waiting());
+    let (code, v) = c.app(&["publish"], &base, true);
+    assert_eq!(code, 1);
+    assert_eq!(
+        v,
+        json!({"code": "review_required",
+            "message": "Publish needs a passing review recorded for this commit.",
+            "next": "run the reviewer or ask your workspace agent to review the preview at https://p.example, then record it: lightbulb app evidence --kind review --verdict pass --file <screenshot> --note \"<what was checked>\""})
+    );
+    assert!(lines(&seen).is_empty());
+}
+
+#[test]
+fn a_name_ending_in_preview_is_refused_and_says_why() {
+    let e = Env::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let o = app_new(&e, tmp.path(), &["lunch-preview"]);
+    assert_eq!(o.status.code(), Some(1));
+    let v: Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["code"], "bad_name");
+    assert!(v["message"].as_str().unwrap().contains("-preview"), "{v}");
+    assert!(!tmp.path().join("lunch-preview").exists());
+}
+
+#[test]
+fn a_source_over_9_mib_is_refused_before_upload() {
+    let c = Checked::new();
+    // Incompressible bytes, so the packed size is over the limit too.
+    let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+    let big: Vec<u8> = (0..10 * 1024 * 1024)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x as u8
+        })
+        .collect();
+    std::fs::write(c.dir.join("hero.mov"), big).unwrap();
+    let e = lightbulb::apps::archive(&c.dir).unwrap_err();
+    assert_eq!(e.code, "source_too_large");
+    assert!(
+        e.message.contains("MiB") && e.message.contains("9 MiB"),
+        "{}",
+        e.message
+    );
+    assert!(e.next.contains(".gitignore") && e.next.contains("generated"));
+    let (base, seen) = ship_stub(waiting());
+    let (code, v) = c.app(&["up"], &base, true);
+    assert_eq!((code, &v["code"]), (1, &json!("source_too_large")));
+    assert!(lines(&seen).is_empty());
+}
+
+#[test]
+fn up_sends_requested_by_and_notes_settings_that_canvas_owns() {
+    let c = Checked::new();
+    let backend = |open_to: &'static str| {
+        stub_with(
+            move |line| {
+                let route = line.trim_end_matches(" HTTP/1.1");
+                match route.split_once(BUILD).map_or("", |(_, r)| r) {
+                    "/source" => (200, json!({"app_id": "a-1", "source_id": "s-1"})),
+                    "/up" => (200, waiting()),
+                    "/a-1/status" => (200, json!({"open_to": open_to, "budget_usd": 10})),
+                    _ => (
+                        404,
+                        json!({"code": "no_route", "message": route, "next": ""}),
+                    ),
+                }
+            },
+            0,
+        )
+    };
+    // First up: requested_by is sent; nothing to compare yet.
+    let (base, seen) = backend("room");
+    let (code, v) = c.app(&["up", "--requested-by", "u-7"], &base, true);
+    assert_eq!(code, 0, "{v}");
+    assert!(v.get("note").is_none());
+    assert_eq!(body(&seen.lock().unwrap()[1])["requested_by"], "u-7");
+    // Later: app.yaml says workspace, the backend says room.
+    let (code, v) = c.app(&["up"], &base, true);
+    assert_eq!(code, 0);
+    assert_eq!(
+        v["note"],
+        "Sharing and budget changes go through Canvas; app.yaml changes to them are ignored after the first up."
+    );
+    assert!(body(&seen.lock().unwrap()[3]).get("requested_by").is_none());
+    let (base, _) = backend("workspace");
+    let (_, v) = c.app(&["up"], &base, true);
+    assert!(v.get("note").is_none(), "{v}");
+}
+
+#[test]
+fn new_without_git_fails_with_a_next() {
+    let e = Env::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let empty = tempfile::tempdir().unwrap();
+    let o = e
+        .base_cmd(Command::new(common::EXE))
+        .current_dir(tmp.path())
+        .env("PATH", empty.path())
+        .args(["app", "new", "team-lunch", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(1));
+    let v: Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["code"], "git_failed");
+    assert_eq!(
+        v["next"],
+        "install git, delete team-lunch, then run lightbulb app new again"
+    );
 }

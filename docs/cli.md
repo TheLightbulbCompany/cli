@@ -424,7 +424,7 @@ When you use it: to build a small web app for your workspace, check it, preview 
 
 ```
 lightbulb app new <NAME> [--room <ROOM>] [--kind <KIND>]
-lightbulb app up [--room <ROOM>] [--approved <CARD>]
+lightbulb app up [--room <ROOM>] [--approved <CARD>] [--requested-by <ID>]
 lightbulb app publish [--reason <TEXT>] [--room <ROOM>] [--approved <CARD>]
 lightbulb app rollback [VERSION]
 lightbulb app status [--errors]
@@ -434,12 +434,12 @@ lightbulb app evidence --kind <browser|review> --file <FILE> [--note <TEXT>] [--
 lightbulb app report-broken-tool <TOOL> <WHAT>
 ```
 
-`--help`: Build, check, preview, publish and undo apps. Every subcommand takes `--json` (the default when stdout is not a terminal); a failure prints `{"code","message","next"}` and exits 1.
+`--help`: Build, check, preview, publish and undo apps. Every subcommand takes `--json` (the default when stdout is not a terminal); a failure prints `{"code","message","next"}` and exits 1; `up` or `publish` still building after 10 minutes exits 2 (`timeout`).
 
 | Command | What it does |
 |---|---|
-| `new` | Creates `./<NAME>` from the starter with one git commit; next, `pnpm install` in it. `--kind` is `site` (default), `content-site`, `form`, `internal-tool`, `dashboard`, `portal`, `payments` or `automation`. `--room` is saved in `.lightbulb/app.json`. |
-| `up` | Sends HEAD, waits for the preview build and reports `done` or what is `missing`. `--approved` is the approved card for a destructive migration. A failed build exits 1 with `{"code","message","next"}`. |
+| `new` | Creates `./<NAME>` from the starter with one git commit; next, `pnpm install` in it, then `lightbulb app up` for a preview. A name may not end in `-preview`. `--kind` is `site` (default), `content-site`, `form`, `internal-tool`, `dashboard`, `portal`, `payments` or `automation`. `--room` is saved in `.lightbulb/app.json`. |
+| `up` | Sends HEAD (at most 9 MiB packed), waits for the preview build and reports `done` or what is `missing`. `--approved` (or `--approved-destructive`) is the approved card for a destructive migration; `--requested-by` names who asked. A failed build exits 1 with `{"code","message","next"}`; still building after 10 minutes exits 2. |
 | `publish` | Puts the preview live as a new version. Needs `check --publish` to pass and a passing review for HEAD. |
 | `rollback` | Makes an earlier version live (default: the one before) and adds one commit with its files. Code only; data is unchanged (the `error.code: "code_only"` it returns says so; it is not a failure). Refuses with uncommitted changes. |
 | `status` | State, URLs, versions and the done gate. `--errors` adds the last client and server errors. |

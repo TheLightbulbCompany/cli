@@ -8,6 +8,8 @@ import { cookies } from "next/headers";
 export type Viewer = { sub: string; name: string; email: string; ws: string; room: string; app: string };
 
 export const SESSION_COOKIE = "lb_session";
+/** The `typ` header of a Lightbulb pass. */
+export const PASS_TYP = "lightbulb-app-pass";
 const DAY = 86_400;
 const FIELDS = ["sub", "name", "email", "ws", "room", "app"] as const;
 const CLAIMS = ["iat", "exp", ...FIELDS].sort().join();
@@ -17,7 +19,7 @@ export function doorOpen(): boolean {
   return process.env.LIGHTBULB_OPEN_TO === "public";
 }
 
-/** Checks a Lightbulb pass (EdDSA, the issuer key's kid, at most 15 minutes old, for this app); null when it is not good. */
+/** Checks a Lightbulb pass (EdDSA, typ `lightbulb-app-pass`, the issuer key's kid, at most 15 minutes old, `app` equal to this app's name `LIGHTBULB_APP`); null when it is not good. */
 export async function verifyPass(token: string, now = new Date()): Promise<Viewer | null> {
   try {
     const jwk = JSON.parse(process.env.LIGHTBULB_ISSUER_KEY ?? "");
@@ -27,6 +29,7 @@ export async function verifyPass(token: string, now = new Date()): Promise<Viewe
       maxTokenAge: "900s",
       clockTolerance: 30,
       currentDate: now,
+      typ: PASS_TYP,
     });
     return protectedHeader.kid === jwk.kid ? toViewer(payload) : null;
   } catch {
