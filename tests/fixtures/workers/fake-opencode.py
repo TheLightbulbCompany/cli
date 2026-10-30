@@ -33,6 +33,7 @@ import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from socketserver import TCPServer
 
 argv = sys.argv[1:]
 if any(a.split("=", 1)[0] in ("--auto", "--cors", "--mdns") for a in argv):
@@ -233,7 +234,17 @@ class Handler(BaseHTTPRequestHandler):
         self.route("POST")
 
 
-server = ThreadingHTTPServer(("127.0.0.1", int(argv[4])), Handler)
+
+
+class Server(ThreadingHTTPServer):
+    def server_bind(self):
+        # HTTPServer's own does a reverse DNS lookup (getfqdn), which stalls past the tests'
+        # 15 s wait on a macOS CI runner.
+        TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
+
+server = Server(("127.0.0.1", int(argv[4])), Handler)
 server.daemon_threads = True
 print(f"opencode server listening on http://127.0.0.1:{argv[4]}", flush=True)
 server.serve_forever()
