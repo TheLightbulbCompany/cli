@@ -332,7 +332,9 @@ pub fn new(name: &str, room: Option<&str>, kind: Kind, json: bool) -> Result<i32
             "pick another name or an empty folder",
         ));
     }
-    for (path, bytes) in starter::FILES {
+    let content = matches!(kind, Kind::ContentSite | Kind::Site);
+    let mut files = 0;
+    for (path, bytes) in app_files(content) {
         let to = dir.join(path);
         std::fs::create_dir_all(to.parent().unwrap())?;
         // Binary files pass through untouched.
@@ -340,10 +342,14 @@ pub fn new(name: &str, room: Option<&str>, kind: Kind, json: bool) -> Result<i32
             Ok(t) => std::fs::write(to, t.replace("{{name}}", name))?,
             Err(_) => std::fs::write(to, bytes)?,
         }
+        files += 1;
     }
     // The starter's own app.yaml is the base; only what was asked for changes.
     let mut config = AppConfig::load(&dir)?;
     config.kind = kind;
+    if content {
+        config.services.push("content".into());
+    }
     config.open_to = if room.is_some() {
         OpenTo::Room
     } else {
@@ -400,13 +406,52 @@ pub fn new(name: &str, room: Option<&str>, kind: Kind, json: bool) -> Result<i32
             );
         }
     }
-    let files = starter::FILES.len();
     if json {
         println!("{}", json!({"name": name, "dir": dir, "files": files}));
     } else {
         println!("Started {name} in {} ({files} files).", dir.display());
     }
     Ok(0)
+}
+
+const CONTENT: &str = "addons/content/";
+/// Moved into the `(site)` route group by the content switch: /admin brings its own root layout.
+const SITE_GROUP: [&str; 3] = [
+    "src/app/layout.tsx",
+    "src/app/page.tsx",
+    "src/app/%5Flightbulb/",
+];
+
+/// The starter's files as the app's paths. `addons/` never lands in an app. The content switch
+/// (Payload) moves the site's root layout and pages into `src/app/(site)/`, then lays
+/// `addons/content/` over the result: its files mirror the app's tree, and its `package.json`,
+/// `pnpm-lock.yaml` and `pnpm-workspace.yaml` are whole copies of the base ones plus Payload. It
+/// ships its first migration, so nothing runs here. Turning content on later by editing
+/// `services` in app.yaml is not built yet.
+fn app_files(content: bool) -> Vec<(String, &'static [u8])> {
+    let base = starter::FILES
+        .iter()
+        .filter(|(p, _)| !p.starts_with("addons/"));
+    let base = base.map(|(p, b)| {
+        let moved = content
+            && SITE_GROUP
+                .iter()
+                .any(|g| p == g || (g.ends_with('/') && p.starts_with(g)));
+        let path = if moved {
+            p.replacen("src/app/", "src/app/(site)/", 1)
+        } else {
+            p.to_string()
+        };
+        (path, *b)
+    });
+    let addon = starter::FILES
+        .iter()
+        .filter(|_| content)
+        .filter_map(|(p, b)| Some((p.strip_prefix(CONTENT)?.to_string(), *b)));
+    // Later entries win: the addon replaces base files of the same path.
+    let mut all: std::collections::BTreeMap<String, &'static [u8]> = base.collect();
+    all.extend(addon);
+    all.into_iter().collect()
 }
 
 /// The app's folder (the git root), its `app.yaml`, and how to call the backend. Writes nothing.

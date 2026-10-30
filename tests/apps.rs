@@ -461,21 +461,22 @@ fn new_writes_the_starter_and_one_commit() {
     );
     let v: Value = serde_json::from_slice(&o.stdout).unwrap();
     assert_eq!(v["name"], "team-lunch");
+    let dir = tmp.path().join("team-lunch");
     assert_eq!(
         v["files"].as_u64().unwrap() as usize,
-        lightbulb::apps::starter::FILES.len()
+        git(&dir, &["ls-files"]).lines().count()
     );
-    let dir = tmp.path().join("team-lunch");
     assert_eq!(
         std::fs::canonicalize(v["dir"].as_str().unwrap()).unwrap(),
         std::fs::canonicalize(&dir).unwrap()
     );
-    assert!(dir.join("src/app/%5Flightbulb").is_dir());
+    // A site (the default kind) has the content switch: its pages sit in the (site) group.
+    assert!(dir.join("src/app/(site)/%5Flightbulb").is_dir());
     let cfg = AppConfig::load(&dir).unwrap();
     assert_eq!(cfg.name, "team-lunch");
     assert_eq!(cfg.open_to, OpenTo::Workspace);
     assert_eq!(cfg.origin.kind, "ask");
-    assert_eq!(cfg.services, ["vercel/project", "neon/postgres"]);
+    assert_eq!(cfg.services, ["vercel/project", "neon/postgres", "content"]);
     assert_eq!(cfg.budget_usd, 10);
     let pkg = std::fs::read_to_string(dir.join("package.json")).unwrap();
     assert!(!pkg.contains("{{name}}"));
@@ -485,6 +486,71 @@ fn new_writes_the_starter_and_one_commit() {
         "lightbulb app new team-lunch"
     );
     assert_eq!(git(&dir, &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn new_content_site_overlays_payload() {
+    let e = Env::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let o = app_new(&e, tmp.path(), &["news-room", "--kind", "content-site"]);
+    assert_eq!(o.status.code(), Some(0));
+    let dir = tmp.path().join("news-room");
+    let config = std::fs::read_to_string(dir.join("src/payload.config.ts")).unwrap();
+    assert!(config.contains("headline: \"news-room\""));
+    let cfg = AppConfig::load(&dir).unwrap();
+    assert_eq!(cfg.kind, Kind::ContentSite);
+    assert_eq!(cfg.services, ["vercel/project", "neon/postgres", "content"]);
+    for p in [
+        "src/app/(payload)/admin/importMap.js",
+        "src/app/(site)/layout.tsx",
+        "src/app/(site)/%5Flightbulb/closed/page.tsx",
+        "src/app/_lightbulb/caps.ts",
+        "src/components/lightbulb/edit-overlay.tsx",
+        "scripts/content.mjs",
+    ] {
+        assert!(dir.join(p).is_file(), "{p} missing");
+    }
+    assert!(!dir.join("src/app/layout.tsx").exists());
+    assert!(!dir.join("addons").exists());
+    let pkg = std::fs::read_to_string(dir.join("package.json")).unwrap();
+    assert!(pkg.contains("\"payload\": \"3.92.1\""));
+    assert!(pkg.contains("\"name\": \"news-room\""));
+    assert_eq!(git(&dir, &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn new_form_has_no_content_switch() {
+    let e = Env::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let o = app_new(&e, tmp.path(), &["sign-up", "--kind", "form"]);
+    assert_eq!(o.status.code(), Some(0));
+    let dir = tmp.path().join("sign-up");
+    assert!(!dir.join("addons").exists());
+    assert!(dir.join("src/app/layout.tsx").is_file());
+    assert!(!git(&dir, &["ls-files"]).to_lowercase().contains("payload"));
+    let pkg = std::fs::read_to_string(dir.join("package.json")).unwrap();
+    assert!(!pkg.contains("payload"));
+    let cfg = AppConfig::load(&dir).unwrap();
+    assert_eq!(cfg.services, ["vercel/project", "neon/postgres"]);
+}
+
+#[test]
+fn content_addon_keeps_the_base_package_json_and_workspace() {
+    use lightbulb::apps::starter::FILES;
+    let file = |p: &str| FILES.iter().find(|(f, _)| *f == p).unwrap().1;
+    let json = |p: &str| serde_json::from_slice::<Value>(file(p)).unwrap();
+    let (base, content) = (json("package.json"), json("addons/content/package.json"));
+    for key in ["dependencies", "devDependencies", "scripts"] {
+        for (k, v) in base[key].as_object().unwrap() {
+            assert_eq!(
+                &content[key][k], v,
+                "{key}.{k}: copy it into addons/content/package.json, then pnpm install there"
+            );
+        }
+    }
+    let ws = std::str::from_utf8(file("pnpm-workspace.yaml")).unwrap();
+    let content_ws = std::str::from_utf8(file("addons/content/pnpm-workspace.yaml")).unwrap();
+    assert!(content_ws.starts_with(ws));
 }
 
 #[test]
@@ -1205,7 +1271,11 @@ fn up_prints_cards_and_exits_zero_when_waiting() {
     assert_eq!(up["name"], "team-lunch");
     assert_eq!(up["room_id"], "r-9");
     assert_eq!(up["source_id"], "s-1");
-    assert_eq!(up["services"], json!(["vercel/project", "neon/postgres"]));
+    // A site (the default kind) has the content switch.
+    assert_eq!(
+        up["services"],
+        json!(["vercel/project", "neon/postgres", "content"])
+    );
     assert_eq!(up["open_to"], "workspace");
     assert_eq!(up["budget_usd"], 10);
     assert_eq!(up["origin"]["kind"], "ask");

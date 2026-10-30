@@ -56,7 +56,8 @@ change anything.
 ## Where things go
 
 - Pages: `src/app/<route>/page.tsx`. The home page is `src/app/page.tsx`. **When you make a new
-  component, import it into a page**, or nobody sees it.
+  component, import it into a page**, or nobody sees it. A site with the content switch keeps its
+  pages in `src/app/(site)/` and its content in Payload (`playbooks/content-site.md`).
 - Components: `src/components/`. Kit components stay in `src/components/ui/`.
 - Server logic: route handlers in `src/app/api/<name>/route.ts`, or server actions.
 - Tables: `src/lib/db/schema.ts`, then `pnpm db:generate` to write the migration in `drizzle/`.

@@ -1,8 +1,8 @@
 // Derived from Dyad's Next.js template (https://github.com/dyad-sh/nextjs-template), commit 121d5674, src/app/layout.tsx. Copyright 2025 Dyad Tech, Inc. Apache-2.0. Modified by The Lightbulb Company.
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
-import { ErrorReporter } from "./_lightbulb/error-reporter";
-import "./globals.css";
+import { ErrorReporter } from "@/app/_lightbulb/error-reporter";
+import "@/app/globals.css";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -15,7 +15,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "{{name}}",
+  title: "demo-content",
 };
 
 export default function RootLayout({

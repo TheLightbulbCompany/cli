@@ -1,0 +1,12 @@
+# pnpm reads its settings here; .npmrc carries the same package-age rule for npm.
+minimumReleaseAge: 1440
+# Install scripts stay off: these packages ship prebuilt binaries.
+allowBuilds:
+  esbuild: false
+  sharp: false
+  unrs-resolver: false
+# Patched versions of what Payload pulls in, so `pnpm audit --prod --audit-level high` passes.
+overrides:
+  dompurify: 3.4.17
+  graphql-scalars: 2.0.1
+  happy-dom: 21.0.4

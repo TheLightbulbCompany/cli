@@ -12,6 +12,11 @@ The error-report limits in src/app/_lightbulb/caps.ts derive from Dyad
 (https://github.com/dyad-sh/dyad), commit 0ee4a524, worker/dyad_logs.js, Copyright (c) Dyad
 contributors, Apache License, Version 2.0. Modified by The Lightbulb Company.
 
+In a site with the content switch, src/app/layout.tsx and src/app/page.tsx live in
+src/app/(site)/, and the admin and API files in src/app/(payload)/ derive from Payload's blank
+template (https://github.com/payloadcms/payload), Copyright (c) 2018-2025 Payload CMS, Inc.,
+under the MIT License (the same terms as shadcn/ui's, below, with that copyright line).
+
 The components in src/components/ui/ originate from shadcn/ui (https://github.com/shadcn-ui/ui),
 under the MIT License:
 
