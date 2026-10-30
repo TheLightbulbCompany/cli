@@ -47,9 +47,6 @@ pub struct Remote {
 /// A remote session's `status`: busy (`Status::Live` or `Status::Waiting`) or idle.
 pub const STATUSES: [&str; 2] = ["busy", "idle"];
 
-/// The reasons an ended session may carry.
-pub const ENDED_REASONS: [&str; 4] = ["process-exited", "moved-on", "job-done", "session-end"];
-
 /// A session that ended, as its computer publishes it: no path, no resume command.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Ended {
@@ -76,13 +73,15 @@ impl Ended {
     }
 
     /// Whether member `peer_short` may publish this: its session id under that prefix, `agent`
-    /// the id's provider, a known `reason`, text at most `TEXT_MAX` characters, and `ended_at`
-    /// at most a day ahead of now.
+    /// the id's provider, a `reason` that is a short word of `[a-z-]` (one this build does not
+    /// know reads as given), text at most `TEXT_MAX` characters, and `ended_at` at most a day
+    /// ahead of now. A bad row costs only itself (`presence::put`).
     pub fn valid(&self, peer_short: &str) -> bool {
         let short = |t: &str| t.chars().count() <= TEXT_MAX;
         own(peer_short, &self.session_id)
             && matches!(Sender::of(peer_short, &self.session_id), Sender::Agent(p) if p == self.agent)
-            && ENDED_REASONS.contains(&self.reason.as_str())
+            && (1..=32).contains(&self.reason.len())
+            && self.reason.bytes().all(|b| b.is_ascii_lowercase() || b == b'-')
             && short(&self.folder)
             && [&self.title, &self.repo, &self.branch]
                 .into_iter()
@@ -319,8 +318,8 @@ pub async fn read(recv: &mut (impl AsyncRead + Unpin)) -> Result<Frame> {
 
 /// The one per-frame check on what a member sends. `roster` entries are checked by
 /// `roster::accept` itself. A `presence` is the peer's own: at most `presence::MAX` of each
-/// list and `presence::MAX_ENDED` ended, every session `Remote::valid` or `Ended::valid` for it
-/// and every address under its prefix, a `seq` at most a day ahead of now. An `envelope` is
+/// list and `presence::MAX_ENDED` ended, every session `Remote::valid` for it and every address
+/// under its prefix (ended rows are filtered one by one, `presence::put`), a `seq` at most a day ahead of now. An `envelope` is
 /// checked by `mail::receive`. An `ack` or `receipt` names a state past `queued`, with a known
 /// reason exactly when it is `refused`, and a `limit` only on a `loop` refusal (that it is bound
 /// to this member is `outbox::acked`'s check). A `share_grant` passes `streams::grant_ok`. A
@@ -374,7 +373,6 @@ pub fn from_peer_ok(
                     .all(|n| *n <= presence::MAX)
                 && ended.len() <= presence::MAX_ENDED
                 && sessions.iter().all(|s| s.valid(&peer.short))
-                && ended.iter().all(|e| e.valid(&peer.short))
                 && known.iter().chain(kept).all(|a| own(&peer.short, a));
             check(ok, "presence")
         }
@@ -563,7 +561,11 @@ mod tests {
             f(&mut e);
             !e.valid("abc")
         };
-        assert!(bad(|e| e.reason = "killed".into()));
+        let mut new_word = sample_ended();
+        new_word.reason = "some-new-reason".into();
+        assert!(new_word.valid("abc"));
+        assert!(bad(|e| e.reason = "Killed".into()));
+        assert!(bad(|e| e.reason = "x".repeat(33)));
         assert!(bad(|e| e.reason = String::new()));
         assert!(bad(|e| e.session_id = "xyz/claude:c1".into()));
         assert!(bad(|e| e.session_id = "abc/friday".into()));

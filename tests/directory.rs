@@ -213,6 +213,52 @@ async fn every_record_says_who_its_proof_claims() {
     assert!(of(&b, &kb).get("user_id").is_none());
 }
 
+/// A bad row costs only itself: not its sessions, not the other ended rows, whatever else the
+/// sender sent. A reason this build does not know reads as given.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_bad_ended_row_costs_only_itself() {
+    let (a, b) = (Env::new(), Env::new());
+    let [_, admit] = seed_pair(&a, &b);
+    a.daemon(false, "", &[]);
+    let ib = b.identity();
+    let (_ep, mut p) = played(&ib, &a, &admit).await;
+    until(5, "A sees B online", || a.status()["peers"]["online"] == 1);
+    let sb = ib.short.clone();
+    let row = |c: &str, reason: &str, ended_at: u64| Ended {
+        session_id: format!("{sb}/claude:{c}"),
+        agent: "claude".into(),
+        folder: "web".into(),
+        title: None,
+        repo: None,
+        branch: None,
+        ended_at,
+        reason: reason.into(),
+    };
+    let now = ipc::now();
+    let id = format!("{sb}/codex:live");
+    let mut f = presence(&ib.key, 1, &[&id]);
+    if let Frame::Presence { ended, .. } = &mut f {
+        *ended = vec![
+            row("good", "session-end", now),
+            row("bad-reason", "NOT A WORD", now),
+            row("ahead", "session-end", now + 2 * 86_400),
+            row("new-word", "some-new-reason", now),
+        ];
+    }
+    p.send(&f).await;
+    let of = |c: &str| {
+        let key = format!("{sb}/claude:{c}");
+        directory(&a, None)
+            .into_iter()
+            .find(|r| r["session_id"] == key.as_str())
+    };
+    until(10, "A takes the presence", || sees(&a, &id));
+    assert_eq!(of("good").unwrap()["status"], "ended");
+    assert_eq!(of("new-word").unwrap()["reason"], "some-new-reason");
+    assert!(of("bad-reason").is_none());
+    assert!(of("ahead").is_none());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_teammates_ended_session_is_seen_for_a_week_and_never_its_resume() {
     let (a, b) = (Env::new(), Env::new());

@@ -403,30 +403,34 @@ fn accept(held: &mut HashMap<String, Latest>, member: &str, l: Latest, first: bo
 
 /// Holds and stores `member`'s presence `f` by the `seq` rule (`accept`).
 pub fn put(d: &Daemon, member: &str, f: &Frame, now: u64, first: bool) {
+    let mut f = f.clone();
     let Frame::Presence {
         seq,
         sessions,
         kept,
         ended,
         ..
-    } = f
+    } = &mut f
     else {
         return;
     };
+    let seq = *seq;
+    // One row this build cannot accept costs only itself.
+    ended.retain(|e| e.valid(crate::net::short(member)));
     let l = Latest {
-        seq: *seq,
+        seq,
         seen_at: now,
         sessions: sessions.clone(),
         kept: kept.clone(),
         ended: ended.clone(),
     };
     if accept(&mut d.latest.lock().unwrap(), member, l, first) {
-        let text = serde_json::to_string(f).unwrap_or_default();
+        let text = serde_json::to_string(&f).unwrap_or_default();
         let stored = d
             .store
             .lock()
             .unwrap()
-            .put_presence(member, *seq, &text, now as i64);
+            .put_presence(member, seq, &text, now as i64);
         if let Err(e) = stored {
             eprintln!("presence: storing {}: {e}", crate::net::short(member));
         }
