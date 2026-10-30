@@ -1384,6 +1384,11 @@ fn register(id: u64, body: &Value, daemon: &Daemon) -> Response {
         .any(|f| body["session"].get(f).is_some());
     // A hook sends a title rarely, and a revived row is still the same conversation.
     let old = store.any_session(&key.0).ok().flatten();
+    // Claude's listing has news only when this says something new; a tool call in a busy session
+    // does not, and asking costs (`super::current_at`).
+    let news = old.as_ref().is_none_or(|o| {
+        o.ended_at.is_some() || o.status != status || o.pid != Some(i64::from(r.pid))
+    });
     let title = r.title.or(old.as_ref().and_then(|o| o.title.clone()));
     let (repo, branch) = if reported {
         (clamp(r.repo), clamp(r.branch))
@@ -1413,8 +1418,9 @@ fn register(id: u64, body: &Value, daemon: &Daemon) -> Response {
     // Every hook event registers: mail delivered before it has been seen.
     match put_row(daemon, &store, &row).and_then(|()| mail::mark_read_for(&store, &key, now())) {
         Ok(()) => {
-            // A hook event: Claude's listing has news too.
-            daemon.listing.lock().unwrap().dirty = true;
+            if news {
+                daemon.listing.lock().unwrap().dirty = true;
+            }
             // A `read` owed to a sender goes now (`Net::flush_loop`).
             daemon.peers.outbox.notify_one();
             Response::ok(id, json!({ "key": key }))

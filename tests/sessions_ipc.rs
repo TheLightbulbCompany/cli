@@ -251,7 +251,7 @@ fn the_listing_feeds_sessions_and_when_claude_fails_nothing_alive_ends() {
             .count()
     };
     until(15, "a second failed read", || {
-        register_claude(&e, "mine", "busy", None);
+        poke(&e);
         listed(&e);
         count() >= 2
     });
@@ -342,6 +342,56 @@ fn a_pid_file_clears_a_hook_waiting_only_if_updated_after_it() {
     assert_eq!(by(&listed(&e), "w").unwrap()["status"], "idle");
 }
 
+/// A tool call in a busy session says nothing new to the listing; a status change does.
+#[test]
+fn only_a_changed_status_asks_for_a_fresh_listing() {
+    let (shim, path) = claude_shim("[]");
+    let tries = shim.path().join("tries");
+    set_shim(
+        shim.path(),
+        &format!("echo x >> '{}'\necho '[]'", tries.display()),
+    );
+    let reads = || {
+        std::fs::read_to_string(&tries)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    let e = Env::new();
+    e.daemon(
+        false,
+        "",
+        &[
+            ("PATH", path),
+            ("LIGHTBULB_CONNECT_DEBUG_LISTING", "1".into()),
+        ],
+    );
+    register_claude(&e, "m", "busy", None);
+    until(10, "the first reads settle", || {
+        listed(&e);
+        reads() >= 1
+    });
+    // Whatever that first registration asked for, it has had time to land.
+    let mut end = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while std::time::Instant::now() < end {
+        listed(&e);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let before = reads();
+    end = std::time::Instant::now() + std::time::Duration::from_secs(4);
+    while std::time::Instant::now() < end {
+        register_claude(&e, "m", "busy", None);
+        listed(&e);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert_eq!(reads(), before, "PostToolUse must not poll");
+    register_claude(&e, "m", "idle", None);
+    until(10, "the change is read", || {
+        listed(&e);
+        reads() > before
+    });
+}
+
 /// A test daemon whose `PATH` has a `claude` leaves it alone unless told to ask it.
 #[test]
 fn a_debug_daemon_never_runs_a_claude_it_was_not_told_to() {
@@ -422,9 +472,13 @@ fn age_rows(e: &Env, secs: i64) {
 /// says nothing about.
 fn poke(e: &Env) {
     let pid = std::process::id();
+    // A changed status: that is what asks for a fresh listing.
+    let idle = by(&listed(e), "poke").is_some_and(|s| s["status"] == "idle");
+    let status = if idle { "busy" } else { "idle" };
     let r = e.ask(
         json!({"id": 1, "op": "register", "session": {"provider": "codex", "conversation": "poke",
-        "pid": pid, "birth_micros": os::process(pid).unwrap().birth_micros, "cwd": "/tmp/p"}}),
+        "pid": pid, "birth_micros": os::process(pid).unwrap().birth_micros, "cwd": "/tmp/p",
+        "status": status}}),
     );
     assert_eq!(r["ok"], true, "{r}");
 }
@@ -818,7 +872,7 @@ fn an_idle_computer_reads_the_listing_at_most_once_a_minute() {
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
     assert_eq!(count(), 1);
-    // Once Claude runs here the 10 s stands: this read is already older than that.
+    // Once Claude runs here the 30 s stands.
     let me = std::process::id();
     let sessions = e.home.path().join(".claude/sessions");
     std::fs::create_dir_all(&sessions).unwrap();
@@ -829,7 +883,7 @@ fn an_idle_computer_reads_the_listing_at_most_once_a_minute() {
         .to_string(),
     )
     .unwrap();
-    until(10, "the next read", || {
+    until(25, "the next read", || {
         listed(&e);
         count() == 2
     });

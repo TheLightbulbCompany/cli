@@ -122,7 +122,8 @@ pub struct ListingCache {
     pub rows: Option<Vec<Listed>>,
     /// The unix second the last read began: what `rows` can know about.
     pub read_at: i64,
-    /// A hook event since the last read began: read again sooner.
+    /// A hook event that changes what the listing says since the last read began: read again
+    /// sooner.
     pub dirty: bool,
     /// A read is running (at most one, on its own thread).
     pub refreshing: bool,
@@ -132,12 +133,16 @@ pub struct ListingCache {
     pub recorded: Option<Instant>,
 }
 
+/// How often Claude's listing is read while a pid file says Claude is running and no hook has news.
+const IDLE_READ: u64 = 30;
+
 /// Claude's listing as last read, at once: never runs `claude` here, and never holds the lock
-/// across it. Starts a read when the last is older than 10 s, or 2 s after a hook event
-/// (`dirty`), or 60 s while no pid file says Claude is running (an idle computer does not keep
-/// running `claude`); until the first ends, `None` (the pid files). A failed read counts as a
-/// read: a hung `claude` is asked once per 10 s, or 60 s with no pid file, so what this returns
-/// may be up to 60 s old. `None` when the Claude home is not `HOME` (an embedded
+/// across it. Starts a read when the last is older than 30 s, or 2 s after a hook event that
+/// changes what the listing says (`dirty`), or 60 s while no pid file says Claude is running (each
+/// read costs about 0.2 s of CPU and a 155 MB spike); until the first ends, `None` (the pid
+/// files). A failed read counts as a read: a hung `claude` is asked once per 30 s, or 60 s with
+/// no pid file, so what this returns may be up to 60 s old. Ends of live rows do not wait for
+/// it: they come from pid liveness on the 5 s tick. `None` when the Claude home is not `HOME` (an embedded
 /// instance's, a test's): `claude` lists `HOME`'s sessions, not those.
 pub(crate) fn current(daemon: &Daemon) -> Option<Vec<Listed>> {
     current_at(daemon).map(|(rows, _)| rows)
@@ -156,9 +161,9 @@ pub(crate) fn current_at(daemon: &Daemon) -> Option<(Vec<Listed>, i64)> {
     // Reads each pid file and checks its process: only when it can matter, and off the lock
     // every session read takes.
     let at = daemon.listing.lock().unwrap().at;
-    let running = older(at, 10) && sessions::any_pid_file(&daemon.claude_home);
+    let running = older(at, IDLE_READ) && sessions::any_pid_file(&daemon.claude_home);
     let mut c = daemon.listing.lock().unwrap();
-    let due = (c.dirty && older(c.at, 2)) || older(c.at, 60) || (older(c.at, 10) && running);
+    let due = (c.dirty && older(c.at, 2)) || older(c.at, 60) || (older(c.at, IDLE_READ) && running);
     if !c.refreshing && due {
         let (cache, home) = (daemon.listing.clone(), daemon.claude_home.clone());
         let started = std::thread::Builder::new()
