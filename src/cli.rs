@@ -1778,8 +1778,38 @@ fn launchctl(args: &[&str]) -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
+/// (tests, debug builds) Let launchctl run from a temporary HOME (the macOS shim test).
+#[cfg(debug_assertions)]
+const LAUNCHCTL_ANYWHERE: &str = "LIGHTBULB_CONNECT_DEBUG_LAUNCHCTL_ANYWHERE";
+
+/// Whether HOME is the account's own home directory (the passwd entry) and no
+/// `LIGHTBULB_CONNECT_HOME` moves the state: anywhere else is a test or a sandbox, and the
+/// launchd label is fixed, so touching launchd there would replace the real background service.
+pub(crate) fn real_home() -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    if std::env::var_os(paths::HOME_ENV).is_some() {
+        return false;
+    }
+    let pw = unsafe { libc::getpwuid(libc::getuid()) };
+    if pw.is_null() || unsafe { (*pw).pw_dir.is_null() } {
+        return false;
+    }
+    let passwd = PathBuf::from(std::ffi::OsStr::from_bytes(
+        unsafe { std::ffi::CStr::from_ptr((*pw).pw_dir) }.to_bytes(),
+    ));
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return false;
+    };
+    let canon = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    canon(&home) == canon(&passwd)
+}
+
 pub(crate) fn use_launchctl() -> bool {
-    test_env(NO_LAUNCHCTL).is_none()
+    #[cfg(debug_assertions)]
+    let anywhere = test_env(LAUNCHCTL_ANYWHERE).is_some();
+    #[cfg(not(debug_assertions))]
+    let anywhere = false;
+    test_env(NO_LAUNCHCTL).is_none() && (real_home() || anywhere)
 }
 
 /// Asks launchd to start the installed job if it is not running; whether launchctl agreed.

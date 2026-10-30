@@ -1078,21 +1078,16 @@ fn install_ignores_a_stale_pid_of_a_live_process() {
     assert!(alive, "the unrelated process was left alone");
 }
 
-/// `daemon --install` over a loaded job boots it out BEFORE it stops the daemon: with the job
-/// loaded, KeepAlive would restart the stopped daemon, which would retake the lock. A
-/// `launchctl` shim on PATH records each call and whether the daemon's socket still answered
-/// then; the first call must be the bootout, made while the old daemon still runs.
+/// A `launchctl` on PATH that appends "<verb> live|gone" to the returned log, by whether `sock`
+/// is a socket then. Keep the returned dir alive while it is in use.
 #[cfg(target_os = "macos")]
-#[test]
-fn install_boots_the_job_out_before_it_stops_the_daemon() {
+fn launchctl_shim(sock: &std::path::Path) -> (tempfile::TempDir, std::path::PathBuf) {
     use std::os::unix::fs::PermissionsExt;
-    let e = Env::new();
-    assert!(e.run(&["who"]).status.success());
     let shim = tempfile::tempdir().unwrap();
     let log = shim.path().join("calls");
-    let sock = e.state.path().join("sock");
+    let bin = shim.path().join("launchctl");
     std::fs::write(
-        shim.path().join("launchctl"),
+        &bin,
         format!(
             "#!/bin/sh\nif [ -S '{}' ]; then up=live; else up=gone; fi\necho \"$1 $up\" >> '{}'\n",
             sock.display(),
@@ -1100,15 +1095,45 @@ fn install_boots_the_job_out_before_it_stops_the_daemon() {
         ),
     )
     .unwrap();
-    std::fs::set_permissions(
-        shim.path().join("launchctl"),
-        std::fs::Permissions::from_mode(0o755),
-    )
-    .unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (shim, log)
+}
+
+/// A setup run from a temporary HOME never calls launchctl: the job label is fixed, so a call
+/// would replace the real user's background service with one pointing at the temp folder.
+#[cfg(target_os = "macos")]
+#[test]
+fn setup_in_a_temporary_home_never_calls_launchctl() {
+    let e = Env::new();
+    assert!(e.run(&["who"]).status.success());
+    let (shim, log) = launchctl_shim(&e.state.path().join("sock"));
     let path = format!("{}:/usr/bin:/bin", shim.path().display());
     let o = e
         .cmd(&["daemon", "--install"])
         .env_remove("LIGHTBULB_CONNECT_NO_LAUNCHCTL")
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(!log.exists(), "launchctl was called from a temp HOME");
+    assert!(out(&o).contains("launchctl skipped"), "{}", out(&o));
+}
+
+/// `daemon --install` over a loaded job boots it out BEFORE it stops the daemon: with the job
+/// loaded, KeepAlive would restart the stopped daemon, which would retake the lock. A
+/// `launchctl` shim on PATH records each call and whether the daemon's socket still answered
+/// then; the first call must be the bootout, made while the old daemon still runs.
+#[cfg(target_os = "macos")]
+#[test]
+fn install_boots_the_job_out_before_it_stops_the_daemon() {
+    let e = Env::new();
+    assert!(e.run(&["who"]).status.success());
+    let (shim, log) = launchctl_shim(&e.state.path().join("sock"));
+    let path = format!("{}:/usr/bin:/bin", shim.path().display());
+    let o = e
+        .cmd(&["daemon", "--install"])
+        .env_remove("LIGHTBULB_CONNECT_NO_LAUNCHCTL")
+        .env("LIGHTBULB_CONNECT_DEBUG_LAUNCHCTL_ANYWHERE", "1")
         .env("PATH", path)
         .output()
         .unwrap();
