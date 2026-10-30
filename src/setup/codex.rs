@@ -7,7 +7,7 @@
 use super::{
     edit_json, edit_toml, set_hook_group, set_toml_server, toml_table, AgentReport, Ctx, Owner,
 };
-use crate::hook::{Event, EVENTS};
+use crate::hook::{Event, CODEX_EVENTS};
 use crate::Result;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -19,8 +19,12 @@ pub(super) fn configure(ctx: &Ctx, r: &mut AgentReport) -> Result<Owner> {
     let mut trust: Vec<(String, Option<String>)> = vec![];
     let mut shared = vec![];
     edit_json(&hooks, !ctx.remove, r, |doc| {
-        for e in EVENTS {
-            let timeout = if e == Event::SessionEnd { 1 } else { 5 };
+        for e in CODEX_EVENTS {
+            let timeout = match e {
+                Event::SessionEnd => 1,
+                Event::PermissionRequest => 2,
+                _ => 5,
+            };
             let command = ctx.hook_command("codex", e.arg());
             let label = e.arg().replace('-', "_");
             let group = (!ctx.remove).then(|| {

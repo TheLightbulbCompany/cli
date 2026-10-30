@@ -164,6 +164,53 @@ fn frame_of(text: &str) -> String {
     format!("[Lightbulb teammate contribution from Your Codex {{\"requestId\":\"{text}\"}}]\nReply with send_message(reply_to=\"{text}\") to answer this message.\n\nbody {text}")
 }
 
+const CLAUDE_CONV: &str = "00000000-0000-4000-8000-0000000000c1";
+
+fn row(net: &Net, provider: &str, conv: &str) -> Value {
+    net.session(&net.key(provider, conv)).unwrap()
+}
+
+#[test]
+fn a_permission_request_marks_the_session_waiting_and_prints_nothing() {
+    let net = Net::new();
+    net.hook("claude", "session-start", "claude-session-start");
+    let out = net.hook("claude", "permission-request", "claude-permission-request");
+    assert_eq!(out.trim(), "");
+    let s = row(&net, "claude", CLAUDE_CONV);
+    assert_eq!(s["status"], "waiting");
+    assert_eq!(s["waiting_for"], "permission prompt");
+    net.hook("claude", "post-tool-use", "claude-post-tool-use");
+    assert_eq!(row(&net, "claude", CLAUDE_CONV)["status"], "live");
+}
+
+#[test]
+fn notifications_set_waiting_or_idle_by_type() {
+    let net = Net::new();
+    net.hook("claude", "session-start", "claude-session-start");
+    let n = |fixture| net.hook("claude", "notification", fixture);
+    assert_eq!(n("claude-notification-permission").trim(), "");
+    let s = row(&net, "claude", CLAUDE_CONV);
+    assert_eq!(s["status"], "waiting");
+    assert_eq!(s["waiting_for"], "permission prompt");
+    n("claude-notification-idle");
+    assert_eq!(row(&net, "claude", CLAUDE_CONV)["status"], "idle");
+    // Back to waiting, then a type that says nothing about waiting leaves the row alone.
+    n("claude-notification-permission");
+    assert_eq!(n("claude-notification-auth").trim(), "");
+    assert_eq!(row(&net, "claude", CLAUDE_CONV)["status"], "waiting");
+}
+
+#[test]
+fn a_codex_permission_request_marks_the_thread_waiting() {
+    let net = Net::new();
+    net.hook("codex", "session-start", "codex-session-start");
+    let out = net.hook("codex", "permission-request", "codex-permission-request");
+    assert_eq!(out.trim(), "");
+    let s = row(&net, "codex", "0199aaaa-0000-7000-8000-0000000000d1");
+    assert_eq!(s["status"], "waiting");
+    assert_eq!(s["waiting_for"], "permission prompt");
+}
+
 #[test]
 fn stop_hook_hands_waiting_mail_to_grok_as_block_decision() {
     let net = Net::new();

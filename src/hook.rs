@@ -31,14 +31,28 @@ pub enum Event {
     PostToolUse,
     Stop,
     SessionEnd,
+    PermissionRequest,
+    Notification,
 }
 
-pub const EVENTS: [Event; 5] = [
+pub const EVENTS: [Event; 7] = [
     Event::SessionStart,
     Event::UserPromptSubmit,
     Event::PostToolUse,
     Event::Stop,
     Event::SessionEnd,
+    Event::PermissionRequest,
+    Event::Notification,
+];
+
+/// Codex documents `PermissionRequest` but no `Notification`.
+pub const CODEX_EVENTS: [Event; 6] = [
+    Event::SessionStart,
+    Event::UserPromptSubmit,
+    Event::PostToolUse,
+    Event::Stop,
+    Event::SessionEnd,
+    Event::PermissionRequest,
 ];
 
 impl Event {
@@ -50,6 +64,8 @@ impl Event {
             Event::PostToolUse => "PostToolUse",
             Event::Stop => "Stop",
             Event::SessionEnd => "SessionEnd",
+            Event::PermissionRequest => "PermissionRequest",
+            Event::Notification => "Notification",
         }
     }
 
@@ -61,7 +77,14 @@ impl Event {
             Event::PostToolUse => "post-tool-use",
             Event::Stop => "stop",
             Event::SessionEnd => "session-end",
+            Event::PermissionRequest => "permission-request",
+            Event::Notification => "notification",
         }
+    }
+
+    /// The two events that only report a session waiting for its person (Claude and Codex).
+    pub fn waits(self) -> bool {
+        matches!(self, Event::PermissionRequest | Event::Notification)
     }
 }
 
@@ -101,9 +124,10 @@ pub fn normalize(provider: &str, event_arg: &str, payload: &Value) -> Option<Hoo
                 transcript_path: payload["transcript_path"].as_str().map(String::from),
             })
         }
-        "cursor" => cursor_grok::normalize_cursor(from_arg?, payload),
-        "grok" => cursor_grok::normalize_grok(from_arg?, payload),
-        "opencode" => cursor_grok::normalize_opencode(from_arg?, payload),
+        // Cursor, Grok and OpenCode have no waiting events.
+        "cursor" => cursor_grok::normalize_cursor(from_arg.filter(|e| !e.waits())?, payload),
+        "grok" => cursor_grok::normalize_grok(from_arg.filter(|e| !e.waits())?, payload),
+        "opencode" => cursor_grok::normalize_opencode(from_arg.filter(|e| !e.waits())?, payload),
         _ => None,
     }
 }
@@ -115,7 +139,7 @@ pub const NUDGE: &str = "Before you stop: if this session settled a fact, made a
 /// Whether this event hands mail to the model.
 pub fn takes_mail(h: &Hook) -> bool {
     match (h.provider, h.event) {
-        (_, Event::SessionEnd) => false,
+        (_, Event::SessionEnd | Event::PermissionRequest | Event::Notification) => false,
         ("cursor" | "grok" | "opencode", e) => matches!(e, Event::PostToolUse | Event::Stop),
         _ => true,
     }
@@ -176,9 +200,20 @@ pub fn run(agent: &str, event: &str, stdin: &str) -> Result<Option<String>> {
     };
     daemon::ensure_running()?;
     let mut conn = Conn::open()?;
-    let status = match h.event {
-        Event::UserPromptSubmit | Event::PostToolUse => "busy",
-        _ => "idle",
+    // A permission or input prompt reads `waiting` the moment the agent asks; other
+    // notification types say nothing about waiting and register nothing.
+    let (status, waiting_for) = match h.event {
+        Event::PermissionRequest => ("waiting", Some("permission prompt")),
+        Event::Notification => match payload["notification_type"].as_str() {
+            Some("permission_prompt") => ("waiting", Some("permission prompt")),
+            Some("elicitation_dialog" | "elicitation_url_dialog" | "agent_needs_input") => {
+                ("waiting", Some("input needed"))
+            }
+            Some("idle_prompt") => ("idle", None),
+            _ => return Ok(None),
+        },
+        Event::UserPromptSubmit | Event::PostToolUse => ("busy", None),
+        _ => ("idle", None),
     };
     // Read here, in the agent's process, which has the folder access the person gave it: the
     // folder resolved (what `folders_off` is matched against) and, at a session's start and
@@ -187,6 +222,9 @@ pub fn run(agent: &str, event: &str, stdin: &str) -> Result<Option<String>> {
     let mut session = json!({ "provider": h.provider, "conversation": h.conversation,
         "pid": me.pid, "birth_micros": me.birth_micros, "cwd": cwd, "status": status,
         "executable": me.executable });
+    if let Some(w) = waiting_for {
+        session["waiting_for"] = w.into();
+    }
     if matches!(h.event, Event::SessionStart | Event::UserPromptSubmit) {
         let (repo, branch) = crate::mcp::git(&h.cwd);
         (session["repo"], session["branch"]) = (repo.into(), branch.into());
@@ -198,6 +236,9 @@ pub fn run(agent: &str, event: &str, stdin: &str) -> Result<Option<String>> {
     let key = r["key"].clone();
     if !key.is_string() {
         return Err(format!("register: {r}").into());
+    }
+    if h.event.waits() {
+        return Ok(None);
     }
     // Our OpenCode plugin sends `mail: false` when it could not hand mail over (it has not
     // seen the session's agent and model yet): the mail waits for `check_inbox`.
@@ -431,6 +472,8 @@ fn try_capture(conn: &mut Conn, h: &Hook, payload: &Value, session: &Value) -> R
                 let _ = conn.call("capture.turn", with(&who, body));
             }
         }
+        // `run` returns before capture for these.
+        Event::PermissionRequest | Event::Notification => {}
     }
     Ok(false)
 }
@@ -590,7 +633,10 @@ mod tests {
 
     #[test]
     fn capture_on_a_dead_connection_errs_and_the_wrapper_swallows_it() {
-        for e in EVENTS.into_iter().filter(|e| *e != Event::UserPromptSubmit) {
+        for e in EVENTS
+            .into_iter()
+            .filter(|e| *e != Event::UserPromptSubmit && !e.waits())
+        {
             let (a, b) = UnixStream::pair().unwrap();
             drop(b);
             let mut conn = Conn {
@@ -708,7 +754,7 @@ mod tests {
     #[test]
     fn which_events_take_mail() {
         for e in EVENTS {
-            let both = e != Event::SessionEnd;
+            let both = e != Event::SessionEnd && !e.waits();
             let tool_or_stop = matches!(e, Event::PostToolUse | Event::Stop);
             assert_eq!(takes_mail(&hook("claude", e)), both);
             assert_eq!(takes_mail(&hook("codex", e)), both);

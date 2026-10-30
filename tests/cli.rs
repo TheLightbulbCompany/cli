@@ -630,6 +630,7 @@ fn setup_installs_the_canonical_binary_and_wires_everything_to_it() {
     let e = Env::new();
     let h = e.home.path();
     std::fs::create_dir(h.join(".claude")).unwrap();
+    std::fs::create_dir(h.join(".codex")).unwrap();
     let canon = h.join(".lightbulb/connect/bin/lightbulb");
 
     // A missing --executable is refused before anything is written.
@@ -654,6 +655,19 @@ fn setup_installs_the_canonical_binary_and_wires_everything_to_it() {
         "{hooks}"
     );
     assert!(!hooks.contains("target/"), "{hooks}");
+    let settings: Value = serde_json::from_str(&hooks).unwrap();
+    for event in ["PermissionRequest", "Notification"] {
+        let cmd = settings["hooks"][event][0]["hooks"][0]["command"].as_str();
+        assert!(
+            cmd.is_some_and(|c| c.contains(&format!("'{canon_s}' hook claude "))),
+            "{event}: {hooks}"
+        );
+    }
+    let codex_hooks: Value =
+        serde_json::from_str(&std::fs::read_to_string(h.join(".codex/hooks.json")).unwrap())
+            .unwrap();
+    assert!(codex_hooks["hooks"]["PermissionRequest"].is_array());
+    assert!(codex_hooks["hooks"].get("Notification").is_none());
     if cfg!(target_os = "macos") {
         let plist = std::fs::read_to_string(
             h.join("Library/LaunchAgents/company.thelightbulb.connect.plist"),

@@ -17,6 +17,7 @@ fn cursor_event(e: Event) -> &'static str {
         Event::PostToolUse => "postToolUse",
         Event::Stop => "stop",
         Event::SessionEnd => "sessionEnd",
+        Event::PermissionRequest | Event::Notification => unreachable!("not installed for Cursor"),
     }
 }
 
@@ -27,7 +28,7 @@ pub(super) fn configure(ctx: &Ctx, r: &mut AgentReport) -> Result<Owner> {
         if !ctx.remove && doc.get("version").is_none() {
             doc["version"] = json!(1);
         }
-        for e in EVENTS {
+        for e in EVENTS.into_iter().filter(|e| !e.waits()) {
             let mut entry = json!({"command": ctx.hook_command("cursor", e.arg()), "timeout": 10});
             if e == Event::PostToolUse {
                 entry["matcher"] = json!("*");
