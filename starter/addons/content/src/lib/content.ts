@@ -87,7 +87,9 @@ export const draftsOrPublishers: Access = ({ req, data }) =>
  */
 export const draftsOnlyForEditors: CollectionBeforeChangeHook = ({ req, data }) => {
   if (!req.user || isPublisher(req.user)) return data;
-  if (String(req.query?.draft) === "true" && data._status === "draft") return data;
+  const q = req.query ?? {};
+  const publishing = ["publishAllLocales", "unpublishAllLocales", "publishSpecificLocale"].some((k) => k in q);
+  if (!publishing && String(q.draft) === "true" && data._status === "draft") return data;
   throw new Forbidden(req.t);
 };
 

@@ -1,4 +1,5 @@
 import { NextRequest } from "next/server";
+import type { Where } from "payload";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 
 // Tests run outside Next's react-server condition, so stand in for it here.
@@ -89,11 +90,15 @@ describe("content", () => {
     expect(await call("PATCH", editor, "", { _status: "draft" })).toBe(403);
     expect(await live()).toBe("About");
     expect((await payload.findByID({ collection: "pages", id: pageId }))._status).toBe("published");
-    // Nor restoring an old version live.
-    const old = (await payload.findVersions({ collection: "pages", where: { parent: { equals: pageId } }, sort: "createdAt", limit: 1 })).docs[0];
+    // Nor restoring their own draft version live.
+    const where: Where = { and: [{ parent: { equals: pageId } }, { "version.title": { equals: "About us" } }] };
+    const old = (await payload.findVersions({ collection: "pages", where, sort: "-createdAt", limit: 1 })).docs[0];
     const restore = new Request(`https://demo-app.example.com/api/pages/versions/${old.id}`, { method: "POST", headers: { cookie: editor } });
     const restored = await REST_POST(config)(restore, { params: Promise.resolve({ slug: ["pages", "versions", String(old.id)] }) });
     expect(restored.status).toBe(403);
+    expect(await live()).toBe("About");
+    // Nor publishing through Payload's locale flags.
+    expect(await call("PATCH", editor, "?draft=true&publishAllLocales=true", { title: "About us" })).toBe(403);
 
     expect(await call("PATCH", publisher, "", { title: "About us", _status: "published" })).toBe(200);
     expect(await live()).toBe("About us");

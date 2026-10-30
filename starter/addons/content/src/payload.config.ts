@@ -145,7 +145,8 @@ export default buildConfig({
     formBuilderPlugin({
       fields: { payment: false },
       formOverrides: { access: { read: () => true, create: publishers, update: publishers, delete: publishers } },
-      formSubmissionOverrides: { access: { update: publishers, delete: publishers } },
+      // Submissions stay as sent (Payload's default update: never); publishers may delete them.
+      formSubmissionOverrides: { access: { delete: publishers } },
     }),
     searchPlugin({
       collections: ["pages", "posts"],

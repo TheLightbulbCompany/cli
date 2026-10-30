@@ -315,28 +315,47 @@ fn list(dir: &Path, keep: impl Fn(&str) -> bool) -> Result<Vec<String>, ApiError
 }
 
 /// The SQL a Payload migration runs going up: every `` sql`...` `` body in `up`, not in `down`.
-fn payload_up_sql(ts: &str) -> String {
-    let up = ts.find("function up").map_or("", |i| &ts[i..]);
-    let up = up.find("function down").map_or(up, |i| &up[..i]);
-    let mut out = String::new();
-    for (i, _) in up.match_indices("sql`") {
-        let body = &up[i + 4..];
-        let mut end = body.len();
+/// `None` (fail closed) when `up` is anything else: missing, an arrow function, or code besides
+/// `await db.execute(sql`...`)` (query builders, `sql.raw`, `payload.*`, `${...}` in the SQL).
+fn payload_up_sql(ts: &str) -> Option<String> {
+    let up = &ts[ts.find("export async function up")?..];
+    let up = up
+        .find("export async function down")
+        .map_or(up, |i| &up[..i]);
+    // The body starts at the first `{` after the parameters.
+    let up = &up[up.find(')')?..];
+    let up = &up[up.find('{')? + 1..];
+    let (mut sql, mut rest, mut at) = (String::new(), String::new(), 0);
+    while let Some(i) = up[at..].find("sql`") {
+        let start = at + i + 4;
+        let mut end = None;
         let mut escaped = false;
-        for (j, c) in body.char_indices() {
+        for (j, c) in up[start..].char_indices() {
             match c {
                 '\\' if !escaped => escaped = true,
                 '`' if !escaped => {
-                    end = j;
+                    end = Some(start + j);
                     break;
                 }
                 _ => escaped = false,
             }
         }
-        out.push_str(&body[..end]);
-        out.push_str(";\n");
+        let end = end?;
+        let body = &up[start..end];
+        if body.contains("${") {
+            return None;
+        }
+        rest.push_str(&up[at..at + i]);
+        sql.push_str(body);
+        sql.push_str(";\n");
+        at = end + 1;
     }
-    out
+    rest.push_str(&up[at..]);
+    // What is left must be only the `await db.execute(...)` wrappers.
+    let rest = rest.replace("await db.execute(", "");
+    rest.chars()
+        .all(|c| c.is_whitespace() || "(){};".contains(c))
+        .then_some(sql)
 }
 
 /// Looks at every `drizzle/*.sql` (not `seed.sql`) and Payload `src/migrations/*.ts` (not
@@ -358,8 +377,17 @@ pub fn gate(root: &Path) -> Result<GateResult, ApiError> {
     for name in list(&payload, |n| n.ends_with(".ts") && n != "index.ts")? {
         let f = format!("src/migrations/{name}");
         if !done.contains(&f) {
-            let sql = payload_up_sql(&read(&payload.join(&name), &f)?);
-            findings.extend(classify(&sql).into_iter().map(|x| (f.clone(), x)));
+            let ts = read(&payload.join(&name), &f)?;
+            match payload_up_sql(&ts) {
+                Some(sql) => findings.extend(classify(&sql).into_iter().map(|x| (f.clone(), x))),
+                None => findings.push((
+                    f.clone(),
+                    Finding {
+                        statement: ts,
+                        kind: "dynamic_sql",
+                    },
+                )),
+            }
             files.push(f);
         }
     }
@@ -417,6 +445,44 @@ mod tests {
         assert_eq!(g.findings[0].1.kind, "drop_column");
         record(d.path(), &g.unrecorded).unwrap();
         assert!(gate(d.path()).unwrap().findings.is_empty());
+    }
+
+    #[test]
+    fn payload_migrations_that_are_not_plain_sql_fail_closed() {
+        let kinds = |ts: &str| {
+            let d = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(d.path().join("src/migrations")).unwrap();
+            std::fs::write(d.path().join("src/migrations/1_x.ts"), ts).unwrap();
+            let g = gate(d.path()).unwrap();
+            g.findings.iter().map(|(_, f)| f.kind).collect::<Vec<_>>()
+        };
+        let arrow =
+            "export const up = async ({ db }) => {\n  await db.execute(sql`DROP TABLE t`)\n}\n";
+        assert_eq!(kinds(arrow), ["dynamic_sql"]);
+        let builder = "export async function up({ payload }) {\n  await payload.delete({ collection: 'pages', where: {} })\n}\n";
+        assert_eq!(kinds(builder), ["dynamic_sql"]);
+        let raw = "export async function up({ db }) {\n  await db.execute(sql.raw(q))\n}\n";
+        assert_eq!(kinds(raw), ["dynamic_sql"]);
+        let interpolated =
+            "export async function up({ db }) {\n  await db.execute(sql`DELETE FROM ${t}`)\n}\n";
+        assert_eq!(kinds(interpolated), ["dynamic_sql"]);
+        let plain = "export async function up({ db }: MigrateUpArgs): Promise<void> {\n  await db.execute(sql`\n  CREATE TABLE t (id int);`)\n}\n";
+        assert!(kinds(plain).is_empty());
+    }
+
+    #[test]
+    fn the_shipped_payload_migration_passes_the_gate() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("src/migrations");
+        std::fs::create_dir_all(&dir).unwrap();
+        for (p, b) in crate::apps::starter::FILES {
+            if let Some(name) = p.strip_prefix("addons/content/src/migrations/") {
+                std::fs::write(dir.join(name), b).unwrap();
+            }
+        }
+        let g = gate(d.path()).unwrap();
+        assert_eq!(g.unrecorded.len(), 1, "{:?}", g.unrecorded);
+        assert!(g.findings.is_empty(), "{:?}", g.findings);
     }
 
     #[test]
