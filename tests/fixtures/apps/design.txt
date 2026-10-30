@@ -1,2 +1,3 @@
 src/app/page.tsx:8: raw hex colour; use a token from design/tokens.css
 src/app/globals.css:20: arbitrary Tailwind value; use the scale or a token
+src/app/(auth)/page.tsx:3: raw colour function; use a token from design/tokens.css

@@ -727,7 +727,7 @@ fn same_error_three_times_says_undo() {
         .map(|n| n.as_u64().unwrap())
         .collect();
     counts.sort();
-    assert_eq!(counts, [1, 1, 3, 3]);
+    assert_eq!(counts, [1, 1, 1, 3, 3]);
 }
 
 #[test]
@@ -752,7 +752,29 @@ fn design_lint_raw_hex_is_a_problem() {
         json!({"file": "src/app/page.tsx", "line": 8, "column": null, "code": null,
         "message": "raw hex colour; use a token from design/tokens.css"})
     );
-    assert_eq!(v["problems"].as_array().unwrap().len(), 2);
+    assert_eq!(v["problems"].as_array().unwrap().len(), 3);
+    assert_eq!(v["problems"][2]["file"], "src/app/(auth)/page.tsx");
+}
+
+#[test]
+fn unreadable_progress_is_an_error_not_overwritten() {
+    let c = Checked::new();
+    let path = c.dir.join(".lightbulb/progress.json");
+    std::fs::write(&path, "{not json").unwrap();
+    let (code, v) = c.check("tsc.txt", 1, &[]);
+    assert_eq!((code, &v["code"]), (1, &json!("bad_progress")));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "{not json");
+}
+
+#[test]
+fn an_unparsed_failure_repeats_to_undo() {
+    let c = Checked::new();
+    for _ in 0..2 {
+        c.check("unknown.txt", 1, &[]);
+    }
+    let (_, v) = c.check("unknown.txt", 1, &[]);
+    assert!(v["next"].as_str().unwrap().starts_with("undo"), "{v}");
+    assert_eq!(v["problems"][0]["message"], "audit: 1 high vulnerability");
 }
 
 #[test]

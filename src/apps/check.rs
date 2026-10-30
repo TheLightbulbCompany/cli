@@ -2,10 +2,9 @@
 //! the design lint) into problems, and counts repeats so a builder that keeps failing the same
 //! way is told to diagnose, then to undo (spec §5).
 //!
-//! The TypeScript diagnostic parser is derived from Dyad (https://github.com/dyad-sh/dyad), commit
-//! 0ee4a524, src/ipc/processors/tsc.ts (`parseTypeScriptDiagnosticsDetailed`). Copyright (c) Dyad
-//! contributors. Apache-2.0. Modified by The Lightbulb Company. (Rust port of the line parser;
-//! Windows paths, snippets and the CLI worker are left out.)
+
+// Derived from Dyad (https://github.com/dyad-sh/dyad), commit 0ee4a524, src/ipc/processors/tsc.ts. Copyright (c) Dyad contributors. Apache-2.0. Modified by The Lightbulb Company.
+// (Rust port of the tsc line parser only; Windows paths, snippets and the CLI worker are left out.)
 
 use super::api::ApiError;
 use super::{fail, preflight};
@@ -61,7 +60,7 @@ pub fn parse(output: &str, root: &Path) -> Vec<Problem> {
     let tsc = regex::Regex::new(r"^(.*)\((\d+),(\d+)\): error TS(\d+):\s*(.*)$").unwrap();
     let tsc_global = regex::Regex::new(r"^error TS(\d+):\s*(.*)$").unwrap();
     let eslint = regex::Regex::new(r"^\s+(\d+):(\d+)\s+error\s+(.*?)(?:\s{2,}(\S+))?\s*$").unwrap();
-    let design = regex::Regex::new(r"^([^\s:()]+):(\d+): (.+)$").unwrap();
+    let design = regex::Regex::new(r"^(.+?):(\d+): (.+)$").unwrap();
     let mut problems: Vec<Problem> = vec![];
     // The last tsc problem (continuation lines extend it) and the last ESLint file header.
     let mut tsc_open = false;
@@ -159,24 +158,21 @@ pub(crate) fn run_check(root: &Path, publish: bool) -> std::result::Result<Check
     );
     let mut problems = if ok { vec![] } else { parse(&text, root) };
     if !ok && problems.is_empty() {
-        // It failed in a way no parser knows (an audit, a build): keep the tail as the problem.
-        let tail: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-        let tail = tail[tail.len().saturating_sub(10)..].join("\n");
+        // It failed in a way no parser knows (an audit, a build): the last line is the problem,
+        // so the same failure signs the same and reaches `undo`.
+        let last = text.lines().rev().find(|l| !l.trim().is_empty());
         problems.push(Problem {
             file: "package.json".into(),
             line: 1,
             column: None,
             code: Some(script.into()),
-            message: tail,
+            message: last
+                .unwrap_or("the check failed with no output")
+                .trim()
+                .into(),
         });
     }
-    let next = update_progress(root, ok, publish, &problems).map_err(|e| {
-        ApiError::new(
-            "progress_failed",
-            &e.to_string(),
-            "check .lightbulb is writable",
-        )
-    })?;
+    let next = update_progress(root, ok, publish, &problems)?;
     Ok(CheckResult { ok, problems, next })
 }
 
@@ -186,13 +182,24 @@ fn update_progress(
     ok: bool,
     publish: bool,
     problems: &[Problem],
-) -> Result<Option<&'static str>> {
+) -> std::result::Result<Option<&'static str>, ApiError> {
     let path = root.join(".lightbulb/progress.json");
-    let mut progress: Value = std::fs::read(&path)
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .filter(Value::is_object)
-        .unwrap_or_else(|| json!({}));
+    let bad = |why: String| {
+        ApiError::new(
+            "bad_progress",
+            &format!("Could not use .lightbulb/progress.json: {why}"),
+            "fix or delete .lightbulb/progress.json, then run the check again",
+        )
+    };
+    // Evidence lives in this file: never overwrite what cannot be read.
+    let mut progress: Value = match std::fs::read(&path) {
+        Ok(b) => serde_json::from_slice(&b)
+            .ok()
+            .filter(Value::is_object)
+            .ok_or_else(|| bad("it is not a JSON object".into()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!({}),
+        Err(e) => return Err(bad(e.to_string())),
+    };
     let mut attempts = progress["attempts"]
         .as_object()
         .cloned()
@@ -213,8 +220,11 @@ fn update_progress(
     }
     progress["attempts"] = Value::Object(attempts);
     progress["last_check"] = json!({"ok": ok, "publish": publish, "problems": problems.len()});
-    std::fs::create_dir_all(root.join(".lightbulb"))?;
-    std::fs::write(&path, progress.to_string())?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::create_dir_all(root.join(".lightbulb"))
+        .and_then(|_| std::fs::write(&tmp, progress.to_string()))
+        .and_then(|_| std::fs::rename(&tmp, &path))
+        .map_err(|e| bad(e.to_string()))?;
     Ok(match worst {
         0 => None,
         1 => Some("fix"),
