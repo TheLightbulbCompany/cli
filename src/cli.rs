@@ -226,6 +226,20 @@ fn field_cell(s: &Value, f: &str) -> Option<String> {
     s[f].as_str().map(cell).filter(|t| !t.is_empty())
 }
 
+/// A path's last part.
+fn last_part(path: &str) -> String {
+    let p = std::path::Path::new(path);
+    p.file_name()
+        .map_or(path.to_string(), |f| f.to_string_lossy().into_owned())
+}
+
+/// An ended row's folder in `Recent`: as published, or (`sessions` gives a path) its last part.
+fn recent_folder(s: &Value) -> String {
+    field_cell(s, "folder")
+        .or(field_cell(s, "cwd").map(|c| last_part(&c)))
+        .unwrap_or_default()
+}
+
 /// `who`'s Status cell. `sessions` says `live` where `directory` says `busy`; only this
 /// computer's rows carry `pid`, and only they wait for the person reading this.
 fn status_cell(s: &Value, now: u64) -> String {
@@ -291,7 +305,16 @@ pub fn who(as_json: bool, all: bool) -> Result<i32> {
     }
     // (header, cell, also without `--all`)
     type Cell = fn(&Value) -> String;
-    let shared: [(&str, Cell, bool); 5] = [
+    let person: Cell = |s| field_cell(s, "person").unwrap_or_default();
+    let computer: Cell = |s| field_cell(s, "computer").unwrap_or_default();
+    let agent: Cell = |s| {
+        crate::frame::agent_name(
+            &field_cell(s, "agent")
+                .or(field_cell(s, "provider"))
+                .unwrap_or_default(),
+        )
+    };
+    let live_columns: [(&str, Cell, bool); 7] = [
         // A handle, else (a teammate's session, or one not registered yet) the address `send`
         // takes.
         (
@@ -304,27 +327,9 @@ pub fn who(as_json: bool, all: bool) -> Result<i32> {
             },
             true,
         ),
-        (
-            "Person",
-            |s| field_cell(s, "person").unwrap_or_default(),
-            false,
-        ),
-        (
-            "Computer",
-            |s| field_cell(s, "computer").unwrap_or_default(),
-            false,
-        ),
-        (
-            "Agent",
-            |s| {
-                crate::frame::agent_name(
-                    &field_cell(s, "agent")
-                        .or(field_cell(s, "provider"))
-                        .unwrap_or_default(),
-                )
-            },
-            true,
-        ),
+        ("Person", person, false),
+        ("Computer", computer, false),
+        ("Agent", agent, true),
         // A teammate's session has no path here: its folder, else its repo.
         (
             "Folder",
@@ -336,8 +341,6 @@ pub fn who(as_json: bool, all: bool) -> Result<i32> {
             },
             true,
         ),
-    ];
-    let live_columns: [(&str, Cell, bool); 2] = [
         (
             "Status",
             |s| status_cell(s, crate::daemon::ipc::now()),
@@ -353,7 +356,16 @@ pub fn who(as_json: bool, all: bool) -> Result<i32> {
             true,
         ),
     ];
-    let recent_columns: [(&str, Cell, bool); 2] = [
+    let recent_columns: [(&str, Cell, bool); 7] = [
+        (
+            "Title",
+            |s| field_cell(s, "title").unwrap_or_else(|| last_part(&recent_folder(s))),
+            true,
+        ),
+        ("Person", person, false),
+        ("Computer", computer, false),
+        ("Agent", agent, true),
+        ("Folder", recent_folder, true),
         (
             "Ended",
             |s| {
@@ -368,8 +380,8 @@ pub fn who(as_json: bool, all: bool) -> Result<i32> {
             true,
         ),
     ];
-    let print = |extra: &[(&str, Cell, bool)], rows: &[&Value]| {
-        let columns: Vec<_> = shared.iter().chain(extra).filter(|c| all || c.2).collect();
+    let print = |columns: &[(&str, Cell, bool)], rows: &[&Value]| {
+        let columns: Vec<_> = columns.iter().filter(|c| all || c.2).collect();
         let mut lines = vec![columns.iter().map(|c| c.0.to_string()).collect::<Vec<_>>()];
         lines.extend(
             rows.iter()

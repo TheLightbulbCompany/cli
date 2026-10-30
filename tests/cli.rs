@@ -99,6 +99,9 @@ fn who_prints_waiting_done_and_a_recent_section_with_resume() {
         json!({"status": "waiting", "waiting_for": "permission prompt"}),
     );
     let t2 = register("codex", "t2", json!({}));
+    let t3 = register("codex", "t3", json!({"title": "fix the thing"}));
+    let r = e.ask(json!({"id": 1, "op": "end", "key": t3, "reason": "session-end"}));
+    assert_eq!(r["ended"], true, "{r}");
     let r = e.ask(json!({"id": 1, "op": "end", "key": t2, "reason": "session-end"}));
     assert_eq!(r["ended"], true, "{r}");
 
@@ -114,13 +117,23 @@ fn who_prints_waiting_done_and_a_recent_section_with_resume() {
     let cols: Vec<&str> = recent.lines().next().unwrap().split_whitespace().collect();
     assert_eq!(
         cols,
-        ["Name", "Agent", "Folder", "Ended", "Resume"],
+        ["Title", "Agent", "Folder", "Ended", "Resume"],
         "{table}"
     );
     assert!(
-        recent.contains("codex-1")
+        recent.lines().any(|l| l.starts_with("proj "))
             && recent.contains("just now")
             && recent.contains("codex resume t2"),
+        "{recent}"
+    );
+
+    // Its title, else its folder's last part; no id, no full path.
+    assert!(
+        recent.lines().any(|l| l.starts_with("fix the thing ")),
+        "{recent}"
+    );
+    assert!(
+        !recent.contains("/tmp/proj") && !recent.contains(&t2),
         "{recent}"
     );
 
@@ -128,11 +141,16 @@ fn who_prints_waiting_done_and_a_recent_section_with_resume() {
     let json: Value = serde_json::from_str(&out(&e.run(&["who", "--json"]))).unwrap();
     assert_eq!(json[0]["key"], c1.as_str(), "{json}");
     assert_eq!(json[0]["status"], "waiting", "{json}");
-    assert_eq!(json[1]["key"], t2.as_str(), "{json}");
-    assert_eq!(json[1]["status"], "ended", "{json}");
-    assert_eq!(json[1]["reason"], "session-end", "{json}");
-    assert_eq!(json[1]["resume"], "codex resume t2", "{json}");
-    assert!(json[1]["ended_at"].is_u64(), "{json}");
+    let t2_row = json
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["key"] == t2.as_str())
+        .unwrap();
+    assert_eq!(t2_row["status"], "ended", "{json}");
+    assert_eq!(t2_row["reason"], "session-end", "{json}");
+    assert_eq!(t2_row["resume"], "codex resume t2", "{json}");
+    assert!(t2_row["ended_at"].is_u64(), "{json}");
 
     // `--all` says the same of this computer's, and only ended rows: Recent alone.
     let all = out(&e.run(&["who", "--all"]));
@@ -152,6 +170,22 @@ fn who_prints_waiting_done_and_a_recent_section_with_resume() {
         "{only}"
     );
     assert!(!only.contains("Status"), "{only}");
+}
+
+#[test]
+fn who_all_invents_nothing_for_an_own_session_that_does_not_say_what_it_waits_for() {
+    let e = Env::new();
+    assert!(e.run(&["who"]).status.success());
+    let p = os::process(std::process::id()).unwrap();
+    let r = e.ask(
+        json!({"id": 1, "op": "register", "session": {"provider": "claude",
+        "conversation": "c1", "pid": p.pid, "birth_micros": p.birth_micros, "cwd": "/tmp/proj",
+        "status": "waiting"}}),
+    );
+    assert_eq!(r["ok"], true, "{r}");
+    let all = out(&e.run(&["who", "--all"]));
+    assert!(all.contains("waiting for you, gets messages"), "{all}");
+    assert!(!all.contains("input needed"), "{all}");
 }
 
 #[test]
@@ -177,14 +211,14 @@ fn who_all_prints_busy_for_a_busy_teammate_and_offline_with_last_seen() {
         "b2",
         json!({"status": "waiting", "waiting_for": "permission prompt"}),
     );
-    let done = register("codex", "b3", json!({}));
+    let done = register("codex", "b3", json!({"title": "finished work"}));
     let r = b.ask(json!({"id": 1, "op": "end", "key": done, "reason": "job-done"}));
     assert_eq!(r["ended"], true, "{r}");
     common::until(15, "A sees B's sessions", || {
         common::sees(&a, &busy) && common::sees(&a, &waits)
     });
     let who = || out(&a.run(&["who", "--all"]));
-    common::until(15, "A sees what ended", || who().contains(done.as_str()));
+    common::until(15, "A sees what ended", || who().contains("finished work"));
     let table = who();
     let row = |t: &str, key: &str| {
         t.lines()
@@ -199,7 +233,21 @@ fn who_all_prints_busy_for_a_busy_teammate_and_offline_with_last_seen() {
     assert!(waiting.contains("waiting: permission prompt"), "{table}");
     assert!(!waiting.contains("waiting for you"), "{table}");
     // A teammate's: never the command that resumes it.
-    assert!(!row(recent, &done).contains("resume"), "{table}");
+    let cols: Vec<&str> = recent.lines().next().unwrap().split_whitespace().collect();
+    assert_eq!(
+        cols,
+        ["Title", "Person", "Computer", "Agent", "Folder", "Ended", "Resume"],
+        "{table}"
+    );
+    let finished = row(recent, "finished work");
+    assert!(
+        finished.contains("bob") && finished.contains("web"),
+        "{table}"
+    );
+    assert!(
+        !finished.contains("resume") && !finished.contains(&done),
+        "{table}"
+    );
 
     assert_eq!(b.ask(json!({"id": 1, "op": "shutdown"}))["ok"], true);
     common::until(15, "A sees B offline", || {

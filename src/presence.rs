@@ -535,7 +535,8 @@ fn as_remote(e: &Ended) -> Remote {
         folder: e.folder.clone(),
         status: "ended".into(),
         doing: None,
-        // Mail to it waits until it is resumed and looks.
+        // Every record has a tier and none fits: nothing reaches it, and mail for it waits a
+        // day for it to be resumed.
         tier: sessions::Tier::Pull.as_str().into(),
         title: e.title.clone(),
         waiting_for: None,
@@ -553,8 +554,8 @@ const LOCAL_FIELDS: [&str; 7] = [
     "job",
 ];
 
-/// `directory {query?}` -> `{sessions}`: this computer's sessions, live then ended, then every
-/// member's latest presence, live then ended; `query` matches session id, person, computer,
+/// `directory {query?}` -> `{sessions}`: this computer's live sessions, every member's from its
+/// latest presence, then those that ended in the same order; `query` matches session id, person, computer,
 /// agent, folder (and this computer's full path), repo, branch, what it is doing or its title,
 /// any case. An ended row of this computer carries `resume`; no one else's can.
 pub fn directory(d: &Daemon, query: Option<&str>) -> Value {
@@ -619,6 +620,12 @@ pub fn directory(d: &Daemon, query: Option<&str>) -> Value {
         let r = remote(s, false);
         if mine(&r, &s.cwd, s.handle.as_ref()) {
             let mut v = record(&me, &r, &s.cwd);
+            // `remote` names a default for the wire: here, only what it said.
+            if s.waiting_for.is_none() {
+                if let Some(o) = v.as_object_mut() {
+                    o.remove("waiting_for");
+                }
+            }
             let local = json!(s);
             for f in LOCAL_FIELDS {
                 if let Some(x) = local.get(f) {
@@ -677,6 +684,9 @@ pub fn directory(d: &Daemon, query: Option<&str>) -> Value {
             }
         }
     }
+    // Stable, so each keeps its order: a page (`find_sessions`' limit) reaches live teammates
+    // before anything that ended.
+    out.sort_by_key(|r| r["status"] == "ended");
     json!({ "sessions": out })
 }
 
@@ -698,6 +708,33 @@ mod tests {
         assert_eq!(says(&format!("user_{}", "x".repeat(200))), None);
         assert_eq!(claimed_user(Some("not a proof")), None);
         assert_eq!(claimed_user(None), None);
+    }
+
+    #[test]
+    fn load_restores_what_ended() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("state.db")).unwrap();
+        let ended = Ended {
+            session_id: "abc/claude:c1".into(),
+            agent: "claude".into(),
+            folder: "web".into(),
+            title: Some("fix".into()),
+            repo: None,
+            branch: None,
+            ended_at: 5,
+            reason: "session-end".into(),
+        };
+        let f = Frame::Presence {
+            member: "m".into(),
+            seq: 7,
+            sessions: vec![],
+            known: vec![],
+            kept: vec![],
+            ended: vec![ended.clone()],
+        };
+        let text = serde_json::to_string(&f).unwrap();
+        store.put_presence("m", 7, &text, 9).unwrap();
+        assert_eq!(load(&store)["m"].ended, [ended]);
     }
 
     #[test]

@@ -177,3 +177,56 @@ async fn a_computer_that_is_not_signed_in_never_dials() {
     let dialed = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await;
     assert!(dialed.is_err(), "no sign-in, no link");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn what_only_this_computer_can_use_does_not_leave_it() {
+    let e = Env::new();
+    let (mut link, _, _l) = linked(&e).await;
+    let p = lightbulb::os::process(std::process::id()).unwrap();
+    let register = |conversation: &str, extra: Value| {
+        let mut session = json!({"provider": "claude", "conversation": conversation,
+            "pid": p.pid, "birth_micros": p.birth_micros, "cwd": "/tmp/p"});
+        session
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let r = e.ask(json!({"id": 1, "op": "register", "session": session}));
+        r["key"].as_str().unwrap().to_string()
+    };
+    let waits = register(
+        "w",
+        json!({"status": "waiting", "waiting_for": "permission prompt"}),
+    );
+    let gone = register("g", json!({}));
+    let r = e.ask(json!({"id": 1, "op": "end", "key": gone, "reason": "session-end"}));
+    assert_eq!(r["ended"], true, "{r}");
+
+    // Here they are all there; over the link, none, and the rows stay.
+    let local = e.ask(json!({"id": 1, "op": "directory"}));
+    let row = |v: &Value, key: &str| {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["session_id"] == key)
+            .cloned()
+            .unwrap_or_else(|| panic!("{key} not in {v}"))
+    };
+    assert!(row(&local["sessions"], &waits)["pid"].is_u64(), "{local}");
+    assert!(
+        row(&local["sessions"], &gone)["resume"].is_string(),
+        "{local}"
+    );
+    let mut seen = vec![];
+    let dir = link.op(json!({"op": "directory"}), &mut seen).await;
+    let sessions = &dir["result"]["sessions"];
+    let (w, g) = (row(sessions, &waits), row(sessions, &gone));
+    assert_eq!(w["status"], "waiting", "{dir}");
+    assert_eq!(w["waiting_for"], "permission prompt", "{dir}");
+    assert_eq!(g["status"], "ended", "{dir}");
+    assert_eq!(g["reason"], "session-end", "{dir}");
+    for s in sessions.as_array().unwrap() {
+        for f in ["resume", "pid", "birth_micros", "entrypoint", "kind", "job"] {
+            assert!(s.get(f).is_none(), "{f}: {s}");
+        }
+    }
+}

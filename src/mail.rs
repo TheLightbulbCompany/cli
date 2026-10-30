@@ -145,11 +145,21 @@ pub struct ForPerson<'a> {
 /// A receipt's reason when a person or agent allowed the held message: `approved by <who>`.
 pub const APPROVED: &str = "approved by ";
 
+/// What a receipt of mail for an ended session says, whoever reads it.
+pub const ENDED_NOTE: &str = "That session has ended. It reads this only if resumed within a day.";
+
 /// What receipt `r` means in words. With `person`, the sentence for the person who sent it at
 /// a terminal (always one). Without, the note an agent's `send_message` and `message_receipt`
-/// carry, only for mail on a teammate's computer or a `loop` refusal.
+/// carry, only for mail on a teammate's computer, a `loop` refusal or an ended session.
 pub fn receipt_note(r: &Value, person: Option<&ForPerson>) -> Option<String> {
-    let text = receipt_text(r, person)?;
+    let text = receipt_text(r, person);
+    if r["ended"] == true {
+        return Some(match text {
+            Some(t) => format!("{t} {ENDED_NOTE}"),
+            None => ENDED_NOTE.into(),
+        });
+    }
+    let text = text?;
     Some(
         match r["reason"].as_str().and_then(|w| w.strip_prefix(APPROVED)) {
             Some(who) if person.is_some() => format!(

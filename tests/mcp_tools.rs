@@ -524,6 +524,70 @@ fn find_sessions_lists_ended_ones_after_the_live_with_their_resume() {
 }
 
 #[test]
+fn ended_rows_do_not_push_live_teammates_off_the_page() {
+    let (a, b) = common::pair(&[]);
+    let codex = Other::new();
+    let mine = register_on(&a, "claude", "c1", &me(), "/tmp");
+    let theirs = register_on(&b, "codex", "b1", &codex.1, "/tmp/api");
+    for i in 0..3 {
+        let key = register_on(&a, "codex", &format!("e{i}"), &codex.1, "/tmp");
+        let r = a.ask(json!({"id": 1, "op": "end", "key": key}));
+        assert_eq!(r["ended"], true, "{r}");
+    }
+    common::until(15, "A sees B's session", || common::sees(&a, &theirs));
+    let mut m = mcp_on(&a, &me());
+    let v = m.tool("find_sessions", json!({"limit": 2})).json();
+    assert_eq!(v["total"], 5, "{v}");
+    let ids: Vec<&str> = v["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["session_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, [mine.as_str(), theirs.as_str()], "{v}");
+}
+
+#[test]
+fn a_receipt_says_when_its_session_has_ended() {
+    const ENDED: &str = "That session has ended. It reads this only if resumed within a day.";
+    let (a, b) = common::pair(&[]);
+    let codex = Other::new();
+    let from = register_on(&a, "claude", "c1", &me(), "/tmp");
+    let live = register_on(&a, "codex", "live", &codex.1, "/tmp");
+    let gone = register_on(&a, "codex", "gone", &codex.1, "/tmp");
+    let theirs = register_on(&b, "codex", "b1", &codex.1, "/tmp/api");
+    for (e, key) in [(&a, &gone), (&b, &theirs)] {
+        let r = e.ask(json!({"id": 1, "op": "end", "key": key, "reason": "session-end"}));
+        assert_eq!(r["ended"], true, "{r}");
+    }
+    let listed = |status: &str| {
+        a.ask(json!({"id": 1, "op": "directory"}))["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["session_id"] == theirs.as_str() && s["status"] == status)
+    };
+    common::until(15, "A sees B's session ended", || listed("ended"));
+    let mut m = mcp_on(&a, &me());
+    let send = |m: &mut Mcp, to: &str, rid: &str| {
+        m.tool(
+            "send_message",
+            json!({"session_id": to, "text": "hi", "request_id": rid}),
+        )
+        .json()
+    };
+    for (to, rid) in [(&gone, "r1"), (&theirs, "r2")] {
+        let v = send(&mut m, to, rid);
+        assert!(v["note"].as_str().unwrap().ends_with(ENDED), "{v}");
+        let v = m.tool("message_receipt", json!({"request_id": rid})).json();
+        assert!(v["note"].as_str().unwrap().ends_with(ENDED), "{v}");
+    }
+    assert_eq!(a.state(&from, "r1"), "stored");
+    let v = send(&mut m, &live, "r3");
+    assert!(!v.to_string().contains(ENDED), "{v}");
+}
+
+#[test]
 fn find_sessions_marks_is_this_session() {
     let net = Net::new();
     let other = Other::new();

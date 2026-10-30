@@ -1482,7 +1482,8 @@ pub(crate) fn live_sessions(daemon: &Daemon) -> Vec<sessions::Session> {
 const JOBS_PER_READ: usize = 200;
 
 /// The one writer of rows from what was seen: a live Claude session with no row gets one, a row
-/// `all` no longer finds live ends with its reason and title, and a finished job with no process
+/// `all` no longer finds live ends with its reason and title (its stored one when no transcript
+/// has one), and a finished job with no process
 /// and no row gets one, ended. Reads transcripts only for rows it ends or creates ended, and
 /// outside the store lock.
 fn record(
@@ -1549,6 +1550,14 @@ fn record(
                 .ok()
                 .flatten()
                 .and_then(|r| r.handle);
+        }
+    }
+    // The name Claude's listing or pid file gives it is known only while it is live: kept, so
+    // that it outlasts the session with no transcript title to fall back on.
+    for s in live.iter() {
+        let untitled = rows.iter().any(|r| r.key == s.key.0 && r.title.is_none());
+        if let Some(title) = s.title.as_deref().filter(|_| untitled) {
+            let _ = store.fill_title(&s.key.0, title);
         }
     }
     for (r, reason, at, title) in &gone {
@@ -1868,7 +1877,8 @@ const SETTLE: Duration = Duration::from_secs(5);
 /// for mail under another member's prefix, with `where` (that member's computer), `person` (its
 /// person's name, `you` for this computer's own), `online` (whether that computer is connected
 /// now), `tier` (the session's, from that member's presence) and, while queued, `until` (when
-/// the outbox gives up). Any receipt of a message (not a refusal) carries its `thread`.
+/// the outbox gives up). Any receipt of a message (not a refusal) carries its `thread`; one still
+/// waiting for a session known to have ended says `ended`.
 pub(crate) async fn finish(daemon: &Daemon, from: &Key, mut r: mail::Receipt, wait: bool) -> Value {
     let thread = daemon
         .store
@@ -1877,10 +1887,18 @@ pub(crate) async fn finish(daemon: &Daemon, from: &Key, mut r: mail::Receipt, wa
         .thread_of(&from.0, &r.request_id)
         .ok()
         .flatten();
-    let with_thread = |r: &mail::Receipt| {
+    let with_thread = |r: &mail::Receipt, member: Option<&str>| {
         let mut v = json!(r);
         if let Some(t) = &thread {
             v["thread"] = t.as_str().into();
+        }
+        let waits = matches!(r.state, mail::State::Queued | mail::State::Stored);
+        if waits
+            && r.to
+                .as_deref()
+                .is_some_and(|to| known_ended(daemon, to, member))
+        {
+            v["ended"] = true.into();
         }
         v
     };
@@ -1896,12 +1914,12 @@ pub(crate) async fn finish(daemon: &Daemon, from: &Key, mut r: mail::Receipt, wa
         Some((m.key.clone(), m.computer.clone(), person, bell))
     });
     let Some((member, computer, person, bell)) = member else {
-        return with_thread(&r);
+        return with_thread(&r, None);
     };
     if wait {
         r = settle(daemon, from, r, &member).await;
     }
-    let mut v = with_thread(&r);
+    let mut v = with_thread(&r, Some(&member));
     v["where"] = computer.into();
     v["person"] = person.into();
     let online = daemon.peers.is_online(&member);
@@ -1920,6 +1938,23 @@ pub(crate) async fn finish(daemon: &Daemon, from: &Key, mut r: mail::Receipt, wa
         v["until"] = (at + outbox::TTL_S as i64).into();
     }
     v
+}
+
+/// Whether `to` has ended as far as this computer knows: a teammate's (`member`) by its latest
+/// presence, this computer's by its row. A row can have ended and be seen live again (no hook
+/// said so): only then is the whole list read.
+fn known_ended(daemon: &Daemon, to: &str, member: Option<&str>) -> bool {
+    match member {
+        Some(m) => daemon.latest.lock().unwrap().get(m).is_some_and(|l| {
+            l.ended.iter().any(|e| e.session_id == to)
+                && l.sessions.iter().all(|s| s.session_id != to)
+        }),
+        None => {
+            let row = daemon.store.lock().unwrap().any_session(to).ok().flatten();
+            row.is_some_and(|r| r.ended_at.is_some())
+                && live_sessions(daemon).iter().all(|s| s.key.0 != to)
+        }
+    }
 }
 
 /// Waits up to `SETTLE` for queued receipt `r` to move while `member` is online, waking when a

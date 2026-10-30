@@ -152,12 +152,13 @@ pub(crate) fn current_at(daemon: &Daemon) -> Option<(Vec<Listed>, i64)> {
     if cfg!(debug_assertions) && std::env::var_os("LIGHTBULB_CONNECT_DEBUG_LISTING").is_none() {
         return None;
     }
-    // Reads each pid file and checks its process: off the lock every session read takes.
-    let running = sessions::any_pid_file(&daemon.claude_home);
+    let older = |at: Option<Instant>, s| at.is_none_or(|t| t.elapsed() > Duration::from_secs(s));
+    // Reads each pid file and checks its process: only when it can matter, and off the lock
+    // every session read takes.
+    let at = daemon.listing.lock().unwrap().at;
+    let running = older(at, 10) && sessions::any_pid_file(&daemon.claude_home);
     let mut c = daemon.listing.lock().unwrap();
-    let age = c.at.map(|t| t.elapsed());
-    let older = |s| age.is_none_or(|a| a > Duration::from_secs(s));
-    let due = (c.dirty && older(2)) || older(60) || (older(10) && running);
+    let due = (c.dirty && older(c.at, 2)) || older(c.at, 60) || (older(c.at, 10) && running);
     if !c.refreshing && due {
         let (cache, home) = (daemon.listing.clone(), daemon.claude_home.clone());
         let started = std::thread::Builder::new()

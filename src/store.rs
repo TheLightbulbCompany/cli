@@ -488,6 +488,14 @@ impl Store {
         )? > 0)
     }
 
+    /// `title` on `key`'s live row, if it has none.
+    pub fn fill_title(&self, key: &str, title: &str) -> rusqlite::Result<usize> {
+        self.conn.execute(
+            "UPDATE sessions SET title = ?2 WHERE key = ?1 AND title IS NULL AND ended_at IS NULL",
+            params![key, title],
+        )
+    }
+
     /// A row born ended at `at`, for a job first seen finished: no process, and no handle (one
     /// comes if it is ever resumed), since hundreds of old jobs must not use up `who`'s numbers.
     /// `false`, changing nothing, when `key` has a row: a job ends once.

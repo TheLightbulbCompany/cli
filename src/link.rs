@@ -248,7 +248,7 @@ async fn answer(d: &Arc<Daemon>, frame: Value) -> Value {
         match tokio::task::spawn_blocking(move || crate::presence::directory(&d2, q.as_deref()))
             .await
         {
-            Ok(v) => ipc::Response::ok(id, v),
+            Ok(v) => ipc::Response::ok(id, this_computers_own_kept(v)),
             Err(_) => ipc::Response::err(id, ipc::INTERNAL),
         }
     } else {
@@ -265,6 +265,18 @@ async fn answer(d: &Arc<Daemon>, frame: Value) -> Value {
         e["ok"] = false.into();
         e
     }
+}
+
+/// `directory`'s answer without what is only of use on this computer: it does not leave it.
+fn this_computers_own_kept(mut v: Value) -> Value {
+    for r in v["sessions"].as_array_mut().into_iter().flatten() {
+        if let Some(o) = r.as_object_mut() {
+            for f in ["resume", "pid", "birth_micros", "entrypoint", "kind", "job"] {
+                o.remove(f);
+            }
+        }
+    }
+    v
 }
 
 /// An app op's session `<app>-<person>` (titled `title`) declared here, for the link's person

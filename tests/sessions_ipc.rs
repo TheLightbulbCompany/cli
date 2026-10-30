@@ -614,6 +614,65 @@ fn a_hidden_folder_gets_no_row() {
     }
 }
 
+/// A name only the pid file gives is on the row by the time the session ends, by `end` or by the
+/// pass that finds it gone, with no transcript title to fall back on.
+#[test]
+fn an_ended_row_keeps_the_name_it_had_while_live() {
+    let e = Env::new();
+    e.daemon(false, "", &[]);
+    let dir = e.home.path().join(".claude/sessions");
+    std::fs::create_dir_all(&dir).unwrap();
+    let me = std::process::id();
+    let mut child = std::process::Command::new("sleep")
+        .arg("100")
+        .spawn()
+        .unwrap();
+    let pid_file = |file: &str, pid: u32, conversation: &str, name: &str| {
+        let path = dir.join(file);
+        let v = json!({"pid": pid, "sessionId": conversation, "cwd": "/tmp/p", "status": "busy",
+            "kind": "interactive", "name": name, "startedAt": os::started_ms(pid).unwrap()});
+        std::fs::write(&path, v.to_string()).unwrap();
+        path
+    };
+    let mine = pid_file("a.json", me, "by-end", "named by end");
+    pid_file("b.json", child.id(), "by-pass", "named by pass");
+    register_claude(&e, "by-end", "busy", None);
+    let birth = os::process(child.id()).unwrap().birth_micros;
+    let r = e.ask(
+        json!({"id": 1, "op": "register", "session": {"provider": "claude",
+        "conversation": "by-pass", "pid": child.id(), "birth_micros": birth, "cwd": "/tmp/p"}}),
+    );
+    assert_eq!(r["ok"], true, "{r}");
+    let s = listed(&e);
+    assert_eq!(by(&s, "by-end").unwrap()["title"], "named by end", "{s:?}");
+    assert_eq!(
+        by(&s, "by-pass").unwrap()["title"],
+        "named by pass",
+        "{s:?}"
+    );
+
+    std::fs::remove_file(mine).unwrap();
+    let key = by(&s, "by-end").unwrap()["key"].clone();
+    let r = e.ask(json!({"id": 1, "op": "end", "key": key, "reason": "session-end"}));
+    assert_eq!(r["ended"], true, "{r}");
+    child.kill().unwrap();
+    child.wait().unwrap();
+    until(10, "the pass ends the other", || {
+        by(&ended(&e), "by-pass").is_some()
+    });
+    let gone = ended(&e);
+    assert_eq!(
+        by(&gone, "by-end").unwrap()["title"],
+        "named by end",
+        "{gone:?}"
+    );
+    assert_eq!(
+        by(&gone, "by-pass").unwrap()["title"],
+        "named by pass",
+        "{gone:?}"
+    );
+}
+
 /// A listing read before a row's last word has settled says nothing: a just-started
 /// conversation or a just-fired hook may not be listed yet.
 #[test]

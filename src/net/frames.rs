@@ -320,10 +320,11 @@ pub async fn read(recv: &mut (impl AsyncRead + Unpin)) -> Result<Frame> {
 /// The one per-frame check on what a member sends. `roster` entries are checked by
 /// `roster::accept` itself. A `presence` is the peer's own: at most `presence::MAX` of each
 /// list and `presence::MAX_ENDED` ended, every session `Remote::valid` or `Ended::valid` for it
-/// and every address under its prefix, a `seq` at most a day ahead of now. An `envelope` is checked by `mail::receive`. An `ack` or `receipt`
-/// names a state past `queued`, with a known reason exactly when it is `refused`, and a `limit`
-/// only on a `loop` refusal (that it is bound to this member is `outbox::acked`'s check). A `share_grant` passes
-/// `streams::grant_ok`. A `stream` never rides the control stream, and a `hold_notice` or a
+/// and every address under its prefix, a `seq` at most a day ahead of now. An `envelope` is
+/// checked by `mail::receive`. An `ack` or `receipt` names a state past `queued`, with a known
+/// reason exactly when it is `refused`, and a `limit` only on a `loop` refusal (that it is bound
+/// to this member is `outbox::acked`'s check). A `share_grant` passes `streams::grant_ok`. A
+/// `stream` never rides the control stream, and a `hold_notice` or a
 /// `decision` (retired) is served nowhere. `Err` names the check.
 pub fn from_peer_ok(
     f: &Frame,
