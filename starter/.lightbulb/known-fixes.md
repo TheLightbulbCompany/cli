@@ -25,3 +25,7 @@ rest are for you to read.
 - **Hydration mismatch.** Something renders differently on server and browser (dates, random
   values, `window`). Compute it in `useEffect`, or render it on the server only.
 - **A component exists but nothing shows.** It isn't imported into a page.
+- **native dialog** (`pnpm check`). Canvas frames the app without `allow-modals`, so `confirm()` answers
+  false and the button does nothing. Do what the person clicked; for something hard to undo, ask in the page.
+- **handleSubmit without onInvalid** (`pnpm check`). Pass `form.handleSubmit(save, () => setError("..."))`,
+  and give every optional field a `""` default so a blank one doesn't fail the schema.
