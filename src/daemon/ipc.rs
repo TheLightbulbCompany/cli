@@ -1691,6 +1691,7 @@ pub(crate) fn ended_sessions(daemon: &Daemon) -> Vec<store::Session> {
 /// An ended row as `sessions` answers it, with the owner's resume command.
 fn ended_json(r: &store::Session) -> Value {
     json!({
+        "status": "ended",
         "key": r.key,
         "provider": r.provider,
         "conversation": r.conversation,

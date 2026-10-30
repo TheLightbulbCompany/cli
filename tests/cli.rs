@@ -76,6 +76,148 @@ fn who_lists_a_registered_session_by_its_handle() {
 }
 
 #[test]
+fn who_prints_waiting_done_and_a_recent_section_with_resume() {
+    let e = Env::new();
+    assert!(e.run(&["who"]).status.success());
+    let p = os::process(std::process::id()).unwrap();
+    let register = |provider: &str, conversation: &str, extra: Value| {
+        let mut session = json!({"provider": provider, "conversation": conversation,
+            "pid": p.pid, "birth_micros": p.birth_micros, "cwd": "/tmp/proj"});
+        session
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let r = e.ask(json!({"id": 1, "op": "register", "session": session}));
+        r["key"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{r}"))
+            .to_string()
+    };
+    let c1 = register(
+        "claude",
+        "c1",
+        json!({"status": "waiting", "waiting_for": "permission prompt"}),
+    );
+    let t2 = register("codex", "t2", json!({}));
+    let r = e.ask(json!({"id": 1, "op": "end", "key": t2, "reason": "session-end"}));
+    assert_eq!(r["ended"], true, "{r}");
+
+    let table = out(&e.run(&["who"]));
+    assert!(
+        table
+            .lines()
+            .any(|l| l.contains("waiting for you: permission prompt")),
+        "{table}"
+    );
+    let (live, recent) = table.split_once("\nRecent\n").expect("a Recent section");
+    assert!(!live.contains("codex-1"), "{table}");
+    let cols: Vec<&str> = recent.lines().next().unwrap().split_whitespace().collect();
+    assert_eq!(
+        cols,
+        ["Name", "Agent", "Folder", "Ended", "Resume"],
+        "{table}"
+    );
+    assert!(
+        recent.contains("codex-1")
+            && recent.contains("just now")
+            && recent.contains("codex resume t2"),
+        "{recent}"
+    );
+
+    // One array, live rows first: what parses `who --json` today keeps working.
+    let json: Value = serde_json::from_str(&out(&e.run(&["who", "--json"]))).unwrap();
+    assert_eq!(json[0]["key"], c1.as_str(), "{json}");
+    assert_eq!(json[0]["status"], "waiting", "{json}");
+    assert_eq!(json[1]["key"], t2.as_str(), "{json}");
+    assert_eq!(json[1]["status"], "ended", "{json}");
+    assert_eq!(json[1]["reason"], "session-end", "{json}");
+    assert_eq!(json[1]["resume"], "codex resume t2", "{json}");
+    assert!(json[1]["ended_at"].is_u64(), "{json}");
+
+    // `--all` says the same of this computer's, and only ended rows: Recent alone.
+    let all = out(&e.run(&["who", "--all"]));
+    assert!(all.contains("waiting for you: permission prompt"), "{all}");
+    assert!(
+        all.split_once("\nRecent\n")
+            .unwrap()
+            .1
+            .contains("codex resume t2"),
+        "{all}"
+    );
+    let r = e.ask(json!({"id": 1, "op": "end", "key": c1, "reason": "session-end"}));
+    assert_eq!(r["ended"], true, "{r}");
+    let only = out(&e.run(&["who"]));
+    assert!(
+        only.contains("\nRecent\n") && !only.contains("No sessions yet"),
+        "{only}"
+    );
+    assert!(!only.contains("Status"), "{only}");
+}
+
+#[test]
+fn who_all_prints_busy_for_a_busy_teammate_and_offline_with_last_seen() {
+    let (a, b) = common::pair(&[]);
+    let p = os::process(std::process::id()).unwrap();
+    let register = |provider: &str, conversation: &str, extra: Value| {
+        let mut session = json!({"provider": provider, "conversation": conversation,
+            "pid": p.pid, "birth_micros": p.birth_micros, "cwd": "/tmp/work/web"});
+        session
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let r = b.ask(json!({"id": 1, "op": "register", "session": session}));
+        r["key"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{r}"))
+            .to_string()
+    };
+    let busy = register("codex", "b1", json!({"status": "busy"}));
+    let waits = register(
+        "claude",
+        "b2",
+        json!({"status": "waiting", "waiting_for": "permission prompt"}),
+    );
+    let done = register("codex", "b3", json!({}));
+    let r = b.ask(json!({"id": 1, "op": "end", "key": done, "reason": "job-done"}));
+    assert_eq!(r["ended"], true, "{r}");
+    common::until(15, "A sees B's sessions", || {
+        common::sees(&a, &busy) && common::sees(&a, &waits)
+    });
+    let who = || out(&a.run(&["who", "--all"]));
+    common::until(15, "A sees what ended", || who().contains(done.as_str()));
+    let table = who();
+    let row = |t: &str, key: &str| {
+        t.lines()
+            .find(|l| l.starts_with(key))
+            .unwrap_or_else(|| panic!("{key}: {t}"))
+            .to_string()
+    };
+    let (live, recent) = table.split_once("\nRecent\n").expect("a Recent section");
+    assert!(row(live, &busy).contains("busy, gets messages"), "{table}");
+    assert!(row(live, &busy).contains("web"), "{table}");
+    let waiting = row(live, &waits);
+    assert!(waiting.contains("waiting: permission prompt"), "{table}");
+    assert!(!waiting.contains("waiting for you"), "{table}");
+    // A teammate's: never the command that resumes it.
+    assert!(!row(recent, &done).contains("resume"), "{table}");
+
+    assert_eq!(b.ask(json!({"id": 1, "op": "shutdown"}))["ok"], true);
+    common::until(15, "A sees B offline", || {
+        who().contains("offline, last seen")
+    });
+    let table = who();
+    let offline = row(&table, &busy);
+    assert!(
+        offline.contains("offline, last seen just now, messages queued"),
+        "{table}"
+    );
+    assert!(
+        !offline.contains("gets messages") && !offline.contains("busy"),
+        "{table}"
+    );
+}
+
+#[test]
 fn send_takes_a_handle_and_a_member_name() {
     let e = Env::new();
     let key = e.session();
