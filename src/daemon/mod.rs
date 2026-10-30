@@ -134,8 +134,9 @@ pub struct ListingCache {
 
 /// Claude's listing as last read, at once: never runs `claude` here, and never holds the lock
 /// across it. Starts a read when the last is older than 10 s, or 2 s after a hook event
-/// (`dirty`); until the first ends, `None` (the pid files). A failed read counts as a read: a
-/// hung `claude` is asked once per 10 s. `None` when the Claude home is not `HOME` (an embedded
+/// (`dirty`), or 60 s while no pid file says Claude is running (an idle computer does not keep
+/// running `claude`); until the first ends, `None` (the pid files). A failed read counts as a
+/// read: a hung `claude` is asked once per 10 s. `None` when the Claude home is not `HOME` (an embedded
 /// instance's, a test's): `claude` lists `HOME`'s sessions, not those.
 pub(crate) fn current(daemon: &Daemon) -> Option<Vec<Listed>> {
     current_at(daemon).map(|(rows, _)| rows)
@@ -153,7 +154,10 @@ pub(crate) fn current_at(daemon: &Daemon) -> Option<(Vec<Listed>, i64)> {
     let mut c = daemon.listing.lock().unwrap();
     let age = c.at.map(|t| t.elapsed());
     let older = |s| age.is_none_or(|a| a > Duration::from_secs(s));
-    if !c.refreshing && (older(10) || (c.dirty && older(2))) {
+    let due = (c.dirty && older(2))
+        || older(60)
+        || (older(10) && sessions::any_pid_file(&daemon.claude_home));
+    if !c.refreshing && due {
         let (cache, home) = (daemon.listing.clone(), daemon.claude_home.clone());
         let started = std::thread::Builder::new()
             .name("claude-listing".into())

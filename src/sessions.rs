@@ -299,12 +299,18 @@ const QUIET_SECS: i64 = 15;
 /// Whether a live process has left a Claude conversation that no live listed row and no verified
 /// pid file holds: its own verified pid file names another or is parked (at once); or it has no
 /// such file and a listing read `QUIET_SECS` after the row's `seen_at` lacks it. With neither,
-/// nothing is known against it and it stays.
+/// nothing is known against it and it stays. A `waiting` row has only the first: it may sit quiet
+/// for hours on its person, and that is no sign it has gone.
 /// ponytail: a session under a custom `CLAUDE_CONFIG_DIR` is not in the default listing, so it
-/// ends after 15 s quiet and revives on its next hook. Ask each config dir's listing if that
-/// shows up in use.
-fn moved_on(has_pid_file: bool, read_at: Option<i64>, seen_at: i64) -> bool {
-    has_pid_file || read_at.is_some_and(|at| at >= seen_at + QUIET_SECS)
+/// ends after 15 s quiet and revives on its next hook, unless it is `waiting`, which stays until
+/// its process exits. Ask each config dir's listing if that shows up in use.
+fn moved_on(has_pid_file: bool, waiting: bool, read_at: Option<i64>, seen_at: i64) -> bool {
+    has_pid_file || (!waiting && read_at.is_some_and(|at| at >= seen_at + QUIET_SECS))
+}
+
+/// Whether a verified pid file, parked or not, says Claude is running here.
+pub fn any_pid_file(home: &Path) -> bool {
+    !pid_files(home, "").is_empty()
 }
 
 /// Registered rows that are still theirs plus Claude discoveries, deduplicated by key (a discovery wins for its
@@ -360,7 +366,12 @@ pub fn all(
             s.provider != "claude"
                 || s.status == Status::Gone
                 || held(&s.conversation)
-                || !moved_on(filed_pids.contains(&s.pid), read_at, *seen_at)
+                || !moved_on(
+                    filed_pids.contains(&s.pid),
+                    s.status == Status::Waiting,
+                    read_at,
+                    *seen_at,
+                )
         })
         .map(|(s, _)| s)
         .collect();
@@ -518,6 +529,15 @@ mod tests {
             ["c", "old"]
         );
         assert_eq!(live_of(&rows, Some((&[], seen + 15)), home.path()), ["c"]);
+        // Waiting on its person: quiet is no evidence, however long.
+        let waiting = [store::Session {
+            status: "waiting".into(),
+            ..rows[0].clone()
+        }];
+        assert_eq!(
+            live_of(&waiting, Some((&[], seen + 3_600)), home.path()),
+            ["old"]
+        );
         // The pid file names the process on another conversation: at once, listing or not.
         pid_file(home.path(), "new", "");
         assert_eq!(live_of(&rows, None, home.path()), ["c", "new"]);

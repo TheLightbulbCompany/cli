@@ -451,15 +451,61 @@ fn a_session_end_after_clear_ends_the_row_as_moved_on() {
     assert_eq!(r["ended"][0]["reason"], "moved-on");
 }
 
+/// A hook sends no title, repo or branch on most events: the row keeps them, across an end too.
+#[test]
+fn a_register_without_a_title_keeps_the_stored_one_and_a_revived_row_its_repo() {
+    let net = Net::new();
+    let me = os::process(std::process::id()).unwrap();
+    let c = "00000000-0000-4000-8000-0000000000c1";
+    let reg = |extra: Value| {
+        let mut session = json!({"provider": "claude", "conversation": c, "pid": me.pid,
+            "birth_micros": me.birth_micros, "cwd": "/"});
+        session
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let r = net.call(json!({"id": 1, "op": "register", "session": session}));
+        assert_eq!(r["ok"], true, "{r}");
+        r["key"].as_str().unwrap().to_string()
+    };
+    let key = reg(json!({"title": "named", "repo": "o/r", "branch": "main"}));
+    reg(json!({}));
+    let s = net.session(&key).unwrap();
+    assert_eq!(s["title"], "named");
+    assert_eq!(
+        net.call(json!({"id": 1, "op": "end", "key": key}))["ok"],
+        true
+    );
+    reg(json!({}));
+    let s = net.session(&key).unwrap();
+    assert_eq!(
+        (
+            s["title"].as_str(),
+            s["repo"].as_str(),
+            s["branch"].as_str()
+        ),
+        (Some("named"), Some("o/r"), Some("main"))
+    );
+}
+
 #[test]
 fn a_session_end_on_exit_ends_the_row_as_session_end() {
     let net = Net::new();
     let me = os::process(std::process::id()).unwrap();
     let c = "00000000-0000-4000-8000-0000000000c1";
+    // Its row's cwd is `/`: Claude's project dir for it is `-`.
+    let projects = net.claude.path().join(".claude/projects/-");
+    std::fs::create_dir_all(&projects).unwrap();
+    std::fs::write(
+        projects.join(format!("{c}.jsonl")),
+        "{\"type\":\"ai-title\",\"aiTitle\":\"Fix the list\"}\n",
+    )
+    .unwrap();
     register(&net, c, me.pid, me.birth_micros);
     net.hook("claude", "session-end", "claude-session-end");
     let r = net.call(json!({"id": 1, "op": "sessions"}));
     assert_eq!(r["ended"][0]["reason"], "session-end", "{r}");
+    assert_eq!(r["ended"][0]["title"], "Fix the list", "{r}");
 }
 
 #[test]

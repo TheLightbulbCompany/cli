@@ -554,6 +554,8 @@ fn a_finished_job_past_the_window_never_shows_and_is_not_recreated() {
     );
     until(15, "the next read's", || {
         assert!(ended(&e).is_empty());
+        // No pid file here: only a hook event brings the next read soon.
+        poke(&e);
         rows() == 201
     });
     // Still listed: kept, however often the ended list and the listing are read.
@@ -668,4 +670,124 @@ fn a_session_ends_with_nobody_asking() {
             "SELECT count(*) FROM sessions WHERE provider = 'claude' AND ended_at IS NOT NULL",
         ) == 1
     });
+}
+
+/// Claude keeps no end time: a job first seen now ended when its transcript was last written, and
+/// so did a row found gone after the daemon was off. Neither is "just ended".
+#[test]
+fn what_ended_while_no_one_looked_is_stamped_with_its_transcripts_last_write() {
+    let (j, r) = (
+        "a1b2c3d4-0000-4000-8000-00000000000a",
+        "a1b2c3d4-0000-4000-8000-00000000000b",
+    );
+    let three_days = 3 * 86_400;
+    let then = common::now_s() - three_days;
+    let job = json!([{"cwd": "/tmp/p", "kind": "background", "id": "ab12", "state": "done",
+        "startedAt": then * 1000, "sessionId": j}]);
+    let (e, _shim) = listing_daemon(&job.to_string());
+    let projects = e.home.path().join(".claude/projects/-tmp-p");
+    std::fs::create_dir_all(&projects).unwrap();
+    for c in [j, r] {
+        let file = projects.join(format!("{c}.jsonl"));
+        std::fs::write(&file, "{}\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(then as u64))
+            .unwrap();
+    }
+    let reg = e.ask(
+        json!({"id": 1, "op": "register", "session": {"provider": "claude",
+        "conversation": r, "pid": 999_999, "birth_micros": 1, "cwd": "/tmp/p"}}),
+    );
+    assert_eq!(reg["ok"], true, "{reg}");
+    until(10, "both are seen", || ended(&e).len() == 2);
+    for row in ended(&e) {
+        let at = row["ended_at"].as_i64().unwrap();
+        assert!((at - then).abs() < 60, "{row}");
+    }
+}
+
+/// No pid file says Claude is running, and no hook event: `claude` is not asked every 10 s.
+#[test]
+fn an_idle_computer_reads_the_listing_at_most_once_a_minute() {
+    let (shim, path) = claude_shim("[]");
+    let reads = shim.path().join("reads");
+    set_shim(
+        shim.path(),
+        &format!("echo x >> '{}'\necho '[]'", reads.display()),
+    );
+    let e = Env::new();
+    e.daemon(false, "", &[("PATH", path), (LISTING, "1".into())]);
+    let count = || {
+        let text = std::fs::read_to_string(&reads).unwrap_or_default();
+        text.lines().count()
+    };
+    until(10, "the first read", || {
+        listed(&e);
+        count() == 1
+    });
+    let quiet = std::time::Instant::now();
+    while quiet.elapsed() < std::time::Duration::from_secs(12) {
+        listed(&e);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    assert_eq!(count(), 1);
+    // Once Claude runs here the 10 s stands: this read is already older than that.
+    let me = std::process::id();
+    let sessions = e.home.path().join(".claude/sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    std::fs::write(
+        sessions.join(format!("{me}.json")),
+        json!({"pid": me, "sessionId": "s", "cwd": "/tmp/p", "status": "busy",
+            "startedAt": os::started_ms(me).unwrap()})
+        .to_string(),
+    )
+    .unwrap();
+    until(10, "the next read", || {
+        listed(&e);
+        count() == 2
+    });
+}
+
+/// With no listing yet (a daemon just started) a job's tombstone waits for one, so it is not
+/// deleted and re-created on every start; a session's ended row past the week still goes.
+#[test]
+fn with_no_listing_old_job_rows_stay_and_old_session_rows_go() {
+    let e = Env::new();
+    let db = e.state.path().join("state.db");
+    e.daemon(false, "", &[]);
+    let long_ago = common::now_s() - 8 * 86_400;
+    e.store()
+        .put_ended_job("x/claude:job", "job", "/tmp/p", None, long_ago)
+        .unwrap();
+    register_claude(&e, "old", "busy", None);
+    let key = format!("{}/claude:old", e.short());
+    e.store()
+        .end_session(&key, long_ago, "session-end", None)
+        .unwrap();
+    assert!(ended(&e).is_empty());
+    assert_eq!(common::count(&db, "SELECT count(*) FROM sessions"), 1);
+    assert!(e.store().holds("x/claude:job").unwrap());
+}
+
+#[test]
+fn the_ended_list_is_at_most_a_hundred_newest_first() {
+    let e = Env::new();
+    e.daemon(false, "", &[]);
+    for i in 0..101 {
+        let r = e.ask(
+            json!({"id": 1, "op": "register", "session": {"provider": "codex",
+            "conversation": format!("c{i}"), "pid": 999_999, "birth_micros": 1, "cwd": "/tmp/p"}}),
+        );
+        assert_eq!(r["ok"], true, "{r}");
+    }
+    let over = ended(&e);
+    assert_eq!(over.len(), 100);
+    let at: Vec<i64> = over
+        .iter()
+        .map(|r| r["ended_at"].as_i64().unwrap())
+        .collect();
+    assert!(at.windows(2).all(|w| w[0] >= w[1]), "{at:?}");
 }

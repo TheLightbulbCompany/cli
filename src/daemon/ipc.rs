@@ -294,6 +294,7 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
                 let ended: Vec<Value> = ended_sessions(daemon)
                     .iter()
                     .filter(|r| live.iter().all(|s| s.key.0 != r.key))
+                    .take(presence::MAX)
                     .map(ended_json)
                     .collect();
                 Response::ok(id, json!({ "sessions": live, "ended": ended }))
@@ -1270,20 +1271,31 @@ fn end(id: u64, key: &str, body: &Value, daemon: &Daemon) -> Response {
         Some(_) => return Response::err(id, BAD_REQUEST),
     };
     let if_gone = body["if_gone"] == true;
-    let store = daemon.store.lock().unwrap();
-    if caller.is_some() || if_gone {
-        let row = match row_process(&store, key) {
+    let row = {
+        let store = daemon.store.lock().unwrap();
+        if caller.is_some() || if_gone {
+            let row = match row_process(&store, key) {
+                Ok(r) => r,
+                Err(_) => return Response::err(id, INTERNAL),
+            };
+            let owned = caller.is_some() && row == caller;
+            let dead = !row.is_some_and(|(p, b)| sessions::alive(p, b));
+            if !(owned || (if_gone && dead)) {
+                return Response::ok(id, json!({ "ended": false }));
+            }
+        }
+        match store.session(key) {
             Ok(r) => r,
             Err(_) => return Response::err(id, INTERNAL),
-        };
-        let owned = caller.is_some() && row == caller;
-        let dead = !row.is_some_and(|(p, b)| sessions::alive(p, b));
-        if !(owned || (if_gone && dead)) {
-            return Response::ok(id, json!({ "ended": false }));
         }
-    }
+    };
+    // Off the store lock: a transcript's tail.
+    let title = row
+        .filter(|r| r.provider == "claude")
+        .and_then(|r| doing::title(&daemon.claude_home, &r.cwd, r.conversation.as_deref()?));
     // The row stays, ended, with its reason: its address is kept (`presence`).
-    match store.end_session(key, now() as i64, reason, None) {
+    let store = daemon.store.lock().unwrap();
+    match store.end_session(key, now() as i64, reason, title.as_deref()) {
         Ok(true) => {
             daemon.presence.notify_one();
             daemon.listing.lock().unwrap().dirty = true;
@@ -1370,10 +1382,12 @@ fn register(id: u64, body: &Value, daemon: &Daemon) -> Response {
     let reported = ["repo", "branch"]
         .iter()
         .any(|f| body["session"].get(f).is_some());
+    // A hook sends a title rarely, and a revived row is still the same conversation.
+    let old = store.any_session(&key.0).ok().flatten();
+    let title = r.title.or(old.as_ref().and_then(|o| o.title.clone()));
     let (repo, branch) = if reported {
         (clamp(r.repo), clamp(r.branch))
     } else {
-        let old = store.session(&key.0).ok().flatten();
         old.map_or((None, None), |o| (o.repo, o.branch))
     };
     let row = store::Session {
@@ -1383,7 +1397,7 @@ fn register(id: u64, body: &Value, daemon: &Daemon) -> Response {
         pid: Some(r.pid.into()),
         birth_micros: i64::try_from(r.birth_micros).ok(),
         cwd: r.cwd,
-        title: r.title,
+        title,
         status: status.into(),
         seen_at: SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1485,14 +1499,23 @@ fn record(
             .then(|| doing::title(home, cwd, conversation))
             .flatten()
     };
-    let gone: Vec<(&store::Session, &str, Option<String>)> = rows
+    let last_written = |cwd: &str, conversation: &str| {
+        doing::last_written(home, cwd, conversation).map(|at| at.min(now))
+    };
+    // Found gone, perhaps long after (the daemon was off): it ended no later than its transcript
+    // says, not when this pass got to it.
+    let gone: Vec<(&store::Session, &str, i64, Option<String>)> = rows
         .iter()
         .filter(|r| !r.provider.is_empty() && !is_live(&r.key))
         .map(|r| {
             let conversation = r.conversation.as_deref().unwrap_or_default();
+            let at = (r.provider == "claude")
+                .then(|| last_written(&r.cwd, conversation))
+                .flatten();
             (
                 r,
                 ended_reason(r, listed),
+                at.unwrap_or(now),
                 title(&r.provider, &r.cwd, conversation),
             )
         })
@@ -1501,13 +1524,15 @@ fn record(
     let jobs: Vec<(String, &Listed, i64, Option<String>)> = jobs
         .into_iter()
         .map(|(key, l)| {
-            // Over long before this computer looked: never "just ended".
+            // Claude keeps no end time: its transcript's last write, else its start. Never
+            // "just ended" for a job over long before this computer looked.
             let started = (l.started_ms / 1000) as i64;
-            if started + (presence::WEEK as i64) < now {
-                (key, l, started, None)
+            let at = last_written(&l.cwd, &l.conversation).unwrap_or(started.min(now));
+            if at + (presence::WEEK as i64) < now {
+                (key, l, at, None)
             } else {
                 let found = title("claude", &l.cwd, &l.conversation);
-                (key, l, now, found.or(l.name.clone()))
+                (key, l, at, found.or(l.name.clone()))
             }
         })
         .collect();
@@ -1526,18 +1551,25 @@ fn record(
                 .and_then(|r| r.handle);
         }
     }
-    for (r, reason, title) in &gone {
+    for (r, reason, at, title) in &gone {
         // A hook wrote it after `rows` was read: it is the newer word.
         if store.session(&r.key).ok().flatten().as_ref() == Some(*r) {
             changed |= store
-                .end_session(&r.key, now, reason, title.as_deref())
+                .end_session(&r.key, *at, reason, title.as_deref())
                 .unwrap_or(false);
         }
     }
-    for (key, l, at, title) in &jobs {
-        changed |= store
-            .put_ended_job(key, &l.conversation, &l.cwd, title.as_deref(), *at)
-            .unwrap_or(false);
+    if !jobs.is_empty() {
+        // One transaction: up to `JOBS_PER_READ` rows under the store lock.
+        let tx = store.conn().unchecked_transaction();
+        for (key, l, at, title) in &jobs {
+            changed |= store
+                .put_ended_job(key, &l.conversation, &l.cwd, title.as_deref(), *at)
+                .unwrap_or(false);
+        }
+        if let Ok(tx) = tx {
+            let _ = tx.commit();
+        }
     }
     drop(store);
     if changed {
@@ -1633,14 +1665,19 @@ fn discovered_row(s: &sessions::Session, now: i64) -> store::Session {
 /// born again as just ended.
 pub(crate) fn ended_sessions(daemon: &Daemon) -> Vec<store::Session> {
     let since = now().saturating_sub(presence::WEEK) as i64;
-    let keep: Vec<String> = super::current(daemon)
-        .iter()
-        .flat_map(|l| listing::finished(l))
-        .map(|c| Key::new(&daemon.identity.short, "claude", &c).0)
-        .collect();
-    let keep: Vec<&str> = keep.iter().map(String::as_str).collect();
+    let listed = super::current(daemon);
     let off = daemon.team.lock().unwrap().off.clone();
     let store = daemon.store.lock().unwrap();
+    let keep = match listed {
+        Some(l) => listing::finished(&l)
+            .iter()
+            .map(|c| Key::new(&daemon.identity.short, "claude", c).0)
+            .collect(),
+        // No word from the listing (a daemon just started): its jobs wait for one.
+        // ponytail: a computer whose Claude is gone for good keeps these rows; each is one
+        // small unseen row, purge by age if that ever matters.
+        None => store.ended_job_keys().unwrap_or_default(),
+    };
     let marked = store.hidden_keys().unwrap_or_default();
     let mut ended = store.ended_since(since, &keep).unwrap_or_default();
     ended.retain(|r| {

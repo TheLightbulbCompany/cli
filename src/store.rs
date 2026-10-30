@@ -1,4 +1,5 @@
 use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 /// Migration `i` takes the db to `user_version` `i + 1`. Forward only; each one only adds
@@ -327,7 +328,7 @@ impl Store {
 
     /// Writes `s` as a live row (an ended one is live again). A new agent session's row gets the
     /// handle `<provider>-<n>`, one past its provider's highest, which it then keeps.
-    /// ponytail: a number frees up again only when its row is purged (a day after it ended)
+    /// ponytail: a number frees up again only when its row is purged (a week after it ended)
     /// and it was the highest.
     pub fn put_session(&self, s: &Session) -> rusqlite::Result<()> {
         self.conn.execute(
@@ -447,6 +448,13 @@ impl Store {
             .optional()
     }
 
+    /// `key`'s row, ended or not: what a revived row keeps.
+    pub fn any_session(&self, key: &str) -> rusqlite::Result<Option<Session>> {
+        self.conn
+            .query_row("SELECT * FROM sessions WHERE key = ?1", [key], row_session)
+            .optional()
+    }
+
     /// The rows that have not ended.
     pub fn sessions(&self) -> rusqlite::Result<Vec<Session>> {
         let mut stmt = self
@@ -498,16 +506,29 @@ impl Store {
         )? > 0)
     }
 
+    /// The keys of the rows born ended (`put_ended_job`), or ended with no process.
+    pub fn ended_job_keys(&self) -> rusqlite::Result<HashSet<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT key FROM sessions WHERE ended_at IS NOT NULL AND pid IS NULL")?;
+        let keys = stmt.query_map([], |r| r.get(0))?;
+        keys.collect()
+    }
+
     /// The ended rows, newest end first; deletes those that ended before `since` unless their
     /// key is in `keep` (a listing still shows it).
-    pub fn ended_since(&self, since: i64, keep: &[&str]) -> rusqlite::Result<Vec<Session>> {
+    pub fn ended_since(
+        &self,
+        since: i64,
+        keep: &HashSet<String>,
+    ) -> rusqlite::Result<Vec<Session>> {
         let mut stale = self
             .conn
             .prepare("SELECT key FROM sessions WHERE ended_at < ?1")?;
         let stale: Vec<String> = stale
             .query_map([since], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
-        for key in stale.iter().filter(|k| !keep.contains(&k.as_str())) {
+        for key in stale.iter().filter(|k| !keep.contains(*k)) {
             self.conn
                 .execute("DELETE FROM sessions WHERE key = ?1", [key])?;
         }
@@ -1108,7 +1129,7 @@ mod tests {
         assert!(!store.end_session("k", 9, "process-exited", None).unwrap());
         assert_eq!(store.session("k").unwrap(), None);
         assert!(store.holds("k").unwrap());
-        let ended = store.ended_since(9, &[]).unwrap();
+        let ended = store.ended_since(9, &HashSet::new()).unwrap();
         assert_eq!(
             ended
                 .iter()
@@ -1116,7 +1137,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [("k", "/p")]
         );
-        assert!(store.ended_since(10, &[]).unwrap().is_empty());
+        assert!(store.ended_since(10, &HashSet::new()).unwrap().is_empty());
         assert!(!store.holds("k").unwrap());
     }
 
@@ -1153,7 +1174,7 @@ mod tests {
         assert!(s
             .end_session("k/claude:b", 1_000, "job-done", None)
             .unwrap());
-        let ended = s.ended_since(500, &[]).unwrap();
+        let ended = s.ended_since(500, &HashSet::new()).unwrap();
         assert_eq!(ended.len(), 2);
         assert_eq!((ended[0].ended_at, ended[0].seen_at), (Some(1_000), 1));
         assert_eq!(
@@ -1161,7 +1182,9 @@ mod tests {
             (Some("moved-on"), Some("fix the thing"))
         );
         // Past the window: `a` goes, `b` is kept because the listing still shows it.
-        let ended = s.ended_since(2_000, &["k/claude:b"]).unwrap();
+        let ended = s
+            .ended_since(2_000, &HashSet::from(["k/claude:b".to_string()]))
+            .unwrap();
         assert_eq!(
             ended.iter().map(|e| e.key.as_str()).collect::<Vec<_>>(),
             ["k/claude:b"]

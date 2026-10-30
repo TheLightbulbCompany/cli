@@ -24,6 +24,16 @@ pub fn title(home: &Path, cwd: &str, conversation: &str) -> Option<String> {
     scan(&tail(&transcript(home, cwd, conversation)).ok()?).0
 }
 
+/// When a Claude conversation's transcript was last written (unix seconds), if it has one.
+pub fn last_written(home: &Path, cwd: &str, conversation: &str) -> Option<i64> {
+    let modified = std::fs::metadata(transcript(home, cwd, conversation))
+        .ok()?
+        .modified()
+        .ok()?;
+    let since = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+    Some(since.as_secs() as i64)
+}
+
 fn transcript(home: &Path, cwd: &str, conversation: &str) -> PathBuf {
     // Claude names the project dir after the cwd with every non-alphanumeric as '-'.
     let dir: String = cwd

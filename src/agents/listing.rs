@@ -187,7 +187,7 @@ pub fn to_sessions(
                 ("background", Some("blocked")) => waiting(Some("blocked")),
                 ("background", Some(_)) => (Status::Idle, None),
                 _ => match l.status.as_deref() {
-                    Some("busy") => (Status::Live, None),
+                    Some("busy" | "shell") => (Status::Live, None),
                     Some("waiting") => waiting(None),
                     _ => (Status::Idle, None),
                 },
