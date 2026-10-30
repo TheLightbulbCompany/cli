@@ -293,9 +293,9 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
                 // A row that ended yet is seen live again (no hook said so) is shown live.
                 let ended: Vec<Value> = ended_sessions(daemon)
                     .iter()
-                    .filter(|r| live.iter().all(|s| s.key.0 != r.key))
+                    .filter(|(r, _)| live.iter().all(|s| s.key.0 != r.key))
                     .take(presence::MAX)
-                    .map(ended_json)
+                    .map(|(r, hidden)| ended_json(r, *hidden))
                     .collect();
                 Response::ok(id, json!({ "sessions": live, "ended": ended }))
             }
@@ -1500,6 +1500,9 @@ fn record(
     hidden: &dyn Fn(&str, &str) -> bool,
 ) {
     let (home, now) = (&daemon.claude_home, now() as i64);
+    if listed.is_some() {
+        first_listing_stamp(daemon, now);
+    }
     let is_live = |key: &str| live.iter().any(|s| s.key.0 == key);
     let title = |provider: &str, cwd: &str, conversation: &str| {
         (provider == "claude")
@@ -1522,7 +1525,8 @@ fn record(
             (
                 r,
                 ended_reason(r, listed),
-                at.unwrap_or(now),
+                // No transcript: its last word, so an upgrade never announces it as just ended.
+                at.unwrap_or(r.seen_at),
                 title(&r.provider, &r.cwd, conversation),
             )
         })
@@ -1589,6 +1593,16 @@ fn record(
     drop(store);
     if changed {
         daemon.presence.notify_one();
+    }
+}
+
+/// `jobs_published_after`, set once, at the first read of the listing.
+fn first_listing_stamp(daemon: &Daemon, now: i64) {
+    let mut team = daemon.team.lock().unwrap();
+    if team.config.jobs_published_after == 0 {
+        team.config.jobs_published_after = now;
+        // Lost, the next start stamps later: its older jobs stay unpublished all the same.
+        let _ = crate::config::Config::set(&daemon.dir, "jobs_published_after", &now.to_string());
     }
 }
 
@@ -1675,10 +1689,11 @@ fn discovered_row(s: &sessions::Session, now: i64) -> store::Session {
     }
 }
 
-/// The sessions that ended within the week, newest first, hidden folders left out. Rows past it
-/// go, except the finished jobs Claude still lists: they stay, unseen, so that they are not
+/// The sessions that ended within the week, newest first, each with whether it is kept from
+/// teammates (its folder is hidden: `presence::build` leaves it out; its owner still sees it,
+/// and can resume it). Rows past it go, except the finished jobs Claude still lists: they stay, unseen, so that they are not
 /// born again as just ended.
-pub(crate) fn ended_sessions(daemon: &Daemon) -> Vec<store::Session> {
+pub(crate) fn ended_sessions(daemon: &Daemon) -> Vec<(store::Session, bool)> {
     let since = now().saturating_sub(presence::WEEK) as i64;
     let listed = super::current(daemon);
     let off = daemon.team.lock().unwrap().off.clone();
@@ -1694,18 +1709,20 @@ pub(crate) fn ended_sessions(daemon: &Daemon) -> Vec<store::Session> {
         None => store.ended_job_keys().unwrap_or_default(),
     };
     let marked = store.hidden_keys().unwrap_or_default();
-    let mut ended = store.ended_since(since, &keep).unwrap_or_default();
-    ended.retain(|r| {
-        r.ended_at.is_some_and(|at| at >= since)
-            && !marked.contains(&r.key)
-            && !presence::hidden(&off, &r.cwd)
-    });
+    let ended = store.ended_since(since, &keep).unwrap_or_default();
     ended
+        .into_iter()
+        .filter(|r| r.ended_at.is_some_and(|at| at >= since))
+        .map(|r| {
+            let hidden = marked.contains(&r.key) || presence::hidden(&off, &r.cwd);
+            (r, hidden)
+        })
+        .collect()
 }
 
 /// An ended row as `sessions` answers it, with the owner's resume command.
-fn ended_json(r: &store::Session) -> Value {
-    json!({
+fn ended_json(r: &store::Session, hidden: bool) -> Value {
+    let mut v = json!({
         "status": "ended",
         "key": r.key,
         "provider": r.provider,
@@ -1718,7 +1735,11 @@ fn ended_json(r: &store::Session) -> Value {
         "reason": r.reason,
         "ended_at": r.ended_at,
         "resume": r.conversation.as_deref().and_then(|c| sessions::resume(&r.provider, c, &r.cwd)),
-    })
+    });
+    if hidden {
+        v["hidden"] = true.into();
+    }
+    v
 }
 
 /// `status`'s `dropped`: frames `from_peer_ok` dropped, by kind, and viewer `input` frames.

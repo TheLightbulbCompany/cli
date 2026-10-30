@@ -201,6 +201,26 @@ async fn what_only_this_computer_can_use_does_not_leave_it() {
     let r = e.ask(json!({"id": 1, "op": "end", "key": gone, "reason": "session-end"}));
     assert_eq!(r["ended"], true, "{r}");
 
+    // A folder turned off after these two registered: they stay on this computer.
+    let root = tempfile::tempdir().unwrap();
+    let secret = lightbulb::presence::resolved(root.path());
+    let cwd = json!({"cwd": secret.to_str().unwrap()});
+    let hid = register("h", cwd.clone());
+    let hid_gone = register("hg", cwd);
+    let r = e.ask(json!({"id": 1, "op": "end", "key": hid_gone, "reason": "session-end"}));
+    assert_eq!(r["ended"], true, "{r}");
+    let off = lightbulb::presence::resolved(root.path());
+    let off = off.to_str().unwrap();
+    let off = if cfg!(target_os = "macos") {
+        off.to_lowercase()
+    } else {
+        off.to_string()
+    };
+    let config = e.state.path().join("config.toml");
+    let text = std::fs::read_to_string(&config).unwrap_or_default();
+    std::fs::write(&config, format!("{text}\nfolders_off = [{off:?}]\n")).unwrap();
+    assert_eq!(e.ask(json!({"id": 1, "op": "reload"}))["ok"], true);
+
     // Here they are all there; over the link, none, and the rows stay.
     let local = e.ask(json!({"id": 1, "op": "directory"}));
     let row = |v: &Value, key: &str| {
@@ -216,9 +236,22 @@ async fn what_only_this_computer_can_use_does_not_leave_it() {
         row(&local["sessions"], &gone)["resume"].is_string(),
         "{local}"
     );
+    assert_eq!(row(&local["sessions"], &hid)["hidden"], true, "{local}");
+    assert_eq!(
+        row(&local["sessions"], &hid_gone)["hidden"],
+        true,
+        "{local}"
+    );
     let mut seen = vec![];
     let dir = link.op(json!({"op": "directory"}), &mut seen).await;
     let sessions = &dir["result"]["sessions"];
+    for key in [&hid, &hid_gone] {
+        let over = sessions.as_array().unwrap();
+        assert!(
+            over.iter().all(|s| s["session_id"] != key.as_str()),
+            "{dir}"
+        );
+    }
     let (w, g) = (row(sessions, &waits), row(sessions, &gone));
     assert_eq!(w["status"], "waiting", "{dir}");
     assert_eq!(w["waiting_for"], "permission prompt", "{dir}");

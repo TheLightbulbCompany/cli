@@ -183,7 +183,13 @@ fn build(d: &Daemon, seq: u64) -> Frame {
     };
     let publishable = |cwd: &str| !hidden(&off, cwd);
     let mut live = ipc::live_sessions(d);
-    let ended_rows = ipc::ended_sessions(d);
+    // After `live_sessions`: the first read of the listing stamps it.
+    let jobs_after = d.team.lock().unwrap().config.jobs_published_after;
+    let ended_rows: Vec<store::Session> = ipc::ended_sessions(d)
+        .into_iter()
+        .filter(|(r, hidden)| !hidden && !old_job(r, jobs_after))
+        .map(|(r, _)| r)
+        .collect();
     // One invalid row would cost the receiver the whole presence.
     let ended: Vec<Ended> = ended_rows
         .iter()
@@ -194,7 +200,7 @@ fn build(d: &Daemon, seq: u64) -> Frame {
         .collect();
     let (rows, waiting) = {
         let store = d.store.lock().unwrap();
-        let since = now.saturating_sub(DAY) as i64;
+        let since = now.saturating_sub(WEEK) as i64;
         let live_keys = live.iter().map(|s| s.key.0.as_str()).collect();
         let _ = store.prune_hidden(since, &live_keys);
         (
@@ -215,7 +221,7 @@ fn build(d: &Daemon, seq: u64) -> Frame {
     // A session whose register a hidden folder refused has no row, but Claude's own file may
     // still name it (its folder spelled another way): its mark keeps that discovery from
     // teammates too (`hidden`). The mark is cleared by its next register, so after `folder
-    // on` it stays hidden until its next hook event, or pruned a day after its last renewal
+    // on` it stays hidden until its next hook event, or pruned a week after its last renewal
     // once no live session carries it; a discovery that never registered is matched by
     // Claude's cwd as given.
     live.retain(|s| !s.hidden);
@@ -247,6 +253,14 @@ fn build(d: &Daemon, seq: u64) -> Frame {
         kept,
         ended,
     }
+}
+
+/// A job over before this computer first read Claude's listing (`jobs_published_after`): months
+/// of them arrive at once, and that is no news for teammates. The owner's `Recent` still has it.
+/// ponytail: a job with no transcript is stamped with its start, so one that started before the
+/// first read and ended after it stays unpublished too.
+fn old_job(r: &store::Session, jobs_after: i64) -> bool {
+    r.reason.as_deref() == Some("job-done") && r.ended_at.unwrap_or(0) < jobs_after
 }
 
 /// Whether `a` and `b` say the same, whatever their `seq`.
@@ -572,7 +586,7 @@ pub fn directory(d: &Daemon, query: Option<&str>) -> Value {
         ),
     };
     // A row that ended yet is seen live again (no hook said so) is shown live.
-    own_ended.retain(|r| live.iter().all(|s| s.key.0 != r.key));
+    own_ended.retain(|(r, _)| live.iter().all(|s| s.key.0 != r.key));
     let remote_ones = stored(d);
     let (own, wakes): (Member, HashSet<String>) = {
         let t = d.team.lock().unwrap();
@@ -644,7 +658,7 @@ pub fn directory(d: &Daemon, query: Option<&str>) -> Value {
             .filter(|r| mine(r, "", None))
             .map(|r| record(&me, r, "")),
     );
-    for row in &own_ended {
+    for (row, hidden) in &own_ended {
         let e = ended_of(row, false);
         let r = as_remote(&e);
         if mine(&r, &row.cwd, row.handle.as_ref()) {
@@ -657,6 +671,9 @@ pub fn directory(d: &Daemon, query: Option<&str>) -> Value {
                 .as_deref()
                 .and_then(|c| sessions::resume(&row.provider, c, &row.cwd))
                 .into();
+            if *hidden {
+                v["hidden"] = true.into();
+            }
             out.push(v);
         }
     }

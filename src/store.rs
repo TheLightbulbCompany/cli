@@ -384,7 +384,8 @@ impl Store {
     }
 
     /// Marks `key` as registered under a hidden folder at `now` (`hidden`), or no longer;
-    /// whether the mark changed. A mark not renewed for a day goes with `prune_hidden`, unless its session is live.
+    /// whether the mark changed. A mark not renewed for a week goes with `prune_hidden`, unless its
+    /// session is live or an ended row holds its key.
     pub fn set_hidden(&self, key: &str, hidden: bool, now: i64) -> rusqlite::Result<bool> {
         let was = self
             .conn
@@ -407,17 +408,19 @@ impl Store {
         Ok(was != hidden)
     }
 
-    /// Deletes the hidden marks last renewed before `since` but those of `live` sessions: a
-    /// live one stays hidden however long it idles without a hook event.
+    /// Deletes the hidden marks last renewed before `since` but those of `live` sessions and of
+    /// ended rows: a live one stays hidden however long it idles without a hook event, and what
+    /// ended there stays hidden while it is listed.
     pub fn prune_hidden(
         &self,
         since: i64,
         live: &std::collections::HashSet<&str>,
     ) -> rusqlite::Result<()> {
         let old: Vec<String> = {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT key FROM hidden_sessions WHERE updated_at < ?1")?;
+            let mut stmt = self.conn.prepare(
+                "SELECT key FROM hidden_sessions WHERE updated_at < ?1 AND key NOT IN \
+                 (SELECT key FROM sessions WHERE ended_at IS NOT NULL)",
+            )?;
             let rows = stmt.query_map([since], |r| r.get(0))?;
             rows.collect::<rusqlite::Result<_>>()?
         };
@@ -1293,7 +1296,7 @@ mod tests {
     }
 
     #[test]
-    fn a_hidden_mark_says_when_it_changed_and_goes_a_day_after_its_last_renewal() {
+    fn a_hidden_mark_says_when_it_changed_and_goes_when_nothing_holds_it() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("state.db")).unwrap();
         let none = std::collections::HashSet::new();
@@ -1304,6 +1307,12 @@ mod tests {
         // A live session's mark stays however old.
         store.prune_hidden(21, &["k"].into()).unwrap();
         assert!(store.hidden_keys().unwrap().contains("k"));
+        // Nor while an ended row holds its key.
+        store.put_session(&sample("k")).unwrap();
+        store.end_session("k", 15, "session-end", None).unwrap();
+        store.prune_hidden(21, &none).unwrap();
+        assert!(store.hidden_keys().unwrap().contains("k"));
+        store.ended_since(100, &HashSet::new()).unwrap();
         store.prune_hidden(21, &none).unwrap();
         assert!(store.hidden_keys().unwrap().is_empty());
         assert!(!store.set_hidden("k", false, 30).unwrap());

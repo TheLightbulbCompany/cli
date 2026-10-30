@@ -499,13 +499,21 @@ async fn off_folder_sessions_are_not_published() {
     let ended_ids: Vec<&str> = ended.iter().map(|e| e.session_id.as_str()).collect();
     assert_eq!(ended_ids, [o2.as_str()]);
     assert_eq!(ended[0].folder, "open");
-    // Locally the off-folder session is still listed, marked hidden; what ended there is not.
+    // Locally the off-folder sessions are still listed, marked hidden, what ended there too: its
+    // owner can still resume it.
     let local = directory(&a, None);
-    assert_eq!(local.len(), 3, "{local:?}");
+    assert_eq!(local.len(), 4, "{local:?}");
     let was = |s: &Value| s["status"] == "ended";
     let local_ended: Vec<&Value> = local.iter().filter(|s| was(s)).collect();
-    assert_eq!(local_ended.len(), 1, "{local:?}");
-    assert_eq!(local_ended[0]["session_id"], o2.as_str());
+    assert_eq!(local_ended.len(), 2, "{local:?}");
+    let h1 = format!("{sa}/codex:h1");
+    let ended_row = |id: &str| {
+        let row = local_ended.iter().find(|s| s["session_id"] == id);
+        row.unwrap_or_else(|| panic!("{id}: {local:?}"))
+    };
+    assert_eq!(ended_row(&o2)["hidden"], Value::Null);
+    assert_eq!(ended_row(&h1)["hidden"], true);
+    assert!(ended_row(&h1)["resume"].is_string());
     let flag = |c: &str| {
         let id = format!("{sa}/codex:{c}");
         local
@@ -515,6 +523,51 @@ async fn off_folder_sessions_are_not_published() {
             .clone()
     };
     assert_eq!((flag("h2"), flag("o1")), (json!(true), Value::Null));
+}
+
+/// Months of finished jobs reach their owner's Recent, not teammates: the first read of Claude's
+/// listing stamps the line. A job that ends after it is news.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn only_jobs_over_after_the_first_listing_are_published() {
+    use std::os::unix::fs::PermissionsExt;
+    let shim = tempfile::tempdir().unwrap();
+    let listing = shim.path().join("listing.json");
+    let job = |id: &str, started: u64| {
+        json!({"cwd": "/tmp/p", "kind": "background", "id": "ab12", "state": "done",
+            "name": "the job", "startedAt": started * 1000, "sessionId": id})
+    };
+    let old = "a1b2c3d4-0000-4000-8000-00000000000a";
+    let new = "a1b2c3d4-0000-4000-8000-00000000000b";
+    std::fs::write(&listing, json!([job(old, ipc::now() - 3_600)]).to_string()).unwrap();
+    let exe = shim.path().join("claude");
+    std::fs::write(&exe, format!("#!/bin/sh\ncat '{}'\n", listing.display())).unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let env = [
+        ("PATH", format!("{}:/usr/bin:/bin", shim.path().display())),
+        ("LIGHTBULB_CONNECT_DEBUG_LISTING", "1".to_string()),
+    ];
+    let (a, b) = common::pair(&env);
+    let sa = a.short();
+    let (old, new) = (format!("{sa}/claude:{old}"), format!("{sa}/claude:{new}"));
+    let row = |e: &Env, key: &str| {
+        directory(e, None)
+            .into_iter()
+            .find(|r| r["session_id"] == key)
+    };
+    until(15, "its owner sees the old job", || row(&a, &old).is_some());
+    assert_eq!(row(&a, &old).unwrap()["status"], "ended");
+
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let (first, second) = (
+        job("a1b2c3d4-0000-4000-8000-00000000000a", ipc::now() - 3_600),
+        job("a1b2c3d4-0000-4000-8000-00000000000b", ipc::now()),
+    );
+    std::fs::write(&listing, json!([first, second]).to_string()).unwrap();
+    // A new row: news, so the listing is read soon.
+    assert_eq!(register(&a, "codex", "poke", "/tmp/p")["ok"], true);
+    until(15, "B sees the new job", || row(&b, &new).is_some());
+    assert!(row(&b, &old).is_none(), "old news stays home");
+    assert!(row(&a, &old).is_some());
 }
 
 /// A Claude session its hook registered under an off folder, which Claude's own file names

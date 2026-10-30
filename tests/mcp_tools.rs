@@ -518,7 +518,7 @@ fn find_sessions_lists_ended_ones_after_the_live_with_their_resume() {
     assert_eq!(ids[2], ended, "{v}");
     assert_eq!(list[2]["status"], "ended", "{v}");
     assert_eq!(list[2]["reason"], "session-end", "{v}");
-    assert_eq!(list[2]["resume"], "codex resume t2", "{v}");
+    assert_eq!(list[2]["resume"], "cd '/tmp' && codex resume t2", "{v}");
     assert!(list[2]["ended_at"].is_u64(), "{v}");
     assert!(list[0].get("resume").is_none(), "{v}");
 }

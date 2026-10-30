@@ -267,8 +267,12 @@ async fn answer(d: &Arc<Daemon>, frame: Value) -> Value {
     }
 }
 
-/// `directory`'s answer without what is only of use on this computer: it does not leave it.
+/// `directory`'s answer without what is only of use on this computer, and without what is kept
+/// from teammates (its folder is hidden): neither leaves it.
 fn this_computers_own_kept(mut v: Value) -> Value {
+    if let Some(rows) = v["sessions"].as_array_mut() {
+        rows.retain(|r| r["hidden"] != true);
+    }
     for r in v["sessions"].as_array_mut().into_iter().flatten() {
         if let Some(o) = r.as_object_mut() {
             for f in ["resume", "pid", "birth_micros", "entrypoint", "kind", "job"] {
