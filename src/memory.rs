@@ -859,7 +859,7 @@ pub const RECALL_RESULTS: usize = 100;
 /// ...within this many tokens of evidence, as the benchmark counts them (`evidence_tokens`).
 pub const RECALL_TOKENS: usize = 8_000;
 
-/// A result's evidence tokens as the BEAM harness counts them (past.dev's published rule):
+/// A result's evidence tokens as the BEAM harness counts them (the harness's published rule):
 /// characters / 4, rounded up, of its content.
 fn evidence_tokens(content: &str) -> usize {
     content.chars().count().div_ceil(4)
