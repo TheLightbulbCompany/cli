@@ -98,20 +98,101 @@ pub(crate) fn request(
     body: Option<&str>,
     headers: &[(&str, &str)],
 ) -> Result<(u16, Value)> {
-    // A curl config string. Compact JSON holds no raw line break, so `\` and `"` are all.
-    let quoted = |s: &str| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""));
+    request_at(&api(), method, path, body, headers)
+}
+
+/// A curl config string. Compact JSON holds no raw line break, so `\` and `"` are all.
+fn quoted(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// `request` against `base` (an API base URL) instead of the public one.
+pub(crate) fn request_at(
+    base: &str,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+    headers: &[(&str, &str)],
+) -> Result<(u16, Value)> {
+    let mut config = head(base, method, path, headers);
+    if let Some(b) = body {
+        config.push_str("header = \"Content-Type: application/json\"\n");
+        config.push_str(&format!("data-raw = {}\n", quoted(b)));
+    }
+    curl(&config)
+}
+
+fn head(base: &str, method: &str, path: &str, headers: &[(&str, &str)]) -> String {
     let mut config = format!(
         "url = {}\nrequest = {}\n",
-        quoted(&format!("{}{path}", api())),
+        quoted(&format!("{base}{path}")),
         quoted(method)
     );
     for (k, v) in headers {
         config.push_str(&format!("header = {}\n", quoted(&format!("{k}: {v}"))));
     }
-    if let Some(b) = body {
-        config.push_str("header = \"Content-Type: application/json\"\n");
-        config.push_str(&format!("data-raw = {}\n", quoted(b)));
+    config
+}
+
+/// `POST {base}{path}` as multipart form data: `fields`, then `file` as `(field, path)`.
+/// The body is built here (random boundary) into a 0600 temp file and sent with
+/// `data-binary @file`, so `headers` can sign the sha256 of exactly the bytes sent: it is
+/// called with the body and returns the headers to add (the backend hashes the raw body).
+pub(crate) fn request_form(
+    base: &str,
+    path: &str,
+    fields: &[(&str, &str)],
+    file: Option<(&str, &std::path::Path)>,
+    headers: impl FnOnce(&[u8]) -> Result<Vec<(String, String)>>,
+) -> Result<(u16, Value)> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let boundary = format!("lightbulb{}", ulid::Ulid::generate());
+    let mut body = Vec::new();
+    for (k, v) in fields {
+        let k = k.replace(['"', '\r', '\n'], "_");
+        body.extend(
+            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n")
+                .as_bytes(),
+        );
     }
+    if let Some((k, p)) = file {
+        let name = p.file_name().map_or(String::new(), |n| {
+            n.to_string_lossy().replace(['"', '\r', '\n'], "_")
+        });
+        body.extend(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"; filename=\"{name}\"\r\nContent-Type: application/octet-stream\r\n\r\n").as_bytes());
+        body.extend(std::fs::read(p)?);
+        body.extend(b"\r\n");
+    }
+    body.extend(format!("--{boundary}--\r\n").as_bytes());
+    let headers = headers(&body)?;
+    let tmp = std::env::temp_dir().join(format!("lightbulb-form-{}", ulid::Ulid::generate()));
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)?
+        .write_all(&body)?;
+    let hs: Vec<(&str, &str)> = headers
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let mut config = head(base, "POST", path, &hs);
+    config.push_str(&format!(
+        "header = {}\n",
+        quoted(&format!(
+            "Content-Type: multipart/form-data; boundary={boundary}"
+        ))
+    ));
+    config.push_str(&format!(
+        "data-binary = {}\n",
+        quoted(&format!("@{}", tmp.display()))
+    ));
+    let out = curl(&config);
+    let _ = std::fs::remove_file(&tmp);
+    out
+}
+
+fn curl(config: &str) -> Result<(u16, Value)> {
     let mut c = Command::new("curl");
     c.args(["-q", "-sS", "--connect-timeout", "10", "--max-time", "30"])
         .args(["-K", "-", "-w", "\n%{http_code}"])
