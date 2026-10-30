@@ -74,7 +74,15 @@ pub(crate) fn done(
     id: &str,
     head: &str,
 ) -> std::result::Result<DoneState, ApiError> {
-    let s = status_of(auth, id)?;
+    done_with(root, &status_of(auth, id)?, head)
+}
+
+/// `done` for a status already in hand.
+pub(crate) fn done_with(
+    root: &Path,
+    s: &Value,
+    head: &str,
+) -> std::result::Result<DoneState, ApiError> {
     let not = |missing: &'static str, next: String| {
         Ok(DoneState {
             done: false,
@@ -82,6 +90,12 @@ pub(crate) fn done(
             next,
         })
     };
+    if s["state"] != "ready" {
+        return not(
+            "ready",
+            "wait for the build to finish, then run lightbulb app status".into(),
+        );
+    }
     let p = &s["preview"];
     if !p.is_object() {
         return not(
@@ -101,6 +115,15 @@ pub(crate) fn done(
             "the backend did not report the preview address".into(),
         );
     };
+    // The address comes from the backend and goes to curl: http(s) and no control characters.
+    if !(url.starts_with("http://") || url.starts_with("https://"))
+        || url.chars().any(char::is_control)
+    {
+        return not(
+            "preview",
+            "the backend reported a preview address that is not a web address".into(),
+        );
+    }
     let url = url.trim_end_matches('/');
     let health = format!("{url}/api/_lightbulb/health");
     if !matches!(login::request_at(url, "GET", "/api/_lightbulb/health", None, &[]),
@@ -116,8 +139,11 @@ pub(crate) fn done(
     let ready = match p["ready_at"].as_str().and_then(parse) {
         Some(t) => t,
         None => {
-            if progress["preview_seen"]["commit"] != head {
-                progress["preview_seen"] = json!({"commit": head, "at": rfc3339(now())});
+            if progress["preview_seen"]["commit"] != head
+                || progress["preview_seen"]["deployment_id"] != p["deployment_id"]
+            {
+                progress["preview_seen"] = json!({"commit": head,
+                    "deployment_id": p["deployment_id"], "at": rfc3339(now())});
                 check::write_progress(root, &progress)?;
             }
             progress["preview_seen"]["at"]
@@ -185,12 +211,17 @@ pub(crate) fn record(
         Ok(h) => h,
         Err(e) => return Ok(fail(json, &e.code, &e.message, &e.next)),
     };
-    // Offline or not up yet is fine: the deployment is just not named.
+    if let Some(e) = in_repo(root, file) {
+        return Ok(fail(json, &e.code, &e.message, &e.next));
+    }
+    // Offline or not up yet is fine: the deployment is just not named. A preview for another
+    // commit is not the one that was looked at.
     let deployment = std::fs::read(root.join(".lightbulb/app.json"))
         .ok()
         .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
         .and_then(|a| a["app_id"].as_str().map(String::from))
         .and_then(|id| status_of(auth, &id).ok())
+        .filter(|s| s["preview"]["commit"] == head)
         .map(|s| s["preview"]["deployment_id"].clone())
         .unwrap_or(Value::Null);
     let sha: String = Sha256::digest(&bytes)
@@ -219,4 +250,25 @@ pub(crate) fn record(
         );
     }
     Ok(0)
+}
+
+/// A file inside the app that git would commit would move HEAD on the next `up`.
+fn in_repo(root: &Path, file: &Path) -> Option<ApiError> {
+    let (root, file) = (root.canonicalize().ok()?, file.canonicalize().ok()?);
+    if !file.starts_with(&root) {
+        return None;
+    }
+    let ignored = std::process::Command::new("git")
+        .current_dir(&root)
+        .args(["check-ignore", "-q", "--"])
+        .arg(&file)
+        .status()
+        .is_ok_and(|s| s.success());
+    (!ignored).then(|| {
+        ApiError::new(
+            "file_in_repo",
+            "That file is inside the app and git would commit it, which changes the version.",
+            "save it under .lightbulb/evidence/ or outside the app",
+        )
+    })
 }

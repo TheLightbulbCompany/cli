@@ -394,13 +394,17 @@ pub(crate) fn up(
     }
     let mut r = r;
     let id = r["app_id"].as_str().unwrap_or_default().to_string();
+    let mut failed_while_waiting = false;
     if matches!(r["state"].as_str(), Some("building" | "provisioning")) {
         match wait(auth, &id, &mut r) {
             Ok(()) => {}
             Err(e) => return Ok(failure(json, e)),
         }
+        failed_while_waiting = true;
     }
-    let extra = if r["state"] == "ready" {
+    let extra = if r["state"] == "failed" && failed_while_waiting {
+        json!({"done": false, "next": "run lightbulb app status --errors to see why the build failed"})
+    } else if r["state"] == "ready" {
         let state = git_ok(root, &["rev-parse", "HEAD"])
             .and_then(|head| evidence::done(root, auth, &id, &head));
         match state {

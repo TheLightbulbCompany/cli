@@ -102,8 +102,15 @@ pub(crate) fn request(
 }
 
 /// A curl config string. Compact JSON holds no raw line break, so `\` and `"` are all.
-fn quoted(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+/// A value with a control character (a line break would start a new curl option) is refused.
+fn quoted(s: &str) -> Result<String> {
+    if s.chars().any(char::is_control) {
+        return Err("A value for the request has a control character in it.".into());
+    }
+    Ok(format!(
+        "\"{}\"",
+        s.replace('\\', "\\\\").replace('"', "\\\"")
+    ))
 }
 
 /// `request` against `base` (an API base URL) instead of the public one.
@@ -114,24 +121,24 @@ pub(crate) fn request_at(
     body: Option<&str>,
     headers: &[(&str, &str)],
 ) -> Result<(u16, Value)> {
-    let mut config = head(base, method, path, headers);
+    let mut config = head(base, method, path, headers)?;
     if let Some(b) = body {
         config.push_str("header = \"Content-Type: application/json\"\n");
-        config.push_str(&format!("data-raw = {}\n", quoted(b)));
+        config.push_str(&format!("data-raw = {}\n", quoted(b)?));
     }
     curl(&config)
 }
 
-fn head(base: &str, method: &str, path: &str, headers: &[(&str, &str)]) -> String {
+fn head(base: &str, method: &str, path: &str, headers: &[(&str, &str)]) -> Result<String> {
     let mut config = format!(
         "url = {}\nrequest = {}\n",
-        quoted(&format!("{base}{path}")),
-        quoted(method)
+        quoted(&format!("{base}{path}"))?,
+        quoted(method)?
     );
     for (k, v) in headers {
-        config.push_str(&format!("header = {}\n", quoted(&format!("{k}: {v}"))));
+        config.push_str(&format!("header = {}\n", quoted(&format!("{k}: {v}"))?));
     }
-    config
+    Ok(config)
 }
 
 /// `POST {base}{path}` as multipart form data: `fields`, then `file` as `(field, path)`.
@@ -176,18 +183,21 @@ pub(crate) fn request_form(
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
-    let mut config = head(base, "POST", path, &hs);
-    config.push_str(&format!(
-        "header = {}\n",
-        quoted(&format!(
-            "Content-Type: multipart/form-data; boundary={boundary}"
-        ))
-    ));
-    config.push_str(&format!(
-        "data-binary = {}\n",
-        quoted(&format!("@{}", tmp.display()))
-    ));
-    let out = curl(&config);
+    let config = (|| -> Result<String> {
+        let mut config = head(base, "POST", path, &hs)?;
+        config.push_str(&format!(
+            "header = {}\n",
+            quoted(&format!(
+                "Content-Type: multipart/form-data; boundary={boundary}"
+            ))?
+        ));
+        config.push_str(&format!(
+            "data-binary = {}\n",
+            quoted(&format!("@{}", tmp.display()))?
+        ));
+        Ok(config)
+    })();
+    let out = config.and_then(|c| curl(&c));
     let _ = std::fs::remove_file(&tmp);
     out
 }

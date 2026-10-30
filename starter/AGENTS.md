@@ -17,7 +17,9 @@ change anything.
 4. **Check, cheapest first:** `lightbulb app check` (type check, lint, design lint, build), then
    `lightbulb app up` (deploys the preview, runs the health check, reads the logs). When `up` asks
    for it, open the preview in the shared browser, walk the flow, and record it with
-   `lightbulb app evidence --kind browser`.
+   `lightbulb app evidence --kind browser --file .lightbulb/evidence/<name>.png`. Keep the file
+   under `.lightbulb/evidence/` (git ignores it) or outside the app, so it never changes the
+   version. `lightbulb app status` shows `done` without redeploying.
 5. **Post nothing until `up` says `done: true`.** Then post the preview link and what you built,
    in two or three plain sentences.
 6. **Same error twice: stop patching.** When `up` or `check` says `next: "diagnose"`, read the

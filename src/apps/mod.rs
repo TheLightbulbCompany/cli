@@ -378,13 +378,23 @@ pub fn status(errors: bool, json: bool) -> Result<i32> {
         ));
     };
     let get = |what: &str| api::call(&auth, "GET", &format!("/{id}/{what}"), None);
+    let head = match ship::git_ok(&root, &["rev-parse", "HEAD"]) {
+        Ok(h) => h,
+        Err(e) => return Ok(fail(json, &e.code, &e.message, &e.next)),
+    };
     let out = get("status").and_then(|s| {
-        if errors {
-            Ok(json!({"status": ship::status_contract(&s),
-                "errors": ship::errors_contract(&get("errors")?)}))
+        // Whether the preview is done, so a builder need not run `up` again to learn it.
+        let d = evidence::done_with(&root, &s, &head)?;
+        let mut v = if errors {
+            json!({"status": ship::status_contract(&s),
+                "errors": ship::errors_contract(&get("errors")?)})
         } else {
-            Ok(ship::status_contract(&s))
-        }
+            ship::status_contract(&s)
+        };
+        v["done"] = d.done.into();
+        v["missing"] = json!(d.missing);
+        v["next"] = d.next.into();
+        Ok(v)
     });
     match out {
         Ok(v) => {
