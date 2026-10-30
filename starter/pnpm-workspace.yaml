@@ -1,0 +1,7 @@
+# pnpm reads its settings here; .npmrc carries the same package-age rule for npm.
+minimumReleaseAge: 1440
+# Install scripts stay off: these packages ship prebuilt binaries.
+allowBuilds:
+  esbuild: false
+  sharp: false
+  unrs-resolver: false

@@ -1,0 +1,101 @@
+# Building this app
+
+This is a Next.js app that a Lightbulb workspace asked for. You build it, check it, and hand the
+room a preview link. `app.yaml` says what kind of app it is (`kind`), who can open it (`open_to`)
+and which services it gets (`services`). Read this file, then `playbooks/<kind>.md`, before you
+change anything.
+
+## The workflow
+
+1. **Read before you ask.** Read the request, the room, the workspace brand, any linked page or
+   attached file, and `.lightbulb/plan.md`. Ask at most one question card, and only for what you
+   could not read. The playbook lists what never to ask.
+2. **Write the plan** in `.lightbulb/plan.md`: what you build first, what "done" means (from the
+   playbook), what you will check.
+3. **Build the screens first, on sample data.** Put sample rows in `drizzle/seed.sql`. Add real
+   data, then sign-in, only when a feature needs them.
+4. **Check, cheapest first:** `lightbulb app check` (type check, lint, design lint, build), then
+   `lightbulb app up` (deploys the preview, runs the health check, reads the logs). When `up` asks
+   for it, open the preview in the shared browser, walk the flow, and record it with
+   `lightbulb app evidence --kind browser`.
+5. **Post nothing until `up` says `done: true`.** Then post the preview link and what you built,
+   in two or three plain sentences.
+6. **Same error twice: stop patching.** When `up` or `check` says `next: "diagnose"`, read the
+   logs (`lightbulb app status --errors`), check `.lightbulb/known-fixes.md`, and write a fresh
+   plan before touching code. When it says `next: "undo"`, roll back and tell the room plainly what
+   failed. If a Lightbulb command itself is broken, run `lightbulb app report-broken-tool` and stop.
+7. **Write a lesson** in `.lightbulb/lessons.md` after every failure you resolve: what broke, why,
+   what fixed it. Read the lessons for an area before you touch it.
+8. **One commit per turn**, with a message that says what changed for the person.
+
+## Safety rules (never break these)
+
+- **No secret in code, in a commit, or in the room.** Keys arrive as environment variables through
+  Lightbulb. If you need one, ask for it through a form card, never in the thread.
+- **Never remove or loosen the door** (`src/proxy.ts`, `src/lib/door.ts`, `src/app/%5Flightbulb/`,
+  `src/app/api/%5Flightbulb/`). Every page and route sits behind it.
+- **The schema only grows.** Add tables and columns; never drop, rename or narrow one. If a change
+  needs that, `up` turns it into an owner card that shows the SQL; wait for the owner.
+- **Data access is server-only.** Only server components, route handlers and server actions import
+  `@/lib/db`. The browser never sees a database URL or key.
+- **Start read-only or undoable.** Delete, pay, send, or publish only when the person asked for that
+  exact action.
+
+## Stack
+
+- Next.js 16 App Router, React 19, TypeScript (strict).
+- Tailwind CSS 4 with the shadcn/ui kit in `src/components/ui/` (Radix underneath).
+- Drizzle ORM on Postgres: Neon when `DATABASE_URL` is set; PGlite in memory with the seed when
+  `LIGHTBULB_SAMPLE_DATA=1`.
+- lucide-react icons, react-hook-form + zod for forms, sonner for toasts, recharts for charts.
+- Vitest for tests. pnpm for packages.
+
+## Where things go
+
+- Pages: `src/app/<route>/page.tsx`. The home page is `src/app/page.tsx`. **When you make a new
+  component, import it into a page**, or nobody sees it.
+- Components: `src/components/`. Kit components stay in `src/components/ui/`.
+- Server logic: route handlers in `src/app/api/<name>/route.ts`, or server actions.
+- Tables: `src/lib/db/schema.ts`, then `pnpm db:generate` to write the migration in `drizzle/`.
+  Never hand-edit a generated migration. Sample data: `drizzle/seed.sql`.
+- Colours, radius, fonts: `design/tokens.css`; why: `design/DESIGN.md`.
+- Tests: next to the code, `*.test.ts`.
+- Plan, lessons, known fixes: `.lightbulb/`.
+
+## Library rules
+
+- **UI:** use `src/components/ui/` first. Build missing pieces from Radix plus Tailwind in the same
+  style. No other component libraries.
+- **Styling:** Tailwind classes using the tokens (`bg-primary`, `text-muted-foreground`). No raw
+  colours and no one-off values like `w-[317px]`; `pnpm check` fails on them. No CSS-in-JS.
+- **Icons:** `lucide-react` only.
+- **Forms:** `react-hook-form` with a `zod` schema through `@hookform/resolvers/zod`, and
+  `src/components/ui/form.tsx`. Validate again on the server.
+- **Data:** `const db = await getDb()` from `@/lib/db`, then Drizzle queries. Don't use
+  `db.transaction` (the Neon HTTP driver has none); make each write one statement
+  (`insert ... returning`, `update ... where`).
+- **Toasts:** `toast()` from `sonner` with `<Toaster />` from `src/components/ui/sonner.tsx`.
+- **Charts:** `src/components/ui/chart.tsx` around recharts.
+- **Packages:** add one only when the stack above can't do the job. Pin it to an exact version.
+  pnpm refuses versions less than a day old; pick the previous one.
+
+## Tests
+
+Write a small test for every business rule: a price, a limit, who can see what. Run `pnpm test`.
+Keep tests that pass; they run on every check.
+
+## Common mistakes
+
+- Creating `src/pages/`. This app uses the App Router: `src/app/`.
+- Naming a route folder `_something`. Folders that start with `_` are private and never routed;
+  write `%5Fsomething` for a URL that starts with `_`.
+- `import { db } from "@/lib/db"`. Wrong: there is no `db` export. Right:
+  `const db = await getDb()`.
+- Importing `@/lib/db` from a file that starts with `"use client"`. The build fails. Fetch in a
+  server component and pass the rows down as props.
+- `import { Button } from "@/components/button"`. Right: `import { Button } from "@/components/ui/button"`.
+- `className="bg-[#2563eb]"`. Right: a token, `bg-primary`; add the colour to `design/tokens.css`.
+- Using `useState` or `onClick` in a file without `"use client"` at the top.
+- Editing a migration in `drizzle/` after it has run. Change `schema.ts` and generate a new one.
+- Reading `process.env.SOME_KEY` in a client component. It is undefined there, and it must stay so.
+- Saying it works before `up` says `done: true`.

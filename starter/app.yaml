@@ -1,0 +1,6 @@
+name: {{name}}
+services: ["vercel/project", "neon/postgres"]
+open_to: room
+budget_usd: 10
+kind: site
+origin: {"kind": "idea"}

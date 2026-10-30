@@ -3,6 +3,7 @@
 //! `app.yaml` is the app's settings; its parser is hand-rolled for exactly six keys.
 
 pub mod api;
+pub mod starter;
 
 use crate::Result;
 use clap::{Subcommand, ValueEnum};

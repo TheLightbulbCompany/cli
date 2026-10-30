@@ -384,3 +384,31 @@ fn evidence_kind_is_a_flag_browser_or_review() {
     );
     assert_eq!(run(&["app", "evidence", "browser"]).status.code(), Some(2));
 }
+
+#[test]
+fn starter_table_contains_agents_md() {
+    use lightbulb::apps::starter::FILES;
+    let paths: Vec<&str> = FILES.iter().map(|(p, _)| *p).collect();
+    let mut sorted = paths.clone();
+    sorted.sort();
+    assert_eq!(paths, sorted);
+    let agents = FILES.iter().find(|(p, _)| *p == "AGENTS.md").unwrap().1;
+    assert!(std::str::from_utf8(agents).unwrap().contains("done: true"));
+    assert_eq!(
+        FILES.iter().find(|(p, _)| *p == "CLAUDE.md").unwrap().1,
+        b"@AGENTS.md\n"
+    );
+    for p in [
+        "app.yaml",
+        "package.json",
+        "pnpm-lock.yaml",
+        "src/proxy.ts",
+        "LICENSE",
+        "NOTICE",
+    ] {
+        assert!(paths.contains(&p), "{p} missing");
+    }
+    assert!(!paths
+        .iter()
+        .any(|p| p.starts_with("node_modules/") || p.starts_with(".next/")));
+}
