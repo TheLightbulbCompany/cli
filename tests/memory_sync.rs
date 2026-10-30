@@ -351,3 +351,49 @@ fn an_entry_with_a_secret_only_in_its_source_is_refused_on_accept() {
     assert!(held(&b, &e.author).is_empty());
     assert_eq!(memory::heads(&b.store()).unwrap()[&e.author], 1);
 }
+
+/// A workspace computer's entries (its member has a doorbell in the roster) are not relayed by
+/// another member, which cannot tell who is in that workspace; that computer sends them itself
+/// (`member::workspace_entries_reach_only_workspace_members`). A's own team entry still goes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_workspace_computers_entries_are_not_relayed() {
+    let (a, b) = (Env::new(), Env::new());
+    seed_pair(&a, &b);
+    let w = common::identity();
+    let store = a.store();
+    let head = roster::entries(&store).unwrap().pop().unwrap();
+    let admit = common::admit(&a.identity(), &head, &w, "w", json!({}));
+    let wake = json!({"wake": {"url": "https://example.test/w", "token": "o.s"}});
+    let meta = roster::Entry::signed(&w, vec![admit.hash()], roster::Kind::Meta, wake, 3);
+    for e in [&admit, &meta] {
+        roster::accept(&store, e, 10).unwrap();
+    }
+    let room = memory::remember(
+        &store,
+        &w,
+        op("room", "from a workspace room", Scope::Team),
+        5,
+    )
+    .unwrap();
+    drop(store);
+    let mine = remember(&a, op("db", "postgres 16", Scope::Team));
+    a.daemon(false, "", &[]);
+    let ep = endpoint(&b.identity()).await;
+    let mut p = Peer::dial(&ep, &a).await;
+    p.hello_full(vec![], None, true).await;
+    p.send(&Frame::MemoryHeads {
+        heads: Default::default(),
+    })
+    .await;
+    let mut got = vec![];
+    let end = tokio::time::Instant::now() + Duration::from_secs(2);
+    while let Ok(Ok(f)) =
+        tokio::time::timeout_at(end, lightbulb::net::frames::read(&mut p.recv)).await
+    {
+        if let Frame::Memory { entries, .. } = f {
+            got.extend(entries.into_iter().map(|e| e.id));
+        }
+    }
+    assert!(got.contains(&mine.id), "{got:?}");
+    assert!(!got.contains(&room.id), "{got:?}");
+}
