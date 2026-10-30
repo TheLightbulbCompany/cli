@@ -12,3 +12,9 @@ paths = ['''docs/acceptance-plan-a\.md''']
 [[allowlists]]
 description = "fake keys the memory and capture refusal tests feed in"
 paths = ['''tests/memory_store\.rs''', '''tests/memory_sync\.rs''', '''tests/cli\.rs''', '''tests/capture\.rs''', '''tests/embed_model\.rs''', '''tests/memory_tools\.rs''']
+
+# The apps tests feed a fake `sk_live_…` key to the secret-file refusal check and a made-up cookie secret to the
+# door and content tests; none is a credential.
+[[allowlists]]
+description = "fake keys and test cookie secrets in the apps tests"
+paths = ['''tests/apps\.rs''', '''starter/src/lib/door\.test\.ts''', '''starter/addons/content/src/lib/content\.test\.ts''']
