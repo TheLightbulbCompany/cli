@@ -5,7 +5,7 @@
 use iroh::Endpoint;
 use lightbulb::daemon::ipc;
 use lightbulb::identity::Identity;
-use lightbulb::net::frames::{Frame, Remote};
+use lightbulb::net::frames::{Ended, Frame, Remote};
 use lightbulb::os;
 use lightbulb::roster::Entry;
 use serde_json::{json, Value};
@@ -161,6 +161,98 @@ async fn each_member_sees_the_whole_directory() {
     assert!(theirs.into_iter().all(|s| s["handle"].is_null()), "{d}");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_teammates_ended_session_is_seen_for_a_week_and_never_its_resume() {
+    let (a, b) = (Env::new(), Env::new());
+    seed_pair(&a, &b);
+    start_pair(&a, &b, "", &[]);
+    assert_eq!(register(&a, "claude", "a1", "/tmp/work/api")["ok"], true);
+    let key = format!("{}/claude:a1", a.short());
+    until(10, "B sees the session", || sees(&b, &key));
+    let r = a.ask(json!({"id": 1, "op": "end", "key": key, "reason": "session-end"}));
+    assert_eq!(r["ended"], true, "{r}");
+
+    let row = |e: &Env, q: Option<&str>| {
+        directory(e, q)
+            .into_iter()
+            .find(|r| r["session_id"] == key.as_str())
+    };
+    until(10, "B sees it ended", || {
+        row(&b, None).is_some_and(|r| r["status"] == "ended")
+    });
+    let theirs = row(&b, None).unwrap();
+    assert_eq!(theirs["reason"], "session-end", "{theirs}");
+    assert!(theirs["ended_at"].is_u64(), "{theirs}");
+    assert_eq!(theirs["cwd"], "", "{theirs}");
+    assert!(theirs.get("resume").is_none(), "{theirs}");
+    // A query finds an ended row too.
+    assert!(row(&b, Some("prasiddha")).is_some());
+    assert!(row(&b, Some("nothing-matches")).is_none());
+
+    let mine = row(&a, None).unwrap();
+    assert_eq!(mine["status"], "ended", "{mine}");
+    assert_eq!(mine["resume"], "claude --resume a1", "{mine}");
+    assert_eq!(mine["cwd"], "/tmp/work/api", "{mine}");
+
+    // The same conversation live again is one live row, on both sides.
+    assert_eq!(register(&a, "claude", "a1", "/tmp/work/api")["ok"], true);
+    until(10, "B sees it live again", || sees(&b, &key));
+    let all = directory(&a, None);
+    let rows = all.iter().filter(|r| r["session_id"] == key.as_str());
+    assert_eq!(rows.count(), 1, "{all:?}");
+    let all = directory(&b, None);
+    let rows = all.iter().filter(|r| r["session_id"] == key.as_str());
+    assert_eq!(rows.count(), 1, "{all:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_presence_with_fifty_one_ended_rows_is_dropped() {
+    let (a, b) = (Env::new(), Env::new());
+    let [_, admit] = seed_pair(&a, &b);
+    a.daemon(false, "", &[]);
+    let ib = b.identity();
+    let (_ep, mut p) = played(&ib, &a, &admit).await;
+    until(5, "A sees B online", || a.status()["peers"]["online"] == 1);
+    let live = format!("{}/codex:live", ib.short);
+    let ended = |n: usize| -> Vec<Ended> {
+        (0..n)
+            .map(|i| Ended {
+                session_id: format!("{}/codex:e{i}", ib.short),
+                agent: "codex".into(),
+                folder: "x".into(),
+                title: None,
+                repo: None,
+                branch: None,
+                ended_at: ipc::now(),
+                reason: "session-end".into(),
+            })
+            .collect()
+    };
+    let with = |seq: u64, n: usize| {
+        let mut f = presence(&ib.key, seq, &[&live]);
+        if let Frame::Presence { ended: e, .. } = &mut f {
+            *e = ended(n);
+        }
+        f
+    };
+    p.send(&with(1, 50)).await;
+    let fifty = || {
+        directory(&a, None)
+            .iter()
+            .filter(|r| r["status"] == "ended")
+            .count()
+    };
+    until(5, "A holds the fifty", || fifty() == 50);
+    // The next one is past the cap: all of it goes, and the fence after it shows A read on.
+    p.send(&with(2, 51)).await;
+    let fence = format!("{}/codex:fence", ib.short);
+    p.send(&presence(&ib.key, 3, &[&fence])).await;
+    until(5, "A applies the fence", || sees(&a, &fence));
+    let log = std::fs::read_to_string(a.state.path().join("daemon.log")).unwrap();
+    let line = format!("net: dropped a presence frame from {}", ib.short);
+    assert_eq!(log.matches(&line).count(), 1, "{log}");
+}
+
 /// `id` played over its own endpoint: dialed into `env` and past its `hello` (at `head`).
 async fn played(id: &Identity, env: &Env, head: &Entry) -> (Endpoint, Peer) {
     let ep = endpoint(id).await;
@@ -289,6 +381,7 @@ async fn off_folder_sessions_are_not_published() {
         sessions,
         known,
         kept,
+        ended,
         ..
     } = p.presence().await
     else {
@@ -300,10 +393,18 @@ async fn off_folder_sessions_are_not_published() {
     // The last path part, not the path.
     assert_eq!(sessions[0].folder, "open");
     let o2 = format!("{sa}/codex:o2");
-    assert_eq!((known, kept), (vec![o2.clone()], vec![o2]));
-    // Locally the off-folder session is still listed, marked hidden.
+    assert_eq!((known, kept), (vec![o2.clone()], vec![o2.clone()]));
+    // The off-folder session that ended is not on the wire: the open one is, by its last part.
+    let ended_ids: Vec<&str> = ended.iter().map(|e| e.session_id.as_str()).collect();
+    assert_eq!(ended_ids, [o2.as_str()]);
+    assert_eq!(ended[0].folder, "open");
+    // Locally the off-folder session is still listed, marked hidden; what ended there is not.
     let local = directory(&a, None);
-    assert_eq!(local.len(), 2);
+    assert_eq!(local.len(), 3, "{local:?}");
+    let was = |s: &Value| s["status"] == "ended";
+    let local_ended: Vec<&Value> = local.iter().filter(|s| was(s)).collect();
+    assert_eq!(local_ended.len(), 1, "{local:?}");
+    assert_eq!(local_ended[0]["session_id"], o2.as_str());
     let flag = |c: &str| {
         let id = format!("{sa}/codex:{c}");
         local
@@ -448,4 +549,18 @@ async fn a_group_send_reaches_a_teammates_sessions() {
     assert!(o.status.success(), "{}{}", out(&o), common::err(&o));
     assert!(out(&o).contains("(Claude Code)"), "{}", out(&o));
     assert_eq!(b.take_one(&kb)["text"], "to the team");
+
+    // What has ended is listed, and a group send does not reach it.
+    assert_eq!(
+        b.ask(json!({"id": 1, "op": "end", "key": kb}))["ended"],
+        true
+    );
+    until(10, "A sees it ended", || !sees(&a, &kb));
+    let o = a.detached(&argv, "");
+    assert!(!o.status.success(), "{}", out(&o));
+    assert!(
+        common::err(&o).contains("No live session matches."),
+        "{}",
+        common::err(&o)
+    );
 }

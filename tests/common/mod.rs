@@ -602,6 +602,7 @@ pub fn remote(session_id: &str) -> Remote {
         doing: None,
         tier: "pull".into(),
         title: None,
+        waiting_for: None,
     }
 }
 
@@ -613,17 +614,18 @@ pub fn presence_with(member: &str, seq: u64, sessions: Vec<Remote>) -> Frame {
         sessions,
         known: vec![],
         kept: vec![],
+        ended: vec![],
     }
 }
 
-/// Whether `env`'s `directory` lists `session_id`.
+/// Whether `env`'s `directory` lists `session_id`, not ended.
 pub fn sees(env: &Env, session_id: &str) -> bool {
     let r = env.ask(json!({"id": 1, "op": "directory"}));
     r["sessions"]
         .as_array()
         .into_iter()
         .flatten()
-        .any(|s| s["session_id"] == session_id)
+        .any(|s| s["session_id"] == session_id && s["status"] != "ended")
 }
 
 /// A member `who` played by the test, dialed in: `hello`, then `presence`.

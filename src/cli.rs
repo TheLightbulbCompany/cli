@@ -369,7 +369,7 @@ pub fn send(
             .as_array()
             .into_iter()
             .flatten()
-            .filter(|s| s["hidden"] != true)
+            .filter(|s| s["hidden"] != true && s["status"] != "ended")
             .filter_map(|s| {
                 let key = s["key"].as_str().or(s["session_id"].as_str())?;
                 (target == "*" || key.starts_with(prefix)).then_some((key, s))

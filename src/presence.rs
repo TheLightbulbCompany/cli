@@ -4,10 +4,10 @@
 
 use crate::daemon::{ipc, Daemon, Declared};
 use crate::mail;
-use crate::net::frames::{Frame, Remote, STATUSES};
-use crate::roster::{Member, Role, Roster};
-use crate::sessions::{Session, Status};
-use crate::store::Store;
+use crate::net::frames::{Ended, Frame, Remote, STATUSES};
+use crate::roster::{Member, Role};
+use crate::sessions::{self, Session, Status};
+use crate::store::{self, Store};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -17,6 +17,8 @@ use std::time::{Duration, Instant};
 
 /// At most this many sessions, `known` and `kept` addresses each per presence.
 pub const MAX: usize = 100;
+/// At most this many ended sessions per presence, newest first.
+pub const MAX_ENDED: usize = 50;
 /// How long an ended session's or a name's address stays kept.
 pub const DAY: u64 = 86_400;
 /// How long an ended session stays listed, and an offline member's presence.
@@ -38,6 +40,7 @@ pub struct Latest {
     pub seen_at: u64,
     pub sessions: Vec<Remote>,
     pub kept: Vec<String>,
+    pub ended: Vec<Ended>,
 }
 
 /// The `agent` every member's latest presence declares, by session id (a workspace member's:
@@ -62,6 +65,7 @@ pub fn load(store: &Store) -> HashMap<String, Latest> {
                     seq,
                     sessions,
                     kept,
+                    ended,
                     ..
                 } => Some((
                     member,
@@ -70,6 +74,7 @@ pub fn load(store: &Store) -> HashMap<String, Latest> {
                         seen_at: u64::try_from(seen_at).unwrap_or(0),
                         sessions,
                         kept,
+                        ended,
                     },
                 )),
                 _ => None,
@@ -78,32 +83,54 @@ pub fn load(store: &Store) -> HashMap<String, Latest> {
         .collect()
 }
 
-/// This computer's person (`Roster::person_of` its key).
-pub fn my_person(d: &Daemon, r: &Roster) -> String {
-    r.person_of(&d.identity.key).to_string()
-}
-
-/// `s` as published: `folder` is `cwd`'s last part, or all of it with `share_paths`; repo and
-/// branch as its hook reported them.
-fn remote(s: &Session, share_paths: bool) -> Remote {
-    let folder = if share_paths {
-        s.cwd.clone()
+/// `cwd` as published: its last part, or all of it with `share_paths`.
+fn folder(cwd: &str, share_paths: bool) -> String {
+    if share_paths {
+        cwd.to_string()
     } else {
-        Path::new(&s.cwd)
+        Path::new(cwd)
             .file_name()
             .map(|f| f.to_string_lossy().into_owned())
             .unwrap_or_default()
-    };
+    }
+}
+
+/// `s` as published: `folder` as `folder` says; repo and branch as its hook reported them. A
+/// waiting session is `busy` with what for: `status` is limited to what older peers accept.
+pub(crate) fn remote(s: &Session, share_paths: bool) -> Remote {
+    let waiting = s.status == Status::Waiting;
     Remote {
         session_id: s.key.0.clone(),
         agent: s.provider.clone(),
         repo: s.repo.clone(),
         branch: s.branch.clone(),
-        folder,
-        status: STATUSES[usize::from(s.status != Status::Live)].into(),
+        folder: folder(&s.cwd, share_paths),
+        status: STATUSES[usize::from(s.status != Status::Live && !waiting)].into(),
         doing: s.doing.clone(),
         tier: s.tier.as_str().into(),
         title: s.title.clone(),
+        // Claude may not say what for: without this it would read as plain busy over there.
+        waiting_for: waiting.then(|| {
+            s.waiting_for
+                .clone()
+                .unwrap_or_else(|| "input needed".into())
+        }),
+    }
+    .clamp()
+}
+
+/// An ended row as published: no path, no resume. A row ended before reasons existed has none,
+/// so `Ended::valid` keeps it off the wire.
+fn ended_of(r: &store::Session, share_paths: bool) -> Ended {
+    Ended {
+        session_id: r.key.clone(),
+        agent: r.provider.clone(),
+        folder: folder(&r.cwd, share_paths),
+        title: r.title.clone(),
+        repo: r.repo.clone(),
+        branch: r.branch.clone(),
+        ended_at: u64::try_from(r.ended_at.unwrap_or(0)).unwrap_or(0),
+        reason: r.reason.clone().unwrap_or_default(),
     }
     .clamp()
 }
@@ -142,7 +169,8 @@ pub(crate) fn canonical(p: &Path) -> PathBuf {
 }
 
 /// This computer's presence: its live sessions (newest first), the non-live addresses still
-/// holding mail (`known`, newest mail first) and the kept ones (`kept`, newest first); nothing
+/// holding mail (`known`, newest mail first), the kept ones (`kept`, newest first) and those
+/// that ended within the week and are not live again (`ended`, newest first); nothing
 /// whose folder is under `folders_off`, nor an address whose folder it does not know.
 /// An embedded instance's is the sessions it declared (`declared`).
 fn build(d: &Daemon, seq: u64) -> Frame {
@@ -156,7 +184,15 @@ fn build(d: &Daemon, seq: u64) -> Frame {
     };
     let publishable = |cwd: &str| !hidden(&off, cwd);
     let mut live = ipc::live_sessions(d);
-    let ended = ipc::ended_sessions(d);
+    let ended_rows = ipc::ended_sessions(d);
+    // One invalid row would cost the receiver the whole presence.
+    let ended: Vec<Ended> = ended_rows
+        .iter()
+        .filter(|r| live.iter().all(|s| s.key.0 != r.key))
+        .map(|r| ended_of(r, share))
+        .filter(|e| e.valid(&d.identity.short))
+        .take(MAX_ENDED)
+        .collect();
     let (rows, waiting) = {
         let store = d.store.lock().unwrap();
         let since = now.saturating_sub(DAY) as i64;
@@ -171,7 +207,7 @@ fn build(d: &Daemon, seq: u64) -> Frame {
     let mine = format!("{}/", d.identity.short);
     let rows = rows
         .into_iter()
-        .chain(ended)
+        .chain(ended_rows)
         .map(|r| (r.key, r.ended_at.unwrap_or(r.seen_at), r.cwd));
     let mut candidates: Vec<(String, i64, String)> = rows
         .filter(|(k, _, cwd)| k.starts_with(&mine) && publishable(cwd))
@@ -210,6 +246,7 @@ fn build(d: &Daemon, seq: u64) -> Frame {
         sessions: live.iter().map(|s| remote(s, share)).chain(apps).collect(),
         known,
         kept,
+        ended,
     }
 }
 
@@ -221,15 +258,17 @@ fn same(a: &Frame, b: &Frame) -> bool {
                 sessions,
                 known,
                 kept,
+                ended,
                 ..
             },
             Frame::Presence {
                 sessions: s,
                 known: k,
                 kept: p,
+                ended: e,
                 ..
             },
-        ) => sessions == s && known == k && kept == p,
+        ) => sessions == s && known == k && kept == p && ended == e,
         _ => false,
     }
 }
@@ -276,6 +315,7 @@ fn declared(d: &Daemon, list: &Declared, seq: u64) -> Frame {
         sessions: list.sessions.to_vec(),
         known: vec![],
         kept: vec![],
+        ended: vec![],
     }
 }
 
@@ -367,6 +407,7 @@ pub fn put(d: &Daemon, member: &str, f: &Frame, now: u64, first: bool) {
         seq,
         sessions,
         kept,
+        ended,
         ..
     } = f
     else {
@@ -377,6 +418,7 @@ pub fn put(d: &Daemon, member: &str, f: &Frame, now: u64, first: bool) {
         seen_at: now,
         sessions: sessions.clone(),
         kept: kept.clone(),
+        ended: ended.clone(),
     };
     if accept(&mut d.latest.lock().unwrap(), member, l, first) {
         let text = serde_json::to_string(f).unwrap_or_default();
@@ -432,7 +474,7 @@ fn stored(d: &Daemon) -> Vec<(Member, Latest)> {
 /// `verified` as its label says it (`label::verified`); `online`, whether its computer is
 /// connected now (this one always is).
 fn record(m: &Member, s: &Remote, cwd: &str, verified: bool, online: bool) -> Value {
-    json!({
+    let mut v = json!({
         "session_id": s.session_id,
         "person": m.name,
         "person_id": m.person_id,
@@ -442,17 +484,41 @@ fn record(m: &Member, s: &Remote, cwd: &str, verified: bool, online: bool) -> Va
         "cwd": cwd,
         "repo": s.repo,
         "branch": s.branch,
-        "status": s.status,
+        "status": if s.waiting_for.is_some() && s.status == "busy" { "waiting" } else { s.status.as_str() },
         "doing": s.doing.clone().unwrap_or_default(),
         "title": s.title,
         "tier": s.tier,
         "online": online,
-    })
+    });
+    if s.status == "busy" {
+        if let Some(w) = &s.waiting_for {
+            v["waiting_for"] = w.as_str().into();
+        }
+    }
+    v
 }
 
-/// `directory {query?}` -> `{sessions}`: this computer's sessions, then every member's latest
-/// presence; `query` matches session id, person, computer, agent, folder (and this computer's
-/// full path), repo, branch, what it is doing or its title, any case.
+/// `e` in the shape `record` and a query read.
+fn as_remote(e: &Ended) -> Remote {
+    Remote {
+        session_id: e.session_id.clone(),
+        agent: e.agent.clone(),
+        repo: e.repo.clone(),
+        branch: e.branch.clone(),
+        folder: e.folder.clone(),
+        status: "ended".into(),
+        doing: None,
+        // Mail to it waits until it is resumed and looks.
+        tier: sessions::Tier::Pull.as_str().into(),
+        title: e.title.clone(),
+        waiting_for: None,
+    }
+}
+
+/// `directory {query?}` -> `{sessions}`: this computer's sessions, live then ended, then every
+/// member's latest presence, live then ended; `query` matches session id, person, computer,
+/// agent, folder (and this computer's full path), repo, branch, what it is doing or its title,
+/// any case. An ended row of this computer carries `resume`; no one else's can.
 pub fn directory(d: &Daemon, query: Option<&str>) -> Value {
     // This computer's, with their folders; an instance's are the sessions it declared.
     let local: Vec<(Remote, String, Option<String>, bool)> = match &d.cloud {
@@ -471,6 +537,14 @@ pub fn directory(d: &Daemon, query: Option<&str>) -> Value {
                     .map(|r| (r, String::new(), None, false)),
             )
             .collect(),
+    };
+    // A row that ended yet is seen live again (no hook said so) is shown live.
+    let own_ended: Vec<store::Session> = if d.cloud.is_some() {
+        vec![]
+    } else {
+        let mut rows = ipc::ended_sessions(d);
+        rows.retain(|r| local.iter().all(|(s, ..)| s.session_id != r.key));
+        rows
     };
     let remote_ones = stored(d);
     let own = {
@@ -521,10 +595,42 @@ pub fn directory(d: &Daemon, query: Option<&str>) -> Value {
             out.push(v);
         }
     }
+    for row in &own_ended {
+        let e = ended_of(row, false);
+        let r = as_remote(&e);
+        let named = |q: &String| {
+            row.handle
+                .as_deref()
+                .is_some_and(|h| h.to_lowercase().contains(q))
+        };
+        if hit(&own, &r, &row.cwd) || q.as_ref().is_some_and(named) {
+            let mut v = record(&own, &r, &row.cwd, true, true);
+            v["handle"] = row.handle.clone().into();
+            v["ended_at"] = e.ended_at.into();
+            v["reason"] = row.reason.clone().into();
+            v["resume"] = row
+                .conversation
+                .as_deref()
+                .and_then(|c| sessions::resume(&row.provider, c))
+                .into();
+            out.push(v);
+        }
+    }
+    let now = ipc::now();
     for (m, l) in &remote_ones {
         let (verified, up) = (crate::label::verified(m, key), d.peers.is_online(&m.key));
         for r in l.sessions.iter().filter(|r| hit(m, r, "")) {
             out.push(record(m, r, "", verified, up));
+        }
+        // An offline member's list stays a week past its last word; each row only its own week.
+        for e in l.ended.iter().filter(|e| e.ended_at + WEEK >= now) {
+            let r = as_remote(e);
+            if hit(m, &r, "") {
+                let mut v = record(m, &r, "", verified, up);
+                v["ended_at"] = e.ended_at.into();
+                v["reason"] = e.reason.as_str().into();
+                out.push(v);
+            }
         }
     }
     json!({ "sessions": out })
@@ -541,6 +647,7 @@ mod tests {
             seen_at: 1,
             sessions: vec![],
             kept: vec![format!("x/{seq}")],
+            ended: vec![],
         };
         let mut held = HashMap::new();
         let took: Vec<bool> = [5, 3, 5, 7]
