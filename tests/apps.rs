@@ -464,6 +464,8 @@ fn new_writes_the_starter_and_one_commit() {
     assert_eq!(cfg.name, "team-lunch");
     assert_eq!(cfg.open_to, OpenTo::Workspace);
     assert_eq!(cfg.origin.kind, "ask");
+    assert_eq!(cfg.services, ["vercel/project", "neon/postgres"]);
+    assert_eq!(cfg.budget_usd, 10);
     let pkg = std::fs::read_to_string(dir.join("package.json")).unwrap();
     assert!(!pkg.contains("{{name}}"));
     assert_eq!(git(&dir, &["rev-list", "--count", "HEAD"]).trim(), "1");

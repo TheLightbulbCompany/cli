@@ -167,22 +167,19 @@ pub fn new(name: &str, room: Option<&str>, kind: Kind, json: bool) -> Result<i32
             Err(_) => std::fs::write(to, bytes)?,
         }
     }
-    AppConfig {
-        name: name.into(),
-        services: vec![],
-        open_to: if room.is_some() {
-            OpenTo::Room
-        } else {
-            OpenTo::Workspace
-        },
-        budget_usd: 10,
-        kind,
-        origin: Origin {
-            kind: "ask".into(),
-            r#ref: None,
-        },
-    }
-    .write(&dir)?;
+    // The starter's own app.yaml is the base; only what was asked for changes.
+    let mut config = AppConfig::load(&dir)?;
+    config.kind = kind;
+    config.open_to = if room.is_some() {
+        OpenTo::Room
+    } else {
+        OpenTo::Workspace
+    };
+    config.origin = Origin {
+        kind: "ask".into(),
+        r#ref: None,
+    };
+    config.write(&dir)?;
     // The playbook is the plan's first section.
     let plan = dir.join(".lightbulb/plan.md");
     let playbook = std::fs::read_to_string(dir.join(format!("playbooks/{}.md", word(&kind))))?;
@@ -201,8 +198,17 @@ pub fn new(name: &str, room: Option<&str>, kind: Kind, json: bool) -> Result<i32
             .output()
     };
     let msg = format!("lightbulb app new {name}");
-    git(&["init", "-q"])?;
-    git(&["add", "-A"])?;
+    for args in [["init", "-q"], ["add", "-A"]] {
+        let o = git(&args)?;
+        if !o.status.success() {
+            return Err(format!(
+                "git {} failed: {}",
+                args[0],
+                String::from_utf8_lossy(&o.stderr)
+            )
+            .into());
+        }
+    }
     if !git(&["commit", "-qm", &msg])?.status.success() {
         // No git identity on this computer: commit as Lightbulb.
         let o = git(&[
