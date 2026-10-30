@@ -536,20 +536,22 @@ fn a_live_pid_whose_conversation_left_the_listing_and_pid_file_ends_moved_on() {
     let (e, shim) = listing_daemon(&json!([live_row(old, me)]).to_string());
     let sessions = e.home.path().join(".claude/sessions");
     std::fs::create_dir_all(&sessions).unwrap();
-    let pid_file = |conversation: &str| {
+    let pid_file = |conversation: &str, status: &str| {
         std::fs::write(
             sessions.join(format!("{me}.json")),
-            json!({"pid": me, "sessionId": conversation, "cwd": "/tmp/p", "status": "shell",
+            json!({"pid": me, "sessionId": conversation, "cwd": "/tmp/p", "status": status,
                 "startedAt": os::started_ms(me).unwrap()})
             .to_string(),
         )
         .unwrap();
     };
-    pid_file(old);
-    until(10, "the row is written", || {
-        by(&listed(&e), old).is_some_and(|s| s["handle"].is_string())
+    pid_file(old, "idle");
+    // `live` is the listing's word, not the pid file's: this read has ended, and the next is
+    // 30 s off with nothing to say it is due.
+    until(10, "the listing is read", || {
+        by(&listed(&e), old).is_some_and(|s| s["handle"].is_string() && s["status"] == "live")
     });
-    pid_file(new);
+    pid_file(new, "shell");
     set_listing(&shim, json!([live_row(new, me)]));
     until(15, "the old one ends", || !ended(&e).is_empty());
     let over = ended(&e);

@@ -356,6 +356,7 @@ pub fn any_pid_file(home: &Path) -> bool {
 /// whichever says it. A session found only
 /// by discovery keeps Claude's own cwd as given (not resolved) and has no handle until its hook
 /// registers it (`ipc::live_sessions` writes its row, which gives it one).
+/// A read older than a process's pid file says nothing of that process.
 /// `listed` comes with the unix second its read began. A live process alone does not keep a
 /// Claude row, since `/clear`, `/resume` and the agent view leave it running on another
 /// conversation; but a row needs evidence to go (`moved_on`). Other providers' rows live with
@@ -368,6 +369,14 @@ pub fn all(
 ) -> Vec<Session> {
     let files = pid_files(home, member_short);
     let filed_pids: Vec<u32> = files.iter().map(|(s, ..)| s.pid).collect();
+    // A process whose pid file names a conversation this read does not have changed conversation
+    // after the read began (Claude's listing comes from these files): what the read says of that
+    // process is out of date, for up to 30 s with no hook to ask for a new one.
+    let stale_pids: Vec<u32> = listed.map_or(vec![], |(listed, _)| {
+        let read = |c: &str| listed.iter().any(|l| l.conversation == c);
+        let moved = files.iter().filter(|(s, ..)| !read(&s.conversation));
+        moved.map(|(s, ..)| s.pid).collect()
+    });
     let updated: HashMap<String, i64> = files
         .iter()
         .filter_map(|(s, _, at)| Some((s.conversation.clone(), (*at)?)))
@@ -378,7 +387,11 @@ pub fn all(
         .map(|(s, ..)| s)
         .collect();
     let read_at = listed.map(|(_, at)| at);
-    let live = listed.map(|(listed, _)| listing::to_sessions(listed, member_short, &scanned));
+    let live = listed.map(|(listed, _)| {
+        let mut live = listing::to_sessions(listed, member_short, &scanned);
+        live.retain(|s| !stale_pids.contains(&s.pid));
+        live
+    });
     scanned.retain(|s| !s.sdk_run());
     let held = |c: &str| {
         let mut holders = live.iter().flatten().chain(&scanned);
@@ -591,6 +604,27 @@ mod tests {
         assert_eq!(
             live_of(&headless, Some((&[], seen + 15)), home.path()),
             ["old"]
+        );
+    }
+
+    /// `/clear` after the last read: the pid file names a conversation the read does not have, so
+    /// the read's row for that process holds nothing.
+    #[test]
+    fn a_read_older_than_the_pid_file_does_not_hold_the_conversation_it_left() {
+        let home = tempfile::tempdir().unwrap();
+        let rows = [row("old", "claude")];
+        let read = [listed_row("old", "busy")];
+        let seen = rows[0].seen_at;
+        pid_file(home.path(), "old", "");
+        assert_eq!(live_of(&rows, Some((&read, seen)), home.path()), ["old"]);
+        fs::remove_file(home.path().join(".claude/sessions/old.json")).unwrap();
+        pid_file(home.path(), "new", "");
+        assert_eq!(live_of(&rows, Some((&read, seen)), home.path()), ["new"]);
+        // The read that has the new one is the newer word: what else it says of the process stands.
+        let read = [listed_row("old", "busy"), listed_row("new", "busy")];
+        assert_eq!(
+            live_of(&rows, Some((&read, seen)), home.path()),
+            ["new", "old"]
         );
     }
 
