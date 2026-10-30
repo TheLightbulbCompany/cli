@@ -586,3 +586,195 @@ fn status_reads_the_app_id_and_asks_the_backend() {
         ]
     );
 }
+
+fn fixture(name: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/apps")
+        .join(name)
+}
+
+/// A new app with a fake `pnpm` first on PATH that prints `fixture` and exits `code`.
+struct Checked {
+    e: Env,
+    dir: std::path::PathBuf,
+    bin: tempfile::TempDir,
+    _tmp: tempfile::TempDir,
+}
+
+impl Checked {
+    fn new() -> Checked {
+        let e = Env::new();
+        let tmp = tempfile::tempdir().unwrap();
+        app_new(&e, tmp.path(), &["team-lunch"]);
+        let bin = tempfile::tempdir().unwrap();
+        let pnpm = bin.path().join("pnpm");
+        std::fs::write(
+            &pnpm,
+            "#!/bin/sh\necho \"$@\" >> \"$FAKE_PNPM_ARGS\"\nsed \"s|{ROOT}|$PWD|\" \"$FAKE_PNPM_OUT\"\nexit $FAKE_PNPM_EXIT\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&pnpm, std::fs::Permissions::from_mode(0o755)).unwrap();
+        Checked {
+            dir: tmp.path().join("team-lunch"),
+            e,
+            bin,
+            _tmp: tmp,
+        }
+    }
+
+    fn check(&self, out: &str, code: i32, args: &[&str]) -> (i32, Value) {
+        let path = format!(
+            "{}:{}",
+            self.bin.path().display(),
+            std::env::var("PATH").unwrap()
+        );
+        let o = self
+            .e
+            .base_cmd(Command::new(common::EXE))
+            .current_dir(&self.dir)
+            .env("PATH", path)
+            .env("FAKE_PNPM_OUT", fixture(out))
+            .env("FAKE_PNPM_EXIT", code.to_string())
+            .env("FAKE_PNPM_ARGS", self.bin.path().join("args"))
+            .args(["app", "check", "--json"])
+            .args(args)
+            .output()
+            .unwrap();
+        let v = serde_json::from_slice(&o.stdout)
+            .unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(&o.stdout)));
+        (o.status.code().unwrap(), v)
+    }
+
+    fn progress(&self) -> Value {
+        serde_json::from_slice(&std::fs::read(self.dir.join(".lightbulb/progress.json")).unwrap())
+            .unwrap()
+    }
+}
+
+#[test]
+fn parses_tsc_errors_into_file_line_code() {
+    let c = Checked::new();
+    let (code, v) = c.check("tsc.txt", 1, &[]);
+    assert_eq!(code, 1);
+    assert_eq!(v["ok"], false);
+    let p = v["problems"].as_array().unwrap();
+    assert_eq!(p.len(), 2, "{v}");
+    assert_eq!(
+        p[0],
+        json!({"file": "src/app/page.tsx", "line": 12, "column": 7, "code": "TS2322",
+        "message": "Type 'number' is not assignable to type 'string'.\n  The expected type comes from property 'title'."})
+    );
+    assert_eq!(p[1]["file"], "src/lib/db.ts");
+    assert_eq!(p[1]["code"], "TS2304");
+    assert_eq!(v["next"], "fix");
+    let args = std::fs::read_to_string(c.bin.path().join("args")).unwrap();
+    assert_eq!(args.trim(), "run check");
+    c.check("tsc.txt", 1, &["--publish"]);
+    let args = std::fs::read_to_string(c.bin.path().join("args")).unwrap();
+    assert!(args.contains("run check:publish"), "{args}");
+}
+
+#[test]
+fn eslint_errors_are_problems_with_the_rule_as_code() {
+    let c = Checked::new();
+    let (_, v) = c.check("eslint.txt", 1, &[]);
+    assert_eq!(
+        v["problems"],
+        json!([{"file": "src/app/page.tsx", "line": 4, "column": 10,
+        "code": "@typescript-eslint/no-unused-vars", "message": "'useState' is defined but never used"}])
+    );
+}
+
+#[test]
+fn same_error_twice_says_diagnose() {
+    let c = Checked::new();
+    assert_eq!(c.check("tsc.txt", 1, &[]).1["next"], "fix");
+    let (_, v) = c.check("tsc.txt", 1, &[]);
+    assert_eq!(
+        v["next"],
+        "diagnose: list what you tried, find the root cause, consider a stronger model for a fresh plan"
+    );
+}
+
+#[test]
+fn same_error_three_times_says_undo() {
+    let c = Checked::new();
+    // Another key in progress.json survives.
+    std::fs::write(
+        c.dir.join(".lightbulb/progress.json"),
+        r#"{"evidence":{"x":1}}"#,
+    )
+    .unwrap();
+    for _ in 0..2 {
+        c.check("tsc.txt", 1, &[]);
+    }
+    let (_, v) = c.check("tsc.txt", 1, &[]);
+    assert_eq!(
+        v["next"],
+        "undo: run lightbulb app rollback or git revert, then tell the room what failed"
+    );
+    // A new error does not lower the next step: it follows the highest count.
+    let (_, v) = c.check("design.txt", 1, &[]);
+    assert_eq!(v["next"], "fix");
+    let p = c.progress();
+    assert_eq!(p["evidence"], json!({"x": 1}));
+    assert_eq!(p["last_check"]["ok"], false);
+    let mut counts: Vec<u64> = p["attempts"]
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|n| n.as_u64().unwrap())
+        .collect();
+    counts.sort();
+    assert_eq!(counts, [1, 1, 3, 3]);
+}
+
+#[test]
+fn passing_check_clears_counts() {
+    let c = Checked::new();
+    c.check("tsc.txt", 1, &[]);
+    assert_eq!(c.progress()["attempts"].as_object().unwrap().len(), 2);
+    let (code, v) = c.check("design.txt", 0, &[]);
+    // A zero exit is a pass even if the output had text.
+    assert_eq!((code, &v["ok"]), (0, &json!(true)));
+    assert_eq!(v["problems"], json!([]));
+    assert_eq!(c.progress()["attempts"], json!({}));
+    assert_eq!(c.progress()["last_check"]["ok"], true);
+}
+
+#[test]
+fn design_lint_raw_hex_is_a_problem() {
+    let c = Checked::new();
+    let (_, v) = c.check("design.txt", 1, &[]);
+    assert_eq!(
+        v["problems"][0],
+        json!({"file": "src/app/page.tsx", "line": 8, "column": null, "code": null,
+        "message": "raw hex colour; use a token from design/tokens.css"})
+    );
+    assert_eq!(v["problems"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn missing_pnpm_says_how_to_install_it() {
+    let c = Checked::new();
+    // A PATH holding git (preflight needs it) and no pnpm.
+    let only_git = tempfile::tempdir().unwrap();
+    let git = Command::new("which").arg("git").output().unwrap().stdout;
+    std::os::unix::fs::symlink(
+        String::from_utf8(git).unwrap().trim(),
+        only_git.path().join("git"),
+    )
+    .unwrap();
+    let o =
+        c.e.base_cmd(Command::new(common::EXE))
+            .current_dir(&c.dir)
+            .env("PATH", only_git.path())
+            .args(["app", "check", "--json"])
+            .output()
+            .unwrap();
+    assert_eq!(o.status.code(), Some(1));
+    let v: Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["code"], "tool_missing");
+    assert!(v["next"].as_str().unwrap().contains("pnpm"));
+}

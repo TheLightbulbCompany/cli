@@ -3,6 +3,7 @@
 //! `app.yaml` is the app's settings; its parser is hand-rolled for exactly six keys.
 
 pub mod api;
+pub mod check;
 pub mod starter;
 
 use crate::Result;
@@ -130,6 +131,7 @@ pub fn run(cmd: AppCommand, json: bool) -> Result<i32> {
             new(&name, room.as_deref(), kind, json)
         }
         AppCommand::Status { errors } => status(errors, json),
+        AppCommand::Check { publish } => check::check(publish, json),
         AppCommand::Up => match preflight(json) {
             Err(code) => Ok(code),
             Ok(_) => Ok(not_implemented(json)),

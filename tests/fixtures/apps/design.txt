@@ -1,0 +1,2 @@
+src/app/page.tsx:8: raw hex colour; use a token from design/tokens.css
+src/app/globals.css:20: arbitrary Tailwind value; use the scale or a token
