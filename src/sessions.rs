@@ -60,6 +60,8 @@ pub fn qualify(member: &str, to: &str) -> Option<String> {
 #[serde(rename_all = "snake_case")]
 pub enum Status {
     Live,
+    /// Stopped for its person (a permission prompt, a question).
+    Waiting,
     Idle,
     Gone,
 }
@@ -115,6 +117,24 @@ pub struct Session {
     /// hidden, or its register was refused for one). Local listings show it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hidden: bool,
+    /// What a `waiting` session waits for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_for: Option<String>,
+    /// Claude's own kind and entrypoint for it (`interactive`, `cli`, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entrypoint: Option<String>,
+    /// The background job it belongs to, as Claude lists it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job: Option<Job>,
+}
+
+/// A background job of a session: its id and state.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Job {
+    pub id: String,
+    pub state: String,
 }
 
 /// Alive means the pid exists AND was born at `birth_micros`; a reused pid is not the session.
@@ -152,6 +172,10 @@ fn from_row(r: &store::Session, home: &Path) -> Option<Session> {
         repo: r.repo.clone(),
         branch: r.branch.clone(),
         hidden: false,
+        waiting_for: r.waiting_for.clone(),
+        kind: None,
+        entrypoint: None,
+        job: None,
         provider,
         conversation,
         pid,
@@ -163,6 +187,8 @@ fn from_row(r: &store::Session, home: &Path) -> Option<Session> {
             Status::Gone
         } else if r.status == "live" {
             Status::Live
+        } else if r.status == "waiting" {
+            Status::Waiting
         } else {
             Status::Idle
         },
@@ -230,6 +256,10 @@ pub fn scan_claude(home: &Path, member_short: &str) -> Vec<Session> {
             repo: None,
             branch: None,
             hidden: false,
+            waiting_for: None,
+            kind: None,
+            entrypoint: None,
+            job: None,
         });
     }
     out

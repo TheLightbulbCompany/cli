@@ -20,6 +20,8 @@ pub const MAX: usize = 100;
 /// How long an ended session's or a name's address stays kept, and how long an offline
 /// member's presence is listed.
 pub const DAY: u64 = 86_400;
+/// How long an ended session stays listed.
+pub const WEEK: u64 = 7 * DAY;
 /// Changes this close together go out as one presence.
 const COALESCE: Duration = Duration::from_millis(250);
 /// What is read from transcripts (`doing`, `title`) and process tables has no event: the
@@ -162,15 +164,17 @@ fn build(d: &Daemon, seq: u64) -> Frame {
         let _ = store.prune_hidden(since, &live_keys);
         (
             store.sessions().unwrap_or_default(),
-            store.ended_since(since).unwrap_or_default(),
+            store.ended_since(since, &[]).unwrap_or_default(),
             mail::waiting_keys(&store, now).unwrap_or_default(),
         )
     };
     // Every address with a row here, `(key, last seen or ended, folder)`, if publishable.
     let mine = format!("{}/", d.identity.short);
-    let rows = rows.into_iter().map(|r| (r.key, r.seen_at, r.cwd));
-    let mut candidates: Vec<(String, i64, String)> = rows
+    let rows = rows
+        .into_iter()
         .chain(ended)
+        .map(|r| (r.key, r.seen_at, r.cwd));
+    let mut candidates: Vec<(String, i64, String)> = rows
         .filter(|(k, _, cwd)| k.starts_with(&mine) && publishable(cwd))
         .collect();
     candidates.sort_by_key(|(_, at, _)| std::cmp::Reverse(*at));

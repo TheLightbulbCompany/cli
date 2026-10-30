@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 /// tables or columns, but V12, which drops and recreates `memory_fts` (stemmed) from the
 /// entries; each runs once (in the transaction that moves `user_version`).
 const MIGRATIONS: &[&str] = &[
-    V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15,
+    V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15, V16,
 ];
 
 const V1: &str = "
@@ -150,6 +150,10 @@ ALTER TABLE capture_sessions ADD COLUMN nudged INTEGER NOT NULL DEFAULT 0;
 /// Why a held memory entry has no body when it was refused rather than forgotten
 /// (`refused:<pattern>`: a peer's entry that looks like a credential).
 const V15: &str = "ALTER TABLE memory_entries ADD COLUMN reason TEXT;";
+
+/// Why a session ended, and what a waiting one waits for.
+const V16: &str =
+    "ALTER TABLE sessions ADD COLUMN reason TEXT; ALTER TABLE sessions ADD COLUMN waiting_for TEXT;";
 /// Memory: signed entries numbered per author, with a full-text index over `subject` and `fact`
 /// (`memory`). `rowid` is explicit so it survives `VACUUM` (the FTS index points at it). A
 /// tombstoned row keeps its id and seq and drops its body (`entry` NULL); `memory_tombstones`
@@ -205,6 +209,10 @@ pub struct Session {
     /// `who`'s `<provider>-<n>`, given when the row is first written and kept for its life
     /// (`put_session` sets it; what a caller passes is ignored).
     pub handle: Option<String>,
+    /// Why it ended (`end_session`); none while it is live.
+    pub reason: Option<String>,
+    /// What a `waiting` session waits for its person on.
+    pub waiting_for: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -236,6 +244,8 @@ fn row_session(r: &rusqlite::Row) -> rusqlite::Result<Session> {
         repo: r.get("repo")?,
         branch: r.get("branch")?,
         handle: r.get("handle")?,
+        reason: r.get("reason")?,
+        waiting_for: r.get("waiting_for")?,
     })
 }
 
@@ -319,14 +329,15 @@ impl Store {
     pub fn put_session(&self, s: &Session) -> rusqlite::Result<()> {
         self.conn.execute(
             "INSERT INTO sessions (key, provider, conversation, pid, birth_micros, cwd, title, \
-             status, seen_at, executable, repo, branch, handle) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, \
+             status, seen_at, executable, repo, branch, waiting_for, handle) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, \
              CASE WHEN ?2 = '' THEN NULL ELSE ?2 || '-' || (SELECT 1 + coalesce(max( \
              CAST(substr(handle, length(?2) + 2) AS INTEGER)), 0) FROM sessions \
              WHERE provider = ?2) END) \
              ON CONFLICT(key) DO UPDATE SET provider = ?2, conversation = ?3, pid = ?4, \
              birth_micros = ?5, cwd = ?6, title = ?7, status = ?8, seen_at = ?9, \
-             executable = ?10, repo = ?11, branch = ?12, ended_at = NULL, \
+             executable = ?10, repo = ?11, branch = ?12, waiting_for = ?13, ended_at = NULL, \
+             reason = NULL, \
              handle = coalesce(handle, excluded.handle)",
             params![
                 s.key,
@@ -340,7 +351,8 @@ impl Store {
                 s.seen_at,
                 s.executable,
                 s.repo,
-                s.branch
+                s.branch,
+                s.waiting_for
             ],
         )?;
         Ok(())
@@ -449,22 +461,39 @@ impl Store {
             .map(|r| r.is_some())
     }
 
-    /// Ends `key`'s row at `now`; `false` when there is no live one.
-    pub fn end_session(&self, key: &str, now: i64) -> rusqlite::Result<bool> {
+    /// Ends `key`'s row at `now` with `reason` (and `title`, when given); `false` when there is
+    /// no live one. `seen_at` becomes `now` too, so it reads as when the row was last of use.
+    pub fn end_session(
+        &self,
+        key: &str,
+        now: i64,
+        reason: &str,
+        title: Option<&str>,
+    ) -> rusqlite::Result<bool> {
         Ok(self.conn.execute(
-            "UPDATE sessions SET ended_at = ?2 WHERE key = ?1 AND ended_at IS NULL",
-            params![key, now],
+            "UPDATE sessions SET ended_at = ?2, seen_at = ?2, reason = ?3, \
+             title = coalesce(?4, title) WHERE key = ?1 AND ended_at IS NULL",
+            params![key, now, reason, title],
         )? > 0)
     }
 
-    /// The rows that ended at `since` or later, `(key, ended_at, cwd)`; deletes older ends.
-    pub fn ended_since(&self, since: i64) -> rusqlite::Result<Vec<(String, i64, String)>> {
-        self.conn
-            .execute("DELETE FROM sessions WHERE ended_at < ?1", [since])?;
+    /// The ended rows, newest end first; deletes those that ended before `since` unless their
+    /// key is in `keep` (a listing still shows it).
+    pub fn ended_since(&self, since: i64, keep: &[&str]) -> rusqlite::Result<Vec<Session>> {
+        let mut stale = self
+            .conn
+            .prepare("SELECT key FROM sessions WHERE ended_at < ?1")?;
+        let stale: Vec<String> = stale
+            .query_map([since], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        for key in stale.iter().filter(|k| !keep.contains(&k.as_str())) {
+            self.conn
+                .execute("DELETE FROM sessions WHERE key = ?1", [key])?;
+        }
         let mut stmt = self
             .conn
-            .prepare("SELECT key, ended_at, cwd FROM sessions WHERE ended_at IS NOT NULL")?;
-        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            .prepare("SELECT * FROM sessions WHERE ended_at IS NOT NULL ORDER BY ended_at DESC")?;
+        let rows = stmt.query_map([], row_session)?;
         rows.collect()
     }
 
@@ -961,6 +990,8 @@ mod tests {
             repo: None,
             branch: None,
             handle: None,
+            reason: None,
+            waiting_for: None,
         };
         store.put_session(&session).unwrap();
         let handle = Some("claude-1".into());
@@ -1051,16 +1082,88 @@ mod tests {
         let store = Store::open(&path).unwrap();
         assert_eq!(user_version(&path), MIGRATIONS.len() as i64);
         assert_eq!(store.sessions().unwrap().len(), 1);
-        assert!(store.end_session("k", 9).unwrap());
-        assert!(!store.end_session("k", 9).unwrap());
+        assert!(store.end_session("k", 9, "process-exited", None).unwrap());
+        assert!(!store.end_session("k", 9, "process-exited", None).unwrap());
         assert_eq!(store.session("k").unwrap(), None);
         assert!(store.holds("k").unwrap());
+        let ended = store.ended_since(9, &[]).unwrap();
         assert_eq!(
-            store.ended_since(9).unwrap(),
-            [("k".into(), 9, "/p".into())]
+            ended
+                .iter()
+                .map(|e| (e.key.as_str(), e.cwd.as_str()))
+                .collect::<Vec<_>>(),
+            [("k", "/p")]
         );
-        assert!(store.ended_since(10).unwrap().is_empty());
+        assert!(store.ended_since(10, &[]).unwrap().is_empty());
         assert!(!store.holds("k").unwrap());
+    }
+
+    fn waiting_row(key: &str) -> Session {
+        Session {
+            key: key.into(),
+            provider: "claude".into(),
+            conversation: None,
+            pid: None,
+            birth_micros: None,
+            cwd: "/".into(),
+            title: None,
+            status: "idle".into(),
+            seen_at: 1,
+            executable: None,
+            repo: None,
+            branch: None,
+            handle: None,
+            reason: None,
+            waiting_for: None,
+        }
+    }
+
+    #[test]
+    fn ending_keeps_reason_and_title_and_prunes_after_the_window_unless_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("state.db")).unwrap();
+        s.put_session(&waiting_row("k/claude:a")).unwrap();
+        s.put_session(&waiting_row("k/claude:b")).unwrap();
+        assert!(s
+            .end_session("k/claude:a", 1_000, "moved-on", Some("fix the thing"))
+            .unwrap());
+        assert!(s
+            .end_session("k/claude:b", 1_000, "job-done", None)
+            .unwrap());
+        let ended = s.ended_since(500, &[]).unwrap();
+        assert_eq!(ended.len(), 2);
+        assert_eq!(
+            (ended[0].reason.as_deref(), ended[0].title.as_deref()),
+            (Some("moved-on"), Some("fix the thing"))
+        );
+        // Past the window: `a` goes, `b` is kept because the listing still shows it.
+        let ended = s.ended_since(2_000, &["k/claude:b"]).unwrap();
+        assert_eq!(
+            ended.iter().map(|e| e.key.as_str()).collect::<Vec<_>>(),
+            ["k/claude:b"]
+        );
+        assert!(!s.holds("k/claude:a").unwrap());
+    }
+
+    #[test]
+    fn a_waiting_row_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("state.db")).unwrap();
+        let row = Session {
+            status: "waiting".into(),
+            waiting_for: Some("permission prompt".into()),
+            ..waiting_row("k/claude:a")
+        };
+        s.put_session(&row).unwrap();
+        let got = s.session("k/claude:a").unwrap().unwrap();
+        assert_eq!(
+            (got.status.as_str(), got.waiting_for.as_deref()),
+            ("waiting", Some("permission prompt"))
+        );
+        // Ended, then registered again: live again, the reason cleared.
+        s.end_session("k/claude:a", 5, "moved-on", None).unwrap();
+        s.put_session(&row).unwrap();
+        assert_eq!(s.session("k/claude:a").unwrap().unwrap().reason, None);
     }
 
     #[test]
@@ -1081,6 +1184,8 @@ mod tests {
             repo: Some("r".into()),
             branch: None,
             handle: None,
+            reason: None,
+            waiting_for: None,
         };
         for (k, p) in [
             ("a", "codex"),
@@ -1091,7 +1196,7 @@ mod tests {
             store.put_session(&row(k, p)).unwrap();
         }
         store.put_session(&row("a", "codex")).unwrap();
-        store.end_session("c", 5).unwrap();
+        store.end_session("c", 5, "process-exited", None).unwrap();
         let got: Vec<_> = store
             .sessions()
             .unwrap()
@@ -1132,10 +1237,10 @@ mod tests {
         let path = dir.path().join("state.db");
         Connection::open(&path)
             .unwrap()
-            .execute_batch("PRAGMA user_version = 16;")
+            .execute_batch("PRAGMA user_version = 17;")
             .unwrap();
         let err = Store::open(&path).err().unwrap().to_string();
-        assert!(err.contains("State is from a newer version (v16)"), "{err}");
-        assert_eq!(user_version(&path), 16);
+        assert!(err.contains("State is from a newer version (v17)"), "{err}");
+        assert_eq!(user_version(&path), 17);
     }
 }

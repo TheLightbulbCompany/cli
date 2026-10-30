@@ -1142,6 +1142,8 @@ mod tests {
                 repo: None,
                 branch: None,
                 handle: None,
+                reason: None,
+                waiting_for: None,
             })
             .unwrap();
     }

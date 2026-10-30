@@ -1,3 +1,6 @@
+mod common;
+
+use common::Env;
 use lightbulb::{daemon, os, paths};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
@@ -101,4 +104,33 @@ async fn register_sessions_end_round_trip() {
         "bad_request"
     );
     call(&mut lines, &mut w, json!({"id": 9, "op": "shutdown"})).await;
+}
+
+#[test]
+fn register_takes_waiting_with_what_for_and_end_takes_a_reason() {
+    let e = Env::new();
+    e.daemon(false, "", &[]);
+    let pid = std::process::id();
+    let birth = os::process(pid).unwrap().birth_micros;
+    let r = e.ask(
+        json!({"id": 1, "op": "register", "session": {"provider": "claude",
+        "conversation": "w1", "pid": pid, "birth_micros": birth, "cwd": "/tmp/p",
+        "status": "waiting", "waiting_for": "permission prompt"}}),
+    );
+    assert_eq!(r["ok"], true, "{r}");
+    let s = &e.ask(json!({"id": 1, "op": "sessions"}))["sessions"][0];
+    assert_eq!(
+        (s["status"].as_str(), s["waiting_for"].as_str()),
+        (Some("waiting"), Some("permission prompt"))
+    );
+    let r = e.ask(
+        json!({"id": 1, "op": "end", "key": s["key"], "if_gone": false, "reason": "moved-on"}),
+    );
+    assert_eq!(r["ended"], true, "{r}");
+    let r = e.ask(
+        json!({"id": 1, "op": "register", "session": {"provider": "claude",
+        "conversation": "w2", "pid": pid, "birth_micros": birth, "cwd": "/tmp/p",
+        "status": "waiting", "waiting_for": "x".repeat(65)}}),
+    );
+    assert_eq!(r["error"], "bad_request", "{r}");
 }

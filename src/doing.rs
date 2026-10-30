@@ -125,6 +125,10 @@ mod tests {
             repo: None,
             branch: None,
             hidden: false,
+            waiting_for: None,
+            kind: None,
+            entrypoint: None,
+            job: None,
         }
     }
 

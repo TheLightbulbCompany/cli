@@ -1245,7 +1245,8 @@ pub(crate) fn refused(id: u64, reason: &str) -> Response {
     Response::err_with(id, BAD_REQUEST, json!({ "reason": reason }))
 }
 
-/// `end {key, caller?, if_gone?}` -> `{ended}`: ends the session row (kept a day, ended);
+/// `end {key, caller?, if_gone?, reason?}` -> `{ended}`: ends the session row (kept, ended);
+/// `reason` is `process-exited` (default), `moved-on`, `job-done` or `job-failed`;
 /// its mail stays for the hold. With `caller`, only the row's own process may end it; with `if_gone`, also
 /// anyone once the row's process is dead. `ended: false` when refused. Neither field (the
 /// CLI) ends it outright.
@@ -1266,8 +1267,13 @@ fn end(id: u64, key: &str, body: &Value, daemon: &Daemon) -> Response {
             return Response::ok(id, json!({ "ended": false }));
         }
     }
-    // The row stays a day, ended: its address is kept (`presence`).
-    match store.end_session(key, now() as i64) {
+    let reason = match body["reason"].as_str() {
+        None => "process-exited",
+        Some(r @ ("process-exited" | "moved-on" | "job-done" | "job-failed")) => r,
+        Some(_) => return Response::err(id, BAD_REQUEST),
+    };
+    // The row stays, ended, with its reason: its address is kept (`presence`).
+    match store.end_session(key, now() as i64, reason, None) {
         Ok(true) => {
             daemon.presence.notify_one();
             Response::ok(id, json!({ "ended": true }))
@@ -1289,13 +1295,14 @@ struct Register {
     executable: Option<String>,
     repo: Option<String>,
     branch: Option<String>,
+    waiting_for: Option<String>,
 }
 
-/// `register {session: {provider, conversation, pid, birth_micros, cwd, title?, status?, executable?, repo?, branch?}, caller?}`
+/// `register {session: {provider, conversation, pid, birth_micros, cwd, title?, status?, waiting_for?, executable?, repo?, branch?}, caller?}`
 /// upserts by key; the daemon supplies the member prefix. A `cwd` under `folders_off` is
 /// answered `{key, ignored: true}` and nothing is written. A key whose row names another
-/// live process is refused (`bad_request`, reason `owned_by_live_process`). `status` is `idle` (default) or
-/// `busy` (stored as live); `conversation` is `[A-Za-z0-9._-]{1,128}`. `repo` and `branch` are
+/// live process is refused (`bad_request`, reason `owned_by_live_process`). `status` is `idle` (default),
+/// `busy` (stored as live) or `waiting` (with `waiting_for`, at most 64 characters, what for); `conversation` is `[A-Za-z0-9._-]{1,128}`. `repo` and `branch` are
 /// what the hook read from `cwd`'s `.git` (it has the folder access the person gave the agent).
 fn register(id: u64, body: &Value, daemon: &Daemon) -> Response {
     let Ok(r) = serde_json::from_value::<Register>(body["session"].clone()) else {
@@ -1304,8 +1311,15 @@ fn register(id: u64, body: &Value, daemon: &Daemon) -> Response {
     let status = match r.status.as_deref() {
         None | Some("idle") => "idle",
         Some("busy") => "live",
+        Some("waiting") => "waiting",
         Some(_) => return Response::err(id, BAD_REQUEST),
     };
+    if r.waiting_for
+        .as_ref()
+        .is_some_and(|w| w.chars().count() > 64)
+    {
+        return Response::err(id, BAD_REQUEST);
+    }
     if !sessions::PROVIDERS.contains(&r.provider.as_str()) || !sessions::word(&r.conversation, 128)
     {
         return Response::err(id, BAD_REQUEST);
@@ -1367,6 +1381,8 @@ fn register(id: u64, body: &Value, daemon: &Daemon) -> Response {
         repo,
         branch,
         handle: None,
+        reason: None,
+        waiting_for: r.waiting_for.filter(|_| status == "waiting"),
     };
     // Every hook event registers: mail delivered before it has been seen.
     match put_row(daemon, &store, &row).and_then(|()| mail::mark_read_for(&store, &key, now())) {
@@ -1815,6 +1831,8 @@ async fn inbox(
                 repo: None,
                 branch: None,
                 handle: None,
+                reason: None,
+                waiting_for: None,
             };
             if put_row(daemon, &daemon.store.lock().unwrap(), &row).is_err() {
                 return Response::err(id, INTERNAL);
