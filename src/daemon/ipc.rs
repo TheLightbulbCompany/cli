@@ -1382,6 +1382,7 @@ fn register(id: u64, body: &Value, daemon: &Daemon) -> Response {
         branch,
         handle: None,
         reason: None,
+        ended_at: None,
         waiting_for: r.waiting_for.filter(|_| status == "waiting"),
     };
     // Every hook event registers: mail delivered before it has been seen.
@@ -1832,6 +1833,7 @@ async fn inbox(
                 branch: None,
                 handle: None,
                 reason: None,
+                ended_at: None,
                 waiting_for: None,
             };
             if put_row(daemon, &daemon.store.lock().unwrap(), &row).is_err() {

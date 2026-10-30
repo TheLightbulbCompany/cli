@@ -166,6 +166,7 @@ fn row(key: &str) -> Session {
         branch: None,
         handle: None,
         reason: None,
+        ended_at: None,
         waiting_for: None,
     }
 }

@@ -211,6 +211,8 @@ pub struct Session {
     pub handle: Option<String>,
     /// Why it ended (`end_session`); none while it is live.
     pub reason: Option<String>,
+    /// When it ended (`end_session`); none while it is live.
+    pub ended_at: Option<i64>,
     /// What a `waiting` session waits for its person on.
     pub waiting_for: Option<String>,
 }
@@ -245,6 +247,7 @@ fn row_session(r: &rusqlite::Row) -> rusqlite::Result<Session> {
         branch: r.get("branch")?,
         handle: r.get("handle")?,
         reason: r.get("reason")?,
+        ended_at: r.get("ended_at")?,
         waiting_for: r.get("waiting_for")?,
     })
 }
@@ -462,7 +465,7 @@ impl Store {
     }
 
     /// Ends `key`'s row at `now` with `reason` (and `title`, when given); `false` when there is
-    /// no live one. `seen_at` becomes `now` too, so it reads as when the row was last of use.
+    /// no live one.
     pub fn end_session(
         &self,
         key: &str,
@@ -471,7 +474,7 @@ impl Store {
         title: Option<&str>,
     ) -> rusqlite::Result<bool> {
         Ok(self.conn.execute(
-            "UPDATE sessions SET ended_at = ?2, seen_at = ?2, reason = ?3, \
+            "UPDATE sessions SET ended_at = ?2, reason = ?3, \
              title = coalesce(?4, title) WHERE key = ?1 AND ended_at IS NULL",
             params![key, now, reason, title],
         )? > 0)
@@ -991,6 +994,7 @@ mod tests {
             branch: None,
             handle: None,
             reason: None,
+            ended_at: None,
             waiting_for: None,
         };
         store.put_session(&session).unwrap();
@@ -1114,6 +1118,7 @@ mod tests {
             branch: None,
             handle: None,
             reason: None,
+            ended_at: None,
             waiting_for: None,
         }
     }
@@ -1132,6 +1137,7 @@ mod tests {
             .unwrap());
         let ended = s.ended_since(500, &[]).unwrap();
         assert_eq!(ended.len(), 2);
+        assert_eq!((ended[0].ended_at, ended[0].seen_at), (Some(1_000), 1));
         assert_eq!(
             (ended[0].reason.as_deref(), ended[0].title.as_deref()),
             (Some("moved-on"), Some("fix the thing"))
@@ -1163,7 +1169,8 @@ mod tests {
         // Ended, then registered again: live again, the reason cleared.
         s.end_session("k/claude:a", 5, "moved-on", None).unwrap();
         s.put_session(&row).unwrap();
-        assert_eq!(s.session("k/claude:a").unwrap().unwrap().reason, None);
+        let back = s.session("k/claude:a").unwrap().unwrap();
+        assert_eq!((back.reason, back.ended_at), (None, None));
     }
 
     #[test]
@@ -1185,6 +1192,7 @@ mod tests {
             branch: None,
             handle: None,
             reason: None,
+            ended_at: None,
             waiting_for: None,
         };
         for (k, p) in [

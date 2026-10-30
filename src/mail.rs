@@ -1143,6 +1143,7 @@ mod tests {
                 branch: None,
                 handle: None,
                 reason: None,
+                ended_at: None,
                 waiting_for: None,
             })
             .unwrap();

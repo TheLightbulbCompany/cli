@@ -173,7 +173,7 @@ fn build(d: &Daemon, seq: u64) -> Frame {
     let rows = rows
         .into_iter()
         .chain(ended)
-        .map(|r| (r.key, r.seen_at, r.cwd));
+        .map(|r| (r.key, r.ended_at.unwrap_or(r.seen_at), r.cwd));
     let mut candidates: Vec<(String, i64, String)> = rows
         .filter(|(k, _, cwd)| k.starts_with(&mine) && publishable(cwd))
         .collect();
