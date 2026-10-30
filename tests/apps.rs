@@ -1291,6 +1291,7 @@ fn rollback_is_a_new_commit_not_a_reset() {
     let mut commits = vec![c1.clone()];
     for n in 2..=3 {
         std::fs::write(c.dir.join("f.txt"), format!("v{n}")).unwrap();
+        std::fs::write(c.dir.join(format!("added{n}.txt")), "x").unwrap();
         git(&c.dir, &["add", "-A"]);
         git(
             &c.dir,
@@ -1335,8 +1336,14 @@ fn rollback_is_a_new_commit_not_a_reset() {
         "{:?}",
         lines(&seen)
     );
-    // The tree is version 1's, history is intact, and HEAD moved forward.
+    // The tree is version 1's (files added since are gone) in exactly one new commit.
     assert_eq!(git(&c.dir, &["diff", &c1, "HEAD"]), "");
+    assert!(!c.dir.join("added3.txt").exists());
+    assert_eq!(git(&c.dir, &["rev-list", "--count", "HEAD"]).trim(), "4");
+    assert_eq!(
+        git(&c.dir, &["log", "-1", "--format=%s"]).trim(),
+        "lightbulb: roll back to version 1"
+    );
     assert_ne!(c.head(), c1);
     for old in &commits {
         let ok = Command::new("git")
@@ -1362,4 +1369,107 @@ fn destroy_prints_next_and_no_secret_in_any_output() {
     let (code, v) = c.app(&["up"], &base, true);
     assert_eq!(code, 0);
     assert!(v.get("token").is_none() && v["cards"][0].get("token").is_none());
+}
+
+#[test]
+fn rollback_refuses_a_dirty_tree_and_sends_nothing() {
+    let c = Checked::new();
+    std::fs::write(c.dir.join(".lightbulb/app.json"), r#"{"app_id":"a-1"}"#).unwrap();
+    std::fs::write(c.dir.join("app.yaml.bak"), "mine").unwrap();
+    let (base, seen) = ship_stub(waiting());
+    let (code, v) = c.app(&["rollback", "1"], &base, true);
+    assert_eq!((code, &v["code"]), (1, &json!("dirty_tree")));
+    assert_eq!(v["next"], "commit or discard your changes, then roll back");
+    assert!(lines(&seen).is_empty());
+}
+
+#[test]
+fn a_building_publish_records_no_migrations() {
+    let c = Checked::new();
+    std::fs::write(c.dir.join(".lightbulb/app.json"), r#"{"app_id":"a-1"}"#).unwrap();
+    std::fs::write(
+        c.dir.join(".lightbulb/progress.json"),
+        json!({"evidence": [{"kind": "review", "commit": c.head(), "verdict": "pass"}]})
+            .to_string(),
+    )
+    .unwrap();
+    let (base, _) = ship_stub(json!({"app_id": "a-1", "state": "building"}));
+    let (code, v) = c.app(&["publish"], &base, true);
+    assert_eq!((code, &v["state"]), (0, &json!("building")));
+    assert!(!c.dir.join(".lightbulb/migrations.json").exists());
+}
+
+#[test]
+fn publish_refuses_when_archive_had_to_commit() {
+    let c = Checked::new();
+    std::fs::write(c.dir.join(".lightbulb/app.json"), r#"{"app_id":"a-1"}"#).unwrap();
+    std::fs::write(
+        c.dir.join(".lightbulb/progress.json"),
+        json!({"evidence": [{"kind": "review", "commit": c.head(), "verdict": "pass"}]})
+            .to_string(),
+    )
+    .unwrap();
+    // A first-line change: porcelain starts with a space (" M app.yaml").
+    let yaml = std::fs::read_to_string(c.dir.join("app.yaml")).unwrap();
+    std::fs::write(c.dir.join("app.yaml"), format!("{yaml}\n")).unwrap();
+    let (base, seen) = ship_stub(json!({"app_id": "a-1", "state": "ready"}));
+    let (code, v) = c.app(&["publish"], &base, true);
+    assert_eq!((code, &v["code"]), (1, &json!("review_required")));
+    assert!(lines(&seen).is_empty());
+    assert!(git(&c.dir, &["log", "-1", "--format=%s"]).contains("app.yaml"));
+}
+
+#[test]
+fn an_untracked_env_file_is_refused_not_committed() {
+    let c = Checked::new();
+    std::fs::write(c.dir.join("app.yaml.keep"), "x").unwrap();
+    std::fs::create_dir_all(c.dir.join("sub")).unwrap();
+    std::fs::write(c.dir.join("sub/.env.prod"), "SECRET=1").unwrap();
+    std::fs::create_dir_all(c.dir.join("node_modules")).unwrap();
+    std::fs::write(c.dir.join("node_modules/m.js"), "x").unwrap();
+    // The starter ignores these; a user's .gitignore may not.
+    std::fs::write(c.dir.join(".gitignore"), "").unwrap();
+    let before = c.head();
+    let e = lightbulb::apps::archive(&c.dir).unwrap_err();
+    assert_eq!(e.code, "secret_file");
+    assert!(e.message.contains("sub/.env.prod"));
+    assert_eq!(e.next, "add them to .gitignore");
+    assert_eq!(c.head(), before);
+    // Build output alone is unstaged, not an error.
+    std::fs::remove_file(c.dir.join("sub/.env.prod")).unwrap();
+    let (tgz, _) = lightbulb::apps::archive(&c.dir).unwrap();
+    assert!(!git(&c.dir, &["ls-files"]).contains("node_modules"));
+    std::fs::remove_file(tgz).unwrap();
+}
+
+#[test]
+fn status_prints_contract_fields_only() {
+    let c = Checked::new();
+    std::fs::write(c.dir.join(".lightbulb/app.json"), r#"{"app_id":"a-1"}"#).unwrap();
+    let (base, _) = stub_with(
+        |line| {
+            if line.contains("/errors") {
+                (
+                    200,
+                    json!({"client": [{"at": "t", "message": "boom", "stack": "SECRET"}], "server": []}),
+                )
+            } else {
+                (
+                    200,
+                    json!({"app_id": "a-1", "state": "ready", "live_version": 2,
+                    "DATABASE_URL": "postgres://u:SECRET@h/db",
+                    "versions": [{"n": 1, "commit": "c", "token": "SECRET"}],
+                    "resources": [{"provider": "neon", "service": "pg", "state": "ready", "url": "SECRET"}]}),
+                )
+            }
+        },
+        0,
+    );
+    let (code, v) = c.app(&["status", "--errors"], &base, true);
+    assert_eq!(code, 0);
+    assert_eq!(v["status"]["versions"][0], json!({"n": 1, "commit": "c"}));
+    assert_eq!(
+        v["errors"]["client"][0],
+        json!({"at": "t", "message": "boom"})
+    );
 }

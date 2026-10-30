@@ -55,6 +55,12 @@ fn identity(root: &Path) -> Vec<&'static str> {
     }
 }
 
+fn commit(root: &Path, msg: &str) -> std::result::Result<(), ApiError> {
+    let mut args = identity(root);
+    args.extend(["commit", "-qm", msg]);
+    git_ok(root, &args).map(drop)
+}
+
 /// Never shipped, even when tracked (the backend refuses them too).
 fn shipped(path: &str) -> bool {
     !path.split('/').any(|c| {
@@ -65,24 +71,61 @@ fn shipped(path: &str) -> bool {
 /// Commits a dirty tree (one commit per change), then packs the tracked files at HEAD into a
 /// tar.gz. Returns its path and HEAD.
 pub fn archive(root: &Path) -> std::result::Result<(PathBuf, String), ApiError> {
-    let dirty = git_ok(root, &["status", "--porcelain"])?;
+    // Raw stdout: git_ok trims, which would eat the first line's leading space.
+    let dirty = String::from_utf8_lossy(&git(root, &["status", "--porcelain"])?.stdout).to_string();
     if !dirty.is_empty() {
         let paths: Vec<&str> = dirty
             .lines()
             .map(|l| l.get(3..).unwrap_or(l).trim())
             .collect();
-        let more = paths.len().saturating_sub(3);
-        let mut msg = format!(
-            "lightbulb: changed {}",
-            paths[..paths.len().min(3)].join(", ")
-        );
-        if more > 0 {
-            msg.push_str(&format!(" and {more} more"));
-        }
         git_ok(root, &["add", "-A"])?;
-        let mut args = identity(root);
-        args.extend(["commit", "-qm", &msg]);
-        git_ok(root, &args)?;
+        // Never commit a secret file; build output is just unstaged.
+        let staged = git(root, &["diff", "--cached", "--name-only", "-z"])?.stdout;
+        let staged: Vec<String> = staged
+            .split(|b| *b == 0)
+            .filter(|p| !p.is_empty())
+            .map(|p| String::from_utf8_lossy(p).into_owned())
+            .collect();
+        let secrets: Vec<&String> = staged
+            .iter()
+            .filter(|p| p.split('/').any(|c| c.starts_with(".env")))
+            .collect();
+        let build: Vec<&String> = staged.iter().filter(|p| !shipped(p)).collect();
+        for list in [&secrets, &build] {
+            if !list.is_empty() {
+                let mut args = vec!["reset", "-q", "--"];
+                args.extend(list.iter().map(|p| p.as_str()));
+                git_ok(root, &args)?;
+            }
+        }
+        if !secrets.is_empty() {
+            return Err(ApiError::new(
+                "secret_file",
+                &format!(
+                    "These files hold secrets and would be committed: {}",
+                    secrets
+                        .iter()
+                        .map(|p| p.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                "add them to .gitignore",
+            ));
+        }
+        if !git(root, &["diff", "--cached", "--quiet"])?
+            .status
+            .success()
+        {
+            let more = paths.len().saturating_sub(3);
+            let mut msg = format!(
+                "lightbulb: changed {}",
+                paths[..paths.len().min(3)].join(", ")
+            );
+            if more > 0 {
+                msg.push_str(&format!(" and {more} more"));
+            }
+            commit(root, &msg)?;
+        }
     }
     let head = git_ok(root, &["rev-parse", "HEAD"])?;
     let files = git(root, &["ls-files", "-z"])?.stdout;
@@ -397,7 +440,7 @@ pub(crate) fn publish(
             body["approved_destructive"] = a.into();
         }
         let r = api::call(auth, "POST", &format!("/{id}/publish"), Some(&body))?;
-        if r["state"] != "failed" {
+        if r["state"] == "ready" {
             migrations::record(root, &g.unrecorded)?;
         }
         Ok(r)
@@ -413,18 +456,31 @@ pub(crate) fn rollback(root: &Path, auth: &Auth, version: Option<u32>, json: boo
         Ok(id) => id,
         Err(code) => return Ok(code),
     };
-    // The commit to go back to comes from the version list, before anything changes.
+    // Restoring the files would overwrite unsaved work: stop before anything changes.
+    match git_ok(root, &["status", "--porcelain"]) {
+        Ok(d) if d.is_empty() => {}
+        Ok(_) => {
+            return Ok(fail(
+                json,
+                "dirty_tree",
+                "There are changes that are not committed.",
+                "commit or discard your changes, then roll back",
+            ))
+        }
+        Err(e) => return Ok(failure(json, e)),
+    }
+    // The version and its commit come from the version list, before anything changes.
     let target = api::call(auth, "GET", &format!("/{id}/status"), None).and_then(|s| {
         let n = version
             .map(u64::from)
             .or_else(|| s["live_version"].as_u64().and_then(|l| l.checked_sub(1)));
         n.and_then(|n| {
-            s["versions"]
+            let commit = s["versions"]
                 .as_array()?
                 .iter()
                 .find(|v| v["n"].as_u64() == Some(n))?["commit"]
-                .as_str()
-                .map(String::from)
+                .as_str()?;
+            Some((n, commit.to_string()))
         })
         .ok_or_else(|| {
             ApiError::new(
@@ -434,41 +490,47 @@ pub(crate) fn rollback(root: &Path, auth: &Auth, version: Option<u32>, json: boo
             )
         })
     });
-    let target = match target {
+    let (n, target) = match target {
         Ok(t) => t,
         Err(e) => return Ok(failure(json, e)),
     };
-    let body = version.map_or(json!({}), |n| json!({"version": n}));
-    let r = match api::call(auth, "POST", &format!("/{id}/rollback"), Some(&body)) {
+    let r = match api::call(
+        auth,
+        "POST",
+        &format!("/{id}/rollback"),
+        Some(&json!({"version": n})),
+    ) {
         Ok(r) => r,
         Err(e) => return Ok(failure(json, e)),
     };
     if r["state"] == "failed" {
         return Ok(show(&r, json!({"next": next_for(&r)}), json));
     }
-    if let Err(e) = revert_to(root, &target) {
+    if let Err(e) = restore(root, &target, n) {
         return Ok(failure(json, e));
     }
     Ok(show(&r, json!({"next": next_for(&r)}), json))
 }
 
-/// A new commit on top that restores `target`'s tree. Never a reset.
-fn revert_to(root: &Path, target: &str) -> std::result::Result<(), ApiError> {
-    let range = format!("{target}..HEAD");
-    if git_ok(root, &["rev-list", "--count", &range])? == "0" {
+/// One new commit on top whose tree is `target`'s. HEAD never moves backwards.
+fn restore(root: &Path, target: &str, n: u64) -> std::result::Result<(), ApiError> {
+    git_ok(root, &["read-tree", "-u", "--reset", target]).map_err(|e| {
+        ApiError::new(
+            "restore_failed",
+            &format!(
+                "The live app was rolled back, but git could not restore the files: {}",
+                e.message
+            ),
+            "run lightbulb app status",
+        )
+    })?;
+    if git(root, &["diff", "--cached", "--quiet"])?
+        .status
+        .success()
+    {
         return Ok(());
     }
-    let mut args = identity(root);
-    args.extend(["revert", "--no-edit", &range]);
-    if git(root, &args)?.status.success() {
-        return Ok(());
-    }
-    let _ = git(root, &["revert", "--abort"]);
-    Err(ApiError::new(
-        "revert_conflict",
-        "The earlier version could not be restored in git without a conflict. The live app was rolled back.",
-        &format!("restore it by hand: git checkout {target} -- . && git commit -am 'restore {target}'"),
-    ))
+    commit(root, &format!("lightbulb: roll back to version {n}"))
 }
 
 pub(crate) fn destroy(root: &Path, auth: &Auth, json: bool) -> Result<i32> {
@@ -484,4 +546,62 @@ pub(crate) fn destroy(root: &Path, auth: &Auth, json: bool) -> Result<i32> {
         }
         Err(e) => Ok(failure(json, e)),
     }
+}
+
+fn pick(v: &Value, keys: &[&str]) -> Value {
+    let mut out = json!({});
+    for k in keys {
+        if !v[*k].is_null() {
+            out[*k] = v[*k].clone();
+        }
+    }
+    out
+}
+
+fn pick_each(v: &Value, keys: &[&str]) -> Value {
+    json!(v
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|x| pick(x, keys))
+        .collect::<Vec<_>>())
+}
+
+/// The contract's fields of an `AppStatus`, nothing else.
+pub(crate) fn status_contract(v: &Value) -> Value {
+    let mut out = pick(
+        v,
+        &[
+            "app_id",
+            "name",
+            "room_id",
+            "state",
+            "open_to",
+            "budget_usd",
+            "preview_url",
+            "live_url",
+            "canvas_url",
+            "live_version",
+            "last_opened_at",
+            "spend_month_cents",
+        ],
+    );
+    if v["origin"].is_object() {
+        out["origin"] = pick(&v["origin"], &["kind", "ref"]);
+    }
+    if v["preview"].is_object() {
+        out["preview"] = pick(&v["preview"], &["deployment_id", "commit", "ready_at"]);
+    }
+    out["versions"] = pick_each(
+        &v["versions"],
+        &["n", "commit", "deployment_id", "at", "by"],
+    );
+    out["resources"] = pick_each(&v["resources"], &["provider", "service", "state"]);
+    out
+}
+
+/// The last errors: only when and what.
+pub(crate) fn errors_contract(v: &Value) -> Value {
+    json!({"client": pick_each(&v["client"], &["at", "message"]),
+        "server": pick_each(&v["server"], &["at", "message"])})
 }

@@ -367,9 +367,10 @@ pub fn status(errors: bool, json: bool) -> Result<i32> {
     let get = |what: &str| api::call(&auth, "GET", &format!("/{id}/{what}"), None);
     let out = get("status").and_then(|s| {
         if errors {
-            Ok(json!({"status": s, "errors": get("errors")?}))
+            Ok(json!({"status": ship::status_contract(&s),
+                "errors": ship::errors_contract(&get("errors")?)}))
         } else {
-            Ok(s)
+            Ok(ship::status_contract(&s))
         }
     });
     match out {
