@@ -438,18 +438,19 @@ lightbulb app report-broken-tool <TOOL> <WHAT>
 
 | Command | What it does |
 |---|---|
-| `new` | Creates `./<NAME>` from the starter with one git commit. `--kind` is `site` (default), `content-site`, `form`, `internal-tool`, `dashboard`, `portal`, `payments` or `automation`. `--room` is saved in `.lightbulb/app.json`. |
-| `up` | Sends HEAD, waits for the preview build and reports `done` or what is `missing`. `--approved` is the approved card for a destructive migration. |
+| `new` | Creates `./<NAME>` from the starter with one git commit; next, `pnpm install` in it. `--kind` is `site` (default), `content-site`, `form`, `internal-tool`, `dashboard`, `portal`, `payments` or `automation`. `--room` is saved in `.lightbulb/app.json`. |
+| `up` | Sends HEAD, waits for the preview build and reports `done` or what is `missing`. `--approved` is the approved card for a destructive migration. A failed build exits 1 with `{"code","message","next"}`. |
 | `publish` | Puts the preview live as a new version. Needs `check --publish` to pass and a passing review for HEAD. |
-| `rollback` | Makes an earlier version live (default: the one before) and adds one commit with its files. Code only; data is unchanged. Refuses with uncommitted changes. |
+| `rollback` | Makes an earlier version live (default: the one before) and adds one commit with its files. Code only; data is unchanged (the `error.code: "code_only"` it returns says so; it is not a failure). Refuses with uncommitted changes. |
 | `status` | State, URLs, versions and the done gate. `--errors` adds the last client and server errors. |
-| `destroy` | Asks for removal; the owner confirms in Canvas. |
-| `check` | `pnpm check`, errors parsed. `--publish` runs `pnpm check:publish`, which adds a high-severity audit. |
+| `destroy` | Asks for removal and prints the backend's state (`awaiting_owner` until the owner removes it in Canvas). |
+| `check` | Type check, lint and design lint (`pnpm check`), errors parsed. `--publish` adds the dependency audit (`pnpm check:publish`). Fails with `not_installed` before `pnpm install`. |
 | `evidence` | Records a browser pass or a review for HEAD. A review needs `--verdict`. The file stays on this computer. |
 | `report-broken-tool` | Notes a failing tool in `.lightbulb/lessons.md`, once per `up`. |
 
 Run all but `new` inside the app's folder. Auth is a workspace agent's hook token when
-`OPENCLAW_HOOK_TOKEN`, `ISOL8_API_URL` and `ISOL8_OWNER_ID` are all set; otherwise `lightbulb login`.
+`OPENCLAW_HOOK_TOKEN`, `ISOL8_API_URL` and `ISOL8_OWNER_ID` are all set (`ISOL8_API_URL` is the
+API origin; the CLI appends `/api/v1` once); otherwise `lightbulb login`.
 Details: [apps you build](apps.md).
 
 ## Commands the agents and macOS run

@@ -461,6 +461,10 @@ fn new_writes_the_starter_and_one_commit() {
     );
     let v: Value = serde_json::from_slice(&o.stdout).unwrap();
     assert_eq!(v["name"], "team-lunch");
+    assert_eq!(
+        v["next"],
+        "cd team-lunch && pnpm install, then lightbulb app check"
+    );
     let dir = tmp.path().join("team-lunch");
     assert_eq!(
         v["files"].as_u64().unwrap() as usize,
@@ -701,6 +705,8 @@ impl Checked {
         .unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&pnpm, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // As after `pnpm install` (git ignores it).
+        std::fs::create_dir(tmp.path().join("team-lunch/node_modules")).unwrap();
         Checked {
             dir: tmp.path().join("team-lunch"),
             e,
@@ -1144,6 +1150,7 @@ impl Checked {
             .env("FAKE_PNPM_OUT", fixture(out))
             .env("FAKE_PNPM_EXIT", code)
             .env("FAKE_PNPM_ARGS", self.bin.path().join("args"))
+            .env("LIGHTBULB_APP_POLL_SCALE_MS", "1")
             .env("GIT_AUTHOR_NAME", "t")
             .env("GIT_AUTHOR_EMAIL", "t@example.com")
             .env("GIT_COMMITTER_NAME", "t")
@@ -1289,12 +1296,15 @@ fn up_prints_cards_and_exits_zero_when_waiting() {
     assert_eq!(up["origin"]["kind"], "ask");
     assert!(up.get("approved_destructive").is_none());
     drop(seen);
-    // A failed build exits 1 and still says what to do.
+    // A failed build is a failure: the backend's error as {code, message, next}, exit 1.
     let (base, _) = ship_stub(json!({"app_id": "a-1", "state": "failed",
         "error": {"code": "build", "message": "it broke", "next": "fix the build"}}));
     let (code, v) = c.app(&["up", "--approved", "card-1"], &base, true);
-    assert_eq!((code, &v["next"]), (1, &json!("fix the build")));
-    assert_eq!(v["done"], false);
+    assert_eq!(code, 1);
+    assert_eq!(
+        v,
+        json!({"code": "build", "message": "it broke", "next": "fix the build"})
+    );
     // No room: null.
     std::fs::remove_file(c.dir.join(".lightbulb/app.json")).unwrap();
     let (base, seen) = ship_stub(waiting());
@@ -1470,6 +1480,25 @@ fn rollback_refuses_a_dirty_tree_and_sends_nothing() {
     assert!(lines(&seen).is_empty());
 }
 
+/// A backend whose `POST /up` and `/publish` answer `building` and whose status is `status`.
+fn building_stub(status: Value) -> (String, Arc<Mutex<Vec<Req>>>) {
+    stub_with(
+        move |line| {
+            let route = line.trim_end_matches(" HTTP/1.1");
+            match route.split_once(BUILD).map_or("", |(_, r)| r) {
+                "/source" => (200, json!({"app_id": "a-1", "source_id": "s-1"})),
+                "/up" | "/a-1/publish" => (200, json!({"app_id": "a-1", "state": "building"})),
+                "/a-1/status" => (200, status.clone()),
+                _ => (
+                    404,
+                    json!({"code": "no_route", "message": route, "next": ""}),
+                ),
+            }
+        },
+        0,
+    )
+}
+
 #[test]
 fn a_building_publish_records_no_migrations() {
     let c = Checked::new();
@@ -1480,10 +1509,118 @@ fn a_building_publish_records_no_migrations() {
             .to_string(),
     )
     .unwrap();
-    let (base, _) = ship_stub(json!({"app_id": "a-1", "state": "building"}));
+    // Still building when the wait gives up: nothing recorded, and the next step is status.
+    let (base, seen) = building_stub(json!({"app_id": "a-1", "state": "building"}));
     let (code, v) = c.app(&["publish"], &base, true);
-    assert_eq!((code, &v["state"]), (0, &json!("building")));
+    assert_eq!((code, &v["state"]), (0, &json!("building")), "{v}");
     assert!(!c.dir.join(".lightbulb/migrations.json").exists());
+    let next = v["next"].as_str().unwrap();
+    assert!(
+        next.contains("lightbulb app status") && !next.contains("again"),
+        "{next}"
+    );
+    assert!(
+        lines(&seen)
+            .iter()
+            .filter(|l| l.ends_with("/status"))
+            .count()
+            > 3
+    );
+    // Live after the wait (R21): recorded, and the next step names the live address.
+    let (base, _) = building_stub(
+        json!({"app_id": "a-1", "state": "live", "live_url": "https://team-lunch.example"}),
+    );
+    let (code, v) = c.app(&["publish"], &base, true);
+    assert_eq!((code, &v["state"]), (0, &json!("live")), "{v}");
+    assert_eq!(
+        v["next"],
+        "it is live at https://team-lunch.example; tell the room what changed"
+    );
+    let m: Value =
+        serde_json::from_slice(&std::fs::read(c.dir.join(".lightbulb/migrations.json")).unwrap())
+            .unwrap();
+    assert!(!m["applied"].as_array().unwrap().is_empty(), "{m}");
+}
+
+#[test]
+fn an_up_still_building_says_status_not_up_again() {
+    let c = Checked::new();
+    let (base, _) = building_stub(json!({"app_id": "a-1", "state": "provisioning"}));
+    let (code, v) = c.app(&["up"], &base, true);
+    assert_eq!(
+        (code, &v["state"], &v["done"]),
+        (0, &json!("provisioning"), &json!(false))
+    );
+    assert_eq!(
+        v["next"],
+        "it is still building; run lightbulb app status to see when it is done"
+    );
+}
+
+#[test]
+fn check_without_node_modules_says_install_and_counts_nothing() {
+    let c = Checked::new();
+    std::fs::remove_dir(c.dir.join("node_modules")).unwrap();
+    for _ in 0..3 {
+        let (code, v) = c.check("tsc.txt", 1, &[]);
+        assert_eq!(code, 1);
+        assert_eq!(
+            v,
+            json!({"code": "not_installed", "message": "The app's packages are not installed.",
+                "next": "run pnpm install, then try again"})
+        );
+    }
+    assert!(!c.dir.join(".lightbulb/progress.json").exists());
+    assert!(!c.bin.path().join("args").exists(), "pnpm ran");
+}
+
+#[test]
+fn an_unexpected_error_has_the_failure_shape() {
+    let e = Env::new();
+    let tmp = tempfile::tempdir().unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+    let o = app_new(&e, tmp.path(), &["team-lunch"]);
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(o.status.code(), Some(1));
+    let v: Value = serde_json::from_slice(&o.stdout)
+        .unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(&o.stdout)));
+    assert_eq!(
+        (&v["code"], &v["next"]),
+        (&json!("failed"), &json!("try again"))
+    );
+    assert!(!v["message"].as_str().unwrap().is_empty());
+}
+
+#[test]
+fn no_embedded_starter_file_is_one_git_ignores() {
+    use lightbulb::apps::starter::FILES;
+    let repo = tempfile::tempdir().unwrap();
+    git(repo.path(), &["init", "-q"]);
+    let ignore = FILES.iter().find(|(p, _)| *p == ".gitignore").unwrap().1;
+    std::fs::write(repo.path().join(".gitignore"), ignore).unwrap();
+    // The addon's files are the app's paths.
+    let paths: Vec<&str> = FILES
+        .iter()
+        .map(|(p, _)| p.strip_prefix("addons/content/").unwrap_or(p))
+        .collect();
+    let mut child = Command::new("git")
+        .current_dir(repo.path())
+        .args(["check-ignore", "--no-index", "--stdin"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // A sanity line that must come back, so an empty answer means none matched.
+    let input = format!("{}\n.lightbulb/progress.json\n", paths.join("\n"));
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    let out = String::from_utf8(child.wait_with_output().unwrap().stdout).unwrap();
+    assert_eq!(out, ".lightbulb/progress.json\n");
 }
 
 #[test]
@@ -1756,10 +1893,9 @@ fn health_commit_mismatch_is_not_done() {
         (0, &json!(false), &json!(["health"])),
         "{v}"
     );
-    assert!(v["next"]
-        .as_str()
-        .unwrap()
-        .contains("/api/_lightbulb/health"));
+    let next = v["next"].as_str().unwrap();
+    assert!(next.contains("/api/_lightbulb/health"), "{next}");
+    assert!(next.contains("lightbulb app status --errors") && !next.contains("app up"));
 }
 
 #[test]
@@ -1799,9 +1935,10 @@ fn next_names_the_missing_piece() {
         json!({}),
     );
     let (code, v) = c.app(&["up"], &base, true);
+    assert_eq!((code, &v["code"]), (1, &json!("build_failed")), "{v}");
     assert_eq!(
-        (code, &v["state"], &v["done"]),
-        (1, &json!("failed"), &json!(false))
+        v["next"],
+        "run lightbulb app status --errors to see why the build failed"
     );
     assert_eq!(
         lines(&seen)

@@ -101,7 +101,7 @@ pub enum AppCommand {
     },
     /// Remove the app (the owner confirms).
     Destroy,
-    /// Type check and build, with errors parsed.
+    /// Type check, lint and design lint (pnpm check); --publish adds the dependency audit.
     Check {
         /// Also check what publishing needs.
         #[arg(long)]
@@ -406,10 +406,15 @@ pub fn new(name: &str, room: Option<&str>, kind: Kind, json: bool) -> Result<i32
             );
         }
     }
+    let next = format!("cd {name} && pnpm install, then lightbulb app check");
     if json {
-        println!("{}", json!({"name": name, "dir": dir, "files": files}));
+        println!(
+            "{}",
+            json!({"name": name, "dir": dir, "files": files, "next": next})
+        );
     } else {
         println!("Started {name} in {} ({files} files).", dir.display());
+        println!("Next: {next}");
     }
     Ok(0)
 }
@@ -514,15 +519,35 @@ pub fn status(errors: bool, json: bool) -> Result<i32> {
         Ok(v)
     });
     match out {
+        Ok(v) if json => {
+            println!("{v}");
+            Ok(0)
+        }
         Ok(v) => {
-            println!(
-                "{}",
-                if json {
-                    v.to_string()
-                } else {
-                    format!("{v:#}")
+            let s = if errors { &v["status"] } else { &v };
+            println!("State: {}", s["state"].as_str().unwrap_or("unknown"));
+            for k in ["preview_url", "live_url", "canvas_url"] {
+                if let Some(u) = s[k].as_str() {
+                    println!("{k}: {u}");
                 }
-            );
+            }
+            let versions = s["versions"].as_array().map_or(0, Vec::len);
+            match s["live_version"].as_u64() {
+                Some(l) => println!("Versions: {versions} (live: {l})"),
+                None => println!("Versions: {versions}"),
+            }
+            if errors {
+                for side in ["client", "server"] {
+                    for e in v["errors"][side].as_array().into_iter().flatten() {
+                        println!(
+                            "Error ({side}) {}: {}",
+                            e["at"].as_str().unwrap_or(""),
+                            e["message"].as_str().unwrap_or("")
+                        );
+                    }
+                }
+            }
+            ship::done_lines(&v);
             Ok(0)
         }
         Err(e) => Ok(fail(json, &e.code, &e.message, &e.next)),

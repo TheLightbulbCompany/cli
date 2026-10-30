@@ -14,7 +14,8 @@ change anything.
    playbook), what you will check.
 3. **Build the screens first, on sample data.** Put sample rows in `drizzle/seed.sql`. Add real
    data, then sign-in, only when a feature needs them.
-4. **Check, cheapest first:** `lightbulb app check` (type check, lint, design lint, build), then
+4. **Check, cheapest first:** run `pnpm install` once (and after changing `package.json`;
+   `check` and `up` answer `not_installed` until you do), then `lightbulb app check` (type check, lint, design lint, build), then
    `lightbulb app up` (deploys the preview, runs the health check, reads the logs). When `up` asks
    for it, open the preview in the shared browser, walk the flow, and record it with
    `lightbulb app evidence --kind browser --file .lightbulb/evidence/<name>.png`. Keep the file

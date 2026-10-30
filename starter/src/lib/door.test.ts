@@ -6,7 +6,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 vi.mock("server-only", () => ({}));
 
 const { verifyPass, sessionCookie, readSession, doorOpen } = await import("./door");
-const { proxy } = await import("../proxy");
+const { proxy, config } = await import("../proxy");
+const { unstable_doesMiddlewareMatch } = await import("next/experimental/testing/server");
 const { POST: openSession } = await import("../app/api/%5Flightbulb/session/route");
 
 let issuer: CryptoKey;
@@ -121,6 +122,30 @@ describe("door", () => {
     const res = await proxy(new NextRequest("https://demo-app.example.com/api/items"));
     expect(res.status).toBe(401);
     expect(await res.json()).toEqual({ code: "closed", message: "Open this from Canvas in Lightbulb." });
+  });
+
+  it("only health and the session route skip the door; error reports do not", () => {
+    const gated = (path: string) => unstable_doesMiddlewareMatch({ config, url: path });
+    expect(gated("/api/_lightbulb/health")).toBe(false);
+    expect(gated("/api/_lightbulb/session")).toBe(false);
+    expect(gated("/_lightbulb/closed")).toBe(false);
+    expect(gated("/_next/static/x.js")).toBe(false);
+    expect(gated("/api/_lightbulb/errors")).toBe(true);
+    expect(gated("/api/_lightbulb/healthz")).toBe(true);
+    expect(gated("/api/items")).toBe(true);
+    expect(gated("/")).toBe(true);
+  });
+
+  it("error reports need a session unless the app is public", async () => {
+    const report = () =>
+      proxy(new NextRequest("https://demo-app.example.com/api/_lightbulb/errors", { method: "POST" }));
+    const closed = await report();
+    expect(closed.status).toBe(401);
+    expect(await closed.json()).toEqual({ code: "closed", message: "Open this from Canvas in Lightbulb." });
+    vi.stubEnv("LIGHTBULB_OPEN_TO", "public");
+    const open = await report();
+    expect(open.status).toBe(200);
+    expect(open.headers.get("x-middleware-next")).toBe("1");
   });
 
   it("session route sets the cookie only for a same-origin json post", async () => {

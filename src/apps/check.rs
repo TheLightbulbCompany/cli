@@ -184,6 +184,14 @@ fn signature(p: &Problem) -> String {
 /// Runs the check in `root`, updates `.lightbulb/progress.json` and returns what to do next.
 /// Prints nothing.
 pub(crate) fn run_check(root: &Path, publish: bool) -> std::result::Result<CheckResult, ApiError> {
+    // Not the app's fault, so not counted toward diagnose/undo.
+    if !root.join("node_modules").is_dir() {
+        return Err(ApiError::new(
+            "not_installed",
+            "The app's packages are not installed.",
+            "run pnpm install, then try again",
+        ));
+    }
     let script = if publish { "check:publish" } else { "check" };
     let out = std::process::Command::new("pnpm")
         .args(["run", script])

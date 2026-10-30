@@ -195,6 +195,8 @@ pub(crate) fn request_form(
             "data-binary = {}\n",
             quoted(&format!("@{}", tmp.display()))?
         ));
+        // Up to 100 MB on a slow uplink: overrides curl()'s 30 s for this call only.
+        config.push_str("max-time = 600\n");
         Ok(config)
     })();
     let out = config.and_then(|c| curl(&c));

@@ -257,8 +257,22 @@ fn print(v: &Value, json: bool) {
             println!("{k}: {u}");
         }
     }
+    done_lines(v);
+}
+
+/// `Done:`, `Missing:` (when not done) and `Next:` lines.
+pub(crate) fn done_lines(v: &Value) {
     if let Some(d) = v["done"].as_bool() {
         println!("Done: {}", if d { "yes" } else { "no" });
+    }
+    let missing: Vec<&str> = v["missing"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    if !missing.is_empty() {
+        println!("Missing: {}", missing.join(", "));
     }
     println!("Next: {}", v["next"].as_str().unwrap_or(""));
 }
@@ -267,32 +281,60 @@ fn failure(json: bool, e: ApiError) -> i32 {
     fail(json, &e.code, &e.message, &e.next)
 }
 
-/// What to do after `up` or `publish`, by state, unless the backend said.
-fn next_for(r: &Value) -> String {
+/// `ready`, or `live` after a publish (R21): the backend is done with it.
+pub(crate) fn finished(state: &Value) -> bool {
+    state == "ready" || state == "live"
+}
+
+/// What to do after `cmd` (`up`, `publish`, `rollback`), by state, unless the backend said.
+/// While it builds the answer is `status`, never the command again: a second upload of the
+/// same commit would move the preview past its evidence (R15).
+fn next_for(cmd: &str, r: &Value) -> String {
     if let Some(n) = r["error"]["next"].as_str().filter(|n| !n.is_empty()) {
         return n.into();
     }
-    match r["state"].as_str() {
-        Some("awaiting_approval") => {
-            "the owner approves the cards in Inbox, then run lightbulb app up again"
+    let live = r["live_url"]
+        .as_str()
+        .map_or(String::new(), |u| format!(" at {u}"));
+    match (cmd, r["state"].as_str()) {
+        (_, Some("awaiting_approval")) => {
+            format!("the owner approves the cards in Inbox, then run lightbulb app {cmd} again")
         }
-        Some("provisioning" | "building") => "wait a little, then run lightbulb app up again",
-        Some("ready") => {
-            "open the preview and check it works, then record it with lightbulb app evidence"
+        (_, Some("provisioning" | "building")) => {
+            "it is still building; run lightbulb app status to see when it is done".into()
         }
-        _ => "fix what the error says, then run lightbulb app up again",
+        ("publish", Some("ready" | "live")) => {
+            format!("it is live{live}; tell the room what changed")
+        }
+        ("rollback", Some("ready" | "live")) => {
+            format!("the earlier version is live{live}; the data is unchanged")
+        }
+        (_, Some("ready" | "live")) => {
+            "open the preview and check it works, then record it with lightbulb app evidence".into()
+        }
+        _ => format!("fix what the error says, then run lightbulb app {cmd} again"),
     }
-    .into()
 }
 
-/// The result's printed form and exit code (1 for `failed`).
+/// The result's printed form and exit code. A `failed` result is a failure:
+/// `{code, message, next}` from the backend's error, else what to do about a failed build.
 fn show(r: &Value, extra: Value, json: bool) -> i32 {
+    if r["state"] == "failed" {
+        let e = &r["error"];
+        let said = |k: &str| e[k].as_str().filter(|s| !s.is_empty());
+        return fail(
+            json,
+            said("code").unwrap_or("build_failed"),
+            said("message").unwrap_or("The build failed."),
+            said("next").unwrap_or("run lightbulb app status --errors to see why the build failed"),
+        );
+    }
     let mut out = contract(r);
     for (k, v) in extra.as_object().into_iter().flatten() {
         out[k] = v.clone();
     }
     print(&out, json);
-    i32::from(r["state"] == "failed")
+    0
 }
 
 /// Packs HEAD and uploads it; returns `(source_id, head)`.
@@ -405,17 +447,10 @@ pub(crate) fn up(
     }
     let mut r = r;
     let id = r["app_id"].as_str().unwrap_or_default().to_string();
-    let mut failed_while_waiting = false;
-    if matches!(r["state"].as_str(), Some("building" | "provisioning")) {
-        match wait(auth, &id, &mut r) {
-            Ok(()) => {}
-            Err(e) => return Ok(failure(json, e)),
-        }
-        failed_while_waiting = true;
+    if let Err(e) = wait(auth, &id, &mut r) {
+        return Ok(failure(json, e));
     }
-    let extra = if r["state"] == "failed" && failed_while_waiting {
-        json!({"done": false, "next": "run lightbulb app status --errors to see why the build failed"})
-    } else if r["state"] == "ready" {
+    let extra = if finished(&r["state"]) {
         let state = git_ok(root, &["rev-parse", "HEAD"])
             .and_then(|head| evidence::done(root, auth, &id, &head));
         match state {
@@ -423,15 +458,18 @@ pub(crate) fn up(
             Err(e) => return Ok(failure(json, e)),
         }
     } else {
-        json!({"done": false, "next": next_for(&r)})
+        json!({"done": false, "next": next_for("up", &r)})
     };
     Ok(show(&r, extra, json))
 }
 
-/// Polls the status (2, 4, 8, 15, 15... s, up to 10 minutes) until the app is no longer
-/// building; `LIGHTBULB_APP_POLL_SCALE_MS` is the unit of those seconds (1000).
+/// While `r` is building, polls the status (2, 4, 8, 15, 15... s, up to 10 minutes) until it no
+/// longer is; `LIGHTBULB_APP_POLL_SCALE_MS` is the unit of those seconds (1000).
 /// The backend never waits inside a request, so the waiting is here.
 fn wait(auth: &Auth, id: &str, r: &mut Value) -> std::result::Result<(), ApiError> {
+    if !matches!(r["state"].as_str(), Some("building" | "provisioning")) {
+        return Ok(());
+    }
     let unit: u64 = std::env::var("LIGHTBULB_APP_POLL_SCALE_MS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -506,14 +544,16 @@ pub(crate) fn publish(
         if let Some(a) = approved {
             body["approved_destructive"] = a.into();
         }
-        let r = api::call(auth, "POST", &format!("/{id}/publish"), Some(&body))?;
-        if r["state"] == "ready" {
+        let mut r = api::call(auth, "POST", &format!("/{id}/publish"), Some(&body))?;
+        wait(auth, &id, &mut r)?;
+        // Only a finished publish applied the migrations; one still building records nothing.
+        if finished(&r["state"]) {
             migrations::record(root, &g.unrecorded)?;
         }
         Ok(r)
     });
     match result {
-        Ok(r) => Ok(show(&r, json!({"next": next_for(&r)}), json)),
+        Ok(r) => Ok(show(&r, json!({"next": next_for("publish", &r)}), json)),
         Err(e) => Ok(failure(json, e)),
     }
 }
@@ -571,12 +611,12 @@ pub(crate) fn rollback(root: &Path, auth: &Auth, version: Option<u32>, json: boo
         Err(e) => return Ok(failure(json, e)),
     };
     if r["state"] == "failed" {
-        return Ok(show(&r, json!({"next": next_for(&r)}), json));
+        return Ok(show(&r, json!({}), json));
     }
     if let Err(e) = restore(root, &target, n) {
         return Ok(failure(json, e));
     }
-    Ok(show(&r, json!({"next": next_for(&r)}), json))
+    Ok(show(&r, json!({"next": next_for("rollback", &r)}), json))
 }
 
 /// One new commit on top whose tree is `target`'s. HEAD never moves backwards.

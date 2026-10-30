@@ -2,7 +2,8 @@ import { NextResponse, type NextRequest } from "next/server";
 import { doorOpen, readSession, SESSION_COOKIE } from "@/lib/door";
 
 // The request gate. Every page and API route passes the door here, except the door's own pages,
-// /api/_lightbulb/* (health and error reports) and Next's assets. Never remove it (AGENTS.md).
+// /api/_lightbulb/health, /api/_lightbulb/session (which opens the door) and Next's assets. Error
+// reports stay behind it: a stranger's text must not reach the builder. Never remove it (AGENTS.md).
 export async function proxy(req: NextRequest) {
   // /admin (the content editor) keeps the door even on a public site.
   const admin = /^\/admin(\/|$)/.test(req.nextUrl.pathname);
@@ -15,5 +16,5 @@ export async function proxy(req: NextRequest) {
 }
 
 export const config = {
-  matcher: ["/((?!_lightbulb/|api/_lightbulb/|_next/|favicon\\.ico$).*)"],
+  matcher: ["/((?!_lightbulb/|api/_lightbulb/health$|api/_lightbulb/session$|_next/|favicon\\.ico$).*)"],
 };

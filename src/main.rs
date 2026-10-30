@@ -445,10 +445,11 @@ fn run() -> lightbulb::Result<()> {
         }
         Command::App { command, json } => {
             use std::io::IsTerminal;
-            exit(lightbulb::apps::run(
-                command,
-                json || !std::io::stdout().is_terminal(),
-            )?)
+            let json = json || !std::io::stdout().is_terminal();
+            // Every app failure has the `{code, message, next}` shape, even an unexpected one.
+            exit(lightbulb::apps::run(command, json).unwrap_or_else(|e| {
+                lightbulb::apps::fail(json, "failed", &e.to_string(), "try again")
+            }))
         }
         Command::External(args) if cli::APP_WORDS.iter().any(|w| args[0] == *w) => {
             exit(cli::app_command(&args)?)

@@ -11,7 +11,7 @@ use std::path::Path;
 
 pub(crate) struct DoneState {
     pub done: bool,
-    /// What is still missing: `preview`, `preview_commit`, `health`, `browser_evidence`.
+    /// What is still missing: `ready`, `preview`, `preview_commit`, `health`, `browser_evidence`.
     pub missing: Vec<&'static str>,
     pub next: String,
 }
@@ -90,7 +90,7 @@ pub(crate) fn done_with(
             next,
         })
     };
-    if s["state"] != "ready" {
+    if !super::ship::finished(&s["state"]) {
         return not(
             "ready",
             "wait for the build to finish, then run lightbulb app status".into(),
@@ -131,7 +131,7 @@ pub(crate) fn done_with(
     {
         return not(
             "health",
-            format!("{health} did not answer 200 for this version; fix the app, then run lightbulb app up"),
+            format!("{health} did not answer 200 for this version; run lightbulb app status --errors to see why"),
         );
     }
     // The deployment's ready time; else when `up` first saw it ready for this commit.
