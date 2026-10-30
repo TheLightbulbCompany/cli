@@ -323,11 +323,13 @@ impl TurnHit {
 /// cosine order of `turns_vec` when there is a model (`memory::fuse`), the newest first where
 /// ranks tie. With `repo`, only the turns of sessions in that repo; every turn without one. A
 /// refused turn is never a candidate.
+/// With `as_of`, only the turns recorded at or before it.
 pub fn search_turns(
     store: &Store,
     query: &str,
     repo: Option<&str>,
     limit: usize,
+    as_of: Option<i64>,
 ) -> Result<Vec<TurnHit>> {
     use crate::memory::{fts_query, fuse, unblob};
     let Some(q) = fts_query(query) else {
@@ -338,11 +340,11 @@ pub fn search_turns(
         "SELECT t.rowid FROM turns_fts JOIN capture_turns t ON t.rowid = turns_fts.rowid
          JOIN capture_sessions s ON s.id = t.session_id
          WHERE turns_fts MATCH ?1 AND substr(t.text, 1, length(?2)) != ?2
-         AND (?3 IS NULL OR s.repo = ?3 COLLATE NOCASE)
+         AND (?3 IS NULL OR s.repo = ?3 COLLATE NOCASE) AND (?5 IS NULL OR t.at <= ?5)
          ORDER BY bm25(turns_fts), t.rowid DESC LIMIT ?4",
     )?;
     let ids: Vec<String> = stmt
-        .query_map(rusqlite::params![q, REFUSED, repo, limit], |r| {
+        .query_map(rusqlite::params![q, REFUSED, repo, limit, as_of], |r| {
             Ok(key(r.get(0)?))
         })?
         .collect::<rusqlite::Result<_>>()?;
@@ -351,9 +353,9 @@ pub fn search_turns(
             "SELECT v.turn, v.v FROM turns_vec v JOIN capture_turns t ON t.rowid = v.turn
              JOIN capture_sessions s ON s.id = t.session_id
              WHERE substr(t.text, 1, length(?1)) != ?1
-             AND (?2 IS NULL OR s.repo = ?2 COLLATE NOCASE)",
+             AND (?2 IS NULL OR s.repo = ?2 COLLATE NOCASE) AND (?3 IS NULL OR t.at <= ?3)",
         )?;
-        let rows = stmt.query_map(rusqlite::params![REFUSED, repo], |r| {
+        let rows = stmt.query_map(rusqlite::params![REFUSED, repo, as_of], |r| {
             Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
         })?;
         let mut out = Vec::new();
