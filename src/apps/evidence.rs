@@ -163,14 +163,26 @@ pub(crate) fn done_with(
     if !seen {
         return not(
             "browser_evidence",
-            format!("open {url} in the browser, check the main flow, then lightbulb app evidence --kind browser --file …"),
+            format!("run lightbulb app test-link --json, open its url in the browser (past the door of {url}), check the main flow, then lightbulb app evidence --kind browser --file …"),
         );
     }
     Ok(DoneState {
         done: true,
         missing: vec![],
-        next: "tell the room the preview is done and send them the link".into(),
+        next: "tell the room the preview is done and give them canvas_url; never the preview address or a test link".into(),
     })
+}
+
+/// A test link, or a bare pass: three dot-joined base64url parts, the first starting `eyJ`.
+pub(crate) fn holds_pass(text: &str) -> bool {
+    text.contains("#token=")
+        || text
+            .split(|c: char| !(c.is_ascii_alphanumeric() || "-_.".contains(c)))
+            .any(|w| {
+                w.starts_with("eyJ")
+                    && w.split('.').count() == 3
+                    && w.split('.').all(|p| p.len() >= 4)
+            })
 }
 
 /// `lightbulb app evidence`: appends the record to `.lightbulb/progress.json`. The file stays
@@ -184,6 +196,14 @@ pub(crate) fn record(
     note: &str,
     json: bool,
 ) -> Result<i32> {
+    if holds_pass(note) {
+        return Ok(fail(
+            json,
+            "note_has_pass",
+            "That note holds a test link; evidence is kept in .lightbulb/.",
+            "say what you checked, without the link",
+        ));
+    }
     let verdict = match (kind, verdict) {
         (EvidenceKind::Review, None) => {
             return Ok(fail(

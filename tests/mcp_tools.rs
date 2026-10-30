@@ -48,7 +48,8 @@ impl Net {
             claude,
             daemon,
         };
-        for _ in 0..50 {
+        // 20 s: a cold start right after a rebuild can take a while.
+        for _ in 0..200 {
             if UnixStream::connect(net.dir.path().join(paths::SOCKET)).is_ok() {
                 return net;
             }
@@ -130,8 +131,18 @@ impl Net {
 
 impl Drop for Net {
     fn drop(&mut self) {
-        let _ = UnixStream::connect(self.dir.path().join(paths::SOCKET))
+        let sent = UnixStream::connect(self.dir.path().join(paths::SOCKET))
             .and_then(|mut s| s.write_all(b"{\"id\":0,\"op\":\"shutdown\"}\n"));
+        // Never an unbounded wait: a daemon that did not hear it (one that had not come up when
+        // the test panicked) would hang the whole suite.
+        let end = std::time::Instant::now() + Duration::from_secs(10);
+        while sent.is_ok() && std::time::Instant::now() < end {
+            if !matches!(self.daemon.try_wait(), Ok(None)) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = self.daemon.kill();
         let _ = self.daemon.wait();
     }
 }
@@ -393,6 +404,33 @@ fn me() -> os::Process {
     os::process(std::process::id()).unwrap()
 }
 
+/// A headless run sends as itself, and `find_sessions` does not show it.
+#[test]
+fn a_headless_run_can_send_and_is_not_found() {
+    let net = Net::new();
+    let other = Other::new();
+    let codex = net.register("codex", "t1", &other.1);
+    let p = me();
+    let r = net.call(
+        json!({"id": 1, "op": "register", "session": {"provider": "claude",
+        "conversation": "run", "pid": p.pid, "birth_micros": p.birth_micros, "cwd": "/tmp",
+        "headless": true}}),
+    );
+    let run = r["key"].as_str().unwrap().to_string();
+    let mut m = net.mcp(&me());
+    let v = m.tool("find_sessions", json!({})).json();
+    assert_eq!(v["total"], 1, "{v}");
+    assert_eq!(v["sessions"][0]["session_id"], codex.as_str(), "{v}");
+    let out = m.tool(
+        "send_message",
+        json!({"request_id": "r-headless", "text": "hi", "session_id": codex}),
+    );
+    assert!(!out.error, "{}", out.text);
+    assert_eq!(out.json()["state"], "stored");
+    let r = net.call(json!({"id": 1, "op": "inbox", "key": codex}));
+    assert_eq!(r["messages"][0]["from"], run.as_str(), "{r}");
+}
+
 #[test]
 fn send_message_from_claude_to_codex_returns_stored_and_receipt_follows() {
     let net = Net::new();
@@ -503,6 +541,101 @@ fn tool_results_carry_the_unread_note_for_pull_tier() {
 }
 
 #[test]
+fn find_sessions_lists_ended_ones_after_the_live_with_their_resume() {
+    let net = Net::new();
+    let other = Other::new();
+    let gone = Other::new();
+    let mine = net.register("claude", "c1", &me());
+    let live = net.register("codex", "t1", &other.1);
+    let ended = net.register("codex", "t2", &gone.1);
+    let r = net.call(json!({"id": 1, "op": "end", "key": ended, "reason": "session-end"}));
+    assert_eq!(r["ended"], true, "{r}");
+    let mut m = net.mcp(&me());
+
+    let v = m.tool("find_sessions", json!({})).json();
+    assert_eq!(v["total"], 3, "{v}");
+    let list = v["sessions"].as_array().unwrap();
+    let ids: Vec<&str> = list
+        .iter()
+        .map(|s| s["session_id"].as_str().unwrap())
+        .collect();
+    assert!(
+        ids[..2].contains(&mine.as_str()) && ids[..2].contains(&live.as_str()),
+        "{v}"
+    );
+    assert_eq!(ids[2], ended, "{v}");
+    assert_eq!(list[2]["status"], "ended", "{v}");
+    assert_eq!(list[2]["reason"], "session-end", "{v}");
+    assert_eq!(list[2]["resume"], "cd '/tmp' && codex resume t2", "{v}");
+    assert!(list[2]["ended_at"].is_u64(), "{v}");
+    assert!(list[0].get("resume").is_none(), "{v}");
+}
+
+#[test]
+fn ended_rows_do_not_push_live_teammates_off_the_page() {
+    let (a, b) = common::pair(&[]);
+    let codex = Other::new();
+    let mine = register_on(&a, "claude", "c1", &me(), "/tmp");
+    let theirs = register_on(&b, "codex", "b1", &codex.1, "/tmp/api");
+    for i in 0..3 {
+        let key = register_on(&a, "codex", &format!("e{i}"), &codex.1, "/tmp");
+        let r = a.ask(json!({"id": 1, "op": "end", "key": key}));
+        assert_eq!(r["ended"], true, "{r}");
+    }
+    common::until(15, "A sees B's session", || common::sees(&a, &theirs));
+    let mut m = mcp_on(&a, &me());
+    let v = m.tool("find_sessions", json!({"limit": 2})).json();
+    assert_eq!(v["total"], 5, "{v}");
+    let ids: Vec<&str> = v["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["session_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, [mine.as_str(), theirs.as_str()], "{v}");
+}
+
+#[test]
+fn a_receipt_says_when_its_session_has_ended() {
+    const ENDED: &str = "That session has ended. It reads this only if resumed within a day.";
+    let (a, b) = common::pair(&[]);
+    let codex = Other::new();
+    let from = register_on(&a, "claude", "c1", &me(), "/tmp");
+    let live = register_on(&a, "codex", "live", &codex.1, "/tmp");
+    let gone = register_on(&a, "codex", "gone", &codex.1, "/tmp");
+    let theirs = register_on(&b, "codex", "b1", &codex.1, "/tmp/api");
+    for (e, key) in [(&a, &gone), (&b, &theirs)] {
+        let r = e.ask(json!({"id": 1, "op": "end", "key": key, "reason": "session-end"}));
+        assert_eq!(r["ended"], true, "{r}");
+    }
+    let listed = |status: &str| {
+        a.ask(json!({"id": 1, "op": "directory"}))["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["session_id"] == theirs.as_str() && s["status"] == status)
+    };
+    common::until(15, "A sees B's session ended", || listed("ended"));
+    let mut m = mcp_on(&a, &me());
+    let send = |m: &mut Mcp, to: &str, rid: &str| {
+        m.tool(
+            "send_message",
+            json!({"session_id": to, "text": "hi", "request_id": rid}),
+        )
+        .json()
+    };
+    for (to, rid) in [(&gone, "r1"), (&theirs, "r2")] {
+        let v = send(&mut m, to, rid);
+        assert!(v["note"].as_str().unwrap().ends_with(ENDED), "{v}");
+        let v = m.tool("message_receipt", json!({"request_id": rid})).json();
+        assert!(v["note"].as_str().unwrap().ends_with(ENDED), "{v}");
+    }
+    assert_eq!(a.state(&from, "r1"), "stored");
+    let v = send(&mut m, &live, "r3");
+    assert!(!v.to_string().contains(ENDED), "{v}");
+}
+
+#[test]
 fn find_sessions_marks_is_this_session() {
     let net = Net::new();
     let other = Other::new();
@@ -544,8 +677,6 @@ fn find_sessions_marks_is_this_session() {
     assert_eq!(by_name["total"], 1, "{by_name}");
     assert_eq!(by_name["sessions"][0]["session_id"], theirs.as_str());
     assert_eq!(b["online"], true);
-    assert_eq!(b["can_send"], true);
-    assert_eq!(b["needs_owner_ok"], false);
     assert_eq!(b["tier"], "next_step");
     assert!(b["computer"].as_str().is_some_and(|c| !c.is_empty()));
     assert!(b["person"].as_str().is_some_and(|c| !c.is_empty()));
@@ -771,7 +902,6 @@ fn find_sessions_lists_teammates_with_person_and_computer() {
         (&json!("bob"), &json!("mbp"), &json!(false)),
         "{bob}"
     );
-    assert_eq!(bob["needs_owner_ok"], true, "{bob}");
     assert_eq!(bob["is_this_session"], false, "{bob}");
     assert_eq!(bob["cwd"], "", "a teammate's path stays on their computer");
     // The query reaches teammates too: by person, by computer.

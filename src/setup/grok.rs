@@ -20,7 +20,7 @@ pub(super) fn configure(ctx: &Ctx, r: &mut AgentReport) -> Result<Owner> {
         }
     } else {
         let mut doc = json!({});
-        for e in EVENTS {
+        for e in EVENTS.into_iter().filter(|e| !e.waits()) {
             let timeout = if e == Event::SessionEnd { 3 } else { 10 };
             let mut group = json!({"hooks": [{"type": "command",
                 "command": ctx.hook_command("grok", e.arg()), "timeout": timeout}]});

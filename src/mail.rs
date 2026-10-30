@@ -22,7 +22,7 @@ pub const NOT_A_MEMBER: &str =
     "This workspace answers its members. Ask an admin to add you, then run `lightbulb login`";
 /// Offline mail (and, later, the outbox) waits this long.
 pub const HOLD_S: u64 = 86_400;
-/// A held message waits this long for the person (nothing holds in Plan A).
+/// A row is kept this long after its final state; nothing is held (owner ruling 2026-10-26).
 pub const HELD_S: u64 = 604_800;
 pub const MAX_TEXT: usize = 65_536;
 pub const MAX_REQUEST_ID: usize = 128;
@@ -166,11 +166,21 @@ pub struct ForPerson<'a> {
 /// A receipt's reason when a person or agent allowed the held message: `approved by <who>`.
 pub const APPROVED: &str = "approved by ";
 
+/// What a receipt of mail for an ended session says, whoever reads it.
+pub const ENDED_NOTE: &str = "That session has ended. It reads this only if resumed within a day.";
+
 /// What receipt `r` means in words. With `person`, the sentence for the person who sent it at
 /// a terminal (always one). Without, the note an agent's `send_message` and `message_receipt`
-/// carry, only for mail on a teammate's computer or a `loop` refusal.
+/// carry, only for mail on a teammate's computer, a `loop` refusal or an ended session.
 pub fn receipt_note(r: &Value, person: Option<&ForPerson>) -> Option<String> {
-    let text = receipt_text(r, person)?;
+    let text = receipt_text(r, person);
+    if r["ended"] == true {
+        return Some(match text {
+            Some(t) => format!("{t} {ENDED_NOTE}"),
+            None => ENDED_NOTE.into(),
+        });
+    }
+    let text = text?;
     Some(
         match r["reason"].as_str().and_then(|w| w.strip_prefix(APPROVED)) {
             Some(who) if person.is_some() => format!(
@@ -209,7 +219,7 @@ fn receipt_text(r: &Value, person: Option<&ForPerson>) -> Option<String> {
         _ => "paused by a loop limit".into(),
     };
     let Some(p) = person else {
-        let (computer, person) = (at("where"), at("person"));
+        let computer = at("where");
         return Some(match at("state") {
             "refused" if at("reason") == "loop" => limit(),
             "refused" if at("reason") == "no_worker" => format!("not sent: {}", no_worker(at("harness"), " (find_workers lists who takes assignments)")),
@@ -1555,6 +1565,10 @@ mod tests {
                 repo: None,
                 branch: None,
                 handle: None,
+                reason: None,
+                ended_at: None,
+                waiting_for: None,
+                headless: false,
             })
             .unwrap();
     }

@@ -391,7 +391,7 @@ impl Ctx<'_> {
     }
 
     fn quoted(&self) -> String {
-        format!("'{}'", self.exe.replace('\'', "'\\''"))
+        crate::sessions::shell_quoted(self.exe)
     }
 
     /// The owner of a server entry, given its command (`None`: the entry has none), its args

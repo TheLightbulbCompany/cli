@@ -97,7 +97,7 @@ fn help_lists_app_under_apps_you_build() {
         .unwrap();
     let help = String::from_utf8_lossy(&o.stdout);
     assert!(
-        help.contains("Apps you build:\n  app       Build, check, preview, publish and undo apps: app new|up|publish|rollback|status|destroy|check|evidence|report-broken-tool\n"),
+        help.contains("Apps you build:\n  app       Build, check, preview, publish and undo apps: app new|up|publish|rollback|status|destroy|check|test-link|evidence|report-broken-tool\n"),
         "{help}"
     );
 }
@@ -1136,6 +1136,10 @@ fn ship_stub(up: Value) -> (String, Arc<Mutex<Vec<Req>>>) {
             match route.strip_prefix(&format!("POST {BUILD}")).unwrap_or("") {
                 "/source" => (200, json!({"app_id": "a-1", "source_id": "s-1"})),
                 "/up" | "/a-1/publish" => (200, up.clone()),
+                "/a-1/test-link" => (
+                    200,
+                    json!({"url": "https://p.example/_lightbulb/session#token=THE_PASS"}),
+                ),
                 "/a-1/destroy" => (
                     200,
                     json!({"state": "awaiting_owner", "next": "the owner removes it from Canvas",
@@ -1491,6 +1495,118 @@ fn destroy_prints_next_and_no_secret_in_any_output() {
 }
 
 #[test]
+fn test_link_prints_the_url_and_keeps_it_out_of_every_file() {
+    let c = Checked::new();
+    std::fs::write(c.dir.join(".lightbulb/app.json"), r#"{"app_id":"a-1"}"#).unwrap();
+    let (base, seen) = ship_stub(waiting());
+    let (code, v) = c.app(&["test-link"], &base, true);
+    assert_eq!(code, 0);
+    assert_eq!(
+        v,
+        json!({"url": "https://p.example/_lightbulb/session#token=THE_PASS"})
+    );
+    assert!(seen.lock().unwrap()[0].line.contains("/a-1/test-link"));
+    let mut dirs = vec![
+        c.dir.clone(),
+        c.e.home.path().to_path_buf(),
+        c.e.state.path().to_path_buf(),
+    ];
+    while let Some(d) = dirs.pop() {
+        for f in std::fs::read_dir(d).unwrap().flatten() {
+            let p = f.path();
+            if p.is_dir() {
+                dirs.push(p);
+            } else if let Ok(b) = std::fs::read(&p) {
+                let text = String::from_utf8_lossy(&b);
+                assert!(!text.contains("THE_PASS"), "{} holds the pass", p.display());
+            }
+        }
+    }
+}
+
+#[test]
+fn test_link_passes_not_ready_on_and_needs_a_first_up() {
+    let c = Checked::new();
+    let (base, seen) = stub(
+        409,
+        json!({"code": "not_ready", "message": "The app has no preview yet.", "next": "wait for the preview build"}),
+        0,
+    );
+    let (code, v) = c.app(&["test-link"], &base, true);
+    assert_eq!((code, &v["code"]), (1, &json!("not_up_yet")));
+    assert!(seen.lock().unwrap().is_empty());
+    std::fs::write(c.dir.join(".lightbulb/app.json"), r#"{"app_id":"a-1"}"#).unwrap();
+    let (code, v) = c.app(&["test-link"], &base, true);
+    assert_eq!((code, &v["code"]), (1, &json!("not_ready")));
+    assert_eq!(v["next"], "wait for the preview build");
+}
+
+#[test]
+fn evidence_refuses_a_note_holding_a_test_link() {
+    let c = Checked::new();
+    let file = c.dir.join(".lightbulb/evidence/a.png");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, "png").unwrap();
+    let (base, _) = ship_stub(waiting());
+    let note = "walked https://p.example/_lightbulb/session#token=THE_PASS";
+    let (code, v) = c.app(
+        &[
+            "evidence",
+            "--kind",
+            "browser",
+            "--file",
+            file.to_str().unwrap(),
+            "--note",
+            note,
+        ],
+        &base,
+        true,
+    );
+    assert_eq!((code, &v["code"]), (1, &json!("note_has_pass")));
+    let progress =
+        std::fs::read_to_string(c.dir.join(".lightbulb/progress.json")).unwrap_or_default();
+    assert!(!progress.contains("THE_PASS"));
+}
+
+#[test]
+fn a_bare_pass_is_refused_in_evidence_and_lessons() {
+    let c = Checked::new();
+    let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJhcHAiOiJkZW1vIn0.c2lnbmF0dXJl";
+    let file = c.dir.join(".lightbulb/evidence/a.png");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, "png").unwrap();
+    let (base, _) = ship_stub(waiting());
+    let note = format!("opened with {jwt} fine");
+    let (code, v) = c.app(
+        &[
+            "evidence",
+            "--kind",
+            "browser",
+            "--file",
+            file.to_str().unwrap(),
+            "--note",
+            &note,
+        ],
+        &base,
+        true,
+    );
+    assert_eq!((code, &v["code"]), (1, &json!("note_has_pass")));
+    let o =
+        c.e.base_cmd(Command::new(common::EXE))
+            .current_dir(&c.dir)
+            .args(["app", "report-broken-tool", "browser", &note, "--json"])
+            .output()
+            .unwrap();
+    let v: Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(
+        (o.status.code(), &v["code"]),
+        (Some(1), &json!("note_has_pass"))
+    );
+    let lessons = std::fs::read_to_string(c.dir.join(".lightbulb/lessons.md")).unwrap_or_default();
+    assert!(!lessons.contains("eyJ"), "{lessons}");
+}
+
+#[test]
 fn rollback_refuses_a_dirty_tree_and_sends_nothing() {
     let c = Checked::new();
     std::fs::write(c.dir.join(".lightbulb/app.json"), r#"{"app_id":"a-1"}"#).unwrap();
@@ -1794,7 +1910,7 @@ fn done_needs_ready_health_and_browser_evidence_for_head() {
     assert_eq!((code, &v["done"]), (0, &json!(false)), "{v}");
     assert_eq!(v["missing"], json!(["browser_evidence"]));
     let want = format!(
-        "open {base} in the browser, check the main flow, then lightbulb app evidence --kind browser --file …"
+        "run lightbulb app test-link --json, open its url in the browser (past the door of {base}), check the main flow, then lightbulb app evidence --kind browser --file …"
     );
     assert_eq!(v["next"], want.as_str());
     assert!(lines(&seen).contains(&"GET /api/_lightbulb/health".to_string()));
@@ -2246,7 +2362,7 @@ fn publish_without_a_review_gives_the_exact_command_and_the_preview() {
         v,
         json!({"code": "review_required",
             "message": "Publish needs a passing review recorded for this commit.",
-            "next": "run the reviewer or ask your workspace agent to review the preview at https://p.example, then record it: lightbulb app evidence --kind review --verdict pass --file <screenshot> --note \"<what was checked>\""})
+            "next": "run the reviewer or ask your workspace agent to review the preview at https://p.example (lightbulb app test-link --json gets past its door), then record it: lightbulb app evidence --kind review --verdict pass --file <screenshot> --note \"<what was checked>\""})
     );
     assert!(lines(&seen).is_empty());
 }

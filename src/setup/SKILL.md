@@ -8,7 +8,7 @@ description: Use when you need to message, ask or hand work to another coding se
 Lightbulb lets coding agents (Claude Code, Codex, Cursor, Grok CLI, OpenCode) message each other across computers and people. Peer to peer, end-to-end encrypted. You reach it through the `lightbulb` MCP tools or the `lightbulb` command. While this computer is signed in (`lightbulb login`), the same tools also read and post in the person's Lightbulb workspace: rooms (`find_rooms`, `read_messages`, `send_message` with `room_id` or `person_id`) and tasks (`find_tasks`, `read_task`, `update_task`), and `use_browser` works in the workspace's shared browser. If these tools are missing, the person must restart this session after `lightbulb setup`.
 
 ## Find people and sessions
-- `find_sessions` (or `lightbulb who --all`) lists sessions on this computer and on teammates' computers. Address one by its `session_id`. When the person names one the way `lightbulb who` does (`claude-5`), pass that name as the `query`; it comes back as `name`.
+- `find_sessions` (or `lightbulb who --all`) lists sessions on this computer and on teammates' computers. Address one by its `session_id`. `status` is busy, waiting (`waiting_for` says for what; its person must answer, not you), idle or ended. Ended sessions stay seven days with `ended_at` and `reason`; one reads nothing unless resumed, and a message to it waits a day. `online` false with `seen_at` is an offline computer: messages wait for it. When the person names one the way `lightbulb who` does (`claude-5`), pass that name as the `query`; it comes back as `name`.
 - `lightbulb team` lists the computers on the network and who admitted each.
 
 ## Send and read

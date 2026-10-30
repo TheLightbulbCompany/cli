@@ -175,6 +175,15 @@ proves a computer ignores app envelopes). The "no admins" rule is the flat netwo
 | A receipt to a parked member with a doorbell carries `waking`; the CLI says it is waking up, not offline. | `src/daemon/ipc.rs`, `finish`; `src/mail.rs`, `receipt_text` | `src/mail.rs::a_parked_workspace_reads_as_waking_not_offline` | PASS |
 | OpenCode: provider, caller, hooks, setup (MCP entry and plugin). Every pushed message carries the session's own agent and model, so a teammate's mail cannot switch a session from `plan` to `build`; with none recorded the plugin does not push and the mail waits for `check_inbox`. | `src/setup/opencode.rs`, `src/hook.rs`, `src/agents/caller.rs` | the OpenCode cases in `tests/hooks.rs` and `src/setup/tests.rs`, and the plugin smoke test (needs node) | PASS (unit and integration); **not run in a live OpenCode session** |
 
+### E. One session list (0.8.0)
+
+| Behaviour | Test | Result |
+|---|---|---|
+| A refresh after an update adds the `Notification` and `PermissionRequest` hooks and leaves the service loaded | `tests/cli.rs::a_refresh_adds_the_waiting_hooks`, `a_refresh_leaves_the_loaded_job_alone` | PASS |
+| `who` shows busy, waiting for you, idle, offline, parked, and a `Recent` section with the resume command | `src/cli.rs::who_says_what_is_true_of_a_session`; `tests/cli.rs::who_prints_waiting_done_and_a_recent_section_with_resume`, `who_all_prints_busy_for_a_busy_teammate_and_offline_with_last_seen` | PASS |
+| Ended sessions stay seven days; teammates get their name, folder, repo, branch, end time and reason, never the resume command | `tests/directory.rs` and `tests/sessions_ipc.rs` (commits `d1230c5`, `fb9988e`) | PASS |
+| `waiting_for` and ended sessions ride presence as optional fields; older peers are unaffected | `src/net/frames.rs` and `tests/directory.rs` (commit `7228360`) | PASS |
+
 ## Real computers
 
 Observed on 2026-10-24 on v0.3.6 and v0.3.7 (nothing here was re-run for this file): the owner's

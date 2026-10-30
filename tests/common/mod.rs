@@ -58,6 +58,8 @@ impl Env {
         c.env("LIGHTBULB_CONNECT_HOME", self.state.path())
             .env("LIGHTBULB_CONNECT_CLAUDE_HOME", self.home.path())
             .env("LIGHTBULB_CONNECT_NO_LAUNCHCTL", "1")
+            // A suite run from `claude -p` must not read as one: hooks would register nothing.
+            .env_remove("CLAUDE_CODE_ENTRYPOINT")
             .env("LIGHTBULB_CONNECT_DEBUG_NO_DEFAULT_RELAYS", "1")
             .env("LIGHTBULB_CONNECT_DEBUG_NO_TELEMETRY", "1")
             // Never the real model download: a closed port (`embed_model`).
@@ -125,7 +127,8 @@ impl Env {
                     && line.contains("\"ok\":true")
             })
         };
-        until(10, "the daemon starts", || {
+        // 20 s: a cold start right after a rebuild can take a while.
+        until(20, "the daemon starts", || {
             assert!(child.try_wait().unwrap().is_none(), "the daemon exited");
             ping()
         });
@@ -603,6 +606,7 @@ pub fn remote(session_id: &str) -> Remote {
         tier: "pull".into(),
         title: None,
         free: None,
+        waiting_for: None,
     }
 }
 
@@ -614,17 +618,18 @@ pub fn presence_with(member: &str, seq: u64, sessions: Vec<Remote>) -> Frame {
         sessions,
         known: vec![],
         kept: vec![],
+        ended: vec![],
     }
 }
 
-/// Whether `env`'s `directory` lists `session_id`.
+/// Whether `env`'s `directory` lists `session_id`, not ended.
 pub fn sees(env: &Env, session_id: &str) -> bool {
     let r = env.ask(json!({"id": 1, "op": "directory"}));
     r["sessions"]
         .as_array()
         .into_iter()
         .flatten()
-        .any(|s| s["session_id"] == session_id)
+        .any(|s| s["session_id"] == session_id && s["status"] != "ended")
 }
 
 /// A member `who` played by the test, dialed in: `hello`, then `presence`.

@@ -42,7 +42,7 @@ Run `lightbulb <command> --help` for the options of each one.
 | `update` | Install the latest release over this one and restart the background service. `--version v0.2.3` installs that release instead (0.2.2 or later; an example tag). `--auto on\|off` turns the daily automatic update on or off and installs nothing. |
 | `setup --remove` | Take out only what `setup` wrote. Backups are left as they are. |
 | `doctor` | Check the service, the local network, the state folder and each agent, and say how to fix what is not right. |
-| `who` | List the sessions on this computer. `who --all` adds your teammates' sessions. |
+| `who` | List the sessions on this computer. Status reads busy, waiting for you (a permission prompt or a question, shown with what it waits for), idle, offline (a computer that is not reachable, with when it was last seen), parked (a workspace that a message wakes), or ended. Under `Recent`, sessions that ended in the last seven days, with when they ended and, for your own, the command that resumes them. `who --all` adds your teammates' sessions. |
 | `invite` | Print a four-word code (works once, for 10 minutes), a `https://thelightbulb.company/j#…` link, and the join command (`lightbulb join '<ticket>'`) that add your other computer or a teammate. The link and line are reusable for 7 days. `--once`: one join, valid 24 hours. `--new`: a new invite; every earlier one from this computer, `--once` ones too, stops working. `--agents`: add your Lightbulb workspace's agents to this network (a workspace admin, signed in; confirm in the browser). |
 | `join '<ticket>'` | Join the team the invite is for. Takes the four-word code, the `https://thelightbulb.company/j#…` link, the `lightbulb://join/…` link or the bare ticket. The name you go by is your user name; `--name <name>` sets another. The computer must be on its own first. |
 | `approve H1` / `decline H1` | Answer a permission prompt the Lightbulb app filed. |
@@ -132,7 +132,8 @@ For each session on your computer, teammates see:
 
 - the agent (Claude Code, Codex, Cursor, Grok CLI, OpenCode) and the computer it runs on;
 - the folder's name (its last part, not the full path), and the repository and branch;
-- whether it is busy or idle, and a short title of what it is doing.
+- whether it is busy, waiting for its person (and what for), or idle, and a short title of what it is doing;
+- for seven days after a session ends: its name, folder, repository, branch, when it ended and why. They do not get the command that resumes it; only you do.
 
 They never see your messages, your files or your agents' conversations. Messages travel end to end
 encrypted between the two computers, and their text is not written to the log. A message's
@@ -143,7 +144,7 @@ Apart from anonymous usage counts (`lightbulb telemetry off`), the engine calls 
 `login`, renewing a signed-in computer's proof, `invite --agents`, and, while signed in, the live
 connection hosted apps use. Otherwise it talks only to your teammates' computers and, when no
 direct path exists, to the relays. The background service checks this project's GitHub releases
-once a day for an update (`lightbulb update --auto off` stops it), and `update` downloads from them.
+once a day for an update (`lightbulb update --auto off` stops it), and `update` downloads from them. After an update, `setup` runs again with the new binary (the daemon's own run is `setup --refresh`), which rewrites the agents' hooks, so an existing install gets new hooks, such as the ones that mark a session as waiting, without anything from you. The refresh does not stop or reload the background service.
 
 To hide sessions, run `lightbulb folder <path> off`. Sessions under that folder disappear
 from your teammates' `who --all` within a few seconds. `who` on your

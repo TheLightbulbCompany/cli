@@ -1,9 +1,10 @@
 //! Newline-delimited JSON over the daemon's Unix socket.
 
 use super::Daemon;
+use crate::agents::listing::{self, Listed};
 use crate::sessions::{self, Key};
 use crate::store;
-use crate::{frame, label, mail, outbox, presence};
+use crate::{doing, frame, label, mail, outbox, presence};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -290,10 +291,25 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
             Response::ok(id, json!({}))
         }
         "register" => register(id, body, daemon),
-        // `sessions {handle?}`: with a handle, the live session of it (`not_found` when none
+        // `sessions {handle?, headless?}`: `headless` adds the runs no list shows, for telling who
+        // is calling; with a handle, the live session of it (`not_found` when none
         // is; `bad_request` for a string that is no handle, which is a name).
         "sessions" => match body["handle"].as_str() {
-            None => Response::ok(id, json!({ "sessions": live_sessions(daemon) })),
+            None => {
+                let live = if body["headless"] == true {
+                    live_sessions(daemon)
+                } else {
+                    listed_sessions(daemon)
+                };
+                // A row that ended yet is seen live again (no hook said so) is shown live.
+                let ended: Vec<Value> = ended_sessions(daemon)
+                    .iter()
+                    .filter(|(r, _)| live.iter().all(|s| s.key.0 != r.key))
+                    .take(presence::MAX)
+                    .map(|(r, hidden)| ended_json(r, *hidden))
+                    .collect();
+                Response::ok(id, json!({ "sessions": live, "ended": ended }))
+            }
             Some(h) if !is_handle(h) => Response::err(id, BAD_REQUEST),
             Some(h) => match live_sessions(daemon)
                 .into_iter()
@@ -1295,7 +1311,8 @@ fn assignments_guard(id: u64, body: &Value, daemon: &Daemon) -> Response {
     )
 }
 
-/// `end {key, caller?, if_gone?}` -> `{ended}`: ends the session row (kept a day, ended);
+/// `end {key, caller?, if_gone?, reason?}` -> `{ended}`: ends the session row (kept, ended);
+/// `reason` is `process-exited` (default), `moved-on`, `job-done` or `session-end`;
 /// its mail stays for the hold. With `caller`, only the row's own process may end it; with `if_gone`, also
 /// anyone once the row's process is dead. `ended: false` when refused. Neither field (the
 /// CLI) ends it outright.
@@ -1303,23 +1320,40 @@ fn end(id: u64, key: &str, body: &Value, daemon: &Daemon) -> Response {
     let Ok(caller) = caller(body) else {
         return Response::err(id, BAD_REQUEST);
     };
+    let reason = match body["reason"].as_str() {
+        None => "process-exited",
+        Some(r @ ("process-exited" | "moved-on" | "job-done" | "session-end")) => r,
+        Some(_) => return Response::err(id, BAD_REQUEST),
+    };
     let if_gone = body["if_gone"] == true;
-    let store = daemon.store.lock().unwrap();
-    if caller.is_some() || if_gone {
-        let row = match row_process(&store, key) {
+    let row = {
+        let store = daemon.store.lock().unwrap();
+        if caller.is_some() || if_gone {
+            let row = match row_process(&store, key) {
+                Ok(r) => r,
+                Err(_) => return Response::err(id, INTERNAL),
+            };
+            let owned = caller.is_some() && row == caller;
+            let dead = !row.is_some_and(|(p, b)| sessions::alive(p, b));
+            if !(owned || (if_gone && dead)) {
+                return Response::ok(id, json!({ "ended": false }));
+            }
+        }
+        match store.session(key) {
             Ok(r) => r,
             Err(_) => return Response::err(id, INTERNAL),
-        };
-        let owned = caller.is_some() && row == caller;
-        let dead = !row.is_some_and(|(p, b)| sessions::alive(p, b));
-        if !(owned || (if_gone && dead)) {
-            return Response::ok(id, json!({ "ended": false }));
         }
-    }
-    // The row stays a day, ended: its address is kept (`presence`).
-    match store.end_session(key, now() as i64) {
+    };
+    // Off the store lock: a transcript's tail.
+    let title = row
+        .filter(|r| r.provider == "claude")
+        .and_then(|r| doing::title(&daemon.claude_home, &r.cwd, r.conversation.as_deref()?));
+    // The row stays, ended, with its reason: its address is kept (`presence`).
+    let store = daemon.store.lock().unwrap();
+    match store.end_session(key, now() as i64, reason, title.as_deref()) {
         Ok(true) => {
             daemon.presence.notify_one();
+            daemon.listing.lock().unwrap().dirty = true;
             Response::ok(id, json!({ "ended": true }))
         }
         Ok(false) => Response::err(id, NOT_FOUND),
@@ -1339,13 +1373,15 @@ struct Register {
     executable: Option<String>,
     repo: Option<String>,
     branch: Option<String>,
+    waiting_for: Option<String>,
+    headless: Option<bool>,
 }
 
-/// `register {session: {provider, conversation, pid, birth_micros, cwd, title?, status?, executable?, repo?, branch?}, caller?}`
+/// `register {session: {provider, conversation, pid, birth_micros, cwd, title?, status?, waiting_for?, executable?, repo?, branch?, headless?}, caller?}`
 /// upserts by key; the daemon supplies the member prefix. A `cwd` under `folders_off` is
 /// answered `{key, ignored: true}` and nothing is written. A key whose row names another
-/// live process is refused (`bad_request`, reason `owned_by_live_process`). `status` is `idle` (default) or
-/// `busy` (stored as live); `conversation` is `[A-Za-z0-9._-]{1,128}`. `repo` and `branch` are
+/// live process is refused (`bad_request`, reason `owned_by_live_process`). `status` is `idle` (default),
+/// `busy` (stored as live) or `waiting` (with `waiting_for`, at most 64 characters, what for); `conversation` is `[A-Za-z0-9._-]{1,128}`. `repo` and `branch` are
 /// what the hook read from `cwd`'s `.git` (it has the folder access the person gave the agent).
 fn register(id: u64, body: &Value, daemon: &Daemon) -> Response {
     let Ok(r) = serde_json::from_value::<Register>(body["session"].clone()) else {
@@ -1354,8 +1390,15 @@ fn register(id: u64, body: &Value, daemon: &Daemon) -> Response {
     let status = match r.status.as_deref() {
         None | Some("idle") => "idle",
         Some("busy") => "live",
+        Some("waiting") => "waiting",
         Some(_) => return Response::err(id, BAD_REQUEST),
     };
+    if r.waiting_for
+        .as_ref()
+        .is_some_and(|w| w.chars().count() > 64)
+    {
+        return Response::err(id, BAD_REQUEST);
+    }
     if !sessions::PROVIDERS.contains(&r.provider.as_str()) || !sessions::word(&r.conversation, 128)
     {
         return Response::err(id, BAD_REQUEST);
@@ -1395,10 +1438,17 @@ fn register(id: u64, body: &Value, daemon: &Daemon) -> Response {
     let reported = ["repo", "branch"]
         .iter()
         .any(|f| body["session"].get(f).is_some());
+    // A hook sends a title rarely, and a revived row is still the same conversation.
+    let old = store.any_session(&key.0).ok().flatten();
+    // Claude's listing has news only when this says something new; a tool call in a busy session
+    // does not, and asking costs (`super::current_at`).
+    let news = old.as_ref().is_none_or(|o| {
+        o.ended_at.is_some() || o.status != status || o.pid != Some(i64::from(r.pid))
+    });
+    let title = r.title.or(old.as_ref().and_then(|o| o.title.clone()));
     let (repo, branch) = if reported {
         (clamp(r.repo), clamp(r.branch))
     } else {
-        let old = store.session(&key.0).ok().flatten();
         old.map_or((None, None), |o| (o.repo, o.branch))
     };
     // A running network worker's hooks register it too: it keeps the title and status its
@@ -1419,7 +1469,7 @@ fn register(id: u64, body: &Value, daemon: &Daemon) -> Response {
         birth_micros: i64::try_from(r.birth_micros).ok(),
         cwd: r.cwd,
         title,
-        status,
+        status: status.clone(),
         seen_at: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs() as i64),
@@ -1427,10 +1477,18 @@ fn register(id: u64, body: &Value, daemon: &Daemon) -> Response {
         repo,
         branch,
         handle: None,
+        reason: None,
+        ended_at: None,
+        waiting_for: r.waiting_for.filter(|_| status == "waiting"),
+        // A network worker runs headless and stays listed: it is found and steered by its row.
+        headless: r.headless == Some(true) && !worker,
     };
     // Every hook event registers: mail delivered before it has been seen.
     match put_row(daemon, &store, &row).and_then(|()| mail::mark_read_for(&store, &key, now())) {
         Ok(()) => {
+            if news {
+                daemon.listing.lock().unwrap().dirty = true;
+            }
             // A `read` owed to a sender goes now (`Net::flush_loop`).
             daemon.peers.outbox.notify_one();
             Response::ok(id, json!({ "key": key }))
@@ -1462,8 +1520,8 @@ fn put_row(daemon: &Daemon, store: &store::Store, row: &store::Session) -> crate
     Ok(())
 }
 
-/// Registered and discovered sessions, `gone` ones left out (their rows stay until `end`).
-/// A session whose last push failed reads `next_step`: its mail waits for the next step. One
+/// Registered and discovered sessions; a discovered one gains a row and a row no longer live
+/// ends (`record`). A session whose last push failed reads `next_step`: its mail waits for the next step. One
 /// under a hidden folder, or marked by a register a hidden folder refused, reads `hidden`.
 pub(crate) fn live_sessions(daemon: &Daemon) -> Vec<sessions::Session> {
     let (rows, marked) = {
@@ -1472,7 +1530,13 @@ pub(crate) fn live_sessions(daemon: &Daemon) -> Vec<sessions::Session> {
         (rows, store.hidden_keys().unwrap_or_default())
     };
     let off = daemon.team.lock().unwrap().off.clone();
-    let mut all = sessions::all(&rows, &daemon.claude_home, &daemon.identity.short);
+    let listed = super::current_at(daemon);
+    let mut all = sessions::all(
+        &rows,
+        listed.as_ref().map(|(l, at)| (l.as_slice(), *at)),
+        &daemon.claude_home,
+        &daemon.identity.short,
+    );
     let failed = daemon.push_failed.lock().unwrap();
     for s in &mut all {
         if s.tier == sessions::Tier::Push && failed.contains(&s.key.0) {
@@ -1480,7 +1544,278 @@ pub(crate) fn live_sessions(daemon: &Daemon) -> Vec<sessions::Session> {
         }
         s.hidden = marked.contains(&s.key.0) || presence::hidden(&off, &s.cwd);
     }
+    drop(failed);
+    let hidden = |key: &str, cwd: &str| marked.contains(key) || presence::hidden(&off, cwd);
+    let listed = listed.as_ref().map(|(l, _)| l.as_slice());
+    record(daemon, &rows, &mut all, listed, &hidden);
     all
+}
+
+/// `live_sessions` as a list shows them: no headless run.
+pub(crate) fn listed_sessions(daemon: &Daemon) -> Vec<sessions::Session> {
+    let mut live = live_sessions(daemon);
+    live.retain(|s| !s.headless);
+    live
+}
+
+/// The most rows of finished jobs written per read of the listing: hundreds of old jobs arrive
+/// over a minute or so, not at once.
+const JOBS_PER_READ: usize = 200;
+
+/// The one writer of rows from what was seen: a live Claude session with no row gets one, a row
+/// `all` no longer finds live ends with its reason and title (its stored one when no transcript
+/// has one), and a finished job with no process
+/// and no row gets one, ended. Reads transcripts only for rows it ends or creates ended, and
+/// outside the store lock.
+fn record(
+    daemon: &Daemon,
+    rows: &[store::Session],
+    live: &mut [sessions::Session],
+    listed: Option<&[Listed]>,
+    hidden: &dyn Fn(&str, &str) -> bool,
+) {
+    let (home, now) = (&daemon.claude_home, now() as i64);
+    if listed.is_some() {
+        first_listing_stamp(daemon, now);
+    }
+    let is_live = |key: &str| live.iter().any(|s| s.key.0 == key);
+    let title = |provider: &str, cwd: &str, conversation: &str| {
+        (provider == "claude")
+            .then(|| doing::title(home, cwd, conversation))
+            .flatten()
+    };
+    let last_written = |cwd: &str, conversation: &str| {
+        doing::last_written(home, cwd, conversation).map(|at| at.min(now))
+    };
+    // Found gone, perhaps long after (the daemon was off): it ended no later than its transcript
+    // says, not when this pass got to it.
+    let gone: Vec<(&store::Session, &str, i64, Option<String>)> = rows
+        .iter()
+        .filter(|r| !r.provider.is_empty() && !is_live(&r.key))
+        .map(|r| {
+            let conversation = r.conversation.as_deref().unwrap_or_default();
+            let at = (r.provider == "claude")
+                .then(|| last_written(&r.cwd, conversation))
+                .flatten();
+            (
+                r,
+                ended_reason(r, listed),
+                // No transcript: its last word, so an upgrade never announces it as just ended.
+                at.unwrap_or(r.seen_at),
+                title(&r.provider, &r.cwd, conversation),
+            )
+        })
+        .collect();
+    let jobs = new_ended_jobs(daemon, listed, &is_live, hidden);
+    let jobs: Vec<(String, &Listed, i64, Option<String>)> = jobs
+        .into_iter()
+        .map(|(key, l)| {
+            // Claude keeps no end time: its transcript's last write, else its start. Never
+            // "just ended" for a job over long before this computer looked.
+            let started = (l.started_ms / 1000) as i64;
+            let at = last_written(&l.cwd, &l.conversation).unwrap_or(started.min(now));
+            if at + (presence::WEEK as i64) < now {
+                (key, l, at, None)
+            } else {
+                let found = title("claude", &l.cwd, &l.conversation);
+                (key, l, at, found.or(l.name.clone()))
+            }
+        })
+        .collect();
+    let store = daemon.store.lock().unwrap();
+    let mut changed = false;
+    for s in live.iter_mut() {
+        if s.provider != "claude" || s.hidden || store.holds(&s.key.0).unwrap_or(true) {
+            continue;
+        }
+        if store.put_session(&discovered_row(s, now)).is_ok() {
+            changed = true;
+            s.handle = store
+                .session(&s.key.0)
+                .ok()
+                .flatten()
+                .and_then(|r| r.handle);
+        }
+    }
+    // The name Claude's listing or pid file gives it is known only while it is live: kept, so
+    // that it outlasts the session with no transcript title to fall back on.
+    for s in live.iter() {
+        let untitled = rows.iter().any(|r| r.key == s.key.0 && r.title.is_none());
+        if let Some(title) = s.title.as_deref().filter(|_| untitled) {
+            let _ = store.fill_title(&s.key.0, title);
+        }
+    }
+    for (r, reason, at, title) in &gone {
+        // A hook wrote it after `rows` was read: it is the newer word.
+        if store.session(&r.key).ok().flatten().as_ref() == Some(*r) {
+            changed |= store
+                .end_session(&r.key, *at, reason, title.as_deref())
+                .unwrap_or(false);
+        }
+    }
+    if !jobs.is_empty() {
+        // One transaction: up to `JOBS_PER_READ` rows under the store lock.
+        let tx = store.conn().unchecked_transaction();
+        for (key, l, at, title) in &jobs {
+            changed |= store
+                .put_ended_job(key, &l.conversation, &l.cwd, title.as_deref(), *at)
+                .unwrap_or(false);
+        }
+        if let Ok(tx) = tx {
+            let _ = tx.commit();
+        }
+    }
+    drop(store);
+    if changed {
+        daemon.presence.notify_one();
+    }
+}
+
+/// `jobs_published_after`, set once, at the first read of the listing.
+fn first_listing_stamp(daemon: &Daemon, now: i64) {
+    let mut team = daemon.team.lock().unwrap();
+    if team.config.jobs_published_after == 0 {
+        team.config.jobs_published_after = now;
+        // Lost, the next start stamps later: its older jobs stay unpublished all the same.
+        let _ = crate::config::Config::set(&daemon.dir, "jobs_published_after", &now.to_string());
+    }
+}
+
+/// Why `r`, no longer live, ended.
+fn ended_reason(r: &store::Session, listed: Option<&[Listed]>) -> &'static str {
+    let job_done = r.provider == "claude"
+        && listed.is_some_and(|l| {
+            listing::ended_jobs(l)
+                .any(|j| Some(j.conversation.as_str()) == r.conversation.as_deref())
+        });
+    let alive = || {
+        r.pid
+            .zip(r.birth_micros)
+            .is_some_and(|(p, b)| sessions::alive(p as u32, b as u64))
+    };
+    if job_done {
+        "job-done"
+    } else if alive() {
+        // The process lives but the harness left the conversation (`/clear`, `/resume`, the
+        // agent view).
+        "moved-on"
+    } else {
+        "process-exited"
+    }
+}
+
+/// The first `JOBS_PER_READ` finished jobs of a read not yet looked at, with their keys, that
+/// have no row and may have one. Each read is looked at once.
+fn new_ended_jobs<'a>(
+    daemon: &Daemon,
+    listed: Option<&'a [Listed]>,
+    is_live: &dyn Fn(&str) -> bool,
+    hidden: &dyn Fn(&str, &str) -> bool,
+) -> Vec<(String, &'a Listed)> {
+    let Some(listed) = listed else {
+        return vec![];
+    };
+    {
+        let mut c = daemon.listing.lock().unwrap();
+        if c.recorded == c.at {
+            return vec![];
+        }
+        c.recorded = c.at;
+    }
+    let store = daemon.store.lock().unwrap();
+    listing::ended_jobs(listed)
+        .map(|l| {
+            (
+                Key::new(&daemon.identity.short, "claude", &l.conversation).0,
+                l,
+            )
+        })
+        .filter(|(key, l)| {
+            !is_live(key) && !hidden(key, &l.cwd) && !store.holds(key).unwrap_or(true)
+        })
+        .take(JOBS_PER_READ)
+        .collect()
+}
+
+/// A discovered session's first row. `waiting` is left to the hooks, its one writer: the
+/// discovery's own status is laid over the row on every read.
+fn discovered_row(s: &sessions::Session, now: i64) -> store::Session {
+    store::Session {
+        key: s.key.0.clone(),
+        provider: s.provider.clone(),
+        conversation: Some(s.conversation.clone()),
+        pid: Some(s.pid.into()),
+        birth_micros: i64::try_from(s.birth_micros).ok(),
+        cwd: s.cwd.clone(),
+        title: s.title.clone(),
+        status: if s.status == sessions::Status::Live {
+            "live".into()
+        } else {
+            "idle".into()
+        },
+        seen_at: now,
+        executable: None,
+        repo: None,
+        branch: None,
+        handle: None,
+        reason: None,
+        ended_at: None,
+        waiting_for: None,
+        headless: false,
+    }
+}
+
+/// The sessions that ended within the week, newest first, each with whether it is kept from
+/// teammates (its folder is hidden: `presence::build` leaves it out; its owner still sees it,
+/// and can resume it). Rows past it go, except the finished jobs Claude still lists: they stay, unseen, so that they are not
+/// born again as just ended.
+pub(crate) fn ended_sessions(daemon: &Daemon) -> Vec<(store::Session, bool)> {
+    let since = now().saturating_sub(presence::WEEK) as i64;
+    let listed = super::current(daemon);
+    let off = daemon.team.lock().unwrap().off.clone();
+    let store = daemon.store.lock().unwrap();
+    let keep = match listed {
+        Some(l) => listing::finished(&l)
+            .iter()
+            .map(|c| Key::new(&daemon.identity.short, "claude", c).0)
+            .collect(),
+        // No word from the listing (a daemon just started): its jobs wait for one.
+        // ponytail: a computer whose Claude is gone for good keeps these rows; each is one
+        // small unseen row, purge by age if that ever matters.
+        None => store.ended_job_keys().unwrap_or_default(),
+    };
+    let marked = store.hidden_keys().unwrap_or_default();
+    let ended = store.ended_since(since, &keep).unwrap_or_default();
+    ended
+        .into_iter()
+        .filter(|r| r.ended_at.is_some_and(|at| at >= since))
+        .map(|r| {
+            let hidden = marked.contains(&r.key) || presence::hidden(&off, &r.cwd);
+            (r, hidden)
+        })
+        .collect()
+}
+
+/// An ended row as `sessions` answers it, with the owner's resume command.
+fn ended_json(r: &store::Session, hidden: bool) -> Value {
+    let mut v = json!({
+        "status": "ended",
+        "key": r.key,
+        "provider": r.provider,
+        "conversation": r.conversation,
+        "cwd": r.cwd,
+        "title": r.title,
+        "handle": r.handle,
+        "repo": r.repo,
+        "branch": r.branch,
+        "reason": r.reason,
+        "ended_at": r.ended_at,
+        "resume": r.conversation.as_deref().and_then(|c| sessions::resume(&r.provider, c, &r.cwd)),
+    });
+    if hidden {
+        v["hidden"] = true.into();
+    }
+    v
 }
 
 /// `status`'s `dropped`: frames `from_peer_ok` dropped, by kind, and viewer `input` frames.
@@ -1497,7 +1832,7 @@ fn is_handle(s: &str) -> bool {
 }
 
 fn live_count(daemon: &Daemon) -> usize {
-    live_sessions(daemon).len()
+    listed_sessions(daemon).len()
 }
 
 /// `m`'s sender as this computer's agents are told it (`label::sender`).
@@ -1798,7 +2133,8 @@ const SETTLE: Duration = Duration::from_secs(5);
 /// for mail under another member's prefix, with `where` (that member's computer), `person` (its
 /// person's name, `you` for this computer's own), `online` (whether that computer is connected
 /// now), `tier` (the session's, from that member's presence) and, while queued, `until` (when
-/// the outbox gives up). Any receipt of a message (not a refusal) carries its `thread`.
+/// the outbox gives up). Any receipt of a message (not a refusal) carries its `thread`; one still
+/// waiting for a session known to have ended says `ended`.
 pub(crate) async fn finish(daemon: &Daemon, from: &Key, mut r: mail::Receipt, wait: bool) -> Value {
     let thread = daemon
         .store
@@ -1807,10 +2143,18 @@ pub(crate) async fn finish(daemon: &Daemon, from: &Key, mut r: mail::Receipt, wa
         .thread_of(&from.0, &r.request_id)
         .ok()
         .flatten();
-    let with_thread = |r: &mail::Receipt| {
+    let with_thread = |r: &mail::Receipt, member: Option<&str>| {
         let mut v = json!(r);
         if let Some(t) = &thread {
             v["thread"] = t.as_str().into();
+        }
+        let waits = matches!(r.state, mail::State::Queued | mail::State::Stored);
+        if waits
+            && r.to
+                .as_deref()
+                .is_some_and(|to| known_ended(daemon, to, member))
+        {
+            v["ended"] = true.into();
         }
         v
     };
@@ -1826,12 +2170,12 @@ pub(crate) async fn finish(daemon: &Daemon, from: &Key, mut r: mail::Receipt, wa
         Some((m.key.clone(), m.computer.clone(), person, bell))
     });
     let Some((member, computer, person, bell)) = member else {
-        return with_thread(&r);
+        return with_thread(&r, None);
     };
     if wait {
         r = settle(daemon, from, r, &member).await;
     }
-    let mut v = with_thread(&r);
+    let mut v = with_thread(&r, Some(&member));
     v["where"] = computer.into();
     v["person"] = person.into();
     if let Some(h) = r.to.as_deref().and_then(mail::new_harness) {
@@ -1853,6 +2197,23 @@ pub(crate) async fn finish(daemon: &Daemon, from: &Key, mut r: mail::Receipt, wa
         v["until"] = (at + outbox::TTL_S as i64).into();
     }
     v
+}
+
+/// Whether `to` has ended as far as this computer knows: a teammate's (`member`) by its latest
+/// presence, this computer's by its row. A row can have ended and be seen live again (no hook
+/// said so): only then is the whole list read.
+fn known_ended(daemon: &Daemon, to: &str, member: Option<&str>) -> bool {
+    match member {
+        Some(m) => daemon.latest.lock().unwrap().get(m).is_some_and(|l| {
+            l.ended.iter().any(|e| e.session_id == to)
+                && l.sessions.iter().all(|s| s.session_id != to)
+        }),
+        None => {
+            let row = daemon.store.lock().unwrap().any_session(to).ok().flatten();
+            row.is_some_and(|r| r.ended_at.is_some())
+                && live_sessions(daemon).iter().all(|s| s.key.0 != to)
+        }
+    }
 }
 
 /// Waits up to `SETTLE` for queued receipt `r` to move while `member` is online, waking when a
@@ -2045,6 +2406,10 @@ async fn inbox(
                 repo: None,
                 branch: None,
                 handle: None,
+                reason: None,
+                ended_at: None,
+                waiting_for: None,
+                headless: false,
             };
             if put_row(daemon, &daemon.store.lock().unwrap(), &row).is_err() {
                 return Response::err(id, INTERNAL);

@@ -177,3 +177,89 @@ async fn a_computer_that_is_not_signed_in_never_dials() {
     let dialed = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await;
     assert!(dialed.is_err(), "no sign-in, no link");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn what_only_this_computer_can_use_does_not_leave_it() {
+    let e = Env::new();
+    let (mut link, _, _l) = linked(&e).await;
+    let p = lightbulb::os::process(std::process::id()).unwrap();
+    let register = |conversation: &str, extra: Value| {
+        let mut session = json!({"provider": "claude", "conversation": conversation,
+            "pid": p.pid, "birth_micros": p.birth_micros, "cwd": "/tmp/p"});
+        session
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let r = e.ask(json!({"id": 1, "op": "register", "session": session}));
+        r["key"].as_str().unwrap().to_string()
+    };
+    let waits = register(
+        "w",
+        json!({"status": "waiting", "waiting_for": "permission prompt"}),
+    );
+    let gone = register("g", json!({}));
+    let r = e.ask(json!({"id": 1, "op": "end", "key": gone, "reason": "session-end"}));
+    assert_eq!(r["ended"], true, "{r}");
+
+    // A folder turned off after these two registered: they stay on this computer.
+    let root = tempfile::tempdir().unwrap();
+    let secret = lightbulb::presence::resolved(root.path());
+    let cwd = json!({"cwd": secret.to_str().unwrap()});
+    let hid = register("h", cwd.clone());
+    let hid_gone = register("hg", cwd);
+    let r = e.ask(json!({"id": 1, "op": "end", "key": hid_gone, "reason": "session-end"}));
+    assert_eq!(r["ended"], true, "{r}");
+    let off = lightbulb::presence::resolved(root.path());
+    let off = off.to_str().unwrap();
+    let off = if cfg!(target_os = "macos") {
+        off.to_lowercase()
+    } else {
+        off.to_string()
+    };
+    let config = e.state.path().join("config.toml");
+    let text = std::fs::read_to_string(&config).unwrap_or_default();
+    std::fs::write(&config, format!("{text}\nfolders_off = [{off:?}]\n")).unwrap();
+    assert_eq!(e.ask(json!({"id": 1, "op": "reload"}))["ok"], true);
+
+    // Here they are all there; over the link, none, and the rows stay.
+    let local = e.ask(json!({"id": 1, "op": "directory"}));
+    let row = |v: &Value, key: &str| {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["session_id"] == key)
+            .cloned()
+            .unwrap_or_else(|| panic!("{key} not in {v}"))
+    };
+    assert!(row(&local["sessions"], &waits)["pid"].is_u64(), "{local}");
+    assert!(
+        row(&local["sessions"], &gone)["resume"].is_string(),
+        "{local}"
+    );
+    assert_eq!(row(&local["sessions"], &hid)["hidden"], true, "{local}");
+    assert_eq!(
+        row(&local["sessions"], &hid_gone)["hidden"],
+        true,
+        "{local}"
+    );
+    let mut seen = vec![];
+    let dir = link.op(json!({"op": "directory"}), &mut seen).await;
+    let sessions = &dir["result"]["sessions"];
+    for key in [&hid, &hid_gone] {
+        let over = sessions.as_array().unwrap();
+        assert!(
+            over.iter().all(|s| s["session_id"] != key.as_str()),
+            "{dir}"
+        );
+    }
+    let (w, g) = (row(sessions, &waits), row(sessions, &gone));
+    assert_eq!(w["status"], "waiting", "{dir}");
+    assert_eq!(w["waiting_for"], "permission prompt", "{dir}");
+    assert_eq!(g["status"], "ended", "{dir}");
+    assert_eq!(g["reason"], "session-end", "{dir}");
+    for s in sessions.as_array().unwrap() {
+        for f in ["resume", "pid", "birth_micros", "entrypoint", "kind", "job"] {
+            assert!(s.get(f).is_none(), "{f}: {s}");
+        }
+    }
+}

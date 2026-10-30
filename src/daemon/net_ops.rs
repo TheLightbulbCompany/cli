@@ -727,6 +727,7 @@ pub(crate) fn remotes(short: &str, list: &[Value]) -> Option<Vec<crate::net::fra
             tier: crate::sessions::Tier::Pull.as_str().into(),
             title: s["title"].as_str().map(String::from),
             free: None,
+            waiting_for: None,
         }
         .clamp();
         if !r.valid(short) {

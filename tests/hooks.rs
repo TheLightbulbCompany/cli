@@ -55,7 +55,8 @@ impl Net {
             claude,
             daemon,
         };
-        for _ in 0..50 {
+        // 20 s: a cold start right after a rebuild can take a while.
+        for _ in 0..200 {
             if UnixStream::connect(net.dir.path().join(paths::SOCKET)).is_ok() {
                 return net;
             }
@@ -139,8 +140,24 @@ impl Net {
         stdin: &[u8],
         pin: Option<&os::Process>,
     ) -> std::process::Output {
+        self.hook_from(None, agent, event, stdin, pin)
+    }
+
+    /// `hook_raw`, run as Claude Code runs it with `entrypoint` as its `CLAUDE_CODE_ENTRYPOINT`.
+    fn hook_from(
+        &self,
+        entrypoint: Option<&str>,
+        agent: &str,
+        event: &str,
+        stdin: &[u8],
+        pin: Option<&os::Process>,
+    ) -> std::process::Output {
         let mut cmd = Command::new(EXE);
-        cmd.env("LIGHTBULB_CONNECT_DEBUG_NO_TELEMETRY", "1");
+        cmd.env("LIGHTBULB_CONNECT_DEBUG_NO_TELEMETRY", "1")
+            .env_remove("CLAUDE_CODE_ENTRYPOINT");
+        if let Some(e) = entrypoint {
+            cmd.env("CLAUDE_CODE_ENTRYPOINT", e);
+        }
         if let Some(p) = pin {
             cmd.env(
                 "LIGHTBULB_CONNECT_HOOK_CALLER",
@@ -165,14 +182,71 @@ impl Net {
 
 impl Drop for Net {
     fn drop(&mut self) {
-        let _ = UnixStream::connect(self.dir.path().join(paths::SOCKET))
+        let sent = UnixStream::connect(self.dir.path().join(paths::SOCKET))
             .and_then(|mut s| s.write_all(b"{\"id\":0,\"op\":\"shutdown\"}\n"));
+        // Never an unbounded wait: a daemon that did not hear it (one that had not come up when
+        // the test panicked) would hang the whole suite.
+        let end = std::time::Instant::now() + Duration::from_secs(10);
+        while sent.is_ok() && std::time::Instant::now() < end {
+            if !matches!(self.daemon.try_wait(), Ok(None)) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = self.daemon.kill();
         let _ = self.daemon.wait();
     }
 }
 
 fn frame_of(text: &str) -> String {
     format!("[Lightbulb teammate contribution from Your Codex {{\"requestId\":\"{text}\"}}]\nReply with send_message(reply_to=\"{text}\") to answer this message.\n\nbody {text}")
+}
+
+const CLAUDE_CONV: &str = "00000000-0000-4000-8000-0000000000c1";
+
+fn row(net: &Net, provider: &str, conv: &str) -> Value {
+    net.session(&net.key(provider, conv)).unwrap()
+}
+
+#[test]
+fn a_permission_request_marks_the_session_waiting_and_prints_nothing() {
+    let net = Net::new();
+    net.hook("claude", "session-start", "claude-session-start");
+    let out = net.hook("claude", "permission-request", "claude-permission-request");
+    assert_eq!(out.trim(), "");
+    let s = row(&net, "claude", CLAUDE_CONV);
+    assert_eq!(s["status"], "waiting");
+    assert_eq!(s["waiting_for"], "permission prompt");
+    net.hook("claude", "post-tool-use", "claude-post-tool-use");
+    assert_eq!(row(&net, "claude", CLAUDE_CONV)["status"], "live");
+}
+
+#[test]
+fn notifications_set_waiting_or_idle_by_type() {
+    let net = Net::new();
+    net.hook("claude", "session-start", "claude-session-start");
+    let n = |fixture| net.hook("claude", "notification", fixture);
+    assert_eq!(n("claude-notification-permission").trim(), "");
+    let s = row(&net, "claude", CLAUDE_CONV);
+    assert_eq!(s["status"], "waiting");
+    assert_eq!(s["waiting_for"], "permission prompt");
+    n("claude-notification-idle");
+    assert_eq!(row(&net, "claude", CLAUDE_CONV)["status"], "idle");
+    // Back to waiting, then a type that says nothing about waiting leaves the row alone.
+    n("claude-notification-permission");
+    assert_eq!(n("claude-notification-auth").trim(), "");
+    assert_eq!(row(&net, "claude", CLAUDE_CONV)["status"], "waiting");
+}
+
+#[test]
+fn a_codex_permission_request_marks_the_thread_waiting() {
+    let net = Net::new();
+    net.hook("codex", "session-start", "codex-session-start");
+    let out = net.hook("codex", "permission-request", "codex-permission-request");
+    assert_eq!(out.trim(), "");
+    let s = row(&net, "codex", "0199aaaa-0000-7000-8000-0000000000d1");
+    assert_eq!(s["status"], "waiting");
+    assert_eq!(s["waiting_for"], "permission prompt");
 }
 
 #[test]
@@ -400,6 +474,76 @@ fn a_session_end_after_the_agent_exited_still_ends_the_session() {
     );
     let r = net.call(json!({"id": 1, "op": "end", "key": key}));
     assert_eq!(r["error"], "not_found", "the row was already ended");
+}
+
+/// `/clear` ends the old conversation while its process lives on: it moved on, nothing more.
+#[test]
+fn a_session_end_after_clear_ends_the_row_as_moved_on() {
+    let net = Net::new();
+    let me = os::process(std::process::id()).unwrap();
+    let c = "00000000-0000-4000-8000-0000000000c1";
+    register(&net, c, me.pid, me.birth_micros);
+    net.hook("claude", "session-end", "claude-session-end-clear");
+    let r = net.call(json!({"id": 1, "op": "sessions"}));
+    assert_eq!(r["ended"][0]["conversation"], c, "{r}");
+    assert_eq!(r["ended"][0]["reason"], "moved-on");
+}
+
+/// A hook sends no title, repo or branch on most events: the row keeps them, across an end too.
+#[test]
+fn a_register_without_a_title_keeps_the_stored_one_and_a_revived_row_its_repo() {
+    let net = Net::new();
+    let me = os::process(std::process::id()).unwrap();
+    let c = "00000000-0000-4000-8000-0000000000c1";
+    let reg = |extra: Value| {
+        let mut session = json!({"provider": "claude", "conversation": c, "pid": me.pid,
+            "birth_micros": me.birth_micros, "cwd": "/"});
+        session
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let r = net.call(json!({"id": 1, "op": "register", "session": session}));
+        assert_eq!(r["ok"], true, "{r}");
+        r["key"].as_str().unwrap().to_string()
+    };
+    let key = reg(json!({"title": "named", "repo": "o/r", "branch": "main"}));
+    reg(json!({}));
+    let s = net.session(&key).unwrap();
+    assert_eq!(s["title"], "named");
+    assert_eq!(
+        net.call(json!({"id": 1, "op": "end", "key": key}))["ok"],
+        true
+    );
+    reg(json!({}));
+    let s = net.session(&key).unwrap();
+    assert_eq!(
+        (
+            s["title"].as_str(),
+            s["repo"].as_str(),
+            s["branch"].as_str()
+        ),
+        (Some("named"), Some("o/r"), Some("main"))
+    );
+}
+
+#[test]
+fn a_session_end_on_exit_ends_the_row_as_session_end() {
+    let net = Net::new();
+    let me = os::process(std::process::id()).unwrap();
+    let c = "00000000-0000-4000-8000-0000000000c1";
+    // Its row's cwd is `/`: Claude's project dir for it is `-`.
+    let projects = net.claude.path().join(".claude/projects/-");
+    std::fs::create_dir_all(&projects).unwrap();
+    std::fs::write(
+        projects.join(format!("{c}.jsonl")),
+        "{\"type\":\"ai-title\",\"aiTitle\":\"Fix the list\"}\n",
+    )
+    .unwrap();
+    register(&net, c, me.pid, me.birth_micros);
+    net.hook("claude", "session-end", "claude-session-end");
+    let r = net.call(json!({"id": 1, "op": "sessions"}));
+    assert_eq!(r["ended"][0]["reason"], "session-end", "{r}");
+    assert_eq!(r["ended"][0]["title"], "Fix the list", "{r}");
 }
 
 #[test]
@@ -1239,4 +1383,69 @@ fn stop_never_blocks_without_open_assignments() {
         me.birth_micros,
     );
     assert_eq!(net.hook("claude", "stop", "claude-stop"), "");
+}
+
+/// `claude -p` and Agent SDK runs (automation, network workers) keep an identity and their mail,
+/// but no list shows them and they leave no ended row. A person's `claude` registers as ever.
+#[test]
+fn a_claude_p_run_is_identified_listed_nowhere_and_gone_when_it_ends() {
+    let net = Net::new();
+    let me = os::process(std::process::id()).unwrap();
+    let fixture = |name: &str| {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/hooks")
+            .join(format!("{name}.json"));
+        std::fs::read(path).unwrap()
+    };
+    let run = |entrypoint, event, name: &str| {
+        net.hook_from(Some(entrypoint), "claude", event, &fixture(name), Some(&me))
+    };
+    let conversation = "00000000-0000-4000-8000-0000000000c1";
+    let key = net.key("claude", conversation);
+    run("sdk-cli", "session-start", "claude-session-start");
+    run("sdk-cli", "post-tool-use", "claude-post-tool-use");
+
+    let rows = net.call(json!({"id": 1, "op": "sessions"}));
+    assert_eq!(rows["sessions"], json!([]), "{rows}");
+    let dir = net.call(json!({"id": 1, "op": "directory"}));
+    assert_eq!(dir["sessions"], json!([]), "{dir}");
+    assert_eq!(net.call(json!({"id": 1, "op": "status"}))["sessions"], 0);
+    // Who is calling can still tell: this is how the MCP server finds it.
+    let mine = net.call(json!({"id": 1, "op": "sessions", "headless": true}));
+    assert_eq!(mine["sessions"][0]["key"], key.as_str(), "{mine}");
+    assert_eq!(mine["sessions"][0]["headless"], true, "{mine}");
+    // Mail reaches it.
+    net.send(&key, "for the run", "r-run");
+    let out = run("sdk-cli", "post-tool-use", "claude-post-tool-use");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("for the run"));
+
+    run("sdk-ts", "session-end", "claude-session-end");
+    let rows = net.call(json!({"id": 1, "op": "sessions", "headless": true}));
+    assert_eq!(rows["sessions"], json!([]), "{rows}");
+    assert_eq!(rows["ended"], json!([]), "{rows}");
+    let db = lightbulb::store::Store::open(&net.dir.path().join("state.db")).unwrap();
+    assert!(!db.holds(&key).unwrap(), "the row is deleted, not kept");
+    drop(db);
+
+    run("cli", "session-start", "claude-session-start");
+    assert!(net.session(&key).is_some(), "a person's claude registers");
+    run("cli", "session-end", "claude-session-end");
+    let rows = net.call(json!({"id": 1, "op": "sessions"}));
+    assert_eq!(rows["ended"][0]["key"], key.as_str(), "{rows}");
+}
+
+/// A daemon that never came up cannot hear `shutdown`: dropping its `Net` must not wait for it.
+#[test]
+fn dropping_a_net_whose_daemon_never_came_up_does_not_hang() {
+    let daemon = Command::new("/bin/sleep").arg("60").spawn().unwrap();
+    let pid = daemon.id();
+    let net = Net {
+        dir: tempfile::tempdir().unwrap(),
+        claude: tempfile::tempdir().unwrap(),
+        daemon,
+    };
+    let t = std::time::Instant::now();
+    drop(net);
+    assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+    assert!(os::process(pid).is_err(), "killed");
 }

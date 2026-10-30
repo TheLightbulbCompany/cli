@@ -20,7 +20,7 @@ enum Kind {
 }
 
 /// Every setting: the one list `load` and `set` read.
-const KEYS: [(&str, Kind); 18] = [
+const KEYS: [(&str, Kind); 19] = [
     ("computer", Kind::Str(|c| &mut c.computer)),
     (
         "preview_to_workspace",
@@ -47,6 +47,10 @@ const KEYS: [(&str, Kind); 18] = [
     (
         "workers_max_deadline_s",
         Kind::Int(|c| &mut c.workers_max_deadline_s),
+    ),
+    (
+        "jobs_published_after",
+        Kind::Int(|c| &mut c.jobs_published_after),
     ),
 ];
 
@@ -109,6 +113,9 @@ pub struct Config {
     pub workers_max: i64,
     /// The most seconds a worker here runs: a later deadline from an asker is clamped to it.
     pub workers_max_deadline_s: i64,
+    /// The unix second this computer first read Claude's listing, set once (0 before): the
+    /// finished jobs that old are its owner's to see, not news for teammates (`presence`).
+    pub jobs_published_after: i64,
 }
 
 impl Default for Config {
@@ -132,6 +139,7 @@ impl Default for Config {
             workers_folder: "~/lightbulb-work".into(),
             workers_max: 3,
             workers_max_deadline_s: 14400,
+            jobs_published_after: 0,
         }
     }
 }
