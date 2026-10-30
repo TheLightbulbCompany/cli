@@ -75,6 +75,29 @@ fn who_lists_a_registered_session_by_its_handle() {
     assert_eq!(json[0]["handle"], "codex-1");
 }
 
+/// `Recent` is the newest ten and how to see the rest.
+#[test]
+fn who_lists_ten_recent_and_says_how_many_more() {
+    let e = Env::new();
+    assert!(e.run(&["who"]).status.success());
+    let p = os::process(std::process::id()).unwrap();
+    for n in 0..12 {
+        let r = e.ask(
+            json!({"id": 1, "op": "register", "session": {"provider": "codex",
+            "conversation": format!("t{n}"), "pid": p.pid, "birth_micros": p.birth_micros,
+            "cwd": "/tmp/proj"}}),
+        );
+        let r = e.ask(json!({"id": 1, "op": "end", "key": r["key"], "reason": "session-end"}));
+        assert_eq!(r["ended"], true, "{r}");
+    }
+    let table = out(&e.run(&["who"]));
+    let (_, recent) = table.split_once("Recent\n").expect("a Recent section");
+    assert_eq!(recent.matches("codex resume").count(), 10, "{table}");
+    assert!(recent.contains("… 2 more: lightbulb who --json"), "{table}");
+    let json: Value = serde_json::from_str(&out(&e.run(&["who", "--json"]))).unwrap();
+    assert_eq!(json.as_array().unwrap().len(), 12, "{json}");
+}
+
 #[test]
 fn who_prints_waiting_done_and_a_recent_section_with_resume() {
     let e = Env::new();
@@ -127,13 +150,14 @@ fn who_prints_waiting_done_and_a_recent_section_with_resume() {
         "{recent}"
     );
 
-    // Its title, else its folder's last part; no id, no full path.
+    // Its title, else its folder's last part; no id, and its full path only in the command.
     assert!(
         recent.lines().any(|l| l.starts_with("fix the thing ")),
         "{recent}"
     );
+    let shown = recent.replace("cd '/tmp/proj' && ", "");
     assert!(
-        !recent.contains("/tmp/proj") && !recent.contains(&t2),
+        !shown.contains("/tmp/proj") && !recent.contains(&t2),
         "{recent}"
     );
 

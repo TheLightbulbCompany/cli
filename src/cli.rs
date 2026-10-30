@@ -248,7 +248,13 @@ fn status_cell(s: &Value, now: u64) -> String {
             return "parked, wakes when messaged".into();
         }
         let seen = now.saturating_sub(s["seen_at"].as_u64().unwrap_or(0));
-        return format!("offline, last seen {}, messages queued", ago(seen));
+        // Mail is held a day: past that, nothing waits for it.
+        let queued = if seen > crate::presence::DAY {
+            ""
+        } else {
+            ", messages queued"
+        };
+        return format!("offline, last seen {}{queued}", ago(seen));
     }
     let status = match s["status"].as_str() {
         Some("live" | "busy") => "busy".to_string(),
@@ -263,14 +269,15 @@ fn status_cell(s: &Value, now: u64) -> String {
                 None => who.to_string(),
             }
         }
-        _ if matches!(
-            s["job"]["state"].as_str(),
-            Some("done" | "failed" | "stopped")
-        ) =>
-        {
-            "idle, done".to_string()
-        }
-        _ => "idle".to_string(),
+        _ => match s["job"]["state"].as_str() {
+            Some(state @ ("done" | "failed" | "stopped")) => {
+                match field_cell(&s["job"], "id").filter(|_| s["pid"].is_number()) {
+                    Some(id) => format!("idle, {state}, attach: claude attach {id}"),
+                    None => format!("idle, {state}"),
+                }
+            }
+            _ => "idle".to_string(),
+        },
     };
     let gets = match s["tier"].as_str() {
         Some("push") => "instantly",
@@ -284,6 +291,9 @@ fn status_cell(s: &Value, now: u64) -> String {
     };
     format!("{status}, gets messages {gets}{hidden}")
 }
+
+/// How many ended sessions `who` lists under `Recent`, newest first.
+const RECENT: usize = 10;
 
 /// `who [--all]`: this computer's sessions by handle; with `all`, every teammate's too
 /// (`directory`); then, under `Recent`, those that ended within the week. Ids only with
@@ -389,14 +399,18 @@ pub fn who(as_json: bool, all: bool) -> Result<i32> {
         );
         table(&lines);
     };
-    let (ended, live): (Vec<&Value>, Vec<&Value>) =
+    let (mut ended, live): (Vec<&Value>, Vec<&Value>) =
         list.iter().partition(|s| s["status"] == "ended");
+    ended.sort_by_key(|s| std::cmp::Reverse(s["ended_at"].as_u64()));
     if !live.is_empty() {
         print(&live_columns, &live);
     }
     if !ended.is_empty() {
         println!("\nRecent");
-        print(&recent_columns, &ended);
+        print(&recent_columns, &ended[..ended.len().min(RECENT)]);
+        if ended.len() > RECENT {
+            println!("… {} more: lightbulb who --json", ended.len() - RECENT);
+        }
     }
     println!("{}", setup::UPSELL);
     Ok(0)
@@ -1884,22 +1898,31 @@ const LAUNCHCTL_ANYWHERE: &str = "LIGHTBULB_CONNECT_DEBUG_LAUNCHCTL_ANYWHERE";
 /// `LIGHTBULB_CONNECT_HOME` moves the state: anywhere else is a test or a sandbox, and the
 /// launchd label is fixed, so touching launchd there would replace the real background service.
 pub(crate) fn real_home() -> bool {
-    use std::os::unix::ffi::OsStrExt;
-    if std::env::var_os(paths::HOME_ENV).is_some() {
-        return false;
-    }
-    let pw = unsafe { libc::getpwuid(libc::getuid()) };
-    if pw.is_null() || unsafe { (*pw).pw_dir.is_null() } {
-        return false;
-    }
-    let passwd = PathBuf::from(std::ffi::OsStr::from_bytes(
-        unsafe { std::ffi::CStr::from_ptr((*pw).pw_dir) }.to_bytes(),
-    ));
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+    real_home_given(
+        std::env::var_os(paths::HOME_ENV).is_some(),
+        std::env::var_os("HOME").map(PathBuf::from),
+    )
+}
+
+/// `real_home`, given whether `LIGHTBULB_CONNECT_HOME` is set and what `HOME` says.
+fn real_home_given(state_moved: bool, home: Option<PathBuf>) -> bool {
+    let (false, Some(home), Some(passwd)) = (state_moved, home, passwd_home()) else {
         return false;
     };
     let canon = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     canon(&home) == canon(&passwd)
+}
+
+/// The account's home directory, from its passwd entry.
+fn passwd_home() -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let pw = unsafe { libc::getpwuid(libc::getuid()) };
+    if pw.is_null() || unsafe { (*pw).pw_dir.is_null() } {
+        return None;
+    }
+    Some(PathBuf::from(std::ffi::OsStr::from_bytes(
+        unsafe { std::ffi::CStr::from_ptr((*pw).pw_dir) }.to_bytes(),
+    )))
 }
 
 pub(crate) fn use_launchctl() -> bool {
@@ -2235,6 +2258,15 @@ pub fn doctor() -> Result<i32> {
         let short = r.short();
         row(&r.product(), ok, &short, &short, &setup);
     }
+    if crate::agents::listing::candidates(&home).is_empty() {
+        row(
+            "Claude listing",
+            true,
+            "not found; using session files",
+            "",
+            "",
+        );
+    }
     let named = match short_link(&home) {
         Link::Ours => Ok("\"lightbulb\""),
         Link::File => Ok("~/.local/bin/lightbulb is another program's; put ~/.lightbulb/connect/bin on your PATH"),
@@ -2484,7 +2516,12 @@ mod tests {
         assert_eq!(says(json!({"status": "idle"})), format!("idle{gets}"));
         for state in ["done", "failed", "stopped"] {
             let s = json!({"status": "idle", "job": {"id": "j", "state": state}});
-            assert_eq!(says(s), format!("idle, done{gets}"));
+            assert_eq!(says(s), format!("idle, {state}{gets}"));
+            let own = json!({"status": "idle", "pid": 1, "job": {"id": "j", "state": state}});
+            assert_eq!(
+                says(own),
+                format!("idle, {state}, attach: claude attach j{gets}")
+            );
         }
         let working = json!({"status": "idle", "job": {"id": "j", "state": "working"}});
         assert_eq!(says(working), format!("idle{gets}"));
@@ -2497,8 +2534,29 @@ mod tests {
             says(offline),
             "offline, last seen 2 min ago, messages queued"
         );
+        // Mail is held a day: past that, nothing is queued.
+        let long = json!({"status": "busy", "online": false, "seen_at": 1, "wakes": false});
+        assert_eq!(
+            super::status_cell(&long, 3 * 86_400),
+            "offline, last seen 2 d ago"
+        );
         let parked = json!({"status": "busy", "online": false, "seen_at": 880, "wakes": true});
         assert_eq!(says(parked), "parked, wakes when messaged");
+    }
+
+    #[test]
+    fn a_home_is_real_only_if_it_is_the_accounts() {
+        let account = super::passwd_home().unwrap();
+        assert!(super::real_home_given(false, Some(account.clone())));
+        assert!(!super::real_home_given(false, None), "HOME unset");
+        assert!(
+            !super::real_home_given(true, Some(account)),
+            "LIGHTBULB_CONNECT_HOME set"
+        );
+        assert!(!super::real_home_given(
+            false,
+            Some("/nonexistent/x".into())
+        ));
     }
 
     #[test]

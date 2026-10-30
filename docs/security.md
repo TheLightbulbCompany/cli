@@ -211,6 +211,8 @@ is `0600`):
 | `sock`, `daemon.lock` | The service's socket and lock. |
 | `bin/lightbulb` | The program. |
 
+To see your Claude Code sessions, the background service runs `claude agents --json --all` periodically; it only reads.
+
 How long things last:
 
 | What | How long |
