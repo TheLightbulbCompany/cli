@@ -1975,15 +1975,23 @@ fn shipped_known_fixes_give_a_hint_and_short_or_broken_tools_titles_do_not() {
     let (_, v) = c.check("server-only.txt", 1, &[]);
     let hint = v["problems"][0]["hint"].as_str().unwrap_or_default();
     assert!(hint.contains("Load the data in a server component"), "{v}");
-    // The shipped lessons.md has the Broken tools heading with no entries: no hint from it.
     let lessons = std::fs::read_to_string(c.dir.join(".lightbulb/lessons.md")).unwrap();
     assert!(lessons.contains("## Broken tools"), "{lessons}");
     std::fs::remove_file(c.dir.join(".lightbulb/known-fixes.md")).unwrap();
+    // "ver" occurs in "server" but is under 4 characters.
     std::fs::write(
         c.dir.join(".lightbulb/lessons.md"),
-        format!("{lessons}\n## fix\nshort title\n"),
+        format!("{lessons}\n## ver\nshort title body\n"),
     )
     .unwrap();
     let (_, v) = c.check("server-only.txt", 1, &[]);
+    assert!(v["problems"][0].get("hint").is_none(), "{v}");
+    // A populated Broken tools section whose heading occurs in the message is not a hint.
+    std::fs::write(
+        c.dir.join(".lightbulb/lessons.md"),
+        "# Lessons\n\n## Broken tools\n- 2026-10-30 browser: timed out\n",
+    )
+    .unwrap();
+    let (_, v) = c.check("broken-tools.txt", 1, &[]);
     assert!(v["problems"][0].get("hint").is_none(), "{v}");
 }
