@@ -70,7 +70,9 @@ pub(crate) fn hint(root: &Path, p: &Problem) -> Option<String> {
     ["known-fixes.md", "lessons.md"].iter().find_map(|f| {
         let text = std::fs::read_to_string(root.join(".lightbulb").join(f)).ok()?;
         entries(&text).into_iter().find_map(|(t, body)| {
-            let hit = !t.is_empty()
+            // A short or generic title would match every problem.
+            let hit = t.len() >= 4
+                && t != "broken tools"
                 && (code.contains(&t)
                     || message.contains(&t)
                     || (!code.is_empty() && t.contains(&code)));

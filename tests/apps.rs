@@ -759,8 +759,11 @@ fn passing_check_clears_counts() {
 fn design_lint_raw_hex_is_a_problem() {
     let c = Checked::new();
     let (_, v) = c.check("design.txt", 1, &[]);
+    let mut first = v["problems"][0].clone();
+    // The shipped known-fixes.md has an entry for design/tokens.css.
+    assert!(first.as_object_mut().unwrap().remove("hint").is_some());
     assert_eq!(
-        v["problems"][0],
+        first,
         json!({"file": "src/app/page.tsx", "line": 8, "column": null, "code": null,
         "message": "raw hex colour; use a token from design/tokens.css"})
     );
@@ -1964,4 +1967,23 @@ fn broken_tool_report_is_rate_limited_to_one_per_cycle() {
     assert_eq!(report("browser", "again").0, 0);
     let lessons = std::fs::read_to_string(c.dir.join(".lightbulb/lessons.md")).unwrap();
     assert_eq!(lessons.matches("## Broken tools").count(), 1, "{lessons}");
+}
+
+#[test]
+fn shipped_known_fixes_give_a_hint_and_short_or_broken_tools_titles_do_not() {
+    let c = Checked::new();
+    let (_, v) = c.check("server-only.txt", 1, &[]);
+    let hint = v["problems"][0]["hint"].as_str().unwrap_or_default();
+    assert!(hint.contains("Load the data in a server component"), "{v}");
+    // The shipped lessons.md has the Broken tools heading with no entries: no hint from it.
+    let lessons = std::fs::read_to_string(c.dir.join(".lightbulb/lessons.md")).unwrap();
+    assert!(lessons.contains("## Broken tools"), "{lessons}");
+    std::fs::remove_file(c.dir.join(".lightbulb/known-fixes.md")).unwrap();
+    std::fs::write(
+        c.dir.join(".lightbulb/lessons.md"),
+        format!("{lessons}\n## fix\nshort title\n"),
+    )
+    .unwrap();
+    let (_, v) = c.check("server-only.txt", 1, &[]);
+    assert!(v["problems"][0].get("hint").is_none(), "{v}");
 }
