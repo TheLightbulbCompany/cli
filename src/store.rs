@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 /// tables or columns, but V12, which drops and recreates `memory_fts` (stemmed) from the
 /// entries; each runs once (in the transaction that moves `user_version`).
 const MIGRATIONS: &[&str] = &[
-    V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15, V16,
+    V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15,
 ];
 
 const V1: &str = "
@@ -152,9 +152,6 @@ ALTER TABLE capture_sessions ADD COLUMN nudged INTEGER NOT NULL DEFAULT 0;
 /// (`refused:<pattern>`: a peer's entry that looks like a credential).
 const V15: &str = "ALTER TABLE memory_entries ADD COLUMN reason TEXT;";
 
-/// Why a session ended, and what a waiting one waits for.
-const V16: &str =
-    "ALTER TABLE sessions ADD COLUMN reason TEXT; ALTER TABLE sessions ADD COLUMN waiting_for TEXT;";
 /// Memory: signed entries numbered per author, with a full-text index over `subject` and `fact`
 /// (`memory`). `rowid` is explicit so it survives `VACUUM` (the FTS index points at it). A
 /// tombstoned row keeps its id and seq and drops its body (`entry` NULL); `memory_tombstones`
@@ -270,6 +267,29 @@ pub(crate) fn row_message(r: &rusqlite::Row) -> rusqlite::Result<Message> {
     })
 }
 
+/// Why a session ended and what a waiting one waits for: nullable columns added on open, not by
+/// a migration, so `user_version` stays and an older build can still open this db (it ignores
+/// them).
+fn add_session_columns(conn: &Connection) -> crate::Result<()> {
+    let has = |column: &str| -> rusqlite::Result<bool> {
+        conn.prepare("SELECT 1 FROM pragma_table_info('sessions') WHERE name = ?1")?
+            .exists([column])
+    };
+    for column in ["reason", "waiting_for"] {
+        if has(column)? {
+            continue;
+        }
+        let add = format!("ALTER TABLE sessions ADD COLUMN {column} TEXT");
+        // A second connection opening beside this one may have just added it.
+        if let Err(e) = conn.execute_batch(&add) {
+            if !has(column)? {
+                return Err(e.into());
+            }
+        }
+    }
+    Ok(())
+}
+
 pub struct Store {
     conn: Connection,
     /// The state dir the db is in: where memory looks for the embedding model.
@@ -299,6 +319,7 @@ impl Store {
             tx.pragma_update(None, "user_version", i + 1)?;
             tx.commit()?;
         }
+        add_session_columns(&conn)?;
         let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
         Ok(Store { conn, dir })
     }
@@ -1288,16 +1309,61 @@ mod tests {
         assert!(!store.set_hidden("k", false, 30).unwrap());
     }
 
+    fn sample(key: &str) -> Session {
+        Session {
+            key: key.into(),
+            provider: "claude".into(),
+            conversation: Some("c".into()),
+            pid: None,
+            birth_micros: None,
+            cwd: "/tmp".into(),
+            title: None,
+            status: "idle".into(),
+            seen_at: 1,
+            executable: None,
+            repo: None,
+            branch: None,
+            handle: None,
+            reason: None,
+            ended_at: None,
+            waiting_for: None,
+        }
+    }
+
     #[test]
     fn newer_db_refuses_to_open() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db");
         Connection::open(&path)
             .unwrap()
-            .execute_batch("PRAGMA user_version = 17;")
+            .execute_batch("PRAGMA user_version = 16;")
             .unwrap();
         let err = Store::open(&path).err().unwrap().to_string();
-        assert!(err.contains("State is from a newer version (v17)"), "{err}");
-        assert_eq!(user_version(&path), 17);
+        assert!(err.contains("State is from a newer version (v16)"), "{err}");
+        assert_eq!(user_version(&path), 16);
+    }
+
+    /// An older db gains the columns with no version bump: that build can still open it.
+    #[test]
+    fn the_session_columns_are_added_on_open_and_the_version_stays() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        drop(Store::open(&path).unwrap());
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "ALTER TABLE sessions DROP COLUMN reason;
+                 ALTER TABLE sessions DROP COLUMN waiting_for;",
+            )
+            .unwrap();
+        let store = Store::open(&path).unwrap();
+        store.put_session(&sample("k")).unwrap();
+        assert_eq!(store.session("k").unwrap().unwrap().waiting_for, None);
+        assert!(store.end_session("k", 5, "session-end", None).unwrap());
+        drop(store);
+        assert_eq!(user_version(&path), 15);
+        // Opening again changes nothing.
+        drop(Store::open(&path).unwrap());
+        assert_eq!(user_version(&path), 15);
     }
 }
