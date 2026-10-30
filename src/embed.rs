@@ -249,6 +249,7 @@ pub(crate) async fn boot(
         home_lock,
         proofs: Mutex::default(),
         link: Mutex::default(),
+        listing: Default::default(),
     });
     // No join connection outlives a restart: its open requests are over.
     daemon.store.lock().unwrap().expire_joins(i64::MAX, now)?;

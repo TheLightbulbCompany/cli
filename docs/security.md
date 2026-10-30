@@ -211,6 +211,8 @@ is `0600`):
 | `sock`, `daemon.lock` | The service's socket and lock. |
 | `bin/lightbulb` | The program. |
 
+To see your Claude Code sessions, the background service runs `claude agents --json --all` periodically; it only reads.
+
 How long things last:
 
 | What | How long |
@@ -235,8 +237,9 @@ rm -rf ~/.lightbulb/connect ~/.local/bin/lightbulb
 ## What teammates see
 
 For each of your sessions that is not hidden: the agent, the computer, the folder's last part
-(not the full path), the repository and branch, whether it is busy or idle, its title, and what
-it is doing now (from the agent's to-do list). They never see your files or your agents'
+(not the full path), the repository and branch, whether it is busy, waiting for its person (and what for) or idle, its title, and what
+it is doing now (from the agent's to-do list). For seven days after a session ends, they also see
+its name, folder, repository, branch, when it ended and why; the command that resumes it stays on your computer. They never see your files or your agents'
 conversations, only the messages sent to them. Hide a folder with `lightbulb folder <path> off`.
 
 ## Telemetry and network requests

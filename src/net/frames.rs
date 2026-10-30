@@ -38,10 +38,60 @@ pub struct Remote {
     pub doing: Option<String>,
     pub tier: String,
     pub title: Option<String>,
+    /// What it waits for: a session stopped for its person travels as `busy` with this, since
+    /// an older peer drops a whole presence over a status it does not know.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_for: Option<String>,
 }
 
-/// A remote session's `status`: busy (`Status::Live`) or idle.
+/// A remote session's `status`: busy (`Status::Live` or `Status::Waiting`) or idle.
 pub const STATUSES: [&str; 2] = ["busy", "idle"];
+
+/// A session that ended, as its computer publishes it: no path, no resume command.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Ended {
+    pub session_id: String,
+    pub agent: String,
+    pub folder: String,
+    pub title: Option<String>,
+    pub repo: Option<String>,
+    pub branch: Option<String>,
+    pub ended_at: u64,
+    pub reason: String,
+}
+
+impl Ended {
+    /// Cut to what a peer accepts (`valid`): text at most `TEXT_MAX` characters.
+    pub fn clamp(mut self) -> Ended {
+        let cut = |t: &mut String| *t = t.chars().take(TEXT_MAX).collect();
+        cut(&mut self.folder);
+        [&mut self.title, &mut self.repo, &mut self.branch]
+            .into_iter()
+            .flatten()
+            .for_each(cut);
+        self
+    }
+
+    /// Whether member `peer_short` may publish this: its session id under that prefix, `agent`
+    /// the id's provider, a `reason` that is a short word of `[a-z-]` (one this build does not
+    /// know reads as given), text at most `TEXT_MAX` characters, and `ended_at` at most a day
+    /// ahead of now. A bad row costs only itself (`presence::put`).
+    pub fn valid(&self, peer_short: &str) -> bool {
+        let short = |t: &str| t.chars().count() <= TEXT_MAX;
+        own(peer_short, &self.session_id)
+            && matches!(Sender::of(peer_short, &self.session_id), Sender::Agent(p) if p == self.agent)
+            && (1..=32).contains(&self.reason.len())
+            && self
+                .reason
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b == b'-')
+            && short(&self.folder)
+            && [&self.title, &self.repo, &self.branch]
+                .into_iter()
+                .all(|t| t.as_deref().is_none_or(short))
+            && self.ended_at <= ipc::now() + 86_400
+    }
+}
 
 impl Remote {
     /// Cut to what a peer accepts (`valid`): text at most `TEXT_MAX` characters.
@@ -53,6 +103,7 @@ impl Remote {
             &mut self.title,
             &mut self.repo,
             &mut self.branch,
+            &mut self.waiting_for,
         ];
         texts.into_iter().flatten().for_each(cut);
         self
@@ -77,9 +128,15 @@ impl Remote {
             && STATUSES.contains(&self.status.as_str())
             && Tier::ALL.iter().any(|t| t.as_str() == self.tier)
             && short(&self.folder)
-            && [&self.doing, &self.title, &self.repo, &self.branch]
-                .into_iter()
-                .all(|t| t.as_deref().is_none_or(short))
+            && [
+                &self.doing,
+                &self.title,
+                &self.repo,
+                &self.branch,
+                &self.waiting_for,
+            ]
+            .into_iter()
+            .all(|t| t.as_deref().is_none_or(short))
     }
 }
 
@@ -127,6 +184,10 @@ pub enum Frame {
         sessions: Vec<Remote>,
         known: Vec<String>,
         kept: Vec<String>,
+        /// Its sessions that ended, newest first, at most `presence::MAX_ENDED`. Absent from
+        /// older builds.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        ended: Vec<Ended>,
     },
     Envelope {
         id: String,
@@ -260,11 +321,12 @@ pub async fn read(recv: &mut (impl AsyncRead + Unpin)) -> Result<Frame> {
 
 /// The one per-frame check on what a member sends. `roster` entries are checked by
 /// `roster::accept` itself. A `presence` is the peer's own: at most `presence::MAX` of each
-/// list, every session `Remote::valid` for it and every address under its prefix, a `seq` at
-/// most a day ahead of now. An `envelope` is checked by `mail::receive`. An `ack` or `receipt`
-/// names a state past `queued`, with a known reason exactly when it is `refused`, and a `limit`
-/// only on a `loop` refusal (that it is bound to this member is `outbox::acked`'s check). A `share_grant` passes
-/// `streams::grant_ok`. A `stream` never rides the control stream, and a `hold_notice` or a
+/// list and `presence::MAX_ENDED` ended, every session `Remote::valid` for it and every address
+/// under its prefix (ended rows are filtered one by one, `presence::put`), a `seq` at most a day ahead of now. An `envelope` is
+/// checked by `mail::receive`. An `ack` or `receipt` names a state past `queued`, with a known
+/// reason exactly when it is `refused`, and a `limit` only on a `loop` refusal (that it is bound
+/// to this member is `outbox::acked`'s check). A `share_grant` passes `streams::grant_ok`. A
+/// `stream` never rides the control stream, and a `hold_notice` or a
 /// `decision` (retired) is served nowhere. `Err` names the check.
 pub fn from_peer_ok(
     f: &Frame,
@@ -305,12 +367,14 @@ pub fn from_peer_ok(
             sessions,
             known,
             kept,
+            ended,
         } => {
             let ok = *member == peer.key
                 && *seq <= ipc::now_ms() + 86_400_000
                 && [sessions.len(), known.len(), kept.len()]
                     .iter()
                     .all(|n| *n <= presence::MAX)
+                && ended.len() <= presence::MAX_ENDED
                 && sessions.iter().all(|s| s.valid(&peer.short))
                 && known.iter().chain(kept).all(|a| own(&peer.short, a));
             check(ok, "presence")
@@ -325,6 +389,198 @@ pub fn from_peer_ok(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A session as a build before `waiting_for` declares it.
+    #[derive(Deserialize)]
+    struct OldRemote {
+        session_id: String,
+        agent: String,
+        repo: Option<String>,
+        branch: Option<String>,
+        folder: String,
+        status: String,
+        doing: Option<String>,
+        tier: String,
+        title: Option<String>,
+    }
+
+    /// The frame as a build before `ended` declares it.
+    #[derive(Deserialize)]
+    #[serde(tag = "t", rename_all = "snake_case")]
+    enum OldFrame {
+        Presence {
+            #[allow(dead_code)]
+            member: String,
+            #[allow(dead_code)]
+            seq: u64,
+            sessions: Vec<OldRemote>,
+            known: Vec<String>,
+            kept: Vec<String>,
+        },
+    }
+
+    fn sample_session(status: sessions::Status, waiting_for: Option<&str>) -> sessions::Session {
+        sessions::Session {
+            key: sessions::Key::new("abc", "claude", "c1"),
+            provider: "claude".into(),
+            conversation: "c1".into(),
+            pid: 1,
+            birth_micros: 1,
+            cwd: "/tmp/work/web".into(),
+            title: None,
+            doing: None,
+            status,
+            tier: Tier::Pull,
+            push_via: None,
+            handle: None,
+            repo: None,
+            branch: None,
+            hidden: false,
+            headless: false,
+            waiting_for: waiting_for.map(String::from),
+            kind: None,
+            entrypoint: None,
+            job: None,
+        }
+    }
+
+    fn sample_ended() -> Ended {
+        Ended {
+            session_id: "abc/claude:c1".into(),
+            agent: "claude".into(),
+            folder: "web".into(),
+            title: Some("fix".into()),
+            repo: None,
+            branch: None,
+            ended_at: ipc::now(),
+            reason: "session-end".into(),
+        }
+    }
+
+    #[test]
+    fn an_old_build_reads_a_new_presence_and_a_new_build_reads_an_old_one() {
+        let waiting = presence::remote(
+            &sample_session(sessions::Status::Waiting, Some("permission prompt")),
+            false,
+        );
+        let f = Frame::Presence {
+            member: "m".into(),
+            seq: 1,
+            sessions: vec![waiting],
+            known: vec![],
+            kept: vec![],
+            ended: vec![sample_ended()],
+        };
+        let text = serde_json::to_string(&f).unwrap();
+        assert!(
+            text.contains("waiting_for") && text.contains("ended"),
+            "{text}"
+        );
+        // An old build: the frame parses, and its one session passes the old `valid`, written
+        // out here so that a later change to `STATUSES` cannot pass it by accident.
+        let OldFrame::Presence {
+            sessions: old,
+            known,
+            kept,
+            ..
+        } = serde_json::from_str(&text).unwrap();
+        assert!(known.is_empty() && kept.is_empty());
+        let s = &old[0];
+        assert!(
+            ["busy", "idle"].contains(&s.status.as_str()),
+            "{}",
+            s.status
+        );
+        let then = Remote {
+            session_id: s.session_id.clone(),
+            agent: s.agent.clone(),
+            repo: s.repo.clone(),
+            branch: s.branch.clone(),
+            folder: s.folder.clone(),
+            status: s.status.clone(),
+            doing: s.doing.clone(),
+            tier: s.tier.clone(),
+            title: s.title.clone(),
+            waiting_for: None,
+        };
+        assert!(then.valid("abc"), "{then:?}");
+        // A new build reads what an old one sends.
+        let old_text = r#"{"t":"presence","member":"m","seq":1,"known":[],"kept":[],"sessions":
+            [{"session_id":"abc/claude:c1","agent":"claude","repo":null,"branch":null,
+              "folder":"web","status":"busy","doing":null,"tier":"pull","title":null}]}"#;
+        let Frame::Presence {
+            sessions: new,
+            ended,
+            ..
+        } = serde_json::from_str(old_text).unwrap()
+        else {
+            unreachable!()
+        };
+        assert!(ended.is_empty());
+        assert_eq!(new[0].waiting_for, None);
+        // Nothing new is written when there is nothing new to say.
+        let quiet = Frame::Presence {
+            member: "m".into(),
+            seq: 1,
+            sessions: vec![presence::remote(
+                &sample_session(sessions::Status::Live, None),
+                false,
+            )],
+            known: vec![],
+            kept: vec![],
+            ended: vec![],
+        };
+        let text = serde_json::to_string(&quiet).unwrap();
+        assert!(
+            !text.contains("waiting_for") && !text.contains("ended"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_waiting_session_travels_as_busy_with_what_for() {
+        let r = presence::remote(
+            &sample_session(sessions::Status::Waiting, Some("permission prompt")),
+            false,
+        );
+        assert_eq!(r.status, "busy");
+        assert_eq!(r.waiting_for.as_deref(), Some("permission prompt"));
+        assert_eq!(r.folder, "web");
+        // Claude may not say what for: still waiting on the far side.
+        let r = presence::remote(&sample_session(sessions::Status::Waiting, None), false);
+        assert_eq!(r.status, "busy");
+        assert!(r.waiting_for.is_some());
+        // Only a waiting session says it.
+        for s in [sessions::Status::Live, sessions::Status::Idle] {
+            let r = presence::remote(&sample_session(s, Some("stale")), false);
+            assert_eq!(r.waiting_for, None);
+        }
+    }
+
+    #[test]
+    fn ended_validates_reason_owner_and_text() {
+        assert!(sample_ended().valid("abc"));
+        let bad = |f: fn(&mut Ended)| {
+            let mut e = sample_ended();
+            f(&mut e);
+            !e.valid("abc")
+        };
+        let mut new_word = sample_ended();
+        new_word.reason = "some-new-reason".into();
+        assert!(new_word.valid("abc"));
+        assert!(bad(|e| e.reason = "Killed".into()));
+        assert!(bad(|e| e.reason = "x".repeat(33)));
+        assert!(bad(|e| e.reason = String::new()));
+        assert!(bad(|e| e.session_id = "xyz/claude:c1".into()));
+        assert!(bad(|e| e.session_id = "abc/friday".into()));
+        assert!(bad(|e| e.agent = "codex".into()));
+        assert!(bad(|e| e.title = Some("x".repeat(TEXT_MAX + 1))));
+        assert!(bad(|e| e.folder = "x".repeat(TEXT_MAX + 1)));
+        assert!(bad(|e| e.ended_at = ipc::now() + 2 * 86_400));
+        let mut long = sample_ended();
+        long.title = Some("x".repeat(TEXT_MAX + 1));
+        assert!(long.clamp().valid("abc"));
+    }
 
     #[test]
     fn an_ack_without_a_limit_reads_as_none_and_one_with_it_round_trips() {

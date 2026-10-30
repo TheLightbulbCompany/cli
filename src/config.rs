@@ -20,7 +20,7 @@ enum Kind {
 }
 
 /// Every setting: the one list `load` and `set` read.
-const KEYS: [(&str, Kind); 13] = [
+const KEYS: [(&str, Kind); 14] = [
     ("computer", Kind::Str(|c| &mut c.computer)),
     (
         "preview_to_workspace",
@@ -40,6 +40,10 @@ const KEYS: [(&str, Kind); 13] = [
         Kind::Int(|c| &mut c.capture_turns_days),
     ),
     ("memory_model", Kind::Bool(|c| &mut c.memory_model)),
+    (
+        "jobs_published_after",
+        Kind::Int(|c| &mut c.jobs_published_after),
+    ),
 ];
 
 fn kind(key: &str) -> Option<Kind> {
@@ -71,6 +75,9 @@ pub struct Config {
     /// Whether `setup` downloads the memory model: `setup --no-model` sets it off, a plain
     /// `setup` on; the automatic setup after an update keeps it.
     pub memory_model: bool,
+    /// The unix second this computer first read Claude's listing, set once (0 before): the
+    /// finished jobs that old are its owner's to see, not news for teammates (`presence`).
+    pub jobs_published_after: i64,
 }
 
 impl Default for Config {
@@ -89,6 +96,7 @@ impl Default for Config {
             capture_turns: true,
             capture_turns_days: 90,
             memory_model: true,
+            jobs_published_after: 0,
         }
     }
 }

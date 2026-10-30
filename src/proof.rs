@@ -104,7 +104,7 @@ pub fn verify(token: &str, member_key: &str, now: i64) -> Result<Proof> {
 }
 
 /// `token`'s claims, unchecked: this computer reading its OWN proof's `exp` (it may hold no
-/// issuer key to verify it with).
+/// issuer key to verify it with), or the directory showing who a proof says it is. Never a gate.
 pub fn peek(token: &str) -> Option<Proof> {
     let payload = token.split('.').nth(1)?;
     serde_json::from_slice(&BASE64URL_NOPAD.decode(payload.as_bytes()).ok()?).ok()

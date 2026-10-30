@@ -17,7 +17,11 @@ pub(super) fn configure(ctx: &Ctx, r: &mut AgentReport) -> Result<Owner> {
                 notes.push("Claude Code has disableAllHooks set; its hooks will not run".into());
             }
             for e in EVENTS {
-                let timeout = if e == Event::SessionEnd { 1 } else { 5 };
+                let timeout = match e {
+                    Event::SessionEnd => 1,
+                    Event::PermissionRequest => 2,
+                    _ => 5,
+                };
                 let group = (!ctx.remove).then(|| {
                     json!({"hooks": [{"type": "command",
                         "command": ctx.hook_command("claude", e.arg()), "timeout": timeout}]})

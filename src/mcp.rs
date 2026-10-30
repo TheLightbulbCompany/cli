@@ -341,7 +341,8 @@ impl Server {
     }
 
     async fn sessions() -> Result<Vec<Session>, CallToolResult> {
-        let r = ask("sessions", json!({}))
+        // Who is calling: a headless run is among them.
+        let r = ask("sessions", json!({ "headless": true }))
             .await
             .map_err(|e| fail(internal(e)))?;
         serde_json::from_value(r["sessions"].clone()).map_err(|e| fail(internal(e)))
