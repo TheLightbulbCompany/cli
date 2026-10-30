@@ -273,6 +273,14 @@ fn report_broken_tool(root: &Path, tool: &str, what: &str, json: bool) -> Result
         Ok(p) => p,
         Err(e) => return Ok(fail(json, &e.code, &e.message, &e.next)),
     };
+    if evidence::holds_pass(tool) || evidence::holds_pass(what) {
+        return Ok(fail(
+            json,
+            "note_has_pass",
+            "That note holds a test link; lessons are committed and uploaded.",
+            "say what broke, without the link",
+        ));
+    }
     let cycle = progress["up_cycle"].as_u64().unwrap_or(0);
     if progress["broken_tool_reported_cycle"].as_u64() == Some(cycle) {
         return Ok(fail(

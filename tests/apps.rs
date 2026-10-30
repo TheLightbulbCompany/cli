@@ -1569,6 +1569,44 @@ fn evidence_refuses_a_note_holding_a_test_link() {
 }
 
 #[test]
+fn a_bare_pass_is_refused_in_evidence_and_lessons() {
+    let c = Checked::new();
+    let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJhcHAiOiJkZW1vIn0.c2lnbmF0dXJl";
+    let file = c.dir.join(".lightbulb/evidence/a.png");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, "png").unwrap();
+    let (base, _) = ship_stub(waiting());
+    let note = format!("opened with {jwt} fine");
+    let (code, v) = c.app(
+        &[
+            "evidence",
+            "--kind",
+            "browser",
+            "--file",
+            file.to_str().unwrap(),
+            "--note",
+            &note,
+        ],
+        &base,
+        true,
+    );
+    assert_eq!((code, &v["code"]), (1, &json!("note_has_pass")));
+    let o =
+        c.e.base_cmd(Command::new(common::EXE))
+            .current_dir(&c.dir)
+            .args(["app", "report-broken-tool", "browser", &note, "--json"])
+            .output()
+            .unwrap();
+    let v: Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(
+        (o.status.code(), &v["code"]),
+        (Some(1), &json!("note_has_pass"))
+    );
+    let lessons = std::fs::read_to_string(c.dir.join(".lightbulb/lessons.md")).unwrap_or_default();
+    assert!(!lessons.contains("eyJ"), "{lessons}");
+}
+
+#[test]
 fn rollback_refuses_a_dirty_tree_and_sends_nothing() {
     let c = Checked::new();
     std::fs::write(c.dir.join(".lightbulb/app.json"), r#"{"app_id":"a-1"}"#).unwrap();

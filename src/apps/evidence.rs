@@ -173,6 +173,18 @@ pub(crate) fn done_with(
     })
 }
 
+/// A test link, or a bare pass: three dot-joined base64url parts, the first starting `eyJ`.
+pub(crate) fn holds_pass(text: &str) -> bool {
+    text.contains("#token=")
+        || text
+            .split(|c: char| !(c.is_ascii_alphanumeric() || "-_.".contains(c)))
+            .any(|w| {
+                w.starts_with("eyJ")
+                    && w.split('.').count() == 3
+                    && w.split('.').all(|p| p.len() >= 4)
+            })
+}
+
 /// `lightbulb app evidence`: appends the record to `.lightbulb/progress.json`. The file stays
 /// here; only its path and sha256 are kept.
 pub(crate) fn record(
@@ -184,7 +196,7 @@ pub(crate) fn record(
     note: &str,
     json: bool,
 ) -> Result<i32> {
-    if note.contains("#token=") {
+    if holds_pass(note) {
         return Ok(fail(
             json,
             "note_has_pass",

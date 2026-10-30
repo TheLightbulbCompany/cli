@@ -30,7 +30,8 @@ change anything.
    plan before touching code. When it says `next: "undo"`, roll back and tell the room plainly what
    failed. If a Lightbulb command itself is broken, run `lightbulb app report-broken-tool` and stop.
 7. **Write a lesson** in `.lightbulb/lessons.md` after every failure you resolve: what broke, why,
-   what fixed it. Read the lessons for an area before you touch it.
+   what fixed it. Read the lessons for an area before you touch it. Never put a test link or its token in
+   a lesson: they are committed and uploaded.
 8. **One commit per turn**, with a message that says what changed for the person.
 
 ## Safety rules (never break these)

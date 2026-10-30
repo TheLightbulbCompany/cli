@@ -15,7 +15,8 @@ export async function POST(req: Request) {
     let reason = "expired";
     try {
       const app = decodeJwt(String(body.token)).app;
-      if (typeof app === "string" && app !== process.env.LIGHTBULB_APP) reason = "wrong_app";
+      const mine = [process.env.LIGHTBULB_APP, process.env.LIGHTBULB_PREVIEW_APP];
+      if (typeof app === "string" && !mine.includes(app)) reason = "wrong_app";
     } catch {}
     return Response.json({ error: "This pass is expired or not for this app.", reason }, { status: 401 });
   }

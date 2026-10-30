@@ -232,6 +232,31 @@ describe("door", () => {
       expect(await readSession(cookie.split(";")[0].slice("lb_session=".length))).toBeNull();
     });
 
+    it("an expired test pass says expired, not wrong_app", async () => {
+      vi.stubEnv("LIGHTBULB_PREVIEW_APP", "demo-app:preview");
+      const res = await post(await pass({ ...claims, iat: Math.floor(Date.now() / 1000) - 2000 }));
+      expect(res.status).toBe(401);
+      expect(await res.json()).toMatchObject({ reason: "expired" });
+    });
+
+    it("another app's preview claim is refused, as a pass and as a session", async () => {
+      vi.stubEnv("LIGHTBULB_PREVIEW_APP", "demo-app:preview");
+      const other = await pass({ ...claims, app: "other-app:preview" });
+      const res = await post(other);
+      expect(res.status).toBe(401);
+      expect(await res.json()).toMatchObject({ reason: "wrong_app" });
+      expect(await verifyPass(other)).toBeNull();
+      const cookie = (await post(await pass(claims))).headers.get("set-cookie")!.split(";")[0].slice("lb_session=".length);
+      expect(await readSession(cookie)).not.toBeNull();
+      // Same secret, so a session carrying the other app's claim verifies as a signature; only toViewer refuses it.
+      const { SignJWT } = await import("jose");
+      const forged = await new SignJWT({ ...claims, app: "other-app:preview", ws: "ws_1", room: "room_1" })
+        .setProtectedHeader({ alg: "HS256" })
+        .setExpirationTime("30m")
+        .sign(new TextEncoder().encode(process.env.LIGHTBULB_COOKIE_SECRET));
+      expect(await readSession(forged)).toBeNull();
+    });
+
     it("a member's pass keeps its 24 hours on the preview", async () => {
       vi.stubEnv("LIGHTBULB_PREVIEW_APP", "demo-app:preview");
       const res = await post(await pass());
