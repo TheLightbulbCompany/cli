@@ -5,6 +5,7 @@ mod common;
 
 use common::Env;
 use lightbulb::apps::api::{self, ApiError, Auth};
+use lightbulb::apps::migrations::{classify, gate};
 use lightbulb::apps::{AppConfig, Kind, OpenTo, Origin};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -799,4 +800,129 @@ fn missing_pnpm_says_how_to_install_it() {
     let v: Value = serde_json::from_slice(&o.stdout).unwrap();
     assert_eq!(v["code"], "tool_missing");
     assert!(v["next"].as_str().unwrap().contains("pnpm"));
+}
+
+fn kinds(sql: &str) -> Vec<&'static str> {
+    classify(sql).iter().map(|f| f.kind).collect()
+}
+
+#[test]
+fn rename_column_is_destructive() {
+    assert_eq!(
+        kinds("ALTER TABLE \"items\" RENAME COLUMN \"name\" TO \"title\";"),
+        ["rename_column"]
+    );
+    assert_eq!(
+        kinds("ALTER TABLE items RENAME TO things;"),
+        ["rename_table"]
+    );
+    assert_eq!(
+        kinds("ALTER TABLE items RENAME CONSTRAINT a TO b;"),
+        [] as [&str; 0]
+    );
+    assert_eq!(
+        kinds("ALTER TABLE items ALTER COLUMN n SET DATA TYPE integer;"),
+        ["alter_type"]
+    );
+    assert_eq!(
+        kinds("ALTER TABLE items ALTER COLUMN n SET NOT NULL;"),
+        ["set_not_null"]
+    );
+    assert_eq!(kinds("TRUNCATE items;"), ["truncate"]);
+    assert_eq!(kinds("delete from items where id = 1;"), ["delete"]);
+    assert_eq!(
+        kinds("ALTER TABLE items DROP COLUMN name;"),
+        ["drop_column"]
+    );
+}
+
+#[test]
+fn add_column_is_not() {
+    let sql = "CREATE TABLE a (id int);\n--> statement-breakpoint\n\
+        ALTER TABLE items ADD COLUMN note text NOT NULL DEFAULT '';\n\
+        ALTER TABLE items ALTER COLUMN n DROP NOT NULL;\n\
+        ALTER TABLE items DROP CONSTRAINT items_pkey;\n\
+        CREATE INDEX i ON items (name);\n\
+        -- drop table nothing;\n\
+        /* delete from x; */\n\
+        INSERT INTO items (name) VALUES ('drop table x; delete from y');";
+    assert!(classify(sql).is_empty(), "{:?}", classify(sql));
+}
+
+#[test]
+fn drop_table_lists_the_statement() {
+    let f = classify("CREATE TABLE a (id int);\n--> statement-breakpoint\nDROP TABLE \"items\" CASCADE;\nSELECT 1;");
+    assert_eq!(f.len(), 1);
+    assert_eq!(f[0].kind, "drop_table");
+    assert_eq!(f[0].statement, "DROP TABLE \"items\" CASCADE");
+    // A semicolon inside a string or dollar quote does not split.
+    assert_eq!(
+        kinds("DO $$ BEGIN DELETE FROM t; END $$; SELECT ';'; DROP TABLE t;"),
+        ["drop_table"]
+    );
+}
+
+fn app_dir(files: &[(&str, &str)]) -> tempfile::TempDir {
+    let d = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(d.path().join("drizzle")).unwrap();
+    for (n, s) in files {
+        std::fs::write(d.path().join("drizzle").join(n), s).unwrap();
+    }
+    d
+}
+
+#[test]
+fn recorded_migrations_are_not_rechecked() {
+    let d = app_dir(&[
+        ("0000_init.sql", "DROP TABLE old;"),
+        ("0001_more.sql", "ALTER TABLE a ADD COLUMN b text;"),
+        ("seed.sql", "DELETE FROM items;"),
+    ]);
+    // Nothing recorded: the destructive file is flagged; seed.sql is data and is ignored.
+    let g = gate(d.path()).unwrap();
+    assert_eq!(g.unrecorded, ["0000_init.sql", "0001_more.sql"]);
+    assert_eq!(g.findings.len(), 1);
+    assert_eq!(g.findings[0].0, "0000_init.sql");
+    // Once recorded, it is not looked at again.
+    std::fs::create_dir_all(d.path().join(".lightbulb")).unwrap();
+    std::fs::write(
+        d.path().join(".lightbulb/migrations.json"),
+        r#"{"applied": ["0000_init.sql"]}"#,
+    )
+    .unwrap();
+    let g = gate(d.path()).unwrap();
+    assert_eq!(g.unrecorded, ["0001_more.sql"]);
+    assert!(g.findings.is_empty());
+    // An unreadable record is an error, never "nothing recorded".
+    std::fs::write(d.path().join(".lightbulb/migrations.json"), "nope").unwrap();
+    assert_eq!(gate(d.path()).unwrap_err().code, "bad_migrations");
+}
+
+#[test]
+fn up_stops_on_a_destructive_migration_unless_approved() {
+    let e = Env::new();
+    let tmp = tempfile::tempdir().unwrap();
+    assert_eq!(app_new(&e, tmp.path(), &["gated"]).status.code(), Some(0));
+    let dir = tmp.path().join("gated");
+    // The starter's own migration is add-only.
+    let run = |extra: &[&str]| {
+        let o = e
+            .base_cmd(Command::new(common::EXE))
+            .current_dir(&dir)
+            .args(["app", "up", "--json"])
+            .args(extra)
+            .output()
+            .unwrap();
+        serde_json::from_slice::<Value>(&o.stdout).unwrap()
+    };
+    assert_eq!(run(&[])["code"], "not_implemented");
+    std::fs::write(dir.join("drizzle/0001_drop.sql"), "DROP TABLE \"items\";").unwrap();
+    let v = run(&[]);
+    assert_eq!(v["code"], "destructive_migration");
+    assert_eq!(v["message"], "DROP TABLE \"items\"");
+    assert_eq!(
+        v["next"],
+        "rewrite add-only (add a column, copy data), or ask the owner and pass --approved <card id>"
+    );
+    assert_eq!(run(&["--approved", "card-1"])["code"], "not_implemented");
 }

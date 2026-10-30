@@ -4,6 +4,7 @@
 
 pub mod api;
 pub mod check;
+pub mod migrations;
 pub mod starter;
 
 use crate::Result;
@@ -60,11 +61,18 @@ pub enum AppCommand {
         kind: Kind,
     },
     /// Build the preview and say when it is done.
-    Up,
+    Up {
+        /// An approved card for a destructive migration.
+        #[arg(long)]
+        approved: Option<String>,
+    },
     /// Put the preview live.
     Publish {
         #[arg(long)]
         reason: Option<String>,
+        /// An approved card for a destructive migration.
+        #[arg(long)]
+        approved: Option<String>,
     },
     /// Go back to an earlier version (code only; data is unchanged).
     Rollback { version: Option<u32> },
@@ -132,12 +140,43 @@ pub fn run(cmd: AppCommand, json: bool) -> Result<i32> {
         }
         AppCommand::Status { errors } => status(errors, json),
         AppCommand::Check { publish } => check::check(publish, json),
-        AppCommand::Up => match preflight(json) {
-            Err(code) => Ok(code),
-            Ok(_) => Ok(not_implemented(json)),
-        },
+        AppCommand::Up { approved } | AppCommand::Publish { approved, .. } => {
+            let root = match preflight(json) {
+                Ok((root, _, _)) => root,
+                Err(code) => return Ok(code),
+            };
+            // Task 6 sends this as `approved_destructive`.
+            let _approved = match destructive_gate(&root, approved, json) {
+                Ok(a) => a,
+                Err(code) => return Ok(code),
+            };
+            Ok(not_implemented(json))
+        }
         _ => Ok(not_implemented(json)),
     }
+}
+
+/// Stops on a destructive migration unless `approved` names the card; returns that id.
+fn destructive_gate(
+    root: &Path,
+    approved: Option<String>,
+    json: bool,
+) -> std::result::Result<Option<String>, i32> {
+    let g = migrations::gate(root).map_err(|e| fail(json, &e.code, &e.message, &e.next))?;
+    if g.findings.is_empty() || approved.is_some() {
+        return Ok(approved);
+    }
+    let sql: Vec<&str> = g
+        .findings
+        .iter()
+        .map(|(_, f)| f.statement.as_str())
+        .collect();
+    Err(fail(
+        json,
+        "destructive_migration",
+        &sql.join("\n"),
+        migrations::NEXT,
+    ))
 }
 
 fn not_implemented(json: bool) -> i32 {
