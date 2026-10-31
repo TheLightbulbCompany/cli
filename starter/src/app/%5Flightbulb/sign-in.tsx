@@ -33,7 +33,7 @@ export async function exchange(hash: URLSearchParams, invite: boolean, f: typeof
     const res = await f("/api/_lightbulb/session", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ token }),
+      body: JSON.stringify({ token, framed: globalThis.top !== globalThis.self }),
     });
     if (res.ok) return "ok";
     if (res.status >= 500) return "offline";

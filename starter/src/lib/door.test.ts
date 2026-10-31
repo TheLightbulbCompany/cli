@@ -101,6 +101,12 @@ describe("door", () => {
     expect(await verifyPass(await pass({ app: "other-app" }))).toBeNull();
   });
 
+  it("a framed session cookie is partitioned, a normal one is not", async () => {
+    const viewer = (await verifyPass(await pass()))!;
+    expect(await sessionCookie(viewer, true)).toMatch(/; HttpOnly; Secure; SameSite=None; Partitioned; Path=\/; Max-Age=86400$/);
+    expect(await sessionCookie(viewer)).not.toContain("Partitioned");
+  });
+
   it("session cookie round-trips and expires in 24h", async () => {
     const viewer = (await verifyPass(await pass()))!;
     const header = await sessionCookie(viewer);
