@@ -636,15 +636,27 @@ struct Inner {
     endpoint: Endpoint,
     daemon: Arc<Daemon>,
     dials: Mutex<HashMap<String, DialState>>,
-    doorbell: Mutex<Doorbell>,
+    doorbells: Mutex<HashMap<String, Doorbell>>,
 }
 
-/// The founder's doorbell on this computer (`ring`): when the next ring may go, and the wait
-/// after the last; back to none once a connection to the founder is up.
+/// A member's doorbell on this computer (`ring`): when the next ring may go, and the wait after
+/// the last; back to none once a connection to that member is up.
 #[derive(Default)]
 struct Doorbell {
     next: Option<std::time::Instant>,
     wait: Duration,
+}
+
+impl Doorbell {
+    /// Whether a ring may go at `now`; if so, the next waits longer.
+    fn may_ring(&mut self, now: std::time::Instant) -> bool {
+        if self.next.is_some_and(|t| now < t) {
+            return false;
+        }
+        self.wait = doorbell_wait(self.wait);
+        self.next = Some(now + self.wait);
+        true
+    }
 }
 
 /// The wait after a ring that followed a wait of `w`: 30 s, doubling to 15 min.
@@ -708,7 +720,7 @@ impl Net {
             endpoint,
             daemon,
             dials: Mutex::default(),
-            doorbell: Mutex::default(),
+            doorbells: Mutex::default(),
         }));
         tokio::spawn(net.clone().accept_loop());
         tokio::spawn(net.clone().keep_up());
@@ -968,15 +980,12 @@ impl Net {
         if !due.is_ok_and(|v| !v.is_empty()) {
             return;
         }
-        {
-            let mut b = self.0.doorbell.lock().unwrap();
-            let now = std::time::Instant::now();
-            if b.next.is_some_and(|t| now < t) {
-                return;
-            }
-            b.wait = doorbell_wait(b.wait);
-            b.next = Some(now + b.wait);
+        let now = std::time::Instant::now();
+        let mut bells = self.0.doorbells.lock().unwrap();
+        if !bells.entry(key.into()).or_default().may_ring(now) {
+            return;
         }
+        drop(bells);
         tokio::spawn(doorbell(wake, short(key).to_string()));
     }
 
@@ -1026,15 +1035,7 @@ impl Net {
         };
         if let Ok((mut send, mut recv)) = streams {
             eprintln!("net: connected {}", short(&key));
-            if d.team
-                .lock()
-                .unwrap()
-                .roster
-                .founder()
-                .is_some_and(|f| f.key == key)
-            {
-                *self.0.doorbell.lock().unwrap() = Doorbell::default();
-            }
+            self.0.doorbells.lock().unwrap().remove(&key);
             let writer = async {
                 while let Some((f, done)) = rx.recv().await {
                     if frames::write(&mut send, &f).await.is_err() {
@@ -1786,6 +1787,16 @@ mod local {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_doorbells_backoff_is_its_own_members() {
+        let now = std::time::Instant::now();
+        let (mut friday, mut other) = (super::Doorbell::default(), super::Doorbell::default());
+        assert!(friday.may_ring(now));
+        assert!(!friday.may_ring(now), "Friday waits 30 s");
+        assert!(other.may_ring(now), "ringing Friday holds no one else back");
+        assert!(friday.may_ring(now + std::time::Duration::from_secs(30)));
+    }
+
     #[test]
     fn the_doorbell_backs_off_from_30_s_to_15_min() {
         let mut w = std::time::Duration::ZERO;
