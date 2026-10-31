@@ -89,6 +89,22 @@ change anything.
 - **Packages:** add one only when the stack above can't do the job. Pin it to an exact version.
   pnpm refuses versions less than a day old; pick the previous one.
 
+## What the person gets
+
+The check can't see these, so read your own screens for them before you finish.
+
+- **Every refused action says so on the page.** A form that fails validation, a save the server
+  refuses, a failed delete: a visible message, and nothing saved. Give optional fields a `""` default.
+- **A button does what it says on the first click.** No `confirm()`, `alert()` or `prompt()`: they
+  do nothing in Canvas. If the request asks for a confirmation, ask in the page.
+- **A value that must be unique has a unique index,** and a duplicate gets a visible message, not an error page.
+- **Anything the request spells out appears exactly as written, where it says:** a label, a timezone
+  name, a status word, a total, a `data-` attribute. Before you finish, search `src/` for each name
+  the request or `contract.json` gives, and check each rule in the request against a screen.
+- **Test what the person does, not only the API.** A route that works says nothing about the form
+  in front of it. Follow each form from its button to the saved row, including with optional fields blank.
+- **If people sign up for themselves,** follow `playbooks/accounts.md`. Sign-up signs them in.
+
 ## Tests
 
 Write a small test for every business rule: a price, a limit, who can see what. Run `pnpm test`.

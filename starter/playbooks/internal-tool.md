@@ -6,7 +6,8 @@ Switches: database, sign-in with roles.
 `drizzle/seed.sql`), then a list with search and filters, a detail page, and edit. Every query is
 scoped to who is asking.
 
-**Asks (one card at most):** who may see or change what, if the request doesn't say.
+**Asks (one card at most):** who may see or change what, if the request doesn't say. If people sign
+up for themselves, `accounts.md`.
 
 **Never asks:** column types (read them from the data), page layout, pagination size.
 
