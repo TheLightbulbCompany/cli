@@ -109,8 +109,8 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, caller: Caller) 
         };
         let gate = gate(op);
         // Removal needs a person at the socket, before any authority check; an invite, a join
-        // and an answer also take a resolved agent session (`Caller::actor`), and an invite the
-        // workspace's bridge, whose token is its authority.
+        // (once its person confirms) and an answer also take a resolved agent session
+        // (`Caller::actor`), and an invite the workspace's bridge, whose token is its authority.
         if gate.person_only && !caller.is_person() {
             return refused(id, "not_a_person");
         }

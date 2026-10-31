@@ -365,11 +365,15 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
                 Err(_) => Response::err(id, INTERNAL),
             }
         }
-        // An agent fed a hostile link must not move this computer into another network.
+        // An agent fed a hostile link must not move this computer into another network: its
+        // person confirms (`admission::join`), and an unresolved caller is refused.
         "team.join" if !instance && caller.actor(&daemon.store.lock().unwrap()).is_none() => {
             refused(id, "not_a_person")
         }
-        "team.join" => crate::admission::join(id, body, daemon).await,
+        "team.join" => {
+            let agent = !instance && !caller.is_person();
+            crate::admission::join(id, body, daemon, agent).await
+        }
         // `mark_read {key}` -> `{}`: `key`'s session took a step (an MCP tool call), so the mail
         // delivered to it before now has been seen.
         "mark_read" => match body["key"].as_str() {

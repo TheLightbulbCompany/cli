@@ -78,6 +78,8 @@ pub struct Daemon {
     pub dialogs: dialog::Queue,
     /// `dialogs`' answers, for the task that routes them (admission, holds) to take.
     pub dialog_answers: Mutex<Option<dialog::Answers>>,
+    /// What waits for the person's answer to an agent's `team.join` (`dialog::JOIN_CONFIRM`).
+    pub join_confirm: Mutex<Option<tokio::sync::oneshot::Sender<Option<String>>>>,
     /// Ticket id -> the agent session that minted that link: when it is used, its person is
     /// told (Keep/Remove). In memory: a restart forgets the notice, never the invite.
     pub agent_invites: Mutex<HashMap<String, String>>,

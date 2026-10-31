@@ -229,6 +229,17 @@ async fn person_only_ops_are_refused_in_process() {
     i.shutdown().await;
 }
 
+/// An instance's dialogs answer "not shown" at once, so one raised here would refuse the join.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_instances_join_shows_no_dialog() {
+    let home = tempfile::tempdir().unwrap();
+    let i = start(home.path(), &[], None).await;
+    let a = computer_a();
+    let r = join(&i, &a).await;
+    assert_eq!(r["state"], "admitted", "{r}");
+    i.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn instance_invite_without_a_doorbell_has_no_wake() {
     let home = tempfile::tempdir().unwrap();

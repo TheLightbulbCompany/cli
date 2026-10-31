@@ -1193,6 +1193,8 @@ pub fn join(link: &str, name: Option<String>) -> Result<i32> {
         (_, Some(admission::NO_CODE)) => "That code did not work. Check the words. Ask them to open their computer, or send the full line instead. A code works once.".to_string(),
         (_, Some(admission::UNREACHABLE)) if has_wake => "Your workspace did not answer. Run the same command again in a minute. Your key is ready; nothing was lost.".to_string(),
         (_, Some(admission::UNREACHABLE)) => "No one from this network is online right now. Ask them to open their laptop, then run the same command again. Your key is ready; nothing was lost.".to_string(),
+        (_, Some(admission::NEEDS_A_PERSON)) => admission::NEEDS_A_PERSON_TEXT.to_string(),
+        (_, Some(admission::PERSON_SAID_NO)) => admission::PERSON_SAID_NO_TEXT.to_string(),
         (_, Some(admission::DECLINED)) => "Your request to join was declined.".to_string(),
         (_, Some(admission::BAD_NAME)) => "That name has characters Lightbulb cannot show. Use letters, numbers, spaces and punctuation.".to_string(),
         (_, Some(admission::BAD_TICKET)) => "This invite link does not work. Ask for a new one.".to_string(),

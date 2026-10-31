@@ -36,6 +36,14 @@ pub const BAD_NAME: &str = "bad_name";
 pub const TOO_MANY: &str = "too_many_requests";
 /// The person did not answer within the wait: the candidate is told so and stops asking.
 pub const NOT_ANSWERED: &str = "not_answered";
+/// An agent's join: its person pressed Don't join. This computer's own, never on the wire.
+pub const PERSON_SAID_NO: &str = "person_said_no";
+/// An agent's join with no answer from a dialog (none here, or it timed out). Likewise.
+pub const NEEDS_A_PERSON: &str = "needs_a_person";
+/// `NEEDS_A_PERSON` as a sentence for the agent.
+pub const NEEDS_A_PERSON_TEXT: &str = "Lightbulb could not get an answer from your person on this computer. Ask your person to run lightbulb join in their own terminal.";
+/// `PERSON_SAID_NO` as a sentence for the agent.
+pub const PERSON_SAID_NO_TEXT: &str = "Your person chose not to join this network.";
 /// Every reason a `join_decision` may carry; another reads as `refused`.
 const REASONS: &[&str] = &[
     BAD_TICKET,
@@ -58,6 +66,8 @@ const STEP: Duration = Duration::from_secs(10);
 const WAKE_RETRY: Duration = Duration::from_secs(5);
 /// How long a member's silence on a join request means it is asking its person.
 const ASKING: Duration = Duration::from_secs(1);
+/// How long an agent's join waits for its person: past the dialog's own 600 s.
+const CONFIRM_WAIT: Duration = Duration::from_secs(610);
 /// Open requests at once: per team, per inviter, per candidate.
 const LIMITS: (usize, usize, usize) = (20, 5, 1);
 /// The roster a candidate takes in, at most.
@@ -390,6 +400,12 @@ pub async fn route(d: Arc<Daemon>) {
         return;
     };
     while let Some((id, button)) = answers.recv().await {
+        if id == dialog::JOIN_CONFIRM {
+            if let Some(waiter) = d.join_confirm.lock().unwrap().take() {
+                let _ = waiter.send(button);
+            }
+            continue;
+        }
         let Some(b) = button else { continue };
         if let Some(n) = dialog::number(&id, 'H') {
             crate::holds::on_dialog(&d, n, &b);
@@ -414,9 +430,36 @@ enum Outcome {
     Next(Option<&'static str>),
 }
 
+/// The person's own answer to an agent's join, before this computer dials anyone. Anything but
+/// Join is no. `t`: the ticket, when the agent gave one (a code's is not fetched until the person
+/// has said yes). A ticket names no team, only its inviter.
+async fn person_confirms(d: &Daemon, t: Option<&Ticket>) -> Result<(), &'static str> {
+    let by = t.map_or(String::new(), |t| {
+        format!(", invited by computer {}", net::short(&t.inviter))
+    });
+    let text = format!(
+        "An agent on this computer asked to join a team{by}. Teammates there will see your \
+         sessions' names, folders and status."
+    );
+    let (waiter, answer) = tokio::sync::oneshot::channel();
+    *d.join_confirm.lock().unwrap() = Some(waiter);
+    let args = dialog::args("Lightbulb", &text, &["Don't join", "Join"]);
+    d.dialogs.show_over_claim(dialog::JOIN_CONFIRM, args);
+    let answer = tokio::time::timeout(CONFIRM_WAIT, answer).await;
+    if answer.is_err() {
+        d.dialogs.withdraw(dialog::JOIN_CONFIRM);
+    }
+    match answer {
+        Ok(Ok(Some(b))) if b == "Join" => Ok(()),
+        Ok(Ok(Some(_))) => Err(PERSON_SAID_NO),
+        _ => Err(NEEDS_A_PERSON),
+    }
+}
+
 /// `team.join {ticket | code, name?}` -> `{state: admitted|waiting|refused, reason?, team,
 /// online}`. Only a solo computer joins; it asks the ticket's members in order, one at a time.
-pub async fn join(id: u64, body: &Value, d: &Arc<Daemon>) -> Response {
+/// `agent`: an agent asked, so its person confirms first.
+pub async fn join(id: u64, body: &Value, d: &Arc<Daemon>, agent: bool) -> Response {
     let (ticket_in, code_in) = (body["ticket"].as_str(), body["code"].as_str());
     if ticket_in.is_some() == code_in.is_some() {
         return Response::err(id, BAD_REQUEST);
@@ -447,6 +490,21 @@ pub async fn join(id: u64, body: &Value, d: &Arc<Daemon>) -> Response {
     // What every member would refuse, refused before any dial.
     if !fits(&name) || !fits(&computer) {
         return done("refused", Some(BAD_NAME), "", 0);
+    }
+    if agent {
+        // A ticket that cannot be used asks no one; `signed_by_inviter`: the dialog names its signer.
+        let given = ticket_in.map(|l| ticket::decode(l).ok().filter(ticket::signed_by_inviter));
+        if given.as_ref().is_some_and(Option::is_none) {
+            return done("refused", Some(BAD_TICKET), "", 0);
+        }
+        if let Err(why) = person_confirms(d, given.flatten().as_ref()).await {
+            return done("refused", Some(why), "", 0);
+        }
+        // Someone may have joined this computer's network during the wait.
+        let t = d.team.lock().unwrap();
+        if !t.roster.is_solo(me) {
+            return done("refused", Some(ALREADY_IN_TEAM), &t.roster.team_name, 0);
+        }
     }
     let Some(ep) = d.peers.endpoint.get() else {
         return Response::err(id, INTERNAL);

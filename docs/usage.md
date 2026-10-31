@@ -63,8 +63,10 @@ Run `lightbulb <command> --help` for the options of each one.
 | `version` | Print the version. |
 
 `held`, `remove`, `leave` and `relay <url>` refuse to run from an agent's shell
-(`Run this from your own terminal, not from an agent.`). An agent may run `invite`, `join`,
-`approve` and `decline`; an answer it gives records its session.
+(`Run this from your own terminal, not from an agent.`). An agent may run `invite`, `approve`
+and `decline`; an answer it gives records its session. An agent may run `join` when you press Join
+in the dialog it raises; where no dialog can show (Linux, headless, SSH) it is refused, and you run
+`lightbulb join` in your own terminal.
 
 ## Memory
 
@@ -122,7 +124,8 @@ full, they let the evaluator suggest lessons: `lightbulb memory drafts` lists th
 ## Trust
 
 Everyone on the network is trusted: a message from a member goes straight to the session it
-names, and an invite is the approval for a join. Nothing is held and nothing asks you. To stop
+names, and an invite is the approval for a join. Nothing is held and nothing asks you, but an
+agent's own `join` on this computer, which you confirm in a dialog. To stop
 someone, `lightbulb remove <name>`. When an agent's invite brings someone in, a dialog tells you
 (Keep or Remove).
 
