@@ -726,7 +726,7 @@ if "error" in cfg:
     #[tokio::test]
     async fn a_write_error_fails() {
         // The harness stops reading; the answer cannot be written. Its later text never counts.
-        let steps = json!([chunk("so far"), ask(7, &ALL), "close", {"sleep": 1}, chunk(" later"),
+        let steps = json!([chunk("so far"), "close", ask(7, &ALL), {"sleep": 1}, chunk(" later"),
             {"sleep": 0.5}]);
         let r = drive(json!({"steps": steps}), vec![Decision::Allow]).await;
         assert_eq!(
