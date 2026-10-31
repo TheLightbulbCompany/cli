@@ -95,27 +95,26 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, caller: Caller) 
         } else {
             Invite::default()
         };
-        // An agent's link is for one join, whatever it asked for; only a person mints the rest.
+        // An agent's or a workspace member's link is for one join, whatever it asked for; only a
+        // person mints the rest.
         let actor = caller.actor(&daemon.store.lock().unwrap());
         let agent = actor
             .clone()
             .filter(|a| op == "team.invite" && a != "local");
-        let invite = if agent.is_some() {
+        let instance = caller == Caller::Instance;
+        let invite = if agent.is_some() || (instance && op == "team.invite") {
             Invite::Once
         } else {
             invite
         };
-        // A workspace member never invites: an admin adds it to a network (`team.join`).
-        if op == "team.invite" && caller == Caller::Instance {
-            return Response::err(id, UNSUPPORTED);
-        }
         let gate = gate(op);
         // Removal needs a person at the socket, before any authority check; an invite, a join
-        // and an answer also take a resolved agent session (`Caller::actor`).
+        // and an answer also take a resolved agent session (`Caller::actor`), and an invite the
+        // workspace's bridge, whose token is its authority.
         if gate.person_only && !caller.is_person() {
             return refused(id, "not_a_person");
         }
-        if op == "team.invite" && actor.is_none() {
+        if op == "team.invite" && actor.is_none() && !instance {
             return refused(id, "not_a_person");
         }
         let mut team = daemon.team.lock().unwrap();
@@ -610,9 +609,20 @@ impl TeamOps<'_> {
                         .values()
                         .any(|l| l.signer == me_key && l.expires_at > self.now);
                 let t = match live {
+                    // Never an instance's: its links are all once, so none reprints.
                     Some(l) if invite != Invite::New => {
                         let hint = self.daemon.peers.hints();
-                        ticket::sign(identity, r, l.ticket_id, l.secret, mode, l.expires_at, hint)
+                        let expires_at = l.expires_at;
+                        ticket::sign(
+                            identity,
+                            r,
+                            l.ticket_id,
+                            l.secret,
+                            mode,
+                            expires_at,
+                            hint,
+                            None,
+                        )
                     }
                     // `--new` ends every earlier link of this computer, `open` and once ones too.
                     _ => self.new_link(mode, invite.once(), invite == Invite::New)?,
@@ -663,6 +673,8 @@ impl TeamOps<'_> {
         once: bool,
         ends_all: bool,
     ) -> crate::Result<ticket::Ticket> {
+        // A workspace member's link rings its doorbell: it may be parked when the joiner dials.
+        let wake = (self.daemon.cloud.as_ref()).and_then(|c| c.wake.lock().unwrap().clone());
         let (t, hashed) = ticket::mint(
             &self.daemon.identity,
             &self.team.roster,
@@ -670,6 +682,7 @@ impl TeamOps<'_> {
             once,
             self.now,
             self.daemon.peers.hints(),
+            wake,
         );
         let mut body = ticket::link_body(&t, hashed.as_deref());
         if ends_all {

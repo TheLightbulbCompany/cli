@@ -81,13 +81,13 @@ pub(crate) fn plist_path(home: &Path) -> PathBuf {
 }
 
 /// Starts the daemon if needed, then opens a connection to it.
-fn connect() -> Result<Conn> {
+pub(crate) fn connect() -> Result<Conn> {
     daemon::ensure_running()?;
     Conn::open()
 }
 
 /// `ask` that turns a refusal into an error: a sentence (`refusal`).
-fn ask(conn: &mut Conn, op: &str, body: Value) -> Result<Value> {
+pub(crate) fn ask(conn: &mut Conn, op: &str, body: Value) -> Result<Value> {
     let r = conn.call(op, body)?;
     if r["ok"] == true {
         Ok(r)
@@ -2333,7 +2333,7 @@ fn first_screen() -> Result<()> {
     let n = std::io::stdin().read_line(&mut answer)?;
     let a = answer.trim();
     if n > 0 && (a.is_empty() || a.eq_ignore_ascii_case("y")) {
-        match crate::login::login() {
+        match crate::login::login(false) {
             Ok(0) => return Ok(()),
             Ok(_) => {}
             Err(e) => eprintln!("{e}"),

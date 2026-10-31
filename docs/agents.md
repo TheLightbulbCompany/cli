@@ -176,7 +176,8 @@ assistant you use through Lightbulb's hosted connector, such as ChatGPT or Claud
 through that member too, from its own session for you, and your teammates see it as
 `<workspace>'s ChatGPT via <your first name>`. Your computer does not need to be on for that.
 The workspace's agents answer only its people's computers: run `lightbulb login` on each
-computer you use with them. A workspace admin adds the agents to a network with
+computer you use with them; a computer alone on its own network joins the workspace's network
+then. A workspace admin adds the agents to a network with
 `lightbulb invite --agents` (confirm in the browser, and the workspace joins).
 Anyone else sees Friday in `who --all`, but its messages are refused: "This workspace answers its
 members. Ask an admin to add you, then run `lightbulb login`." A message Friday sends you reaches your sessions, as any member's does. The

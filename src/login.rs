@@ -6,6 +6,7 @@
 //! computer shows it in its `hello` (a workspace answers only its own people's computers) and
 //! on its route link (`link`). The CLI never holds an account token; the poll `code` is single
 //! use and lives only in memory here. Logout tells Lightbulb (signed), then deletes the file.
+//! `login` then joins the workspace's network when this computer is alone on its own.
 //!
 //! The wire is `curl`, as `lightbulb update` and the usage counts use; bodies go in on stdin
 //! (never in argv, which other processes can read).
@@ -19,7 +20,7 @@ use std::time::{Duration, Instant};
 
 /// The public Lightbulb API. `LIGHTBULB_API` points a test or another environment elsewhere.
 const API: &str = "https://api.thelightbulb.company/api/v1";
-/// (tests) Set: no browser is opened.
+/// (tests, debug builds) Set: no browser is opened.
 const NO_BROWSER: &str = "LIGHTBULB_CONNECT_NO_BROWSER";
 /// The sign-in, `{proof, route_url, name}`, in the state dir.
 pub const FILE: &str = "login.json";
@@ -205,9 +206,15 @@ pub(crate) fn request_form(
 }
 
 fn curl(config: &str) -> Result<(u16, Value)> {
+    curl_after(config).map(|(code, v, _)| (code, v))
+}
+
+/// `curl`, with the answer's `Retry-After` in seconds, when it has one. (A curl older than 7.84
+/// prints the `%header` as it is, which parses as none.)
+fn curl_after(config: &str) -> Result<(u16, Value, Option<u64>)> {
     let mut c = Command::new("curl");
     c.args(["-q", "-sS", "--connect-timeout", "10", "--max-time", "30"])
-        .args(["-K", "-", "-w", "\n%{http_code}"])
+        .args(["-K", "-", "-w", "\n%header{retry-after}\n%{http_code}"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -219,9 +226,14 @@ fn curl(config: &str) -> Result<(u16, Value)> {
         .write_all(config.as_bytes())?;
     let out = child.wait_with_output()?;
     let text = String::from_utf8_lossy(&out.stdout);
-    let (answer, code) = text.rsplit_once('\n').unwrap_or(("", &text));
+    let (rest, code) = text.rsplit_once('\n').unwrap_or(("", &text));
+    let (answer, after) = rest.rsplit_once('\n').unwrap_or((rest, ""));
     match code.trim().parse::<u16>() {
-        Ok(code) if code > 0 => Ok((code, serde_json::from_str(answer).unwrap_or(Value::Null))),
+        Ok(code) if code > 0 => Ok((
+            code,
+            serde_json::from_str(answer).unwrap_or(Value::Null),
+            after.trim().parse().ok(),
+        )),
         _ => Err("Could not reach Lightbulb. Check your connection and try again.".into()),
     }
 }
@@ -266,7 +278,7 @@ pub(crate) fn signed(id: &Identity, purpose: &str, ticket: Option<&str>) -> Resu
 
 /// Opens `url` in the browser (an `https` one only); a failure is fine, the URL is printed.
 fn open(url: &str) {
-    if !url.starts_with("https://") || std::env::var_os(NO_BROWSER).is_some() {
+    if !url.starts_with("https://") || crate::cli::test_env(NO_BROWSER).is_some() {
         return;
     }
     let opener = if cfg!(target_os = "macos") {
@@ -282,8 +294,9 @@ fn open(url: &str) {
 }
 
 /// The device flow for `purpose`: start, show the code, open the browser, poll until the
-/// person confirms. The approved poll's answer.
-fn device(purpose: &str, ticket: Option<&str>) -> Result<Value> {
+/// person confirms. The approved poll's answer. `app`: the code alone, as one line of JSON for
+/// the desktop app, which confirms it itself; no browser.
+fn device(purpose: &str, ticket: Option<&str>, app: bool) -> Result<Value> {
     let id = identity()?;
     let mut body = signed(&id, purpose, ticket)?;
     let computer = crate::config::Config::load(&paths::state_dir())?.computer;
@@ -305,9 +318,13 @@ fn device(purpose: &str, ticket: Option<&str>) -> Result<Value> {
             "Lightbulb sent an answer this version cannot read. Run lightbulb update.".into(),
         );
     };
-    println!("Confirm in your browser: {url}");
-    println!("Type this code there: {user_code}");
-    open(url);
+    if app {
+        println!("{}", json!({ "user_code": user_code }));
+    } else {
+        println!("Confirm in your browser: {url}");
+        println!("Type this code there: {user_code}");
+        open(url);
+    }
     let every = Duration::from_secs(start["interval"].as_u64().unwrap_or(2).clamp(1, 10));
     let until =
         Instant::now() + Duration::from_secs(start["expiresIn"].as_u64().unwrap_or(600).min(900));
@@ -334,9 +351,10 @@ fn again(purpose: &str) -> &'static str {
     }
 }
 
-/// `login`: ties this computer to the person who confirms in the browser.
-pub fn login() -> Result<i32> {
-    let r = device("login", None)?;
+/// `login`: ties this computer to the person who confirms in the browser, then puts it on their
+/// workspace's network. `app` (`login --app`, the desktop app): the sign-in alone, in silence.
+pub fn login(app: bool) -> Result<i32> {
+    let r = device("login", None, app)?;
     let Some(proof) = r["proof"].as_str() else {
         return Err(
             "Lightbulb sent an answer this version cannot read. Run lightbulb update.".into(),
@@ -347,6 +365,9 @@ pub fn login() -> Result<i32> {
         &json!({"proof": proof, "route_url": r["routeUrl"], "name": r["name"]}),
     )?;
     tell_daemon();
+    if app {
+        return Ok(0);
+    }
     match r["name"]
         .as_str()
         .filter(|n| n.chars().all(crate::label::printable))
@@ -356,11 +377,118 @@ pub fn login() -> Result<i32> {
         }
         _ => println!("This computer is signed in."),
     }
-    println!(
-        "Your workspace's agents answer it once an admin adds them: lightbulb invite --agents"
-    );
+    // The proof is saved: whatever happens here, the login stands.
+    match join_workspace() {
+        Ok(Some(said)) => println!("{said}"),
+        Ok(None) => {}
+        Err(e) => println!("This computer did not join your workspace's network: {e}"),
+    }
     crate::cli::ask_upload_mode()?;
     Ok(0)
+}
+
+/// One call signed as this computer's person (`mcp::proof_headers`), with no body: the status,
+/// the answer's JSON and its `Retry-After`. Signed afresh each time: a signed call is good once.
+fn signed_call(method: &str, path: &str) -> Result<(u16, Value, Option<u64>)> {
+    let headers = crate::mcp::proof_headers(method, path, b"", "lightbulb login").map_err(|e| {
+        let why = e["hint"].as_str().or(e["error"].as_str());
+        why.unwrap_or("not signed in").to_string()
+    })?;
+    let headers: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let mut config = head(&api(), method, path, &headers)?;
+    // Past API Gateway's own 30 s cut, so its answer is what arrives. Overrides curl()'s 30 s.
+    config.push_str("max-time = 40\n");
+    curl_after(&config)
+}
+
+/// `POST /network/join-line`, waiting out a cold member: the gateway answers a 5xx at once while
+/// it wakes (about 55 s), with `Retry-After` (else 15 s). Up to 3 minutes.
+// ponytail: only a 5xx is retried; a dropped connection fails this login's join with one line and
+// the person runs login again. Retry those here too if they turn up during cold starts.
+fn join_line() -> Result<(u16, Value)> {
+    let wait = crate::cli::test_env("LIGHTBULB_CONNECT_JOIN_WAIT_S")
+        .and_then(|s| s.to_str()?.parse().ok())
+        .unwrap_or(180);
+    let until = Instant::now() + Duration::from_secs(wait);
+    loop {
+        let (code, v, after) = signed_call("POST", "/network/join-line")?;
+        if code < 500 {
+            return Ok((code, v));
+        }
+        // At least a second: the next call's signature must differ from this one's.
+        let pause = Duration::from_secs(after.unwrap_or(15).clamp(1, 60));
+        if Instant::now() + pause > until {
+            return Err("your workspace did not wake in time. Run lightbulb login again.".into());
+        }
+        std::thread::sleep(pause);
+    }
+}
+
+/// After the sign-in: puts a computer that is alone on its signed-in person's workspace's
+/// network, through a once link its cloud member minted, and leaves one on another network with
+/// members where it is. What to tell the person, if anything: nothing for a person with no
+/// workspace, or a backend without these routes (404: older than this engine).
+fn join_workspace() -> Result<Option<String>> {
+    let (code, me, _) = signed_call("GET", "/network/team")?;
+    if code == 404 {
+        return Ok(None);
+    }
+    if !(200..300).contains(&code) {
+        return Err(said(code, &me).into());
+    }
+    if !me["workspace"].is_string() {
+        return Ok(None);
+    }
+    let workspace = shown(&me["workspace"]).unwrap_or("your workspace");
+    let mut conn = crate::cli::connect()?;
+    let team = crate::cli::ask(&mut conn, "team.get", json!({}))?;
+    if me["teamId"].is_string() && me["teamId"] == team["team_id"] {
+        return Ok(Some(format!("On {workspace}'s network.")));
+    }
+    if team["members"].as_array().map_or(0, Vec::len) != 1 {
+        let name = shown(&team["name"]).unwrap_or("another network");
+        return Ok(Some(format!(
+            "You are on {name}. To join {workspace}'s network: lightbulb leave, then lightbulb login."
+        )));
+    }
+    println!("Connecting your computer to {workspace}…");
+    let (code, line) = join_line()?;
+    if code == 404 {
+        return Ok(None);
+    }
+    if !(200..300).contains(&code) {
+        return Err(said(code, &line).into());
+    }
+    let ticket = line["ticket"].as_str().ok_or("Lightbulb sent no invite.")?;
+    let name = shown(&line["name"]).map_or_else(crate::daemon::user_name, String::from);
+    // Dialing, and ringing a parked member's doorbell, as `cli::join` waits for it.
+    conn.wait_up_to(Duration::from_secs(660))?;
+    let body = json!({ "ticket": ticket, "name": name });
+    let mut r = crate::cli::ask(&mut conn, "team.join", body)?;
+    // A person's second computer: every computer is its own member, each name unique.
+    if r["reason"] == crate::admission::NAME_TAKEN {
+        let computer = crate::config::Config::load(&paths::state_dir())?.computer;
+        let body = json!({ "ticket": ticket, "name": format!("{name} ({computer})") });
+        r = crate::cli::ask(&mut conn, "team.join", body)?;
+    }
+    if r["state"] != "admitted" {
+        let why = r["reason"].as_str().unwrap_or("refused").replace('_', " ");
+        return Err(format!("the network refused it ({why}). Run lightbulb login again.").into());
+    }
+    crate::telemetry::send(
+        &paths::state_dir(),
+        crate::telemetry::Event::NetworkJoined(crate::telemetry::Via::Line),
+    );
+    Ok(Some(format!(
+        "Your computer joined {workspace}'s network. Teammates on it see the names, folders and \
+         status of your sessions, never your files or conversations. Hide a folder: lightbulb \
+         folder <path> off."
+    )))
+}
+
+/// `v`, when it is text this terminal can safely show.
+fn shown(v: &Value) -> Option<&str> {
+    (v.as_str()).filter(|s| !s.is_empty() && s.chars().all(crate::label::printable))
 }
 
 /// `logout`: signs this computer out everywhere first (a signed call: the backend adds its key
@@ -433,7 +561,7 @@ pub fn refresh(dir: &std::path::Path) -> Result<bool> {
 /// `invite --agents`: a workspace admin adds their workspace's agents to this network. A once
 /// link minted here goes to the workspace, which joins with it (the invite is the approval).
 pub fn invite_agents(ticket: &str) -> Result<i32> {
-    let r = device("agents", Some(ticket))?;
+    let r = device("agents", Some(ticket), false)?;
     let ws = r["workspaceName"]
         .as_str()
         .filter(|n| !n.is_empty() && n.chars().all(crate::label::printable))

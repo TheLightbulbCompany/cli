@@ -187,8 +187,8 @@ fn status_answers_as_an_instance_and_shutdown_is_refused() {
         "{r}"
     );
     // A person-only op answers as for an instance's caller.
-    let r = line(&sock, &token, "team.invite", json!({}));
-    assert_eq!(r["error"], "unsupported", "{r}");
+    let r = line(&sock, &token, "team.remove", json!({"member": "x"}));
+    assert_eq!(r["reason"], "not_a_person", "{r}");
     // Still running: SIGTERM stops it, exit 0, with its snapshot.
     assert_eq!(ok(&sock, &token, "ping", json!({})), json!({}));
     // SAFETY: kill takes a pid and a signal; the pid is our own live child's.
@@ -411,15 +411,26 @@ async fn a_delivered_record_left_unread_past_its_ttl_expires() {
     exits_zero(child);
 }
 
+/// A member whose sessions file carries a doorbell: its child, token, socket, and the doorbell.
+fn with_doorbell(dir: &Path) -> (Child, String, std::path::PathBuf, Value) {
+    let wake =
+        json!({"url": "https://wake.example.test/api/v1/network/wake", "token": "org_1.abc"});
+    let file = json!({"workspace": NAME, "sessions": friday(), "wake": wake});
+    let (child, token, sock) = common::member_with(dir, file);
+    (child, token, sock, wake)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_workspace_member_never_invites() {
+async fn instance_invite_is_once_and_carries_the_wake() {
     let dir = tempfile::tempdir().unwrap();
-    let (child, token, sock) = member(dir.path(), friday());
+    let (child, token, sock, wake) = with_doorbell(dir.path());
     let invite = |mode: Value| line(&sock, &token, "team.invite", json!({ "mode": mode }));
     // `ask` and `person` are no `team.invite` modes (person links are gone).
     for mode in [json!("ask"), json!("person")] {
         assert_eq!(invite(mode.clone())["error"], "bad_request", "{mode}");
     }
+    // Whatever it is asked for, a link for one join, a new one each time, ending no other.
+    let mut tickets = vec![];
     for mode in [
         Value::Null,
         json!("open"),
@@ -427,10 +438,23 @@ async fn a_workspace_member_never_invites() {
         json!("once"),
         json!("new"),
     ] {
-        assert_eq!(invite(mode.clone())["error"], "unsupported", "{mode}");
+        let r = invite(mode.clone());
+        assert_eq!(r["ok"], true, "{mode}: {r}");
+        assert_eq!(r["result"]["mode"], "once", "{mode}");
+        let t = lightbulb::ticket::decode(r["result"]["ticket"].as_str().unwrap()).unwrap();
+        assert_eq!(t.wake, lightbulb::roster::Wake::parse(&wake), "{mode}");
+        assert!(lightbulb::ticket::signed_by_inviter(&t), "{mode}");
+        assert_eq!(t.mode, "open", "{mode}");
+        tickets.push(t.ticket_id);
     }
     ok(&sock, &token, "stop", json!({}));
     exits_zero(child);
+    let store = Store::open(&dir.path().join("home/state.db")).unwrap();
+    let r = roster::replay(&roster::entries(&store).unwrap());
+    for id in &tickets {
+        assert!(r.links[id].once, "{id}");
+    }
+    assert_eq!(r.links.len(), tickets.len(), "no earlier link was ended");
     // A computer refuses a person link too.
     let a = common::Env::new();
     a.daemon(false, "", &[]);
@@ -439,6 +463,50 @@ async fn a_workspace_member_never_invites() {
         json!({"id": 1, "op": "team.invite", "mode": "person", "for": "u", "name": "P"}),
     );
     assert_eq!(r["error"], "bad_request", "{r}");
+    // A person's ticket names no doorbell.
+    let t = common::invite(&a, "once");
+    assert_eq!(lightbulb::ticket::decode(&t).unwrap().wake, None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_joiner_is_admitted_on_an_instance_once_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let (child, token, sock, _) = with_doorbell(dir.path());
+    let r = ok(&sock, &token, "team.invite", json!({"mode": "once"}));
+    let ticket = r["ticket"].as_str().unwrap();
+    let key = ok(&sock, &token, "identity.get", json!({}))["member_key"].clone();
+    let port = ok(&sock, &token, "status", json!({}))["port"].clone();
+    let peers = format!("{}@127.0.0.1:{port}", key.as_str().unwrap());
+    let b = common::Env::new();
+    b.daemon(
+        false,
+        &common::computer("mbp"),
+        &[("LIGHTBULB_CONNECT_PEERS", peers)],
+    );
+    let r = common::person(
+        &b,
+        json!({"id": 1, "op": "team.join", "ticket": ticket, "name": "Leonardo"}),
+    );
+    assert_eq!(r["state"], "admitted", "{r}");
+    common::until(5, "both list both", || {
+        let m = ok(&sock, &token, "team.get", json!({}));
+        m["members"].as_array().unwrap().len() == 2 && common::members(&b).len() == 2
+    });
+    // A once link: spent.
+    let c = common::Env::new();
+    let peers = format!("{}@127.0.0.1:{port}", key.as_str().unwrap());
+    c.daemon(
+        false,
+        &common::computer("mba"),
+        &[("LIGHTBULB_CONNECT_PEERS", peers)],
+    );
+    let r = common::person(
+        &c,
+        json!({"id": 1, "op": "team.join", "ticket": ticket, "name": "Carol"}),
+    );
+    assert_ne!(r["state"], "admitted", "{r}");
+    ok(&sock, &token, "stop", json!({}));
+    exits_zero(child);
 }
 
 /// The doorbell (E4): the member founds its own network and publishes `wake` from its
