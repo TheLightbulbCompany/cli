@@ -219,6 +219,7 @@ fn receipt_text(r: &Value, person: Option<&ForPerson>) -> Option<String> {
         _ => "paused by a loop limit".into(),
     };
     let Some(p) = person else {
+        let person = at("person");
         let computer = at("where");
         return Some(match at("state") {
             "refused" if at("reason") == "loop" => limit(),

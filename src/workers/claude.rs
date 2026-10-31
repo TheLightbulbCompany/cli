@@ -408,6 +408,10 @@ mod tests {
             repo: None,
             branch: None,
             handle: None,
+            reason: None,
+            ended_at: None,
+            waiting_for: None,
+            headless: false,
         })
         .unwrap();
     }

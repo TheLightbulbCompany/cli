@@ -512,6 +512,7 @@ mod tests {
             doing: s.doing.clone(),
             tier: s.tier.clone(),
             title: s.title.clone(),
+            free: None,
             waiting_for: None,
         };
         assert!(then.valid("abc"), "{then:?}");
@@ -606,6 +607,7 @@ mod tests {
             tier: "pull".into(),
             title: None,
             free: Some(1),
+            waiting_for: None,
         };
         assert!(!row("x/claude:1").valid("x"));
         assert!(row("x/claude:new").valid("x"));

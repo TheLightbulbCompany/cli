@@ -1459,7 +1459,7 @@ fn register(id: u64, body: &Value, daemon: &Daemon) -> Response {
         .flatten();
     let (title, status) = match kept {
         Some(o) => (o.title, o.status),
-        None => (r.title, status.into()),
+        None => (title, status.into()),
     };
     let row = store::Session {
         key: key.0.clone(),

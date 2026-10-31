@@ -511,6 +511,10 @@ impl Launch {
                 repo: None,
                 branch: None,
                 handle: None,
+                reason: None,
+                ended_at: None,
+                waiting_for: None,
+                headless: false,
             });
             if let Err(e) = row {
                 eprintln!("worker {}: no session row: {e}", w.id);
@@ -735,7 +739,7 @@ fn finish(d: &Arc<Daemon>, w: &Worker, o: Outcome, stopped: Option<Stop>) {
         };
         let at = now as i64;
         let ended = store.end_worker(w.id, state, by, at);
-        if let Err(e) = store.end_session(&w.session, at) {
+        if let Err(e) = store.end_session(&w.session, at, "job-done", None) {
             eprintln!("worker {}: session not ended: {e}", w.id);
         }
         (
@@ -1411,6 +1415,10 @@ mod tests {
             repo: None,
             branch: None,
             handle: None,
+            reason: None,
+            ended_at: None,
+            waiting_for: None,
+            headless: false,
         })
         .unwrap();
         s.insert_worker(&Worker {
