@@ -411,6 +411,31 @@ async fn a_delivered_record_left_unread_past_its_ttl_expires() {
     exits_zero(child);
 }
 
+/// `LIGHTBULB_CONNECT_PEERS`' value for the member behind `sock`.
+fn peer_arg(sock: &Path, token: &str) -> String {
+    let key = ok(sock, token, "identity.get", json!({}))["member_key"].clone();
+    let port = ok(sock, token, "status", json!({}))["port"].clone();
+    format!("{}@127.0.0.1:{port}", key.as_str().unwrap())
+}
+
+/// A `curl` that records each call in `dir/curl` (`rings`): the `PATH` that finds it.
+fn fake_curl(dir: &Path) -> String {
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(dir.join("curl")).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    let rec = dir.join("curl").display().to_string();
+    let fake = common::script(
+        &bin,
+        &format!(
+            "n=$(ls '{rec}' | wc -l | tr -d ' ')\n\
+             printf '%s\\n' \"$@\" > '{rec}/'$n.args\n\
+             cat > '{rec}/'$n.stdin"
+        ),
+    );
+    std::fs::rename(fake, bin.join("curl")).unwrap();
+    format!("{}:{}", bin.display(), std::env::var("PATH").unwrap())
+}
+
 /// A member whose sessions file carries a doorbell: its child, token, socket, and the doorbell.
 fn with_doorbell(dir: &Path) -> (Child, String, std::path::PathBuf, Value) {
     let wake =
@@ -474,9 +499,8 @@ async fn a_joiner_is_admitted_on_an_instance_once_link() {
     let (child, token, sock, _) = with_doorbell(dir.path());
     let r = ok(&sock, &token, "team.invite", json!({"mode": "once"}));
     let ticket = r["ticket"].as_str().unwrap();
-    let key = ok(&sock, &token, "identity.get", json!({}))["member_key"].clone();
-    let port = ok(&sock, &token, "status", json!({}))["port"].clone();
-    let peers = format!("{}@127.0.0.1:{port}", key.as_str().unwrap());
+    assert!(lightbulb::ticket::decode(ticket).unwrap().wake.is_some());
+    let peers = peer_arg(&sock, &token);
     let b = common::Env::new();
     b.daemon(
         false,
@@ -494,7 +518,7 @@ async fn a_joiner_is_admitted_on_an_instance_once_link() {
     });
     // A once link: spent.
     let c = common::Env::new();
-    let peers = format!("{}@127.0.0.1:{port}", key.as_str().unwrap());
+    let peers = peer_arg(&sock, &token);
     c.daemon(
         false,
         &common::computer("mba"),
@@ -568,23 +592,8 @@ fn doorbell_of(
     let wake = json!({"url": "https://wake.example.test/api/v1/network/wake", "token": wake_token});
     let file = json!({"workspace": NAME, "sessions": friday(), "wake": wake});
     let (child, token, sock) = common::member_with(dir, file);
-    let bin = dir.join("bin");
-    std::fs::create_dir_all(dir.join("curl")).unwrap();
-    std::fs::create_dir_all(&bin).unwrap();
-    let rec = dir.join("curl").display().to_string();
-    let fake = common::script(
-        &bin,
-        &format!(
-            "n=$(ls '{rec}' | wc -l | tr -d ' ')\n\
-             printf '%s\\n' \"$@\" > '{rec}/'$n.args\n\
-             cat > '{rec}/'$n.stdin"
-        ),
-    );
-    std::fs::rename(fake, bin.join("curl")).unwrap();
-    let key = ok(&sock, &token, "identity.get", json!({}))["member_key"].clone();
-    let port = ok(&sock, &token, "status", json!({}))["port"].clone();
-    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
-    let peers = format!("{}@127.0.0.1:{port}", key.as_str().unwrap());
+    let path = fake_curl(dir);
+    let peers = peer_arg(&sock, &token);
     a.daemon(
         false,
         "",
@@ -612,6 +621,83 @@ fn rings(dir: &Path) -> Vec<Vec<String>> {
             .collect()
     };
     calls.iter().map(|p| lines(p)).collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_joiner_rings_the_doorbell_its_ticket_carries() {
+    let dir = tempfile::tempdir().unwrap();
+    let (child, token, sock, wake) = with_doorbell(dir.path());
+    let r = ok(&sock, &token, "team.invite", json!({"mode": "once"}));
+    let ticket = r["ticket"].as_str().unwrap();
+    let peers = peer_arg(&sock, &token);
+    // Parked: nobody answers the joiner.
+    ok(&sock, &token, "stop", json!({}));
+    exits_zero(child);
+    let b = common::Env::new();
+    b.daemon(
+        false,
+        &common::computer("mbp"),
+        &[
+            ("LIGHTBULB_CONNECT_PEERS", peers),
+            ("PATH", fake_curl(dir.path())),
+            ("LIGHTBULB_CONNECT_DEBUG_WAKE_WAIT_S", "1".into()),
+        ],
+    );
+    let r = common::person(
+        &b,
+        json!({"id": 1, "op": "team.join", "ticket": ticket, "name": "Leonardo"}),
+    );
+    assert_eq!(
+        (&r["state"], &r["reason"], &r["wake"]),
+        (&json!("refused"), &json!("unreachable"), &json!(true)),
+        "{r}"
+    );
+    let secret = wake["token"].as_str().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("curl/0.stdin")).unwrap(),
+        format!("header = \"Authorization: Bearer {secret}\"\n")
+    );
+    let argv = &rings(dir.path())[0];
+    assert!(
+        argv.contains(&wake["url"].as_str().unwrap().to_string()),
+        "{argv:?}"
+    );
+    assert!(argv.iter().all(|a| !a.contains(secret)), "{argv:?}");
+}
+
+/// The production shape: the member joined an admin's network, then mints for a teammate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_member_of_an_admins_network_mints_and_a_third_computer_is_admitted() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, child, token, sock, wake) = doorbell_of(dir.path(), false);
+    let r = ok(&sock, &token, "team.invite", json!({"mode": "reusable"}));
+    let ticket = r["ticket"].as_str().unwrap();
+    let t = lightbulb::ticket::decode(ticket).unwrap();
+    assert_eq!(t.wake.unwrap().token, wake);
+    assert_eq!(
+        t.members[1],
+        a.identity().key,
+        "the founder, after the inviter"
+    );
+    let c = common::Env::new();
+    c.daemon(
+        false,
+        &common::computer("mbp"),
+        &[("LIGHTBULB_CONNECT_PEERS", peer_arg(&sock, &token))],
+    );
+    let r = common::person(
+        &c,
+        json!({"id": 1, "op": "team.join", "ticket": ticket, "name": "Leonardo"}),
+    );
+    assert_eq!(r["state"], "admitted", "{r}");
+    common::until(10, "all three list all three", || {
+        let m = ok(&sock, &token, "team.get", json!({}));
+        m["members"].as_array().unwrap().len() == 3
+            && common::members(&a).len() == 3
+            && common::members(&c).len() == 3
+    });
+    ok(&sock, &token, "stop", json!({}));
+    exits_zero(child);
 }
 
 /// The member stopped, and a message for its Friday due on A: until A rang once. Returns

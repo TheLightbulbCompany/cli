@@ -471,9 +471,25 @@ fn join_workspace() -> Result<Option<String>> {
         let body = json!({ "ticket": ticket, "name": format!("{name} ({computer})") });
         r = crate::cli::ask(&mut conn, "team.join", body)?;
     }
-    if r["state"] != "admitted" {
-        let why = r["reason"].as_str().unwrap_or("refused").replace('_', " ");
-        return Err(format!("the network refused it ({why}). Run lightbulb login again.").into());
+    // Only a refusal is called one: nobody answering, or nobody answering yet, is not.
+    match (r["state"].as_str(), r["reason"].as_str()) {
+        (Some("admitted"), _) => {}
+        (Some("waiting"), _) => {
+            return Ok(Some(format!(
+            "Still connecting to {workspace}'s network. Run lightbulb login again to keep asking."
+        )))
+        }
+        (_, Some(crate::admission::UNREACHABLE)) => {
+            return Ok(Some(
+                "Couldn't reach your workspace's network; try lightbulb login again.".into(),
+            ))
+        }
+        (_, why) => {
+            let why = why.unwrap_or("refused").replace('_', " ");
+            return Err(
+                format!("the network refused it ({why}). Run lightbulb login again.").into(),
+            );
+        }
     }
     crate::telemetry::send(
         &paths::state_dir(),

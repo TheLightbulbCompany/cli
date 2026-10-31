@@ -563,3 +563,40 @@ fn a_member_that_never_wakes_is_one_line_and_the_login_stands() {
         .count();
     assert!(posts >= 2, "{posts}");
 }
+
+#[test]
+fn a_network_nobody_answers_is_not_called_a_refusal() {
+    let (a, b) = (Env::new(), Env::new());
+    let id = a.identity();
+    let now = common::now_s();
+    let g = lightbulb::daemon::net_ops::genesis(&id, "aden", "mac", "acme", now);
+    lightbulb::roster::accept(&a.store(), &g, now).unwrap();
+    let r = lightbulb::roster::replay(&lightbulb::roster::entries(&a.store()).unwrap());
+    // A's ticket, and A never runs.
+    let t = lightbulb::ticket::sign(
+        &id,
+        &r,
+        format!("{}.t1", id.short),
+        "s".into(),
+        "open",
+        now + 60,
+        (String::new(), vec![]),
+        None,
+    );
+    let ticket = lightbulb::ticket::encode(&t);
+    b.daemon(
+        false,
+        "",
+        &[("LIGHTBULB_CONNECT_DEBUG_DIAL_WAIT_S", "1".into())],
+    );
+    let line = json!({"ticket": ticket, "name": "Aden"});
+    let (base, _) = workspace(acme(json!("t")), (200, line));
+    let out = login_detached(&b, &base, &["login"]);
+    let text = common::out(&out);
+    assert!(out.status.success(), "{text}{}", common::err(&out));
+    assert!(
+        text.ends_with("Couldn't reach your workspace's network; try lightbulb login again.\n"),
+        "{text}"
+    );
+    assert!(!text.contains("refused"), "{text}");
+}
