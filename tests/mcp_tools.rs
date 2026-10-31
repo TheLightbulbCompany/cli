@@ -235,6 +235,17 @@ impl Drop for Other {
     }
 }
 
+/// This engine's binary at `to`, copied by a child `cp`: a parallel test's fork inherits any write
+/// fd this process holds until it execs, and exec of a file open for writing fails (ETXTBSY).
+fn copy_exe(to: &std::path::Path) {
+    assert!(Command::new("cp")
+        .arg(EXE)
+        .arg(to)
+        .status()
+        .unwrap()
+        .success());
+}
+
 /// A live process whose executable is named `opencode` (this engine's binary copied under that
 /// name, a hook waiting for its stdin to end), for the agent above an OpenCode MCP server;
 /// killed on drop.
@@ -246,7 +257,7 @@ impl FakeOpencode {
         let dir = tempfile::tempdir().unwrap();
         let exe = dir.path().join("opencode");
         // A copy, not a hard link: macOS may name a hard-linked running image by its other link.
-        std::fs::copy(EXE, &exe).unwrap();
+        copy_exe(&exe);
         let mut child = Command::new(&exe)
             .args(["hook", "none", "none"])
             .env(paths::HOME_ENV, dir.path())
@@ -1541,7 +1552,7 @@ fn a_server_whose_binary_was_replaced_says_so_and_sends_nothing() {
     let (base, seen) = stub(api);
     let bin = tempfile::tempdir().unwrap();
     let exe = bin.path().join("lightbulb");
-    std::fs::copy(EXE, &exe).unwrap();
+    copy_exe(&exe);
     let mut m = mcp_exe(&e, &me(), &base, &exe);
     let out = m.tool("find_rooms", json!({}));
     assert!(!out.error, "{}", out.text);
