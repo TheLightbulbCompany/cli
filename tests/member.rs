@@ -529,6 +529,11 @@ fn doorbell_of(
     (a, child, token, sock, wake_token)
 }
 
+/// How long a ring may take: a member gone without a close A hears lives on until the idle
+/// timeout (30 s), the next redial round after that is up to 30 s off (`net::REDIAL`), and only
+/// that dial's failure, 30 s on, rings: 90 s and scheduling.
+const RING_S: u64 = 120;
+
 /// The curl calls made so far: each one's argv lines.
 fn rings(dir: &Path) -> Vec<Vec<String>> {
     let mut calls: Vec<_> = std::fs::read_dir(dir.join("curl"))
@@ -559,7 +564,7 @@ fn rang(dir: &Path, a: &common::Env, child: Child, token: &str, sock: &Path) -> 
     exits_zero(child);
     assert!(rings(dir).is_empty(), "rang while the member was up");
     a.send(&from, &to, "while parked", "r2", None);
-    common::until(90, "A rings the doorbell", || !rings(dir).is_empty());
+    common::until(RING_S, "A rings the doorbell", || !rings(dir).is_empty());
     to
 }
 
@@ -623,7 +628,7 @@ async fn a_computer_rings_a_non_founder_members_doorbell() {
     exits_zero(child);
     a.send(&common::session(&a, "c1"), &to, "while parked", "r1", None);
     let stdin = dir.path().join("curl/0.stdin");
-    common::until(90, "A rings the doorbell", || {
+    common::until(RING_S, "A rings the doorbell", || {
         std::fs::read_to_string(&stdin).is_ok_and(|t| !t.is_empty())
     });
     assert_eq!(
@@ -649,6 +654,12 @@ async fn the_doorbell_token_is_absent_from_logs() {
         format!("header = \"Authorization: Bearer {wake}\"\n")
     );
     assert!(rings(dir.path())[0].iter().all(|l| !l.contains(&wake)));
+    // The daemon logs the ring once curl has exited, after the fake wrote its stdin.
+    common::until(30, "the ring is logged", || {
+        std::fs::read_to_string(a.state.path().join("daemon.log"))
+            .unwrap()
+            .contains("doorbell")
+    });
     for log in [
         dir.path().join("member.log"),
         a.state.path().join("daemon.log"),
@@ -657,12 +668,6 @@ async fn the_doorbell_token_is_absent_from_logs() {
         assert!(!text.contains(&wake), "{log:?}: {text}");
         assert!(!text.contains("org_1."), "{log:?}");
     }
-    assert!(
-        std::fs::read_to_string(a.state.path().join("daemon.log"))
-            .unwrap()
-            .contains("doorbell"),
-        "the ring is logged"
-    );
 }
 
 /// The sessions file's `members` (people) gates who may message the member's sessions: a
