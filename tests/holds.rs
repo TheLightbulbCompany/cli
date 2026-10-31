@@ -573,7 +573,7 @@ fn a_workers_prompt_hold_outlives_permission_s() {
         .unwrap()
         .is_empty());
     // Gone with its session.
-    s.end_session(&w, 5_000).unwrap();
+    s.end_session(&w, 5_000, "session-end", None).unwrap();
     assert_eq!(ids(holds::expire(&s, 5_001).unwrap()), [p.id]);
 }
 
