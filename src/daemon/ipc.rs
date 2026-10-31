@@ -70,6 +70,14 @@ pub async fn serve(listener: UnixListener, daemon: Arc<Daemon>) {
         tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => {
+                    // `shutdown` answers once notified, so a caller's next ping can get here with
+                    // the notice already sent: answered, it would take a daemon on its way out for
+                    // a live one and start none. Unanswered, it starts the next.
+                    tokio::select! {
+                        biased;
+                        _ = daemon.shutdown.notified() => break,
+                        _ = std::future::ready(()) => {}
+                    }
                     // Subscribe here, not in the task, so a connection accepted
                     // just before shutdown cannot miss the shutdown event.
                     conns.spawn(connection(stream, daemon.events.subscribe(), daemon.clone()));

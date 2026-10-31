@@ -326,12 +326,22 @@ mod tests {
         assert_eq!(parse("[]"), Some(vec![]));
     }
 
-    /// An executable script in `dir`.
+    /// An executable script in `dir`, written by a child `sh`: a parallel test's fork inherits
+    /// any write fd this process holds until it execs, and exec of a file open for writing fails
+    /// (ETXTBSY), which `read` takes for a `claude` that cannot start.
     fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
+        use std::io::Write;
         let exe = dir.join(name);
-        std::fs::write(&exe, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut sh = Command::new("/bin/sh")
+            .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+            .arg(&exe)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = sh.stdin.take().unwrap();
+        write!(stdin, "#!/bin/sh\n{body}\n").unwrap();
+        drop(stdin);
+        assert!(sh.wait().unwrap().success());
         exe
     }
 
