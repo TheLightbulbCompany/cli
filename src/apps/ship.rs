@@ -543,6 +543,20 @@ pub(crate) fn up(
     if let Err(e) = wait(auth, &id, &mut r) {
         return Ok(failure(json, e));
     }
+    if r["state"] == "failed" || finished(&r["state"]) {
+        match check::count_build(root, r["state"] == "failed") {
+            Ok(Some(next)) if r["state"] == "failed" => {
+                // Keep the backend's own next step; the diagnose or undo step follows it.
+                r["error"]["next"] = match r["error"]["next"].as_str().filter(|s| !s.is_empty()) {
+                    Some(own) => format!("{own} {next}"),
+                    None => next.to_string(),
+                }
+                .into();
+            }
+            Ok(_) => {}
+            Err(e) => return Ok(failure(json, e)),
+        }
+    }
     if r["state"] == "failed" || building(&r) {
         return Ok(show(&r, "up", json!({}), json));
     }

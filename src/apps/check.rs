@@ -111,7 +111,10 @@ pub fn parse(output: &str, root: &Path) -> Vec<Problem> {
     let tsc_global = regex::Regex::new(r"^error TS(\d+):\s*(.*)$").unwrap();
     let eslint = regex::Regex::new(r"^\s+(\d+):(\d+)\s+error\s+(.*?)(?:\s{2,}(\S+))?\s*$").unwrap();
     let design = regex::Regex::new(r"^(.+?):(\d+): (.+)$").unwrap();
+    let vitest = regex::Regex::new(r"^\s*FAIL\s+(\S+)(?:\s+>\s+(.+?))?\s*$").unwrap();
     let mut problems: Vec<Problem> = vec![];
+    // The vitest problem still waiting for its error line.
+    let mut vitest_open: Option<usize> = None;
     // The last tsc problem (continuation lines extend it) and the last ESLint file header.
     let mut tsc_open = false;
     let mut eslint_file = String::new();
@@ -120,7 +123,43 @@ pub fn parse(output: &str, root: &Path) -> Vec<Problem> {
             continue;
         }
         let at = |c: &regex::Captures, i: usize| c[i].parse().unwrap();
-        if let Some(c) = tsc.captures(raw) {
+        if let Some(c) = vitest.captures(raw) {
+            // A failed test: vitest lists it twice (summary, then detail), so one problem per name.
+            let name = c.get(2).map_or("", |m| m.as_str()).to_string();
+            let file = relative(root, &c[1]);
+            let seen = problems.iter().any(|p| {
+                p.code.as_deref() == Some("vitest")
+                    && p.file == file
+                    && p.message.starts_with(&name)
+            });
+            // ponytail: first 5 failures only, so one broken suite does not flood the report
+            let room = problems
+                .iter()
+                .filter(|p| p.code.as_deref() == Some("vitest"))
+                .count()
+                < 5;
+            vitest_open = (!seen && room).then(|| {
+                problems.push(Problem {
+                    file,
+                    line: 1,
+                    column: None,
+                    code: Some("vitest".into()),
+                    message: name,
+                });
+                problems.len() - 1
+            });
+            tsc_open = false;
+        } else if let Some(i) = vitest_open.take().filter(|_| !raw.contains('\u{23af}')) {
+            // The line after FAIL is the error ("AssertionError: expected 1 to be 2").
+            if let Some(p) = problems.get_mut(i) {
+                let msg: String = raw.trim().chars().take(300).collect();
+                p.message = if p.message.is_empty() {
+                    msg
+                } else {
+                    format!("{}: {msg}", p.message)
+                };
+            }
+        } else if let Some(c) = tsc.captures(raw) {
             problems.push(Problem {
                 file: relative(root, &c[1]),
                 line: at(&c, 2),
@@ -181,6 +220,63 @@ fn signature(p: &Problem) -> String {
         .collect()
 }
 
+const DOOR_FILES: [&str; 2] = ["src/proxy.ts", "src/lib/door.ts"];
+const DOOR_HASH: &str = ".lightbulb/door.sha256";
+
+/// Hash of the door files as they are now; none when one is missing.
+pub(crate) fn door_hash(root: &Path) -> Option<String> {
+    let mut h = Sha256::new();
+    for f in DOOR_FILES {
+        h.update(std::fs::read(root.join(f)).ok()?);
+    }
+    Some(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Records the door files as the starter shipped them (`app new`).
+pub(crate) fn record_door(root: &Path) -> std::io::Result<()> {
+    match door_hash(root) {
+        Some(h) => std::fs::write(root.join(DOOR_HASH), h),
+        None => Ok(()),
+    }
+}
+
+/// A problem when the door files differ from the recorded hash. Apps made before the hash was
+/// recorded have none, and are never failed.
+fn door_problem(root: &Path) -> Option<Problem> {
+    let want = std::fs::read_to_string(root.join(DOOR_HASH)).ok()?;
+    (door_hash(root).as_deref() != Some(want.trim())).then(|| Problem {
+        file: DOOR_FILES[0].into(),
+        line: 1,
+        column: None,
+        code: Some("door".into()),
+        message: "src/proxy.ts or src/lib/door.ts was changed. They decide who can open the app; \
+            restore them with: git checkout $(git rev-list --max-parents=0 HEAD) -- src/proxy.ts src/lib/door.ts"
+            .into(),
+    })
+}
+
+/// Counts a failed build of `up` in `progress.json` (`build_failures`), apart from the local
+/// problems so a passing check does not clear it; a ready build clears it. Returns the step to
+/// tell the builder once it has failed twice or more.
+pub(crate) fn count_build(
+    root: &Path,
+    failed: bool,
+) -> std::result::Result<Option<&'static str>, ApiError> {
+    let mut progress = read_progress(root)?;
+    let n = if failed {
+        progress["build_failures"].as_u64().unwrap_or(0) + 1
+    } else {
+        0
+    };
+    progress["build_failures"] = n.into();
+    write_progress(root, &progress)?;
+    Ok(match n {
+        0 | 1 => None,
+        2 => Some(DIAGNOSE),
+        _ => Some(UNDO),
+    })
+}
+
 /// Runs the check in `root`, updates `.lightbulb/progress.json` and returns what to do next.
 /// Prints nothing.
 pub(crate) fn run_check(root: &Path, publish: bool) -> std::result::Result<CheckResult, ApiError> {
@@ -208,7 +304,7 @@ pub(crate) fn run_check(root: &Path, publish: bool) -> std::result::Result<Check
                 ApiError::new("check_failed", &format!("Could not run pnpm: {e}"), "try again")
             }
         })?;
-    let ok = out.status.success();
+    let mut ok = out.status.success();
     let text = format!(
         "{}\n{}",
         String::from_utf8_lossy(&out.stdout),
@@ -229,6 +325,10 @@ pub(crate) fn run_check(root: &Path, publish: bool) -> std::result::Result<Check
                 .trim()
                 .into(),
         });
+    }
+    if let Some(p) = door_problem(root) {
+        ok = false;
+        problems.push(p);
     }
     let next = update_progress(root, ok, publish, &problems)?;
     Ok(CheckResult { ok, problems, next })
@@ -326,5 +426,22 @@ pub fn check(publish: bool, json: bool) -> Result<i32> {
             }
             Ok(if r.ok { 0 } else { 1 })
         }
+    }
+}
+
+#[cfg(test)]
+mod vitest_tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_test_names_itself() {
+        let out = " FAIL  src/a.test.ts > math > adds\nAssertionError: expected 1 to be 2\n \u{276f} src/a.test.ts:5:20\n\n\u{23af}\u{23af}\u{23af} Failed Tests 1 \u{23af}\u{23af}\u{23af}\n\n FAIL  src/a.test.ts > math > adds\nAssertionError: expected 1 to be 2\n";
+        let p = parse(out, Path::new("/x"));
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].file, "src/a.test.ts");
+        assert_eq!(
+            p[0].message,
+            "math > adds: AssertionError: expected 1 to be 2"
+        );
     }
 }

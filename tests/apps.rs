@@ -2466,3 +2466,48 @@ fn new_without_git_fails_with_a_next() {
         "install git, delete team-lunch, then run lightbulb app new again"
     );
 }
+
+#[test]
+fn failed_builds_are_counted_and_only_a_ready_build_clears_them() {
+    let c = Checked::new();
+    let failed = || {
+        ship_stub(json!({"app_id": "a-1", "state": "failed",
+            "error": {"code": "build", "message": "it broke", "next": "fix the build"}}))
+        .0
+    };
+    let next = |c: &Checked| c.app(&["up"], &failed(), true).1["next"].clone();
+    assert_eq!(next(&c), "fix the build");
+    // A passing local check does not clear the count.
+    c.check("design.txt", 0, &[]);
+    // The backend's own step stays first; the diagnose or undo step follows it.
+    assert!(next(&c)
+        .as_str()
+        .unwrap()
+        .starts_with("fix the build diagnose"));
+    assert!(next(&c).as_str().unwrap().starts_with("fix the build undo"));
+    assert_eq!(c.progress()["build_failures"], 3);
+    let (base, _) = ship_stub(json!({"app_id": "a-1", "state": "ready"}));
+    c.app(&["up"], &base, true);
+    assert_eq!(c.progress()["build_failures"], 0);
+}
+
+#[test]
+fn changed_door_files_fail_the_check_unless_no_hash_was_recorded() {
+    let c = Checked::new();
+    assert_eq!(c.check("design.txt", 0, &[]).0, 0);
+    let proxy = c.dir.join("src/proxy.ts");
+    let original = std::fs::read_to_string(&proxy).unwrap();
+    std::fs::write(&proxy, format!("{original}\n// open to all\n")).unwrap();
+    let (code, v) = c.check("design.txt", 0, &[]);
+    assert_eq!((code, &v["problems"][0]["code"]), (1, &json!("door")));
+    assert!(v["problems"][0]["message"]
+        .as_str()
+        .unwrap()
+        .contains("git checkout"));
+    // An app from an older starter has no hash and is not failed.
+    std::fs::remove_file(c.dir.join(".lightbulb/door.sha256")).unwrap();
+    assert_eq!(c.check("design.txt", 0, &[]).0, 0);
+    // Restored, with the hash back: passes.
+    std::fs::write(&proxy, original).unwrap();
+    assert_eq!(c.check("design.txt", 0, &[]).0, 0);
+}
