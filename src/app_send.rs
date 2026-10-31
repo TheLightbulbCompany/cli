@@ -4,7 +4,8 @@
 //! <First name>"`): an ordinary send of the member's, which its recipient reads as that title
 //! (`label`). `person` is the opaque key the bridge passes. No computer is asked.
 //!
-//! `app.send {app, person, to, text, request_id, reply_to?}` -> the receipt with the message's
+//! `app.send {app, person, to, text, request_id, reply_to?, kind?, done_when?, deadline_s?, ..}` (a
+//! send may be an assignment, a result or a cancel like a session's) -> the receipt with the message's
 //! `id` (a `request_id` sent before answers its first receipt and sends nothing);
 //! `app.inbox {app, person}` -> `{records}`, taken and read; with `peek: true` they are left
 //! as they are (delivered-unread, then waiting) until `app.ack {app, person, ids}` -> `{acked}`

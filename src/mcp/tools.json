@@ -14,7 +14,7 @@
   {
     "name": "send_message",
     "scope": "network",
-    "description": "Sends text to exactly one of: session_id (a coding session from find_sessions, on this computer or a teammate's, sent peer to peer), room_id (a channel or DM from find_rooms) or person_id (a workspace member's id; opens your DM with them if needed). reply_to (the request_id of a message you got from check_inbox) answers that message; reply_to alone replies to whoever sent it. A room or person send may reply in a thread (reply_to_message_id) and mention room members (mention_ids); a session send takes neither. request_id: a new [A-Za-z0-9._-]{1,128} string; reuse it only to retry that same send. Returns its receipt; its note says where the message waits.",
+    "description": "Sends text to exactly one of: session_id (a coding session from find_sessions, on this computer or a teammate's, sent peer to peer), room_id (a channel or DM from find_rooms) or person_id (a workspace member's id; opens your DM with them if needed). reply_to (the request_id of a message you got from check_inbox) answers that message; reply_to alone replies to whoever sent it. A room or person send may reply in a thread (reply_to_message_id) and mention room members (mention_ids); a session send takes neither. request_id: a new [A-Za-z0-9._-]{1,128} string; reuse it only to retry that same send. Returns its receipt; its note says where the message waits. Answering an assignment (reply_to its request_id) makes your reply its result; add status if it is not done.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -25,7 +25,8 @@
         "room_id": {"type": "string", "description": "A room id from find_rooms."},
         "person_id": {"type": "string", "description": "A workspace member's id."},
         "reply_to_message_id": {"type": "string", "description": "A room send: the id of the message (from read_messages) this replies to in its thread."},
-        "mention_ids": {"type": "array", "items": {"type": "string"}, "description": "A room send: the ids of the room members it mentions."}
+        "mention_ids": {"type": "array", "items": {"type": "string"}, "description": "A room send: the ids of the room members it mentions."},
+        "status": {"type": "string", "enum": ["done", "failed", "cancelled"], "description": "Only when answering an assignment: how it ended. Absent means done."}
       },
       "required": ["request_id", "text"]
     }
@@ -51,6 +52,50 @@
       "properties": {
         "wait_secs": {"type": "integer", "minimum": 0, "maximum": 600, "description": "Wait up to this many seconds for a message to arrive."}
       }
+    }
+  },
+  {
+    "name": "find_workers",
+    "scope": "network",
+    "description": "The agents that take an assignment: always-on agents (workspace agents and connected apps) now; computers that start fresh workers once they opt in. Pass one's session_id to assign.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": {"type": "string", "description": "Text to find (case-insensitive) in a worker's id, agent, folder, repo, branch, title, task, person or computer. Empty lists all."},
+        "limit": {"type": "integer", "minimum": 1, "description": "At most this many workers."}
+      }
+    }
+  },
+  {
+    "name": "assign",
+    "scope": "network",
+    "description": "Hands a job to one agent: to is a session_id from find_sessions or find_workers. brief says what to do, done_when says what finished looks like, deadline_s (default 3600, at most 14400) bounds it. The reply is the result: it arrives in check_inbox as kind \"result\" with a status, and message_receipt shows it under result. request_id: a new [A-Za-z0-9._-]{1,128} string.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "request_id": {"type": "string", "description": "A new [A-Za-z0-9._-]{1,128} string; reuse it only to retry this assignment."},
+        "to": {"type": "string", "description": "A session_id from find_sessions or find_workers."},
+        "brief": {"type": "string", "description": "What to do."},
+        "done_when": {"type": "string", "description": "What finished looks like."},
+        "deadline_s": {"type": "integer", "minimum": 1, "maximum": 14400, "description": "Seconds the job may take (default 3600)."},
+        "repo": {"type": "string", "description": "The repository the job is in, if any."},
+        "branch": {"type": "string", "description": "The branch to work on, if any."}
+      },
+      "required": ["request_id", "to", "brief", "done_when"]
+    }
+  },
+  {
+    "name": "cancel_assignment",
+    "scope": "network",
+    "description": "Cancels an assignment you sent, by its request_id. The agent is told to stop and reply with status \"cancelled\". request_id: a new id for this cancel.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "assignment": {"type": "string", "description": "The request_id of the assignment you sent."},
+        "request_id": {"type": "string", "description": "A new id for this cancel; reuse it only to retry."},
+        "note": {"type": "string", "description": "Why, if worth saying."}
+      },
+      "required": ["assignment", "request_id"]
     }
   },
   {

@@ -88,6 +88,21 @@ fn spec() -> &'static [Value] {
     SPEC.get_or_init(|| serde_json::from_str(TOOLS).expect("tools.json is a list"))
 }
 
+/// The assignment tools: listed (and callable) only while `network_workers` is on.
+const WORKER_TOOLS: [&str; 3] = ["find_workers", "assign", "cancel_assignment"];
+
+/// Whether tool `t` is listed: an assignment tool only while `workers` (this computer's
+/// `network_workers`), a workspace tool only while `workspace` (signed in).
+fn listed(t: &Value, workspace: bool, workers: bool) -> bool {
+    let assignment = WORKER_TOOLS.iter().any(|n| t["name"] == *n);
+    (workspace || t["scope"] == "network") && (workers || !assignment)
+}
+
+/// This computer's `network_workers` setting.
+fn workers_on() -> bool {
+    crate::config::Config::load(&paths::state_path()).is_ok_and(|c| c.network_workers)
+}
+
 /// Whether this computer has a sign-in that has not ended: the workspace tools exist only then.
 fn signed_in() -> bool {
     let dir = paths::state_path();
@@ -116,6 +131,25 @@ struct SendArgs {
     person_id: Option<String>,
     reply_to_message_id: Option<String>,
     mention_ids: Option<Vec<String>>,
+    status: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AssignArgs {
+    request_id: String,
+    to: String,
+    brief: String,
+    done_when: String,
+    deadline_s: Option<u64>,
+    repo: Option<String>,
+    branch: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CancelArgs {
+    assignment: String,
+    request_id: String,
+    note: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -123,14 +157,43 @@ struct ReceiptArgs {
     request_id: String,
 }
 
-/// The longest one `check_inbox` call waits: clients such as Codex time a tool out at 60 s.
-const WAIT_CAP_S: u32 = 30;
+/// The longest one `check_inbox` call waits. Codex times a tool call out at 60 s, so a Codex
+/// session's wait is held to `CODEX_WAIT_CAP_S` whatever it asks for.
+const WAIT_CAP_S: u32 = 600;
+const CODEX_WAIT_CAP_S: u32 = 55;
 
 #[derive(Deserialize)]
 struct InboxArgs {
     /// Accepts up to 600, but one call waits at most `WAIT_CAP_S`.
     #[serde(default)]
     wait_secs: u32,
+}
+
+/// The rows of a directory listing that take assignments: first the worker hosts (a row with
+/// `kind` `worker`, online, `always_on: false`, with `free` and `folder`), then the always-on
+/// agents: online, at a name address (`<member>/<name>`, never a terminal or a coding
+/// session), marked `always_on`.
+fn always_on(short: &str, sessions: Vec<Value>) -> Vec<Value> {
+    let (hosts, rest): (Vec<Value>, Vec<Value>) = (sessions.into_iter())
+        .filter(|s| s["online"] == true)
+        .partition(|s| s["kind"] == "worker");
+    let named = rest.into_iter().filter(|s| {
+        s["session_id"].as_str().is_some_and(|id| {
+            matches!(
+                crate::frame::Sender::of(short, id),
+                crate::frame::Sender::Name(_)
+            )
+        })
+    });
+    hosts
+        .into_iter()
+        .map(|s| (s, false))
+        .chain(named.map(|s| (s, true)))
+        .map(|(mut s, on)| {
+            s["always_on"] = on.into();
+            s
+        })
+        .collect()
 }
 
 /// The calling session, resolved, and every live session as the daemon sees them.
@@ -549,7 +612,9 @@ pub(crate) fn proof_headers(
 impl Server {
     /// `tool`, called with `args` for the session `meta` names.
     async fn call(&self, name: &str, args: Value, meta: RequestMetaObject) -> CallToolResult {
-        let Some(tool) = spec().iter().find(|t| t["name"] == name) else {
+        // A hidden assignment tool is as unknown as any other name.
+        let hidden = WORKER_TOOLS.contains(&name) && !workers_on();
+        let Some(tool) = spec().iter().find(|t| t["name"] == name && !hidden) else {
             return code("unknown_tool");
         };
         let call = match self.source(meta).await {
@@ -569,6 +634,18 @@ impl Server {
             },
             "send_message" => match parse(args) {
                 Ok(a) => self.send_message(call, a).await,
+                Err(e) => e,
+            },
+            "find_workers" => match parse(args) {
+                Ok(a) => self.find_workers(call, a).await,
+                Err(e) => e,
+            },
+            "assign" => match parse(args) {
+                Ok(a) => self.assign(call, a).await,
+                Err(e) => e,
+            },
+            "cancel_assignment" => match parse(args) {
+                Ok(a) => self.cancel_assignment(call, a).await,
                 Err(e) => e,
             },
             "recall" | "remember" => self.memory(call, name, args).await,
@@ -761,14 +838,66 @@ impl Server {
         let r = ask(
             "send",
             json!({ "from": call.from, "to": a.session_id, "text": a.text,
-                "request_id": a.request_id, "reply_to": a.reply_to, "wait": true }),
+                "request_id": a.request_id, "reply_to": a.reply_to, "wait": true,
+                "kind": a.status.is_some().then_some("result"), "status": a.status }),
         )
         .await;
+        Self::sent(&call, r).await
+    }
+
+    /// The tool result for the daemon's answer to a `send`.
+    async fn sent(call: &Call, r: Result<Value, impl std::fmt::Display>) -> CallToolResult {
         match r {
-            Ok(r) if r["ok"] == true => Self::done(&call, with_note(r["receipt"].clone())).await,
+            Ok(r) if r["ok"] == true => Self::done(call, with_note(r["receipt"].clone())).await,
             Ok(r) => refused(r),
             Err(e) => fail(internal(e)),
         }
+    }
+
+    /// Hands a job to one agent; the daemon checks the deadline and the rest.
+    async fn assign(&self, call: Call, a: AssignArgs) -> CallToolResult {
+        let r = ask(
+            "send",
+            json!({ "from": call.from, "to": a.to, "text": a.brief, "request_id": a.request_id,
+                "kind": "assign", "done_when": a.done_when, "deadline_s": a.deadline_s,
+                "repo": a.repo, "branch": a.branch, "wait": true }),
+        )
+        .await;
+        Self::sent(&call, r).await
+    }
+
+    /// Cancels an assignment of the caller's: the daemon addresses its target.
+    async fn cancel_assignment(&self, call: Call, a: CancelArgs) -> CallToolResult {
+        let r = ask(
+            "send",
+            json!({ "from": call.from, "reply_to": a.assignment,
+                "text": a.note.unwrap_or_else(|| "cancelled".into()),
+                "request_id": a.request_id, "kind": "cancel", "wait": true }),
+        )
+        .await;
+        Self::sent(&call, r).await
+    }
+
+    /// The always-on agents: online sessions with a name address (not a terminal).
+    async fn find_workers(&self, call: Call, a: FindArgs) -> CallToolResult {
+        let short = match ask("status", json!({})).await {
+            Ok(s) => s["member_key_short"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            Err(e) => return fail(internal(e)),
+        };
+        let r = match ask("directory", json!({ "query": a.query })).await {
+            Ok(r) => r,
+            Err(e) => return fail(internal(e)),
+        };
+        let found = always_on(
+            &short,
+            r["sessions"].as_array().cloned().unwrap_or_default(),
+        );
+        let total = found.len();
+        let sessions: Vec<Value> = found.into_iter().take(a.limit as usize).collect();
+        Self::done(&call, json!({ "sessions": sessions, "total": total })).await
     }
 
     /// A room or person send: the person's DM opened first when needed (Lightbulb finds an
@@ -854,9 +983,14 @@ impl Server {
         if a.wait_secs > 600 {
             return code("bad_request");
         }
+        let member = crate::sessions::member_of(&call.from.0).unwrap_or_default();
+        let cap = match crate::frame::Sender::of(member, &call.from.0) {
+            crate::frame::Sender::Agent("codex") => CODEX_WAIT_CAP_S,
+            _ => WAIT_CAP_S,
+        };
         let r = ask(
             "inbox",
-            json!({ "key": call.from, "wait_secs": a.wait_secs.min(WAIT_CAP_S),
+            json!({ "key": call.from, "wait_secs": a.wait_secs.min(cap),
                 "caller": hook::proc_json(&call.me) }),
         )
         .await;
@@ -892,7 +1026,8 @@ impl ServerHandler for Server {
         .with_instructions(INSTRUCTIONS.to_string())
     }
 
-    /// The network tools, and the workspace tools while this computer is signed in.
+    /// The network tools (the assignment ones while `network_workers` is on), and the
+    /// workspace tools while this computer is signed in.
     async fn list_tools(
         &self,
         _: Option<PaginatedRequestParams>,
@@ -900,9 +1035,10 @@ impl ServerHandler for Server {
     ) -> Result<ListToolsResult, ErrorData> {
         let workspace = signed_in();
         self.signed.store(workspace, Ordering::SeqCst);
+        let workers = workers_on();
         let tools: Vec<Value> = spec()
             .iter()
-            .filter(|t| workspace || t["scope"] == "network")
+            .filter(|t| listed(t, workspace, workers))
             .map(|t| {
                 json!({"name": t["name"], "description": t["description"],
                     "inputSchema": t["inputSchema"]})
@@ -929,6 +1065,39 @@ const INSTRUCTIONS: &str = "These tools message the other coding sessions (Claud
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn always_on_keeps_online_name_rows_only() {
+        let rows = vec![
+            json!({"session_id": "abc/friday", "online": true}),
+            json!({"session_id": "abc/claude:1", "online": true}),
+            json!({"session_id": "abc/sleepy", "online": false}),
+            json!({"session_id": "abc/terminal", "online": true}),
+        ];
+        assert_eq!(
+            always_on("abc", rows),
+            vec![json!({"session_id": "abc/friday", "online": true, "always_on": true})]
+        );
+    }
+
+    #[test]
+    fn find_workers_lists_worker_hosts_then_always_on_agents() {
+        let rows = vec![
+            json!({"session_id": "abc/friday", "online": true}),
+            json!({"session_id": "abc/claude:1", "online": true}),
+            json!({"session_id": "abc/claude:new", "online": true, "kind": "worker",
+                "free": 2, "folder": "lightbulb-work"}),
+        ];
+        let got = always_on("abc", rows);
+        assert_eq!(
+            got,
+            vec![
+                json!({"session_id": "abc/claude:new", "online": true, "kind": "worker",
+                    "free": 2, "folder": "lightbulb-work", "always_on": false}),
+                json!({"session_id": "abc/friday", "online": true, "always_on": true}),
+            ]
+        );
+    }
 
     #[test]
     fn git_reads_origin_repo_and_branch_also_from_a_linked_worktree() {

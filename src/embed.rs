@@ -239,6 +239,7 @@ pub(crate) async fn boot(
         built: Mutex::default(),
         latest: Mutex::new(latest),
         streams: Default::default(),
+        workers: Default::default(),
         cloud: cloud.map(|name| {
             let c = Cloud::new(name);
             if !declared.is_empty() || members.is_some() || !revoked.is_empty() {

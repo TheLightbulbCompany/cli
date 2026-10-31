@@ -52,6 +52,7 @@ fn envelope(id: &str, rid: &str, from: &str, to: &str, body: &str) -> Frame {
         body: body.into(),
         files: vec![],
         sent_at: 0,
+        meta: Default::default(),
     }
 }
 
@@ -737,4 +738,128 @@ async fn leave_reaches_a_peer_or_warns_after_5s() {
         "{}",
         out(&o)
     );
+}
+
+/// Registers `<short>/<provider>:<conv>` on `e`, this test process standing in for its agent:
+/// its key.
+fn register(e: &Env, provider: &str, conv: &str) -> String {
+    let me = lightbulb::os::process(std::process::id()).unwrap();
+    let r = e.ask(
+        json!({"id": 1, "op": "register", "session": {"provider": provider,
+        "conversation": conv, "pid": me.pid, "birth_micros": me.birth_micros, "cwd": "/tmp"}}),
+    );
+    r["key"].as_str().unwrap().to_string()
+}
+
+/// `config.toml`'s line for network workers on (assignments are `unsupported` without).
+const ON: &str = "network_workers = true\n";
+
+/// Two computers of one team, running with configs `a_config` and `b_config`.
+fn workers_pair(a_config: &str, b_config: &str) -> (Env, Env) {
+    let (a, b) = (Env::new(), Env::new());
+    seed_pair(&a, &b);
+    b.daemon(false, b_config, &[]);
+    a.daemon(false, a_config, &[peers(&[&b])]);
+    until(10, "both online", || {
+        a.status()["peers"]["online"] == 1 && b.status()["peers"]["online"] == 1
+    });
+    (a, b)
+}
+
+/// Network workers on at A but off at B (its default): B answers A's assignment
+/// `unsupported`, before anything is stored, whether to a session or a fresh worker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_peer_assign_is_unsupported_where_network_workers_is_off() {
+    let (a, b) = workers_pair(ON, "workers_offer = \"claude\"\n");
+    let asker = session(&a, "a1");
+    let worker = register(&b, "claude", "w1");
+    let new = format!("{}/claude:new", b.short());
+    for (rid, to) in [("as1", worker.clone()), ("as2", new)] {
+        let r = a.ask(
+            json!({"id": 1, "op": "send", "from": asker, "to": to, "kind": "assign",
+            "text": "fix it", "done_when": "green", "deadline_s": 300, "request_id": rid}),
+        );
+        assert_eq!(r["ok"], true, "{r}");
+        wait_state(&a, &asker, rid, "refused");
+        assert_eq!(a.receipt(&asker, rid)["reason"], "unsupported", "{rid}");
+    }
+    assert_eq!(b.unread(&worker), 0);
+    assert!(person(&b, json!({"id": 1, "op": "holds"}))["holds"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_assignment_crosses_the_wire_and_its_result_comes_back() {
+    let (a, b) = workers_pair(ON, ON);
+    let asker = session(&a, "a1");
+    let worker = register(&b, "claude", "w1");
+    let r = a.ask(
+        json!({"id": 1, "op": "send", "from": asker, "to": worker, "kind": "assign",
+        "text": "fix the build", "done_when": "green", "deadline_s": 300, "request_id": "as1"}),
+    );
+    assert_eq!(r["ok"], true, "{r}");
+    wait_state(&a, &asker, "as1", "stored");
+
+    let m = b.take_one(&worker);
+    assert_eq!(m["kind"], "assign", "{m}");
+    assert_eq!(m["done_when"], "green", "{m}");
+    assert!(
+        m["framed"]
+            .as_str()
+            .unwrap()
+            .starts_with("[Lightbulb assignment from "),
+        "{m}"
+    );
+
+    b.send(&worker, &asker, "all green", "re1", Some("as1"));
+    let mut got = vec![];
+    until(10, "the result reaches the asker", || {
+        got = a.inbox(&asker);
+        !got.is_empty()
+    });
+    assert_eq!(
+        (got[0]["kind"].as_str(), got[0]["status"].as_str()),
+        (Some("result"), Some("done")),
+        "{:?}",
+        got[0]
+    );
+    until(10, "as1 receipt names its result", || {
+        a.receipt(&asker, "as1")["result"]["status"] == "done"
+    });
+
+    let new = format!("{}/claude:new", b.short());
+    let r = a.ask(
+        json!({"id": 1, "op": "send", "from": asker, "to": new, "kind": "assign",
+        "text": "start fresh", "done_when": "green", "deadline_s": 300, "request_id": "as2"}),
+    );
+    assert_eq!(r["ok"], true, "{r}");
+    wait_state(&a, &asker, "as2", "refused");
+    assert_eq!(a.receipt(&asker, "as2")["reason"], "no_worker");
+}
+
+/// B offers claude and has no standing word for A, so A's assignment to `<B>/claude:new` is
+/// held: A's receipt says so, and B's person sees a worker-start hold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_peer_assign_to_a_worker_address_is_held_and_the_receipt_says_so() {
+    let (a, b) = (Env::new(), Env::new());
+    seed_pair(&a, &b);
+    b.daemon(false, &format!("{ON}workers_offer = \"claude\"\n"), &[]);
+    a.daemon(false, ON, &[peers(&[&b])]);
+    until(10, "both online", || {
+        a.status()["peers"]["online"] == 1 && b.status()["peers"]["online"] == 1
+    });
+    let asker = session(&a, "a1");
+    let new = format!("{}/claude:new", b.short());
+    let r = a.ask(
+        json!({"id": 1, "op": "send", "from": asker, "to": new, "kind": "assign",
+        "text": "start fresh", "done_when": "green", "deadline_s": 300, "request_id": "as1"}),
+    );
+    assert_eq!(r["ok"], true, "{r}");
+    wait_state(&a, &asker, "as1", "held");
+    let holds = person(&b, json!({"id": 1, "op": "holds"}));
+    let list = holds["holds"].as_array().unwrap();
+    assert_eq!(list.len(), 1, "{holds}");
+    assert_eq!(list[0]["kind"], "worker", "{holds}");
 }

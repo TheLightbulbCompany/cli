@@ -752,3 +752,56 @@ async fn a_group_send_reaches_a_teammates_sessions() {
         common::err(&o)
     );
 }
+
+#[test]
+fn a_worker_host_is_listed_by_its_teammate_with_free_slots() {
+    let (a, b) = (Env::new(), Env::new());
+    seed_pair(&a, &b);
+    let key = format!("{}/claude:new", b.short());
+    let config =
+        "computer = \"mbp\"\nnetwork_workers = true\nworkers_offer = \"claude\"\nworkers_max = 2\n";
+    b.daemon(false, config, &[]);
+    // One worker running before A connects.
+    b.store()
+        .insert_worker(&lightbulb::store::Worker {
+            id: 0,
+            assignment: "as1".into(),
+            session: format!("{}/claude:w1", b.short()),
+            provider: "claude".into(),
+            folder: "/tmp/w1".into(),
+            pid: None,
+            started_at: 1,
+            ended_at: None,
+            state: "running".into(),
+            by: None,
+        })
+        .unwrap();
+    a.daemon(false, "", &[common::peers(&[&b])]);
+    let row = |e: &Env| {
+        directory(e, None)
+            .into_iter()
+            .find(|r| r["session_id"] == key.as_str())
+    };
+    until(15, "A lists B's worker host", || row(&a).is_some());
+    let r = row(&a).unwrap();
+    assert_eq!(r["free"], 1, "{r}");
+    assert_eq!(
+        (&r["kind"], &r["agent"], &r["status"]),
+        (&json!("worker"), &json!("claude"), &json!("idle")),
+        "{r}"
+    );
+    assert_eq!(r["cwd"], "", "{r}");
+
+    // `network_workers` turned off and reloaded: the row goes; back on, it comes back.
+    let set = |k: &str, v: &str| {
+        lightbulb::config::Config::set(b.state.path(), k, v).unwrap();
+        assert_eq!(b.ask(json!({"id": 1, "op": "reload"}))["ok"], true);
+    };
+    set("network_workers", "false");
+    until(15, "the host row is gone", || row(&a).is_none());
+    set("network_workers", "true");
+    until(15, "the host row is back", || row(&a).is_some());
+    // `workers_offer` cleared and reloaded: the row goes.
+    set("workers_offer", "");
+    until(15, "the host row is gone", || row(&a).is_none());
+}

@@ -6,16 +6,19 @@
 use crate::admission::NOT_OPEN;
 use crate::daemon::ipc::{self, refused, Caller, Response, BAD_REQUEST, INTERNAL, NOT_FOUND};
 use crate::daemon::Daemon;
-use crate::frame::{agent_name, defang, Sender};
+use crate::daemon::TeamState;
+use crate::frame::{agent_name, preview, preview_long, Sender};
 use crate::identity::Identity;
 use crate::mail::{self, State};
 use crate::roster::Roster;
 use crate::sessions;
 use crate::store::{row_message, Message, Store};
+use crate::workers;
 use crate::{dialog, label, Result};
 use rusqlite::params;
 use serde::Serialize;
 use serde_json::{json, Value};
+use std::path::Path;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -23,6 +26,8 @@ use std::sync::Arc;
 pub enum Kind {
     Message,
     Permission,
+    /// A worker-start hold: its message is an `assign` to `<member>/<provider>:new`.
+    Worker,
 }
 
 impl Kind {
@@ -30,6 +35,7 @@ impl Kind {
         match self {
             Kind::Message => "message",
             Kind::Permission => "permission",
+            Kind::Worker => "worker",
         }
     }
 }
@@ -38,6 +44,13 @@ impl Kind {
 pub const PERMISSION_S: i64 = 600;
 pub const ALLOW: &str = "allow";
 pub const DECLINE: &str = "decline";
+/// An agent tried to answer a hold only a person answers.
+pub const NOT_A_PERSON: &str = "not_a_person";
+
+/// Whether `session` is a running network worker (a `workers` row not yet ended).
+pub fn is_workers(store: &Store, session: &str) -> bool {
+    matches!(store.worker_by_session(session), Ok(Some(w)) if w.ended_at.is_none())
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Hold {
@@ -61,6 +74,7 @@ impl Hold {
     pub fn kind(&self) -> Kind {
         match self.message.kind.as_str() {
             "permission" => Kind::Permission,
+            "assign" => Kind::Worker,
             _ => Kind::Message,
         }
     }
@@ -71,7 +85,7 @@ impl Hold {
 }
 
 /// The `holds` row for `message` (from its sender to its recipient), from `member`.
-fn insert(store: &Store, message: Message, member: &str, now: i64) -> Result<Hold> {
+pub fn insert(store: &Store, message: Message, member: &str, now: i64) -> Result<Hold> {
     store.conn().execute(
         "INSERT INTO holds (message_id, target_session, from_session, from_member, created_at, \
          state) VALUES (?1, ?2, ?3, ?4, ?5, 'open')",
@@ -104,6 +118,8 @@ pub fn file_permission(store: &Store, session: &str, prompt: &str, now: i64) -> 
         origin: Some("permission".into()),
         body: prompt.into(),
         sent_at: now,
+        reply_to: None,
+        meta: Default::default(),
     };
     let tx = store.conn().unchecked_transaction()?;
     store.put_message(&m)?;
@@ -161,20 +177,6 @@ pub fn open(store: &Store) -> Result<Vec<Hold>> {
     Ok(open_rows(store)?.into_iter().map(|(h, _)| h).collect())
 }
 
-/// The first 160 characters of `text` as one printable, defanged line: what cannot be shown
-/// goes first, so nothing hidden can shield a forged prefix from `defang`.
-fn preview(text: &str) -> String {
-    let shown: String = text
-        .chars()
-        .filter(|c| matches!(c, '\n' | '\t') || label::printable(*c))
-        .collect();
-    defang(&shown)
-        .chars()
-        .map(|c| if matches!(c, '\n' | '\t') { ' ' } else { c })
-        .take(160)
-        .collect()
-}
-
 /// `session`'s agent as the person reads it: `Claude Code`, `desk mailbox`, `terminal`.
 fn agent(session: &str) -> String {
     let member = sessions::member_of(session).unwrap_or_default();
@@ -185,9 +187,62 @@ fn agent(session: &str) -> String {
     }
 }
 
-/// `h`'s dialog: its text, its buttons and the asking session's label in it.
-pub fn dialog(roster: &Roster, me: &str, h: &Hold) -> (String, Vec<&'static str>, String) {
+/// `h`'s dialog: its text, its buttons and the asking session's label in it. `folder` is
+/// where workers run (`workers::folder`).
+pub fn dialog(
+    store: &Store,
+    roster: &Roster,
+    me: &str,
+    h: &Hold,
+    folder: &Path,
+) -> (String, Vec<&'static str>, String) {
     let who = label::render(roster, me, &h.from_session);
+    let worker = (h.kind() == Kind::Permission)
+        .then(|| store.worker_by_session(&h.target_session).ok().flatten())
+        .flatten()
+        .filter(|w| w.ended_at.is_none());
+    if h.kind() == Kind::Worker {
+        let to = &h.message.to_key;
+        let provider = sessions::split_addr(to)
+            .and_then(|(_, p)| p.split(':').next())
+            .unwrap_or_default();
+        let dir = workers::dir_for(folder, &h.message.id);
+        let asker = sessions::member_of(&h.from_session)
+            .and_then(|m| roster.by_short(m))
+            .map_or_else(|| "the asker".into(), label::name);
+        let name = agent_name(provider);
+        let a = if name.starts_with(['A', 'E', 'I', 'O', 'U']) {
+            "an"
+        } else {
+            "a"
+        };
+        let text = format!(
+            "{who} wants to start {a} {name} worker in {}: \"{}\". Always allow lets {asker}'s \
+             computer start workers here without asking.",
+            dir.display(),
+            preview(&h.message.body)
+        );
+        return (text, vec!["Decline", "Allow", "Always allow"], who);
+    }
+    if let Some(w) = worker {
+        let asker = match store.message(&w.assignment) {
+            Ok(Some(a)) => label::render(roster, me, &a.from_key),
+            _ => "a worker".into(),
+        };
+        let handle = store
+            .session(&w.session)
+            .ok()
+            .flatten()
+            .and_then(|s| s.handle)
+            .unwrap_or_else(|| w.session.clone());
+        let text = format!(
+            "worker {handle} ({}) for {asker} in {} wants to: {}",
+            w.provider,
+            w.folder.display(),
+            preview_long(&h.message.body)
+        );
+        return (text, vec!["Decline", "Allow", "Stop worker"], who);
+    }
     let text = format!(
         "{} asks: \"{}\"",
         agent(&h.target_session),
@@ -213,29 +268,45 @@ impl Closed {
     }
 }
 
-/// The person's answer to permission hold `id` (`by` `local` or `bridge`): `Err(not_found)`,
-/// `Err(not_open)` once answered or expired. A signed `approvals` record keeps the text the
-/// dialog showed.
+/// The answer to permission or worker hold `id` (`by` `local`, `bridge` or an agent's session):
+/// `Err(not_found)`, `Err(not_open)` once answered or expired (a worker hold at its
+/// assignment's deadline too), `Err(not_a_person)` when `by_agent` (an agent answers) a worker hold or a
+/// worker's prompt, `Err(bad_request)` for scope `always` on anything but an Allow of a worker
+/// hold (which also records the asker's standing policy). A signed `approvals` record keeps
+/// the text the dialog showed.
+#[allow(clippy::too_many_arguments)]
 pub fn answer(
     store: &Store,
     roster: &Roster,
     me: &Identity,
+    folder: &Path,
     id: i64,
     allow: bool,
+    scope: &str,
     by: &str,
+    by_agent: bool,
     now: i64,
 ) -> Result<std::result::Result<Closed, &'static str>> {
     let Some(h) = get(store, id)? else {
         return Ok(Err(NOT_FOUND));
     };
     // (A message hold of an older build is not answerable; `expire` closes it.)
-    if !h.is_open() || h.kind() != Kind::Permission {
+    let kind = h.kind();
+    let late = kind == Kind::Worker && h.message.meta.deadline_at.is_some_and(|d| now >= d);
+    if !h.is_open() || kind == Kind::Message || late {
         return Ok(Err(NOT_OPEN));
+    }
+    let workers_own = kind == Kind::Worker || is_workers(store, &h.target_session);
+    if workers_own && by_agent {
+        return Ok(Err(NOT_A_PERSON));
+    }
+    if scope == "always" && !(allow && kind == Kind::Worker) {
+        return Ok(Err(BAD_REQUEST));
     }
     // The text the person saw; one never shown (no dialog yet) is what it would show now.
     let shown = match &h.shown {
         Some(t) => t.clone(),
-        None => dialog(roster, &me.key, &h).0,
+        None => dialog(store, roster, &me.key, &h, folder).0,
     };
     let c = Closed { hold: h, allow };
     let verdict = c.verdict();
@@ -245,16 +316,39 @@ pub fn answer(
         "UPDATE holds SET state = ?2 WHERE id = ?1",
         params![id, state],
     )?;
-    let nonce = ulid::Ulid::generate().to_string();
-    let mut record = json!({"hold": c.hold.name(), "verdict": verdict, "scope": "once",
-        "by": by, "nonce": nonce, "decided_at": now, "member": me.key, "text": shown});
-    record["sig"] = me.sign(&record).into();
+    let (nonce, record) = signed_record(
+        me,
+        json!({"hold": c.hold.name(), "verdict": verdict, "scope": scope,
+            "by": by, "decided_at": now, "member": me.key, "text": shown}),
+    );
     store.conn().execute(
         "INSERT INTO approvals VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![id, verdict, "once", by, nonce, now, record.to_string()],
+        params![id, verdict, scope, by, nonce, now, record],
     )?;
+    if scope == "always" {
+        workers::set_policy(store, me, &c.hold.from_member, "always", by, now)?;
+    }
+    // A worker-start hold's assignment is stored (to start) or refused.
+    if kind == Kind::Worker {
+        let m = &c.hold.message;
+        let (state, reason) = match allow {
+            true => (State::Stored, None),
+            false => (State::Refused, Some("declined")),
+        };
+        let (f, rid, at) = (&m.from_key, &m.request_id, now as u64);
+        mail::advance(store.conn(), f, rid, state, reason, None, at)?;
+    }
     tx.commit()?;
     Ok(Ok(c))
+}
+
+/// `fields` plus a fresh `nonce`, signed by `me`: the nonce and the record JSON an `approvals`
+/// row keeps.
+pub(crate) fn signed_record(me: &Identity, mut fields: serde_json::Value) -> (String, String) {
+    let nonce = ulid::Ulid::generate().to_string();
+    fields["nonce"] = nonce.clone().into();
+    fields["sig"] = me.sign(&fields).into();
+    (nonce, fields.to_string())
 }
 
 /// Closes the open holds past their time at `now`: a permission prompt whose session is gone or
@@ -265,11 +359,20 @@ pub fn expire(store: &Store, now: i64) -> Result<Vec<Hold>> {
     for (h, gone_since) in open_rows(store)? {
         // A message hold of an older build is closed at once: nothing answers it any more.
         let (due, reason) = match h.kind() {
+            // A worker's prompt waits for its person as long as the worker lives.
+            Kind::Permission if is_workers(store, &h.target_session) => {
+                (gone_since.is_some(), None)
+            }
             Kind::Permission => (
                 gone_since.is_some() || h.created_at <= now - PERMISSION_S,
                 None,
             ),
             Kind::Message => (true, Some("not_allowed")),
+            // Its target (`<m>/<p>:new`) never has a session row: only the deadline closes it.
+            Kind::Worker => (
+                h.message.meta.deadline_at.is_some_and(|d| now >= d),
+                Some("timed_out"),
+            ),
         };
         if !due {
             continue;
@@ -277,7 +380,7 @@ pub fn expire(store: &Store, now: i64) -> Result<Vec<Hold>> {
         store
             .conn()
             .execute("UPDATE holds SET state = 'expired' WHERE id = ?1", [h.id])?;
-        if h.kind() == Kind::Message {
+        if h.kind() != Kind::Permission {
             let m = &h.message;
             let (f, rid) = (&m.from_key, &m.request_id);
             mail::advance(
@@ -296,38 +399,95 @@ pub fn expire(store: &Store, now: i64) -> Result<Vec<Hold>> {
     Ok(out)
 }
 
+/// Closes `session`'s open holds `expired` (its worker ended): them.
+pub fn expire_for(store: &Store, session: &str) -> Result<Vec<Hold>> {
+    let open = rows(
+        store,
+        "WHERE h.state = 'open' AND h.target_session = ?1",
+        &session,
+    )?;
+    for (h, _) in &open {
+        store
+            .conn()
+            .execute("UPDATE holds SET state = 'expired' WHERE id = ?1", [h.id])?;
+    }
+    Ok(open.into_iter().map(|(h, _)| h).collect())
+}
+
 /// The daemon's side of a new hold: its dialog text kept (`shown`), subscribers told `held`,
 /// the person shown the dialog.
-pub fn shown(d: &Daemon, roster: &Roster, store: &Store, h: &Hold) {
-    let me = &d.identity.key;
-    let (text, buttons, who) = dialog(roster, me, h);
-    let kept = store
-        .conn()
-        .execute(
-            "UPDATE holds SET shown = ?2 WHERE id = ?1",
-            params![h.id, text],
-        )
-        .map(|_| (text, buttons, who));
-    let (text, buttons, who) = match kept {
-        Ok(t) => t,
-        Err(e) => return eprintln!("hold {}: {e}", h.name()),
+pub fn shown(d: &Daemon, team: &TeamState, store: &Store, h: &Hold) {
+    let Some(who) = raise(d, team, store, h) else {
+        return;
     };
     // No preview: subscribers include agents.
     let _ = d
         .events
         .send(json!({"event": "held", "id": h.name(), "kind": h.kind(),
         "target_session": h.target_session, "from": h.from_session, "label": who}));
-    let args = dialog::args("Lightbulb", &text, &buttons);
-    d.dialogs.show(&h.name(), args);
     eprintln!("hold {}: open", h.name());
 }
 
+/// `h`'s dialog queued, its text kept (`shown`): the asking session's label, or none when the
+/// text could not be kept (nothing is shown).
+fn raise(d: &Daemon, team: &TeamState, store: &Store, h: &Hold) -> Option<String> {
+    let me = &d.identity.key;
+    let (text, buttons, who) = dialog(store, &team.roster, me, h, &workers::folder(&team.config));
+    let sql = "UPDATE holds SET shown = ?2 WHERE id = ?1";
+    if let Err(e) = store.conn().execute(sql, params![h.id, text]) {
+        eprintln!("hold {}: {e}", h.name());
+        return None;
+    }
+    d.dialogs
+        .show(&h.name(), dialog::args("Lightbulb", &text, &buttons));
+    Some(who)
+}
+
+/// Every open hold whose dialog is neither queued nor on screen (it gave up, or the daemon
+/// restarted) is shown again; from daemon start and `holds {reshow: true}` (`lightbulb
+/// held`). A start hold for a harness no longer offered is declined instead (`no_worker`).
+pub fn reraise(d: &Daemon) {
+    let declined = {
+        let team = d.team.lock().unwrap();
+        let store = d.store.lock().unwrap();
+        let offered = workers::offers(&team.config);
+        let mut stale = vec![];
+        for h in open(&store).unwrap_or_default() {
+            let provider = workers::provider_of(&h.message.to_key);
+            if h.kind() == Kind::Worker && !offered.iter().any(|p| p == provider) {
+                stale.push(h.id);
+            } else if !d.dialogs.is_pending(&h.name()) && raise(d, &team, &store, &h).is_some() {
+                eprintln!("hold {}: shown again", h.name());
+            }
+        }
+        workers::decline(&store, &stale, "no_worker", ipc::now() as i64)
+    };
+    match declined {
+        Ok(h) => workers::declined_here(d, &h, "local", None),
+        Err(e) => eprintln!("holds: not declined: {e}"),
+    }
+}
+
 /// The daemon's side of a closed hold (`verdict` `allow`, `decline` or `expired`; `by` null for
-/// an expiry; `surface` the one that answered, if this computer's): its dialog withdrawn,
-/// subscribers told `hold_closed`.
-fn closed(d: &Daemon, h: &Hold, verdict: &str, by: Option<&str>, surface: Option<&'static str>) {
+/// an expiry; `reason` why, when it is not an answer: `cancelled`; `surface` the one that
+/// answered, if this computer's): its dialog withdrawn, subscribers told `hold_closed`, a
+/// worker waiting on it answered.
+pub(crate) fn closed(
+    d: &Daemon,
+    h: &Hold,
+    verdict: &str,
+    by: Option<&str>,
+    reason: Option<&str>,
+    surface: Option<&'static str>,
+) {
+    // A worker is told who declined it by name (`local` is this computer's person).
+    let by_name = by.map(|b| workers::named_here(d, b));
+    d.workers.answered(h.id, verdict, by_name.as_deref());
     d.dialogs.withdraw(&h.name());
-    let event = json!({"event": "hold_closed", "id": h.name(), "by": by, "verdict": verdict});
+    let mut event = json!({"event": "hold_closed", "id": h.name(), "by": by, "verdict": verdict});
+    if let Some(r) = reason {
+        event["reason"] = r.into();
+    }
     let _ = d.events.send(event);
     match surface {
         Some(s) => {
@@ -343,32 +503,67 @@ fn answer_here(
     d: &Arc<Daemon>,
     id: i64,
     allow: bool,
+    scope: &str,
     by: &str,
+    by_agent: bool,
     surface: &'static str,
-) -> Result<std::result::Result<Closed, &'static str>> {
+) -> Result<std::result::Result<(Closed, Option<&'static str>), &'static str>> {
     let r = {
         let team = d.team.lock().unwrap();
         let store = d.store.lock().unwrap();
         let now = ipc::now() as i64;
-        answer(&store, &team.roster, &d.identity, id, allow, by, now)?
+        let folder = workers::folder(&team.config);
+        answer(
+            &store,
+            &team.roster,
+            &d.identity,
+            &folder,
+            id,
+            allow,
+            scope,
+            by,
+            by_agent,
+            now,
+        )?
     };
+    let mut note = None;
     if let Ok(c) = &r {
-        closed(d, &c.hold, c.verdict(), Some(by), Some(surface));
+        closed(d, &c.hold, c.verdict(), Some(by), None, Some(surface));
+        if c.hold.kind() == Kind::Worker {
+            d.peers.outbox.notify_one(); // its receipt moved
+            if c.allow {
+                match workers::start(d, &c.hold.message.id) {
+                    Ok(refused) => note = refused,
+                    Err(e) => eprintln!("hold {}: worker not started: {e}", c.hold.name()),
+                }
+            }
+        }
     }
-    Ok(r)
+    Ok(r.map(|c| (c, note)))
 }
 
 /// Expires what is due (`expire`) and closes their dialogs; from the 60 s mail timer.
 pub fn expire_here(d: &Daemon, store: &Store, now: i64) -> Result<()> {
     for h in expire(store, now)? {
-        closed(d, &h, "expired", None, None);
+        closed(d, &h, "expired", None, None, None);
     }
     Ok(())
 }
 
-/// Dialog `H<n>` answered `button`: `Decline` or `Allow`.
+/// Dialog `H<n>` answered `button`: `Allow`, `Always allow`, `Stop worker`, else a decline.
 pub fn on_dialog(d: &Arc<Daemon>, n: i64, button: &str) {
-    if let Err(e) = answer_here(d, n, button != "Decline", "local", "dialog") {
+    let r = |allow, scope| answer_here(d, n, allow, scope, "local", false, "dialog");
+    let done = match button {
+        "Allow" => r(true, "once"),
+        "Always allow" => r(true, "always"),
+        "Stop worker" => r(false, "once").inspect(|c| {
+            if let Ok((c, _)) = c {
+                workers::stop_requested(d, &c.hold.target_session, "local");
+            }
+        }),
+        _ => r(false, "once"),
+    };
+    if let Err(e) = done {
         eprintln!("hold H{n}: {e}");
     }
 }
@@ -414,9 +609,13 @@ fn run(
     let missing = if instance { HOLD_NOT_FOUND } else { NOT_FOUND };
     let hold_id = body["hold"].as_str().and_then(|s| dialog::number(s, 'H'));
     Ok(match op {
-        // `holds {}` -> `{holds: [{id, kind, target_session, from, label, verified, preview,
-        // created_at}]}` (`verified` as the label says it)
+        // `holds {reshow?}` -> `{holds: [{id, kind, target_session, from, label, verified, preview,
+        // shown, created_at}]}` (`verified` as the label says it)
         "holds" => {
+            // `lightbulb held` asks: any dialog that gave up comes back (never a bridge's poll).
+            if !instance && body["reshow"] == true {
+                reraise(d);
+            }
             let team = d.team.lock().unwrap();
             let store = d.store.lock().unwrap();
             let list: Vec<Value> = open(&store)?
@@ -428,7 +627,8 @@ fn run(
                         "from": h.from_session,
                         "label": label::render(&team.roster, me, &h.from_session),
                         "verified": m.is_some_and(|m| label::verified(m, me)),
-                        "preview": preview(&h.message.body), "created_at": h.created_at})
+                        "preview": preview(&h.message.body), "shown": h.shown,
+                        "created_at": h.created_at})
                 })
                 .collect();
             Response::ok(id, json!({ "holds": list }))
@@ -452,7 +652,8 @@ fn run(
                     "target_birth_micros": birth}),
             )
         }
-        // `hold.answer {hold, verdict: allow|decline}` -> `{id, verdict}`. On an instance also
+        // `hold.answer {hold, verdict: allow|decline, scope?: once|always}` -> `{id, verdict,
+        // scope, note?}`. A worker hold and a worker's prompt are a person's to answer. On an instance also
         // `decided_by`, recorded as the answer's `by` (a computer's is `local`, an agent's its session).
         "hold.answer" => {
             let (by, surface) = match body["decided_by"].as_str() {
@@ -465,12 +666,32 @@ fn run(
                 Some(DECLINE) => false,
                 _ => return Ok(Response::err(id, BAD_REQUEST)),
             };
+            let scope = match body["scope"].as_str() {
+                None => "once",
+                Some(s @ ("once" | "always")) => s,
+                Some(_) => return Ok(Response::err(id, BAD_REQUEST)),
+            };
             let Some(n) = hold_id else {
                 return Ok(Response::err(id, missing));
             };
-            match answer_here(d, n, allow, by, surface)? {
-                Ok(c) => Response::ok(id, json!({"id": c.hold.name(), "verdict": c.verdict()})),
+            match answer_here(
+                d,
+                n,
+                allow,
+                scope,
+                by,
+                agent.is_some() && !instance,
+                surface,
+            )? {
+                // `note: "busy"`: allowed, but at `workers_max` nothing started.
+                Ok((c, note)) => Response::ok(
+                    id,
+                    json!({"id": c.hold.name(), "verdict": c.verdict(), "scope": scope,
+                        "note": note}),
+                ),
                 Err(NOT_FOUND) => Response::err(id, missing),
+                Err(NOT_A_PERSON) => refused(id, NOT_A_PERSON),
+                Err(BAD_REQUEST) => Response::err(id, BAD_REQUEST),
                 Err(code) => {
                     let by = d.answered_by.lock().unwrap().get(&format!("H{n}")).copied();
                     Response::err_with(id, code, json!({ "answered_in": by }))
@@ -498,7 +719,7 @@ fn run(
                 return Ok(refused(id, "unknown_session"));
             }
             let h = file_permission(&store, &session, prompt, ipc::now() as i64)?;
-            shown(d, &team.roster, &store, &h);
+            shown(d, &team, &store, &h);
             Response::ok(id, json!({ "hold": h.name() }))
         }
         _ => Response::err(id, ipc::UNKNOWN_OP),

@@ -58,7 +58,10 @@ impl World {
     async fn instance(&self) -> Instance {
         self.a.sign_in("user_aden", None);
         self.b.sign_in("user_quinn", None);
-        self.b.daemon(false, "", &[]);
+        // Assignments need network workers on, at both ends.
+        let on = "network_workers = true\n";
+        std::fs::write(self.w1.path().join("config.toml"), on).unwrap();
+        self.b.daemon(false, on, &[]);
         let i = common::instance(self.w1.path(), &[&self.b], NAME, None, &[])
             .await
             .unwrap();
@@ -279,6 +282,7 @@ async fn a_computer_ignores_app_envelopes_and_decisions_from_the_member() {
         .to_string(),
         files: vec![],
         sent_at: now_s(),
+        meta: Default::default(),
     })
     .await;
     p.send(&Frame::Decision {
@@ -364,7 +368,8 @@ mod linked {
             listener.local_addr().unwrap()
         );
         e.sign_in("user_aden", Some(&url));
-        e.daemon(false, "", &[]);
+        // Network workers on: one test assigns over the link.
+        e.daemon(false, "network_workers = true\n", &[]);
         let (tcp, _) = tokio::time::timeout(Duration::from_secs(30), listener.accept())
             .await
             .unwrap()
@@ -433,4 +438,92 @@ async fn app_mail_is_never_hop_zero() {
     )
     .await;
     assert_eq!(linked::hops(&e, "r1"), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hosted_assignment_over_the_route_link_is_never_hop_zero() {
+    let e = Env::new();
+    let mut link = linked::link(&e).await;
+    let q = common::session(&e, "q1");
+    link.app(
+        "app.send",
+        json!({"to": q, "kind": "assign", "text": "do x", "done_when": "x done",
+        "deadline_s": 300, "request_id": "ha2"}),
+    )
+    .await;
+    assert_eq!(linked::hops(&e, "ha2"), 1);
+}
+
+/// Registers `<short>/codex:<conv>` on `e`, this test process standing in for its agent.
+fn register(e: &Env, conv: &str) -> String {
+    let me = lightbulb::os::process(std::process::id()).unwrap();
+    let r = e.ask(
+        json!({"id": 1, "op": "register", "session": {"provider": "codex",
+        "conversation": conv, "pid": me.pid, "birth_micros": me.birth_micros, "cwd": "/tmp"}}),
+    );
+    r["key"].as_str().unwrap().to_string()
+}
+
+/// Polls until `f` answers `Some`, for up to 10 s.
+async fn poll<T, F: std::future::Future<Output = Option<T>>>(f: impl Fn() -> F) -> T {
+    for _ in 0..250 {
+        if let Some(v) = f().await {
+            return v;
+        }
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+    panic!("timed out");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hosted_app_assigns_and_reads_the_result() {
+    let w = world();
+    let i = w.instance().await;
+    // The online computer (B) stands in for the worker's: the instance dials only it.
+    let codex = register(&w.b, "c1");
+    let mut body = send_body(&codex, "ha1");
+    body["kind"] = json!("assign");
+    body["text"] = json!("do x");
+    body["done_when"] = json!("x done");
+    body["deadline_s"] = json!(300);
+    let sent = now_s();
+    let r = ok(&i, "app.send", body).await;
+    assert!(
+        ["queued", "stored"].contains(&r["state"].as_str().unwrap()),
+        "{r}"
+    );
+    let ask = json!({"app": "chatgpt", "person": P, "request_id": "ha1"});
+    poll(|| async {
+        (ok(&i, "app.receipt", ask.clone()).await["state"] == "stored").then_some(())
+    })
+    .await;
+    let m = w.b.take_one(&codex);
+    assert_eq!(m["kind"], "assign", "{m}");
+    assert_eq!(m["done_when"], "x done", "{m}");
+    let due = m["deadline_at"].as_i64().unwrap();
+    assert!((due - (sent + 300)).abs() <= 5, "{m}");
+    assert!(
+        m["framed"]
+            .as_str()
+            .unwrap()
+            .starts_with(&format!("[Lightbulb assignment from {NAME}'s {TITLE}")),
+        "{m}"
+    );
+    w.b.send(&codex, &w.app(), "x done", "hr1", Some("ha1"));
+    let inbox = json!({"app": "chatgpt", "person": P});
+    let records = poll(|| async {
+        let r = ok(&i, "app.inbox", inbox.clone()).await["records"].clone();
+        (!r.as_array().unwrap().is_empty()).then_some(r)
+    })
+    .await;
+    assert_eq!(
+        (records[0]["kind"].as_str(), records[0]["status"].as_str()),
+        (Some("result"), Some("done")),
+        "{records:?}"
+    );
+    poll(|| async {
+        (ok(&i, "app.receipt", ask.clone()).await["result"]["status"] == "done").then_some(())
+    })
+    .await;
+    i.shutdown().await;
 }

@@ -23,6 +23,7 @@ use crate::mail::{self, State};
 use crate::memory;
 use crate::roster::{self, Entry, Roster};
 use crate::sessions::Key;
+use crate::workers::{self, Taken};
 use crate::Result;
 use crate::{holds, identity, outbox, relay};
 use frames::Frame;
@@ -93,6 +94,17 @@ pub struct Knobs {
     /// `LIGHTBULB_CONNECT_DEBUG_NO_DEFAULT_RELAYS=1`: no public relays when nothing else is
     /// set (direct only), so a test never reaches the internet.
     no_default_relays: bool,
+    /// The Claude Code a worker runs (`claude` on `PATH` when none), or
+    /// `LIGHTBULB_CONNECT_DEBUG_CLAUDE` (a fake harness).
+    pub claude_program: Option<PathBuf>,
+    /// The Codex a worker runs, or `LIGHTBULB_CONNECT_DEBUG_CODEX` (a fake harness).
+    pub codex_program: Option<PathBuf>,
+    /// The Cursor Agent a worker runs, or `LIGHTBULB_CONNECT_DEBUG_CURSOR` (a fake harness).
+    pub cursor_program: Option<PathBuf>,
+    /// The Grok CLI a worker runs, or `LIGHTBULB_CONNECT_DEBUG_GROK` (a fake harness).
+    pub grok_program: Option<PathBuf>,
+    /// The OpenCode a worker runs, or `LIGHTBULB_CONNECT_DEBUG_OPENCODE` (a fake harness).
+    pub opencode_program: Option<PathBuf>,
 }
 
 /// Off macOS there is no dialog program: an empty one answers nothing (`dialog::Queue`).
@@ -144,6 +156,11 @@ impl Knobs {
             relay_only: var("LIGHTBULB_CONNECT_DEBUG_RELAY_ONLY").is_some_and(|v| v == "1"),
             no_default_relays: var("LIGHTBULB_CONNECT_DEBUG_NO_DEFAULT_RELAYS")
                 .is_some_and(|v| v == "1"),
+            claude_program: var("LIGHTBULB_CONNECT_DEBUG_CLAUDE").map(Into::into),
+            codex_program: var("LIGHTBULB_CONNECT_DEBUG_CODEX").map(Into::into),
+            cursor_program: var("LIGHTBULB_CONNECT_DEBUG_CURSOR").map(Into::into),
+            grok_program: var("LIGHTBULB_CONNECT_DEBUG_GROK").map(Into::into),
+            opencode_program: var("LIGHTBULB_CONNECT_DEBUG_OPENCODE").map(Into::into),
         }
     }
 
@@ -162,6 +179,11 @@ impl Knobs {
             outbox_s: outbox::TTL_S,
             relay_only: false,
             no_default_relays: false,
+            claude_program: None,
+            codex_program: None,
+            cursor_program: None,
+            grok_program: None,
+            opencode_program: None,
         }
     }
 }
@@ -843,8 +865,12 @@ impl Net {
             if expire {
                 expired_at = Some(std::time::Instant::now());
             }
-            if let Err(e) = flush(d, all, expire) {
-                eprintln!("net: outbox: {e}");
+            match flush(d, all, expire) {
+                Ok(wake) => (wake.iter()).for_each(|(k, id)| ipc::stored(d, k, Some(id))),
+                Err(e) => eprintln!("net: outbox: {e}"),
+            }
+            if expire {
+                workers::tick(d, ipc::now() as i64); // a worker past its deadline stops
             }
         }
     }
@@ -1282,18 +1308,52 @@ fn receive(d: &Arc<Daemon>, key: &str, env: &Frame, tx: &Tx) {
     let store = d.store.lock().unwrap();
     let me = &d.identity.short;
     let now = ipc::now();
-    match mail::receive(&store, env, peer, &team.roster, me, ids, members, now) {
+    match mail::receive(
+        &store,
+        env,
+        peer,
+        &team.roster,
+        me,
+        ids,
+        members,
+        &team.config,
+        now,
+    ) {
         Ok(mail::Answer {
             state,
             reason,
             limit,
             fresh,
+            taken,
+            cancelled,
         }) => {
             eprintln!("net: envelope {id} from {short}: {}", state.name());
             ack(state, reason, limit);
-            if state == State::Stored {
-                drop((store, team));
-                ipc::stored(d, &Key(to.clone()), fresh.then_some(id.as_str()));
+            // A fresh worker's address has no mailbox: nothing to wake, only a follow-up.
+            match (taken, cancelled) {
+                (Some(Taken::Held { hold }), _) => {
+                    if let Ok(Some(h)) = holds::get(&store, hold) {
+                        holds::shown(d, &team, &store, &h);
+                    }
+                }
+                (Some(Taken::Start), _) => {
+                    drop((store, team));
+                    if let Err(e) = workers::start(d, id) {
+                        eprintln!("net: worker for {id}: {e}");
+                    }
+                }
+                (_, Some(assign)) => {
+                    let by = short.to_string();
+                    drop((store, team));
+                    if let Err(e) = workers::cancel(d, &assign, &by) {
+                        eprintln!("net: cancel for {assign}: {e}");
+                    }
+                }
+                _ if state == State::Stored => {
+                    drop((store, team));
+                    ipc::stored(d, &Key(to.clone()), fresh.then_some(id.as_str()));
+                }
+                _ => {}
             }
         }
         Err(e) => eprintln!("net: dropped envelope {id} from {short}: {e}"),
@@ -1309,12 +1369,19 @@ fn receipt_changed(d: &Daemon, id: &str, state: &str, reason: Option<&str>) {
 
 /// One flush (`Net::flush_loop`): with `all`, every queued envelope of an online member,
 /// whatever its backoff; with `expire`, first what waited too long.
-fn flush(d: &Daemon, all: bool, expire: bool) -> Result<()> {
+/// Returns the askers whose assignments just timed out, with each timeout result's id, for the
+/// caller to wake (`ipc::stored` needs the `Arc`; the id wakes a hosted app's bot).
+fn flush(d: &Daemon, all: bool, expire: bool) -> Result<Vec<(Key, String)>> {
     let now = ipc::now();
     let online = d.peers.online();
     let store = d.store.lock().unwrap();
+    let mut wake = vec![];
     if expire {
         mail::expire(&store, now)?;
+        match mail::expire_assignments(&store, &d.identity.short, now) {
+            Ok(keys) => wake = keys,
+            Err(e) => eprintln!("net: expire assignments: {e}"),
+        }
         // An instance's delivered-unread mail (`inbox.peek` hands it out until it is read).
         if d.cloud.is_some() {
             mail::expire_delivered(&store, &d.identity.short, now)?;
@@ -1340,7 +1407,7 @@ fn flush(d: &Daemon, all: bool, expire: bool) -> Result<()> {
             outbox::told(&store, &member, &id, &state)?;
         }
     }
-    Ok(())
+    Ok(wake)
 }
 
 /// Rings `who`'s doorbell: `curl -q -g --proto =http,https -fsS -m 10 -X POST -K - <url>`, the bearer token handed on
