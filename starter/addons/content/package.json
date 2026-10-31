@@ -7,7 +7,7 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "check": "tsc --noEmit && eslint . && node scripts/design-lint.mjs",
+    "check": "tsc --noEmit && eslint . && node scripts/design-lint.mjs && vitest run",
     "check:publish": "pnpm check && pnpm audit --prod --audit-level high",
     "test": "vitest run",
     "db:generate": "drizzle-kit generate",

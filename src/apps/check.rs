@@ -111,7 +111,10 @@ pub fn parse(output: &str, root: &Path) -> Vec<Problem> {
     let tsc_global = regex::Regex::new(r"^error TS(\d+):\s*(.*)$").unwrap();
     let eslint = regex::Regex::new(r"^\s+(\d+):(\d+)\s+error\s+(.*?)(?:\s{2,}(\S+))?\s*$").unwrap();
     let design = regex::Regex::new(r"^(.+?):(\d+): (.+)$").unwrap();
+    let vitest = regex::Regex::new(r"^\s*FAIL\s+(\S+)(?:\s+>\s+(.+?))?\s*$").unwrap();
     let mut problems: Vec<Problem> = vec![];
+    // The vitest problem still waiting for its error line.
+    let mut vitest_open: Option<usize> = None;
     // The last tsc problem (continuation lines extend it) and the last ESLint file header.
     let mut tsc_open = false;
     let mut eslint_file = String::new();
@@ -120,7 +123,33 @@ pub fn parse(output: &str, root: &Path) -> Vec<Problem> {
             continue;
         }
         let at = |c: &regex::Captures, i: usize| c[i].parse().unwrap();
-        if let Some(c) = tsc.captures(raw) {
+        if let Some(c) = vitest.captures(raw) {
+            // A failed test: vitest lists it twice (summary, then detail), so one problem per name.
+            let name = c.get(2).map_or("", |m| m.as_str()).to_string();
+            let file = relative(root, &c[1]);
+            let seen = problems.iter().any(|p| {
+                p.code.as_deref() == Some("vitest") && p.file == file && p.message.starts_with(&name)
+            });
+            // ponytail: first 5 failures only, so one broken suite does not flood the report
+            let room = problems.iter().filter(|p| p.code.as_deref() == Some("vitest")).count() < 5;
+            vitest_open = (!seen && room).then(|| {
+                problems.push(Problem {
+                    file,
+                    line: 1,
+                    column: None,
+                    code: Some("vitest".into()),
+                    message: name,
+                });
+                problems.len() - 1
+            });
+            tsc_open = false;
+        } else if let Some(i) = vitest_open.take().filter(|_| !raw.contains('\u{23af}')) {
+            // The line after FAIL is the error ("AssertionError: expected 1 to be 2").
+            if let Some(p) = problems.get_mut(i) {
+                let msg: String = raw.trim().chars().take(300).collect();
+                p.message = if p.message.is_empty() { msg } else { format!("{}: {msg}", p.message) };
+            }
+        } else if let Some(c) = tsc.captures(raw) {
             problems.push(Problem {
                 file: relative(root, &c[1]),
                 line: at(&c, 2),
@@ -387,5 +416,19 @@ pub fn check(publish: bool, json: bool) -> Result<i32> {
             }
             Ok(if r.ok { 0 } else { 1 })
         }
+    }
+}
+
+#[cfg(test)]
+mod vitest_tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_test_names_itself() {
+        let out = " FAIL  src/a.test.ts > math > adds\nAssertionError: expected 1 to be 2\n \u{276f} src/a.test.ts:5:20\n\n\u{23af}\u{23af}\u{23af} Failed Tests 1 \u{23af}\u{23af}\u{23af}\n\n FAIL  src/a.test.ts > math > adds\nAssertionError: expected 1 to be 2\n";
+        let p = parse(out, Path::new("/x"));
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].file, "src/a.test.ts");
+        assert_eq!(p[0].message, "math > adds: AssertionError: expected 1 to be 2");
     }
 }
