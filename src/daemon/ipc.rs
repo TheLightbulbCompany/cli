@@ -183,8 +183,8 @@ impl Caller {
     }
 }
 
-/// What an instance does not do: it mints no link but a person one (`net_ops`), its settings
-/// are its `EmbedOpts`, it asks no one (`ui.claim`), and it stops by `Instance::shutdown`.
+/// What an instance does not do: its settings are its `EmbedOpts`, it asks no one (`ui.claim`),
+/// and it stops by `Instance::shutdown`. (Its links are once links only: `net_ops`.)
 const NOT_ON_AN_INSTANCE: [&str; 3] = ["reload", "ui.claim", "shutdown"];
 
 /// What only an instance does: the workspace's memory ops on its cloud member. `memory.list`

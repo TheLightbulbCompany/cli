@@ -49,7 +49,7 @@ pub fn hash(secret: &str) -> String {
 /// A new ticket from `id` for a new link, and, for a `once` one, its secret's hash (what the
 /// link entry carries in place of the secret). `relay_hint` is the first relay in effect
 /// (`""` for none): a joiner dials through it before it knows its own list; `addrs` this
-/// computer's direct addresses (`Peers::hints`).
+/// computer's direct addresses (`Peers::hints`); `wake` a workspace member's doorbell (`sign`).
 pub fn mint(
     id: &Identity,
     roster: &Roster,
@@ -57,6 +57,7 @@ pub fn mint(
     once: bool,
     now: i64,
     hints: (String, Vec<String>),
+    wake: Option<Wake>,
 ) -> (Ticket, Option<String>) {
     let secret = BASE64URL_NOPAD.encode(&rand::random::<[u8; 32]>());
     let ttl = if once { ONCE_S } else { REUSABLE_S };
@@ -69,12 +70,15 @@ pub fn mint(
         mode,
         now + ttl,
         hints,
+        wake,
     );
     (t, hashed)
 }
 
 /// The ticket `id` signs for its link `ticket_id`: the same bytes each time for the same link
-/// and roster (Ed25519 is deterministic), so a reusable link reprints unchanged.
+/// and roster (Ed25519 is deterministic), so a reusable link reprints unchanged. `wake`, only
+/// from a workspace member, is covered by the signature.
+#[allow(clippy::too_many_arguments)]
 pub fn sign(
     id: &Identity,
     roster: &Roster,
@@ -83,6 +87,7 @@ pub fn sign(
     mode: &str,
     expires_at: i64,
     (relay_hint, addrs): (String, Vec<String>),
+    wake: Option<Wake>,
 ) -> Ticket {
     // The inviter first, then the founder, by key.
     let mut members = vec![id.key.clone()];
@@ -103,7 +108,7 @@ pub fn sign(
         addrs,
         members,
         expires_at,
-        wake: None,
+        wake,
         sig: String::new(),
     };
     t.sig = id.sign(&value(&t));
@@ -218,7 +223,7 @@ mod tests {
             2,
         );
         let before = replay(&[g.clone(), ax.clone()]);
-        let (t, hashed) = mint(&x, &before, mode, once, 100, (String::new(), vec![]));
+        let (t, hashed) = mint(&x, &before, mode, once, 100, (String::new(), vec![]), None);
         let l = Entry::signed(
             &x,
             vec![ax.hash()],
@@ -302,6 +307,7 @@ mod tests {
                 mode,
                 t.expires_at,
                 (String::new(), vec![]),
+                None,
             )
         };
         assert!(verify(&forge(&f, "open"), &r).is_err());

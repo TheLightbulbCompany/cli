@@ -206,14 +206,8 @@ async fn person_only_ops_are_refused_in_process() {
     ] {
         refused(&call(&i, op, body).await, "not_a_person");
     }
-    // A workspace member mints no link, unlinks nothing, and stops only by `shutdown()`.
-    for (op, body) in [
-        ("team.unlink", json!({})),
-        ("team.invite", json!({})),
-        ("team.invite", json!({"mode": "once"})),
-        ("team.invite", json!({"mode": "open"})),
-        ("shutdown", json!({})),
-    ] {
+    // A workspace member unlinks nothing, and stops only by `shutdown()`.
+    for (op, body) in [("team.unlink", json!({})), ("shutdown", json!({}))] {
         assert_eq!(call(&i, op, body).await["error"], "unsupported", "{op}");
     }
     // Its solo network is the workspace's.
@@ -232,6 +226,19 @@ async fn person_only_ops_are_refused_in_process() {
         let r = call(&i, "snapshot", json!({ "path": p })).await;
         assert_eq!(r["error"], "bad_request", "{p:?}: {r}");
     }
+    i.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn instance_invite_without_a_doorbell_has_no_wake() {
+    let home = tempfile::tempdir().unwrap();
+    let i = start(home.path(), &[], None).await;
+    let r = ok(&i, "team.invite", json!({"mode": "reusable"})).await;
+    let t = lightbulb::ticket::decode(r["ticket"].as_str().unwrap()).unwrap();
+    assert_eq!(t.wake, None);
+    assert!(lightbulb::ticket::signed_by_inviter(&t));
+    assert_eq!(r["mode"], "once", "{r}");
+    assert!(r.get("code").is_none(), "an instance offers no code: {r}");
     i.shutdown().await;
 }
 
@@ -267,10 +274,6 @@ async fn workspace_instance_joins_and_leaves_in_process() {
     assert_eq!(again["reason"], "already_in_team", "{again}");
     let me = ok(&i, "identity.get", json!({})).await;
     assert_eq!(me["person_id"], me["member_key"], "{me}");
-    assert_eq!(
-        call(&i, "team.invite", json!({})).await["error"],
-        "unsupported"
-    );
     let key = me["member_key"].clone();
     let team = ok(&i, "team.get", json!({})).await;
     let mine = team["members"]

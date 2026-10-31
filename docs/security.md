@@ -50,9 +50,12 @@ Proofs last 30 days and are renewed in their last week (renewal asks the account
 can refuse); removing a person from a workspace takes effect at once (`members`), and a computer
 whose key is in the sessions file's `revoked_keys` is refused even with a valid proof. `lightbulb logout` deletes
 the proof. A
-workspace member never invites; it joins one network when a workspace admin runs
+workspace member joins one network when a workspace admin runs
 `lightbulb invite --agents`, which hands it a one-time link that admin's computer signed (the admin
-confirmed it in the browser, so that computer admits it without a dialog). Labels ending "(not verified)" are unproven names, never an
+confirmed it in the browser, so that computer admits it without a dialog). It also mints one-time
+links, each carrying its doorbell under its signature, which Lightbulb gives only to a signed-in
+person of that workspace: `lightbulb login` joins a computer that is alone on its own network with
+one. Labels ending "(not verified)" are unproven names, never an
 identity.
 
 ### Invite codes

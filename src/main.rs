@@ -197,8 +197,12 @@ enum Command {
         agents: bool,
     },
     /// Sign this computer in to Lightbulb (confirm in the browser): your workspace's agents
-    /// answer the computers of its signed-in members.
-    Login,
+    /// answer the computers of its signed-in members. Then joins your workspace's network.
+    Login {
+        /// (The desktop app) Open nothing, ask nothing, join nothing: print `{"user_code"}`.
+        #[arg(long, hide = true)]
+        app: bool,
+    },
     /// Sign this computer out of Lightbulb: workspaces stop answering it.
     Logout,
     /// Show the team and its members.
@@ -410,7 +414,7 @@ fn run() -> lightbulb::Result<()> {
         } => exit(cli::receipt(&request_id, from, json)?),
         Command::Doctor => exit(cli::doctor()?),
         Command::Invite { agents: true, .. } => exit(cli::invite_agents()?),
-        Command::Login => exit(lightbulb::login::login()?),
+        Command::Login { app } => exit(lightbulb::login::login(app)?),
         Command::Logout => exit(lightbulb::login::logout()?),
         Command::Invite { new, once, .. } => exit(cli::invite(match (new, once) {
             (true, _) => Invite::New,

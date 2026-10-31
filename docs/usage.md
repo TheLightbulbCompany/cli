@@ -55,7 +55,7 @@ Run `lightbulb <command> --help` for the options of each one.
 | `leave` | Leave the team. This computer is on its own network again. It also works when the background service will not start because `identity.key` no longer matches the team record. |
 | `relay [<url>]` | Show the relays this computer uses, or set one. With nothing set it uses the iroh project's public relays (`default`). It sets the team's relay; `--local` sets only this computer's; `--clear` clears yours and goes back to the default. Relays carry encrypted bytes only. Lightbulb fetches no relay list of its own. |
 | `folder <path> on\|off` | Show or hide the sessions under a folder from your teammates. |
-| `login` | Sign this computer in to Lightbulb (confirm in the browser), so your workspace's agents answer it. |
+| `login` | Sign this computer in to Lightbulb (confirm in the browser), so your workspace's agents answer it. A computer alone on its own network then joins your workspace's network, and `login` tells you what teammates see. One on another network with members stays there, and `login` says how to move: `lightbulb leave`, then `lightbulb login`. |
 | `logout` | Sign this computer out. |
 | `memory list\|show\|forget\|share\|export\|last\|team\|drafts\|approve\|dismiss` | See and control what your agents remember (see "Memory" below), and keep or drop the lessons suggested from sessions you uploaded. |
 | `sessions list\|show\|forget\|export\|upload` | See and delete what was captured of your coding sessions here: the agent, the repository, each tool call and a short summary of it, never file contents or output. Dot folders in your home folder (`~/.config`) are skipped; a repository's own (`.claude/worktrees`) are captured. Tokens are filled for Claude Code only (from its transcript, when the session ends); the other agents leave them blank until their payloads are verified, and OpenCode's tool calls are captured on 1.x only. `sessions upload off\|metadata\|full` chooses what is sent to Lightbulb (off by default). |
@@ -141,8 +141,9 @@ text is deleted from `state.db` once nothing waits on it (read, refused or expir
 your own terminal keep theirs.
 
 Apart from anonymous usage counts (`lightbulb telemetry off`), the engine calls Lightbulb only for
-`login`, renewing a signed-in computer's proof, `invite --agents`, and, while signed in, the live
-connection hosted apps use. Otherwise it talks only to your teammates' computers and, when no
+`login` (the sign-in, then your workspace's network and its one-time join link), renewing a
+signed-in computer's proof, `invite --agents`, and, while signed in, the live connection hosted
+apps use. Otherwise it talks only to your teammates' computers and, when no
 direct path exists, to the relays. The background service checks this project's GitHub releases
 once a day for an update (`lightbulb update --auto off` stops it), and `update` downloads from them. After an update, `setup` runs again with the new binary (the daemon's own run is `setup --refresh`), which rewrites the agents' hooks, so an existing install gets new hooks, such as the ones that mark a session as waiting, without anything from you. The refresh does not stop or reload the background service.
 

@@ -154,6 +154,7 @@ fn an_expired_link_is_refused_by_the_inviters_clock() {
         "open",
         now - 60,
         (String::new(), vec![]),
+        None,
     );
     let link = ticket::link_body(&t, None);
     let entry = roster::Entry::signed(&ia, vec![g.hash()], roster::Kind::Link, link, now - 90);
@@ -207,6 +208,7 @@ fn forged_ticket_from_another_members_link_is_refused() {
         "open",
         xt.expires_at,
         (String::new(), vec![]),
+        None,
     );
     c.daemon(false, "", &[peers(&[&f])]);
     refused(&join(&c, &ticket::encode(&forged), "carol"), "bad_ticket");

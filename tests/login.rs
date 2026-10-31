@@ -10,12 +10,12 @@ use std::net::TcpListener;
 use std::process::{Command, Output};
 use std::sync::{Arc, Mutex};
 
-/// Calls the stub got: `(path, body)`.
+/// Calls the stub got: `(path, body)`; a signed call adds `("proof <path>", its proof)`.
 type Seen = Arc<Mutex<Vec<(String, Value)>>>;
 
 /// A stub API answering each request with `answer(path, body, n)` (`n`: that path's count so
 /// far): `(status, json)`. Its base URL, and what it saw.
-fn stub(answer: fn(&str, &Value, usize) -> (u16, Value)) -> (String, Seen) {
+fn stub(answer: impl Fn(&str, &Value, usize) -> (u16, Value) + Send + 'static) -> (String, Seen) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let seen: Seen = Arc::default();
@@ -28,6 +28,7 @@ fn stub(answer: fn(&str, &Value, usize) -> (u16, Value)) -> (String, Seen) {
             r.read_line(&mut first).unwrap();
             let path = first.split(' ').nth(1).unwrap_or_default().to_string();
             let mut len = 0;
+            let mut proof = None;
             loop {
                 let mut h = String::new();
                 r.read_line(&mut h).unwrap();
@@ -37,6 +38,9 @@ fn stub(answer: fn(&str, &Value, usize) -> (u16, Value)) -> (String, Seen) {
                 if let Some(v) = h.to_lowercase().strip_prefix("content-length:") {
                     len = v.trim().parse().unwrap();
                 }
+                if let Some(v) = h.strip_prefix("X-Lightbulb-Proof:") {
+                    proof = Some(v.trim().to_string());
+                }
             }
             let mut body = vec![0; len];
             r.read_exact(&mut body).unwrap();
@@ -45,14 +49,19 @@ fn stub(answer: fn(&str, &Value, usize) -> (u16, Value)) -> (String, Seen) {
                 let mut l = log.lock().unwrap();
                 let n = l.iter().filter(|(p, _)| *p == path).count();
                 l.push((path.clone(), body.clone()));
+                if let Some(p) = proof {
+                    l.push((format!("proof {path}"), json!(p)));
+                }
                 n
             };
             let (code, v) = answer(&path, &body, n);
             let text = v.to_string();
             let _ = write!(
                 s,
-                "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
-                text.len()
+                "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{}Connection: close\r\n\r\n{text}",
+                text.len(),
+                // A cold member's answer; the wait is short, so a test ends.
+                if code == 503 { "Retry-After: 1\r\n" } else { "" }
             );
         }
     });
@@ -286,4 +295,308 @@ fn an_expired_sign_in_says_sign_in_again_and_its_age_does_not() {
         text.contains("Lightbulb sign-in") && text.contains("lightbulb login"),
         "{text}"
     );
+}
+
+const NOTICE: &str = "Your computer joined Acme's network. Teammates on it see the names, folders \
+                      and status of your sessions, never your files or conversations. Hide a \
+                      folder: lightbulb folder <path> off.";
+
+/// `login` from outside any agent's process tree, against `base`.
+fn login_detached(e: &Env, base: &str, args: &[&str]) -> Output {
+    let api_env = format!("LIGHTBULB_API={base}");
+    let argv = ["/usr/bin/env", &api_env, "LIGHTBULB_CONNECT_NO_BROWSER=1"];
+    e.detached(&[&argv[..], &[common::EXE], args].concat(), "")
+}
+
+/// The stub, with `team` answering `GET /network/team`, `line` `POST /network/join-line`.
+fn workspace(team: Value, line: (u16, Value)) -> (String, Seen) {
+    stub(move |path, body, n| match path {
+        "/network/team" => (200, team.clone()),
+        "/network/join-line" => line.clone(),
+        _ => api(path, body, n),
+    })
+}
+
+fn acme(team_id: Value) -> Value {
+    json!({"workspace": "Acme", "teamId": team_id, "userId": "user_a", "name": "Aden"})
+}
+
+fn called(seen: &Seen, path: &str) -> bool {
+    seen.lock().unwrap().iter().any(|(p, _)| p == path)
+}
+
+#[test]
+fn login_app_prints_one_json_line_and_opens_nothing() {
+    let e = Env::new();
+    e.identity();
+    // Openers on the PATH that say they ran. No NO_BROWSER here: nothing else stops them.
+    let dir = tempfile::tempdir().unwrap();
+    let ran = dir.path().join("ran");
+    for opener in ["open", "xdg-open"] {
+        let p = dir.path().join(opener);
+        std::fs::write(&p, format!("#!/bin/sh\ntouch '{}'\n", ran.display())).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = format!(
+        "{}:{}",
+        dir.path().display(),
+        std::env::var("PATH").unwrap()
+    );
+    let (base, seen) = stub(api);
+    let login = |args: &[&str]| {
+        let mut c = e.base_cmd(Command::new(common::EXE));
+        c.arg("login")
+            .args(args)
+            .env("LIGHTBULB_API", &base)
+            .env("PATH", &path)
+            .env_remove("LIGHTBULB_CONNECT_NO_BROWSER");
+        c.output().unwrap()
+    };
+    let out = login(&["--app"]);
+    assert!(out.status.success(), "{}", common::err(&out));
+    assert_eq!(common::out(&out), "{\"user_code\":\"ABCD-EFGH\"}\n");
+    assert!(!ran.exists(), "--app opens nothing");
+    // It signed in, and asked for no network.
+    assert_eq!(
+        lightbulb::login::stored_proof(e.state.path()).unwrap(),
+        "h.p.s"
+    );
+    assert!(!called(&seen, "/network/team"));
+    // The plain `login` does open it: the openers above are real.
+    let out = login(&[]);
+    assert!(out.status.success(), "{}", common::err(&out));
+    assert!(ran.exists(), "login opens the browser");
+    // Hidden from the help.
+    let out = run(&e, &base, &["login", "--help"]);
+    assert!(
+        !common::out(&out).contains("--app"),
+        "{}",
+        common::out(&out)
+    );
+}
+
+#[test]
+fn a_backend_without_the_routes_is_a_plain_login() {
+    let e = Env::new();
+    e.identity();
+    let (base, seen) = stub(api);
+    let out = run(&e, &base, &["login"]);
+    let text = common::out(&out);
+    assert!(out.status.success(), "{text}{}", common::err(&out));
+    assert!(text.ends_with("Not you? Run lightbulb logout.\n"), "{text}");
+    assert!(common::err(&out).is_empty(), "{}", common::err(&out));
+    // A signed call, as the workspace tools make.
+    assert!(called(&seen, "proof /network/team"));
+}
+
+#[test]
+fn a_person_with_no_workspace_joins_nothing() {
+    let e = Env::new();
+    e.identity();
+    let team = json!({"workspace": null, "teamId": null, "userId": "user_a", "name": "Aden"});
+    let (base, seen) = workspace(team, (500, json!({})));
+    let out = run(&e, &base, &["login"]);
+    let text = common::out(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(text.ends_with("Not you? Run lightbulb logout.\n"), "{text}");
+    assert!(!called(&seen, "/network/join-line"));
+}
+
+#[test]
+fn a_computer_already_on_the_workspaces_network_is_told_so() {
+    let e = Env::new();
+    e.daemon(false, "", &[]);
+    let id = e.ask(json!({"id": 1, "op": "team.get"}))["team_id"].clone();
+    let (base, seen) = workspace(acme(id), (500, json!({})));
+    let out = login_detached(&e, &base, &["login"]);
+    let text = common::out(&out);
+    assert!(out.status.success(), "{text}{}", common::err(&out));
+    assert!(text.ends_with("On Acme's network.\n"), "{text}");
+    assert!(!called(&seen, "/network/join-line"));
+}
+
+#[test]
+fn a_computer_on_another_network_is_told_how_and_moved_nowhere() {
+    let (a, b) = (Env::new(), Env::new());
+    common::seed_pair(&a, &b);
+    b.daemon(false, "", &[]);
+    let team = b.ask(json!({"id": 1, "op": "team.get"}));
+    let (base, seen) = workspace(acme(json!("elsewhere")), (500, json!({})));
+    let out = login_detached(&b, &base, &["login"]);
+    let text = common::out(&out);
+    assert!(out.status.success(), "{text}{}", common::err(&out));
+    let want = format!(
+        "You are on {}. To join Acme's network: lightbulb leave, then lightbulb login.\n",
+        team["name"].as_str().unwrap()
+    );
+    assert!(text.ends_with(&want), "{text}");
+    assert!(!called(&seen, "/network/join-line"));
+    assert_eq!(common::members(&b).len(), 2);
+}
+
+/// Computer A, online, and its once link as the workspace's line for computer B ("mbp"), alone
+/// and reaching A, under the name `name`; B's `login` output.
+fn login_joins(name: Option<&str>) -> (Env, Env, Output, Seen) {
+    let (a, b) = (Env::new(), Env::new());
+    a.daemon(false, &common::computer("mac"), &[]);
+    let ticket = common::invite(&a, "once");
+    b.daemon(false, &common::computer("mbp"), &[common::peers(&[&a])]);
+    let taken = common::members(&a)[0]["name"].as_str().unwrap().to_string();
+    let name = name.unwrap_or(&taken);
+    let line = json!({"ticket": ticket, "teamId": "t", "workspace": "Acme", "name": name,
+        "expiresAt": 0});
+    let (base, seen) = workspace(acme(json!("t")), (200, line));
+    let out = login_detached(&b, &base, &["login"]);
+    (a, b, out, seen)
+}
+
+#[test]
+fn a_computer_alone_joins_and_gets_the_notice() {
+    let (a, b, out, seen) = login_joins(Some("Aden"));
+    let text = common::out(&out);
+    assert!(out.status.success(), "{text}{}", common::err(&out));
+    assert!(
+        text.contains("Connecting your computer to Acme…\n"),
+        "{text}"
+    );
+    assert!(text.ends_with(&format!("{NOTICE}\n")), "{text}");
+    assert!(called(&seen, "proof /network/join-line"));
+    let names: Vec<String> = common::members(&b)
+        .iter()
+        .map(|m| m["name"].as_str().unwrap().to_string())
+        .collect();
+    assert!(names.contains(&"Aden".to_string()), "{names:?}");
+    assert_eq!(common::members(&a).len(), 2);
+    assert!(!text.contains("eyJ"), "the ticket is never shown: {text}");
+}
+
+#[test]
+fn a_taken_name_joins_as_the_name_and_computer_on_the_same_line() {
+    let (a, b, out, seen) = login_joins(None);
+    let text = common::out(&out);
+    assert!(out.status.success(), "{text}{}", common::err(&out));
+    assert!(text.ends_with(&format!("{NOTICE}\n")), "{text}");
+    let posts = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(p, _)| p == "/network/join-line")
+        .count();
+    assert_eq!(posts, 1, "the same line");
+    let taken = common::members(&a)
+        .iter()
+        .map(|m| m["name"].as_str().unwrap().to_string())
+        .find(|n| n.ends_with(" (mbp)"));
+    assert!(taken.is_some(), "{:?}", common::members(&a));
+    assert_eq!(common::members(&b).len(), 2);
+}
+
+#[test]
+fn a_failed_join_is_one_line_and_the_login_stands() {
+    let e = Env::new();
+    e.daemon(false, "", &[]);
+    let line = (409, json!({"detail": "This workspace has no agents yet."}));
+    let (base, _) = workspace(acme(Value::Null), line);
+    let out = login_detached(&e, &base, &["login"]);
+    let text = common::out(&out);
+    assert!(out.status.success(), "{text}{}", common::err(&out));
+    assert_eq!(
+        lightbulb::login::stored_proof(e.state.path()).unwrap(),
+        "h.p.s"
+    );
+    let last = text.lines().last().unwrap();
+    assert!(last.contains("This workspace has no agents yet."), "{text}");
+    assert_eq!(common::members(&e).len(), 1);
+}
+
+#[test]
+fn a_cold_member_is_waited_for_at_its_retry_after() {
+    let (a, b) = (Env::new(), Env::new());
+    a.daemon(false, &common::computer("mac"), &[]);
+    let ticket = common::invite(&a, "once");
+    b.daemon(false, &common::computer("mbp"), &[common::peers(&[&a])]);
+    let (base, seen) = stub(move |path, body, n| match (path, n) {
+        ("/network/team", _) => (200, acme(json!("t"))),
+        ("/network/join-line", 0 | 1) => (503, json!({"detail": "Waking."})),
+        ("/network/join-line", _) => (200, json!({"ticket": ticket, "name": "Aden"})),
+        _ => api(path, body, n),
+    });
+    let out = login_detached(&b, &base, &["login"]);
+    let text = common::out(&out);
+    assert!(out.status.success(), "{text}{}", common::err(&out));
+    assert!(text.ends_with(&format!("{NOTICE}\n")), "{text}");
+    assert_eq!(text.matches("Connecting").count(), 1, "{text}");
+    let posts = (seen.lock().unwrap().iter())
+        .filter(|(p, _)| p == "/network/join-line")
+        .count();
+    assert_eq!(posts, 3);
+}
+
+#[test]
+fn a_member_that_never_wakes_is_one_line_and_the_login_stands() {
+    let e = Env::new();
+    e.daemon(false, "", &[]);
+    let (base, seen) = workspace(acme(Value::Null), (503, json!({"detail": "Waking."})));
+    let api_env = format!("LIGHTBULB_API={base}");
+    let argv = [
+        "/usr/bin/env",
+        &api_env,
+        "LIGHTBULB_CONNECT_NO_BROWSER=1",
+        "LIGHTBULB_CONNECT_JOIN_WAIT_S=2",
+        common::EXE,
+        "login",
+    ];
+    let out = e.detached(&argv, "");
+    let text = common::out(&out);
+    assert!(out.status.success(), "{text}{}", common::err(&out));
+    assert!(
+        text.lines().last().unwrap().contains("did not wake"),
+        "{text}"
+    );
+    assert_eq!(
+        lightbulb::login::stored_proof(e.state.path()).unwrap(),
+        "h.p.s"
+    );
+    let posts = (seen.lock().unwrap().iter())
+        .filter(|(p, _)| p == "/network/join-line")
+        .count();
+    assert!(posts >= 2, "{posts}");
+}
+
+#[test]
+fn a_network_nobody_answers_is_not_called_a_refusal() {
+    let (a, b) = (Env::new(), Env::new());
+    let id = a.identity();
+    let now = common::now_s();
+    let g = lightbulb::daemon::net_ops::genesis(&id, "aden", "mac", "acme", now);
+    lightbulb::roster::accept(&a.store(), &g, now).unwrap();
+    let r = lightbulb::roster::replay(&lightbulb::roster::entries(&a.store()).unwrap());
+    // A's ticket, and A never runs.
+    let t = lightbulb::ticket::sign(
+        &id,
+        &r,
+        format!("{}.t1", id.short),
+        "s".into(),
+        "open",
+        now + 60,
+        (String::new(), vec![]),
+        None,
+    );
+    let ticket = lightbulb::ticket::encode(&t);
+    b.daemon(
+        false,
+        "",
+        &[("LIGHTBULB_CONNECT_DEBUG_DIAL_WAIT_S", "1".into())],
+    );
+    let line = json!({"ticket": ticket, "name": "Aden"});
+    let (base, _) = workspace(acme(json!("t")), (200, line));
+    let out = login_detached(&b, &base, &["login"]);
+    let text = common::out(&out);
+    assert!(out.status.success(), "{text}{}", common::err(&out));
+    assert!(
+        text.ends_with("Couldn't reach your workspace's network; try lightbulb login again.\n"),
+        "{text}"
+    );
+    assert!(!text.contains("refused"), "{text}");
 }
