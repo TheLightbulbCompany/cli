@@ -541,9 +541,9 @@ fn a_worker_killed_with_its_daemon_sends_a_failed_result_on_restart() {
         .unwrap();
     assert!(killed.success(), "kill -9 the daemon");
     // The worker may already have exited on its closed pipes; either way its group goes.
-    let _ = Command::new("kill")
-        .args(["-9", &format!("-{pid}")])
-        .status();
+    // SAFETY: a plain syscall on the worker's own process group (`spawn` made it leader). Not
+    // `kill -9 -<pid>`: procps on Linux does not take that as a group.
+    unsafe { libc::killpg(pid as i32, libc::SIGKILL) };
     until(10, "B and its worker are gone", || {
         gone(pid) && std::os::unix::net::UnixStream::connect(p.b.state.path().join("sock")).is_err()
     });
