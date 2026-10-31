@@ -463,6 +463,16 @@ fn row_3_decline_refuses_declined() {
     p.wait_state("as1", "refused");
     assert_eq!(p.a.receipt(&p.asker(), "as1")["reason"], "declined");
     assert!(p.workers().is_empty());
+    // An asker waiting on its inbox hears it, long before the deadline.
+    let r = p.result("as1", 15);
+    assert!(
+        r["framed"]
+            .as_str()
+            .unwrap()
+            .contains("\"status\":\"failed\""),
+        "{r}"
+    );
+    assert!(r["framed"].as_str().unwrap().contains("declined"), "{r}");
 }
 
 #[test]
