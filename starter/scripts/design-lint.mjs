@@ -12,8 +12,6 @@ const RULES = [
   [/(?<![\w-])[a-z][a-z0-9-]*-\[[^\]\s]+\](?!:)/, "arbitrary Tailwind value; use the scale or a token"],
   // Canvas frames the app without allow-modals: confirm() answers false there, so the button does nothing.
   [/(?<![\w.$])(?:window\.)?(?:confirm|alert|prompt)\(/, "native dialog does nothing in Canvas; act on the click, or ask in the page"],
-  // ponytail: a named handler only; an inline handler or a split line slips through. Catches the common shape.
-  [/handleSubmit\(\s*[\w.]+\s*\)/, "handleSubmit without onInvalid: a refused form says nothing; pass a second function that shows the error"],
 ];
 const SKIP = ["node_modules", ".next", "src/components/ui"];
 

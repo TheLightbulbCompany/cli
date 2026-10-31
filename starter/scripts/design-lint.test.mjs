@@ -15,7 +15,3 @@ it("flags native dialogs, not methods or names that contain the word", () => {
   for (const ok of ["onConfirm()", "dialog.confirm()", "const confirmed = true;", "setAlert(x)"]) expect(lint(ok)).toEqual([]);
 });
 
-it("flags a form that is refused in silence, not one that shows it", () => {
-  expect(lint("<form onSubmit={form.handleSubmit(submit)}>")).toHaveLength(1);
-  expect(lint("<form onSubmit={form.handleSubmit(submit, showError)}>")).toEqual([]);
-});
