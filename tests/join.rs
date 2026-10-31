@@ -384,6 +384,7 @@ fn an_agent_joins_when_its_person_presses_join() {
     assert_eq!((members(&a).len(), members(&b).len()), (2, 2));
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn dont_join_refuses_an_agent_and_admits_nothing() {
     let (a, b, t) = agent_joiner(&[dialog("Don't join")]);
@@ -393,8 +394,9 @@ fn dont_join_refuses_an_agent_and_admits_nothing() {
     assert!(!log.contains("join: J"), "A heard no request: {log}");
 }
 
-/// `dialog("")`: no window can answer (off macOS, headless, SSH), and a timeout reads the same.
+/// `dialog("")`: no window can answer (SSH), and a timeout reads the same.
 /// The CLI runs under this pinned process: the agent is told what its person must do.
+#[cfg(target_os = "macos")]
 #[test]
 fn with_no_dialog_an_agent_is_refused_and_told_what_to_do() {
     let (a, b, t) = agent_joiner(&[dialog("")]);
@@ -413,6 +415,7 @@ fn with_no_dialog_an_agent_is_refused_and_told_what_to_do() {
 }
 
 /// The dialog's own words, and Don't join first (the default); a fake `osascript` that gives up.
+#[cfg(target_os = "macos")]
 #[test]
 fn the_dialog_says_what_happens_and_giving_up_is_no() {
     let d = tempfile::tempdir().unwrap();
@@ -440,6 +443,16 @@ fn the_dialog_says_what_happens_and_giving_up_is_no() {
         )),
         "{shown}"
     );
+}
+
+/// The desktop app exists only on macOS: elsewhere an agent joins as before, nobody asked.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn off_macos_an_agent_joins_with_no_dialog() {
+    let (a, b, t) = agent_joiner(&[dialog("Don't join")]);
+    let r = agent_join(&b, &t);
+    assert_eq!(r["state"], "admitted", "{r}");
+    assert_eq!((members(&a).len(), members(&b).len()), (2, 2));
 }
 
 #[test]

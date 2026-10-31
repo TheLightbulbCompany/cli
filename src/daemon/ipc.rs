@@ -366,12 +366,13 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
             }
         }
         // An agent fed a hostile link must not move this computer into another network: its
-        // person confirms (`admission::join`), and an unresolved caller is refused.
+        // person confirms (`admission::join`), and an unresolved caller is refused. The threat is
+        // a hosted page driving the desktop app, which exists only on macOS.
         "team.join" if !instance && caller.actor(&daemon.store.lock().unwrap()).is_none() => {
             refused(id, "not_a_person")
         }
         "team.join" => {
-            let agent = !instance && !caller.is_person();
+            let agent = cfg!(target_os = "macos") && !instance && !caller.is_person();
             crate::admission::join(id, body, daemon, agent).await
         }
         // `mark_read {key}` -> `{}`: `key`'s session took a step (an MCP tool call), so the mail

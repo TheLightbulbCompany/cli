@@ -38,7 +38,7 @@ pub const TOO_MANY: &str = "too_many_requests";
 pub const NOT_ANSWERED: &str = "not_answered";
 /// An agent's join: its person pressed Don't join. This computer's own, never on the wire.
 pub const PERSON_SAID_NO: &str = "person_said_no";
-/// An agent's join with no answer from a dialog (none here, or it timed out). Likewise.
+/// An agent's join with no answer from a dialog (none, as over SSH, or it timed out). Likewise.
 pub const NEEDS_A_PERSON: &str = "needs_a_person";
 /// `NEEDS_A_PERSON` as a sentence for the agent.
 pub const NEEDS_A_PERSON_TEXT: &str = "Lightbulb could not get an answer from your person on this computer. Ask your person to run lightbulb join in their own terminal.";
@@ -458,7 +458,7 @@ async fn person_confirms(d: &Daemon, t: Option<&Ticket>) -> Result<(), &'static 
 
 /// `team.join {ticket | code, name?}` -> `{state: admitted|waiting|refused, reason?, team,
 /// online}`. Only a solo computer joins; it asks the ticket's members in order, one at a time.
-/// `agent`: an agent asked, so its person confirms first.
+/// `agent`: an agent asked on macOS, so its person confirms first.
 pub async fn join(id: u64, body: &Value, d: &Arc<Daemon>, agent: bool) -> Response {
     let (ticket_in, code_in) = (body["ticket"].as_str(), body["code"].as_str());
     if ticket_in.is_some() == code_in.is_some() {

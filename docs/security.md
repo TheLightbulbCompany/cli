@@ -119,13 +119,15 @@ An agent may invite; only a person at a terminal can remove a member, leave a ne
 the relay: a command run from an agent's shell or tools is refused. It does not stop a program
 that you run yourself as your own user.
 
-An agent's join first asks the person in a native dialog on this computer, before anything is
-dialed: `An agent on this computer asked to join a team, invited by computer <key>. Teammates
+On macOS, where a script on the hosted page could drive the desktop app into starting an agent, an
+agent's join first asks the person in a native dialog on this computer, before anything is dialed: `An agent on this computer asked to join a team, invited by computer <key>. Teammates
 there will see your sessions' names, folders and status.`, with Join and Don't join. Don't join is
 the default, and it gives up after 10 minutes as a no. It shows even while the Lightbulb app holds
 its `ui.claim`, so a script on the hosted page can neither answer nor delay it. With no dialog
-(Linux, headless, SSH) the join is refused, and the person runs `lightbulb join` in their own
-terminal. A person's terminal, the desktop app's own join and a workspace member's are not asked.
+(over SSH, say) the join is refused, and the person runs `lightbulb join` in their own terminal. A
+person's terminal, the desktop app's own join, a workspace member's and an agent's off macOS are not
+asked. This confirm stops a prompted agent from joining by the normal route; it isn't a boundary
+against code running as the person, which can also detach or edit local state.
 
 The other prompts are that notice for an agent's invite and an agent's permission request that the
 Lightbulb app files (`lightbulb held`, `approve H<n>`).
