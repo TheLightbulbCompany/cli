@@ -1,7 +1,8 @@
 import { fileURLToPath } from "node:url";
-import { defineConfig } from "vitest/config";
+import { configDefaults, defineConfig } from "vitest/config";
 
 export default defineConfig({
   resolve: { alias: { "@": fileURLToPath(new URL("./src", import.meta.url)) } },
-  test: { environment: "node" },
+  // PGlite takes several seconds to start under load; addons/ only run once copied into an app.
+  test: { environment: "node", testTimeout: 30_000, exclude: [...configDefaults.exclude, "addons/**"] },
 });

@@ -181,6 +181,63 @@ fn signature(p: &Problem) -> String {
         .collect()
 }
 
+const DOOR_FILES: [&str; 2] = ["src/proxy.ts", "src/lib/door.ts"];
+const DOOR_HASH: &str = ".lightbulb/door.sha256";
+
+/// Hash of the door files as they are now; none when one is missing.
+pub(crate) fn door_hash(root: &Path) -> Option<String> {
+    let mut h = Sha256::new();
+    for f in DOOR_FILES {
+        h.update(std::fs::read(root.join(f)).ok()?);
+    }
+    Some(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Records the door files as the starter shipped them (`app new`).
+pub(crate) fn record_door(root: &Path) -> std::io::Result<()> {
+    match door_hash(root) {
+        Some(h) => std::fs::write(root.join(DOOR_HASH), h),
+        None => Ok(()),
+    }
+}
+
+/// A problem when the door files differ from the recorded hash. Apps made before the hash was
+/// recorded have none, and are never failed.
+fn door_problem(root: &Path) -> Option<Problem> {
+    let want = std::fs::read_to_string(root.join(DOOR_HASH)).ok()?;
+    (door_hash(root).as_deref() != Some(want.trim())).then(|| Problem {
+        file: DOOR_FILES[0].into(),
+        line: 1,
+        column: None,
+        code: Some("door".into()),
+        message: "src/proxy.ts or src/lib/door.ts was changed. They decide who can open the app; \
+            restore them with: git checkout $(git rev-list --max-parents=0 HEAD) -- src/proxy.ts src/lib/door.ts"
+            .into(),
+    })
+}
+
+/// Counts a failed build of `up` in `progress.json` (`build_failures`), apart from the local
+/// problems so a passing check does not clear it; a ready build clears it. Returns the step to
+/// tell the builder once it has failed twice or more.
+pub(crate) fn count_build(
+    root: &Path,
+    failed: bool,
+) -> std::result::Result<Option<&'static str>, ApiError> {
+    let mut progress = read_progress(root)?;
+    let n = if failed {
+        progress["build_failures"].as_u64().unwrap_or(0) + 1
+    } else {
+        0
+    };
+    progress["build_failures"] = n.into();
+    write_progress(root, &progress)?;
+    Ok(match n {
+        0 | 1 => None,
+        2 => Some(DIAGNOSE),
+        _ => Some(UNDO),
+    })
+}
+
 /// Runs the check in `root`, updates `.lightbulb/progress.json` and returns what to do next.
 /// Prints nothing.
 pub(crate) fn run_check(root: &Path, publish: bool) -> std::result::Result<CheckResult, ApiError> {
@@ -208,7 +265,7 @@ pub(crate) fn run_check(root: &Path, publish: bool) -> std::result::Result<Check
                 ApiError::new("check_failed", &format!("Could not run pnpm: {e}"), "try again")
             }
         })?;
-    let ok = out.status.success();
+    let mut ok = out.status.success();
     let text = format!(
         "{}\n{}",
         String::from_utf8_lossy(&out.stdout),
@@ -229,6 +286,10 @@ pub(crate) fn run_check(root: &Path, publish: bool) -> std::result::Result<Check
                 .trim()
                 .into(),
         });
+    }
+    if let Some(p) = door_problem(root) {
+        ok = false;
+        problems.push(p);
     }
     let next = update_progress(root, ok, publish, &problems)?;
     Ok(CheckResult { ok, problems, next })

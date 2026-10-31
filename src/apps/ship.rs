@@ -543,6 +543,13 @@ pub(crate) fn up(
     if let Err(e) = wait(auth, &id, &mut r) {
         return Ok(failure(json, e));
     }
+    if r["state"] == "failed" || finished(&r["state"]) {
+        match check::count_build(root, r["state"] == "failed") {
+            Ok(Some(next)) if r["state"] == "failed" => r["error"]["next"] = next.into(),
+            Ok(_) => {}
+            Err(e) => return Ok(failure(json, e)),
+        }
+    }
     if r["state"] == "failed" || building(&r) {
         return Ok(show(&r, "up", json!({}), json));
     }

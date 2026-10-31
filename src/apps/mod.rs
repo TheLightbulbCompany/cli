@@ -420,6 +420,7 @@ pub fn new(name: &str, room: Option<&str>, kind: Kind, json: bool) -> Result<i32
         r#ref: None,
     };
     config.write(&dir)?;
+    check::record_door(&dir)?;
     // The playbook is the plan's first section.
     let plan = dir.join(".lightbulb/plan.md");
     let playbook = std::fs::read_to_string(dir.join(format!("playbooks/{}.md", word(&kind))))?;
