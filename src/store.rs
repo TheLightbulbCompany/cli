@@ -799,6 +799,21 @@ impl Store {
         rows.collect()
     }
 
+    /// Assignments from a key under `prefix` that their host's person declined and that no
+    /// result replies to yet, oldest first.
+    pub fn declined_assignments(&self, prefix: &str) -> rusqlite::Result<Vec<Message>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.* FROM messages m JOIN receipts c \
+             ON c.from_key = m.from_key AND c.request_id = m.request_id \
+             WHERE m.kind = 'assign' AND substr(m.from_key, 1, ?1) = ?2 \
+             AND c.state = 'refused' AND c.reason = 'declined' AND NOT EXISTS \
+             (SELECT 1 FROM messages r WHERE r.kind = 'result' AND r.reply_to = m.id) \
+             ORDER BY m.rowid",
+        )?;
+        let rows = stmt.query_map(params![prefix.len() as i64, prefix], row_message)?;
+        rows.collect()
+    }
+
     /// `(open, latest)` for assignments from `key`: how many have no result and a deadline after
     /// `now`, and the newest `sent_at` among those and the results that reply to any assignment
     /// from `key` (0 when none).

@@ -1256,6 +1256,16 @@ impl Net {
                     if moved {
                         receipt_changed(d, &id, state.name(), reason);
                     }
+                    // A decline closes the assignment now: its asker may be waiting on its inbox.
+                    if moved && reason == Some("declined") {
+                        let closed =
+                            mail::expire_assignments(&store, &d.identity.short, ipc::now());
+                        drop(store);
+                        match closed {
+                            Ok(woken) => woken.iter().for_each(|(k, m)| ipc::stored(d, k, Some(m))),
+                            Err(e) => eprintln!("net: close declined: {e}"),
+                        }
+                    }
                 }
                 Ok(None) => {
                     eprintln!("net: dropped an answer from {short} for {id} (not sent there)")

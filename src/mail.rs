@@ -1223,42 +1223,63 @@ pub fn expire_delivered(store: &Store, short: &str, now: u64) -> Result<()> {
 /// message id, to wake. A real result arriving later is ordinary mail: `result_of` keeps
 /// naming the oldest, this one.
 pub fn expire_assignments(store: &Store, me: &str, now: u64) -> Result<Vec<(Key, String)>> {
+    let prefix = format!("{me}/");
     let mut askers = vec![];
-    for a in store.open_assignments_past(&format!("{me}/"), now as i64)? {
+    for a in store.open_assignments_past(&prefix, now as i64)? {
         let at = a.meta.deadline_at.unwrap_or_default();
-        let p = Prepared {
-            message_id: ulid::Ulid::generate().to_string(),
-            from: Key(a.to_key.clone()),
-            to: Key(a.from_key.clone()),
-            text: format!(
-                "deadline passed: no result from {} by {}",
-                a.to_key,
-                crate::date::local_time(at)
-            ),
-            request_id: format!("timeout-{}", a.id),
-            reply_to: Some(a.id.clone()),
-            thread: a.thread.clone().unwrap_or_else(|| a.id.clone()),
-            hops: a.hops + 1,
-            kind: "result".into(),
-            meta: Meta {
-                status: Some("failed".into()),
-                reason: Some("timed_out".into()),
-                ..Meta::default()
-            },
-            sent_at: now as i64,
-        };
-        // One transaction each: an assignment that cannot be closed never stops the others.
-        let stored = (|| -> Result<()> {
-            let tx = store.conn().unchecked_transaction()?;
-            record(store, &p, Origin::Local, false)?;
-            Ok(tx.commit()?)
-        })();
-        match stored {
-            Ok(()) => askers.push((Key(a.from_key), p.message_id)),
-            Err(e) => eprintln!("mail: assignment {} not timed out: {e}", a.id),
-        }
+        let text = format!(
+            "deadline passed: no result from {} by {}",
+            a.to_key,
+            crate::date::local_time(at)
+        );
+        close_assignment(store, &a, text, "timeout", "timed_out", now, &mut askers);
+    }
+    // A decline only moves the receipt: an asker waiting on its inbox hears it here.
+    for a in store.declined_assignments(&prefix)? {
+        let text = format!("declined: {} did not start a worker", a.to_key);
+        close_assignment(store, &a, text, "declined", "declined", now, &mut askers);
     }
     Ok(askers)
+}
+
+/// Stores a `failed` result for assignment `a` from its assignee in the asker's mailbox and adds
+/// the asker to `askers`, to wake.
+fn close_assignment(
+    store: &Store,
+    a: &Message,
+    text: String,
+    tag: &str,
+    reason: &str,
+    now: u64,
+    askers: &mut Vec<(Key, String)>,
+) {
+    let p = Prepared {
+        message_id: ulid::Ulid::generate().to_string(),
+        from: Key(a.to_key.clone()),
+        to: Key(a.from_key.clone()),
+        text,
+        request_id: format!("{tag}-{}", a.id),
+        reply_to: Some(a.id.clone()),
+        thread: a.thread.clone().unwrap_or_else(|| a.id.clone()),
+        hops: a.hops + 1,
+        kind: "result".into(),
+        meta: Meta {
+            status: Some("failed".into()),
+            reason: Some(reason.into()),
+            ..Meta::default()
+        },
+        sent_at: now as i64,
+    };
+    // One transaction each: an assignment that cannot be closed never stops the others.
+    let stored = (|| -> Result<()> {
+        let tx = store.conn().unchecked_transaction()?;
+        record(store, &p, Origin::Local, false)?;
+        Ok(tx.commit()?)
+    })();
+    match stored {
+        Ok(()) => askers.push((Key(a.from_key.clone()), p.message_id)),
+        Err(e) => eprintln!("mail: assignment {} not closed: {e}", a.id),
+    }
 }
 
 /// The ids of `delivered_unread`'s messages for which `bound` (on `r.updated_at`, the delivery
