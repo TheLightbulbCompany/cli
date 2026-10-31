@@ -1734,9 +1734,9 @@ mod tests {
         assert_eq!(store.session("k").unwrap().unwrap().waiting_for, None);
         assert!(store.end_session("k", 5, "session-end", None).unwrap());
         drop(store);
-        assert_eq!(user_version(&path), 15);
+        assert_eq!(user_version(&path), MIGRATIONS.len() as i64);
         // Opening again changes nothing.
         drop(Store::open(&path).unwrap());
-        assert_eq!(user_version(&path), 15);
+        assert_eq!(user_version(&path), MIGRATIONS.len() as i64);
     }
 }
