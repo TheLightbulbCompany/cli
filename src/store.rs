@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 /// tables or columns, but V12, which drops and recreates `memory_fts` (stemmed) from the
 /// entries; each runs once (in the transaction that moves `user_version`).
 const MIGRATIONS: &[&str] = &[
-    V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15, V16, V17,
+    V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15,
 ];
 
 const V1: &str = "
@@ -151,26 +151,6 @@ ALTER TABLE capture_sessions ADD COLUMN nudged INTEGER NOT NULL DEFAULT 0;
 /// Why a held memory entry has no body when it was refused rather than forgotten
 /// (`refused:<pattern>`: a peer's entry that looks like a credential).
 const V15: &str = "ALTER TABLE memory_entries ADD COLUMN reason TEXT;";
-/// An assignment's answer names the message it answers (`reply_to`) and carries the job's
-/// terms (`meta`, JSON, NULL when empty); `stop_guard_at` is when a session's Stop hook last
-/// held it for unanswered work.
-const V16: &str = "
-ALTER TABLE messages ADD COLUMN reply_to TEXT;
-ALTER TABLE messages ADD COLUMN meta TEXT;
-ALTER TABLE sessions ADD COLUMN stop_guard_at INTEGER;
-CREATE INDEX IF NOT EXISTS messages_reply_to ON messages (reply_to);
-";
-/// Network workers: one row per headless worker a computer started for an assignment
-/// (`assignment` is the assign message id; `state` is starting, running, done, failed, stopped
-/// or cancelled).
-const V17: &str = "
-CREATE TABLE workers (
-    id INTEGER PRIMARY KEY, assignment TEXT NOT NULL UNIQUE, session TEXT NOT NULL,
-    provider TEXT NOT NULL, folder TEXT NOT NULL, pid INTEGER, started_at INTEGER NOT NULL,
-    ended_at INTEGER, state TEXT NOT NULL, by TEXT
-);
-CREATE INDEX IF NOT EXISTS workers_session ON workers (session);
-";
 
 /// Memory: signed entries numbered per author, with a full-text index over `subject` and `fact`
 /// (`memory`). `rowid` is explicit so it survives `VACUUM` (the FTS index points at it). A
@@ -328,30 +308,50 @@ pub(crate) fn row_message(r: &rusqlite::Row) -> rusqlite::Result<Message> {
     })
 }
 
-/// Why a session ended, what a waiting one waits for, and whether it is headless: nullable columns
-/// added on open, not by a migration, so `user_version` stays and an older build can still open this db (it ignores
-/// them).
-fn add_session_columns(conn: &Connection) -> crate::Result<()> {
-    let has = |column: &str| -> rusqlite::Result<bool> {
-        conn.prepare("SELECT 1 FROM pragma_table_info('sessions') WHERE name = ?1")?
-            .exists([column])
+/// What was added after V15, on open and not by a migration, so `user_version` stays and an older
+/// build can still open this db (it ignores them), even with network workers never turned on.
+/// `sessions`: why it ended, what a waiting one waits for, whether it is headless, and when its
+/// Stop hook last held it for unanswered work. `messages`: the message an answer answers
+/// (`reply_to`) and an assignment's terms (`meta`, JSON).
+const ADDED_COLUMNS: [(&str, &str, &str); 6] = [
+    ("sessions", "reason", "TEXT"),
+    ("sessions", "waiting_for", "TEXT"),
+    ("sessions", "headless", "INTEGER"),
+    ("sessions", "stop_guard_at", "INTEGER"),
+    ("messages", "reply_to", "TEXT"),
+    ("messages", "meta", "TEXT"),
+];
+/// Network workers: one row per headless worker a computer started for an assignment
+/// (`assignment` is the assign message id; `state` is starting, running, done, failed, stopped
+/// or cancelled).
+const ADDED_TABLES: &str = "
+CREATE INDEX IF NOT EXISTS messages_reply_to ON messages (reply_to);
+CREATE TABLE IF NOT EXISTS workers (
+    id INTEGER PRIMARY KEY, assignment TEXT NOT NULL UNIQUE, session TEXT NOT NULL,
+    provider TEXT NOT NULL, folder TEXT NOT NULL, pid INTEGER, started_at INTEGER NOT NULL,
+    ended_at INTEGER, state TEXT NOT NULL, by TEXT
+);
+CREATE INDEX IF NOT EXISTS workers_session ON workers (session);
+";
+
+fn add_schema_on_open(conn: &Connection) -> crate::Result<()> {
+    let has = |table: &str, column: &str| -> rusqlite::Result<bool> {
+        conn.prepare("SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2")?
+            .exists([table, column])
     };
-    for (column, kind) in [
-        ("reason", "TEXT"),
-        ("waiting_for", "TEXT"),
-        ("headless", "INTEGER"),
-    ] {
-        if has(column)? {
+    for (table, column, kind) in ADDED_COLUMNS {
+        if has(table, column)? {
             continue;
         }
-        let add = format!("ALTER TABLE sessions ADD COLUMN {column} {kind}");
+        let add = format!("ALTER TABLE {table} ADD COLUMN {column} {kind}");
         // A second connection opening beside this one may have just added it.
         if let Err(e) = conn.execute_batch(&add) {
-            if !has(column)? {
+            if !has(table, column)? {
                 return Err(e.into());
             }
         }
     }
+    conn.execute_batch(ADDED_TABLES)?;
     Ok(())
 }
 
@@ -384,7 +384,7 @@ impl Store {
             tx.pragma_update(None, "user_version", i + 1)?;
             tx.commit()?;
         }
-        add_session_columns(&conn)?;
+        add_schema_on_open(&conn)?;
         let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
         Ok(Store { conn, dir })
     }
@@ -1623,11 +1623,12 @@ mod tests {
     }
 
     #[test]
-    fn v17_adds_the_workers_table_and_a_worker_round_trips() {
+    fn the_workers_table_is_added_on_open_and_a_worker_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db");
         let store = Store::open(&path).unwrap();
-        assert_eq!(user_version(&path), 17);
+        // Not a migration: an older build still opens this db.
+        assert_eq!(user_version(&path), 15);
         let w = Worker {
             id: 0,
             assignment: "a1".into(),
@@ -1669,14 +1670,14 @@ mod tests {
     }
 
     #[test]
-    fn a_message_keeps_its_reply_to_and_meta_and_v16_adds_them() {
+    fn a_message_keeps_its_reply_to_and_meta() {
         let dir = tempfile::tempdir().unwrap();
         let s = Store::open(&dir.path().join("state.db")).unwrap();
         let v: i64 = s
             .conn()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 17);
+        assert_eq!(v, 15);
         let meta = crate::mail::Meta {
             done_when: Some("tests pass".into()),
             deadline_at: Some(99),
@@ -1726,7 +1727,11 @@ mod tests {
             .unwrap()
             .execute_batch(
                 "ALTER TABLE sessions DROP COLUMN reason;
-                 ALTER TABLE sessions DROP COLUMN waiting_for;",
+                 ALTER TABLE sessions DROP COLUMN waiting_for;
+                 DROP INDEX messages_reply_to;
+                 ALTER TABLE messages DROP COLUMN reply_to;
+                 ALTER TABLE sessions DROP COLUMN stop_guard_at;
+                 DROP TABLE workers;",
             )
             .unwrap();
         let store = Store::open(&path).unwrap();
@@ -1734,9 +1739,9 @@ mod tests {
         assert_eq!(store.session("k").unwrap().unwrap().waiting_for, None);
         assert!(store.end_session("k", 5, "session-end", None).unwrap());
         drop(store);
-        assert_eq!(user_version(&path), MIGRATIONS.len() as i64);
+        assert_eq!(user_version(&path), 15);
         // Opening again changes nothing.
         drop(Store::open(&path).unwrap());
-        assert_eq!(user_version(&path), MIGRATIONS.len() as i64);
+        assert_eq!(user_version(&path), 15);
     }
 }
