@@ -40,14 +40,17 @@ export async function verifyPass(token: string, now = new Date()): Promise<Viewe
 }
 
 /** The `Set-Cookie` value that keeps this viewer signed in: 24 hours, or 30 minutes for a preview-only pass. */
-export async function sessionCookie(v: Viewer): Promise<string> {
+export async function sessionCookie(v: Viewer, framed = false): Promise<string> {
   const life = v.app === process.env.LIGHTBULB_PREVIEW_APP ? TEST_SESSION : DAY;
   const token = await new SignJWT({ ...v })
     .setProtectedHeader({ alg: "HS256" })
     .setIssuedAt()
     .setExpirationTime(`${life}s`)
     .sign(cookieSecret());
-  return `${SESSION_COOKIE}=${token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${life}`;
+  // Inside Canvas the app is a cross-site frame, where the browser drops a Lax cookie. A partitioned
+  // one is kept and is only ever sent under the site that framed it, so other sites can't ride it.
+  const site = framed ? "SameSite=None; Partitioned" : "SameSite=Lax";
+  return `${SESSION_COOKIE}=${token}; HttpOnly; Secure; ${site}; Path=/; Max-Age=${life}`;
 }
 
 /** Reads a session cookie value; null when it is missing, forged, expired or for another app. */
