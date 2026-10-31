@@ -231,6 +231,7 @@ pub(crate) async fn boot(
         dialogs,
         dialog_answers: Mutex::new(Some(answers)),
         answered_by: Mutex::default(),
+        join_confirm: Mutex::default(),
         agent_invites: Mutex::default(),
         roster_changed: Default::default(),
         joining: tokio::sync::Mutex::new(()),

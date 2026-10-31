@@ -49,6 +49,9 @@ pub fn args(title: &str, text: &str, buttons: &[&str]) -> Vec<String> {
     a
 }
 
+/// The dialog id of an agent's `team.join`: `show_over_claim`, one at a time (`Daemon::joining`).
+pub const JOIN_CONFIRM: &str = "JC";
+
 /// Dialog id `<prefix><n>`'s `n` (`J` a join request, `H` a hold).
 pub fn number(id: &str, prefix: char) -> Option<i64> {
     id.strip_prefix(prefix)?.parse().ok()
@@ -123,6 +126,15 @@ impl Queue {
         self.0.wake.notify_one();
     }
 
+    /// Queues dialog `id` next, and shows it through a `ui.claim`: a page in the app that holds
+    /// the claim must not be what answers, or delays, this question.
+    pub fn show_over_claim(&self, id: &str, args: Vec<String>) {
+        let mut s = self.0.state.lock().unwrap();
+        s.waiting.push_front((id.into(), args));
+        drop(s);
+        self.0.wake.notify_one();
+    }
+
     /// Takes dialog `id` off the screen or out of the queue; it answers nothing.
     pub fn withdraw(&self, id: &str) {
         let mut s = self.0.state.lock().unwrap();
@@ -172,12 +184,16 @@ async fn run(inner: Arc<Inner>) {
             return;
         }
         let left = inner.claim_until.load(Relaxed) - now() as i64;
-        let idle = inner.state.lock().unwrap().waiting.is_empty();
+        let (idle, over_claim) = {
+            let s = inner.state.lock().unwrap();
+            let head = s.waiting.front();
+            (head.is_none(), head.is_some_and(|(i, _)| i == JOIN_CONFIRM))
+        };
         if idle {
             inner.wake.notified().await;
             continue;
         }
-        if left > 0 {
+        if left > 0 && !over_claim {
             let wait = Duration::from_secs(left.min(1) as u64);
             let _ = tokio::time::timeout(wait, inner.wake.notified()).await;
             continue;

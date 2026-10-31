@@ -358,19 +358,119 @@ fn admitted_candidate_that_lost_the_roster_rejoins() {
     converged(&a, &b, 2);
 }
 
-#[test]
-fn an_agent_may_join() {
+/// A's link, and a B whose daemon takes this test process for an agent, with `env` set.
+fn agent_joiner(env: &[(&str, String)]) -> (Env, Env, String) {
     let (a, b) = (Env::new(), Env::new());
     a.daemon(false, "", &[dialog("Allow")]);
     let t = invite(&a, "reusable");
-    // B's daemon takes this test process for an agent.
     let me = std::process::id();
     let birth = lightbulb::os::process(me).unwrap().birth_micros;
     let pin = ("LIGHTBULB_CONNECT_HOOK_CALLER", format!("{me}:{birth}"));
-    b.daemon(false, "", &[peers(&[&a]), pin]);
-    let r = b.ask(json!({"id": 1, "op": "team.join", "ticket": t, "name": "bob"}));
+    let mut all = vec![peers(&[&a]), pin];
+    all.extend(env.iter().map(|(k, v)| (*k, v.clone())));
+    b.daemon(false, "", &all);
+    (a, b, t)
+}
+
+fn agent_join(b: &Env, t: &str) -> Value {
+    b.ask(json!({"id": 1, "op": "team.join", "ticket": t, "name": "bob"}))
+}
+
+#[test]
+fn an_agent_joins_when_its_person_presses_join() {
+    let (a, b, t) = agent_joiner(&[dialog("Join")]);
+    let r = agent_join(&b, &t);
     assert_eq!(r["state"], "admitted", "{r}");
     assert_eq!((members(&a).len(), members(&b).len()), (2, 2));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn dont_join_refuses_an_agent_and_admits_nothing() {
+    let (a, b, t) = agent_joiner(&[dialog("Don't join")]);
+    refused(&agent_join(&b, &t), admission::PERSON_SAID_NO);
+    assert_eq!((members(&a).len(), members(&b).len()), (1, 1));
+    let log = std::fs::read_to_string(a.state.path().join("daemon.log")).unwrap();
+    assert!(!log.contains("join: J"), "A heard no request: {log}");
+}
+
+/// `dialog("")`: no window can answer (SSH), and a timeout reads the same.
+/// The CLI runs under this pinned process: the agent is told what its person must do.
+#[cfg(target_os = "macos")]
+#[test]
+fn with_no_dialog_an_agent_is_refused_and_told_what_to_do() {
+    let (a, b, t) = agent_joiner(&[dialog("")]);
+    refused(&agent_join(&b, &t), admission::NEEDS_A_PERSON);
+    let o = b
+        .base_cmd(std::process::Command::new(EXE))
+        .args(["join", &t, "--name", "bob"])
+        .output()
+        .unwrap();
+    assert!(
+        err(&o).contains(admission::NEEDS_A_PERSON_TEXT),
+        "{}",
+        err(&o)
+    );
+    assert_eq!((members(&a).len(), members(&b).len()), (1, 1));
+}
+
+/// The dialog's own words, and Don't join first (the default); a fake `osascript` that gives up.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_dialog_says_what_happens_and_giving_up_is_no() {
+    let d = tempfile::tempdir().unwrap();
+    let log = d.path().join("log");
+    let fake = common::script(
+        d.path(),
+        &format!(
+            "printf '%s\\n' \"$@\" >{}\necho 'button returned:Join, gave up:true'",
+            log.display()
+        ),
+    );
+    let (_a, b, t) = agent_joiner(&[(
+        "LIGHTBULB_CONNECT_DEBUG_OSASCRIPT",
+        fake.display().to_string(),
+    )]);
+    refused(&agent_join(&b, &t), admission::NEEDS_A_PERSON);
+    assert_eq!(members(&b).len(), 1);
+    let shown = std::fs::read_to_string(&log).unwrap();
+    let inviter = lightbulb::ticket::decode(&t).unwrap().inviter;
+    assert!(
+        shown.contains(&format!(
+            "An agent on this computer asked to join a team, invited by computer {}. Teammates \
+             there will see your sessions' names, folders and status.\nDon't join\nJoin\n",
+            &inviter[..12]
+        )),
+        "{shown}"
+    );
+}
+
+/// The desktop app exists only on macOS: elsewhere an agent joins as before, nobody asked.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn off_macos_an_agent_joins_with_no_dialog() {
+    let (a, b, t) = agent_joiner(&[dialog("Don't join")]);
+    let r = agent_join(&b, &t);
+    assert_eq!(r["state"], "admitted", "{r}");
+    assert_eq!((members(&a).len(), members(&b).len()), (2, 2));
+}
+
+#[test]
+fn a_persons_join_shows_no_dialog() {
+    // Any dialog would answer Don't join, and refuse.
+    let (a, b) = (Env::new(), Env::new());
+    a.daemon(false, "", &[dialog("Allow")]);
+    let t = invite(&a, "reusable");
+    b.daemon(false, "", &[peers(&[&a]), dialog("Don't join")]);
+    let r = join(&b, &t, "bob");
+    assert_eq!(r["state"], "admitted", "{r}");
+}
+
+/// An unusable ticket bothers no one.
+#[test]
+fn an_agents_doomed_join_asks_no_one() {
+    let (_a, b, _t) = agent_joiner(&[dialog("Don't join")]);
+    refused(&agent_join(&b, "nonsense"), admission::BAD_TICKET);
 }
 
 #[test]

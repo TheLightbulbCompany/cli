@@ -44,6 +44,22 @@ async fn claim_suppresses_dialog_for_20_seconds() {
     assert_eq!(a, Some(("1".into(), Some("Allow".into()))));
 }
 
+/// A page in the app may hold the claim all day: an agent's join still reaches the person.
+#[tokio::test]
+async fn a_join_confirm_shows_through_a_claim() {
+    let d = tempfile::tempdir().unwrap();
+    let prog = script(d.path(), "echo 'button returned:Join'");
+    let (q, mut rx) = Queue::new(prog);
+    q.claim(ipc::now() as i64);
+    q.show("1", dialog::args("T", "x", &["Allow"]));
+    q.show_over_claim(dialog::JOIN_CONFIRM, dialog::args("T", "x", &["Join"]));
+    let a = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap();
+    assert_eq!(a, Some((dialog::JOIN_CONFIRM.into(), Some("Join".into()))));
+    q.withdraw("1");
+}
+
 #[test]
 fn ui_claim_is_person_only() {
     let env = Env::new();

@@ -484,6 +484,12 @@ fn join_workspace() -> Result<Option<String>> {
                 "Couldn't reach your workspace's network; try lightbulb login again.".into(),
             ))
         }
+        (_, Some(crate::admission::NEEDS_A_PERSON)) => {
+            return Err(crate::admission::NEEDS_A_PERSON_TEXT.into())
+        }
+        (_, Some(crate::admission::PERSON_SAID_NO)) => {
+            return Err(crate::admission::PERSON_SAID_NO_TEXT.into())
+        }
         (_, why) => {
             let why = why.unwrap_or("refused").replace('_', " ");
             return Err(

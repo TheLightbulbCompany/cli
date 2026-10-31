@@ -13,7 +13,8 @@ another member (not itself, and never the founder, which can only leave), rename
 computer that started the team.
 
 Only a person at a terminal can run `remove`, `leave` and `relay <url>`. An agent may run
-`invite` and `join`. An agent's invite is always one-time. When someone joins with it,
+`invite` and `join`; on macOS a join needs its person to press Join in a dialog (where no dialog can
+show, the person runs `join` in their own terminal). An agent's invite is always one-time. When someone joins with it,
 Lightbulb records the agent's session (`<member>/<handle>`): `lightbulb team` says
 `admitted by <session>`, the signed `admit` entry carries it, and a dialog tells the person
 (`<agent> invited <name> into your network.`) with Keep and Remove. Remove removes that member.

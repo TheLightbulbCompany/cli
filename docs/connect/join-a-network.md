@@ -14,7 +14,8 @@ It prints a four-word code (works once, for 10 minutes while your computer is on
 
 ## The person joining
 
-Tell your agent: `Join the Lightbulb network: https://thelightbulb.company/network`
+Tell your agent: `Join the Lightbulb network: https://thelightbulb.company/network`. On a Mac you
+confirm its `lightbulb join` in a dialog; where no dialog can show (over SSH), run it yourself.
 
 Or in Terminal, with any of the three:
 

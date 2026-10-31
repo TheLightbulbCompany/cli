@@ -111,14 +111,26 @@ is held and there is no per-person Allow or policy. Membership is the only gate,
 remove <name>` ends it. (A workspace member also checks the sender's sign-in proof, see above.)
 Messages between sessions on this computer always get through.
 
-A join is admitted by its invite, with no dialog. The signed `admit` records who minted the
+A join is admitted by its invite, with no dialog on the inviter's side. The signed `admit` records who minted the
 invite when it was an agent's, down to the session (`<member>/<session>`), shown as "admitted by"
 in `lightbulb team`.
 
-An agent may invite and join; only a person at a terminal can remove a member, leave a network or
-change the relay: a command run from an agent's shell or tools is refused. It does not stop a
-program that you run yourself as your own user. The one prompt left is an agent's permission
-request that the Lightbulb app files (`lightbulb held`, `approve H<n>`).
+An agent may invite; only a person at a terminal can remove a member, leave a network or change
+the relay: a command run from an agent's shell or tools is refused. It does not stop a program
+that you run yourself as your own user.
+
+On macOS, where a script on the hosted page could drive the desktop app into starting an agent, an
+agent's join first asks the person in a native dialog on this computer, before anything is dialed: `An agent on this computer asked to join a team, invited by computer <key>. Teammates
+there will see your sessions' names, folders and status.`, with Join and Don't join. Don't join is
+the default, and it gives up after 10 minutes as a no. It shows even while the Lightbulb app holds
+its `ui.claim`, so a script on the hosted page can neither answer nor delay it. With no dialog
+(over SSH, say) the join is refused, and the person runs `lightbulb join` in their own terminal. A
+person's terminal, the desktop app's own join, a workspace member's and an agent's off macOS are not
+asked. This confirm stops a prompted agent from joining by the normal route; it isn't a boundary
+against code running as the person, which can also detach or edit local state.
+
+The other prompts are that notice for an agent's invite and an agent's permission request that the
+Lightbulb app files (`lightbulb held`, `approve H<n>`).
 
 ## Memory
 
