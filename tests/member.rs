@@ -567,6 +567,25 @@ async fn a_computer_rings_the_doorbell_only_after_a_failed_dial() {
     let dir = tempfile::tempdir().unwrap();
     let (a, child, token, sock, _) = doorbell(dir.path());
     let to = rang(dir.path(), &a, child, &token, &sock);
+    // A parked member says so: online false, wakes true, and `who --all` in those words.
+    let row = a.ask(json!({"id": 1, "op": "directory"}))["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["session_id"] == to.as_str())
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        (&row["online"], &row["wakes"]),
+        (&json!(false), &json!(true)),
+        "{row}"
+    );
+    let o = a.detached(&[common::EXE, "who", "--all"], "");
+    assert!(
+        common::out(&o).contains("parked, wakes when messaged"),
+        "{}",
+        common::out(&o)
+    );
     let calls = rings(dir.path());
     assert_eq!(
         calls[0],

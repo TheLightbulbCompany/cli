@@ -5,7 +5,7 @@
 use iroh::Endpoint;
 use lightbulb::daemon::ipc;
 use lightbulb::identity::Identity;
-use lightbulb::net::frames::{Frame, Remote};
+use lightbulb::net::frames::{Ended, Frame, Remote};
 use lightbulb::os;
 use lightbulb::roster::Entry;
 use serde_json::{json, Value};
@@ -85,7 +85,12 @@ async fn each_member_sees_the_whole_directory() {
         (&mine["cwd"], &mine["person"], &mine["computer"]),
         (&json!("/tmp/work/api"), &json!("prasiddha"), &json!("mac"))
     );
-    assert_eq!(mine["needs_owner_ok"], false);
+    for r in &on_a {
+        assert!(
+            r.get("can_send").is_none() && r.get("needs_owner_ok").is_none(),
+            "{r}"
+        );
+    }
     for (field, want) in [
         ("cwd", json!("")),
         ("person", json!("bob")),
@@ -93,11 +98,18 @@ async fn each_member_sees_the_whole_directory() {
         ("computer", json!("mbp")),
         ("agent", json!("claude")),
         ("status", json!("idle")),
-        ("can_send", json!(true)),
-        ("needs_owner_ok", json!(true)),
+        ("folder", json!("web")),
+        ("wakes", json!(false)),
+        ("online", json!(true)),
     ] {
         assert_eq!(theirs[field], want, "{field}: {theirs}");
     }
+    assert!(theirs.get("seen_at").is_none(), "{theirs}");
+    assert_eq!(mine["folder"], "api", "{mine}");
+    assert!(
+        mine["pid"].is_u64() && mine["birth_micros"].is_u64(),
+        "{mine}"
+    );
     // The query matches person, computer, agent, repo, folder and session id, any case.
     // (A random member key may itself contain the query: only such an id may join.)
     let only = |q: &str, want: &str| {
@@ -156,6 +168,190 @@ async fn each_member_sees_the_whole_directory() {
         .iter()
         .filter(|s| s["session_id"] == kb2.as_str());
     assert!(theirs.into_iter().all(|s| s["handle"].is_null()), "{d}");
+
+    // B's computer stops: its session stays listed, offline since then.
+    assert_eq!(b.ask(json!({"id": 1, "op": "shutdown"}))["ok"], true);
+    let row = || {
+        directory(&a, None)
+            .into_iter()
+            .find(|r| r["session_id"] == kb2.as_str())
+            .unwrap()
+    };
+    until(15, "A sees B offline", || row()["online"] == false);
+    let seen_at = row()["seen_at"].as_i64().unwrap();
+    assert!((common::now_s() - seen_at).abs() < 60, "{seen_at}");
+    assert!(directory(&a, None)
+        .iter()
+        .find(|r| r["session_id"] == ka.as_str())
+        .unwrap()
+        .get("seen_at")
+        .is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_record_says_who_its_proof_claims() {
+    let (a, b) = (Env::new(), Env::new());
+    seed_pair(&a, &b);
+    a.sign_in("user_aden", None);
+    start_pair(&a, &b, "", &[]);
+    assert_eq!(register(&a, "codex", "a1", "/tmp/work/api")["ok"], true);
+    assert_eq!(register(&b, "codex", "b1", "/tmp/work/web")["ok"], true);
+    let (ka, kb) = (
+        format!("{}/codex:a1", a.short()),
+        format!("{}/codex:b1", b.short()),
+    );
+    until(10, "each sees both", || sees(&a, &kb) && sees(&b, &ka));
+    let of = |e: &Env, key: &str| {
+        directory(e, None)
+            .into_iter()
+            .find(|r| r["session_id"] == key)
+            .unwrap()
+    };
+    assert_eq!(of(&a, &ka)["user_id"], "user_aden");
+    assert_eq!(of(&b, &ka)["user_id"], "user_aden");
+    assert!(of(&a, &kb).get("user_id").is_none());
+    assert!(of(&b, &kb).get("user_id").is_none());
+}
+
+/// A bad row costs only itself: not its sessions, not the other ended rows, whatever else the
+/// sender sent. A reason this build does not know reads as given.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_bad_ended_row_costs_only_itself() {
+    let (a, b) = (Env::new(), Env::new());
+    let [_, admit] = seed_pair(&a, &b);
+    a.daemon(false, "", &[]);
+    let ib = b.identity();
+    let (_ep, mut p) = played(&ib, &a, &admit).await;
+    until(5, "A sees B online", || a.status()["peers"]["online"] == 1);
+    let sb = ib.short.clone();
+    let row = |c: &str, reason: &str, ended_at: u64| Ended {
+        session_id: format!("{sb}/claude:{c}"),
+        agent: "claude".into(),
+        folder: "web".into(),
+        title: None,
+        repo: None,
+        branch: None,
+        ended_at,
+        reason: reason.into(),
+    };
+    let now = ipc::now();
+    let id = format!("{sb}/codex:live");
+    let mut f = presence(&ib.key, 1, &[&id]);
+    if let Frame::Presence { ended, .. } = &mut f {
+        *ended = vec![
+            row("good", "session-end", now),
+            row("bad-reason", "NOT A WORD", now),
+            row("ahead", "session-end", now + 2 * 86_400),
+            row("new-word", "some-new-reason", now),
+        ];
+    }
+    p.send(&f).await;
+    let of = |c: &str| {
+        let key = format!("{sb}/claude:{c}");
+        directory(&a, None)
+            .into_iter()
+            .find(|r| r["session_id"] == key.as_str())
+    };
+    until(10, "A takes the presence", || sees(&a, &id));
+    assert_eq!(of("good").unwrap()["status"], "ended");
+    assert_eq!(of("new-word").unwrap()["reason"], "some-new-reason");
+    assert!(of("bad-reason").is_none());
+    assert!(of("ahead").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_teammates_ended_session_is_seen_for_a_week_and_never_its_resume() {
+    let (a, b) = (Env::new(), Env::new());
+    seed_pair(&a, &b);
+    start_pair(&a, &b, "", &[]);
+    assert_eq!(register(&a, "claude", "a1", "/tmp/work/api")["ok"], true);
+    let key = format!("{}/claude:a1", a.short());
+    until(10, "B sees the session", || sees(&b, &key));
+    let r = a.ask(json!({"id": 1, "op": "end", "key": key, "reason": "session-end"}));
+    assert_eq!(r["ended"], true, "{r}");
+
+    let row = |e: &Env, q: Option<&str>| {
+        directory(e, q)
+            .into_iter()
+            .find(|r| r["session_id"] == key.as_str())
+    };
+    until(10, "B sees it ended", || {
+        row(&b, None).is_some_and(|r| r["status"] == "ended")
+    });
+    let theirs = row(&b, None).unwrap();
+    assert_eq!(theirs["reason"], "session-end", "{theirs}");
+    assert!(theirs["ended_at"].is_u64(), "{theirs}");
+    assert_eq!(theirs["cwd"], "", "{theirs}");
+    assert!(theirs.get("resume").is_none(), "{theirs}");
+    // A query finds an ended row too.
+    assert!(row(&b, Some("prasiddha")).is_some());
+    assert!(row(&b, Some("nothing-matches")).is_none());
+
+    let mine = row(&a, None).unwrap();
+    assert_eq!(mine["status"], "ended", "{mine}");
+    assert_eq!(
+        mine["resume"], "cd '/tmp/work/api' && claude --resume a1",
+        "{mine}"
+    );
+    assert_eq!(mine["cwd"], "/tmp/work/api", "{mine}");
+
+    // The same conversation live again is one live row, on both sides.
+    assert_eq!(register(&a, "claude", "a1", "/tmp/work/api")["ok"], true);
+    until(10, "B sees it live again", || sees(&b, &key));
+    let all = directory(&a, None);
+    let rows = all.iter().filter(|r| r["session_id"] == key.as_str());
+    assert_eq!(rows.count(), 1, "{all:?}");
+    let all = directory(&b, None);
+    let rows = all.iter().filter(|r| r["session_id"] == key.as_str());
+    assert_eq!(rows.count(), 1, "{all:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_presence_with_fifty_one_ended_rows_is_dropped() {
+    let (a, b) = (Env::new(), Env::new());
+    let [_, admit] = seed_pair(&a, &b);
+    a.daemon(false, "", &[]);
+    let ib = b.identity();
+    let (_ep, mut p) = played(&ib, &a, &admit).await;
+    until(5, "A sees B online", || a.status()["peers"]["online"] == 1);
+    let live = format!("{}/codex:live", ib.short);
+    let ended = |n: usize| -> Vec<Ended> {
+        (0..n)
+            .map(|i| Ended {
+                session_id: format!("{}/codex:e{i}", ib.short),
+                agent: "codex".into(),
+                folder: "x".into(),
+                title: None,
+                repo: None,
+                branch: None,
+                ended_at: ipc::now(),
+                reason: "session-end".into(),
+            })
+            .collect()
+    };
+    let with = |seq: u64, n: usize| {
+        let mut f = presence(&ib.key, seq, &[&live]);
+        if let Frame::Presence { ended: e, .. } = &mut f {
+            *e = ended(n);
+        }
+        f
+    };
+    p.send(&with(1, 50)).await;
+    let fifty = || {
+        directory(&a, None)
+            .iter()
+            .filter(|r| r["status"] == "ended")
+            .count()
+    };
+    until(5, "A holds the fifty", || fifty() == 50);
+    // The next one is past the cap: all of it goes, and the fence after it shows A read on.
+    p.send(&with(2, 51)).await;
+    let fence = format!("{}/codex:fence", ib.short);
+    p.send(&presence(&ib.key, 3, &[&fence])).await;
+    until(5, "A applies the fence", || sees(&a, &fence));
+    let log = std::fs::read_to_string(a.state.path().join("daemon.log")).unwrap();
+    let line = format!("net: dropped a presence frame from {}", ib.short);
+    assert_eq!(log.matches(&line).count(), 1, "{log}");
 }
 
 /// `id` played over its own endpoint: dialed into `env` and past its `hello` (at `head`).
@@ -286,6 +482,7 @@ async fn off_folder_sessions_are_not_published() {
         sessions,
         known,
         kept,
+        ended,
         ..
     } = p.presence().await
     else {
@@ -297,10 +494,26 @@ async fn off_folder_sessions_are_not_published() {
     // The last path part, not the path.
     assert_eq!(sessions[0].folder, "open");
     let o2 = format!("{sa}/codex:o2");
-    assert_eq!((known, kept), (vec![o2.clone()], vec![o2]));
-    // Locally the off-folder session is still listed, marked hidden.
+    assert_eq!((known, kept), (vec![o2.clone()], vec![o2.clone()]));
+    // The off-folder session that ended is not on the wire: the open one is, by its last part.
+    let ended_ids: Vec<&str> = ended.iter().map(|e| e.session_id.as_str()).collect();
+    assert_eq!(ended_ids, [o2.as_str()]);
+    assert_eq!(ended[0].folder, "open");
+    // Locally the off-folder sessions are still listed, marked hidden, what ended there too: its
+    // owner can still resume it.
     let local = directory(&a, None);
-    assert_eq!(local.len(), 2);
+    assert_eq!(local.len(), 4, "{local:?}");
+    let was = |s: &Value| s["status"] == "ended";
+    let local_ended: Vec<&Value> = local.iter().filter(|s| was(s)).collect();
+    assert_eq!(local_ended.len(), 2, "{local:?}");
+    let h1 = format!("{sa}/codex:h1");
+    let ended_row = |id: &str| {
+        let row = local_ended.iter().find(|s| s["session_id"] == id);
+        row.unwrap_or_else(|| panic!("{id}: {local:?}"))
+    };
+    assert_eq!(ended_row(&o2)["hidden"], Value::Null);
+    assert_eq!(ended_row(&h1)["hidden"], true);
+    assert!(ended_row(&h1)["resume"].is_string());
     let flag = |c: &str| {
         let id = format!("{sa}/codex:{c}");
         local
@@ -310,6 +523,85 @@ async fn off_folder_sessions_are_not_published() {
             .clone()
     };
     assert_eq!((flag("h2"), flag("o1")), (json!(true), Value::Null));
+}
+
+/// A headless run is on no one's list and never in `ended`; its address alone is published.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_headless_run_is_listed_nowhere() {
+    let (a, b) = (Env::new(), Env::new());
+    let [_, admit] = seed_pair(&a, &b);
+    a.daemon(false, "", &[]);
+    let p = os::process(std::process::id()).unwrap();
+    let r = a.ask(
+        json!({"id": 1, "op": "register", "session": {"provider": "claude",
+        "conversation": "run", "pid": p.pid, "birth_micros": p.birth_micros, "cwd": "/tmp/p",
+        "headless": true}}),
+    );
+    let run = r["key"].as_str().unwrap().to_string();
+    assert_eq!(directory(&a, None), Vec::<Value>::new());
+    let (_ep, mut peer) = played(&b.identity(), &a, &admit).await;
+    let Frame::Presence {
+        sessions,
+        kept,
+        ended,
+        ..
+    } = peer.presence().await
+    else {
+        unreachable!()
+    };
+    assert!(sessions.is_empty() && ended.is_empty(), "{sessions:?}");
+    assert_eq!(kept, std::slice::from_ref(&run));
+
+    let r = a.ask(json!({"id": 1, "op": "end", "key": run, "reason": "session-end"}));
+    assert_eq!(r["ended"], true, "{r}");
+    assert_eq!(directory(&a, None), Vec::<Value>::new());
+    let db = a.state.path().join("state.db");
+    assert_eq!(common::count(&db, "SELECT count(*) FROM sessions"), 0);
+}
+
+/// Months of finished jobs reach their owner's Recent, not teammates: the first read of Claude's
+/// listing stamps the line. A job that ends after it is news.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn only_jobs_over_after_the_first_listing_are_published() {
+    use std::os::unix::fs::PermissionsExt;
+    let shim = tempfile::tempdir().unwrap();
+    let listing = shim.path().join("listing.json");
+    let job = |id: &str, started: u64| {
+        json!({"cwd": "/tmp/p", "kind": "background", "id": "ab12", "state": "done",
+            "name": "the job", "startedAt": started * 1000, "sessionId": id})
+    };
+    let old = "a1b2c3d4-0000-4000-8000-00000000000a";
+    let new = "a1b2c3d4-0000-4000-8000-00000000000b";
+    std::fs::write(&listing, json!([job(old, ipc::now() - 3_600)]).to_string()).unwrap();
+    let exe = shim.path().join("claude");
+    std::fs::write(&exe, format!("#!/bin/sh\ncat '{}'\n", listing.display())).unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let env = [
+        ("PATH", format!("{}:/usr/bin:/bin", shim.path().display())),
+        ("LIGHTBULB_CONNECT_DEBUG_LISTING", "1".to_string()),
+    ];
+    let (a, b) = common::pair(&env);
+    let sa = a.short();
+    let (old, new) = (format!("{sa}/claude:{old}"), format!("{sa}/claude:{new}"));
+    let row = |e: &Env, key: &str| {
+        directory(e, None)
+            .into_iter()
+            .find(|r| r["session_id"] == key)
+    };
+    until(15, "its owner sees the old job", || row(&a, &old).is_some());
+    assert_eq!(row(&a, &old).unwrap()["status"], "ended");
+
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let (first, second) = (
+        job("a1b2c3d4-0000-4000-8000-00000000000a", ipc::now() - 3_600),
+        job("a1b2c3d4-0000-4000-8000-00000000000b", ipc::now()),
+    );
+    std::fs::write(&listing, json!([first, second]).to_string()).unwrap();
+    // A new row: news, so the listing is read soon.
+    assert_eq!(register(&a, "codex", "poke", "/tmp/p")["ok"], true);
+    until(15, "B sees the new job", || row(&b, &new).is_some());
+    assert!(row(&b, &old).is_none(), "old news stays home");
+    assert!(row(&a, &old).is_some());
 }
 
 /// A Claude session its hook registered under an off folder, which Claude's own file names
@@ -445,4 +737,18 @@ async fn a_group_send_reaches_a_teammates_sessions() {
     assert!(o.status.success(), "{}{}", out(&o), common::err(&o));
     assert!(out(&o).contains("(Claude Code)"), "{}", out(&o));
     assert_eq!(b.take_one(&kb)["text"], "to the team");
+
+    // What has ended is listed, and a group send does not reach it.
+    assert_eq!(
+        b.ask(json!({"id": 1, "op": "end", "key": kb}))["ended"],
+        true
+    );
+    until(10, "A sees it ended", || !sees(&a, &kb));
+    let o = a.detached(&argv, "");
+    assert!(!o.status.success(), "{}", out(&o));
+    assert!(
+        common::err(&o).contains("No live session matches."),
+        "{}",
+        common::err(&o)
+    );
 }

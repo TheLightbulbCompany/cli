@@ -1,6 +1,7 @@
 pub mod ipc;
 pub mod net_ops;
 
+use crate::agents::listing::{self, Listed};
 use crate::agents::{claude, codex};
 use crate::config::Config;
 use crate::identity::Identity;
@@ -109,6 +110,152 @@ pub struct Daemon {
     /// daemon ends, so no second engine starts on this home while one still runs. The socket
     /// daemon holds its own across `run`.
     pub home_lock: Option<File>,
+    /// Claude's own session listing, last read (`current`).
+    pub listing: Arc<Mutex<ListingCache>>,
+}
+
+/// `claude agents --json --all` as last read; `rows` is `None` before the first read ends and
+/// after one fails.
+#[derive(Default)]
+pub struct ListingCache {
+    pub at: Option<Instant>,
+    pub rows: Option<Vec<Listed>>,
+    /// The unix second the last read began: what `rows` can know about.
+    pub read_at: i64,
+    /// A hook event that changes what the listing says since the last read began: read again
+    /// sooner.
+    pub dirty: bool,
+    /// A read is running (at most one, on its own thread).
+    pub refreshing: bool,
+    /// The last read failed and has been logged: one line per streak.
+    pub failing: bool,
+    /// The read whose finished jobs have been written (`ipc::live_sessions`).
+    pub recorded: Option<Instant>,
+}
+
+/// How often Claude's listing is read while a pid file says Claude is running and no hook has news.
+const IDLE_READ: u64 = 30;
+/// How long after a read began the next is due while a session waits: an approved long tool has
+/// no hook to say so. From when it began, so the 5 s tick takes each one.
+const WAITING_READ: i64 = 5;
+
+/// Whether a session still waits as far as anyone knows: for a row a hook says waits
+/// (`store::waiting_rows`), no read has begun since, or the last one says it waits too. Once a
+/// newer read says otherwise it no longer shows as waiting, though the row says so until its next
+/// hook: a long tool is not polled every 5 s for its whole run.
+fn still_waits(waiting: &[(String, i64)], rows: Option<&[Listed]>, read_at: i64) -> bool {
+    waiting.iter().any(|(conversation, seen_at)| {
+        read_at <= *seen_at
+            || rows.into_iter().flatten().any(|l| {
+                l.conversation == *conversation
+                    && (l.status.as_deref() == Some("waiting")
+                        || l.state.as_deref() == Some("blocked"))
+            })
+    })
+}
+
+/// Whether a read is due, `age` after the last ended (`None`: there has been none), `began_ago`
+/// seconds after it began.
+fn read_due(
+    age: Option<Duration>,
+    began_ago: i64,
+    dirty: bool,
+    running: bool,
+    waits: bool,
+) -> bool {
+    let older = |s| age.is_none_or(|a| a > Duration::from_secs(s));
+    (dirty && older(2))
+        || older(60)
+        || (running && older(IDLE_READ))
+        || (waits && began_ago >= WAITING_READ)
+}
+
+/// Claude's listing as last read, at once: never runs `claude` here, and never holds the lock
+/// across it. Starts a read when the last is older than 30 s, 5 s while a session waits
+/// (`still_waits`), or 2 s after a hook event that changes what the listing says (`dirty`), or 60 s while no pid file says Claude is running (each
+/// read costs about 0.2 s of CPU and a 155 MB spike); until the first ends, `None` (the pid
+/// files). A failed read counts as a read: a hung `claude` is asked once per 30 s, or 60 s with
+/// no pid file, so what this returns may be up to 60 s old. Ends of live rows do not wait for
+/// it: they come from pid liveness on the 5 s tick. `None` when the Claude home is not `HOME` (an embedded
+/// instance's, a test's): `claude` lists `HOME`'s sessions, not those.
+pub(crate) fn current(daemon: &Daemon) -> Option<Vec<Listed>> {
+    current_at(daemon).map(|(rows, _)| rows)
+}
+
+/// `current`, with the unix second that read began.
+pub(crate) fn current_at(daemon: &Daemon) -> Option<(Vec<Listed>, i64)> {
+    if dirs::home_dir().as_ref() != Some(&daemon.claude_home) {
+        return None;
+    }
+    // A debug build (a test) never runs a `claude` it was not told to: never the person's real one.
+    if cfg!(debug_assertions) && std::env::var_os("LIGHTBULB_CONNECT_DEBUG_LISTING").is_none() {
+        return None;
+    }
+    let older = |at: Option<Instant>, s| at.is_none_or(|t| t.elapsed() > Duration::from_secs(s));
+    // Reads each pid file and checks its process: only when it can matter, and off the lock
+    // every session read takes.
+    let at = daemon.listing.lock().unwrap().at;
+    let running = older(at, IDLE_READ) && sessions::any_pid_file(&daemon.claude_home);
+    let waiting = daemon.store.lock().unwrap().waiting_rows();
+    let waiting = waiting.unwrap_or_default();
+    let mut c = daemon.listing.lock().unwrap();
+    let waits = still_waits(&waiting, c.rows.as_deref(), c.read_at);
+    let began_ago = ipc::now() as i64 - c.read_at;
+    let due = read_due(
+        c.at.map(|t| t.elapsed()),
+        began_ago,
+        c.dirty,
+        running,
+        waits,
+    );
+    if !c.refreshing && due {
+        let (cache, home) = (daemon.listing.clone(), daemon.claude_home.clone());
+        let started = std::thread::Builder::new()
+            .name("claude-listing".into())
+            .spawn(move || refresh(&cache, &home));
+        // Cleared at the start: a hook event during the read is news for the next one.
+        c.refreshing = started.is_ok();
+        c.dirty = c.dirty && started.is_err();
+    }
+    c.rows.clone().map(|rows| (rows, c.read_at))
+}
+
+/// Ends a refresh however it ends: a read that panics counts as a failed one, so the listing is
+/// neither left stale nor stuck "refreshing".
+struct Refreshed<'a> {
+    cache: &'a Mutex<ListingCache>,
+    rows: Option<Vec<Listed>>,
+    began: i64,
+}
+
+impl Drop for Refreshed<'_> {
+    fn drop(&mut self) {
+        let mut c = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        c.rows = self.rows.take();
+        c.read_at = self.began;
+        c.at = Some(Instant::now());
+        c.refreshing = false;
+    }
+}
+
+/// One read of the listing, its result swapped into `cache`.
+fn refresh(cache: &Mutex<ListingCache>, home: &Path) {
+    let mut done = Refreshed {
+        cache,
+        rows: None,
+        began: ipc::now() as i64,
+    };
+    let exes = listing::candidates(home);
+    done.rows = listing::read(&exes);
+    let first_failure = {
+        let mut c = cache.lock().unwrap();
+        let first = done.rows.is_none() && !exes.is_empty() && !c.failing;
+        c.failing = done.rows.is_none() && (c.failing || first);
+        first
+    };
+    if first_failure {
+        eprintln!("claude agents: no answer from {exes:?}; using the pid files");
+    }
 }
 
 /// An embedded instance: a Lightbulb workspace's member.
@@ -199,7 +346,8 @@ impl Daemon {
 /// send, or handed over by the next hook.
 pub async fn deliver(daemon: Arc<Daemon>, to: Key) {
     let rows = daemon.store.lock().unwrap().sessions().unwrap_or_default();
-    let Some(session) = sessions::all(&rows, &daemon.claude_home, &daemon.identity.short)
+    // The pid files name every push socket: no need to wait on Claude's listing here.
+    let Some(session) = sessions::all(&rows, None, &daemon.claude_home, &daemon.identity.short)
         .into_iter()
         .find(|s| s.key == to && s.tier == Tier::Push)
     else {
@@ -469,4 +617,81 @@ fn answers_ping(sock: &Path) -> bool {
     stream.write_all(b"{\"id\":0,\"op\":\"ping\"}\n").is_ok()
         && BufReader::new(stream).read_line(&mut line).is_ok()
         && line.contains("\"ok\":true")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_read_is_due_sooner_while_a_session_waits() {
+        let secs = |s| Some(Duration::from_secs(s));
+        let due =
+            |age, began_ago, dirty, running, waits| read_due(age, began_ago, dirty, running, waits);
+        assert!(due(None, 0, false, false, false), "the first read");
+        assert!(!due(secs(59), 59, false, false, false));
+        assert!(due(secs(61), 61, false, false, false));
+        assert!(!due(secs(29), 29, false, true, false));
+        assert!(due(secs(31), 31, false, true, false));
+        assert!(!due(secs(1), 1, true, true, false));
+        assert!(due(secs(3), 3, true, true, false));
+        // Waiting: 5 s after the last read began, though it ended later.
+        assert!(!due(secs(3), 4, false, true, true));
+        assert!(due(secs(4), 5, false, true, true));
+    }
+
+    #[test]
+    fn a_session_stops_waiting_once_a_newer_read_says_so() {
+        let row = |status: &str, state: Option<&str>| Listed {
+            conversation: "c".into(),
+            pid: Some(1),
+            kind: String::new(),
+            status: Some(status.into()),
+            waiting_for: None,
+            state: state.map(String::from),
+            job_id: None,
+            name: None,
+            cwd: String::new(),
+            started_ms: 0,
+        };
+        let waiting = [("c".to_string(), 100)];
+        assert!(!still_waits(&[], None, 0), "no row waits");
+        // No read since the hook (strict, as `sessions::all` is).
+        assert!(still_waits(&waiting, Some(&[row("busy", None)]), 100));
+        assert!(still_waits(&waiting, None, 99));
+        // A newer read: Claude's word.
+        assert!(!still_waits(&waiting, Some(&[row("busy", None)]), 101));
+        assert!(still_waits(&waiting, Some(&[row("waiting", None)]), 101));
+        assert!(still_waits(
+            &waiting,
+            Some(&[row("busy", Some("blocked"))]),
+            101
+        ));
+        // A failed read, or one without it, says nothing worth hammering Claude for.
+        assert!(!still_waits(&waiting, None, 101));
+        assert!(!still_waits(&waiting, Some(&[]), 101));
+    }
+
+    /// A read that panics counts as a failed one: the next look may start another.
+    #[test]
+    fn a_panicking_read_leaves_the_listing_usable() {
+        let cache = Mutex::new(ListingCache {
+            refreshing: true,
+            rows: Some(vec![]),
+            ..Default::default()
+        });
+        std::thread::scope(|s| {
+            let read = s.spawn(|| {
+                let _done = Refreshed {
+                    cache: &cache,
+                    rows: None,
+                    began: 0,
+                };
+                panic!("the read");
+            });
+            assert!(read.join().is_err());
+        });
+        let c = cache.lock().unwrap();
+        assert!(!c.refreshing && c.rows.is_none() && c.at.is_some());
+    }
 }

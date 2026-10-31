@@ -75,6 +75,223 @@ fn who_lists_a_registered_session_by_its_handle() {
     assert_eq!(json[0]["handle"], "codex-1");
 }
 
+/// `Recent` is the newest ten and how to see the rest.
+#[test]
+fn who_lists_ten_recent_and_says_how_many_more() {
+    let e = Env::new();
+    assert!(e.run(&["who"]).status.success());
+    let p = os::process(std::process::id()).unwrap();
+    for n in 0..12 {
+        let r = e.ask(
+            json!({"id": 1, "op": "register", "session": {"provider": "codex",
+            "conversation": format!("t{n}"), "pid": p.pid, "birth_micros": p.birth_micros,
+            "cwd": "/tmp/proj"}}),
+        );
+        let r = e.ask(json!({"id": 1, "op": "end", "key": r["key"], "reason": "session-end"}));
+        assert_eq!(r["ended"], true, "{r}");
+    }
+    let table = out(&e.run(&["who"]));
+    let (_, recent) = table.split_once("Recent\n").expect("a Recent section");
+    assert_eq!(recent.matches("codex resume").count(), 10, "{table}");
+    assert!(recent.contains("… 2 more: lightbulb who --json"), "{table}");
+    let json: Value = serde_json::from_str(&out(&e.run(&["who", "--json"]))).unwrap();
+    assert_eq!(json.as_array().unwrap().len(), 12, "{json}");
+}
+
+#[test]
+fn who_prints_waiting_done_and_a_recent_section_with_resume() {
+    let e = Env::new();
+    assert!(e.run(&["who"]).status.success());
+    let p = os::process(std::process::id()).unwrap();
+    let register = |provider: &str, conversation: &str, extra: Value| {
+        let mut session = json!({"provider": provider, "conversation": conversation,
+            "pid": p.pid, "birth_micros": p.birth_micros, "cwd": "/tmp/proj"});
+        session
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let r = e.ask(json!({"id": 1, "op": "register", "session": session}));
+        r["key"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{r}"))
+            .to_string()
+    };
+    let c1 = register(
+        "claude",
+        "c1",
+        json!({"status": "waiting", "waiting_for": "permission prompt"}),
+    );
+    let t2 = register("codex", "t2", json!({}));
+    let t3 = register("codex", "t3", json!({"title": "fix the thing"}));
+    let r = e.ask(json!({"id": 1, "op": "end", "key": t3, "reason": "session-end"}));
+    assert_eq!(r["ended"], true, "{r}");
+    let r = e.ask(json!({"id": 1, "op": "end", "key": t2, "reason": "session-end"}));
+    assert_eq!(r["ended"], true, "{r}");
+
+    let table = out(&e.run(&["who"]));
+    assert!(
+        table
+            .lines()
+            .any(|l| l.contains("waiting for you: permission prompt")),
+        "{table}"
+    );
+    let (live, recent) = table.split_once("\nRecent\n").expect("a Recent section");
+    assert!(!live.contains("codex-1"), "{table}");
+    let cols: Vec<&str> = recent.lines().next().unwrap().split_whitespace().collect();
+    assert_eq!(
+        cols,
+        ["Title", "Agent", "Folder", "Ended", "Resume"],
+        "{table}"
+    );
+    assert!(
+        recent.lines().any(|l| l.starts_with("proj "))
+            && recent.contains("just now")
+            && recent.contains("codex resume t2"),
+        "{recent}"
+    );
+
+    // Its title, else its folder's last part; no id, and its full path only in the command.
+    assert!(
+        recent.lines().any(|l| l.starts_with("fix the thing ")),
+        "{recent}"
+    );
+    let shown = recent.replace("cd '/tmp/proj' && ", "");
+    assert!(
+        !shown.contains("/tmp/proj") && !recent.contains(&t2),
+        "{recent}"
+    );
+
+    // One array, live rows first: what parses `who --json` today keeps working.
+    let json: Value = serde_json::from_str(&out(&e.run(&["who", "--json"]))).unwrap();
+    assert_eq!(json[0]["key"], c1.as_str(), "{json}");
+    assert_eq!(json[0]["status"], "waiting", "{json}");
+    let t2_row = json
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["key"] == t2.as_str())
+        .unwrap();
+    assert_eq!(t2_row["status"], "ended", "{json}");
+    assert_eq!(t2_row["reason"], "session-end", "{json}");
+    assert_eq!(
+        t2_row["resume"], "cd '/tmp/proj' && codex resume t2",
+        "{json}"
+    );
+    assert!(t2_row["ended_at"].is_u64(), "{json}");
+
+    // `--all` says the same of this computer's, and only ended rows: Recent alone.
+    let all = out(&e.run(&["who", "--all"]));
+    assert!(all.contains("waiting for you: permission prompt"), "{all}");
+    assert!(
+        all.split_once("\nRecent\n")
+            .unwrap()
+            .1
+            .contains("codex resume t2"),
+        "{all}"
+    );
+    let r = e.ask(json!({"id": 1, "op": "end", "key": c1, "reason": "session-end"}));
+    assert_eq!(r["ended"], true, "{r}");
+    let only = out(&e.run(&["who"]));
+    assert!(
+        only.contains("\nRecent\n") && !only.contains("No sessions yet"),
+        "{only}"
+    );
+    assert!(!only.contains("Status"), "{only}");
+}
+
+#[test]
+fn who_all_invents_nothing_for_an_own_session_that_does_not_say_what_it_waits_for() {
+    let e = Env::new();
+    assert!(e.run(&["who"]).status.success());
+    let p = os::process(std::process::id()).unwrap();
+    let r = e.ask(
+        json!({"id": 1, "op": "register", "session": {"provider": "claude",
+        "conversation": "c1", "pid": p.pid, "birth_micros": p.birth_micros, "cwd": "/tmp/proj",
+        "status": "waiting"}}),
+    );
+    assert_eq!(r["ok"], true, "{r}");
+    let all = out(&e.run(&["who", "--all"]));
+    assert!(all.contains("waiting for you, gets messages"), "{all}");
+    assert!(!all.contains("input needed"), "{all}");
+}
+
+#[test]
+fn who_all_prints_busy_for_a_busy_teammate_and_offline_with_last_seen() {
+    let (a, b) = common::pair(&[]);
+    let p = os::process(std::process::id()).unwrap();
+    let register = |provider: &str, conversation: &str, extra: Value| {
+        let mut session = json!({"provider": provider, "conversation": conversation,
+            "pid": p.pid, "birth_micros": p.birth_micros, "cwd": "/tmp/work/web"});
+        session
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let r = b.ask(json!({"id": 1, "op": "register", "session": session}));
+        r["key"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{r}"))
+            .to_string()
+    };
+    let busy = register("codex", "b1", json!({"status": "busy"}));
+    let waits = register(
+        "claude",
+        "b2",
+        json!({"status": "waiting", "waiting_for": "permission prompt"}),
+    );
+    let done = register("codex", "b3", json!({"title": "finished work"}));
+    let r = b.ask(json!({"id": 1, "op": "end", "key": done, "reason": "job-done"}));
+    assert_eq!(r["ended"], true, "{r}");
+    common::until(15, "A sees B's sessions", || {
+        common::sees(&a, &busy) && common::sees(&a, &waits)
+    });
+    let who = || out(&a.run(&["who", "--all"]));
+    common::until(15, "A sees what ended", || who().contains("finished work"));
+    let table = who();
+    let row = |t: &str, key: &str| {
+        t.lines()
+            .find(|l| l.starts_with(key))
+            .unwrap_or_else(|| panic!("{key}: {t}"))
+            .to_string()
+    };
+    let (live, recent) = table.split_once("\nRecent\n").expect("a Recent section");
+    assert!(row(live, &busy).contains("busy, gets messages"), "{table}");
+    assert!(row(live, &busy).contains("web"), "{table}");
+    let waiting = row(live, &waits);
+    assert!(waiting.contains("waiting: permission prompt"), "{table}");
+    assert!(!waiting.contains("waiting for you"), "{table}");
+    // A teammate's: never the command that resumes it.
+    let cols: Vec<&str> = recent.lines().next().unwrap().split_whitespace().collect();
+    assert_eq!(
+        cols,
+        ["Title", "Person", "Computer", "Agent", "Folder", "Ended", "Resume"],
+        "{table}"
+    );
+    let finished = row(recent, "finished work");
+    assert!(
+        finished.contains("bob") && finished.contains("web"),
+        "{table}"
+    );
+    assert!(
+        !finished.contains("resume") && !finished.contains(&done),
+        "{table}"
+    );
+
+    assert_eq!(b.ask(json!({"id": 1, "op": "shutdown"}))["ok"], true);
+    common::until(15, "A sees B offline", || {
+        who().contains("offline, last seen")
+    });
+    let table = who();
+    let offline = row(&table, &busy);
+    assert!(
+        offline.contains("offline, last seen just now, messages queued"),
+        "{table}"
+    );
+    assert!(
+        !offline.contains("gets messages") && !offline.contains("busy"),
+        "{table}"
+    );
+}
+
 #[test]
 fn send_takes_a_handle_and_a_member_name() {
     let e = Env::new();
@@ -630,6 +847,7 @@ fn setup_installs_the_canonical_binary_and_wires_everything_to_it() {
     let e = Env::new();
     let h = e.home.path();
     std::fs::create_dir(h.join(".claude")).unwrap();
+    std::fs::create_dir(h.join(".codex")).unwrap();
     let canon = h.join(".lightbulb/connect/bin/lightbulb");
 
     // A missing --executable is refused before anything is written.
@@ -654,6 +872,19 @@ fn setup_installs_the_canonical_binary_and_wires_everything_to_it() {
         "{hooks}"
     );
     assert!(!hooks.contains("target/"), "{hooks}");
+    let settings: Value = serde_json::from_str(&hooks).unwrap();
+    for event in ["PermissionRequest", "Notification"] {
+        let cmd = settings["hooks"][event][0]["hooks"][0]["command"].as_str();
+        assert!(
+            cmd.is_some_and(|c| c.contains(&format!("'{canon_s}' hook claude "))),
+            "{event}: {hooks}"
+        );
+    }
+    let codex_hooks: Value =
+        serde_json::from_str(&std::fs::read_to_string(h.join(".codex/hooks.json")).unwrap())
+            .unwrap();
+    assert!(codex_hooks["hooks"]["PermissionRequest"].is_array());
+    assert!(codex_hooks["hooks"].get("Notification").is_none());
     if cfg!(target_os = "macos") {
         let plist = std::fs::read_to_string(
             h.join("Library/LaunchAgents/company.thelightbulb.connect.plist"),
@@ -732,6 +963,29 @@ fn a_refresh_leaves_the_loaded_job_alone() {
     let d = out(&e.run(&["doctor"]));
     let row = d.lines().find(|l| l.contains("Starts at login")).unwrap();
     assert!(row.contains("yes"), "{d}");
+}
+
+/// An install from before the waiting hooks gets `Notification` and `PermissionRequest` from the
+/// daemon's `setup --refresh` alone.
+#[test]
+fn a_refresh_adds_the_waiting_hooks() {
+    let e = Env::new();
+    let h = e.home.path();
+    std::fs::create_dir(h.join(".claude")).unwrap();
+    assert!(e.run(&["setup", "--no-model"]).status.success());
+    let file = h.join(".claude/settings.json");
+    let mut doc: Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    for ev in ["Notification", "PermissionRequest"] {
+        assert!(doc["hooks"][ev].is_array(), "setup writes {ev}");
+        doc["hooks"].as_object_mut().unwrap().remove(ev);
+    }
+    std::fs::write(&file, doc.to_string()).unwrap();
+    let o = e.run(&["setup", "--refresh"]);
+    assert!(o.status.success(), "{}", err(&o));
+    let doc: Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    for ev in ["Notification", "PermissionRequest"] {
+        assert!(doc["hooks"][ev].is_array(), "refresh restores {ev}");
+    }
 }
 
 /// A person's plain `setup` turns the model back on, and the refresh then follows that.
@@ -1078,21 +1332,16 @@ fn install_ignores_a_stale_pid_of_a_live_process() {
     assert!(alive, "the unrelated process was left alone");
 }
 
-/// `daemon --install` over a loaded job boots it out BEFORE it stops the daemon: with the job
-/// loaded, KeepAlive would restart the stopped daemon, which would retake the lock. A
-/// `launchctl` shim on PATH records each call and whether the daemon's socket still answered
-/// then; the first call must be the bootout, made while the old daemon still runs.
+/// A `launchctl` on PATH that appends "<verb> live|gone" to the returned log, by whether `sock`
+/// is a socket then. Keep the returned dir alive while it is in use.
 #[cfg(target_os = "macos")]
-#[test]
-fn install_boots_the_job_out_before_it_stops_the_daemon() {
+fn launchctl_shim(sock: &std::path::Path) -> (tempfile::TempDir, std::path::PathBuf) {
     use std::os::unix::fs::PermissionsExt;
-    let e = Env::new();
-    assert!(e.run(&["who"]).status.success());
     let shim = tempfile::tempdir().unwrap();
     let log = shim.path().join("calls");
-    let sock = e.state.path().join("sock");
+    let bin = shim.path().join("launchctl");
     std::fs::write(
-        shim.path().join("launchctl"),
+        &bin,
         format!(
             "#!/bin/sh\nif [ -S '{}' ]; then up=live; else up=gone; fi\necho \"$1 $up\" >> '{}'\n",
             sock.display(),
@@ -1100,15 +1349,45 @@ fn install_boots_the_job_out_before_it_stops_the_daemon() {
         ),
     )
     .unwrap();
-    std::fs::set_permissions(
-        shim.path().join("launchctl"),
-        std::fs::Permissions::from_mode(0o755),
-    )
-    .unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (shim, log)
+}
+
+/// A setup run from a temporary HOME never calls launchctl: the job label is fixed, so a call
+/// would replace the real user's background service with one pointing at the temp folder.
+#[cfg(target_os = "macos")]
+#[test]
+fn setup_in_a_temporary_home_never_calls_launchctl() {
+    let e = Env::new();
+    assert!(e.run(&["who"]).status.success());
+    let (shim, log) = launchctl_shim(&e.state.path().join("sock"));
     let path = format!("{}:/usr/bin:/bin", shim.path().display());
     let o = e
         .cmd(&["daemon", "--install"])
         .env_remove("LIGHTBULB_CONNECT_NO_LAUNCHCTL")
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(!log.exists(), "launchctl was called from a temp HOME");
+    assert!(out(&o).contains("launchctl skipped"), "{}", out(&o));
+}
+
+/// `daemon --install` over a loaded job boots it out BEFORE it stops the daemon: with the job
+/// loaded, KeepAlive would restart the stopped daemon, which would retake the lock. A
+/// `launchctl` shim on PATH records each call and whether the daemon's socket still answered
+/// then; the first call must be the bootout, made while the old daemon still runs.
+#[cfg(target_os = "macos")]
+#[test]
+fn install_boots_the_job_out_before_it_stops_the_daemon() {
+    let e = Env::new();
+    assert!(e.run(&["who"]).status.success());
+    let (shim, log) = launchctl_shim(&e.state.path().join("sock"));
+    let path = format!("{}:/usr/bin:/bin", shim.path().display());
+    let o = e
+        .cmd(&["daemon", "--install"])
+        .env_remove("LIGHTBULB_CONNECT_NO_LAUNCHCTL")
+        .env("LIGHTBULB_CONNECT_DEBUG_LAUNCHCTL_ANYWHERE", "1")
         .env("PATH", path)
         .output()
         .unwrap();

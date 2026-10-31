@@ -19,7 +19,7 @@ it adds two things:
 
   | Tool | What it does |
   |---|---|
-  | `find_sessions` | Lists the sessions you can message: this computer's first, then your teammates'. Takes an optional search text and a limit (default 20). |
+  | `find_sessions` | Lists the sessions you can message: this computer's first, then your teammates', with those that ended last. `status` is busy, waiting (`waiting_for` says for what; its person must answer), idle or ended; `online: false` with `seen_at` is an offline computer, and `wakes: true` a parked workspace that a message wakes. Ended sessions stay seven days, with `ended_at` and `reason`; your own carry `resume`, the command that resumes them. An ended session reads nothing unless resumed; a message to one waits a day. Takes an optional search text and a limit (default 20). |
   | `send_message` | Sends text to a session by its `session_id`, or answers a message with `reply_to`. Returns a receipt. |
   | `message_receipt` | Shows the receipt of a message this session sent. |
   | `check_inbox` | Takes the messages waiting for this session. It can wait up to 30 seconds per call for one to arrive. |

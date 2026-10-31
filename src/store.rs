@@ -1,4 +1,5 @@
 use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 /// Migration `i` takes the db to `user_version` `i + 1`. Forward only; each one only adds
@@ -150,6 +151,7 @@ ALTER TABLE capture_sessions ADD COLUMN nudged INTEGER NOT NULL DEFAULT 0;
 /// Why a held memory entry has no body when it was refused rather than forgotten
 /// (`refused:<pattern>`: a peer's entry that looks like a credential).
 const V15: &str = "ALTER TABLE memory_entries ADD COLUMN reason TEXT;";
+
 /// Memory: signed entries numbered per author, with a full-text index over `subject` and `fact`
 /// (`memory`). `rowid` is explicit so it survives `VACUUM` (the FTS index points at it). A
 /// tombstoned row keeps its id and seq and drops its body (`entry` NULL); `memory_tombstones`
@@ -205,6 +207,14 @@ pub struct Session {
     /// `who`'s `<provider>-<n>`, given when the row is first written and kept for its life
     /// (`put_session` sets it; what a caller passes is ignored).
     pub handle: Option<String>,
+    /// Why it ended (`end_session`); none while it is live.
+    pub reason: Option<String>,
+    /// When it ended (`end_session`); none while it is live.
+    pub ended_at: Option<i64>,
+    /// What a `waiting` session waits for its person on.
+    pub waiting_for: Option<String>,
+    /// A `claude -p` or Agent SDK run: messageable, listed nowhere, deleted when it ends.
+    pub headless: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -236,6 +246,10 @@ fn row_session(r: &rusqlite::Row) -> rusqlite::Result<Session> {
         repo: r.get("repo")?,
         branch: r.get("branch")?,
         handle: r.get("handle")?,
+        reason: r.get("reason")?,
+        ended_at: r.get("ended_at")?,
+        waiting_for: r.get("waiting_for")?,
+        headless: r.get::<_, Option<i64>>("headless")?.is_some_and(|h| h != 0),
     })
 }
 
@@ -254,6 +268,33 @@ pub(crate) fn row_message(r: &rusqlite::Row) -> rusqlite::Result<Message> {
         body: r.get::<_, Option<String>>("body")?.unwrap_or_default(),
         sent_at: r.get("sent_at")?,
     })
+}
+
+/// Why a session ended, what a waiting one waits for, and whether it is headless: nullable columns
+/// added on open, not by a migration, so `user_version` stays and an older build can still open this db (it ignores
+/// them).
+fn add_session_columns(conn: &Connection) -> crate::Result<()> {
+    let has = |column: &str| -> rusqlite::Result<bool> {
+        conn.prepare("SELECT 1 FROM pragma_table_info('sessions') WHERE name = ?1")?
+            .exists([column])
+    };
+    for (column, kind) in [
+        ("reason", "TEXT"),
+        ("waiting_for", "TEXT"),
+        ("headless", "INTEGER"),
+    ] {
+        if has(column)? {
+            continue;
+        }
+        let add = format!("ALTER TABLE sessions ADD COLUMN {column} {kind}");
+        // A second connection opening beside this one may have just added it.
+        if let Err(e) = conn.execute_batch(&add) {
+            if !has(column)? {
+                return Err(e.into());
+            }
+        }
+    }
+    Ok(())
 }
 
 pub struct Store {
@@ -285,6 +326,7 @@ impl Store {
             tx.pragma_update(None, "user_version", i + 1)?;
             tx.commit()?;
         }
+        add_session_columns(&conn)?;
         let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
         Ok(Store { conn, dir })
     }
@@ -313,20 +355,23 @@ impl Store {
     }
 
     /// Writes `s` as a live row (an ended one is live again). A new agent session's row gets the
-    /// handle `<provider>-<n>`, one past its provider's highest, which it then keeps.
-    /// ponytail: a number frees up again only when its row is purged (a day after it ended)
+    /// handle `<provider>-<n>`, one past its provider's highest, which it then keeps; a headless
+    /// one none, since `who` never shows it. A row a person's session wrote stays not headless
+    /// (`claude -p --resume` must not cost that conversation its place in Recent).
+    /// ponytail: a number frees up again only when its row is purged (a week after it ended)
     /// and it was the highest.
     pub fn put_session(&self, s: &Session) -> rusqlite::Result<()> {
         self.conn.execute(
             "INSERT INTO sessions (key, provider, conversation, pid, birth_micros, cwd, title, \
-             status, seen_at, executable, repo, branch, handle) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, \
-             CASE WHEN ?2 = '' THEN NULL ELSE ?2 || '-' || (SELECT 1 + coalesce(max( \
+             status, seen_at, executable, repo, branch, waiting_for, headless, handle) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, \
+             CASE WHEN ?2 = '' OR ?14 IS NOT NULL THEN NULL ELSE ?2 || '-' || (SELECT 1 + coalesce(max( \
              CAST(substr(handle, length(?2) + 2) AS INTEGER)), 0) FROM sessions \
              WHERE provider = ?2) END) \
              ON CONFLICT(key) DO UPDATE SET provider = ?2, conversation = ?3, pid = ?4, \
              birth_micros = ?5, cwd = ?6, title = ?7, status = ?8, seen_at = ?9, \
-             executable = ?10, repo = ?11, branch = ?12, ended_at = NULL, \
+             executable = ?10, repo = ?11, branch = ?12, waiting_for = ?13, ended_at = NULL, \
+             reason = NULL, headless = headless AND excluded.headless, \
              handle = coalesce(handle, excluded.handle)",
             params![
                 s.key,
@@ -340,14 +385,17 @@ impl Store {
                 s.seen_at,
                 s.executable,
                 s.repo,
-                s.branch
+                s.branch,
+                s.waiting_for,
+                s.headless.then_some(1)
             ],
         )?;
         Ok(())
     }
 
     /// Marks `key` as registered under a hidden folder at `now` (`hidden`), or no longer;
-    /// whether the mark changed. A mark not renewed for a day goes with `prune_hidden`, unless its session is live.
+    /// whether the mark changed. A mark not renewed for a week goes with `prune_hidden`, unless its
+    /// session is live or an ended row holds its key.
     pub fn set_hidden(&self, key: &str, hidden: bool, now: i64) -> rusqlite::Result<bool> {
         let was = self
             .conn
@@ -370,17 +418,19 @@ impl Store {
         Ok(was != hidden)
     }
 
-    /// Deletes the hidden marks last renewed before `since` but those of `live` sessions: a
-    /// live one stays hidden however long it idles without a hook event.
+    /// Deletes the hidden marks last renewed before `since` but those of `live` sessions and of
+    /// ended rows: a live one stays hidden however long it idles without a hook event, and what
+    /// ended there stays hidden while it is listed.
     pub fn prune_hidden(
         &self,
         since: i64,
         live: &std::collections::HashSet<&str>,
     ) -> rusqlite::Result<()> {
         let old: Vec<String> = {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT key FROM hidden_sessions WHERE updated_at < ?1")?;
+            let mut stmt = self.conn.prepare(
+                "SELECT key FROM hidden_sessions WHERE updated_at < ?1 AND key NOT IN \
+                 (SELECT key FROM sessions WHERE ended_at IS NOT NULL)",
+            )?;
             let rows = stmt.query_map([since], |r| r.get(0))?;
             rows.collect::<rusqlite::Result<_>>()?
         };
@@ -432,6 +482,13 @@ impl Store {
             .optional()
     }
 
+    /// `key`'s row, ended or not: what a revived row keeps.
+    pub fn any_session(&self, key: &str) -> rusqlite::Result<Option<Session>> {
+        self.conn
+            .query_row("SELECT * FROM sessions WHERE key = ?1", [key], row_session)
+            .optional()
+    }
+
     /// The rows that have not ended.
     pub fn sessions(&self) -> rusqlite::Result<Vec<Session>> {
         let mut stmt = self
@@ -449,22 +506,97 @@ impl Store {
             .map(|r| r.is_some())
     }
 
-    /// Ends `key`'s row at `now`; `false` when there is no live one.
-    pub fn end_session(&self, key: &str, now: i64) -> rusqlite::Result<bool> {
+    /// Ends `key`'s row at `now` with `reason` (and `title`, when given); `false` when there is
+    /// no live one. A headless row is deleted instead: it never reaches `ended` or Recent.
+    /// Left for the rebase onto CLI #105: a headless row whose key matches a declared worker (none
+    /// on this branch yet) is the exception to that deletion.
+    pub fn end_session(
+        &self,
+        key: &str,
+        now: i64,
+        reason: &str,
+        title: Option<&str>,
+    ) -> rusqlite::Result<bool> {
+        let deleted = self.conn.execute(
+            "DELETE FROM sessions WHERE key = ?1 AND headless = 1 AND ended_at IS NULL",
+            [key],
+        )?;
+        if deleted > 0 {
+            return Ok(true);
+        }
         Ok(self.conn.execute(
-            "UPDATE sessions SET ended_at = ?2 WHERE key = ?1 AND ended_at IS NULL",
-            params![key, now],
+            "UPDATE sessions SET ended_at = ?2, reason = ?3, \
+             title = coalesce(?4, title) WHERE key = ?1 AND ended_at IS NULL",
+            params![key, now, reason, title],
         )? > 0)
     }
 
-    /// The rows that ended at `since` or later, `(key, ended_at, cwd)`; deletes older ends.
-    pub fn ended_since(&self, since: i64) -> rusqlite::Result<Vec<(String, i64, String)>> {
-        self.conn
-            .execute("DELETE FROM sessions WHERE ended_at < ?1", [since])?;
+    /// The live Claude rows a hook says wait for their person: `(conversation, seen_at)`.
+    pub fn waiting_rows(&self) -> rusqlite::Result<Vec<(String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT conversation, seen_at FROM sessions WHERE provider = 'claude' \
+             AND status = 'waiting' AND ended_at IS NULL AND conversation IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect()
+    }
+
+    /// `title` on `key`'s live row, if it has none.
+    pub fn fill_title(&self, key: &str, title: &str) -> rusqlite::Result<usize> {
+        self.conn.execute(
+            "UPDATE sessions SET title = ?2 WHERE key = ?1 AND title IS NULL AND ended_at IS NULL",
+            params![key, title],
+        )
+    }
+
+    /// A row born ended at `at`, for a job first seen finished: no process, and no handle (one
+    /// comes if it is ever resumed), since hundreds of old jobs must not use up `who`'s numbers.
+    /// `false`, changing nothing, when `key` has a row: a job ends once.
+    pub fn put_ended_job(
+        &self,
+        key: &str,
+        conversation: &str,
+        cwd: &str,
+        title: Option<&str>,
+        at: i64,
+    ) -> rusqlite::Result<bool> {
+        Ok(self.conn.execute(
+            "INSERT OR IGNORE INTO sessions (key, provider, conversation, cwd, title, status, \
+             seen_at, reason, ended_at) VALUES (?1, 'claude', ?2, ?3, ?4, 'idle', ?5, 'job-done', ?5)",
+            params![key, conversation, cwd, title, at],
+        )? > 0)
+    }
+
+    /// The keys of the rows born ended (`put_ended_job`), or ended with no process.
+    pub fn ended_job_keys(&self) -> rusqlite::Result<HashSet<String>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT key, ended_at, cwd FROM sessions WHERE ended_at IS NOT NULL")?;
-        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            .prepare("SELECT key FROM sessions WHERE ended_at IS NOT NULL AND pid IS NULL")?;
+        let keys = stmt.query_map([], |r| r.get(0))?;
+        keys.collect()
+    }
+
+    /// The ended rows, newest end first; deletes those that ended before `since` unless their
+    /// key is in `keep` (a listing still shows it).
+    pub fn ended_since(
+        &self,
+        since: i64,
+        keep: &HashSet<String>,
+    ) -> rusqlite::Result<Vec<Session>> {
+        let mut stale = self
+            .conn
+            .prepare("SELECT key FROM sessions WHERE ended_at < ?1")?;
+        let stale: Vec<String> = stale
+            .query_map([since], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        for key in stale.iter().filter(|k| !keep.contains(*k)) {
+            self.conn
+                .execute("DELETE FROM sessions WHERE key = ?1", [key])?;
+        }
+        let mut stmt = self
+            .conn
+            .prepare("SELECT * FROM sessions WHERE ended_at IS NOT NULL ORDER BY ended_at DESC")?;
+        let rows = stmt.query_map([], row_session)?;
         rows.collect()
     }
 
@@ -961,6 +1093,10 @@ mod tests {
             repo: None,
             branch: None,
             handle: None,
+            reason: None,
+            ended_at: None,
+            waiting_for: None,
+            headless: false,
         };
         store.put_session(&session).unwrap();
         let handle = Some("claude-1".into());
@@ -1051,16 +1187,94 @@ mod tests {
         let store = Store::open(&path).unwrap();
         assert_eq!(user_version(&path), MIGRATIONS.len() as i64);
         assert_eq!(store.sessions().unwrap().len(), 1);
-        assert!(store.end_session("k", 9).unwrap());
-        assert!(!store.end_session("k", 9).unwrap());
+        assert!(store.end_session("k", 9, "process-exited", None).unwrap());
+        assert!(!store.end_session("k", 9, "process-exited", None).unwrap());
         assert_eq!(store.session("k").unwrap(), None);
         assert!(store.holds("k").unwrap());
+        let ended = store.ended_since(9, &HashSet::new()).unwrap();
         assert_eq!(
-            store.ended_since(9).unwrap(),
-            [("k".into(), 9, "/p".into())]
+            ended
+                .iter()
+                .map(|e| (e.key.as_str(), e.cwd.as_str()))
+                .collect::<Vec<_>>(),
+            [("k", "/p")]
         );
-        assert!(store.ended_since(10).unwrap().is_empty());
+        assert!(store.ended_since(10, &HashSet::new()).unwrap().is_empty());
         assert!(!store.holds("k").unwrap());
+    }
+
+    fn waiting_row(key: &str) -> Session {
+        Session {
+            key: key.into(),
+            provider: "claude".into(),
+            conversation: None,
+            pid: None,
+            birth_micros: None,
+            cwd: "/".into(),
+            title: None,
+            status: "idle".into(),
+            seen_at: 1,
+            executable: None,
+            repo: None,
+            branch: None,
+            handle: None,
+            reason: None,
+            ended_at: None,
+            waiting_for: None,
+            headless: false,
+        }
+    }
+
+    #[test]
+    fn ending_keeps_reason_and_title_and_prunes_after_the_window_unless_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("state.db")).unwrap();
+        s.put_session(&waiting_row("k/claude:a")).unwrap();
+        s.put_session(&waiting_row("k/claude:b")).unwrap();
+        assert!(s
+            .end_session("k/claude:a", 1_000, "moved-on", Some("fix the thing"))
+            .unwrap());
+        assert!(s
+            .end_session("k/claude:b", 1_000, "job-done", None)
+            .unwrap());
+        let ended = s.ended_since(500, &HashSet::new()).unwrap();
+        assert_eq!(ended.len(), 2);
+        assert_eq!((ended[0].ended_at, ended[0].seen_at), (Some(1_000), 1));
+        assert_eq!(
+            (ended[0].reason.as_deref(), ended[0].title.as_deref()),
+            (Some("moved-on"), Some("fix the thing"))
+        );
+        // Past the window: `a` goes, `b` is kept because the listing still shows it.
+        let ended = s
+            .ended_since(2_000, &HashSet::from(["k/claude:b".to_string()]))
+            .unwrap();
+        assert_eq!(
+            ended.iter().map(|e| e.key.as_str()).collect::<Vec<_>>(),
+            ["k/claude:b"]
+        );
+        assert!(!s.holds("k/claude:a").unwrap());
+    }
+
+    #[test]
+    fn a_waiting_row_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("state.db")).unwrap();
+        let row = Session {
+            status: "waiting".into(),
+            waiting_for: Some("permission prompt".into()),
+            ..waiting_row("k/claude:a")
+        };
+        s.put_session(&row).unwrap();
+        let got = s.session("k/claude:a").unwrap().unwrap();
+        assert_eq!(
+            (got.status.as_str(), got.waiting_for.as_deref()),
+            ("waiting", Some("permission prompt"))
+        );
+        // Ended, then registered again: live again, the reason cleared.
+        s.end_session("k/claude:a", 5, "moved-on", None).unwrap();
+        s.put_session(&row).unwrap();
+        let back = s.session("k/claude:a").unwrap().unwrap();
+        assert_eq!((back.reason, back.ended_at), (None, None));
     }
 
     #[test]
@@ -1081,6 +1295,10 @@ mod tests {
             repo: Some("r".into()),
             branch: None,
             handle: None,
+            reason: None,
+            ended_at: None,
+            waiting_for: None,
+            headless: false,
         };
         for (k, p) in [
             ("a", "codex"),
@@ -1091,7 +1309,7 @@ mod tests {
             store.put_session(&row(k, p)).unwrap();
         }
         store.put_session(&row("a", "codex")).unwrap();
-        store.end_session("c", 5).unwrap();
+        store.end_session("c", 5, "process-exited", None).unwrap();
         let got: Vec<_> = store
             .sessions()
             .unwrap()
@@ -1110,7 +1328,7 @@ mod tests {
     }
 
     #[test]
-    fn a_hidden_mark_says_when_it_changed_and_goes_a_day_after_its_last_renewal() {
+    fn a_hidden_mark_says_when_it_changed_and_goes_when_nothing_holds_it() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("state.db")).unwrap();
         let none = std::collections::HashSet::new();
@@ -1121,9 +1339,65 @@ mod tests {
         // A live session's mark stays however old.
         store.prune_hidden(21, &["k"].into()).unwrap();
         assert!(store.hidden_keys().unwrap().contains("k"));
+        // Nor while an ended row holds its key.
+        store.put_session(&sample("k")).unwrap();
+        store.end_session("k", 15, "session-end", None).unwrap();
+        store.prune_hidden(21, &none).unwrap();
+        assert!(store.hidden_keys().unwrap().contains("k"));
+        store.ended_since(100, &HashSet::new()).unwrap();
         store.prune_hidden(21, &none).unwrap();
         assert!(store.hidden_keys().unwrap().is_empty());
         assert!(!store.set_hidden("k", false, 30).unwrap());
+    }
+
+    fn sample(key: &str) -> Session {
+        Session {
+            key: key.into(),
+            provider: "claude".into(),
+            conversation: Some("c".into()),
+            pid: None,
+            birth_micros: None,
+            cwd: "/tmp".into(),
+            title: None,
+            status: "idle".into(),
+            seen_at: 1,
+            executable: None,
+            repo: None,
+            branch: None,
+            handle: None,
+            reason: None,
+            ended_at: None,
+            waiting_for: None,
+            headless: false,
+        }
+    }
+
+    #[test]
+    fn a_headless_row_has_no_handle_and_is_gone_when_it_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("state.db")).unwrap();
+        let headless = Session {
+            headless: true,
+            ..sample("h")
+        };
+        store.put_session(&headless).unwrap();
+        let row = store.session("h").unwrap().unwrap();
+        assert!(row.headless);
+        assert_eq!(row.handle, None);
+        assert!(store.end_session("h", 5, "session-end", None).unwrap());
+        assert!(!store.holds("h").unwrap());
+        assert!(!store.end_session("h", 6, "session-end", None).unwrap());
+        // `claude -p --resume` of a person's conversation: the row stays theirs.
+        store.put_session(&sample("p")).unwrap();
+        store
+            .put_session(&Session {
+                headless: true,
+                ..sample("p")
+            })
+            .unwrap();
+        assert!(!store.session("p").unwrap().unwrap().headless);
+        assert!(store.end_session("p", 5, "session-end", None).unwrap());
+        assert!(store.holds("p").unwrap());
     }
 
     #[test]
@@ -1137,5 +1411,29 @@ mod tests {
         let err = Store::open(&path).err().unwrap().to_string();
         assert!(err.contains("State is from a newer version (v16)"), "{err}");
         assert_eq!(user_version(&path), 16);
+    }
+
+    /// An older db gains the columns with no version bump: that build can still open it.
+    #[test]
+    fn the_session_columns_are_added_on_open_and_the_version_stays() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        drop(Store::open(&path).unwrap());
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "ALTER TABLE sessions DROP COLUMN reason;
+                 ALTER TABLE sessions DROP COLUMN waiting_for;",
+            )
+            .unwrap();
+        let store = Store::open(&path).unwrap();
+        store.put_session(&sample("k")).unwrap();
+        assert_eq!(store.session("k").unwrap().unwrap().waiting_for, None);
+        assert!(store.end_session("k", 5, "session-end", None).unwrap());
+        drop(store);
+        assert_eq!(user_version(&path), 15);
+        // Opening again changes nothing.
+        drop(Store::open(&path).unwrap());
+        assert_eq!(user_version(&path), 15);
     }
 }

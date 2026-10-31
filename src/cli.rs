@@ -211,95 +211,207 @@ fn table(rows: &[Vec<String>]) {
     }
 }
 
+/// How long ago, as `who` says it.
+fn ago(secs_ago: u64) -> String {
+    match secs_ago {
+        0..60 => "just now".into(),
+        60..3_600 => format!("{} min ago", secs_ago / 60),
+        3_600..86_400 => format!("{} h ago", secs_ago / 3_600),
+        _ => format!("{} d ago", secs_ago / 86_400),
+    }
+}
+
+/// A row's field as one cell, `None` when empty.
+fn field_cell(s: &Value, f: &str) -> Option<String> {
+    s[f].as_str().map(cell).filter(|t| !t.is_empty())
+}
+
+/// A path's last part.
+fn last_part(path: &str) -> String {
+    let p = std::path::Path::new(path);
+    p.file_name()
+        .map_or(path.to_string(), |f| f.to_string_lossy().into_owned())
+}
+
+/// An ended row's folder in `Recent`: as published, or (`sessions` gives a path) its last part.
+fn recent_folder(s: &Value) -> String {
+    field_cell(s, "folder")
+        .or(field_cell(s, "cwd").map(|c| last_part(&c)))
+        .unwrap_or_default()
+}
+
+/// `who`'s Status cell. `sessions` says `live` where `directory` says `busy`; only this
+/// computer's rows carry `pid`, and only they wait for the person reading this.
+fn status_cell(s: &Value, now: u64) -> String {
+    if s["online"] == false {
+        if s["wakes"] == true {
+            return "parked, wakes when messaged".into();
+        }
+        let seen = now.saturating_sub(s["seen_at"].as_u64().unwrap_or(0));
+        // Mail is held a day: past that, nothing waits for it.
+        let queued = if seen > crate::presence::DAY {
+            ""
+        } else {
+            ", messages queued"
+        };
+        return format!("offline, last seen {}{queued}", ago(seen));
+    }
+    let status = match s["status"].as_str() {
+        Some("live" | "busy") => "busy".to_string(),
+        Some("waiting") => {
+            let who = if s["pid"].is_number() {
+                "waiting for you"
+            } else {
+                "waiting"
+            };
+            match field_cell(s, "waiting_for") {
+                Some(what) => format!("{who}: {what}"),
+                None => who.to_string(),
+            }
+        }
+        _ => match s["job"]["state"].as_str() {
+            Some(state @ ("done" | "failed" | "stopped")) => {
+                match field_cell(&s["job"], "id").filter(|_| s["pid"].is_number()) {
+                    Some(id) => format!("idle, {state}, attach: claude attach {id}"),
+                    None => format!("idle, {state}"),
+                }
+            }
+            _ => "idle".to_string(),
+        },
+    };
+    let gets = match s["tier"].as_str() {
+        Some("push") => "instantly",
+        Some("next_step") => "at its next step",
+        _ => "when it checks",
+    };
+    let hidden = if s["hidden"] == true {
+        ", hidden from teammates"
+    } else {
+        ""
+    };
+    format!("{status}, gets messages {gets}{hidden}")
+}
+
+/// How many ended sessions `who` lists under `Recent`, newest first.
+const RECENT: usize = 10;
+
 /// `who [--all]`: this computer's sessions by handle; with `all`, every teammate's too
-/// (`directory`). Ids only with `--json`.
+/// (`directory`); then, under `Recent`, those that ended within the week. Ids only with
+/// `--json`, which prints one array, live rows first.
 pub fn who(as_json: bool, all: bool) -> Result<i32> {
     let mut conn = connect()?;
     let op = if all { "directory" } else { "sessions" };
-    let sessions = ask(&mut conn, op, json!({}))?["sessions"].clone();
+    let r = ask(&mut conn, op, json!({}))?;
+    let mut list = r["sessions"].as_array().cloned().unwrap_or_default();
+    // `sessions` answers them apart; `directory` has them in `sessions` already.
+    list.extend(r["ended"].as_array().cloned().unwrap_or_default());
     if as_json {
-        println!("{sessions}");
+        println!("{}", Value::Array(list));
         return Ok(0);
     }
-    let list = sessions.as_array().cloned().unwrap_or_default();
     if list.is_empty() {
         println!("No sessions yet. Open Claude Code, Codex, Cursor, Grok or OpenCode and they appear here.");
         return Ok(0);
     }
     // (header, cell, also without `--all`)
     type Cell = fn(&Value) -> String;
-    fn text(s: &Value, f: &str) -> Option<String> {
-        s[f].as_str().map(cell).filter(|t| !t.is_empty())
-    }
-    let columns: [(&str, Cell, bool); 7] = [
+    let person: Cell = |s| field_cell(s, "person").unwrap_or_default();
+    let computer: Cell = |s| field_cell(s, "computer").unwrap_or_default();
+    let agent: Cell = |s| {
+        crate::frame::agent_name(
+            &field_cell(s, "agent")
+                .or(field_cell(s, "provider"))
+                .unwrap_or_default(),
+        )
+    };
+    let live_columns: [(&str, Cell, bool); 7] = [
         // A handle, else (a teammate's session, or one not registered yet) the address `send`
         // takes.
         (
             "Name",
             |s| {
-                text(s, "handle")
-                    .or(text(s, "session_id"))
-                    .or(text(s, "key"))
+                field_cell(s, "handle")
+                    .or(field_cell(s, "session_id"))
+                    .or(field_cell(s, "key"))
                     .unwrap_or_default()
             },
             true,
         ),
-        ("Person", |s| text(s, "person").unwrap_or_default(), false),
-        (
-            "Computer",
-            |s| text(s, "computer").unwrap_or_default(),
-            false,
-        ),
-        (
-            "Agent",
-            |s| {
-                crate::frame::agent_name(
-                    &text(s, "agent").or(text(s, "provider")).unwrap_or_default(),
-                )
-            },
-            true,
-        ),
-        // A teammate's session has no folder here: its repo instead.
+        ("Person", person, false),
+        ("Computer", computer, false),
+        ("Agent", agent, true),
+        // A teammate's session has no path here: its folder, else its repo.
         (
             "Folder",
-            |s| text(s, "cwd").or(text(s, "repo")).unwrap_or_default(),
+            |s| {
+                field_cell(s, "cwd")
+                    .or(field_cell(s, "folder"))
+                    .or(field_cell(s, "repo"))
+                    .unwrap_or_default()
+            },
             true,
         ),
         (
             "Status",
-            |s| {
-                let status = if s["status"] == "live" {
-                    "busy"
-                } else {
-                    "idle"
-                };
-                let gets = match s["tier"].as_str() {
-                    Some("push") => "instantly",
-                    Some("next_step") => "at its next step",
-                    _ => "when it checks",
-                };
-                let hidden = if s["hidden"] == true {
-                    ", hidden from teammates"
-                } else {
-                    ""
-                };
-                format!("{status}, gets messages {gets}{hidden}")
-            },
+            |s| status_cell(s, crate::daemon::ipc::now()),
             true,
         ),
         (
             "Doing",
-            |s| text(s, "doing").or(text(s, "title")).unwrap_or_default(),
+            |s| {
+                field_cell(s, "doing")
+                    .or(field_cell(s, "title"))
+                    .unwrap_or_default()
+            },
             true,
         ),
     ];
-    let columns: Vec<_> = columns.into_iter().filter(|c| all || c.2).collect();
-    let mut rows = vec![columns.iter().map(|c| c.0.to_string()).collect::<Vec<_>>()];
-    rows.extend(
-        list.iter()
-            .map(|s| columns.iter().map(|c| (c.1)(s)).collect()),
-    );
-    table(&rows);
+    let recent_columns: [(&str, Cell, bool); 7] = [
+        (
+            "Title",
+            |s| field_cell(s, "title").unwrap_or_else(|| last_part(&recent_folder(s))),
+            true,
+        ),
+        ("Person", person, false),
+        ("Computer", computer, false),
+        ("Agent", agent, true),
+        ("Folder", recent_folder, true),
+        (
+            "Ended",
+            |s| {
+                let at = s["ended_at"].as_u64().unwrap_or(0);
+                ago(crate::daemon::ipc::now().saturating_sub(at))
+            },
+            true,
+        ),
+        (
+            "Resume",
+            |s| field_cell(s, "resume").unwrap_or_default(),
+            true,
+        ),
+    ];
+    let print = |columns: &[(&str, Cell, bool)], rows: &[&Value]| {
+        let columns: Vec<_> = columns.iter().filter(|c| all || c.2).collect();
+        let mut lines = vec![columns.iter().map(|c| c.0.to_string()).collect::<Vec<_>>()];
+        lines.extend(
+            rows.iter()
+                .map(|s| columns.iter().map(|c| (c.1)(s)).collect()),
+        );
+        table(&lines);
+    };
+    let (mut ended, live): (Vec<&Value>, Vec<&Value>) =
+        list.iter().partition(|s| s["status"] == "ended");
+    ended.sort_by_key(|s| std::cmp::Reverse(s["ended_at"].as_u64()));
+    if !live.is_empty() {
+        print(&live_columns, &live);
+    }
+    if !ended.is_empty() {
+        println!("\nRecent");
+        print(&recent_columns, &ended[..ended.len().min(RECENT)]);
+        if ended.len() > RECENT {
+            println!("… {} more: lightbulb who --json", ended.len() - RECENT);
+        }
+    }
     println!("{}", setup::UPSELL);
     Ok(0)
 }
@@ -315,7 +427,7 @@ fn session_identity() -> bool {
 /// The session of the agent above this invocation, resolved as the MCP server resolves it.
 fn calling_session(conn: &mut Conn) -> Option<String> {
     let me = hook::calling_agent(None).ok()?;
-    let sessions = ask(conn, "sessions", json!({})).ok()?["sessions"].clone();
+    let sessions = ask(conn, "sessions", json!({ "headless": true })).ok()?["sessions"].clone();
     let sessions: Vec<crate::sessions::Session> = serde_json::from_value(sessions).ok()?;
     crate::agents::source::resolve(&me, &json!({}), &sessions)
         .ok()
@@ -369,7 +481,7 @@ pub fn send(
             .as_array()
             .into_iter()
             .flatten()
-            .filter(|s| s["hidden"] != true)
+            .filter(|s| s["hidden"] != true && s["status"] != "ended")
             .filter_map(|s| {
                 let key = s["key"].as_str().or(s["session_id"].as_str())?;
                 (target == "*" || key.starts_with(prefix)).then_some((key, s))
@@ -1778,8 +1890,47 @@ fn launchctl(args: &[&str]) -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
+/// (tests, debug builds) Let launchctl run from a temporary HOME (the macOS shim test).
+#[cfg(debug_assertions)]
+const LAUNCHCTL_ANYWHERE: &str = "LIGHTBULB_CONNECT_DEBUG_LAUNCHCTL_ANYWHERE";
+
+/// Whether HOME is the account's own home directory (the passwd entry) and no
+/// `LIGHTBULB_CONNECT_HOME` moves the state: anywhere else is a test or a sandbox, and the
+/// launchd label is fixed, so touching launchd there would replace the real background service.
+pub(crate) fn real_home() -> bool {
+    real_home_given(
+        std::env::var_os(paths::HOME_ENV).is_some(),
+        std::env::var_os("HOME").map(PathBuf::from),
+    )
+}
+
+/// `real_home`, given whether `LIGHTBULB_CONNECT_HOME` is set and what `HOME` says.
+fn real_home_given(state_moved: bool, home: Option<PathBuf>) -> bool {
+    let (false, Some(home), Some(passwd)) = (state_moved, home, passwd_home()) else {
+        return false;
+    };
+    let canon = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    canon(&home) == canon(&passwd)
+}
+
+/// The account's home directory, from its passwd entry.
+fn passwd_home() -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let pw = unsafe { libc::getpwuid(libc::getuid()) };
+    if pw.is_null() || unsafe { (*pw).pw_dir.is_null() } {
+        return None;
+    }
+    Some(PathBuf::from(std::ffi::OsStr::from_bytes(
+        unsafe { std::ffi::CStr::from_ptr((*pw).pw_dir) }.to_bytes(),
+    )))
+}
+
 pub(crate) fn use_launchctl() -> bool {
-    test_env(NO_LAUNCHCTL).is_none()
+    #[cfg(debug_assertions)]
+    let anywhere = test_env(LAUNCHCTL_ANYWHERE).is_some();
+    #[cfg(not(debug_assertions))]
+    let anywhere = false;
+    test_env(NO_LAUNCHCTL).is_none() && (real_home() || anywhere)
 }
 
 /// Asks launchd to start the installed job if it is not running; whether launchctl agreed.
@@ -2107,6 +2258,15 @@ pub fn doctor() -> Result<i32> {
         let short = r.short();
         row(&r.product(), ok, &short, &short, &setup);
     }
+    if crate::agents::listing::candidates(&home).is_empty() {
+        row(
+            "Claude listing",
+            true,
+            "not found; using session files",
+            "",
+            "",
+        );
+    }
     let named = match short_link(&home) {
         Link::Ours => Ok("\"lightbulb\""),
         Link::File => Ok("~/.local/bin/lightbulb is another program's; put ~/.lightbulb/connect/bin on your PATH"),
@@ -2317,6 +2477,88 @@ pub fn setup(
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
+    #[test]
+    fn who_says_how_long_ago() {
+        let said = [0, 59, 60, 3_599, 3_600, 86_399, 86_400].map(super::ago);
+        assert_eq!(
+            said,
+            [
+                "just now",
+                "just now",
+                "1 min ago",
+                "59 min ago",
+                "1 h ago",
+                "23 h ago",
+                "1 d ago"
+            ]
+        );
+    }
+
+    #[test]
+    fn who_says_what_is_true_of_a_session() {
+        let says = |s| super::status_cell(&s, 1_000);
+        let gets = ", gets messages when it checks";
+        assert_eq!(says(json!({"status": "live"})), format!("busy{gets}"));
+        assert_eq!(
+            says(json!({"status": "busy", "online": true})),
+            format!("busy{gets}")
+        );
+        assert_eq!(
+            says(json!({"status": "waiting", "waiting_for": "permission prompt", "pid": 1})),
+            format!("waiting for you: permission prompt{gets}")
+        );
+        assert_eq!(
+            says(json!({"status": "waiting", "waiting_for": "permission prompt", "online": true})),
+            format!("waiting: permission prompt{gets}")
+        );
+        assert_eq!(says(json!({"status": "idle"})), format!("idle{gets}"));
+        for state in ["done", "failed", "stopped"] {
+            let s = json!({"status": "idle", "job": {"id": "j", "state": state}});
+            assert_eq!(says(s), format!("idle, {state}{gets}"));
+            let own = json!({"status": "idle", "pid": 1, "job": {"id": "j", "state": state}});
+            assert_eq!(
+                says(own),
+                format!("idle, {state}, attach: claude attach j{gets}")
+            );
+        }
+        let working = json!({"status": "idle", "job": {"id": "j", "state": "working"}});
+        assert_eq!(says(working), format!("idle{gets}"));
+        assert_eq!(
+            says(json!({"status": "idle", "tier": "push", "hidden": true})),
+            "idle, gets messages instantly, hidden from teammates"
+        );
+        let offline = json!({"status": "busy", "online": false, "seen_at": 880, "wakes": false});
+        assert_eq!(
+            says(offline),
+            "offline, last seen 2 min ago, messages queued"
+        );
+        // Mail is held a day: past that, nothing is queued.
+        let long = json!({"status": "busy", "online": false, "seen_at": 1, "wakes": false});
+        assert_eq!(
+            super::status_cell(&long, 3 * 86_400),
+            "offline, last seen 2 d ago"
+        );
+        let parked = json!({"status": "busy", "online": false, "seen_at": 880, "wakes": true});
+        assert_eq!(says(parked), "parked, wakes when messaged");
+    }
+
+    #[test]
+    fn a_home_is_real_only_if_it_is_the_accounts() {
+        let account = super::passwd_home().unwrap();
+        assert!(super::real_home_given(false, Some(account.clone())));
+        assert!(!super::real_home_given(false, None), "HOME unset");
+        assert!(
+            !super::real_home_given(true, Some(account)),
+            "LIGHTBULB_CONNECT_HOME set"
+        );
+        assert!(!super::real_home_given(
+            false,
+            Some("/nonexistent/x".into())
+        ));
+    }
+
     #[test]
     fn print_disabled_marks_only_the_disabled_label() {
         let l = "\tdisabled services = {\n\t\t\"a.b\" => disabled\n\t\t\"c.d\" => enabled\n\t\t\"e.f\" => true\n\t}\n";
