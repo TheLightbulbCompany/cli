@@ -4,7 +4,7 @@
 use crate::daemon::{ipc, Daemon};
 use crate::doing::TEXT_MAX;
 use crate::frame::Sender;
-use crate::mail::{self, State};
+use crate::mail::{self, Meta, State};
 use crate::memory;
 use crate::roster::{Entry, Member};
 use crate::sessions::Tier;
@@ -16,7 +16,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub const MAX_FRAME: usize = 1 << 20;
 
 /// The reasons a peer may give for `refused`.
-pub const REASONS: [&str; 7] = [
+pub const REASONS: [&str; 11] = [
     "loop",
     "policy",
     "declined",
@@ -24,6 +24,11 @@ pub const REASONS: [&str; 7] = [
     "not_a_member",
     "request_id_reused",
     "unsupported",
+    "no_worker",
+    "bad_request",
+    // A worker host at its cap; an assignment its asker cancelled while it was held.
+    "busy",
+    "cancelled",
 ];
 
 /// A session as a peer publishes it (Task 7).
@@ -38,6 +43,9 @@ pub struct Remote {
     pub doing: Option<String>,
     pub tier: String,
     pub title: Option<String>,
+    /// A worker host's free slots (`<m>/<harness>:new` rows only); an older peer ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free: Option<u32>,
     /// What it waits for: a session stopped for its person travels as `busy` with this, since
     /// an older peer drops a whole presence over a status it does not know.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -125,6 +133,7 @@ impl Remote {
         };
         own(peer_short, &self.session_id)
             && agent
+            && (self.free.is_none() || self.session_id.ends_with(":new"))
             && STATUSES.contains(&self.status.as_str())
             && Tier::ALL.iter().any(|t| t.as_str() == self.tier)
             && short(&self.folder)
@@ -202,6 +211,8 @@ pub enum Frame {
         body: String,
         files: Vec<String>,
         sent_at: i64,
+        #[serde(default, skip_serializing_if = "Meta::is_empty")]
+        meta: Meta,
     },
     /// `limit` (`hops` or `rate`) names the limit a `loop` refusal hit; a peer may leave it out.
     Ack {
@@ -501,6 +512,7 @@ mod tests {
             doing: s.doing.clone(),
             tier: s.tier.clone(),
             title: s.title.clone(),
+            free: None,
             waiting_for: None,
         };
         assert!(then.valid("abc"), "{then:?}");
@@ -580,6 +592,86 @@ mod tests {
         let mut long = sample_ended();
         long.title = Some("x".repeat(TEXT_MAX + 1));
         assert!(long.clamp().valid("abc"));
+    }
+
+    #[test]
+    fn free_slots_ride_only_a_new_row() {
+        let row = |id: &str| Remote {
+            session_id: id.into(),
+            agent: "claude".into(),
+            repo: None,
+            branch: None,
+            folder: "f".into(),
+            status: "idle".into(),
+            doing: None,
+            tier: "pull".into(),
+            title: None,
+            free: Some(1),
+            waiting_for: None,
+        };
+        assert!(!row("x/claude:1").valid("x"));
+        assert!(row("x/claude:new").valid("x"));
+    }
+
+    #[test]
+    fn an_envelope_without_meta_reads_as_empty_and_one_with_it_round_trips() {
+        let old = r#"{"t":"envelope","id":"01A","request_id":"r","kind":"message","from":"a/codex:1","to":"b/claude:2","reply_to":null,"thread":null,"hops":0,"body":"hi","files":[],"sent_at":1}"#;
+        let f: Frame = serde_json::from_str(old).unwrap();
+        assert!(matches!(&f, Frame::Envelope { meta, .. } if meta.is_empty()));
+        assert!(!serde_json::to_string(&f).unwrap().contains("meta"));
+        let Frame::Envelope { mut meta, .. } = f.clone() else {
+            unreachable!()
+        };
+        meta.done_when = Some("green".into());
+        meta.deadline_at = Some(7);
+        let f = match f {
+            Frame::Envelope {
+                id,
+                request_id,
+                from,
+                to,
+                reply_to,
+                thread,
+                hops,
+                body,
+                files,
+                sent_at,
+                ..
+            } => Frame::Envelope {
+                id,
+                request_id,
+                kind: "assign".into(),
+                from,
+                to,
+                reply_to,
+                thread,
+                hops,
+                body,
+                files,
+                sent_at,
+                meta,
+            },
+            _ => unreachable!(),
+        };
+        let text = serde_json::to_string(&f).unwrap();
+        assert!(
+            text.contains(r#""meta":{"done_when":"green","deadline_at":7}"#),
+            "{text}"
+        );
+        assert_eq!(serde_json::from_str::<Frame>(&text).unwrap(), f);
+    }
+
+    #[test]
+    fn no_worker_is_a_reason_a_peer_may_give() {
+        assert!(REASONS.contains(&"no_worker"));
+        // `check_kind` refuses an assignment's bad terms on receipt too.
+        assert!(REASONS.contains(&"bad_request"));
+        // A worker host at its cap, and a held assignment its asker cancelled.
+        assert!(REASONS.contains(&"busy") && REASONS.contains(&"cancelled"));
+        assert_eq!(
+            crate::mail::KINDS,
+            ["message", "assign", "result", "cancel"]
+        );
     }
 
     #[test]

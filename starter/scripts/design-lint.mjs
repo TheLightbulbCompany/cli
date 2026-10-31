@@ -1,5 +1,6 @@
 // Flags colours and one-off sizes written outside the design tokens, so the app keeps the
 // company's look. Colours belong in design/tokens.css; src/components/ui is the token-based kit.
+// Also flags two ways a button silently does nothing: native dialogs and forms refused in silence.
 // Prints file:line for each and exits 1.
 import { readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
@@ -9,6 +10,8 @@ const RULES = [
   [/(?<![&\w])#(?:[0-9a-f]{8}|[0-9a-f]{6}|[0-9a-f]{3,4})\b/i, "raw hex colour; use a token from design/tokens.css"],
   [/\b(?:rgba?|hsla?|oklch|oklab|lab|lch|hwb)\(/i, "raw colour function; use a token from design/tokens.css"],
   [/(?<![\w-])[a-z][a-z0-9-]*-\[[^\]\s]+\](?!:)/, "arbitrary Tailwind value; use the scale or a token"],
+  // Canvas frames the app without allow-modals: confirm() answers false there, so the button does nothing.
+  [/(?<![\w.$])(?:window\.)?(?:confirm|alert|prompt)\(/, "native dialog does nothing in Canvas; act on the click, or ask in the page"],
 ];
 const SKIP = ["node_modules", ".next", "src/components/ui"];
 

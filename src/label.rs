@@ -41,6 +41,9 @@ pub fn render_as(roster: &Roster, viewer: &str, from: &str, declared: Option<&st
             Some(a) => format!("{possessive} {}", shown(a, 64, "agent")),
             None => format!("{possessive} {n} mailbox"),
         },
+        Sender::Agent(p) if from.ends_with(":new") => {
+            format!("a new {} on {}", agent_name(p), m.computer)
+        }
         Sender::Agent(p) => format!("{possessive} {}", agent_name(p)),
     };
     if verified(m, viewer) {
@@ -132,6 +135,18 @@ mod tests {
             admitted_at: 0,
             by: None,
         }
+    }
+
+    #[test]
+    fn a_new_worker_address_reads_as_a_new_harness_on_the_computer() {
+        let mut r = Roster::default();
+        let mut b = member("bkey", "bshort", "aden");
+        b.computer = "mbp".into();
+        r.members.insert(b.key.clone(), b);
+        assert_eq!(
+            render(&r, "akey", "bshort/claude:new"),
+            "a new Claude Code on mbp (not verified)"
+        );
     }
 
     #[test]

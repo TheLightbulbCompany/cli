@@ -52,6 +52,8 @@ fn fake_codex(rel: &str) -> PathBuf {
 async fn start(conv: &str, exe: &Path) -> (tempfile::TempDir, Conn, String) {
     home();
     let dir = tempfile::tempdir().unwrap();
+    // Network workers on: one test pushes an assignment.
+    std::fs::write(dir.path().join("config.toml"), "network_workers = true\n").unwrap();
     let state = dir.path().to_path_buf();
     tokio::spawn(async move { daemon::run(&state).await.unwrap() });
     let sock = dir.path().join(paths::SOCKET);
@@ -154,6 +156,53 @@ async fn codex_push_runs_codex_queue_with_the_thread_id() {
     assert_eq!(
         call(&mut c, json!({"id": 5, "op": "unread", "key": to})).await["unread"],
         0
+    );
+}
+
+/// An assignment is pushed with its own header: its done_when and deadline, and how to answer.
+#[tokio::test]
+async fn codex_push_frames_an_assignment_as_one() {
+    let exe = fake_codex(".codex/packages/app-server-daemon/releases/assign/bin");
+    let bin = exe.parent().unwrap();
+    let (_dir, mut c, to) = start("t4", &exe).await;
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    };
+    let before = now();
+    let sent = call(
+        &mut c,
+        json!({"id": 3, "op": "send", "from": "x/claude:a", "to": to, "kind": "assign",
+        "text": "run the tests", "done_when": "tests pass", "deadline_s": 600,
+        "request_id": "as1"}),
+    )
+    .await;
+    let after = now();
+    assert_eq!(sent["receipt"]["state"], "stored", "{sent}");
+    calls(bin, 1).await;
+    let got = argv(bin, 1);
+    let want = (before..=after).map(|t| {
+        let meta = lightbulb::mail::Meta {
+            done_when: Some("tests pass".into()),
+            deadline_at: Some(t + 600),
+            ..Default::default()
+        };
+        let framed = frame::framed_kind(
+            "assign",
+            "Your Claude Code",
+            "as1",
+            None,
+            &meta,
+            "run the tests",
+        );
+        expected_argv("t4", &framed)
+    });
+    assert!(
+        want.into_iter().any(|w| w == got),
+        "{:?}",
+        String::from_utf8_lossy(&got[4])
     );
 }
 

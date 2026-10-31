@@ -15,14 +15,23 @@ it adds two things:
   `'~/.lightbulb/connect/bin/lightbulb' hook <agent> <event>` (with your real home path).
   Hooks tell Lightbulb which sessions are open, and hand waiting messages to the agent.
 - **A tool server** (an MCP server) named `lightbulb`. Its command is
-  `~/.lightbulb/connect/bin/lightbulb mcp`. It always gives the agent four network tools. While this computer is signed in (`lightbulb login`), it also gives the workspace tools (`find_rooms`, `read_messages`, `find_tasks`, `read_task`, `update_task`, `use_browser`), and `send_message` can post to a room (`room_id`) or a person (`person_id`). The names, descriptions and schemas are `src/mcp/tools.json`; `lightbulb mcp --tools-json` prints it.
+  `~/.lightbulb/connect/bin/lightbulb mcp`. It always gives the agent six network tools (`recall` and `remember` among them), and three more for assignments while network workers are on. While this computer is signed in (`lightbulb login`), it also gives the workspace tools (`find_rooms`, `read_messages`, `find_tasks`, `read_task`, `update_task`, `use_browser`), and `send_message` can post to a room (`room_id`) or a person (`person_id`). The names, descriptions and schemas are `src/mcp/tools.json`; `lightbulb mcp --tools-json` prints it.
 
   | Tool | What it does |
   |---|---|
   | `find_sessions` | Lists the sessions you can message: this computer's first, then your teammates', with those that ended last. `status` is busy, waiting (`waiting_for` says for what; its person must answer), idle or ended; `online: false` with `seen_at` is an offline computer, and `wakes: true` a parked workspace that a message wakes. Ended sessions stay seven days, with `ended_at` and `reason`; your own carry `resume`, the command that resumes them. An ended session reads nothing unless resumed; a message to one waits a day. Takes an optional search text and a limit (default 20). |
   | `send_message` | Sends text to a session by its `session_id`, or answers a message with `reply_to`. Returns a receipt. |
   | `message_receipt` | Shows the receipt of a message this session sent. |
-  | `check_inbox` | Takes the messages waiting for this session. It can wait up to 30 seconds per call for one to arrive. |
+  | `check_inbox` | Takes the messages waiting for this session. It can wait up to 600 seconds per call for one to arrive. |
+  | `find_workers` | Lists the agents that take an assignment: for now the always-on agents (workspace agents and connected apps). |
+  | `assign` | Hands one job to one session: a brief, a `done_when` line and a deadline (default an hour). Its reply is the result. |
+  | `cancel_assignment` | Tells the session working on an assignment to stop. |
+
+`find_workers`, `assign` and `cancel_assignment` are listed only while this computer's network workers are on. They are off by default; turn them on with `lightbulb config set network_workers true`. While they are off, the daemon refuses to send or take an assignment (`unsupported`), whatever the tool list says.
+
+`find_workers` also lists computers that start a fresh worker for you (`<member>/claude:new`). Assign to one and its person is asked once; the worker then runs headless in a folder of its own, its permission prompts go to that person (never to you), and its reply is the result. The person manages them with `lightbulb workers`.
+
+**Workspace agents.** An assignment reaches a workspace agent once its runtime runs an engine with this feature and its `config.toml` turns `network_workers` on; until then it is refused `unsupported`, like on any computer. The frame names no tool, only `reply_to` with the assignment's `requestId`. The bridge half is TheLightbulbCompany/lightbulb#4489.
 
 Before it changes a file for the first time, `setup` saves a copy beside it as
 `<file>.lightbulb-backup`. It never overwrites a backup. It does not touch other entries in

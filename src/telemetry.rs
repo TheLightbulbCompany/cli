@@ -196,19 +196,24 @@ fn install_id(dir: &Path) -> Result<String> {
             return Ok(id.trim().to_string());
         }
     }
+    let id = uuid_v4();
+    write_private(&path, &id)?;
+    Ok(id)
+}
+
+/// A random UUID (v4).
+pub(crate) fn uuid_v4() -> String {
     let mut b = rand::random::<[u8; 16]>();
     (b[6], b[8]) = ((b[6] & 0x0f) | 0x40, (b[8] & 0x3f) | 0x80);
     let h = data_encoding::HEXLOWER.encode(&b);
-    let id = format!(
+    format!(
         "{}-{}-{}-{}-{}",
         &h[..8],
         &h[8..12],
         &h[12..16],
         &h[16..20],
         &h[20..]
-    );
-    write_private(&path, &id)?;
-    Ok(id)
+    )
 }
 
 fn write_private(path: &Path, text: &str) -> Result<()> {

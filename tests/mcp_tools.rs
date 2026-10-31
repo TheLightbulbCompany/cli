@@ -21,8 +21,18 @@ struct Net {
 
 impl Net {
     fn new() -> Net {
+        Net::with_config("")
+    }
+
+    /// A daemon (and its MCP servers) with network workers on.
+    fn workers() -> Net {
+        Net::with_config("network_workers = true\n")
+    }
+
+    fn with_config(config: &str) -> Net {
         let dir = tempfile::tempdir().unwrap();
         let claude = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.toml"), config).unwrap();
         let daemon = Command::new(EXE)
             .arg("daemon")
             .env("LIGHTBULB_CONNECT_DEBUG_NO_DEFAULT_RELAYS", "1")
@@ -682,6 +692,20 @@ fn find_sessions_marks_is_this_session() {
     );
 }
 
+/// Codex times a tool call out at 60 s: a Codex session's long wait comes back before that.
+#[test]
+fn a_codex_wait_returns_inside_codexs_tool_timeout() {
+    let net = Net::new();
+    net.register("codex", "t1", &me());
+    let mut m = net.mcp(&me());
+    let started = Instant::now();
+    let out = m.tool("check_inbox", json!({"wait_secs": 600}));
+    let took = started.elapsed();
+    assert!(!out.error, "{}", out.text);
+    assert_eq!(out.json()["messages"], json!([]));
+    assert!(took < Duration::from_secs(60), "{took:?}");
+}
+
 #[test]
 fn codex_calls_pick_their_thread_from_meta() {
     let net = Net::new();
@@ -1238,10 +1262,15 @@ fn api(method: &str, path: &str) -> (u16, Value) {
 }
 
 /// A signed-in computer named mac, its daemon up, this process its Claude session `c1`.
+/// `config.toml` naming the computer, with network workers on (every tool listed).
+fn mac_workers() -> String {
+    format!("{}network_workers = true\n", common::computer("mac"))
+}
+
 fn signed_in() -> common::Env {
     let e = common::Env::new();
     e.sign_in("user_1", None);
-    e.daemon(false, &common::computer("mac"), &[]);
+    e.daemon(false, &mac_workers(), &[]);
     register_on(&e, "claude", "c1", &me(), "/tmp");
     e
 }
@@ -1254,7 +1283,7 @@ fn tools_list_matches_tools_json() {
     let got: Vec<Value> = m.tools().iter().map(shape).collect();
     let want: Vec<Value> = spec().iter().map(shape).collect();
     assert_eq!(got, want);
-    assert_eq!(names(&got).len(), 12);
+    assert_eq!(names(&got).len(), 15);
 }
 
 #[test]
@@ -1274,14 +1303,14 @@ fn tools_json_flag_prints_the_spec() {
 #[test]
 fn workspace_tools_hidden_until_signed_in() {
     let e = common::Env::new();
-    e.daemon(false, &common::computer("mac"), &[]);
+    e.daemon(false, &mac_workers(), &[]);
     register_on(&e, "claude", "c1", &me(), "/tmp");
     let network: Vec<String> = spec()
         .iter()
         .filter(|t| t["scope"] == "network")
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(network.len(), 6);
+    assert_eq!(network.len(), 9);
     let mut m = mcp_on(&e, &me());
     assert_eq!(names(&m.tools()), network);
     let out = m.tool("find_rooms", json!({}));
@@ -1295,7 +1324,7 @@ fn workspace_tools_hidden_until_signed_in() {
 
     // Signing in shows them to the same server; an ended sign-in hides them again.
     e.sign_in("user_1", None);
-    assert_eq!(m.tools().len(), 12);
+    assert_eq!(m.tools().len(), 15);
     let old = common::now_s() - 40 * 86_400;
     let proof = common::issuer::proof(&e.identity().key, "user_1", old);
     let login = json!({"proof": proof, "name": "user_1"});
@@ -1467,7 +1496,7 @@ fn room_targets_go_to_rest_session_targets_stay_p2p() {
 #[test]
 fn the_tool_list_changes_when_the_sign_in_does() {
     let e = common::Env::new();
-    e.daemon(false, &common::computer("mac"), &[]);
+    e.daemon(false, &mac_workers(), &[]);
     register_on(&e, "claude", "c1", &me(), "/tmp");
     let mut m = mcp_on(&e, &me());
     let changes = |m: &mut Mcp| {
@@ -1477,17 +1506,17 @@ fn the_tool_list_changes_when_the_sign_in_does() {
             .count()
     };
     let wait = || std::thread::sleep(Duration::from_millis(800));
-    assert_eq!(m.tools().len(), 6);
+    assert_eq!(m.tools().len(), 9);
     // A login with no request after it: the timer tells the client.
     e.sign_in("user_1", None);
     wait();
-    assert_eq!(m.tools().len(), 12);
+    assert_eq!(m.tools().len(), 15);
     assert_eq!(changes(&mut m), 1);
     // A logout: told once, by the next call at the latest.
     std::fs::remove_file(e.state.path().join("login.json")).unwrap();
     assert!(!m.tool("find_sessions", json!({})).error);
     assert_eq!(changes(&mut m), 1);
-    assert_eq!(m.tools().len(), 6);
+    assert_eq!(m.tools().len(), 9);
     // A sign-in that ends.
     e.sign_in("user_1", None);
     wait();
@@ -1498,7 +1527,7 @@ fn the_tool_list_changes_when_the_sign_in_does() {
     let login = json!({"proof": proof, "name": "user_1"});
     std::fs::write(e.state.path().join("login.json"), login.to_string()).unwrap();
     wait();
-    assert_eq!(m.tools().len(), 6);
+    assert_eq!(m.tools().len(), 9);
     assert_eq!(changes(&mut m), 1);
     // Nothing changed: nothing said.
     wait();
@@ -1671,4 +1700,142 @@ fn a_question_recall_through_mcp_is_one_page() {
         start.get("block").is_some() && start.get("facts").is_some(),
         "{start}"
     );
+}
+
+/// Network workers off (the default): the assignment tools are not listed, and calling one
+/// answers what an unknown tool does; turned on, the next list has them.
+#[test]
+fn the_assignment_tools_are_hidden_until_network_workers_is_on() {
+    let net = Net::new();
+    net.register("claude", "c1", &me());
+    let mut m = net.mcp(&me());
+    let names = |m: &mut Mcp| -> Vec<String> {
+        let listed = m.rpc("tools/list", json!({}));
+        (listed["result"]["tools"].as_array().unwrap().iter())
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let hidden = ["find_workers", "assign", "cancel_assignment"];
+    let off = names(&mut m);
+    assert!(off.iter().all(|n| !hidden.contains(&n.as_str())), "{off:?}");
+    assert!(off.iter().any(|n| n == "send_message"), "{off:?}");
+    let unknown = m.tool("no_such_tool", json!({}));
+    for n in hidden {
+        let out = m.tool(n, json!({"request_id": "r1", "assignment": "a"}));
+        assert!(out.error, "{n}");
+        assert_eq!(out.text, unknown.text, "{n}");
+    }
+    std::fs::write(
+        net.dir.path().join("config.toml"),
+        "network_workers = true\n",
+    )
+    .unwrap();
+    let on = names(&mut m);
+    assert!(hidden.iter().all(|n| on.iter().any(|o| o == n)), "{on:?}");
+}
+
+#[test]
+fn the_three_assignment_tools_are_listed_and_assign_round_trips() {
+    let net = Net::workers();
+    let codex = Other::new();
+    net.register("claude", "c1", &me());
+    let t = net.register("codex", "t1", &codex.1);
+    let mut m = net.mcp(&me());
+
+    let listed = m.rpc("tools/list", json!({}));
+    let tools = listed["result"]["tools"].as_array().unwrap();
+    for n in ["find_workers", "assign", "cancel_assignment"] {
+        assert!(tools.iter().any(|x| x["name"] == n), "{n} not listed");
+    }
+    let send = tools.iter().find(|x| x["name"] == "send_message").unwrap();
+    assert!(!send["inputSchema"]["properties"]["status"].is_null());
+
+    let out = m.tool(
+        "assign",
+        json!({"request_id": "as1", "to": t, "brief": "run tests", "done_when": "green"}),
+    );
+    assert!(!out.error, "{}", out.text);
+    assert_eq!(out.json()["state"], "stored");
+    let r = net.call(json!({"id": 1, "op": "inbox", "key": t}));
+    assert_eq!(r["messages"][0]["kind"], "assign", "{r}");
+
+    let r = net.call(json!({"id": 1, "op": "send", "from": t, "reply_to": "as1",
+        "request_id": "res1", "text": "green", "kind": "result", "status": "failed",
+        "reason": "error"}));
+    assert_eq!(r["receipt"]["state"], "stored", "{r}");
+    let out = m.tool("check_inbox", json!({"wait_secs": 1}));
+    let msgs = out.json()["messages"].clone();
+    assert_eq!(msgs.as_array().unwrap().len(), 1, "{msgs}");
+    assert_eq!(msgs[0]["kind"], "result");
+    assert_eq!(msgs[0]["status"], "failed");
+    let out = m.tool("message_receipt", json!({"request_id": "as1"}));
+    assert_eq!(out.json()["result"]["status"], "failed", "{}", out.text);
+
+    let out = m.tool(
+        "cancel_assignment",
+        json!({"assignment": "as1", "request_id": "c1"}),
+    );
+    assert_eq!(out.json()["state"], "stored", "{}", out.text);
+    let r = net.call(json!({"id": 1, "op": "inbox", "key": t}));
+    assert_eq!(r["messages"][0]["kind"], "cancel", "{r}");
+
+    let out = m.tool(
+        "assign",
+        json!({"request_id": "as2", "to": t, "brief": "b", "done_when": "d", "deadline_s": 99999}),
+    );
+    assert!(out.error);
+    assert_eq!(out.json()["error"], "bad_request");
+}
+
+#[test]
+fn find_workers_lists_always_on_sessions_only() {
+    let net = Net::workers();
+    let codex = Other::new();
+    net.register("claude", "c1", &me());
+    let t = net.register("codex", "t1", &codex.1);
+    let short = net.call(json!({"id": 1, "op": "status"}))["member_key_short"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    net.call(json!({"id": 1, "op": "inbox", "key": format!("{short}/friday"), "wait_secs": 0}));
+    let mut m = net.mcp(&me());
+
+    // `directory` does not list a name row, so no worker is online here; the registered
+    // coding session T is filtered out all the same.
+    let v = m.tool("find_workers", json!({})).json();
+    let sessions = v["sessions"].as_array().unwrap();
+    assert!(sessions.iter().all(|s| s["always_on"] == true), "{v}");
+    assert!(
+        sessions.iter().all(|s| s["session_id"] != t.as_str()),
+        "{v}"
+    );
+    assert_eq!(v["total"], 0, "{v}");
+}
+
+#[test]
+fn find_workers_shows_a_teammates_worker_host() {
+    let (b, a) = (common::Env::new(), common::Env::new());
+    common::seed_pair(&b, &a);
+    // Network workers on at both: B hosts, A's agent lists it.
+    a.daemon(false, "network_workers = true\n", &[]);
+    let b_config =
+        "computer = \"mbp\"\nnetwork_workers = true\nworkers_offer = \"claude\"\nworkers_max = 2\n";
+    b.daemon(false, b_config, &[common::peers(&[&a])]);
+    common::until(10, "both online", || {
+        a.status()["peers"]["online"] == 1 && b.status()["peers"]["online"] == 1
+    });
+    let key = format!("{}/claude:new", b.short());
+    common::until(15, "A sees B's worker host", || common::sees(&a, &key));
+    register_on(&a, "claude", "c1", &me(), "/tmp");
+    let mut m = mcp_on(&a, &me());
+    let v = m.tool("find_workers", json!({})).json();
+    let host = v["sessions"][0].clone();
+    assert_eq!(host["session_id"], key.as_str(), "{v}");
+    assert_eq!(
+        (&host["always_on"], &host["free"]),
+        (&json!(false), &json!(2)),
+        "{v}"
+    );
+    assert_eq!(host["folder"], "lightbulb-work", "{v}");
+    assert_eq!(v["total"], 1, "{v}");
 }

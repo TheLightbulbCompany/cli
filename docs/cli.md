@@ -203,6 +203,49 @@ lightbulb decline <REQUEST>
 
 `--help`: Decline a permission prompt (`H<n>`).
 
+## Workers
+
+### workers
+
+When you use it: to let teammates start coding-agent workers (Claude Code, Codex, Cursor, Grok CLI or OpenCode) on this computer, to see what they did, and to say whom you trust. Only you can run these; an agent's shell is refused.
+
+Network workers are off by default. Turn them on with `lightbulb config set network_workers true`. While they are off, this computer's agents have no `find_workers`, `assign` or `cancel_assignment` tool, it refuses to send or take any assignment (`unsupported`), it offers no workers, and `workers on` refuses with that command.
+
+```
+lightbulb workers
+lightbulb workers show <NAME>
+lightbulb workers stop <NAME>
+lightbulb workers on [--offer claude,codex] [--folder <PATH>] [--max <N>]
+lightbulb workers off
+lightbulb workers policy [allow|refuse|revoke|ask <MEMBER>]
+lightbulb workers clean
+```
+
+With no argument, lists the workers: name, who asked, harness, folder, start time, state. `show` prints a worker's result, its folder and the command that resumes its conversation there: `claude --resume <id>`, `codex resume <id>`, `cursor-agent --resume <id>`, `grok -r <id>` or `opencode -s <id>`. `stop` ends a running one. `on` offers the harnesses (default `claude`), the folder workers run in and how many at once; it refuses a folder you hid with `folder <path> off`. `off` stops offering and stops every running worker. `policy` lists your teammates as `always`, `ask` or `refused`; `allow`, `refuse` and `revoke` (or `ask`) change one, and `ask self` makes your own assignments ask too. `clean` removes the folders of workers that finished over a week ago, and prints them; a running worker's folder stays.
+
+`--offer` takes any of `claude`, `codex`, `cursor`, `grok` and `opencode` (comma separated). Each needs its own harness installed and signed in on this Mac: Claude Code runs headless over stream-json, Codex over its app-server, Cursor (`cursor-agent acp`) and Grok CLI (`grok agent --no-leader stdio`) over the Agent Client Protocol, and OpenCode through a local server it starts on 127.0.0.1 with a password only the worker knows. Every permission prompt goes to you, never to the asker. A harness whose config could skip your approval refuses to host: the asker is told why (naming the file), and nothing starts. What each one refuses:
+
+- Claude Code: `"defaultMode": "bypassPermissions"` in `~/.claude/settings.json`. The worker reads your user settings only, never the folder's.
+- Codex: `approval_policy = "never"` with `sandbox_mode = "danger-full-access"` in `~/.codex/config.toml`.
+- Cursor: in `cli-config.json` in its config folder (`$CURSOR_CONFIG_DIR`, else `$XDG_CONFIG_HOME/cursor`, else `~/.cursor`; the worker is pinned to the folder checked), `approvalMode` `unrestricted` or `auto-review`, or a wildcard allow such as `Shell(*)` or `Write(**)`. In the worker's folder: any allow rule or such an `approvalMode` in `.cursor/cli.json`, or a `.cursor/hooks.json` or `.cursor/mcp.json` at all.
+- Grok CLI: in `~/.grok/config.toml`, a `permission-mode` such as `bypassPermissions`, `dontAsk`, `auto` or `yolo`, a `[permission] allow` rule of `*`, `Bash`, `Bash(*)`, `Edit` or `Edit(**)`, or a `[permission] rules` entry that allows with no pattern or `*`; in `~/.grok/settings.json` or `~/.claude/settings.json` (Grok reads it too), a `defaultMode` of `bypassPermissions`, `acceptEdits`, `auto` or `dontAsk`, or a wildcard allow (`*`, `Bash`, `Bash(*)`, `Edit`, `Edit(**)`, `Write`, `Write(**)`). In the worker's folder, any allow rule (or such a mode) in `.grok/config.toml`, `.grok/settings.json`, `.claude/settings.json` or `.claude/settings.local.json`. `GROK_CONFIG` and `GROK_CONFIG_PATH` never reach the worker.
+- OpenCode: an OpenCode worker always asks. It runs with `OPENCODE_PERMISSION={"*":"ask"}` (OpenCode's own default allows everything) and without the folder's own config (`OPENCODE_DISABLE_PROJECT_CONFIG=1`); `OPENCODE_CONFIG`, `OPENCODE_CONFIG_CONTENT` and `OPENCODE_CONFIG_DIR` never reach it. Since a rule of yours would still win over that, it refuses any `"allow"` under `permission`, `agent.<name>.permission` or `mode.<name>.permission`, or any tool set `true` under `tools`, in `config.json`, `opencode.json` or `opencode.jsonc` in `~/.config/opencode`, `$XDG_CONFIG_HOME/opencode` or `~/.opencode`, and an agent or mode Markdown file there whose header allows. Every prompt asks, reads included; a subagent's prompts come to you too.
+
+For Cursor, Grok CLI and OpenCode, a config file that exists but cannot be read or parsed refuses too.
+
+
+The first assignment from a teammate asks you with a dialog (or `held` and `approve`); Always allow (`approve --always`) lets that teammate's computer start workers here without asking from then on. A dialog that gave up comes back when you run `held`. An Allow that lands while this computer already runs `workers_max` workers starts nothing, and the asker is told `busy`.
+
+### config
+
+When you use it: to turn a true/false or number setting on or off, such as `network_workers`. Only you can run it; an agent's shell is refused.
+
+```
+lightbulb config set <KEY> <VALUE>
+```
+
+Sets one key in `config.toml` and reloads the daemon. It takes `true`/`false` and number settings only; for any other it names the command that sets it.
+
 ## Team
 
 ### team

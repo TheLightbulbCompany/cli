@@ -109,6 +109,7 @@ pub(crate) fn remote(s: &Session, share_paths: bool) -> Remote {
         doing: s.doing.clone(),
         tier: s.tier.as_str().into(),
         title: s.title.clone(),
+        free: None,
         // Claude may not say what for: without this it would read as plain busy over there.
         waiting_for: waiting.then(|| {
             let what = s.waiting_for.as_deref().unwrap_or_default();
@@ -132,6 +133,54 @@ fn ended_of(r: &store::Session, share_paths: bool) -> Ended {
         reason: r.reason.clone().unwrap_or_default(),
     }
     .clamp()
+}
+
+/// This computer's worker-host rows: one `<short>/<harness>:new` per harness `workers_offer`
+/// names, with the slots left under `workers_max` (all harnesses share the cap); none while
+/// `network_workers` is off.
+fn hosts(d: &Daemon) -> Vec<Remote> {
+    let (offered, max, folder) = {
+        let t = d.team.lock().unwrap();
+        (
+            crate::workers::offers(&t.config),
+            t.config.workers_max.max(0),
+            crate::workers::folder(&t.config),
+        )
+    };
+    if offered.is_empty() {
+        return vec![];
+    }
+    let running = d
+        .store
+        .lock()
+        .unwrap()
+        .workers(true)
+        .unwrap_or_default()
+        .len() as i64;
+    let free = u32::try_from((max - running).max(0)).unwrap_or(u32::MAX);
+    let folder = folder
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    offered
+        .into_iter()
+        .map(|h| {
+            Remote {
+                session_id: format!("{}/{h}:new", d.identity.short),
+                agent: h,
+                repo: None,
+                branch: None,
+                folder: folder.clone(),
+                status: STATUSES[usize::from(free != 0)].into(),
+                doing: None,
+                tier: "pull".into(),
+                title: Some(String::new()),
+                waiting_for: None,
+                free: Some(free),
+            }
+            .clamp()
+        })
+        .collect()
 }
 
 /// Whether `cwd` is under one of `off` (`folders_off`, each `canonical`). A string compare, no
@@ -250,7 +299,12 @@ fn build(d: &Daemon, seq: u64) -> Frame {
     Frame::Presence {
         member: d.identity.key.clone(),
         seq,
-        sessions: live.iter().map(|s| remote(s, share)).chain(apps).collect(),
+        sessions: live
+            .iter()
+            .map(|s| remote(s, share))
+            .chain(hosts(d))
+            .chain(apps)
+            .collect(),
         known,
         kept,
         ended,
@@ -532,6 +586,11 @@ fn record(o: &Owner, s: &Remote, cwd: &str) -> Value {
         "online": o.online,
         "wakes": o.wakes,
     });
+    if let Some(free) = s.free {
+        v["free"] = free.into();
+        v["kind"] = "worker".into();
+        v["folder"] = s.folder.clone().into();
+    }
     if let Some(w) = waiting_for {
         v["waiting_for"] = w.into();
     }
@@ -558,6 +617,7 @@ fn as_remote(e: &Ended) -> Remote {
         // day for it to be resumed.
         tier: sessions::Tier::Pull.as_str().into(),
         title: e.title.clone(),
+        free: None,
         waiting_for: None,
     }
 }
@@ -583,7 +643,7 @@ pub fn directory(d: &Daemon, query: Option<&str>) -> Value {
         Some(c) => (vec![], c.declared().sessions.to_vec(), vec![]),
         None => (
             ipc::listed_sessions(d),
-            crate::link::apps(d),
+            hosts(d).into_iter().chain(crate::link::apps(d)).collect(),
             ipc::ended_sessions(d),
         ),
     };

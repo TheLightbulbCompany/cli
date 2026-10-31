@@ -99,6 +99,8 @@ pub struct Daemon {
     pub latest: Mutex<HashMap<String, crate::presence::Latest>>,
     /// The open streams (`streams`).
     pub streams: crate::streams::Streams,
+    /// The network workers running here (`workers`).
+    pub workers: crate::workers::Registry,
     /// What an embedded (cloud) instance is; `None` on a computer.
     pub cloud: Option<Cloud>,
     /// Each member's sign-in proof from its latest `hello` (`proof`): what a workspace member's
@@ -357,11 +359,29 @@ pub async fn deliver(daemon: Arc<Daemon>, to: Key) {
     loop {
         // One message per hold, so an `inbox` waits for at most one push.
         let _held = lock.lock().await;
-        let next = mail::waiting(&daemon.store.lock().unwrap(), &to, ipc::now());
-        let Some(m) = next.ok().and_then(|w| w.into_iter().next()) else {
+        // The mail and the request id of the message it answers, under one store lock.
+        let next = {
+            let store = daemon.store.lock().unwrap();
+            mail::waiting(&store, &to, ipc::now())
+                .ok()
+                .and_then(|w| w.into_iter().next())
+                .map(|m| {
+                    let parent = m.reply_to.as_deref();
+                    let parent = parent.and_then(|id| store.message(id).ok().flatten());
+                    (parent.map(|p| p.request_id), m)
+                })
+        };
+        let Some((parent_rid, m)) = next else {
             return;
         };
-        let framed = frame::framed(&ipc::sender_label(&daemon, &m), &m.request_id, &m.body);
+        let framed = frame::framed_kind(
+            &m.kind,
+            &ipc::sender_label(&daemon, &m),
+            &m.request_id,
+            parent_rid.as_deref(),
+            &m.meta,
+            &m.body,
+        );
         let pushed = match session.provider.as_str() {
             "claude" => claude::push(&session, &framed).await,
             _ => codex::push(&session, &framed).await,
@@ -418,6 +438,10 @@ pub async fn run(dir: &Path) -> Result<()> {
     let _lock = lock_dir(dir, true)?;
     let config = Config::load(dir)?;
     let (daemon, net) = crate::embed::boot(dir, config, None).await?;
+    // Workers whose process went with the last daemon end; live ones are re-adopted.
+    crate::workers::reap(&daemon);
+    // The dialogs of the holds still open went with the last daemon.
+    crate::holds::reraise(&daemon);
 
     // We hold the lock, so any socket file left behind is stale.
     let sock = dir.join(paths::SOCKET);

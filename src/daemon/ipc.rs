@@ -185,7 +185,7 @@ const ONLY_ON_AN_INSTANCE: [&str; 2] = ["memory.import", "memory.forget_author"]
 
 /// The fields of an `inbox` record an agent (MCP `check_inbox`) or an instance's caller is
 /// handed.
-pub const INBOX_RECORD: [&str; 11] = [
+pub const INBOX_RECORD: [&str; 17] = [
     "id",
     "request_id",
     "thread",
@@ -197,6 +197,12 @@ pub const INBOX_RECORD: [&str; 11] = [
     "text",
     "framed",
     "sent_at",
+    "kind",
+    "reply_to",
+    "status",
+    "reason",
+    "done_when",
+    "deadline_at",
 ];
 
 /// `v` (an `inbox` record from `records`) cut to `INBOX_RECORD`.
@@ -413,6 +419,7 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
         "memory.remember" => {
             memory_remember(id, body, daemon, instance, !instance && for_a_person())
         }
+        "assignments.guard" => assignments_guard(id, body, daemon),
         "memory.recall" => memory_recall(id, body, daemon),
         #[cfg(feature = "bench")]
         "bench.ingest_turns" => bench_ingest_turns(id, body, daemon),
@@ -428,6 +435,9 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
         "team.leave" => super::net_ops::leave(id, daemon, for_a_person()).await,
         "holds" | "hold.get" | "hold.answer" | "hold.file" => {
             crate::holds::op(id, op, body, daemon, caller)
+        }
+        "workers.list" | "workers.show" | "workers.stop" | "workers.off" | "workers.policy" => {
+            crate::workers::op(id, op, body, daemon, caller)
         }
         "share.grant" | "stream.open" | "stream.send" | "stream.close" => {
             crate::streams::handle(id, op, body, daemon, caller).await
@@ -1261,6 +1271,46 @@ pub(crate) fn refused(id: u64, reason: &str) -> Response {
     Response::err_with(id, BAD_REQUEST, json!({ "reason": reason }))
 }
 
+/// `assignments.guard {key, caller?}` -> `{block?}`: the Stop hook's question. `block` (what to
+/// tell the session) is set only when `key` has open assignments (no result, deadline ahead)
+/// and something changed since the last block (a new assignment or a result for one); the
+/// answer is given once per change, so a session can end on its second Stop with nothing new.
+/// With `caller`, only the session's own process may ask (as `inbox`). Network workers off:
+/// `{}`.
+fn assignments_guard(id: u64, body: &Value, daemon: &Daemon) -> Response {
+    let (Some(key), Ok(caller)) = (body["key"].as_str(), caller(body)) else {
+        return Response::err(id, BAD_REQUEST);
+    };
+    if !daemon.team.lock().unwrap().config.network_workers {
+        return Response::ok(id, json!({}));
+    }
+    if let Some(c) = caller {
+        match owner_process(daemon, key) {
+            Ok(Some(owner)) if owner == c => {}
+            Ok(_) => return refused(id, "not_owner"),
+            Err(_) => return Response::err(id, INTERNAL),
+        }
+    }
+    let now = now() as i64;
+    let store = daemon.store.lock().unwrap();
+    let Ok((open, latest)) = store.open_assignments(key, now) else {
+        return Response::err(id, INTERNAL);
+    };
+    let Ok(seen) = store.stop_guard_at(key) else {
+        return Response::err(id, INTERNAL);
+    };
+    if open == 0 || latest <= seen {
+        return Response::ok(id, json!({}));
+    }
+    if store.set_stop_guard_at(key, now).is_err() {
+        return Response::err(id, INTERNAL);
+    }
+    Response::ok(
+        id,
+        json!({ "block": format!("{open} assignment(s) still running: call check_inbox(wait_secs=600) to wait for results, or cancel_assignment the ones you no longer need.") }),
+    )
+}
+
 /// `end {key, caller?, if_gone?, reason?}` -> `{ended}`: ends the session row (kept, ended);
 /// `reason` is `process-exited` (default), `moved-on`, `job-done` or `session-end`;
 /// its mail stays for the hold. With `caller`, only the row's own process may end it; with `if_gone`, also
@@ -1401,6 +1451,16 @@ fn register(id: u64, body: &Value, daemon: &Daemon) -> Response {
     } else {
         old.map_or((None, None), |o| (o.repo, o.branch))
     };
+    // A running network worker's hooks register it too: it keeps the title and status its
+    // daemon gave it ("<asker>'s worker", busy).
+    let worker = crate::holds::is_workers(&store, &key.0);
+    let kept = worker
+        .then(|| store.session(&key.0).ok().flatten())
+        .flatten();
+    let (title, status) = match kept {
+        Some(o) => (o.title, o.status),
+        None => (title, status.into()),
+    };
     let row = store::Session {
         key: key.0.clone(),
         provider: r.provider,
@@ -1409,7 +1469,7 @@ fn register(id: u64, body: &Value, daemon: &Daemon) -> Response {
         birth_micros: i64::try_from(r.birth_micros).ok(),
         cwd: r.cwd,
         title,
-        status: status.into(),
+        status: status.clone(),
         seen_at: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs() as i64),
@@ -1420,7 +1480,8 @@ fn register(id: u64, body: &Value, daemon: &Daemon) -> Response {
         reason: None,
         ended_at: None,
         waiting_for: r.waiting_for.filter(|_| status == "waiting"),
-        headless: r.headless == Some(true),
+        // A network worker runs headless and stays listed: it is found and steered by its row.
+        headless: r.headless == Some(true) && !worker,
     };
     // Every hook event registers: mail delivered before it has been seen.
     match put_row(daemon, &store, &row).and_then(|()| mail::mark_read_for(&store, &key, now())) {
@@ -1803,7 +1864,9 @@ pub fn now() -> u64 {
 /// this member's (`<member>/<name>`), and `to` may be left out
 /// only with `reply_to` (the reply goes to the parent's sender). `to` follows
 /// `sessions::qualify` (a bare name is this member's; anything else, groups included, is
-/// refused with reason `bad_address`). `kind` is `message` (the default) or `unsupported`.
+/// refused with reason `bad_address`). `kind` is one of `mail::KINDS` (`message` by default); an `assign` also takes
+/// `done_when`, `deadline_s` (1..=14 400, default 3 600) and `repo`/`branch`, a `result` its
+/// `status`/`reason`; a bad `deadline_s` is `bad_request`.
 /// Mail for a session here is stored, then pushed into a Claude or Codex session
 /// (`super::deliver`) if its tier is `push`; mail under another member's prefix goes to the
 /// outbox (`queued`, `where` that member's computer), `not_member` for a prefix no member has.
@@ -1832,10 +1895,37 @@ pub(crate) fn send_as(
     ) else {
         return Err(Response::err(id, BAD_REQUEST));
     };
-    match body.get("kind") {
-        None | Some(Value::Null) => {}
-        Some(k) if k == "message" => {}
-        Some(_) => return Err(Response::err(id, UNSUPPORTED)),
+    let kind = match body.get("kind") {
+        None | Some(Value::Null) => "message",
+        Some(k) => match k.as_str().filter(|k| mail::KINDS.contains(k)) {
+            Some(k) => k,
+            None => return Err(Response::err(id, UNSUPPORTED)),
+        },
+    };
+    // Network workers off: plain messages only, as before assignments existed.
+    let plain = kind == "message" && body.get("status").is_none_or(Value::is_null);
+    if !plain && !daemon.team.lock().unwrap().config.network_workers {
+        return Err(Response::err(id, UNSUPPORTED));
+    }
+    let text_of = |k: &str| body[k].as_str().map(String::from);
+    let mut meta = mail::Meta {
+        done_when: text_of("done_when"),
+        repo: text_of("repo"),
+        branch: text_of("branch"),
+        status: text_of("status"),
+        reason: text_of("reason"),
+        ..Default::default()
+    };
+    if kind == "assign" {
+        // An integer in 1..=14 400 seconds; anything else is refused, never clamped.
+        let secs = match body.get("deadline_s") {
+            None | Some(Value::Null) => 3_600,
+            Some(v) => match v.as_i64().filter(|n| (1..=14_400).contains(n)) {
+                Some(n) => n,
+                None => return Err(Response::err(id, BAD_REQUEST)),
+            },
+        };
+        meta.deadline_at = Some(now() as i64 + secs);
     }
     let reply_to = body["reply_to"].as_str();
     let to = match body["to"].as_str() {
@@ -1859,7 +1949,17 @@ pub(crate) fn send_as(
     let team = daemon.team.lock().unwrap();
     let store = daemon.store.lock().unwrap();
     let internal = |_| Response::err(id, INTERNAL);
-    let prepared = mail::prepare(&store, &from, to.as_ref(), text, rid, reply_to, now());
+    let prepared = mail::prepare(
+        &store,
+        &from,
+        to.as_ref(),
+        text,
+        rid,
+        reply_to,
+        kind,
+        meta,
+        now(),
+    );
     let mut p = match prepared.map_err(internal)? {
         mail::Prep::Go(p) => p,
         mail::Prep::Done(r) => return Ok((from, r)),
@@ -1867,27 +1967,141 @@ pub(crate) fn send_as(
     if app {
         p.hops = p.hops.max(1);
     }
+    let origin = if app {
+        mail::Origin::App
+    } else {
+        mail::Origin::Local
+    };
+    match dispatch_locked(daemon, team, store, &p, origin) {
+        Ok(r) => Ok((from, r)),
+        Err(Failed::NotMember) => Err(Response::err(id, super::net_ops::NOT_MEMBER)),
+        Err(Failed::Internal(_)) => Err(Response::err(id, INTERNAL)),
+    }
+}
+
+/// Why `dispatch` did not route a message.
+#[derive(Debug)]
+pub(crate) enum Failed {
+    /// Its recipient's member prefix is in no roster.
+    NotMember,
+    Internal(String),
+}
+
+impl std::fmt::Display for Failed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Failed::NotMember => f.write_str("not_member"),
+            Failed::Internal(e) => f.write_str(e),
+        }
+    }
+}
+
+impl std::error::Error for Failed {}
+
+fn internal(e: impl std::fmt::Display) -> Failed {
+    Failed::Internal(e.to_string())
+}
+
+/// Routes the prepared message `p` from this computer: to the outbox for another member, else
+/// recorded here (`dispatch_locked`); its receipt.
+pub(crate) fn dispatch(daemon: &Arc<Daemon>, p: &mail::Prepared) -> Result<mail::Receipt, Failed> {
+    let team = daemon.team.lock().unwrap();
+    let store = daemon.store.lock().unwrap();
+    dispatch_locked(daemon, team, store, p, mail::Origin::Local)
+}
+
+/// `dispatch` under the locks the caller prepared `p` with (they are released here, before any
+/// wake or follow-up that takes them again). An assignment to this computer's fresh-worker
+/// address is refused, held (its dialog shown) or started (`workers::take_assign`); a cancel
+/// of one is stored and reaches `workers::cancel`; any other mail for a session here is
+/// stored and the session woken.
+fn dispatch_locked(
+    daemon: &Arc<Daemon>,
+    team: std::sync::MutexGuard<'_, super::TeamState>,
+    store: std::sync::MutexGuard<'_, store::Store>,
+    p: &mail::Prepared,
+    origin: mail::Origin,
+) -> Result<mail::Receipt, Failed> {
     let prefix = sessions::member_of(&p.to.0).unwrap_or("");
-    if prefix != daemon.identity.short {
+    let me = &daemon.identity.short;
+    if prefix != me {
         let Some(member) = team.roster.by_short(prefix) else {
-            return Err(Response::err(id, super::net_ops::NOT_MEMBER));
+            return Err(Failed::NotMember);
         };
-        let r = outbox::enqueue(&store, p, member).map_err(internal)?;
+        let r = outbox::enqueue(&store, p.clone(), member).map_err(internal)?;
         daemon.peers.outbox.notify_one();
-        return Ok((from, r));
+        return Ok(r);
+    }
+    // An assign to a fresh worker, or the cancel of one (any other cancel is plain mail).
+    let of_worker = |id: &String| store.message(id).ok().flatten();
+    let worker_cancel =
+        (p.reply_to.as_ref().and_then(of_worker)).is_some_and(|a| mail::is_new_worker(&a.to_key));
+    if mail::is_new_worker(&p.to.0) && (p.kind == "assign" || worker_cancel) {
+        return fresh_worker(daemon, team, store, p, origin);
     }
     drop(team);
-    let sent = if app {
-        mail::store_local_from(&store, &p, mail::Origin::App)
-    } else {
-        mail::store_local(&store, &p)
-    }
-    .map_err(internal)?;
+    let sent = mail::store_local_from(&store, p, origin).map_err(internal)?;
     drop(store);
     if sent.state == mail::State::Stored {
         stored(daemon, &p.to, Some(&p.message_id));
     }
-    Ok((from, sent))
+    Ok(sent)
+}
+
+/// `dispatch_locked` for an assign (or its cancel) addressed to `<me>/<provider>:new`.
+fn fresh_worker(
+    daemon: &Arc<Daemon>,
+    team: std::sync::MutexGuard<'_, super::TeamState>,
+    store: std::sync::MutexGuard<'_, store::Store>,
+    p: &mail::Prepared,
+    origin: mail::Origin,
+) -> Result<mail::Receipt, Failed> {
+    use crate::workers::{self, Taken};
+    let now = now();
+    let tx = store.conn().unchecked_transaction().map_err(internal)?;
+    let (mut taken, mut cancelled) = (None, None);
+    if p.kind == "assign" {
+        let mut m = store::Message::from(p);
+        if let mail::Origin::App = origin {
+            m.origin = Some(mail::APP_ORIGIN.into());
+        }
+        match workers::take_assign(&store, &team.config, &daemon.identity.short, &m, now as i64)
+            .map_err(internal)?
+        {
+            Taken::Refused(reason) => {
+                drop(tx); // nothing was written
+                let r = mail::refuse(store.conn(), &p.from, &p.request_id, reason, None, now)
+                    .map_err(internal)?;
+                return Ok(r);
+            }
+            t => taken = Some(t),
+        }
+    } else {
+        mail::put(&store, p, origin, mail::State::Stored).map_err(internal)?;
+        cancelled = p.reply_to.clone();
+    }
+    tx.commit().map_err(internal)?;
+    let r = mail::receipt(&store, &p.from, &p.request_id)
+        .map_err(internal)?
+        .ok_or_else(|| internal("receipt missing after write"))?;
+    if let Some(Taken::Held { hold }) = taken {
+        if let Some(h) = crate::holds::get(&store, hold).map_err(internal)? {
+            crate::holds::shown(daemon, &team, &store, &h);
+        }
+    }
+    drop((team, store));
+    let log = |e: Box<dyn std::error::Error + Send + Sync>| {
+        eprintln!("workers: {} {}: {e}", p.kind, p.message_id)
+    };
+    if let Some(Taken::Start) = taken {
+        if let Err(e) = workers::start(daemon, &p.message_id) {
+            log(e);
+        }
+    }
+    if let Some(assign) = cancelled {
+        workers::cancel(daemon, &assign, &p.from.0).unwrap_or_else(log);
+    }
+    Ok(r)
 }
 
 /// Mail was stored for `to` here: a waiting `inbox` looks again, a Claude or Codex session is
@@ -1964,6 +2178,9 @@ pub(crate) async fn finish(daemon: &Daemon, from: &Key, mut r: mail::Receipt, wa
     let mut v = with_thread(&r, Some(&member));
     v["where"] = computer.into();
     v["person"] = person.into();
+    if let Some(h) = r.to.as_deref().and_then(mail::new_harness) {
+        v["harness"] = h.into();
+    }
     let online = daemon.peers.is_online(&member);
     v["online"] = online.into();
     // A parked workspace with a doorbell: the outbox rang it, so it is starting, not gone.
@@ -2039,6 +2256,16 @@ pub(crate) fn records(daemon: &Daemon, messages: &[store::Message]) -> Vec<Value
     let declared = presence::declared_agents(daemon);
     // A hosted app's session here (`link`): named as the app, never as this computer's person.
     let apps = crate::link::apps(daemon);
+    // Parents' request ids (a header's `replyTo`). Every caller has dropped the store lock, and
+    // this one is taken and released before `team`, the order everywhere else.
+    let parents: HashMap<&str, String> = {
+        let store = daemon.store.lock().unwrap();
+        messages
+            .iter()
+            .filter_map(|m| m.reply_to.as_deref())
+            .filter_map(|id| Some((id, store.message(id).ok()??.request_id)))
+            .collect()
+    };
     let team = daemon.team.lock().unwrap();
     let mut senders: HashMap<String, Value> = HashMap::new();
     messages
@@ -2076,7 +2303,11 @@ pub(crate) fn records(daemon: &Daemon, messages: &[store::Message]) -> Vec<Value
                 "kind": m.kind, "thread": m.thread, "hops": m.hops, "text": m.body,
                 "sent_at": m.sent_at, "label": who["label"], "person": who["person"],
                 "person_verified": who["person_verified"], "computer": who["computer"],
-                "framed": frame::framed(label, &m.request_id, &m.body) })
+                "reply_to": m.reply_to, "status": m.meta.status, "reason": m.meta.reason,
+                "done_when": m.meta.done_when, "deadline_at": m.meta.deadline_at,
+                "framed": frame::framed_kind(&m.kind, label, &m.request_id,
+                    m.reply_to.as_deref().and_then(|id| parents.get(id)).map(String::as_str),
+                    &m.meta, &m.body) })
         })
         .collect()
 }
@@ -2135,7 +2366,7 @@ async fn peek_or_ack(id: u64, op: &str, body: &Value, daemon: &Daemon) -> Respon
 async fn inbox(
     id: u64,
     body: &Value,
-    daemon: &Daemon,
+    daemon: &Arc<Daemon>,
     peer: &mut Lines<BufReader<OwnedReadHalf>>,
 ) -> Response {
     let (Some(key), Ok(caller)) = (body["key"].as_str().map(|k| Key(k.into())), caller(body))
@@ -2212,6 +2443,12 @@ async fn inbox(
                 },
                 () = std::future::ready(()) => {}
             }
+        }
+        // The asker's own lapsed assignments close here, so a waiting asker needs no tick.
+        let lapsed = mail::expire_assignments(&daemon.store.lock().unwrap(), short, now());
+        match lapsed {
+            Err(e) => eprintln!("ipc: expire assignments: {e}"),
+            Ok(woken) => woken.iter().for_each(|(k, id)| stored(daemon, k, Some(id))),
         }
         let taken = mail::take(&daemon.store.lock().unwrap(), &key, now());
         match taken {

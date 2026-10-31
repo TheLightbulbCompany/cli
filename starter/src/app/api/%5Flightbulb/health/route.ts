@@ -6,7 +6,8 @@ export const dynamic = "force-dynamic";
 export function GET() {
   return Response.json({
     ok: true,
-    commit: process.env.VERCEL_GIT_COMMIT_SHA ?? process.env.LIGHTBULB_COMMIT ?? null,
+    // Vercel sets the git variable to "" on file deploys, so empty must fall through.
+    commit: process.env.VERCEL_GIT_COMMIT_SHA || process.env.LIGHTBULB_COMMIT || null,
     db: dbMode(),
   });
 }

@@ -605,6 +605,7 @@ pub fn remote(session_id: &str) -> Remote {
         doing: None,
         tier: "pull".into(),
         title: None,
+        free: None,
         waiting_for: None,
     }
 }

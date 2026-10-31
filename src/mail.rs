@@ -1,13 +1,18 @@
 //! Messages, the mailbox, receipts and the loop limit. Time is passed in (`now`, unix seconds).
 
+use crate::config::Config;
 use crate::net::frames::Frame;
 use crate::roster::{Member, Roster};
 use crate::sessions::{self, Key};
 use crate::store::{Message, Store, MSG_RECEIPT};
+use crate::workers::{self, Taken};
 use crate::Result;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+/// The kinds an envelope may carry.
+pub const KINDS: [&str; 4] = ["message", "assign", "result", "cancel"];
 
 pub const LOOP_LIMIT: u32 = 12;
 /// Half-open: a send counts while `sent_at > now - LOOP_WINDOW_S`, so one sent at T stops counting at T + 600.
@@ -33,6 +38,10 @@ pub struct Answer {
     pub limit: Option<String>,
     /// Whether it is new mail (stored now), not a resend or a refusal.
     pub fresh: bool,
+    /// What a fresh worker's assignment became (the caller runs its follow-up).
+    pub taken: Option<Taken>,
+    /// The assignment (message id) a cancel for a fresh worker names.
+    pub cancelled: Option<String>,
 }
 
 impl Answer {
@@ -42,6 +51,8 @@ impl Answer {
             reason: None,
             limit: None,
             fresh: false,
+            taken: None,
+            cancelled: None,
         }
     }
 
@@ -114,6 +125,13 @@ impl State {
     }
 }
 
+/// The result that answered an assignment: its `request_id` and `status`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResultRef {
+    pub request_id: String,
+    pub status: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Receipt {
     pub request_id: String,
@@ -130,6 +148,9 @@ pub struct Receipt {
     pub to: Option<String>,
     #[serde(skip)]
     pub at: Option<i64>,
+    /// For an assignment, the result that closed it (the oldest reply to it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<ResultRef>,
 }
 
 /// What a terminal's sender is told about a receipt: the address it went `to` (when known), its
@@ -171,6 +192,16 @@ pub fn receipt_note(r: &Value, person: Option<&ForPerson>) -> Option<String> {
     )
 }
 
+/// The `no_worker` note, naming `harness` (a provider) when the address has one.
+fn no_worker(harness: &str, hint: &str) -> String {
+    if harness.is_empty() {
+        format!("that computer does not take fresh workers yet{hint}")
+    } else {
+        let h = crate::frame::agent_name(harness);
+        format!("that computer does not take {h} workers (find_workers lists who does)")
+    }
+}
+
 fn receipt_text(r: &Value, person: Option<&ForPerson>) -> Option<String> {
     let at = |f: &str| r[f].as_str().unwrap_or_default();
     // A teammate's words, printed to a terminal: one line, nothing it would act on.
@@ -188,9 +219,13 @@ fn receipt_text(r: &Value, person: Option<&ForPerson>) -> Option<String> {
         _ => "paused by a loop limit".into(),
     };
     let Some(p) = person else {
+        let person = at("person");
         let computer = at("where");
         return Some(match at("state") {
             "refused" if at("reason") == "loop" => limit(),
+            "refused" if at("reason") == "no_worker" => format!("not sent: {}", no_worker(at("harness"), " (find_workers lists who takes assignments)")),
+            "refused" if at("reason") == "busy" && remote => format!("not sent: {person}'s computer is running all the workers it allows; try later or another worker"),
+            "refused" if at("reason") == "declined" && remote => format!("not sent: {person} declined to start a worker"),
             "queued" if remote && r["waking"] == true => {
                 format!("queued: {computer} is waking up and gets it in a moment.")
             }
@@ -203,6 +238,7 @@ fn receipt_text(r: &Value, person: Option<&ForPerson>) -> Option<String> {
                 format!("queued: {computer} {why}. Will retry until {}.", until())
             }
             "stored" if remote => format!("stored on {computer}."),
+            "held" if remote => format!("held until {person} allows it"),
             _ => return None,
         });
     };
@@ -220,14 +256,19 @@ fn receipt_text(r: &Value, person: Option<&ForPerson>) -> Option<String> {
             "Not sent: {}.",
             match at("reason") {
                 "policy" => "they do not take messages from you".to_string(),
+                "declined" if remote => format!("{who} declined to start a worker"),
                 "declined" => "they declined it".into(),
+                "busy" => format!("{who}'s computer is running all the workers it allows; try later or another worker"),
                 "not_member" => "that computer is not in your team".into(),
                 "not_a_member" => NOT_A_MEMBER.into(),
                 "request_id_reused" => "that request id was used for another message".into(),
                 "unsupported" => "their computer cannot take it".into(),
+                "no_worker" => no_worker(p.to.and_then(new_harness).unwrap_or_default(), ""),
+                "bad_request" => "the assignment's terms were refused".into(),
                 _ => shown("reason").replace('_', " "),
             }
         ),
+        "held" => format!("Not yet sent: held until {who} allows it.{check}"),
         "queued" if remote && r["waking"] == true => {
             format!("Sent. {computer} is waking up and gets it in a moment.{check}")
         }
@@ -350,7 +391,7 @@ pub fn receipt(store: &Store, from: &Key, request_id: &str) -> Result<Option<Rec
     let row = store
         .conn()
         .query_row(
-            "SELECT r.state, r.reason, r.\"limit\", r.updated_at, m.to_key FROM receipts r \
+            "SELECT r.state, r.reason, r.\"limit\", r.updated_at, m.to_key, m.id FROM receipts r \
              LEFT JOIN messages m ON m.from_key = r.from_key AND m.request_id = r.request_id \
              WHERE r.from_key = ?1 AND r.request_id = ?2",
             [&from.0, request_id],
@@ -361,11 +402,12 @@ pub fn receipt(store: &Store, from: &Key, request_id: &str) -> Result<Option<Rec
                     r.get(2)?,
                     r.get(3)?,
                     r.get::<_, Option<String>>(4)?,
+                    r.get::<_, Option<String>>(5)?,
                 ))
             },
         )
         .optional()?;
-    let Some((state, reason, limit, at, to)) = row else {
+    let Some((state, reason, limit, at, to, id)) = row else {
         return Ok(None);
     };
     let state = State::parse(&state)?;
@@ -377,6 +419,11 @@ pub fn receipt(store: &Store, from: &Key, request_id: &str) -> Result<Option<Rec
         }
         .to_string()
     });
+    let result = match id {
+        Some(id) => store.result_of(&id)?,
+        None => None,
+    }
+    .map(|(request_id, status)| ResultRef { request_id, status });
     Ok(Some(Receipt {
         request_id: request_id.into(),
         state,
@@ -385,10 +432,11 @@ pub fn receipt(store: &Store, from: &Key, request_id: &str) -> Result<Option<Rec
         limit,
         to,
         at,
+        result,
     }))
 }
 
-fn refuse(
+pub(crate) fn refuse(
     conn: &Connection,
     from: &Key,
     request_id: &str,
@@ -413,7 +461,31 @@ fn refuse(
         limit: limit.map(Into::into),
         to: None,
         at: Some(now as i64),
+        result: None,
     })
+}
+
+/// The terms of an assignment and its result, stored with the message as JSON.
+#[derive(Default, Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Meta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub done_when: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl Meta {
+    pub fn is_empty(&self) -> bool {
+        *self == Meta::default()
+    }
 }
 
 /// A message decided and ready to store: here (`send`, `receive`) or in the outbox
@@ -430,6 +502,7 @@ pub struct Prepared {
     pub thread: String,
     pub hops: i64,
     pub kind: String,
+    pub meta: Meta,
     pub sent_at: i64,
 }
 
@@ -465,6 +538,8 @@ impl From<&Prepared> for Message {
             origin: Some("local".into()),
             body: p.text.clone(),
             sent_at: p.sent_at,
+            reply_to: p.reply_to.clone(),
+            meta: p.meta.clone(),
         }
     }
 }
@@ -484,6 +559,7 @@ impl From<&Prepared> for Frame {
             body: p.text.clone(),
             files: vec![],
             sent_at: p.sent_at,
+            meta: p.meta.clone(),
         }
     }
 }
@@ -513,6 +589,86 @@ pub(crate) fn expires_for(to: &str, sent_at: i64) -> i64 {
     }
 }
 
+/// Whether `m` is an assignment addressed to `to`, or to `<member>/<provider>:new` when `to`
+/// is a session of that harness (the worker started for it).
+fn answers_assign(m: &Message, to: &str) -> bool {
+    m.kind == "assign" && (m.to_key == to || Some(&m.to_key) == new_key_of(to).as_ref())
+}
+
+/// `<m>/<p>:<conv>` as the address a worker for it was asked at: `<m>/<p>:new`.
+pub fn new_key_of(session: &str) -> Option<String> {
+    let (member, rest) = sessions::split_addr(session)?;
+    let (provider, conv) = rest.split_once(':')?;
+    (sessions::PROVIDERS.contains(&provider) && conv != "new")
+        .then(|| format!("{member}/{provider}:new"))
+}
+
+/// The harness of a `<member>/<provider>:new` address.
+pub fn new_harness(to: &str) -> Option<&str> {
+    let (_, rest) = sessions::split_addr(to)?;
+    rest.strip_suffix(":new")
+        .filter(|p| sessions::PROVIDERS.contains(p))
+}
+
+/// Whether `to` is `<member>/<provider>:new`: a request for a fresh worker session.
+pub fn is_new_worker(to: &str) -> bool {
+    sessions::split_addr(to)
+        .and_then(|(_, rest)| rest.strip_suffix(":new"))
+        .is_some_and(|p| sessions::PROVIDERS.contains(&p))
+}
+
+/// The rule for sending `kind` with `meta` from `from` to `to`, answering `parent`:
+/// `Err(reason)` is the refusal. An `assign` carries its terms (`done_when`, a deadline;
+/// `repo`/`branch` short); a `result` answers an assignment made to `from`, goes back to its
+/// asker and has a known status; a `cancel` is the asker's alone.
+pub(crate) fn check_kind(
+    kind: &str,
+    meta: &Meta,
+    parent: Option<&Message>,
+    from: &str,
+    to: &str,
+) -> std::result::Result<(), &'static str> {
+    let too_long = |v: &Option<String>, max| v.as_ref().is_some_and(|s| s.chars().count() > max);
+    match kind {
+        // No build sends a plain message with terms or a status.
+        "message" if meta.is_empty() => Ok(()),
+        "message" => Err("bad_request"),
+        "assign" => match &meta.done_when {
+            Some(d)
+                if !d.is_empty()
+                    && !too_long(&meta.done_when, 4_096)
+                    && meta.deadline_at.is_some()
+                    && !too_long(&meta.repo, 256)
+                    && !too_long(&meta.branch, 256) =>
+            {
+                Ok(())
+            }
+            _ => Err("bad_request"),
+        },
+        "result" => {
+            if !parent.is_some_and(|p| answers_assign(p, from) && p.from_key == to) {
+                return Err("policy");
+            }
+            let status = meta.status.as_deref();
+            let ok = matches!(status, None | Some("done" | "failed" | "cancelled"))
+                && match meta.reason.as_deref() {
+                    None => true,
+                    Some(r) => {
+                        status == Some("failed") && ["timed_out", "stopped", "error"].contains(&r)
+                    }
+                };
+            if ok {
+                Ok(())
+            } else {
+                Err("bad_request")
+            }
+        }
+        "cancel" if parent.is_some_and(|p| p.kind == "assign" && p.from_key == from) => Ok(()),
+        "cancel" => Err("policy"),
+        _ => Err("unsupported"),
+    }
+}
+
 /// Decides `from`'s message `request_id` before anything is stored: `Done` with the receipt
 /// when it is refused or already sent. With no `to`, it goes to the sender of the `reply_to`
 /// message (refused `no_recipient`, nothing stored, when that is unknown). Thread and hops:
@@ -526,6 +682,7 @@ pub(crate) fn expires_for(to: &str, sent_at: i64) -> i64 {
 /// stored). Retrying a `request_id` that was accepted returns its receipt; one that was
 /// refused (`loop`, `too_long`) is refused again, whatever text comes with the retry, because a
 /// refusal stores no `to`/`text`. Clients mint a new `request_id` after any refusal.
+#[allow(clippy::too_many_arguments)]
 pub fn prepare(
     store: &Store,
     from: &Key,
@@ -533,6 +690,8 @@ pub fn prepare(
     text: &str,
     request_id: &str,
     reply_to: Option<&str>,
+    kind: &str,
+    mut meta: Meta,
     now: u64,
 ) -> Result<Prep> {
     let conn = store.conn();
@@ -545,6 +704,7 @@ pub fn prepare(
             limit: None,
             to: None,
             at: None,
+            result: None,
         }))
     };
     let refused = |reason: &str| {
@@ -559,22 +719,47 @@ pub fn prepare(
     if !sessions::word(request_id, MAX_REQUEST_ID) {
         return unstored("bad_request_id"); // nothing safe to key a receipt on
     }
+    // A running worker's reply naming its assignment (by request id or id) answers that one,
+    // whichever other assignment to its `:new` address shares the request id.
+    let worker = store.worker_by_session(&from.0)?;
+    let worker = worker.filter(|w| w.ended_at.is_none());
+    let own = match (reply_to, &worker) {
+        (Some(r), Some(w)) => store
+            .message(&w.assignment)?
+            .filter(|a| a.request_id == r || a.id == r),
+        _ => None,
+    };
+    // A worker answers no other `:new` assignment.
+    let new_key = new_key_of(&from.0).filter(|_| worker.is_none());
     // The message this answers: a message id, or a request id `from` received.
-    let parent: Option<(String, Option<String>, i64, String)> = match reply_to {
-        Some(r) => conn
-            .query_row(
-                "SELECT id, thread, hops, from_key FROM messages WHERE id = ?1 OR (request_id = ?1 AND to_key = ?2) \
-                 ORDER BY id = ?1 DESC, rowid DESC LIMIT 1",
-                params![r, from.0],
-                |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?, x.get(3)?)),
-            )
-            .optional()?,
+    let parent: Option<Message> = match reply_to {
+        _ if own.is_some() => own,
+        Some(r) => {
+            let id: Option<String> = conn
+                .query_row(
+                    // A cancel names the asker's own assignment by request id; any other
+                    // reply names a message sent to `from`.
+                    // A worker started for `<m>/<p>:new` answers it as its own session.
+                    "SELECT id FROM messages WHERE id = ?1 OR (request_id = ?1 AND \
+                     CASE WHEN ?3 = 'cancel' THEN from_key = ?2 ELSE (to_key = ?2 OR to_key = ?4) \
+                     END) ORDER BY id = ?1 DESC, rowid DESC LIMIT 1",
+                    params![r, from.0, kind, new_key],
+                    |x| x.get(0),
+                )
+                .optional()?;
+            match id {
+                Some(id) => store.message(&id)?,
+                None => None,
+            }
+        }
         None => None,
     };
     // No recipient named: the reply goes to whoever sent the parent.
     let to = match (to, &parent) {
         (Some(t), _) => t.clone(),
-        (None, Some((_, _, _, sender))) => Key(sender.clone()),
+        // A cancel goes to the assignment's target, not back to its asker.
+        (None, Some(p)) if kind == "cancel" => Key(p.to_key.clone()),
+        (None, Some(p)) => Key(p.from_key.clone()),
         // Not persisted: a later message may make this reply_to known.
         (None, None) => return unstored("no_recipient"),
     };
@@ -602,9 +787,29 @@ pub fn prepare(
         return looped(RATE);
     }
 
+    // Only an assignment (taken or refused where the worker would run) and its cancel go to
+    // a fresh worker's address.
+    if is_new_worker(&to.0) && !matches!(kind, "assign" | "cancel") {
+        return refused("no_worker");
+    }
+    // A plain message answering an assignment addressed to `from`, sent back to its asker, is
+    // its result.
+    let mut kind = kind;
+    if kind == "message"
+        && parent
+            .as_ref()
+            .is_some_and(|p| answers_assign(p, &from.0) && p.from_key == to.0)
+    {
+        kind = "result";
+        meta.status.get_or_insert_with(|| "done".into());
+    }
+    if let Err(reason) = check_kind(kind, &meta, parent.as_ref(), &from.0, &to.0) {
+        return refused(reason);
+    }
+
     let id = ulid::Ulid::generate().to_string();
     let (thread, hops) = match &parent {
-        Some((pid, thread, hops, _)) => (thread.clone().unwrap_or(pid.clone()), hops + 1),
+        Some(p) => (p.thread.clone().unwrap_or(p.id.clone()), p.hops + 1),
         None => {
             // The trigger: the newest message delivered to `from` in the window. Hops carry on
             // from it even when the work is forwarded to a third session.
@@ -612,7 +817,8 @@ pub fn prepare(
                 .query_row(
                     &format!(
                         "SELECT m.id, m.thread, m.hops, m.from_key FROM messages m {MSG_RECEIPT} \
-                         WHERE m.to_key = ?1 AND r.state IN ('delivered', 'read') AND r.updated_at > ?2 \
+                         WHERE m.to_key = ?1 AND m.kind NOT IN ('result', 'cancel') \
+                         AND r.state IN ('delivered', 'read') AND r.updated_at > ?2 \
                          ORDER BY r.updated_at DESC, m.rowid DESC LIMIT 1"
                     ),
                     params![from.0, since],
@@ -639,10 +845,11 @@ pub fn prepare(
         to,
         text: text.into(),
         request_id: request_id.into(),
-        reply_to: parent.map(|(pid, ..)| pid),
+        reply_to: parent.map(|p| p.id),
         thread,
         hops,
-        kind: "message".into(),
+        kind: kind.into(),
+        meta,
         sent_at: now as i64,
     }))
 }
@@ -729,18 +936,30 @@ pub fn send(
     reply_to: Option<&str>,
     now: u64,
 ) -> Result<Receipt> {
-    match prepare(store, from, to, text, request_id, reply_to, now)? {
+    match prepare(
+        store,
+        from,
+        to,
+        text,
+        request_id,
+        reply_to,
+        "message",
+        Meta::default(),
+        now,
+    )? {
         Prep::Go(p) => store_local(store, &p),
         Prep::Done(r) => Ok(r),
     }
 }
 
 /// What member `peer`'s envelope `env` becomes on this computer (member prefix `me`), checked
-/// in this order: a `from` outside `peer`'s prefix is dropped unanswered (`Err`); a `kind` other than
-/// `message` (the `app_*` kinds never reach here: `net::receive` drops them), any `files`, a body over `MAX_TEXT`, or a malformed id, `thread` or `request_id`
+/// in this order: a `from` outside `peer`'s prefix is dropped unanswered (`Err`); a `kind` outside `KINDS` (`message`, `assign`, `result`, `cancel`; the `app_*` kinds never reach here: `net::receive` drops them), any `files`, a body over `MAX_TEXT`, or a malformed id, `thread` or `request_id`
 /// is `unsupported`; a `to` that is not one address is `policy`, one under another prefix
-/// `not_member`; an envelope seen before gets the state it has now and is not delivered again;
-/// a `request_id` reused with another text or recipient is `request_id_reused`; `hops` at
+/// `not_member`; a `to` of the form `<member>/<provider>:new` is `no_worker` (this build starts
+/// no workers); an envelope seen before gets the state it has now and is not delivered again;
+/// a `request_id` reused with another text or recipient is `request_id_reused`; a kind whose
+/// rules fail (`check_kind`, with `reply_to` resolved to the stored message) is refused with
+/// its reason; `hops` at
 /// `MAX_HOPS` or more, or below one past a message of ours it answers (`hops_ok`), or the
 /// `LOOP_LIMIT`th send in `LOOP_WINDOW_S` from one member to `to`, is `loop`; then
 /// stored for `to` with origin `net:<peer short>`, timed by its arrival (`now`), and
@@ -758,6 +977,7 @@ pub fn receive(
     me: &str,
     declared: Option<&std::collections::HashSet<String>>,
     members: Option<&std::collections::HashSet<String>>,
+    config: &Config,
     now: u64,
 ) -> Result<Answer> {
     let Frame::Envelope {
@@ -771,6 +991,7 @@ pub fn receive(
         hops,
         body,
         files,
+        meta,
         ..
     } = env
     else {
@@ -783,7 +1004,7 @@ pub fn receive(
     if !address(from) || sessions::member_of(from) != Some(peer.short.as_str()) {
         return Err("an envelope from outside its member's prefix".into());
     }
-    if kind != "message"
+    if !KINDS.contains(&kind.as_str())
         || !files.is_empty()
         || body.len() > MAX_TEXT
         || !sessions::word(request_id, MAX_REQUEST_ID)
@@ -792,11 +1013,18 @@ pub fn receive(
     {
         return refused("unsupported");
     }
+    // Network workers off: plain messages only (the rule before assignments existed).
+    if kind != "message" && !config.network_workers {
+        return refused("unsupported");
+    }
     if !address(to) {
         return refused("policy");
     }
     if sessions::member_of(to) != Some(me) {
         return refused("not_member");
+    }
+    if is_new_worker(to) && !matches!(kind.as_str(), "assign" | "cancel") {
+        return refused("no_worker");
     }
     if let Some((state, reason)) = store.seen_state(&peer.key, id)? {
         return Ok(Answer {
@@ -816,6 +1044,14 @@ pub fn receive(
             limit: r.limit,
             ..Answer::is(r.state)
         });
+    }
+    // `reply_to` is a message id on the wire.
+    let parent = match reply_to {
+        Some(r) => store.message(r)?,
+        None => None,
+    };
+    if let Err(reason) = check_kind(kind, meta, parent.as_ref(), from, to) {
+        return refused(reason);
     }
     if declared.is_some_and(|d| !d.contains(to)) {
         return refused("policy");
@@ -853,9 +1089,42 @@ pub fn receive(
         thread: thread.clone().unwrap_or_else(|| id.clone()),
         hops,
         kind: kind.clone(),
+        meta: meta.clone(),
         sent_at: now as i64,
     };
     let tx = store.conn().unchecked_transaction()?;
+    // A cancel reaches the worker module only for an assignment to a fresh worker.
+    let worker_cancel = parent.as_ref().is_some_and(|p| is_new_worker(&p.to_key));
+    if is_new_worker(to) && (kind == "assign" || worker_cancel) {
+        // A fresh worker's address has no mailbox: the assignment is refused, held for the
+        // person or started; its cancel is stored and reaches the worker module.
+        let mut taken = None;
+        let mut cancelled = None;
+        let state = if kind == "assign" {
+            let mut m = Message::from(&p);
+            m.origin = Some(format!("net:{}", peer.short));
+            let t = workers::take_assign(store, config, me, &m, now as i64)?;
+            let state = match t {
+                Taken::Refused(r) => return refused(r), // nothing written: the tx rolls back
+                Taken::Held { .. } => State::Held,
+                Taken::Start => State::Stored,
+            };
+            taken = Some(t);
+            state
+        } else {
+            put(store, &p, Origin::Net(&peer.short), State::Stored)?;
+            cancelled = p.reply_to.clone();
+            State::Stored
+        };
+        store.put_seen(&peer.key, id, state.name(), now as i64)?;
+        tx.commit()?;
+        return Ok(Answer {
+            fresh: true,
+            taken,
+            cancelled,
+            ..Answer::is(state)
+        });
+    }
     // Seen with what the sender is told, so a resend makes no second copy.
     let state = State::Stored;
     record(store, &p, Origin::Net(&peer.short), false)?;
@@ -945,6 +1214,51 @@ pub fn expire_delivered(store: &Store, short: &str, now: u64) -> Result<()> {
     }
     tx.commit()?;
     Ok(())
+}
+
+/// Closes member `me`'s unanswered assignments whose deadline (`meta.deadline_at`) is at or
+/// before `now`: each gets a `failed` / `timed_out` result from the assignee to the asker,
+/// stored in the asker's mailbox, one transaction each (the caller holds the store lock); one
+/// that fails is logged by id and skipped. Returns each asker's key and the timeout result's
+/// message id, to wake. A real result arriving later is ordinary mail: `result_of` keeps
+/// naming the oldest, this one.
+pub fn expire_assignments(store: &Store, me: &str, now: u64) -> Result<Vec<(Key, String)>> {
+    let mut askers = vec![];
+    for a in store.open_assignments_past(&format!("{me}/"), now as i64)? {
+        let at = a.meta.deadline_at.unwrap_or_default();
+        let p = Prepared {
+            message_id: ulid::Ulid::generate().to_string(),
+            from: Key(a.to_key.clone()),
+            to: Key(a.from_key.clone()),
+            text: format!(
+                "deadline passed: no result from {} by {}",
+                a.to_key,
+                crate::date::local_time(at)
+            ),
+            request_id: format!("timeout-{}", a.id),
+            reply_to: Some(a.id.clone()),
+            thread: a.thread.clone().unwrap_or_else(|| a.id.clone()),
+            hops: a.hops + 1,
+            kind: "result".into(),
+            meta: Meta {
+                status: Some("failed".into()),
+                reason: Some("timed_out".into()),
+                ..Meta::default()
+            },
+            sent_at: now as i64,
+        };
+        // One transaction each: an assignment that cannot be closed never stops the others.
+        let stored = (|| -> Result<()> {
+            let tx = store.conn().unchecked_transaction()?;
+            record(store, &p, Origin::Local, false)?;
+            Ok(tx.commit()?)
+        })();
+        match stored {
+            Ok(()) => askers.push((Key(a.from_key), p.message_id)),
+            Err(e) => eprintln!("mail: assignment {} not timed out: {e}", a.id),
+        }
+    }
+    Ok(askers)
 }
 
 /// The ids of `delivered_unread`'s messages for which `bound` (on `r.updated_at`, the delivery
@@ -1092,6 +1406,65 @@ pub fn expire(store: &Store, now: u64) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// A config with network workers on (assignments are refused `unsupported` without).
+    fn workers_on() -> Config {
+        Config {
+            network_workers: true,
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn a_no_worker_refusal_has_a_note() {
+        let r = serde_json::json!({"state": "refused", "reason": "no_worker", "person": "aden", "where": "mac"});
+        assert_eq!(receipt_note(&r, None).as_deref(), Some("not sent: that computer does not take fresh workers yet (find_workers lists who takes assignments)"));
+    }
+
+    #[test]
+    fn worker_receipts_name_the_person_in_both_notes() {
+        let r = |state: &str, reason: Option<&str>| serde_json::json!({"state": state, "reason": reason, "person": "aden", "where": "mac"});
+        let note = |v| receipt_note(&v, None).unwrap();
+        assert_eq!(note(r("held", None)), "held until aden allows it");
+        let to_aden = ForPerson {
+            to: Some("m/claude:new"),
+            rid: "r1",
+            cmd: "lightbulb",
+            check: false,
+        };
+        assert_eq!(
+            receipt_note(&r("held", None), Some(&to_aden)).unwrap(),
+            "Not yet sent: held until aden allows it."
+        );
+        assert_eq!(
+            note(r("refused", Some("declined"))),
+            "not sent: aden declined to start a worker"
+        );
+        assert!(note(r("refused", Some("busy"))).contains("running all the workers it allows"));
+        let p = ForPerson {
+            to: Some("m/claude:new"),
+            rid: "r1",
+            cmd: "lightbulb",
+            check: false,
+        };
+        let said = receipt_note(&r("refused", Some("declined")), Some(&p)).unwrap();
+        assert_eq!(said, "Not sent: aden declined to start a worker.");
+    }
+
+    #[test]
+    fn a_bad_request_refusal_names_the_terms() {
+        let p = ForPerson {
+            to: Some("m/codex:b"),
+            rid: "r1",
+            cmd: "lightbulb",
+            check: false,
+        };
+        let r = serde_json::json!({"state": "refused", "reason": "bad_request"});
+        assert_eq!(
+            receipt_note(&r, Some(&p)).as_deref(),
+            Some("Not sent: the assignment's terms were refused.")
+        );
+    }
+
     #[test]
     fn notes_name_the_loop_limit_or_say_a_limit() {
         let r = |limit: Option<&str>| {
@@ -1132,6 +1505,47 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("state.db")).unwrap();
         (dir, store)
+    }
+
+    #[test]
+    fn one_bad_assignment_never_stops_the_expiry_of_the_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("state.db")).unwrap();
+        let assign = |id: &str, from: &str| Message {
+            id: id.into(),
+            request_id: format!("r-{id}"),
+            from_key: from.into(),
+            to_key: "w/b".into(),
+            kind: "assign".into(),
+            thread: None,
+            hops: 0,
+            origin: None,
+            body: "x".into(),
+            sent_at: 1,
+            reply_to: None,
+            meta: Meta {
+                deadline_at: Some(5),
+                ..Meta::default()
+            },
+        };
+        store.put_message(&assign("a1", "me/x")).unwrap();
+        store.put_message(&assign("a2", "me/y")).unwrap();
+        // Takes the first timeout's (from_key, request_id) so its store trips UNIQUE.
+        let mut squat = assign("squat", "w/b");
+        squat.request_id = "timeout-a1".into();
+        squat.kind = "message".into();
+        store.put_message(&squat).unwrap();
+        let woken = expire_assignments(&store, "me", 10).unwrap();
+        let [(key, id)] = &woken[..] else {
+            panic!("{woken:?}")
+        };
+        assert_eq!(key, &Key("me/y".into()));
+        assert_eq!(
+            store.message(id).unwrap().unwrap().reply_to.as_deref(),
+            Some("a2")
+        );
+        assert!(store.result_of("a2").unwrap().is_some());
+        assert!(store.result_of("a1").unwrap().is_none());
     }
 
     /// A registered session; `alive` picks this process's real birth time, else a wrong one.
@@ -1674,8 +2088,204 @@ mod tests {
             body: "x".into(),
             files: vec![],
             sent_at: 0,
+            meta: Default::default(),
         };
         (peer, roster, env)
+    }
+
+    fn peer_env(from: &str, to: &str, rid: &str, kind: &str, meta: Meta) -> Frame {
+        let (_, _, mut env) = peer_mail(to, rid);
+        if let Frame::Envelope {
+            from: f,
+            kind: k,
+            meta: m,
+            ..
+        } = &mut env
+        {
+            (*f, *k, *m) = (from.into(), kind.into(), meta);
+        }
+        env
+    }
+
+    #[test]
+    fn a_peers_assign_is_stored_with_its_meta_and_a_new_address_is_no_worker() {
+        let (_d, s) = setup();
+        let (peer, roster, _) = peer_mail("m/claude:2", "x");
+        let meta = terms("green", 1060);
+        let env = peer_env("p/codex:a", "m/claude:2", "r1", "assign", meta);
+        let got = receive(
+            &s,
+            &env,
+            &peer,
+            &roster,
+            "m",
+            None,
+            None,
+            &workers_on(),
+            1000,
+        )
+        .unwrap();
+        assert_eq!(
+            got,
+            Answer {
+                fresh: true,
+                ..Answer::is(State::Stored)
+            }
+        );
+        let Frame::Envelope { id, .. } = &env else {
+            unreachable!()
+        };
+        let stored = s.message(id).unwrap().unwrap();
+        assert_eq!(stored.meta.done_when.as_deref(), Some("green"));
+        assert_eq!(stored.kind, "assign");
+        let env = peer_env(
+            "p/codex:a",
+            "m/claude:new",
+            "r2",
+            "assign",
+            terms("green", 1060),
+        );
+        let got = receive(
+            &s,
+            &env,
+            &peer,
+            &roster,
+            "m",
+            None,
+            None,
+            &workers_on(),
+            1000,
+        )
+        .unwrap();
+        assert_eq!(
+            (got.state, got.reason.as_deref()),
+            (State::Refused, Some("no_worker"))
+        );
+    }
+
+    #[test]
+    fn a_peers_result_must_answer_an_assign_sent_to_it() {
+        let (_d, s) = setup();
+        let (peer, roster, _) = peer_mail("m/codex:1", "x");
+        let a = go(prep(
+            &s,
+            "m/codex:1",
+            Some("p/claude:9"),
+            "a1",
+            None,
+            "assign",
+            terms("green", 1060),
+            900,
+        ));
+        store_local(&s, &a).unwrap();
+        let done = Meta {
+            status: Some("done".into()),
+            ..Default::default()
+        };
+        let mut env = peer_env("p/claude:9", "m/codex:1", "r1", "result", done.clone());
+        if let Frame::Envelope { reply_to, hops, .. } = &mut env {
+            (*reply_to, *hops) = (Some(a.message_id.clone()), a.hops as u32 + 1);
+        }
+        // A result to a session other than the asker is refused.
+        let mut third = peer_env("p/claude:9", "m/cursor:2", "r0", "result", done.clone());
+        if let Frame::Envelope { reply_to, hops, .. } = &mut third {
+            (*reply_to, *hops) = (Some(a.message_id.clone()), a.hops as u32 + 1);
+        }
+        let got = receive(
+            &s,
+            &third,
+            &peer,
+            &roster,
+            "m",
+            None,
+            None,
+            &workers_on(),
+            1000,
+        )
+        .unwrap();
+        assert_eq!(
+            (got.state, got.reason.as_deref()),
+            (State::Refused, Some("policy"))
+        );
+        let got = receive(
+            &s,
+            &env,
+            &peer,
+            &roster,
+            "m",
+            None,
+            None,
+            &workers_on(),
+            1000,
+        )
+        .unwrap();
+        assert_eq!(got.state, State::Stored);
+        let Frame::Envelope { id, .. } = &env else {
+            unreachable!()
+        };
+        let stored = s.message(id).unwrap().unwrap();
+        assert_eq!(stored.meta.status.as_deref(), Some("done"));
+        assert!(stored.hops >= 1);
+        // A result to a plain message is not an answer to an assignment.
+        let plain = peer_env("p/claude:9", "m/codex:1", "r2", "message", Meta::default());
+        receive(
+            &s,
+            &plain,
+            &peer,
+            &roster,
+            "m",
+            None,
+            None,
+            &workers_on(),
+            1000,
+        )
+        .unwrap();
+        let Frame::Envelope { id: plain_id, .. } = &plain else {
+            unreachable!()
+        };
+        let mut env = peer_env("p/claude:9", "m/codex:1", "r3", "result", done);
+        if let Frame::Envelope { reply_to, hops, .. } = &mut env {
+            (*reply_to, *hops) = (Some(plain_id.clone()), 1);
+        }
+        let got = receive(
+            &s,
+            &env,
+            &peer,
+            &roster,
+            "m",
+            None,
+            None,
+            &workers_on(),
+            1000,
+        )
+        .unwrap();
+        assert_eq!(
+            (got.state, got.reason.as_deref()),
+            (State::Refused, Some("policy"))
+        );
+    }
+
+    #[test]
+    fn a_peers_unknown_kind_is_unsupported() {
+        let (_d, s) = setup();
+        let (peer, roster, _) = peer_mail("m/codex:c", "x");
+        let env = peer_env("p/codex:a", "m/codex:c", "r1", "poke", Meta::default());
+        let got = receive(
+            &s,
+            &env,
+            &peer,
+            &roster,
+            "m",
+            None,
+            None,
+            &workers_on(),
+            1000,
+        )
+        .unwrap();
+        assert_eq!(
+            (got.state, got.reason.as_deref()),
+            (State::Refused, Some("unsupported"))
+        );
     }
 
     #[test]
@@ -1683,7 +2293,18 @@ mod tests {
         let (_d, s) = setup();
         for (i, to) in ["m/terminal", "m/codex:c"].iter().enumerate() {
             let (peer, roster, env) = peer_mail(to, &format!("r{i}"));
-            let got = receive(&s, &env, &peer, &roster, "m", None, None, 1000).unwrap();
+            let got = receive(
+                &s,
+                &env,
+                &peer,
+                &roster,
+                "m",
+                None,
+                None,
+                &workers_on(),
+                1000,
+            )
+            .unwrap();
             let fresh = Answer {
                 fresh: true,
                 ..Answer::is(State::Stored)
@@ -1701,10 +2322,32 @@ mod tests {
         let (_d, s) = setup();
         let (peer, roster, env) = peer_mail("m/codex:c", "r1");
         let again = || {
-            let r = receive(&s, &env, &peer, &roster, "m", None, None, 1001).unwrap();
+            let r = receive(
+                &s,
+                &env,
+                &peer,
+                &roster,
+                "m",
+                None,
+                None,
+                &workers_on(),
+                1001,
+            )
+            .unwrap();
             (r.state, r.reason, r.fresh)
         };
-        receive(&s, &env, &peer, &roster, "m", None, None, 1000).unwrap();
+        receive(
+            &s,
+            &env,
+            &peer,
+            &roster,
+            "m",
+            None,
+            None,
+            &workers_on(),
+            1000,
+        )
+        .unwrap();
         advance(
             s.conn(),
             "p/codex:a",
@@ -1894,5 +2537,602 @@ mod tests {
             note(serde_json::json!({"state": "stored", "reason": "approved by m/claude-1"})),
             "Sent. It waits until that session is back. Approved by m/claude-1."
         );
+    }
+
+    fn terms(done_when: &str, deadline: i64) -> Meta {
+        Meta {
+            done_when: Some(done_when.into()),
+            deadline_at: Some(deadline),
+            ..Default::default()
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prep(
+        s: &Store,
+        from: &str,
+        to: Option<&str>,
+        rid: &str,
+        reply_to: Option<&str>,
+        kind: &str,
+        meta: Meta,
+        now: u64,
+    ) -> Prep {
+        let to = to.map(k);
+        prepare(
+            s,
+            &k(from),
+            to.as_ref(),
+            "t",
+            rid,
+            reply_to,
+            kind,
+            meta,
+            now,
+        )
+        .unwrap()
+    }
+
+    fn go(p: Prep) -> Prepared {
+        match p {
+            Prep::Go(p) => p,
+            Prep::Done(r) => panic!("refused: {r:?}"),
+        }
+    }
+
+    fn refused_for(p: Prep, reason: &str) {
+        match p {
+            Prep::Done(r) => assert_eq!(
+                (r.state, r.reason.as_deref()),
+                (State::Refused, Some(reason))
+            ),
+            Prep::Go(p) => panic!("expected {reason}, got {p:?}"),
+        }
+    }
+
+    /// Stores an assign a/codex:1 -> a/claude:2 as request `rid`; returns its message id.
+    fn assigned(s: &Store, rid: &str) -> String {
+        let p = go(prep(
+            s,
+            "a/codex:1",
+            Some("a/claude:2"),
+            rid,
+            None,
+            "assign",
+            terms("tests pass", 10),
+            100,
+        ));
+        store_local(s, &p).unwrap();
+        p.message_id
+    }
+
+    #[test]
+    fn an_assign_needs_done_when_and_a_deadline() {
+        let (_d, s) = setup();
+        let bare = prep(
+            &s,
+            "a/codex:1",
+            Some("a/claude:2"),
+            "r1",
+            None,
+            "assign",
+            Meta::default(),
+            100,
+        );
+        refused_for(bare, "bad_request");
+        let p = go(prep(
+            &s,
+            "a/codex:1",
+            Some("a/claude:2"),
+            "r2",
+            None,
+            "assign",
+            terms("x", 10),
+            100,
+        ));
+        assert_eq!(p.kind, "assign");
+        assert_eq!(p.meta.deadline_at, Some(10));
+    }
+
+    #[test]
+    fn a_reply_to_an_assignment_is_its_result_marked_done() {
+        let (_d, s) = setup();
+        let aid = assigned(&s, "r1");
+        let p = go(prep(
+            &s,
+            "a/claude:2",
+            None,
+            "r2",
+            Some("r1"),
+            "message",
+            Meta::default(),
+            101,
+        ));
+        assert_eq!(p.kind, "result");
+        assert_eq!(p.meta.status.as_deref(), Some("done"));
+        assert_eq!(p.hops, 1);
+        assert_eq!(p.reply_to, Some(aid));
+    }
+
+    #[test]
+    fn a_reply_to_someone_elses_assignment_stays_a_message() {
+        let (_d, s) = setup();
+        let aid = assigned(&s, "r1");
+        let p = go(prep(
+            &s,
+            "a/cursor:3",
+            Some("a/codex:1"),
+            "r2",
+            Some(&aid),
+            "message",
+            Meta::default(),
+            101,
+        ));
+        assert_eq!(p.kind, "message");
+        assert!(p.meta.is_empty());
+    }
+
+    #[test]
+    fn a_reply_to_an_assignment_sent_to_a_third_session_stays_a_message() {
+        let (_d, s) = setup();
+        let aid = assigned(&s, "r1");
+        let p = go(prep(
+            &s,
+            "a/claude:2",
+            Some("a/cursor:3"),
+            "r2",
+            Some(&aid),
+            "message",
+            Meta::default(),
+            101,
+        ));
+        assert_eq!(p.kind, "message");
+        assert!(p.meta.is_empty());
+        // An explicit result may only go back to the asker.
+        let r = prep(
+            &s,
+            "a/claude:2",
+            Some("a/cursor:3"),
+            "r3",
+            Some(&aid),
+            "result",
+            Meta::default(),
+            101,
+        );
+        refused_for(r, "policy");
+    }
+
+    #[test]
+    fn a_plain_message_carries_no_meta() {
+        let (_d, s) = setup();
+        let with = |rid: &str, meta: Meta| {
+            prep(
+                &s,
+                "a/codex:1",
+                Some("a/claude:2"),
+                rid,
+                None,
+                "message",
+                meta,
+                100,
+            )
+        };
+        let status = Meta {
+            status: Some("done".into()),
+            ..Default::default()
+        };
+        refused_for(with("r1", status), "bad_request");
+        refused_for(with("r2", terms("x", 10)), "bad_request");
+        assert_eq!(go(with("r3", Meta::default())).kind, "message");
+    }
+
+    #[test]
+    fn a_result_with_a_bad_status_is_refused() {
+        let (_d, s) = setup();
+        assigned(&s, "r1");
+        let with = |rid: &str, status: &str, reason: Option<&str>| {
+            prep(
+                &s,
+                "a/claude:2",
+                None,
+                rid,
+                Some("r1"),
+                "result",
+                Meta {
+                    status: Some(status.into()),
+                    reason: reason.map(Into::into),
+                    ..Default::default()
+                },
+                101,
+            )
+        };
+        refused_for(with("r2", "maybe", None), "bad_request");
+        refused_for(with("r3", "failed", Some("bored")), "bad_request");
+        assert_eq!(go(with("r4", "failed", Some("timed_out"))).kind, "result");
+    }
+
+    #[test]
+    fn only_the_asker_may_cancel() {
+        let (_d, s) = setup();
+        let aid = assigned(&s, "r1");
+        let cancel = |from: &str, rid: &str, reply_to: &str| {
+            prep(
+                &s,
+                from,
+                None,
+                rid,
+                Some(reply_to),
+                "cancel",
+                Meta::default(),
+                101,
+            )
+        };
+        refused_for(cancel("a/claude:2", "r2", &aid), "policy");
+        // The asker names the assignment by its request id, or by its message id.
+        let p = go(cancel("a/codex:1", "r3", "r1"));
+        assert_eq!((p.kind.as_str(), p.reply_to), ("cancel", Some(aid.clone())));
+        assert_eq!(p.to, k("a/claude:2"));
+        let p = go(cancel("a/codex:1", "r4", &aid));
+        assert_eq!((p.kind.as_str(), p.to), ("cancel", k("a/claude:2")));
+    }
+
+    #[test]
+    fn only_an_assign_or_its_cancel_may_go_to_a_new_worker_address() {
+        let (_d, s) = setup();
+        let to = Some("a/codex:new");
+        let assign = prep(
+            &s,
+            "a/claude:2",
+            to,
+            "r1",
+            None,
+            "assign",
+            terms("x", 10),
+            100,
+        );
+        assert_eq!(go(assign).to, k("a/codex:new"));
+        refused_for(
+            prep(
+                &s,
+                "a/claude:2",
+                to,
+                "r2",
+                None,
+                "message",
+                Meta::default(),
+                100,
+            ),
+            "no_worker",
+        );
+        assert!(is_new_worker("a/codex:new"));
+        assert!(!is_new_worker("a/codex:1"));
+        assert!(!is_new_worker("a/other:new"));
+    }
+
+    /// Stores the assign `from` -> `to` (a worker address) as request `rid` in no mailbox.
+    fn assigned_new(s: &Store, from: &str, to: &str, rid: &str) -> Prepared {
+        let p = go(prep(
+            s,
+            from,
+            Some(to),
+            rid,
+            None,
+            "assign",
+            terms("x", 1060),
+            900,
+        ));
+        put(s, &p, Origin::Local, State::Stored).unwrap();
+        p
+    }
+
+    #[test]
+    fn a_new_assignment_is_answered_by_the_worker_started_for_it() {
+        let (_d, s) = setup();
+        let a = assigned_new(&s, "a/codex:1", "m/claude:new", "r1");
+        assert_eq!(new_key_of("m/claude:w1").as_deref(), Some("m/claude:new"));
+        assert_eq!(new_key_of("m/claude:new"), None);
+        assert_eq!(new_key_of("m/inbox"), None);
+        // A plain reply from the worker (by request id) finds the assignment and is a result.
+        let p = go(prep(
+            &s,
+            "m/claude:w1",
+            None,
+            "w-r1",
+            Some("r1"),
+            "message",
+            Meta::default(),
+            901,
+        ));
+        assert_eq!((p.kind.as_str(), p.to.0.as_str()), ("result", "a/codex:1"));
+        assert_eq!(p.reply_to.as_deref(), Some(a.message_id.as_str()));
+        assert_eq!(p.meta.status.as_deref(), Some("done"));
+        // Another harness's session did not get this assignment.
+        refused_for(
+            prep(
+                &s,
+                "m/codex:x",
+                Some("a/codex:1"),
+                "w-r2",
+                Some("r1"),
+                "result",
+                Meta::default(),
+                901,
+            ),
+            "policy",
+        );
+    }
+
+    #[test]
+    fn a_workers_reply_binds_to_its_own_assignment() {
+        let (_d, s) = setup();
+        // Two askers, one request id, one worker address.
+        let first = assigned_new(&s, "a/codex:1", "m/claude:new", "r1");
+        let second = assigned_new(&s, "b/codex:2", "m/claude:new", "r1");
+        assert_ne!(first.message_id, second.message_id);
+        s.insert_worker(&crate::store::Worker {
+            id: 0,
+            assignment: first.message_id.clone(),
+            session: "m/claude:w1".into(),
+            provider: "claude".into(),
+            folder: "/f".into(),
+            pid: None,
+            started_at: 1,
+            ended_at: None,
+            state: "running".into(),
+            by: None,
+        })
+        .unwrap();
+        // By request id or by message id, the worker's reply is the first assignment's result.
+        for (rid, reply_to) in [("w-1", "r1"), ("w-2", first.message_id.as_str())] {
+            let p = go(prep(
+                &s,
+                "m/claude:w1",
+                None,
+                rid,
+                Some(reply_to),
+                "message",
+                Meta::default(),
+                901,
+            ));
+            assert_eq!((p.kind.as_str(), p.to.0.as_str()), ("result", "a/codex:1"));
+            assert_eq!(p.reply_to.as_deref(), Some(first.message_id.as_str()));
+        }
+    }
+
+    #[test]
+    fn receive_accepts_a_result_from_the_workers_real_key() {
+        let (_d, s) = setup();
+        let (peer, roster, _) = peer_mail("m/codex:1", "x");
+        // The asker's copy: addressed to the host's `:new`.
+        let a = assigned_new(&s, "m/codex:1", "p/claude:new", "a1");
+        let done = Meta {
+            status: Some("done".into()),
+            ..Default::default()
+        };
+        let mut env = peer_env("p/claude:abc", "m/codex:1", "r1", "result", done);
+        if let Frame::Envelope { reply_to, hops, .. } = &mut env {
+            (*reply_to, *hops) = (Some(a.message_id.clone()), a.hops as u32 + 1);
+        }
+        let got = receive(
+            &s,
+            &env,
+            &peer,
+            &roster,
+            "m",
+            None,
+            None,
+            &workers_on(),
+            1000,
+        )
+        .unwrap();
+        assert_eq!(got.state, State::Stored);
+    }
+
+    #[test]
+    fn take_assign_refuses_holds_or_starts() {
+        let (dir, s) = setup();
+        let me = crate::identity::Identity::load_or_create(dir.path()).unwrap();
+        let assign = |rid: &str, from: &str| Message {
+            id: ulid::Ulid::generate().to_string(),
+            request_id: rid.into(),
+            from_key: from.into(),
+            to_key: "m/claude:new".into(),
+            kind: "assign".into(),
+            thread: None,
+            hops: 0,
+            origin: None,
+            body: "x".into(),
+            sent_at: 1,
+            reply_to: None,
+            meta: terms("x", 100),
+        };
+        let mut config = workers_on();
+        let take =
+            |config: &Config, a: &Message| workers::take_assign(&s, config, "m", a, 10).unwrap();
+        let st = |a: &Message| state(&s, &a.request_id);
+        // Not offered, nor for this harness.
+        let a = assign("r1", "p/codex:a");
+        assert_eq!(take(&config, &a), Taken::Refused("no_worker"));
+        config.workers_offer = "codex".into(); // another harness's worker is not this one
+        assert_eq!(take(&config, &a), Taken::Refused("no_worker"));
+        config.workers_offer = "claude".into();
+        // Busy at the cap.
+        config.workers_max = 1;
+        s.insert_worker(&crate::store::Worker {
+            id: 0,
+            assignment: "x".into(),
+            session: "m/claude:w".into(),
+            provider: "claude".into(),
+            folder: "/f".into(),
+            pid: None,
+            started_at: 1,
+            ended_at: None,
+            state: "running".into(),
+            by: None,
+        })
+        .unwrap();
+        let b = assign("r2", "p/codex:a");
+        assert_eq!(take(&config, &b), Taken::Refused("busy"));
+        config.workers_max = 3;
+        // Refused by policy, nothing written.
+        workers::set_policy(&s, &me, "q", "refused", "me", 1).unwrap();
+        let c = assign("r3", "q/codex:a");
+        assert_eq!(take(&config, &c), Taken::Refused("declined"));
+        assert!(s.message(&c.id).unwrap().is_none());
+        // Ask: held, with a hold row and receipt.
+        let d = assign("r4", "p/codex:b");
+        let Taken::Held { hold } = take(&config, &d) else {
+            panic!()
+        };
+        let h = crate::holds::get(&s, hold).unwrap().unwrap();
+        assert_eq!(
+            (h.message.id, h.from_member, h.state),
+            (d.id.clone(), "p".into(), "open".into())
+        );
+        assert_eq!(st(&d), State::Held);
+        // Allow (the standing policy): stored, to start.
+        workers::set_policy(&s, &me, "p", "always", "me", 2).unwrap();
+        let e = assign("r5", "p/codex:c");
+        assert_eq!(take(&config, &e), Taken::Start);
+        assert_eq!(st(&e), State::Stored);
+        // A peer's 30-day deadline is stored as this host's most: now + 14 400.
+        let f = Message {
+            meta: terms("x", 10 + 30 * 86_400),
+            ..assign("r6", "p/codex:d")
+        };
+        assert_eq!(take(&config, &f), Taken::Start);
+        let stored = s.message(&f.id).unwrap().unwrap();
+        assert_eq!(stored.meta.deadline_at, Some(10 + 14_400));
+        // An earlier one stays as asked.
+        assert_eq!(
+            s.message(&e.id).unwrap().unwrap().meta.deadline_at,
+            Some(100)
+        );
+    }
+
+    #[test]
+    fn a_peers_assign_is_unsupported_while_network_workers_is_off() {
+        let (_d, s) = setup();
+        let (peer, roster, _) = peer_mail("m/claude:new", "x");
+        let config = Config {
+            workers_offer: "claude".into(),
+            ..Config::default()
+        };
+        for kind in ["assign", "result", "cancel"] {
+            let env = peer_env("p/codex:a", "m/claude:new", "r1", kind, terms("x", 1060));
+            let got = receive(&s, &env, &peer, &roster, "m", None, None, &config, 1000).unwrap();
+            assert_eq!(
+                (got.state, got.reason.as_deref()),
+                (State::Refused, Some("unsupported")),
+                "{kind}"
+            );
+        }
+        assert!(crate::holds::open(&s).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_replayed_assign_to_a_worker_address_is_answered_held_once() {
+        let (_d, s) = setup();
+        let (peer, roster, _) = peer_mail("m/claude:new", "x");
+        let config = Config {
+            workers_offer: "claude".into(),
+            ..workers_on()
+        };
+        let env = peer_env(
+            "p/codex:a",
+            "m/claude:new",
+            "r1",
+            "assign",
+            terms("x", 1060),
+        );
+        let first = receive(&s, &env, &peer, &roster, "m", None, None, &config, 1000).unwrap();
+        assert_eq!((first.state, first.fresh), (State::Held, true));
+        assert!(matches!(first.taken, Some(Taken::Held { .. })));
+        // The same envelope again, and the same request under another envelope id.
+        let again = receive(&s, &env, &peer, &roster, "m", None, None, &config, 1001).unwrap();
+        assert_eq!(
+            (again.state, again.fresh, again.taken),
+            (State::Held, false, None)
+        );
+        let other = peer_env(
+            "p/codex:a",
+            "m/claude:new",
+            "r1",
+            "assign",
+            terms("x", 1060),
+        );
+        let again = receive(&s, &other, &peer, &roster, "m", None, None, &config, 1002).unwrap();
+        assert_eq!((again.state, again.fresh), (State::Held, false));
+        let holds: i64 = s
+            .conn()
+            .query_row("SELECT COUNT(*) FROM holds", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(holds, 1);
+    }
+
+    #[test]
+    fn results_and_cancels_are_not_hop_triggers() {
+        let (_d, s) = setup();
+        let a = go(prep(
+            &s,
+            "a/codex:1",
+            Some("a/claude:2"),
+            "r1",
+            None,
+            "assign",
+            terms("x", 10),
+            100,
+        ));
+        assert_eq!(a.hops, 0);
+        store_local(&s, &a).unwrap();
+        let res = go(prep(
+            &s,
+            "a/claude:2",
+            None,
+            "r2",
+            Some("r1"),
+            "result",
+            Meta::default(),
+            101,
+        ));
+        assert_eq!(res.hops, 1);
+        store_local(&s, &res).unwrap();
+        take(&s, &k("a/codex:1"), 102).unwrap();
+        let next = go(prep(
+            &s,
+            "a/codex:1",
+            Some("a/claude:2"),
+            "r3",
+            None,
+            "assign",
+            terms("y", 10),
+            103,
+        ));
+        assert_eq!(next.hops, 0);
+        // Control: a plain message delivered to codex is a trigger.
+        let (_d2, s2) = setup();
+        let m = go(prep(
+            &s2,
+            "a/claude:2",
+            Some("a/codex:1"),
+            "q1",
+            None,
+            "message",
+            Meta::default(),
+            100,
+        ));
+        store_local(&s2, &m).unwrap();
+        take(&s2, &k("a/codex:1"), 101).unwrap();
+        let after = go(prep(
+            &s2,
+            "a/codex:1",
+            Some("a/claude:2"),
+            "q2",
+            None,
+            "message",
+            Meta::default(),
+            102,
+        ));
+        assert_eq!(after.hops, 1);
     }
 }

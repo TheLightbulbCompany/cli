@@ -4,6 +4,11 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
 
+/// `dir`'s `config.toml`: network workers on (assignments are `unsupported` without).
+fn workers_on(dir: &tempfile::TempDir) {
+    std::fs::write(dir.path().join("config.toml"), "network_workers = true\n").unwrap();
+}
+
 async fn connect(sock: &std::path::Path) -> (Lines<BufReader<OwnedReadHalf>>, OwnedWriteHalf) {
     for _ in 0..50 {
         if let Ok(s) = UnixStream::connect(sock).await {
@@ -181,6 +186,61 @@ async fn mail_arriving_after_a_waiting_inbox_hung_up_stays_in_the_mailbox() {
     call(&mut l, &mut w, json!({"id": 4, "op": "shutdown"})).await;
 }
 
+/// Network workers off (the default): a send of any kind but `message`, or with a `status`,
+/// is `unsupported`; a plain message goes as ever.
+#[tokio::test]
+async fn assignments_are_unsupported_until_network_workers_is_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let claude_home = tempfile::tempdir().unwrap();
+    std::env::set_var("LIGHTBULB_CONNECT_CLAUDE_HOME", claude_home.path());
+    let home = dir.path().to_path_buf();
+    tokio::spawn(async move { daemon::run(&home).await.unwrap() });
+    let (mut l, mut w) = connect(&dir.path().join(paths::SOCKET)).await;
+    let birth = os::process(std::process::id()).unwrap().birth_micros;
+    let mut keys = vec![];
+    for (i, (provider, conv)) in [("codex", "a"), ("claude", "b")].into_iter().enumerate() {
+        let reg = call(
+            &mut l,
+            &mut w,
+            json!({"id": i + 1, "op": "register", "session": {
+            "provider": provider, "conversation": conv, "pid": std::process::id(),
+            "birth_micros": birth, "cwd": "/tmp"}}),
+        )
+        .await;
+        keys.push(reg["key"].as_str().unwrap().to_string());
+    }
+    let (a, b) = (keys[0].clone(), keys[1].clone());
+    for (rid, extra) in [
+        ("as1", json!({"kind": "assign", "done_when": "y"})),
+        ("rs1", json!({"kind": "result", "reply_to": "x"})),
+        ("cn1", json!({"kind": "cancel", "reply_to": "x"})),
+        ("st1", json!({"status": "done"})),
+    ] {
+        let mut m = json!({"id": 3, "op": "send", "from": a, "to": b, "text": "x",
+            "request_id": rid});
+        for (k, v) in extra.as_object().unwrap() {
+            m[k] = v.clone();
+        }
+        let r = call(&mut l, &mut w, m).await;
+        assert_eq!(r["error"], "unsupported", "{rid}: {r}");
+    }
+    let r = call(
+        &mut l,
+        &mut w,
+        json!({"id": 4, "op": "send", "from": a, "to": b, "text": "hi", "request_id": "m1"}),
+    )
+    .await;
+    assert_eq!(r["receipt"]["state"], "stored", "{r}");
+    let r = call(
+        &mut l,
+        &mut w,
+        json!({"id": 5, "op": "assignments.guard", "key": b}),
+    )
+    .await;
+    assert!(r["ok"] == true && r.get("block").is_none(), "{r}");
+    call(&mut l, &mut w, json!({"id": 6, "op": "shutdown"})).await;
+}
+
 #[tokio::test]
 async fn send_qualifies_a_bare_name_and_refuses_bad_addresses() {
     let dir = tempfile::tempdir().unwrap();
@@ -261,4 +321,328 @@ async fn a_peer_hanging_up_as_mail_arrives_never_loses_the_message() {
         assert_eq!(got["messages"][0]["text"], "kept", "iteration {i}: {got}");
     }
     call(&mut l, &mut w, json!({"id": 4, "op": "shutdown"})).await;
+}
+
+#[tokio::test]
+async fn an_assignment_is_delivered_with_its_fields_and_its_reply_is_its_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let claude_home = tempfile::tempdir().unwrap();
+    std::env::set_var("LIGHTBULB_CONNECT_CLAUDE_HOME", claude_home.path());
+    workers_on(&dir);
+    let home = dir.path().to_path_buf();
+    tokio::spawn(async move { daemon::run(&home).await.unwrap() });
+    let sock = dir.path().join(paths::SOCKET);
+    let (mut l, mut w) = connect(&sock).await;
+    let birth = os::process(std::process::id()).unwrap().birth_micros;
+    let mut keys = vec![];
+    for (i, (provider, conv)) in [("codex", "a"), ("claude", "b")].into_iter().enumerate() {
+        let reg = call(
+            &mut l,
+            &mut w,
+            json!({"id": i + 1, "op": "register", "session": {
+            "provider": provider, "conversation": conv, "pid": std::process::id(),
+            "birth_micros": birth, "cwd": "/tmp"}}),
+        )
+        .await;
+        keys.push(reg["key"].as_str().unwrap().to_string());
+    }
+    let (a, b) = (keys[0].clone(), keys[1].clone());
+    let assign = |rid: &str, extra: Value| {
+        let mut m = json!({"id": 10, "op": "send", "from": a, "to": b, "kind": "assign",
+            "text": "x", "request_id": rid, "done_when": "y"});
+        for (k, v) in extra.as_object().unwrap() {
+            m[k] = v.clone();
+        }
+        m
+    };
+
+    let sent = call(
+        &mut l,
+        &mut w,
+        json!({"id": 3, "op": "send", "from": a, "to": b, "kind": "assign",
+        "text": "run the tests", "done_when": "suite green", "deadline_s": 120,
+        "request_id": "as1"}),
+    )
+    .await;
+    assert_eq!(sent["ok"], true);
+    assert_eq!(sent["receipt"]["state"], "stored");
+
+    let got = call(&mut l, &mut w, json!({"id": 4, "op": "inbox", "key": b})).await;
+    let m = &got["messages"][0];
+    assert_eq!(got["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(m["kind"], "assign");
+    assert_eq!(m["done_when"], "suite green");
+    assert!(m["framed"]
+        .as_str()
+        .unwrap()
+        .starts_with("[Lightbulb assignment from "));
+    let at = m["deadline_at"].as_i64().unwrap();
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    assert!((at - (t + 120)).abs() <= 5, "deadline_at {at} vs {t}");
+    let assign_id = m["id"].as_str().unwrap().to_string();
+
+    let sent = call(
+        &mut l,
+        &mut w,
+        json!({"id": 5, "op": "send", "from": b, "text": "all green",
+        "request_id": "re1", "reply_to": "as1"}),
+    )
+    .await;
+    assert_eq!(sent["receipt"]["state"], "stored");
+    let got = call(&mut l, &mut w, json!({"id": 6, "op": "inbox", "key": a})).await;
+    let m = &got["messages"][0];
+    assert_eq!(m["kind"], "result");
+    assert_eq!(m["status"], "done");
+    assert_eq!(m["reply_to"], assign_id);
+    let f = m["framed"].as_str().unwrap();
+    assert!(f.starts_with("[Lightbulb result from "), "{f}");
+    assert!(f.contains("\"replyTo\":\"as1\""), "{f}");
+
+    let r = call(
+        &mut l,
+        &mut w,
+        json!({"id": 7, "op": "receipt", "from": a, "request_id": "as1"}),
+    )
+    .await;
+    assert_eq!(
+        r["receipt"]["result"],
+        json!({"request_id": "re1", "status": "done"})
+    );
+
+    let r = call(&mut l, &mut w, assign("as6", json!({}))).await;
+    assert_eq!(r["receipt"]["state"], "stored");
+    let got = call(&mut l, &mut w, json!({"id": 13, "op": "inbox", "key": b})).await;
+    let m = got["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["request_id"] == "as6")
+        .unwrap();
+    let at = m["deadline_at"].as_i64().unwrap();
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    assert!(
+        (at - (t + 3600)).abs() <= 5,
+        "default deadline_at {at} vs {t}"
+    );
+
+    for (rid, extra) in [
+        ("as7", json!({"deadline_s": 60.0})),
+        ("as8", json!({"deadline_s": -5})),
+        ("as2", json!({"deadline_s": 20000})),
+        ("as4", json!({"deadline_s": 0})),
+        ("as5", json!({"deadline_s": "soon"})),
+    ] {
+        let r = call(&mut l, &mut w, assign(rid, extra)).await;
+        assert_eq!(r["ok"], false, "{rid}");
+        assert_eq!(r["error"], "bad_request", "{rid}");
+    }
+    let r = call(
+        &mut l,
+        &mut w,
+        json!({"id": 11, "op": "send", "from": a, "to": b, "kind": "assign",
+        "text": "x", "request_id": "as3"}),
+    )
+    .await;
+    assert_eq!(r["receipt"]["state"], "refused");
+    assert_eq!(r["receipt"]["reason"], "bad_request");
+    call(&mut l, &mut w, json!({"id": 12, "op": "shutdown"})).await;
+}
+
+/// Two registered sessions (codex `a`, claude `b`) with `a`'s assignment `as1` (1 s deadline) to
+/// `b` sent and left to lapse; returns the connection, the keys and the assignment's id.
+async fn lapsed_assignment(
+    dir: &tempfile::TempDir,
+) -> (
+    Lines<BufReader<OwnedReadHalf>>,
+    OwnedWriteHalf,
+    String,
+    String,
+    String,
+) {
+    let claude_home = tempfile::tempdir().unwrap();
+    std::env::set_var("LIGHTBULB_CONNECT_CLAUDE_HOME", claude_home.path());
+    workers_on(dir);
+    let home = dir.path().to_path_buf();
+    tokio::spawn(async move { daemon::run(&home).await.unwrap() });
+    let (mut l, mut w) = connect(&dir.path().join(paths::SOCKET)).await;
+    let birth = os::process(std::process::id()).unwrap().birth_micros;
+    let mut keys = vec![];
+    for (i, (provider, conv)) in [("codex", "a"), ("claude", "b")].into_iter().enumerate() {
+        let reg = call(
+            &mut l,
+            &mut w,
+            json!({"id": i + 1, "op": "register", "session": {
+            "provider": provider, "conversation": conv, "pid": std::process::id(),
+            "birth_micros": birth, "cwd": "/tmp"}}),
+        )
+        .await;
+        keys.push(reg["key"].as_str().unwrap().to_string());
+    }
+    let (a, b) = (keys[0].clone(), keys[1].clone());
+    let sent = call(
+        &mut l,
+        &mut w,
+        json!({"id": 3, "op": "send", "from": a, "to": b, "kind": "assign",
+        "text": "x", "done_when": "y", "deadline_s": 1, "request_id": "as1"}),
+    )
+    .await;
+    assert_eq!(sent["receipt"]["state"], "stored");
+    let got = call(&mut l, &mut w, json!({"id": 4, "op": "inbox", "key": b})).await;
+    let assign_id = got["messages"][0]["id"].as_str().unwrap().to_string();
+    tokio::time::sleep(std::time::Duration::from_millis(1300)).await;
+    (l, w, a, b, assign_id)
+}
+
+#[tokio::test]
+async fn an_assignment_past_its_deadline_fails_timed_out_in_the_askers_inbox() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut l, mut w, a, b, assign_id) = lapsed_assignment(&dir).await;
+    let got = call(
+        &mut l,
+        &mut w,
+        json!({"id": 5, "op": "inbox", "key": a, "wait_secs": 0}),
+    )
+    .await;
+    let ms = got["messages"].as_array().unwrap();
+    assert_eq!(ms.len(), 1, "{got}");
+    assert_eq!(ms[0]["kind"], "result");
+    assert_eq!(ms[0]["status"], "failed");
+    assert_eq!(ms[0]["reason"], "timed_out");
+    assert_eq!(ms[0]["reply_to"], assign_id);
+    assert_eq!(ms[0]["from"], b);
+    let r = call(
+        &mut l,
+        &mut w,
+        json!({"id": 6, "op": "receipt", "from": a, "request_id": "as1"}),
+    )
+    .await;
+    assert_eq!(r["receipt"]["result"]["status"], "failed");
+}
+
+#[tokio::test]
+async fn a_late_result_after_the_timeout_is_mail_not_a_second_closing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut l, mut w, a, b, assign_id) = lapsed_assignment(&dir).await;
+    let got = call(
+        &mut l,
+        &mut w,
+        json!({"id": 5, "op": "inbox", "key": a, "wait_secs": 0}),
+    )
+    .await;
+    assert_eq!(got["messages"].as_array().unwrap().len(), 1);
+    let sent = call(
+        &mut l,
+        &mut w,
+        json!({"id": 6, "op": "send", "from": b, "text": "done late",
+        "request_id": "late1", "reply_to": "as1"}),
+    )
+    .await;
+    assert_eq!(sent["receipt"]["state"], "stored");
+    let got = call(&mut l, &mut w, json!({"id": 7, "op": "inbox", "key": a})).await;
+    let ms = got["messages"].as_array().unwrap();
+    assert_eq!(ms.len(), 1, "{got}");
+    assert_eq!(ms[0]["kind"], "result");
+    assert_eq!(ms[0]["status"], "done");
+    let r = call(
+        &mut l,
+        &mut w,
+        json!({"id": 8, "op": "receipt", "from": a, "request_id": "as1"}),
+    )
+    .await;
+    assert_eq!(
+        r["receipt"]["result"]["request_id"],
+        format!("timeout-{assign_id}")
+    );
+}
+
+/// An assignment to this computer's own `<me>/claude:new` (policy: this key allows itself) is
+/// stored with no mailbox and handed to `workers::start`, whose harness (a program that does
+/// not exist here) cannot start: the worker ends `failed`; its cancel is stored, in no mailbox
+/// either. (`tests/workers.rs` runs a worker itself.)
+#[tokio::test]
+async fn an_assign_to_my_own_new_claude_is_stored_and_a_cancel_reaches_the_worker_module() {
+    let dir = tempfile::tempdir().unwrap();
+    let claude_home = tempfile::tempdir().unwrap();
+    std::env::set_var("LIGHTBULB_CONNECT_CLAUDE_HOME", claude_home.path());
+    // Never the real Claude Code.
+    std::env::set_var("LIGHTBULB_CONNECT_DEBUG_CLAUDE", "/nonexistent/claude");
+    let work = dir.path().join("work");
+    std::fs::write(
+        dir.path().join("config.toml"),
+        format!(
+            "lan = false\nnetwork_workers = true\nworkers_offer = \"claude\"\nworkers_folder = \"{}\"\n",
+            work.display()
+        ),
+    )
+    .unwrap();
+    let home = dir.path().to_path_buf();
+    tokio::spawn(async move { daemon::run(&home).await.unwrap() });
+    let sock = dir.path().join(paths::SOCKET);
+    let (mut l, mut w) = connect(&sock).await;
+    let birth = os::process(std::process::id()).unwrap().birth_micros;
+    let reg = call(
+        &mut l,
+        &mut w,
+        json!({"id": 1, "op": "register", "session": {
+        "provider": "codex", "conversation": "a", "pid": std::process::id(),
+        "birth_micros": birth, "cwd": "/tmp"}}),
+    )
+    .await;
+    let asker = reg["key"].as_str().unwrap().to_string();
+    let me = asker.split('/').next().unwrap();
+    let new = format!("{me}/claude:new");
+
+    let sent = call(
+        &mut l,
+        &mut w,
+        json!({"id": 2, "op": "send", "from": asker, "to": new, "kind": "assign",
+        "text": "start fresh", "done_when": "green", "deadline_s": 300, "request_id": "as1"}),
+    )
+    .await;
+    assert_eq!(sent["ok"], true, "{sent}");
+    assert_eq!(sent["receipt"]["state"], "stored", "{sent}");
+    let db = dir.path().join("state.db");
+    let store = lightbulb::store::Store::open(&db).unwrap();
+    let mut ended = None;
+    for _ in 0..500 {
+        ended = store
+            .workers(false)
+            .unwrap()
+            .pop()
+            .filter(|w| w.ended_at.is_some());
+        if ended.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(ended.expect("the worker ended").state, "failed");
+    // No mailbox holds it: only its `failed` result waits, for the asker.
+    let rows = |sql: &str| {
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .query_row(sql, [], |r| r.get::<_, i64>(0))
+            .unwrap()
+    };
+    let not_results = "SELECT COUNT(*) FROM mailbox b JOIN messages m ON m.id = b.message_id \
+        WHERE m.kind != 'result'";
+    assert_eq!(rows(not_results), 0);
+    assert_eq!(rows("SELECT COUNT(*) FROM mailbox"), 1);
+    assert_eq!(rows("SELECT COUNT(*) FROM holds"), 0);
+
+    let cancelled = call(
+        &mut l,
+        &mut w,
+        json!({"id": 3, "op": "send", "from": asker, "reply_to": "as1", "kind": "cancel",
+        "text": "stop", "request_id": "c1"}),
+    )
+    .await;
+    assert_eq!(cancelled["receipt"]["state"], "stored", "{cancelled}");
+    assert_eq!(store.workers(false).unwrap().len(), 1);
+    assert_eq!(rows(not_results), 0);
 }
