@@ -33,7 +33,7 @@ tokio-websockets = { version = "0.13", default-features = false, features = ["cl
 # The local embedding model (`embed_model`): static, pure Rust. tokenizers is named only to pick
 # its pure-Rust regex (fancy-regex), not onig or the C++ suffix array.
 model2vec-rs = { version = "0.3", default-features = false }
-tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
+tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
 rusqlite = { version = "0.40", default-features = false, features = ["bundled", "cache", "fallible_uint"] }
 regex = "1"
 serde = { version = "1", features = ["derive"] }
