@@ -2480,7 +2480,10 @@ fn failed_builds_are_counted_and_only_a_ready_build_clears_them() {
     // A passing local check does not clear the count.
     c.check("design.txt", 0, &[]);
     // The backend's own step stays first; the diagnose or undo step follows it.
-    assert!(next(&c).as_str().unwrap().starts_with("fix the build diagnose"));
+    assert!(next(&c)
+        .as_str()
+        .unwrap()
+        .starts_with("fix the build diagnose"));
     assert!(next(&c).as_str().unwrap().starts_with("fix the build undo"));
     assert_eq!(c.progress()["build_failures"], 3);
     let (base, _) = ship_stub(json!({"app_id": "a-1", "state": "ready"}));

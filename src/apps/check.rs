@@ -128,10 +128,16 @@ pub fn parse(output: &str, root: &Path) -> Vec<Problem> {
             let name = c.get(2).map_or("", |m| m.as_str()).to_string();
             let file = relative(root, &c[1]);
             let seen = problems.iter().any(|p| {
-                p.code.as_deref() == Some("vitest") && p.file == file && p.message.starts_with(&name)
+                p.code.as_deref() == Some("vitest")
+                    && p.file == file
+                    && p.message.starts_with(&name)
             });
             // ponytail: first 5 failures only, so one broken suite does not flood the report
-            let room = problems.iter().filter(|p| p.code.as_deref() == Some("vitest")).count() < 5;
+            let room = problems
+                .iter()
+                .filter(|p| p.code.as_deref() == Some("vitest"))
+                .count()
+                < 5;
             vitest_open = (!seen && room).then(|| {
                 problems.push(Problem {
                     file,
@@ -147,7 +153,11 @@ pub fn parse(output: &str, root: &Path) -> Vec<Problem> {
             // The line after FAIL is the error ("AssertionError: expected 1 to be 2").
             if let Some(p) = problems.get_mut(i) {
                 let msg: String = raw.trim().chars().take(300).collect();
-                p.message = if p.message.is_empty() { msg } else { format!("{}: {msg}", p.message) };
+                p.message = if p.message.is_empty() {
+                    msg
+                } else {
+                    format!("{}: {msg}", p.message)
+                };
             }
         } else if let Some(c) = tsc.captures(raw) {
             problems.push(Problem {
@@ -429,6 +439,9 @@ mod vitest_tests {
         let p = parse(out, Path::new("/x"));
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].file, "src/a.test.ts");
-        assert_eq!(p[0].message, "math > adds: AssertionError: expected 1 to be 2");
+        assert_eq!(
+            p[0].message,
+            "math > adds: AssertionError: expected 1 to be 2"
+        );
     }
 }
