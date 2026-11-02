@@ -57,6 +57,36 @@ pub fn resolve(parent: &Process, meta: &Value, sessions: &[Session]) -> Result<K
     }
 }
 
+/// The process whose sessions are `me`'s: `me`, or the nearest ancestor holding a session of the
+/// same agent. A worker's row names the process the daemon started, and an npm install's `codex` is
+/// a node wrapper over the native binary that runs its tools. Another agent's session above `me`
+/// is never `me`: a Codex started by a Claude session has no claim on that Claude's name.
+pub fn owner(
+    me: &Process,
+    above: impl IntoIterator<Item = Process>,
+    sessions: &[Session],
+) -> Process {
+    let holds = |p: &Process| {
+        sessions
+            .iter()
+            .any(|s| s.pid == p.pid && s.birth_micros == p.birth_micros)
+    };
+    if holds(me) {
+        return me.clone();
+    }
+    let Some(agent) = crate::agents::caller::classify(&me.executable) else {
+        return me.clone();
+    };
+    above
+        .into_iter()
+        .find(|p| {
+            sessions
+                .iter()
+                .any(|s| s.pid == p.pid && s.birth_micros == p.birth_micros && s.provider == agent)
+        })
+        .unwrap_or_else(|| me.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,5 +234,29 @@ mod tests {
             resolve(&reborn, &json!({}), &all),
             Err(SourceError::Unidentified)
         );
+    }
+
+    fn named(pid: u32, exe: &str) -> Process {
+        Process {
+            executable: PathBuf::from(exe),
+            ..proc_(pid)
+        }
+    }
+
+    #[test]
+    fn a_wrapped_worker_is_the_wrappers_session_of_the_same_agent_only() {
+        let native = named(3, "/x/vendor/codex");
+        let wrapper = proc_(2);
+        let sessions = [s("codex", "t1", 2)];
+        // The row names the npm wrapper; the tools run under the native binary.
+        assert_eq!(owner(&native, [wrapper.clone()], &sessions).pid, 2);
+        // Its own session wins.
+        let own = [s("codex", "t2", 3), s("codex", "t1", 2)];
+        assert_eq!(owner(&native, [wrapper.clone()], &own).pid, 3);
+        // A Claude above a Codex is not that Codex.
+        let claude = [s("claude", "c1", 2)];
+        assert_eq!(owner(&native, [wrapper], &claude).pid, 3);
+        // Nothing above: unchanged, so it stays unidentified.
+        assert_eq!(owner(&native, [], &[]).pid, 3);
     }
 }

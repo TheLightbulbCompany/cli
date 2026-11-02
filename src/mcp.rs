@@ -381,6 +381,10 @@ impl Server {
         };
         let meta = Value::Object(meta.0 .0);
         let mut sessions = Self::sessions().await?;
+        let above = crate::agents::caller::ancestors_from(me.pid)
+            .skip(1)
+            .map_while(|step| step.ok().map(|(p, _)| p));
+        let me = source::owner(&me, above, &sessions);
         // Only for an OpenCode process with no session yet: once it has one, an id none of
         // its sessions has is a subagent's child session, never registered.
         let has_one = sessions.iter().any(|s| {
