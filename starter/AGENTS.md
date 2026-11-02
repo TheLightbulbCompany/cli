@@ -24,7 +24,8 @@ change anything.
    under `.lightbulb/evidence/` (git ignores it) or outside the app, so it never changes the
    version. `lightbulb app status` shows `done` without redeploying.
 5. **Post nothing until `up` says `done: true`.** Then post the Canvas line (`canvas_url`) and what
-   you built, in two or three plain sentences. People open the app from Canvas: never post the
+   you built, in two or three plain sentences. Call it a preview: it is not live until
+   `lightbulb app publish` returns. People open the app from Canvas: never post the
    preview address, and never post a test link anywhere; it lets its holder in as the builder.
 6. **Same error twice: stop patching.** When `up` or `check` says `next: "diagnose"`, read the
    logs (`lightbulb app status --errors`), check `.lightbulb/known-fixes.md`, and write a fresh
