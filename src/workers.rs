@@ -971,9 +971,14 @@ fn stop_in(reg: &Registry, worker_id: i64, reason: &'static str, by: &str) -> Re
         return Ok(());
     };
     let _ = tell.send((reason, by.into()));
+    let below = u32::try_from(pgid)
+        .map(driver::descendants)
+        .unwrap_or_default();
+    driver::signal_each(&below, libc::SIGTERM);
     kill_group(pgid, libc::SIGTERM);
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(5)).await;
+        driver::signal_each(&below, libc::SIGKILL);
         // ponytail: a group id is reused only once all of its processes are gone and a new
         // leader gets that pid; within 5 s that is not a risk worth a pidfd.
         // SAFETY: signal 0 only asks whether the group exists.
@@ -1124,6 +1129,9 @@ pub fn reap(d: &Arc<Daemon>) {
             reason: Some("error"),
             body: "the worker's daemon restarted; nothing more came from it".into(),
         };
+        // The job must not keep running with no one able to stop it: a tool in its own session
+        // outlived the harness (`driver::descendants`), and only its folder still names it.
+        driver::signal_each(&driver::running_in(&w.folder), libc::SIGTERM);
         finish(d, &w, o, None);
     }
     for w in adopted {
