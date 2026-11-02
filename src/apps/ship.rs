@@ -629,7 +629,7 @@ fn wait(auth: &Auth, id: &str, r: &mut Value) -> std::result::Result<(), ApiErro
     Ok(())
 }
 
-fn app_id(root: &Path, json: bool) -> std::result::Result<String, i32> {
+pub(crate) fn app_id(root: &Path, json: bool) -> std::result::Result<String, i32> {
     app_json(root)["app_id"]
         .as_str()
         .map(String::from)

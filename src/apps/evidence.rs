@@ -154,7 +154,7 @@ pub(crate) fn done_with(
     };
     let seen = progress["evidence"].as_array().is_some_and(|e| {
         e.iter().any(|r| {
-            r["kind"] == "browser"
+            (r["kind"] == "browser" || r["kind"] == "verify")
                 && r["commit"] == head
                 && r["verdict"] == "pass"
                 && r["at"].as_str().and_then(parse).is_some_and(|t| t >= ready)
@@ -163,7 +163,7 @@ pub(crate) fn done_with(
     if !seen {
         return not(
             "browser_evidence",
-            format!("run lightbulb app test-link --json, open its url in the browser (past the door of {url}), check the main flow, then lightbulb app evidence --kind browser --file …"),
+            format!("run lightbulb app verify (it signs in past the door of {url} and opens every page)"),
         );
     }
     Ok(DoneState {
@@ -171,6 +171,19 @@ pub(crate) fn done_with(
         missing: vec![],
         next: "tell the room the preview is done and give them canvas_url; never the preview address or a test link".into(),
     })
+}
+
+/// Records `lightbulb app verify`'s pass for `head`.
+pub(crate) fn record_verify(
+    root: &Path,
+    head: &str,
+    pages: &[String],
+) -> std::result::Result<(), ApiError> {
+    let mut p = check::read_progress(root)?;
+    let mut all = p["evidence"].as_array().cloned().unwrap_or_default();
+    all.push(json!({"kind": "verify", "verdict": "pass", "commit": head, "pages": pages, "at": rfc3339(now())}));
+    p["evidence"] = json!(all);
+    check::write_progress(root, &p)
 }
 
 /// A test link, or a bare pass: three dot-joined base64url parts, the first starting `eyJ`.

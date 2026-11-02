@@ -8,6 +8,7 @@ pub(crate) mod evidence;
 pub mod migrations;
 mod ship;
 pub mod starter;
+mod verify;
 
 pub use ship::{archive, has_passing_review};
 
@@ -119,6 +120,8 @@ pub enum AppCommand {
     },
     /// A short-lived link past the preview's door, for your own check. Never post it.
     TestLink,
+    /// Sign in through the door and open every page, with no browser. Records a pass for this version.
+    Verify,
     /// Record a browser pass for the preview.
     Evidence {
         #[arg(long, value_enum)]
@@ -243,6 +246,13 @@ pub fn run(cmd: AppCommand, json: bool) -> Result<i32> {
                 Err(code) => return Ok(code),
             };
             ship::test_link(&root, &auth, json)
+        }
+        AppCommand::Verify => {
+            let (root, _, auth) = match preflight(json) {
+                Ok(p) => p,
+                Err(code) => return Ok(code),
+            };
+            verify::run(&root, &auth, json)
         }
         AppCommand::ReportBrokenTool { tool, what } => {
             let (root, _, _) = match preflight(json) {
