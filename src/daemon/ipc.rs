@@ -1537,10 +1537,21 @@ fn put_row(daemon: &Daemon, store: &store::Store, row: &store::Session) -> crate
 /// ends (`record`). A session whose last push failed reads `next_step`: its mail waits for the next step. One
 /// under a hidden folder, or marked by a register a hidden folder refused, reads `hidden`.
 pub(crate) fn live_sessions(daemon: &Daemon) -> Vec<sessions::Session> {
-    let (rows, marked) = {
+    let (rows, marked, workers) = {
         let store = daemon.store.lock().unwrap();
-        let rows = store.sessions().unwrap_or_default();
-        (rows, store.hidden_keys().unwrap_or_default())
+        let workers: Vec<String> = (store.workers(true).unwrap_or_default().into_iter())
+            .map(|w| w.session)
+            .collect();
+        // A running worker's row lives with its process, as a headless run's does: a Claude worker
+        // is an SDK run, whose pid file would otherwise end the row and leave its tool calls with
+        // no session. It stays listed (below).
+        let rows: Vec<store::Session> = (store.sessions().unwrap_or_default().into_iter())
+            .map(|r| store::Session {
+                headless: r.headless || workers.contains(&r.key),
+                ..r
+            })
+            .collect();
+        (rows, store.hidden_keys().unwrap_or_default(), workers)
     };
     let off = daemon.team.lock().unwrap().off.clone();
     let listed = super::current_at(daemon);
@@ -1550,6 +1561,9 @@ pub(crate) fn live_sessions(daemon: &Daemon) -> Vec<sessions::Session> {
         &daemon.claude_home,
         &daemon.identity.short,
     );
+    for s in all.iter_mut().filter(|s| workers.contains(&s.key.0)) {
+        s.headless = false;
+    }
     let failed = daemon.push_failed.lock().unwrap();
     for s in &mut all {
         if s.tier == sessions::Tier::Push && failed.contains(&s.key.0) {
