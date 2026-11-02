@@ -1910,7 +1910,7 @@ fn done_needs_ready_health_and_browser_evidence_for_head() {
     assert_eq!((code, &v["done"]), (0, &json!(false)), "{v}");
     assert_eq!(v["missing"], json!(["browser_evidence"]));
     let want = format!(
-        "run lightbulb app test-link --json, open its url in the browser (past the door of {base}), check the main flow, then lightbulb app evidence --kind browser --file …"
+        "run lightbulb app verify (it signs in past the door of {base} and opens every page)"
     );
     assert_eq!(v["next"], want.as_str());
     assert!(lines(&seen).contains(&"GET /api/_lightbulb/health".to_string()));
@@ -2207,10 +2207,7 @@ fn status_prints_done_and_a_failed_wait_says_where_to_look() {
         (0, &json!(false), &json!(["browser_evidence"])),
         "{v}"
     );
-    assert!(v["next"]
-        .as_str()
-        .unwrap()
-        .contains("evidence --kind browser"));
+    assert!(v["next"].as_str().unwrap().contains("lightbulb app verify"));
     assert_eq!(v["state"], "ready");
     let (_, v) = c.evidence(&base, &[]);
     assert_eq!(v["deployment_id"], "d-1");

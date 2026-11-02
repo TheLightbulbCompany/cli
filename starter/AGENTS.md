@@ -16,9 +16,10 @@ change anything.
    data, then sign-in, only when a feature needs them.
 4. **Check, cheapest first:** run `pnpm install` once (and after changing `package.json`;
    `check` and `up` answer `not_installed` until you do), then `lightbulb app check` (type check, lint, design lint), then
-   `lightbulb app up` (deploys the preview, runs the health check, reads the logs). When `up` asks
-   for it, run `lightbulb app test-link --json`, open the `url` it prints in the shared browser
-   (the plain preview address only reaches the door), walk the flow, and record it with
+   `lightbulb app up` (deploys the preview, runs the health check, reads the logs), then
+   `lightbulb app verify` (signs in past the door and opens every page; never install a browser).
+   Verify doesn't press buttons, so also try the main flow: `lightbulb app test-link --json` gives a
+   `url` for the shared browser. Record what you saw with
    `lightbulb app evidence --kind browser --file .lightbulb/evidence/<name>.png`. Keep the file
    under `.lightbulb/evidence/` (git ignores it) or outside the app, so it never changes the
    version. `lightbulb app status` shows `done` without redeploying.
