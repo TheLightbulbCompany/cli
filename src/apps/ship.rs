@@ -195,15 +195,18 @@ fn save_app_json(root: &Path, v: &Value) -> Result<()> {
     Ok(())
 }
 
-/// A review record for `head` with verdict pass (R10), in `.lightbulb/progress.json`.
+/// A passing review or `verify` for `head` (R10), in `.lightbulb/progress.json`.
 pub fn has_passing_review(root: &Path, head: &str) -> bool {
     std::fs::read(root.join(".lightbulb/progress.json"))
         .ok()
         .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
         .and_then(|v| v["evidence"].as_array().cloned())
         .is_some_and(|e| {
-            e.iter()
-                .any(|r| r["kind"] == "review" && r["commit"] == head && r["verdict"] == "pass")
+            e.iter().any(|r| {
+                (r["kind"] == "review" || r["kind"] == "verify")
+                    && r["commit"] == head
+                    && r["verdict"] == "pass"
+            })
         })
 }
 
@@ -449,17 +452,11 @@ fn upload(
         })
 }
 
-/// The preview address `up` last saw (kept in app.json), if any.
-fn last_preview(root: &Path) -> Option<String> {
-    app_json(root)["preview_url"].as_str().map(String::from)
-}
-
-fn review_required(root: &Path) -> ApiError {
-    let at = last_preview(root).map_or(String::new(), |u| format!(" at {u}"));
+fn review_required(_root: &Path) -> ApiError {
     ApiError::new(
         "review_required",
-        "Publish needs a passing review recorded for this commit.",
-        &format!("run the reviewer or ask your workspace agent to review the preview{at} (lightbulb app test-link --json gets past its door), then record it: lightbulb app evidence --kind review --verdict pass --file <screenshot> --note \"<what was checked>\""),
+        "Publish needs a passing check recorded for this commit.",
+        "run lightbulb app verify, then publish again",
     )
 }
 

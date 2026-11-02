@@ -1371,11 +1371,11 @@ fn publish_requires_review_evidence() {
         review(commit, verdict, kind);
         let (code, v) = c.app(&["publish"], &base, true);
         assert_eq!((code, &v["code"]), (1, &json!("review_required")));
-        assert!(v["next"].as_str().unwrap().contains("--kind review"));
+        assert!(v["next"].as_str().unwrap().contains("lightbulb app verify"));
     }
     assert!(lines(&seen).is_empty());
 
-    review(&c.head(), "pass", "review");
+    review(&c.head(), "pass", "verify");
     let (code, v) = c.app(&["publish", "--reason", "launch"], &base, true);
     assert_eq!((code, &v["state"]), (0, &json!("ready")), "{v}");
     assert_eq!(v["version"], 2);
@@ -2345,7 +2345,7 @@ fn shipped_known_fixes_give_a_hint_and_short_or_broken_tools_titles_do_not() {
 }
 
 #[test]
-fn publish_without_a_review_gives_the_exact_command_and_the_preview() {
+fn publish_without_a_check_says_to_run_verify() {
     let c = Checked::new();
     std::fs::write(
         c.dir.join(".lightbulb/app.json"),
@@ -2358,8 +2358,8 @@ fn publish_without_a_review_gives_the_exact_command_and_the_preview() {
     assert_eq!(
         v,
         json!({"code": "review_required",
-            "message": "Publish needs a passing review recorded for this commit.",
-            "next": "run the reviewer or ask your workspace agent to review the preview at https://p.example (lightbulb app test-link --json gets past its door), then record it: lightbulb app evidence --kind review --verdict pass --file <screenshot> --note \"<what was checked>\""})
+            "message": "Publish needs a passing check recorded for this commit.",
+            "next": "run lightbulb app verify, then publish again"})
     );
     assert!(lines(&seen).is_empty());
 }
