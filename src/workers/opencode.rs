@@ -336,12 +336,15 @@ async fn serve(
     let outcome = talk(&mut child, listening, &server, prompt, relay).await;
     drop(stdin);
     let group = child.id();
+    let below = group.map(super::driver::descendants).unwrap_or_default();
+    super::driver::signal_each(&below, libc::SIGTERM);
     if let Some(pid) = group.filter(|&p| p > 0) {
         // SAFETY: a plain syscall on the server's own process group (`spawn` made it leader).
         unsafe { libc::killpg(pid as i32, libc::SIGTERM) };
     }
     let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
     super::driver::end_group(group);
+    super::driver::signal_each(&below, libc::SIGKILL);
     outcome
 }
 

@@ -266,6 +266,44 @@ pub fn end_group(pgid: Option<u32>) {
     }
 }
 
+/// Every process below `root`, whichever process group it is in: a harness's tool can start
+/// its own session (OpenCode's shell tool does), and then the group's signal never reaches it.
+/// Read while `root` lives: once it is gone they hang off pid 1 and nothing names them.
+pub fn descendants(root: u32) -> Vec<i32> {
+    let Ok(out) = std::process::Command::new("ps")
+        .args(["-A", "-o", "pid=,ppid="])
+        .output()
+    else {
+        return vec![];
+    };
+    let rows: Vec<(i32, i32)> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.split_whitespace();
+            Some((f.next()?.parse().ok()?, f.next()?.parse().ok()?))
+        })
+        .collect();
+    let mut found = vec![];
+    let mut next = vec![root as i32];
+    while let Some(parent) = next.pop() {
+        for &(pid, _) in rows.iter().filter(|(_, p)| *p == parent) {
+            found.push(pid);
+            next.push(pid);
+        }
+    }
+    found
+}
+
+/// Sends `signal` to each of `pids` (`descendants`).
+// ponytail: a pid could be reused between the read and a signal; the window is the 5 s stop grace
+// at most, and a pidfd per process is not worth it for that.
+pub fn signal_each(pids: &[i32], signal: i32) {
+    for &pid in pids.iter().filter(|&&p| p > 1) {
+        // SAFETY: a plain syscall on a process id.
+        unsafe { libc::kill(pid, signal) };
+    }
+}
+
 /// Flags (and `--permission-mode` values) that would let a harness act without its person:
 /// never in a launch argv.
 const BYPASS: [&str; 14] = [
@@ -550,5 +588,42 @@ pub(crate) mod tests {
                 .unwrap(),
             std::path::PathBuf::from("/opt/homebrew/bin")
         );
+    }
+
+    #[test]
+    fn descendants_finds_a_tool_that_left_the_process_group() {
+        // A child in its own session, as OpenCode's shell tool starts one.
+        let mut parent = std::process::Command::new("python3")
+            .args([
+                "-c",
+                "import os,subprocess,time;p=subprocess.Popen(['sleep','300'],start_new_session=True);print(p.pid,flush=True);time.sleep(300)",
+            ])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(parent.stdout.take().unwrap()),
+            &mut line,
+        )
+        .unwrap();
+        let tool: i32 = line.trim().parse().unwrap();
+        // SAFETY: signal 0 only asks; different groups is what this test is about.
+        assert_ne!(unsafe { libc::getpgid(tool) }, unsafe {
+            libc::getpgid(parent.id() as i32)
+        });
+        let found = super::descendants(parent.id());
+        assert!(found.contains(&tool), "{found:?} misses {tool}");
+        super::signal_each(&found, libc::SIGKILL);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        // SAFETY: signal 0 only asks. Reaped by init, or a zombie of `parent`: never running.
+        let state = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &tool.to_string()])
+            .output()
+            .unwrap();
+        let state = String::from_utf8_lossy(&state.stdout);
+        assert!(state.trim().is_empty() || state.starts_with('Z'), "{state}");
+        parent.kill().unwrap();
+        parent.wait().unwrap();
     }
 }
