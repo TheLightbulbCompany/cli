@@ -24,7 +24,8 @@ pub fn classify(path: &Path) -> Option<&'static str> {
     let name = path.file_name()?.to_str()?;
     let full = path.to_string_lossy();
     match name {
-        "claude" => Some("claude"),
+        // The npm install's native binary is `.../claude-code/bin/claude.exe`, on Linux too.
+        "claude" | "claude.exe" => Some("claude"),
         "codex" => Some("codex"),
         "cursor-agent" => Some("cursor"),
         "grok" | "grok-native" => Some("grok"),
@@ -269,5 +270,11 @@ mod tests {
         // The test runner is no agent.
         assert_eq!(identify("grok"), Err(CallerError::NotThatAgent));
         assert_eq!(identify_any(), Err(CallerError::NotThatAgent));
+    }
+
+    #[test]
+    fn the_npm_claude_binary_is_claude() {
+        let npm = "/usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe";
+        assert_eq!(classify(Path::new(npm)), Some("claude"));
     }
 }
