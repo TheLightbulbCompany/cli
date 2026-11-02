@@ -1129,6 +1129,9 @@ pub fn reap(d: &Arc<Daemon>) {
             reason: Some("error"),
             body: "the worker's daemon restarted; nothing more came from it".into(),
         };
+        // The job must not keep running with no one able to stop it: a tool in its own session
+        // outlived the harness (`driver::descendants`), and only its folder still names it.
+        driver::signal_each(&driver::running_in(&w.folder), libc::SIGTERM);
         finish(d, &w, o, None);
     }
     for w in adopted {

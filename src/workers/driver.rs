@@ -294,6 +294,48 @@ pub fn descendants(root: u32) -> Vec<i32> {
     found
 }
 
+/// The processes whose working directory is `folder` (a worker's own): after a daemon restart
+/// the worker's tools hang off pid 1, and only where they run still names them.
+// ponytail: a tool that changed directory is missed; a person's shell sitting in a worker's folder
+// is not, which is why `reap` only sends it SIGTERM.
+pub fn running_in(folder: &Path) -> Vec<i32> {
+    let Ok(folder) = folder.canonicalize() else {
+        return vec![];
+    };
+    #[cfg(target_os = "linux")]
+    let pids = std::fs::read_dir("/proc")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let pid: i32 = e.file_name().to_str()?.parse().ok()?;
+            (std::fs::read_link(e.path().join("cwd")).ok()? == folder).then_some(pid)
+        })
+        .collect();
+    #[cfg(not(target_os = "linux"))]
+    let pids = {
+        let out = std::process::Command::new("lsof")
+            .args(["-a", "-d", "cwd", "-Fpn", "+d"])
+            .arg(&folder)
+            .output();
+        let text = out.map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+        let mut pid = 0;
+        let mut found = vec![];
+        for line in text.unwrap_or_default().lines() {
+            match line.split_at_checked(1) {
+                Some(("p", p)) => pid = p.parse().unwrap_or(0),
+                Some(("n", n)) if Path::new(n) == folder => found.push(pid),
+                _ => {}
+            }
+        }
+        found
+    };
+    let pids: Vec<i32> = pids;
+    pids.into_iter()
+        .filter(|&p| p != std::process::id() as i32)
+        .collect()
+}
+
 /// Sends `signal` to each of `pids` (`descendants`).
 // ponytail: a pid could be reused between the read and a signal; the window is the 5 s stop grace
 // at most, and a pidfd per process is not worth it for that.
@@ -625,5 +667,23 @@ pub(crate) mod tests {
         assert!(state.trim().is_empty() || state.starts_with('Z'), "{state}");
         parent.kill().unwrap();
         parent.wait().unwrap();
+    }
+
+    #[test]
+    fn running_in_finds_a_process_by_its_working_directory() {
+        let d = tempfile::tempdir().unwrap();
+        let mut p = std::process::Command::new("sleep")
+            .arg("300")
+            .current_dir(d.path())
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let found = super::running_in(d.path());
+        assert_eq!(found, vec![p.id() as i32]);
+        let other = tempfile::tempdir().unwrap();
+        assert!(super::running_in(other.path()).is_empty());
+        assert!(super::running_in(&other.path().join("gone")).is_empty());
+        p.kill().unwrap();
+        p.wait().unwrap();
     }
 }
