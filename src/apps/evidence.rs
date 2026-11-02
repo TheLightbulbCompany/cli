@@ -169,7 +169,7 @@ pub(crate) fn done_with(
     Ok(DoneState {
         done: true,
         missing: vec![],
-        next: "tell the room the preview is done and give them canvas_url; never the preview address or a test link".into(),
+        next: "tell the room your preview is ready in Canvas, with canvas_url. It is a preview, not live: nothing is live until lightbulb app publish returns. Never post the preview address or a test link".into(),
     })
 }
 
