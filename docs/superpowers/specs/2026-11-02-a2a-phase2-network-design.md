@@ -93,3 +93,10 @@ The `src/authority.rs` and `src/rules.rs` module layout; where `signed_at` is su
 3. The rules document is signed by the backend's issuer key and pushed to each computer over its route link, so Lightbulb's server is the rules authority on every laptop, the same trust every sign-in proof already relies on. Acceptable?
 4. Hosted sends move from the origin person's computer link to the cloud member. Keep the person-link path as a fallback, or remove it?
 5. `ISSUER_KEYS` is empty in the code; filling it from the prod issuer endpoint is an owner step at release time. Who does it, and when?
+
+## Clarifications (2 Nov, evening; after the super-agent session's questions)
+
+- §4 resource for assigns: `worker:<short>/<harness>`, the envelope's `to` with `:new` stripped (`:new` is addressing, `workers.rs:124`, `provider_of` `:213`). §7's `worker:<me>/*` globs the harness.
+- §4 operands for `skill: assign`: `text` (= `body`), `done_when`, `deadline_at` (the integer as sent, before the receiver's cap at `workers.rs:153`), `repo`, `branch` (`Meta`, `mail.rs:470`); absent fields omitted; `operands_hash` as in phase 1.
+- Cancel stays the built-in `cancel` kind (`mail.rs:15`), accepted only from the parent assign's own `from_key` (`mail.rs:666`) with its target from the parent (`mail.rs:761`). No rules action and no `cancel` skill in this phase; cancelling someone else's assignment is a later capability.
+- A receiver without a card (an old build) still receives hosted envelopes and behaves as today; the backend records `receiver_enforces: false` on the task record. A receiver whose card lists the extension runs the second check. Refusing card-less receivers outright is a founder call, not taken here.
