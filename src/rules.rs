@@ -4,6 +4,7 @@
 
 use crate::store::Store;
 use crate::Result;
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -95,38 +96,44 @@ pub fn verify_doc(jws: &str, now: i64) -> Result<(String, i64, Rules)> {
     Ok((workspace.into(), iat, rules))
 }
 
-/// Stores `jws` when it verifies and its `iat` is newer than the workspace's stored one.
+/// Stores `jws` when it verifies, is for this computer's workspace (the first stored document
+/// fixes it; another is refused `workspace`) and its `iat` is newer than the stored one.
 /// `false` when an equal-or-newer document is already stored.
 pub fn store_doc(store: &Store, jws: &str, now: i64) -> Result<bool> {
     let (workspace, iat, rules) = verify_doc(jws, now)?;
-    let stored: Option<i64> = store
+    let pinned = store
         .conn()
-        .query_row(
-            "SELECT iat FROM rules WHERE workspace = ?1",
-            [&workspace],
-            |r| r.get(0),
-        )
-        .ok();
-    if stored.is_some_and(|s| s >= iat) {
-        return Ok(false);
+        .query_row("SELECT workspace FROM rules LIMIT 1", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .optional()?;
+    if pinned.is_some_and(|p| p != workspace) {
+        return Err("workspace".into());
     }
-    store.conn().execute(
-        "INSERT OR REPLACE INTO rules (workspace, revision, iat, jws, doc) VALUES (?1, ?2, ?3, ?4, ?5)",
-        rusqlite::params![workspace, rules.revision, iat, jws, serde_json::to_string(&rules)?],
+    let changed = store.conn().execute(
+        "INSERT INTO rules (workspace, revision, iat, jws, doc) VALUES (?1, ?2, ?3, ?4, ?5) \
+         ON CONFLICT(workspace) DO UPDATE SET revision = excluded.revision, iat = excluded.iat, \
+         jws = excluded.jws, doc = excluded.doc WHERE excluded.iat > rules.iat",
+        rusqlite::params![
+            workspace,
+            rules.revision,
+            iat,
+            jws,
+            serde_json::to_string(&rules)?
+        ],
     )?;
-    Ok(true)
+    Ok(changed > 0)
 }
 
-/// The stored document (newest `iat`) and its workspace, or `(None, default_rules())`.
+/// The stored document and its workspace, or `(None, default_rules())` when none is stored.
+/// Fails closed: a database error or a document that does not parse is an error.
 pub fn load(store: &Store) -> Result<(Option<String>, Rules)> {
     let row: Option<(String, String)> = store
         .conn()
-        .query_row(
-            "SELECT workspace, doc FROM rules ORDER BY iat DESC LIMIT 1",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .ok();
+        .query_row("SELECT workspace, doc FROM rules LIMIT 1", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .optional()?;
     match row {
         Some((w, doc)) => Ok((Some(w), serde_json::from_str(&doc)?)),
         None => Ok((None, default_rules())),
@@ -219,6 +226,9 @@ pub struct Input<'a> {
     pub intent: Option<&'a str>,
     pub verified_by: Option<&'a str>,
     pub operands_hash: Option<&'a str>,
+    /// Whether the authority object's `verified_by` is a person source; an agent-originated
+    /// ask is never upgraded by the holder rule.
+    pub origin_is_person: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -237,6 +247,7 @@ pub fn glob(pattern: &str, value: &str) -> bool {
     }
 }
 
+/// `to_lowercase` stands in for the backend's `casefold` (std has none; ß-class characters may miss a match).
 fn norm(s: &str) -> String {
     s.split_whitespace()
         .collect::<Vec<_>>()
@@ -352,9 +363,9 @@ pub fn decide(rules: &Rules, exceptions: &[Exception], i: &Input) -> Decision {
     let (effect, rule) = hits
         .first()
         .map_or((rules.default, "default"), |r| (r.effect, &r.id));
-    if effect == Effect::Hold {
+    if effect == Effect::Hold && i.origin_is_person {
         if let Some(sub) = i.requester.strip_prefix("person:") {
-            if holders.iter().any(|h| h == sub || h == i.requester) {
+            if holders.iter().any(|h| h == sub) {
                 return done(Effect::Allow, "holder");
             }
         }
@@ -401,6 +412,7 @@ mod tests {
             intent: None,
             verified_by: None,
             operands_hash: None,
+            origin_is_person: true,
         }
     }
 
@@ -502,6 +514,10 @@ mod tests {
         j.session_person = None;
         let d = decide(&r, &[], &j);
         assert_eq!((d.effect, d.holders.len()), (Effect::Hold, 0));
+        // An agent-originated ask stays held.
+        let mut k = input("person:user_a", i.resource, i.skill);
+        k.origin_is_person = false;
+        assert_eq!(decide(&r, &[], &k).effect, Effect::Hold);
         // A default of deny stays a deny.
         let mut deny = default_rules();
         deny.default = Effect::Deny;
@@ -624,6 +640,9 @@ mod tests {
         assert!(!glob("worker:abc/*", "worker:abd/claude"));
         assert!(glob("session:abc", "session:abc"));
         assert!(!glob("session:abc", "session:abcd"));
+        assert!(!glob("session:*", "sessions:x"));
+        assert!(!glob("session:*", "session"));
+        assert!(!glob("a*c", "abc"), "a mid-* pattern is a literal");
 
         let w = |v: Value| Some(serde_json::from_value::<When>(v).unwrap());
         let mut r = default_rules();
@@ -740,5 +759,39 @@ mod tests {
         assert_eq!((w.as_deref(), r.revision.as_str()), (Some("ws1"), "b"));
         assert_eq!(r.rules[0].id, "r1");
         assert!(store_doc(&s, "garbage", NOW).is_err());
+    }
+
+    #[test]
+    fn store_doc_pins_the_workspace_and_load_fails_closed() {
+        let (_d, s) = store();
+        assert!(store_doc(&s, &mint("ws1", NOW, "a"), NOW).unwrap());
+        let e = store_doc(&s, &mint("ws2", NOW + 5, "b"), NOW + 5).unwrap_err();
+        assert_eq!(e.to_string(), "workspace");
+        let (w, r) = load(&s).unwrap();
+        assert_eq!((w.as_deref(), r.revision.as_str()), (Some("ws1"), "a"));
+        assert!(store_doc(&s, &mint("ws1", NOW + 5, "c"), NOW + 5).unwrap());
+        assert!(!store_doc(&s, &mint("ws1", NOW + 1, "old"), NOW + 5).unwrap());
+        assert_eq!(load(&s).unwrap().1.revision, "c");
+        s.conn()
+            .execute("UPDATE rules SET doc = '{nope'", [])
+            .unwrap();
+        assert!(load(&s).is_err());
+    }
+
+    #[test]
+    fn verify_doc_refuses_a_bad_revision_or_doc_and_stores_nothing() {
+        let (_d, s) = store();
+        let good = json!({"workspace": "ws1", "iat": NOW, "revision": "r",
+            "doc": doc(json!({"id": "r1", "resource": "*", "skill": "s", "requesters": [], "effect": "allow"}))});
+        let mut num = good.clone();
+        num["revision"] = 7.into();
+        let mut bad = good.clone();
+        bad["doc"]["rules"][0]["effect"] = "maybe".into();
+        for c in [num, bad] {
+            let jws = issuer::mint_typ(TYP, &c);
+            assert_eq!(verify_doc(&jws, NOW).unwrap_err().to_string(), "shape");
+            assert!(store_doc(&s, &jws, NOW).is_err());
+        }
+        assert_eq!(load(&s).unwrap().0, None);
     }
 }
