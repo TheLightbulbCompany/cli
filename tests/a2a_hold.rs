@@ -48,12 +48,17 @@ fn ask(text: &str, jws: Option<String>) -> Value {
 
 /// An `ask_session` object from `person` for `resource` binding `{text}`.
 fn authority(person: &str, resource: &str, text: &str) -> String {
+    authority_in("org_1", person, resource, text)
+}
+
+/// `authority`, its requester in workspace `org`.
+fn authority_in(org: &str, person: &str, resource: &str, text: &str) -> String {
     let (now, operands) = (now_s(), json!({"text": text}));
     issuer::mint_typ(
         authority::TYP,
         &json!({
             "v": 1, "id": "auth_1", "iat": now, "exp": now + 600,
-            "requester": {"person": person, "org": "org_1", "verified_by": "lightbulb"},
+            "requester": {"person": person, "org": org, "verified_by": "lightbulb"},
             "chain": [{"agent": "agent_1", "session": null, "person": person, "at": now}],
             "operation": {"skill": "ask_session", "resource": resource, "operands": operands,
                           "operands_hash": authority::operands_hash(&operands)},
@@ -218,4 +223,40 @@ async fn unsigned_sender_a2a_ask_is_held_as_member() {
     assert_eq!(h.from_member, b.short());
     assert_eq!(h.message.authority_id, None);
     assert_eq!(a.unread(&sa), 0);
+}
+
+/// A bound object from `user_b` sent to A, whose document is `doc`: the ack and whether A wrote
+/// anything (message, hold or mailbox row).
+async fn object_against(doc: String, org: &str) -> ((String, Option<String>), bool) {
+    let (a, b, _ep, mut p) = a_and_b(Some("user_a"), Some("user_b"), Some(doc)).await;
+    let (sa, sb) = (session(&a, "a1"), session(&b, "b1"));
+    let id = ulid();
+    let jws = authority_in(org, "user_b", &format!("session:{sa}"), "hi");
+    let v = signed(
+        &b.identity(),
+        envelope(&id, &sb, &sa, "hi", Some(ask("hi", Some(jws)))),
+    );
+    p.send_raw(&v).await;
+    let ack = p.ack(&id).await;
+    let wrote =
+        a.store().message(&id).unwrap().is_some() || !held(&a).is_empty() || mailbox(&a) > 0;
+    (ack, wrote)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deny_rule_refuses_an_authority_object_too() {
+    let deny = json!([{"id": "no-b", "resource": "session:*", "skill": "ask_session",
+                       "requesters": ["person:user_b"], "effect": "deny"}]);
+    let (ack, wrote) = object_against(document(deny), "org_1").await;
+    assert_eq!(ack, refused("policy"));
+    assert!(!wrote);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn object_from_another_workspace_is_refused_outside_org() {
+    let allow = json!([{"id": "all", "resource": "session:*", "skill": "ask_session",
+                        "requesters": ["*"], "effect": "allow"}]);
+    let (ack, wrote) = object_against(document(allow), "org_2").await;
+    assert_eq!(ack, refused("policy"));
+    assert!(!wrote);
 }

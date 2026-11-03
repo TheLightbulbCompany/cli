@@ -1089,11 +1089,15 @@ impl Store {
     /// memory grows past tens of thousands of entries.
     pub fn nudge(&self, id: &str, key: &str, now: i64) -> rusqlite::Result<bool> {
         let n = self.conn().execute(
-            "UPDATE capture_sessions SET nudged = ?3 WHERE id = ?1 AND nudged = 0 \
-             AND EXISTS (SELECT 1 FROM capture_tool_calls WHERE session_id = ?1) \
-             AND NOT EXISTS (SELECT 1 FROM memory_entries \
-                 WHERE json_extract(entry, '$.op.source.session') = ?2) \
-             AND NOT EXISTS (SELECT 1 FROM mailbox WHERE to_key = ?2 AND expires_at >= ?3)",
+            &format!(
+                "UPDATE capture_sessions SET nudged = ?3 WHERE id = ?1 AND nudged = 0 \
+                 AND EXISTS (SELECT 1 FROM capture_tool_calls WHERE session_id = ?1) \
+                 AND NOT EXISTS (SELECT 1 FROM memory_entries \
+                     WHERE json_extract(entry, '$.op.source.session') = ?2) \
+                 AND NOT EXISTS (SELECT 1 FROM mailbox WHERE to_key = ?2 AND expires_at >= ?3 \
+                     AND {})",
+                crate::mail::NOT_HELD
+            ),
             params![id, key, now],
         )?;
         Ok(n == 1)

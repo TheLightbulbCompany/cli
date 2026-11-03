@@ -550,7 +550,7 @@ impl Default for Judge<'static> {
 }
 
 /// A `mailbox` row whose message no open hold parks: one a session may be handed.
-const NOT_HELD: &str = "NOT EXISTS (SELECT 1 FROM holds h \
+pub(crate) const NOT_HELD: &str = "NOT EXISTS (SELECT 1 FROM holds h \
      WHERE h.message_id = mailbox.message_id AND h.state = 'open')";
 
 /// An A2A Message's text: its `parts[].text` joined by newlines; `None` when a part has no
