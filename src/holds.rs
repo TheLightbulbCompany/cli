@@ -323,7 +323,7 @@ pub fn answer(
             "by": by, "decided_at": now, "member": me.key, "text": shown}),
     );
     store.conn().execute(
-        "INSERT INTO approvals VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO approvals (hold_id, verdict, scope, \"by\", nonce, decided_at, record) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![id, verdict, scope, by, nonce, now, record],
     )?;
     if scope == "always" {

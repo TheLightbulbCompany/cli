@@ -32,6 +32,7 @@ pub mod presence;
 pub mod proof;
 pub mod relay;
 pub mod roster;
+pub mod rules;
 pub mod sessions;
 pub mod setup;
 pub mod store;

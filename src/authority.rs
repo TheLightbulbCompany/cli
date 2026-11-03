@@ -63,14 +63,14 @@ pub fn operands_hash(operands: &Value) -> String {
     format!("sha256:{}", HEXLOWER.encode(&digest))
 }
 
-/// `jws`'s claims when it is an authority object from a known issuer key, in force at `now`
-/// (`iat` at most `IAT_SKEW_S` ahead), living at most `MAX_LIFE_S`, of the phase-1 shape, its
-/// first hop the requester and its `operands_hash` its operands'. Errors name the check.
-pub fn verify(jws: &str, now: i64) -> Result<Authority> {
-    if jws.len() > MAX_TOKEN {
+/// `token`'s claims when it is a compact EdDSA JWS of at most `max` bytes, signed by a known
+/// issuer key, whose protected header `typ` is `typ`. Errors name the check: `size`, `jws`,
+/// `alg`, `kid`, `signature`, `typ`. The claims' own checks are the caller's.
+pub(crate) fn verify_jws(token: &str, max: usize, typ: &str, _now: i64) -> Result<Value> {
+    if token.len() > max {
         return Err("size".into());
     }
-    let mut parts = jws.split('.');
+    let mut parts = token.split('.');
     let (Some(h), Some(p), Some(s), None) =
         (parts.next(), parts.next(), parts.next(), parts.next())
     else {
@@ -92,10 +92,17 @@ pub fn verify(jws: &str, now: i64) -> Result<Authority> {
     key.verify_strict(format!("{h}.{p}").as_bytes(), &sig)
         .map_err(|_| "signature")?;
     // The issuer puts `typ` in the protected header; a `typ` among the claims is not it.
-    if header["typ"] != TYP {
+    if header["typ"] != typ {
         return Err("typ".into());
     }
-    let c: Value = serde_json::from_slice(&payload).map_err(|_| "jws")?;
+    Ok(serde_json::from_slice(&payload).map_err(|_| "jws")?)
+}
+
+/// `jws`'s claims when it is an authority object from a known issuer key, in force at `now`
+/// (`iat` at most `IAT_SKEW_S` ahead), living at most `MAX_LIFE_S`, of the phase-1 shape, its
+/// first hop the requester and its `operands_hash` its operands'. Errors name the check.
+pub fn verify(jws: &str, now: i64) -> Result<Authority> {
+    let c = verify_jws(jws, MAX_TOKEN, TYP, now)?;
     let a = shape(&c, jws).ok_or("shape")?;
     let on_behalf_of = &c["on_behalf_of"];
     if a.intent.len() > MAX_INTENT {

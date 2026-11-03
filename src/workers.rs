@@ -84,7 +84,7 @@ pub fn set_policy(
         serde_json::json!({"member": member, "scope": scope, "by": by, "decided_at": now}),
     );
     store.conn().execute(
-        "INSERT INTO approvals VALUES (NULL, ?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO approvals (hold_id, verdict, scope, \"by\", nonce, decided_at, record) VALUES (NULL, ?1, ?2, ?3, ?4, ?5, ?6)",
         params![verdict, scope, by, nonce, now, record],
     )?;
     Ok(())

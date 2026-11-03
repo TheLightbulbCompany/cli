@@ -328,8 +328,9 @@ pub(crate) fn row_message(r: &rusqlite::Row) -> rusqlite::Result<Message> {
 /// Stop hook last held it for unanswered work. `messages`: the message an answer answers
 /// (`reply_to`), an assignment's terms (`meta`, JSON), the A2A Message the envelope carried
 /// (`a2a`, JSON), the sender's signature and the stamp it covers (`sig`, `signed_at`), and the
-/// authority object it carried (`authority_id`).
-const ADDED_COLUMNS: [(&str, &str, &str); 10] = [
+/// authority object it carried (`authority_id`). `approvals`: a local exception's `resource`,
+/// `skill`, `requester` and `operands_hash`. `rules`: the newest verified rules document per workspace.
+const ADDED_COLUMNS: [(&str, &str, &str); 14] = [
     ("sessions", "reason", "TEXT"),
     ("sessions", "waiting_for", "TEXT"),
     ("sessions", "headless", "INTEGER"),
@@ -340,6 +341,10 @@ const ADDED_COLUMNS: [(&str, &str, &str); 10] = [
     ("messages", "sig", "TEXT"),
     ("messages", "signed_at", "INTEGER"),
     ("messages", "authority_id", "TEXT"),
+    ("approvals", "resource", "TEXT"),
+    ("approvals", "skill", "TEXT"),
+    ("approvals", "requester", "TEXT"),
+    ("approvals", "operands_hash", "TEXT"),
 ];
 /// Network workers: one row per headless worker a computer started for an assignment
 /// (`assignment` is the assign message id; `state` is starting, running, done, failed, stopped
@@ -352,6 +357,10 @@ CREATE TABLE IF NOT EXISTS workers (
     ended_at INTEGER, state TEXT NOT NULL, by TEXT
 );
 CREATE INDEX IF NOT EXISTS workers_session ON workers (session);
+CREATE TABLE IF NOT EXISTS rules (
+    workspace TEXT PRIMARY KEY, revision TEXT NOT NULL, iat INTEGER NOT NULL,
+    jws TEXT NOT NULL, doc TEXT NOT NULL
+);
 ";
 
 fn add_schema_on_open(conn: &Connection) -> crate::Result<()> {
