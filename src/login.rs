@@ -130,7 +130,20 @@ pub(crate) fn request_at(
     curl(&config)
 }
 
+/// Every request's curl config starts here, so the agent's run id rides on all of them.
 fn head(base: &str, method: &str, path: &str, headers: &[(&str, &str)]) -> Result<String> {
+    let run = std::env::var("LIGHTBULB_RUN_ID").ok();
+    head_for_run(base, method, path, headers, run.as_deref())
+}
+
+/// `X-Lightbulb-Run` is sent only for a non-empty id with no control character.
+fn head_for_run(
+    base: &str,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    run: Option<&str>,
+) -> Result<String> {
     let mut config = format!(
         "url = {}\nrequest = {}\n",
         quoted(&format!("{base}{path}"))?,
@@ -138,6 +151,12 @@ fn head(base: &str, method: &str, path: &str, headers: &[(&str, &str)]) -> Resul
     );
     for (k, v) in headers {
         config.push_str(&format!("header = {}\n", quoted(&format!("{k}: {v}"))?));
+    }
+    if let Some(r) = run.filter(|r| !r.is_empty() && !r.chars().any(char::is_control)) {
+        config.push_str(&format!(
+            "header = {}\n",
+            quoted(&format!("X-Lightbulb-Run: {r}"))?
+        ));
     }
     Ok(config)
 }
@@ -595,6 +614,15 @@ pub fn invite_agents(ticket: &str) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_run_id_header_is_sent_only_for_a_non_empty_id() {
+        let cfg = |run| head_for_run("http://x", "GET", "/p", &[], run).unwrap();
+        assert!(cfg(Some("run_1")).contains("header = \"X-Lightbulb-Run: run_1\"\n"));
+        assert!(!cfg(None).contains("X-Lightbulb-Run"));
+        assert!(!cfg(Some("")).contains("X-Lightbulb-Run"));
+        assert!(!cfg(Some("a\nb")).contains("X-Lightbulb-Run"));
+    }
 
     #[test]
     fn a_proof_is_the_keys_signature_over_purpose_challenge_key_and_link() {
