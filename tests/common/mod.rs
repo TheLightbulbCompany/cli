@@ -62,6 +62,8 @@ impl Env {
             .env_remove("CLAUDE_CODE_ENTRYPOINT")
             .env("LIGHTBULB_CONNECT_DEBUG_NO_DEFAULT_RELAYS", "1")
             .env("LIGHTBULB_CONNECT_DEBUG_NO_TELEMETRY", "1")
+            // No card entry in the roster unless a test asks (`a2a_cards`).
+            .env("LIGHTBULB_CONNECT_DEBUG_NO_CARD", "1")
             // Never the real model download: a closed port (`embed_model`).
             .env("LIGHTBULB_CONNECT_DEBUG_MODEL_URL", "http://127.0.0.1:9")
             // Never the real Lightbulb: a closed port unless a test points it at its stub.

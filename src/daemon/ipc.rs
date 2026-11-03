@@ -365,6 +365,20 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
                 Err(_) => Response::err(id, INTERNAL),
             }
         }
+        // `card {member?}` -> `{card}`: that member's (a short or a key; default this one) Agent
+        // Card from the roster.
+        "card" => {
+            let team = daemon.team.lock().unwrap();
+            let r = &team.roster;
+            let key = match body["member"].as_str() {
+                None => Some(&daemon.identity.key),
+                Some(m) => r.members.get(m).or_else(|| r.by_short(m)).map(|m| &m.key),
+            };
+            match key.and_then(|k| r.cards.get(k)) {
+                Some(card) => Response::ok(id, json!({ "card": card })),
+                None => Response::err(id, NOT_FOUND),
+            }
+        }
         // An agent fed a hostile link must not move this computer into another network: its
         // person confirms (`admission::join`), and an unresolved caller is refused. The threat is
         // a hosted page driving the desktop app, which exists only on macOS.

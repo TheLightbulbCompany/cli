@@ -375,6 +375,37 @@ pub(crate) fn publish(d: &Daemon) -> Result<()> {
     Ok(())
 }
 
+/// Signs this member's Agent Card into its roster as a `meta` when the roster's differs from
+/// the one computed now (the first start, a new name, workers switched on or off). A computer
+/// that is no member of its team publishes nothing.
+pub(crate) fn publish_card(d: &Daemon) -> Result<()> {
+    // For suites that count the roster's entries or feed it exact frames.
+    if std::env::var_os("LIGHTBULB_CONNECT_DEBUG_NO_CARD").is_some_and(|v| !v.is_empty()) {
+        return Ok(());
+    }
+    let mut team = d.team.lock().unwrap();
+    let Some(me) = team.roster.members.get(&d.identity.key) else {
+        return Ok(());
+    };
+    let offers = !crate::workers::offers(&team.config).is_empty();
+    let card = roster::own_card(&d.identity.short, &me.name, offers);
+    if team.roster.cards.get(&d.identity.key) == Some(&card) {
+        return Ok(());
+    }
+    let store = d.store.lock().unwrap();
+    let now = ipc::now() as i64;
+    net_ops::write(
+        d,
+        &mut team,
+        &store,
+        roster::Kind::Meta,
+        json!({"card": card}),
+        now,
+    )?;
+    eprintln!("card: published");
+    Ok(())
+}
+
 /// `inbox {session}` -> `{messages}`: takes what waits for declared session `session` (a
 /// name), each marked read: the bridge hands it to that agent's turn.
 pub(crate) fn inbox(id: u64, body: &Value, d: &Daemon) -> Response {

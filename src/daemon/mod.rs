@@ -444,6 +444,9 @@ pub async fn run(dir: &Path) -> Result<()> {
     crate::workers::reap(&daemon);
     // The dialogs of the holds still open went with the last daemon.
     crate::holds::reraise(&daemon);
+    if let Err(e) = crate::embed::publish_card(&daemon) {
+        eprintln!("card: {e}");
+    }
 
     // We hold the lock, so any socket file left behind is stale.
     let sock = dir.join(paths::SOCKET);
