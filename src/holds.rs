@@ -28,15 +28,29 @@ pub enum Kind {
     Permission,
     /// A worker-start hold: its message is an `assign` to `<member>/<provider>:new`.
     Worker,
+    /// A message the workspace rules hold for a person: it waits in the mailbox, receipt `held`.
+    Authority,
 }
 
 impl Kind {
+    const ALL: [Kind; 4] = [
+        Kind::Message,
+        Kind::Permission,
+        Kind::Worker,
+        Kind::Authority,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Kind::Message => "message",
             Kind::Permission => "permission",
             Kind::Worker => "worker",
+            Kind::Authority => "authority",
         }
+    }
+
+    fn parse(s: &str) -> Option<Kind> {
+        Kind::ALL.into_iter().find(|k| k.as_str() == s)
     }
 }
 
@@ -64,6 +78,8 @@ pub struct Hold {
     pub state: String,
     /// The dialog's text, once shown.
     pub shown: Option<String>,
+    /// The `holds.kind` column (`None` on a row from before it).
+    pub stored_kind: Option<Kind>,
 }
 
 impl Hold {
@@ -72,11 +88,7 @@ impl Hold {
     }
 
     pub fn kind(&self) -> Kind {
-        match self.message.kind.as_str() {
-            "permission" => Kind::Permission,
-            "assign" => Kind::Worker,
-            _ => Kind::Message,
-        }
+        self.stored_kind.unwrap_or_else(|| inferred(&self.message))
     }
 
     pub fn is_open(&self) -> bool {
@@ -84,12 +96,41 @@ impl Hold {
     }
 }
 
-/// The `holds` row for `message` (from its sender to its recipient), from `member`.
+/// The `holds` row for `message` (from its sender to its recipient), from `member`, of the kind
+/// its message reads as.
 pub fn insert(store: &Store, message: Message, member: &str, now: i64) -> Result<Hold> {
+    let kind = inferred(&message);
+    insert_kind(store, message, member, kind, now)
+}
+
+/// The kind a hold of `m` is when its row names none.
+fn inferred(m: &Message) -> Kind {
+    match m.kind.as_str() {
+        "permission" => Kind::Permission,
+        "assign" => Kind::Worker,
+        _ => Kind::Message,
+    }
+}
+
+/// `insert`, of `kind`.
+pub fn insert_kind(
+    store: &Store,
+    message: Message,
+    member: &str,
+    kind: Kind,
+    now: i64,
+) -> Result<Hold> {
     store.conn().execute(
         "INSERT INTO holds (message_id, target_session, from_session, from_member, created_at, \
-         state) VALUES (?1, ?2, ?3, ?4, ?5, 'open')",
-        params![message.id, message.to_key, message.from_key, member, now],
+         state, kind) VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6)",
+        params![
+            message.id,
+            message.to_key,
+            message.from_key,
+            member,
+            now,
+            kind.as_str()
+        ],
     )?;
     Ok(Hold {
         id: store.conn().last_insert_rowid(),
@@ -100,6 +141,7 @@ pub fn insert(store: &Store, message: Message, member: &str, now: i64) -> Result
         created_at: now,
         state: "open".into(),
         shown: None,
+        stored_kind: Some(kind),
     })
 }
 
@@ -139,7 +181,7 @@ fn rows(
     let mut stmt = store.conn().prepare(&format!(
         "SELECT m.*, h.id AS h_id, h.target_session AS h_to, h.from_session AS h_from, \
          h.from_member AS h_member, h.created_at AS h_at, h.state AS h_state, \
-         h.shown AS h_shown, s.key IS NOT NULL AS s_row, s.ended_at AS s_end \
+         h.shown AS h_shown, h.kind AS h_kind, s.key IS NOT NULL AS s_row, s.ended_at AS s_end \
          FROM holds h JOIN messages m ON m.id = h.message_id \
          LEFT JOIN sessions s ON s.key = h.target_session {filter} ORDER BY h.id"
     ))?;
@@ -159,6 +201,10 @@ fn rows(
             created_at,
             state: r.get("h_state")?,
             shown: r.get("h_shown")?,
+            stored_kind: r
+                .get::<_, Option<String>>("h_kind")?
+                .as_deref()
+                .and_then(Kind::parse),
         };
         Ok((h, gone_since))
     })?;
@@ -294,7 +340,8 @@ pub fn answer(
     // (A message hold of an older build is not answerable; `expire` closes it.)
     let kind = h.kind();
     let late = kind == Kind::Worker && h.message.meta.deadline_at.is_some_and(|d| now >= d);
-    if !h.is_open() || kind == Kind::Message || late {
+    // An Authority hold is answered with its dialog, which is not built yet.
+    if !h.is_open() || matches!(kind, Kind::Message | Kind::Authority) || late {
         return Ok(Err(NOT_OPEN));
     }
     let workers_own = kind == Kind::Worker || is_workers(store, &h.target_session);
@@ -369,6 +416,8 @@ pub fn expire(store: &Store, now: i64) -> Result<Vec<Hold>> {
                 None,
             ),
             Kind::Message => (true, Some("not_allowed")),
+            // Its answer and its 24 h expiry come with its dialog.
+            Kind::Authority => (false, None),
             // Its target (`<m>/<p>:new`) never has a session row: only the deadline closes it.
             Kind::Worker => (
                 h.message.meta.deadline_at.is_some_and(|d| now >= d),

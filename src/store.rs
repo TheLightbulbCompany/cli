@@ -330,7 +330,7 @@ pub(crate) fn row_message(r: &rusqlite::Row) -> rusqlite::Result<Message> {
 /// (`a2a`, JSON), the sender's signature and the stamp it covers (`sig`, `signed_at`), and the
 /// authority object it carried (`authority_id`). `approvals`: a local exception's `resource`,
 /// `skill`, `requester` and `operands_hash`. `rules`: the newest verified rules document per workspace.
-const ADDED_COLUMNS: [(&str, &str, &str); 14] = [
+const ADDED_COLUMNS: [(&str, &str, &str); 15] = [
     ("sessions", "reason", "TEXT"),
     ("sessions", "waiting_for", "TEXT"),
     ("sessions", "headless", "INTEGER"),
@@ -345,6 +345,7 @@ const ADDED_COLUMNS: [(&str, &str, &str); 14] = [
     ("approvals", "skill", "TEXT"),
     ("approvals", "requester", "TEXT"),
     ("approvals", "operands_hash", "TEXT"),
+    ("holds", "kind", "TEXT"),
 ];
 /// Network workers: one row per headless worker a computer started for an assignment
 /// (`assignment` is the assign message id; `state` is starting, running, done, failed, stopped

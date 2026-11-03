@@ -1324,8 +1324,34 @@ fn receive(d: &Arc<Daemon>, key: &str, env: &Frame, raw: &serde_json::Value, tx:
     // The person the sender's `hello` proof names, when it verifies.
     let proof = d.proofs.lock().unwrap().get(key).cloned();
     let person = proof.and_then(|t| crate::proof::verify(&t, key, now as i64).ok());
+    // This computer's own person (`@session-person`), and the rules with their exceptions.
+    let mine =
+        crate::login::stored_proof(&crate::paths::state_dir()).and_then(|t| crate::proof::peek(&t));
+    // Fail closed: rules that cannot be read refuse every message.
+    let (workspace, rules, exceptions) = match (
+        crate::rules::load(&store),
+        crate::rules::exceptions(&store, me),
+    ) {
+        (Ok((w, r)), Ok(e)) => (w, r, e),
+        (r, e) => {
+            let why = r.err().or(e.err()).map(|e| e.to_string());
+            eprintln!(
+                "net: the rules are unreadable ({}): refusing",
+                why.unwrap_or_default()
+            );
+            let mut deny = crate::rules::default_rules();
+            (deny.rules, deny.default) = (vec![], crate::rules::Effect::Deny);
+            (None, deny, vec![])
+        }
+    };
     let judge = mail::Judge {
         sender_person: person.as_ref().map(|p| p.sub.as_str()),
+        // Sign-in proofs carry no org claim.
+        sender_org: None,
+        my_person: mine.as_ref().map(|p| p.sub.as_str()),
+        rules: &rules,
+        exceptions: &exceptions,
+        workspace: workspace.as_deref(),
     };
     match mail::receive(
         &store,
@@ -1347,9 +1373,13 @@ fn receive(d: &Arc<Daemon>, key: &str, env: &Frame, raw: &serde_json::Value, tx:
             fresh,
             taken,
             cancelled,
+            held,
         }) => {
             eprintln!("net: envelope {id} from {short}: {}", state.name());
             ack(state, reason, limit);
+            if let Some(h) = held {
+                eprintln!("net: hold H{h} for {to}");
+            }
             // A fresh worker's address has no mailbox: nothing to wake, only a follow-up.
             match (taken, cancelled) {
                 (Some(Taken::Held { hold }), _) => {

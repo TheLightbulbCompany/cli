@@ -165,14 +165,16 @@ pub struct Exception {
     pub skill: String,
     pub requester: String,
     pub operands_hash: Option<String>,
-    pub deny: bool,
+    /// `Hold` (a Workers `revoked` row) matches as no exception: the rules decide.
+    pub effect: Effect,
 }
 
 /// The local exceptions, oldest first. A row without an `operands_hash` is a standing policy
 /// (`always` allows, `refused` denies, `revoked` removes the earlier one for the same
 /// resource, skill and requester); a row with one is a one-shot allow. Workers' rows (no
-/// `resource`, `$.member` in the record) read as `worker:<me>/*`, `assign`, `agent:<member>`;
-/// the latest per member wins. Nothing is rewritten on disk.
+/// `resource`, `$.member` in the record) read as `worker:<me>/*`, `assign`,
+/// `member:<member short>`; the latest per member wins, a `revoked` one as a `Hold` exception
+/// (ask, never the `member == me` allow). Nothing is rewritten on disk.
 pub fn exceptions(store: &Store, me: &str) -> Result<Vec<Exception>> {
     let mut q = store.conn().prepare(
         "SELECT scope, resource, skill, requester, operands_hash, json_extract(record, '$.member') \
@@ -191,24 +193,33 @@ pub fn exceptions(store: &Store, me: &str) -> Result<Vec<Exception>> {
     let mut out: Vec<Exception> = vec![];
     for row in rows {
         let (scope, resource, skill, requester, hash, member) = row?;
-        let e = match (resource, skill, requester, member) {
-            (Some(resource), Some(skill), Some(requester), _) => Exception {
-                resource,
-                skill,
-                requester,
-                operands_hash: hash,
-                deny: scope == "refused",
-            },
+        let effect = match scope.as_str() {
+            "refused" => Effect::Deny,
+            "revoked" => Effect::Hold,
+            _ => Effect::Allow,
+        };
+        let (e, legacy) = match (resource, skill, requester, member) {
+            (Some(resource), Some(skill), Some(requester), _) => {
+                let e = Exception {
+                    resource,
+                    skill,
+                    requester,
+                    operands_hash: hash,
+                    effect,
+                };
+                (e, false)
+            }
             (None, _, _, Some(member))
                 if matches!(scope.as_str(), "always" | "refused" | "revoked") =>
             {
-                Exception {
+                let e = Exception {
                     resource: format!("worker:{me}/*"),
                     skill: "assign".into(),
-                    requester: format!("agent:{member}"),
+                    requester: format!("member:{member}"),
                     operands_hash: None,
-                    deny: scope == "refused",
-                }
+                    effect,
+                };
+                (e, true)
             }
             _ => continue,
         };
@@ -221,7 +232,7 @@ pub fn exceptions(store: &Store, me: &str) -> Result<Vec<Exception>> {
                     || (&o.resource, &o.skill, &o.requester)
                         != (&e.resource, &e.skill, &e.requester)
             });
-            if scope == "revoked" {
+            if scope == "revoked" && !legacy {
                 continue;
             }
         }
@@ -230,7 +241,7 @@ pub fn exceptions(store: &Store, me: &str) -> Result<Vec<Exception>> {
     Ok(out)
 }
 
-/// What `decide` judges. `requester` is `person:<sub>` (verified) or `member:<key>`;
+/// What `decide` judges. `requester` is `person:<sub>` (verified) or `member:<short>`;
 /// `requester_org` is the sender's proof org, or `org` itself for a roster member without one.
 pub struct Input<'a> {
     pub org: Option<&'a str>,
@@ -372,10 +383,10 @@ pub fn decide(rules: &Rules, exceptions: &[Exception], i: &Input) -> Decision {
                     .is_none_or(|h| i.operands_hash == Some(h))
         })
         .collect();
-    if matching.iter().any(|e| e.deny) {
+    if matching.iter().any(|e| e.effect == Effect::Deny) {
         return done(Effect::Deny, "exception:deny");
     }
-    if !matching.is_empty() {
+    if matching.iter().any(|e| e.effect == Effect::Allow) {
         return done(Effect::Allow, "exception:allow");
     }
     let (effect, rule) = hits
@@ -450,14 +461,14 @@ mod tests {
         skill: &str,
         requester: &str,
         hash: Option<&str>,
-        deny: bool,
+        effect: Effect,
     ) -> Exception {
         Exception {
             resource: resource.into(),
             skill: skill.into(),
             requester: requester.into(),
             operands_hash: hash.map(String::from),
-            deny,
+            effect,
         }
     }
 
@@ -512,13 +523,25 @@ mod tests {
             Effect::Deny,
         ));
         let i = input("person:user_a", "session:abc/claude:1", "ask_session");
-        let allow = exc("session:*", "ask_session", "person:user_a", None, false);
+        let allow = exc(
+            "session:*",
+            "ask_session",
+            "person:user_a",
+            None,
+            Effect::Allow,
+        );
         let d = decide(&r, std::slice::from_ref(&allow), &i);
         assert_eq!((d.effect, d.rule.as_str()), (Effect::Deny, "d1"));
         // A deny exception beats an allow rule and an allow exception.
         let r = default_rules();
         let i = input("person:user_a", "session:abc/claude:1", "message");
-        let deny = exc("session:abc/*", "message", "person:user_a", None, true);
+        let deny = exc(
+            "session:abc/*",
+            "message",
+            "person:user_a",
+            None,
+            Effect::Deny,
+        );
         assert_eq!(decide(&r, &[allow, deny], &i).effect, Effect::Deny);
     }
 
@@ -557,7 +580,13 @@ mod tests {
         let r = default_rules();
         let mut i = input("person:user_b", "session:abc/claude:1", "ask_session");
         i.operands_hash = Some("sha256:aa");
-        let standing = exc("session:abc/*", "ask_session", "person:user_b", None, false);
+        let standing = exc(
+            "session:abc/*",
+            "ask_session",
+            "person:user_b",
+            None,
+            Effect::Allow,
+        );
         let d = decide(&r, std::slice::from_ref(&standing), &i);
         assert_eq!(
             (d.effect, d.rule.as_str()),
@@ -568,7 +597,7 @@ mod tests {
             "ask_session",
             "person:user_b",
             Some("sha256:aa"),
-            false,
+            Effect::Allow,
         );
         assert_eq!(
             decide(&r, std::slice::from_ref(&once), &i).effect,
@@ -577,17 +606,43 @@ mod tests {
         i.operands_hash = Some("sha256:bb");
         assert_eq!(decide(&r, &[once], &i).effect, Effect::Hold, "another hash");
         i.operands_hash = None;
-        let other_skill = exc("session:abc/*", "message", "person:user_b", None, false);
-        let other_who = exc("session:abc/*", "ask_session", "person:user_c", None, false);
-        let other_res = exc("session:zzz/*", "ask_session", "person:user_b", None, false);
+        let other_skill = exc(
+            "session:abc/*",
+            "message",
+            "person:user_b",
+            None,
+            Effect::Allow,
+        );
+        let other_who = exc(
+            "session:abc/*",
+            "ask_session",
+            "person:user_c",
+            None,
+            Effect::Allow,
+        );
+        let other_res = exc(
+            "session:zzz/*",
+            "ask_session",
+            "person:user_b",
+            None,
+            Effect::Allow,
+        );
         for e in [other_skill, other_who, other_res] {
             assert_eq!(decide(&r, &[e], &i).effect, Effect::Hold);
         }
+        // A Hold exception (a Workers `revoked` row) is no exception: the rules decide.
+        let m = input("member:abc", "session:abc/codex:1", "message");
+        let revoked = exc("session:*", "message", "member:abc", None, Effect::Hold);
+        let d = decide(&default_rules(), &[revoked], &m);
+        assert_eq!(
+            (d.effect, d.rule.as_str()),
+            (Effect::Allow, "members-message")
+        );
         // An agent requester matches the chain.
         let agents = ["friday".to_string()];
         let mut j = input("person:user_b", "worker:me/claude", "assign");
         j.chain_agents = &agents;
-        let e = exc("worker:me/*", "assign", "agent:friday", None, false);
+        let e = exc("worker:me/*", "assign", "agent:friday", None, Effect::Allow);
         assert_eq!(decide(&r, &[e], &j).effect, Effect::Allow);
     }
 
@@ -624,9 +679,10 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                exc("worker:me1/*", "assign", "agent:abc", None, false),
-                exc("worker:me1/*", "assign", "agent:def", None, true),
-                exc("worker:me1/*", "assign", "agent:jkl", None, false),
+                exc("worker:me1/*", "assign", "member:abc", None, Effect::Allow),
+                exc("worker:me1/*", "assign", "member:def", None, Effect::Deny),
+                exc("worker:me1/*", "assign", "member:ghi", None, Effect::Hold),
+                exc("worker:me1/*", "assign", "member:jkl", None, Effect::Allow),
             ]
         );
         // A row bound to a hold is not an exception.
@@ -636,7 +692,7 @@ mod tests {
                 [],
             )
             .unwrap();
-        assert_eq!(exceptions(&s, "me1").unwrap().len(), 3);
+        assert_eq!(exceptions(&s, "me1").unwrap().len(), 4);
         // New-style rows: standing, revoked, one-shot.
         let new = |scope: &str, hash: Option<&str>, n: &str| {
             s.conn()
@@ -649,10 +705,10 @@ mod tests {
         };
         new("always", None, "n1");
         new("always", Some("sha256:aa"), "n2");
-        assert_eq!(exceptions(&s, "me1").unwrap().len(), 5);
+        assert_eq!(exceptions(&s, "me1").unwrap().len(), 6);
         new("revoked", None, "n3");
         let got = exceptions(&s, "me1").unwrap();
-        assert_eq!(got.len(), 4);
+        assert_eq!(got.len(), 5);
         assert!(got
             .iter()
             .any(|e| e.operands_hash.as_deref() == Some("sha256:aa")));

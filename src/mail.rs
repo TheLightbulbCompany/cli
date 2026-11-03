@@ -1,8 +1,10 @@
 //! Messages, the mailbox, receipts and the loop limit. Time is passed in (`now`, unix seconds).
 
 use crate::config::Config;
+use crate::holds::Kind as HoldKind;
 use crate::net::frames::Frame;
 use crate::roster::{Member, Roster};
+use crate::rules::Effect;
 use crate::sessions::{self, Key};
 use crate::store::{Message, Store, MSG_RECEIPT};
 use crate::workers::{self, Taken};
@@ -42,6 +44,8 @@ pub struct Answer {
     pub taken: Option<Taken>,
     /// The assignment (message id) a cancel for a fresh worker names.
     pub cancelled: Option<String>,
+    /// The Authority hold (its id) the workspace rules parked fresh mail under.
+    pub held: Option<i64>,
 }
 
 impl Answer {
@@ -53,6 +57,7 @@ impl Answer {
             fresh: false,
             taken: None,
             cancelled: None,
+            held: None,
         }
     }
 
@@ -514,12 +519,39 @@ pub struct Prepared {
     pub authority: Option<crate::authority::Authority>,
 }
 
-/// What `receive` knows of the sender beyond the envelope.
-#[derive(Default)]
+/// What `receive` knows of the sender beyond the envelope, and the rules it is judged by.
 pub struct Judge<'a> {
     /// The person the sending computer's `hello` proof names (`Proof::sub`), when it verified.
     pub sender_person: Option<&'a str>,
+    /// The sender's org, when its proof names one.
+    pub sender_org: Option<&'a str>,
+    /// The person this computer is signed in as (its own proof's `sub`): `@session-person`.
+    pub my_person: Option<&'a str>,
+    pub rules: &'a crate::rules::Rules,
+    pub exceptions: &'a [crate::rules::Exception],
+    /// The stored rules document's workspace; `None` when none is stored.
+    pub workspace: Option<&'a str>,
 }
+
+impl Default for Judge<'static> {
+    /// An unknown sender on a computer not signed in, judged by the shipped default rules.
+    fn default() -> Self {
+        static RULES: std::sync::LazyLock<crate::rules::Rules> =
+            std::sync::LazyLock::new(crate::rules::default_rules);
+        Judge {
+            sender_person: None,
+            sender_org: None,
+            my_person: None,
+            rules: &RULES,
+            exceptions: &[],
+            workspace: None,
+        }
+    }
+}
+
+/// A `mailbox` row whose message no open hold parks: one a session may be handed.
+const NOT_HELD: &str = "NOT EXISTS (SELECT 1 FROM holds h \
+     WHERE h.message_id = mailbox.message_id AND h.state = 'open')";
 
 /// An A2A Message's text: its `parts[].text` joined by newlines; `None` when a part has no
 /// `text` (this phase takes text only), there are no parts, or the role is not `ROLE_USER` or `ROLE_AGENT`.
@@ -1171,6 +1203,21 @@ pub fn receive(
     if roster.by_short(me).is_none() {
         return refused("not_member");
     }
+    // The workspace rules judge every message (an assignment keeps its own path).
+    let held = if kind == "message" {
+        let d = judge_message(judge, peer, roster, to, a2a.is_some(), authority.as_ref());
+        match d.effect {
+            Effect::Allow => false,
+            Effect::Deny => return refused("policy"),
+            Effect::Hold if d.holders.is_empty() => {
+                eprintln!("net: envelope {id} from {}: no_holder", peer.short);
+                return refused("policy");
+            }
+            Effect::Hold => true,
+        }
+    } else {
+        false
+    };
     let p = Prepared {
         message_id: id.clone(),
         from: Key(from.clone()),
@@ -1221,6 +1268,22 @@ pub fn receive(
             ..Answer::is(state)
         });
     }
+    if held {
+        // In the mailbox, but no session is handed it while its hold is open.
+        put(store, &p, Origin::Net(&peer.short), State::Held)?;
+        let expires = expires_for(&p.to.0, p.sent_at);
+        store.put_mailbox(&p.to.0, &p.message_id, p.sent_at, expires)?;
+        let mut m = Message::from(&p);
+        m.origin = Some(format!("net:{}", peer.short));
+        let h = crate::holds::insert_kind(store, m, &peer.short, HoldKind::Authority, now as i64)?;
+        store.put_seen(&peer.key, id, State::Held.name(), now as i64)?;
+        tx.commit()?;
+        return Ok(Answer {
+            fresh: true,
+            held: Some(h.id),
+            ..Answer::is(State::Held)
+        });
+    }
     // Seen with what the sender is told, so a resend makes no second copy.
     let state = State::Stored;
     record(store, &p, Origin::Net(&peer.short), false)?;
@@ -1230,6 +1293,58 @@ pub fn receive(
         fresh: true,
         ..Answer::is(state)
     })
+}
+
+/// The rules' decision on a `message` from `peer` to `to`: requester `person:<sub>` (the bound
+/// object's requester, else the sender's proof person) or `member:<short>`; skill the object's,
+/// else `ask_session` for an A2A Message, else `message`; the requester's org the object's, else
+/// the sender's, else (every peer is a roster member) the workspace.
+fn judge_message(
+    judge: &Judge,
+    peer: &Member,
+    roster: &Roster,
+    to: &str,
+    is_a2a: bool,
+    a: Option<&crate::authority::Authority>,
+) -> crate::rules::Decision {
+    let requester = match (a, judge.sender_person) {
+        (Some(a), _) => format!("person:{}", a.requester_person),
+        (None, Some(p)) => format!("person:{p}"),
+        (None, None) => format!("member:{}", peer.short),
+    };
+    // With no document, the roster is the workspace (`org:*` matches its members).
+    let member_org = judge.workspace.unwrap_or(&roster.team_id);
+    let requester_org = a.map_or(judge.sender_org.unwrap_or(member_org), |a| {
+        a.requester_org.as_str()
+    });
+    let chain_agents: Vec<String> = a.map_or(vec![], |a| {
+        a.chain.iter().filter_map(|h| h.agent.clone()).collect()
+    });
+    let hash = a.map(|a| crate::authority::operands_hash(&a.operands));
+    let resource = format!("session:{to}");
+    let skill = match a {
+        Some(a) => a.skill.as_str(),
+        None if is_a2a => "ask_session",
+        None => "message",
+    };
+    let input = crate::rules::Input {
+        org: judge.workspace,
+        requester: &requester,
+        requester_org: Some(requester_org),
+        chain_agents: &chain_agents,
+        resource: &resource,
+        skill,
+        session_person: judge.my_person,
+        operands: a.map(|a| &a.operands),
+        intent: a.map(|a| a.intent.as_str()),
+        verified_by: a.map(|a| a.verified_by.as_str()),
+        operands_hash: hash.as_deref(),
+        origin_is_person: match a {
+            Some(a) => a.verified_by != "agent-runtime",
+            None => judge.sender_person.is_some(),
+        },
+    };
+    crate::rules::decide(judge.rules, judge.exceptions, &input)
 }
 
 /// What senders are owed about the messages they sent here: a `Receipt` for each whose state
@@ -1265,9 +1380,10 @@ pub fn take_one(store: &Store, to: &Key, message_id: &str, now: u64) -> Result<O
 
 /// The messages waiting for `to`, oldest first, left where they are.
 pub fn waiting(store: &Store, to: &Key, now: u64) -> Result<Vec<Message>> {
-    let mut stmt = store.conn().prepare(
-        "SELECT message_id FROM mailbox WHERE to_key = ?1 AND expires_at >= ?2 ORDER BY id",
-    )?;
+    let mut stmt = store.conn().prepare(&format!(
+        "SELECT message_id FROM mailbox WHERE to_key = ?1 AND expires_at >= ?2 \
+             AND {NOT_HELD} ORDER BY id"
+    ))?;
     let ids = stmt.query_map(params![to.0, now as i64], |r| r.get::<_, String>(0))?;
     let mut out = vec![];
     for id in ids {
@@ -1401,9 +1517,10 @@ fn delivered_ids(store: &Store, short: &str, bound: &str, at: i64) -> Result<Vec
 
 /// The addresses with waiting mail, newest mail first.
 pub fn waiting_keys(store: &Store, now: u64) -> Result<Vec<String>> {
-    let mut stmt = store.conn().prepare(
-        "SELECT to_key FROM mailbox WHERE expires_at >= ?1 GROUP BY to_key ORDER BY MAX(id) DESC",
-    )?;
+    let mut stmt = store.conn().prepare(&format!(
+        "SELECT to_key FROM mailbox WHERE expires_at >= ?1 AND {NOT_HELD} \
+             GROUP BY to_key ORDER BY MAX(id) DESC"
+    ))?;
     let keys = stmt.query_map([now as i64], |r| r.get(0))?;
     Ok(keys.collect::<rusqlite::Result<_>>()?)
 }
@@ -1412,10 +1529,10 @@ fn take_where(store: &Store, to: &Key, only: Option<&str>, now: u64) -> Result<V
     let conn = store.conn();
     let tx = conn.unchecked_transaction()?;
     let rows: Vec<(i64, String)> = {
-        let mut stmt = tx.prepare(
+        let mut stmt = tx.prepare(&format!(
             "SELECT id, message_id FROM mailbox WHERE to_key = ?1 AND expires_at >= ?2 \
-             AND (?3 IS NULL OR message_id = ?3) ORDER BY id",
-        )?;
+             AND (?3 IS NULL OR message_id = ?3) AND {NOT_HELD} ORDER BY id"
+        ))?;
         let rows = stmt.query_map(params![to.0, now as i64, only], |r| {
             Ok((r.get(0)?, r.get(1)?))
         })?;
@@ -1444,7 +1561,9 @@ fn take_where(store: &Store, to: &Key, only: Option<&str>, now: u64) -> Result<V
 /// How many messages wait for `to`, without taking them.
 pub fn unread(store: &Store, to: &Key, now: u64) -> Result<u64> {
     let n: i64 = store.conn().query_row(
-        "SELECT COUNT(*) FROM mailbox WHERE to_key = ?1 AND expires_at >= ?2",
+        &format!(
+            "SELECT COUNT(*) FROM mailbox WHERE to_key = ?1 AND expires_at >= ?2 AND {NOT_HELD}"
+        ),
         params![to.0, now as i64],
         |r| r.get(0),
     )?;

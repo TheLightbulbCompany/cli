@@ -63,10 +63,12 @@ async fn a_and_peer_b() -> (Env, Env, iroh::Endpoint, Peer) {
     a_and_peer_b_as(None).await
 }
 
-/// `a_and_peer_b`, B's `hello` showing a sign-in proof for Lightbulb user `user`.
+/// `a_and_peer_b`, B's `hello` showing a sign-in proof for Lightbulb user `user`. A is signed
+/// in as `user_a`: an A2A ask with no object is held for that person.
 async fn a_and_peer_b_as(user: Option<&str>) -> (Env, Env, iroh::Endpoint, Peer) {
     let (a, b) = (Env::new(), Env::new());
     seed_pair(&a, &b);
+    a.sign_in("user_a", None);
     a.daemon(false, "", &[]);
     let ep = endpoint(&b.identity()).await;
     let mut p = Peer::dial(&ep, &a).await;
@@ -90,7 +92,8 @@ async fn signed_envelope_with_a2a_is_stored_with_sig_and_signed_at() {
         envelope(&id, &sb, &sa, "hi", Some(user("hi"))),
     );
     p.send_raw(&v).await;
-    assert_eq!(p.ack(&id).await.0, "stored");
+    // No authority object: the rules hold it for A's person, stored all the same.
+    assert_eq!(p.ack(&id).await.0, "held");
     let m = a.store().message(&id).unwrap().expect("stored");
     assert_eq!(m.a2a, Some(user("hi")));
     assert_eq!(m.sig.as_deref(), v["sig"].as_str());
@@ -108,7 +111,7 @@ async fn unknown_future_field_survives_signature_verification() {
     v["future"] = json!(1);
     let v = signed(&b.identity(), v);
     p.send_raw(&v).await;
-    assert_eq!(p.ack(&id).await.0, "stored");
+    assert_eq!(p.ack(&id).await.0, "held");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
