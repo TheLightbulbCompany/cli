@@ -1203,20 +1203,22 @@ pub fn receive(
     if roster.by_short(me).is_none() {
         return refused("not_member");
     }
-    // The workspace rules judge every message (an assignment keeps its own path).
+    // The workspace rules judge every message (an assignment keeps its own path); a hold keeps
+    // the requester and skill it was judged as.
     let held = if kind == "message" {
-        let d = judge_message(judge, peer, roster, to, a2a.is_some(), authority.as_ref());
+        let (d, requester, skill) =
+            judge_message(judge, peer, roster, to, a2a.is_some(), authority.as_ref());
         match d.effect {
-            Effect::Allow => false,
+            Effect::Allow => None,
             Effect::Deny => return refused("policy"),
             Effect::Hold if d.holders.is_empty() => {
                 eprintln!("net: envelope {id} from {}: no_holder", peer.short);
                 return refused("policy");
             }
-            Effect::Hold => true,
+            Effect::Hold => Some((requester, skill)),
         }
     } else {
-        false
+        None
     };
     let p = Prepared {
         message_id: id.clone(),
@@ -1268,7 +1270,7 @@ pub fn receive(
             ..Answer::is(state)
         });
     }
-    if held {
+    if let Some((requester, skill)) = held {
         // In the mailbox, but no session is handed it while its hold is open.
         put(store, &p, Origin::Net(&peer.short), State::Held)?;
         let expires = expires_for(&p.to.0, p.sent_at);
@@ -1276,6 +1278,10 @@ pub fn receive(
         let mut m = Message::from(&p);
         m.origin = Some(format!("net:{}", peer.short));
         let h = crate::holds::insert_kind(store, m, &peer.short, HoldKind::Authority, now as i64)?;
+        store.conn().execute(
+            "UPDATE holds SET requester = ?2, skill = ?3 WHERE id = ?1",
+            params![h.id, requester, skill],
+        )?;
         store.put_seen(&peer.key, id, State::Held.name(), now as i64)?;
         tx.commit()?;
         return Ok(Answer {
@@ -1295,10 +1301,11 @@ pub fn receive(
     })
 }
 
-/// The rules' decision on a `message` from `peer` to `to`: requester `person:<sub>` (the bound
-/// object's requester, else the sender's proof person) or `member:<short>`; skill the object's,
-/// else `ask_session` for an A2A Message, else `message`; the requester's org the object's, else
-/// the sender's, else (every peer is a roster member) the workspace.
+/// The rules' decision on a `message` from `peer` to `to`, with the requester and skill it
+/// judged: requester `person:<sub>` (the bound object's requester, else the sender's proof
+/// person) or `member:<short>`; skill the object's, else `ask_session` for an A2A Message, else
+/// `message`; the requester's org the object's, else the sender's, else (every peer is a roster
+/// member) the workspace.
 fn judge_message(
     judge: &Judge,
     peer: &Member,
@@ -1306,7 +1313,7 @@ fn judge_message(
     to: &str,
     is_a2a: bool,
     a: Option<&crate::authority::Authority>,
-) -> crate::rules::Decision {
+) -> (crate::rules::Decision, String, String) {
     let requester = match (a, judge.sender_person) {
         (Some(a), _) => format!("person:{}", a.requester_person),
         (None, Some(p)) => format!("person:{p}"),
@@ -1344,7 +1351,8 @@ fn judge_message(
             None => judge.sender_person.is_some(),
         },
     };
-    crate::rules::decide(judge.rules, judge.exceptions, &input)
+    let d = crate::rules::decide(judge.rules, judge.exceptions, &input);
+    (d, requester, skill.into())
 }
 
 /// What senders are owed about the messages they sent here: a `Receipt` for each whose state
@@ -1623,21 +1631,24 @@ pub fn forget(store: &Store) -> Result<()> {
     Ok(())
 }
 
-/// Mail that waited past `HOLD_S` becomes `expired` and leaves the mailbox.
+/// Mail that waited past `HOLD_S` becomes `expired` and leaves the mailbox; mail an open hold
+/// parks waits for it (`holds::expire` closes it).
 pub fn expire(store: &Store, now: u64) -> Result<()> {
     let conn = store.conn();
     let tx = conn.unchecked_transaction()?;
     let due: Vec<(String, String)> = {
-        let mut stmt = tx.prepare(
-            "SELECT m.from_key, m.request_id FROM mailbox b JOIN messages m ON m.id = b.message_id WHERE b.expires_at < ?1",
-        )?;
+        let mut stmt = tx.prepare(&format!(
+            "SELECT m.from_key, m.request_id FROM mailbox JOIN messages m \
+             ON m.id = mailbox.message_id WHERE mailbox.expires_at < ?1 AND {NOT_HELD}"
+        ))?;
         let rows = stmt.query_map([now as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
         rows.collect::<rusqlite::Result<_>>()?
     };
     for (from, request_id) in due {
         advance(&tx, &from, &request_id, State::Expired, None, None, now)?;
     }
-    tx.execute("DELETE FROM mailbox WHERE expires_at < ?1", [now as i64])?;
+    let sql = format!("DELETE FROM mailbox WHERE expires_at < ?1 AND {NOT_HELD}");
+    tx.execute(&sql, [now as i64])?;
     tx.commit()?;
     Ok(())
 }

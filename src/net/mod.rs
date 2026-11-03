@@ -1377,8 +1377,9 @@ fn receive(d: &Arc<Daemon>, key: &str, env: &Frame, raw: &serde_json::Value, tx:
         }) => {
             eprintln!("net: envelope {id} from {short}: {}", state.name());
             ack(state, reason, limit);
-            if let Some(h) = held {
-                eprintln!("net: hold H{h} for {to}");
+            // Shown to the person, as a worker hold is.
+            if let Some(Ok(Some(h))) = held.map(|h| holds::get(&store, h)) {
+                holds::shown(d, &team, &store, &h);
             }
             // A fresh worker's address has no mailbox: nothing to wake, only a follow-up.
             match (taken, cancelled) {

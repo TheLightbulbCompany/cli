@@ -309,16 +309,22 @@ fn when_matches(w: &Option<When>, i: &Input) -> bool {
 /// The holders of the best-matching key (an exact key, else the longest wildcard prefix), with
 /// `@session-person` replaced by the session's person, or dropped when there is none.
 fn holders_of(rules: &Rules, i: &Input) -> Vec<String> {
+    holders(rules, i.resource, i.session_person)
+}
+
+/// The people who hold `resource` under `rules` (`holders_of`), `session_person` standing for
+/// `@session-person`.
+pub fn holders(rules: &Rules, resource: &str, session_person: Option<&str>) -> Vec<String> {
     let best = rules
         .holders
         .keys()
-        .filter(|k| glob(k, i.resource))
+        .filter(|k| glob(k, resource))
         .max_by_key(|k| (!k.ends_with('*'), k.len()));
     let Some(best) = best else { return vec![] };
     rules.holders[best]
         .iter()
         .filter_map(|h| match h.as_str() {
-            "@session-person" => i.session_person.map(String::from),
+            "@session-person" => session_person.map(String::from),
             h => Some(h.into()),
         })
         .collect()

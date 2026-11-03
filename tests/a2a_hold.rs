@@ -78,6 +78,19 @@ fn document(rules: Value) -> String {
 }
 
 impl Peer {
+    /// The next receipt for envelope `id` in `state`: its reason.
+    async fn receipt(&mut self, id: &str, state: &str) -> Option<String> {
+        match self
+            .recv_where(
+                |f| matches!(f, Frame::Receipt { id: i, state: s, .. } if i == id && s == state),
+            )
+            .await
+        {
+            Frame::Receipt { reason, .. } => reason,
+            _ => unreachable!(),
+        }
+    }
+
     async fn ack(&mut self, id: &str) -> (String, Option<String>) {
         match self
             .recv_where(|f| matches!(f, Frame::Ack { id: i, .. } if i == id))
@@ -96,6 +109,16 @@ async fn a_and_b(
     b_user: Option<&str>,
     doc: Option<String>,
 ) -> (Env, Env, iroh::Endpoint, Peer) {
+    a_and_b_with(a_user, b_user, doc, &[]).await
+}
+
+/// `a_and_b`, A's daemon started with `env`.
+async fn a_and_b_with(
+    a_user: Option<&str>,
+    b_user: Option<&str>,
+    doc: Option<String>,
+    env: &[(&str, String)],
+) -> (Env, Env, iroh::Endpoint, Peer) {
     let (a, b) = (Env::new(), Env::new());
     seed_team(&a, &b);
     if let Some(u) = a_user {
@@ -104,7 +127,7 @@ async fn a_and_b(
     if let Some(d) = doc {
         assert!(lightbulb::rules::store_doc(&a.store(), &d, now_s()).unwrap());
     }
-    a.daemon(false, "", &[]);
+    a.daemon(false, "", env);
     let ep = endpoint(&b.identity()).await;
     let mut p = Peer::dial(&ep, &a).await;
     let proof = b_user.map(|u| issuer::proof(&b.identity().key, u, now_s()));
@@ -259,4 +282,220 @@ async fn object_from_another_workspace_is_refused_outside_org() {
     let (ack, wrote) = object_against(document(allow), "org_2").await;
     assert_eq!(ack, refused("policy"));
     assert!(!wrote);
+}
+
+// Answering an Authority hold (spec §6).
+
+fn answer(e: &Env, id: &str, verdict: &str, scope: &str) -> Value {
+    person(
+        e,
+        json!({"id": 1, "op": "hold.answer", "hold": id, "verdict": verdict, "scope": scope}),
+    )
+}
+
+/// The `approvals` record of hold `n`.
+fn record(e: &Env, n: i64) -> Value {
+    let c = rusqlite::Connection::open(e.state.path().join("state.db")).unwrap();
+    let r: String = c
+        .query_row(
+            "SELECT record FROM approvals WHERE hold_id = ?1",
+            [n],
+            |r| r.get(0),
+        )
+        .unwrap();
+    serde_json::from_str(&r).unwrap()
+}
+
+/// A signed in as `user_a`, B as `user_b` (A's `env`), and B's held ask `hi` with an object:
+/// the envelope id and the object.
+async fn held_ask(
+    env: &[(&str, String)],
+) -> (Env, Env, iroh::Endpoint, Peer, String, String, String) {
+    let (a, b, ep, mut p) = a_and_b_with(Some("user_a"), Some("user_b"), None, env).await;
+    let (sa, sb) = (session(&a, "a1"), session(&b, "b1"));
+    let id = ulid();
+    let jws = authority("user_b", &format!("session:{sa}"), "hi");
+    let v = signed(
+        &b.identity(),
+        envelope(&id, &sb, &sa, "hi", Some(ask("hi", Some(jws.clone())))),
+    );
+    p.send_raw(&v).await;
+    assert_eq!(p.ack(&id).await.0, "held");
+    (a, b, ep, p, id, jws, sa)
+}
+
+fn sha256(s: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let d = Sha256::digest(s.as_bytes());
+    format!("sha256:{}", data_encoding::HEXLOWER.encode(&d))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn allow_delivers_the_held_message_and_writes_the_record_with_authority_id() {
+    let (a, b, _ep, mut p, id, jws, sa) = held_ask(&[]).await;
+    let sb = session(&b, "b1");
+    // Shown on arrival: the requester chain, the session, for whom, the intent, the text.
+    until(5, "the dialog's text kept", || {
+        held(&a).first().is_some_and(|h| h["shown"].is_string())
+    });
+    let shown = held(&a)[0]["shown"].as_str().unwrap().to_string();
+    assert_eq!(
+        shown,
+        "agent_1 (user_b) asks Codex for user_b: say hi\n\nhi"
+    );
+    let r = answer(&a, "H1", "allow", "once");
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(p.receipt(&id, "stored").await, None);
+    assert_eq!(a.state(&sb, &format!("r-{id}")), "stored");
+    let got = a.inbox(&sa);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0]["text"], "hi");
+    let rec = record(&a, 1);
+    assert_eq!(rec["verdict"], "allow");
+    assert_eq!(rec["authority_id"], "auth_1");
+    assert_eq!(rec["authority_hash"], sha256(&jws));
+    assert_eq!(rec["resource"], format!("session:{sa}"));
+    assert_eq!(rec["skill"], "ask_session");
+    assert_eq!(rec["requester"], "person:user_b");
+    assert_eq!(rec["text"], shown.as_str());
+    assert_eq!(rec["by"], "local");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn decline_refuses_declined() {
+    let (a, b, _ep, mut p, id, _jws, sa) = held_ask(&[]).await;
+    let r = answer(&a, "H1", "decline", "once");
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(p.receipt(&id, "refused").await.as_deref(), Some("declined"));
+    let rid = format!("r-{id}");
+    assert_eq!(a.receipt(&session(&b, "b1"), &rid)["reason"], "declined");
+    assert_eq!(mailbox(&a), 0);
+    assert!(a.inbox(&sa).is_empty());
+    assert_eq!(record(&a, 1)["verdict"], "decline");
+    assert!(held(&a).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn always_allow_writes_an_exception_and_the_next_identical_ask_flows() {
+    // A's person holds `session:*` (`@session-person`): the dialog offers Always allow.
+    let (a, b, _ep, mut p, id, _jws, sa) = held_ask(&[common::dialog("Always allow")]).await;
+    let sb = session(&b, "b1");
+    assert_eq!(p.receipt(&id, "stored").await, None);
+    assert_eq!(record(&a, 1)["scope"], "always");
+    let ex = lightbulb::rules::exceptions(&a.store(), &a.short()).unwrap();
+    assert_eq!(ex.len(), 1, "{ex:?}");
+    assert_eq!(
+        (&*ex[0].resource, &*ex[0].skill, &*ex[0].requester),
+        (&*format!("session:{sa}"), "ask_session", "person:user_b")
+    );
+    assert_eq!(ex[0].operands_hash, None);
+    // The next identical ask flows, stored at once.
+    let again = ulid();
+    let jws = authority("user_b", &format!("session:{sa}"), "hi");
+    let v = signed(
+        &b.identity(),
+        envelope(&again, &sb, &sa, "hi", Some(ask("hi", Some(jws)))),
+    );
+    p.send_raw(&v).await;
+    assert_eq!(p.ack(&again).await.0, "stored");
+    assert_eq!(held(&a).len(), 0);
+    assert_eq!(a.inbox(&sa).len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_agent_session_cannot_answer_an_authority_hold() {
+    let (a, _b, _ep, _p, _id, _jws, sa) = held_ask(&[]).await;
+    let store = a.store();
+    let roster = lightbulb::roster::replay(&lightbulb::roster::entries(&store).unwrap());
+    let agent = format!("{}/claude:x", a.short());
+    for allow in [true, false] {
+        let r = lightbulb::holds::answer(
+            &store,
+            &roster,
+            &a.identity(),
+            std::path::Path::new("/tmp"),
+            1,
+            allow,
+            "once",
+            &agent,
+            true,
+            now_s(),
+        )
+        .unwrap();
+        assert_eq!(r.err(), Some("not_a_person"));
+    }
+    assert_eq!(held(&a).len(), 1);
+    assert_eq!(a.unread(&sa), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn authority_hold_expires_after_24h_with_receipt_expired() {
+    // The daemon's clock cannot be moved: `holds::expire` runs on A's store at a later `now`.
+    let (a, b, _ep, _p, id, _jws, sa) = held_ask(&[]).await;
+    let store = a.store();
+    let at = lightbulb::holds::get(&store, 1)
+        .unwrap()
+        .unwrap()
+        .created_at;
+    assert!(lightbulb::holds::expire(&store, at + 86_399)
+        .unwrap()
+        .is_empty());
+    let gone = lightbulb::holds::expire(&store, at + 86_400).unwrap();
+    assert_eq!(gone.iter().map(|h| h.id).collect::<Vec<_>>(), [1]);
+    let h = lightbulb::holds::get(&store, 1).unwrap().unwrap();
+    assert_eq!(h.state, "expired");
+    assert_eq!(mailbox(&a), 0);
+    assert_eq!(a.state(&session(&b, "b1"), &format!("r-{id}")), "expired");
+    assert!(a.inbox(&sa).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn held_mailbox_row_survives_mail_expire_while_its_hold_is_open() {
+    let (a, b, _ep, _p, id, _jws, sa) = held_ask(&[]).await;
+    let store = a.store();
+    let later = now_s() as u64 + lightbulb::mail::HOLD_S + 60;
+    lightbulb::mail::expire(&store, later).unwrap();
+    assert_eq!(mailbox(&a), 1);
+    assert_eq!(a.state(&session(&b, "b1"), &format!("r-{id}")), "held");
+    assert_eq!(held(&a).len(), 1);
+    // Still answerable, and the answer delivers.
+    assert_eq!(answer(&a, "H1", "allow", "once")["ok"], true);
+    assert_eq!(a.inbox(&sa).len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rules_set_while_a_hold_is_open_leaves_it_answerable() {
+    let (a, _b, _ep, _p, _id, _jws, sa) = held_ask(&[]).await;
+    until(5, "shown", || {
+        held(&a).first().is_some_and(|h| h["shown"].is_string())
+    });
+    let shown = held(&a)[0]["shown"].as_str().unwrap().to_string();
+    // A new document that would deny this ask arrives.
+    let deny = json!([{"id": "no-b", "resource": "session:*", "skill": "ask_session",
+                       "requesters": ["person:user_b"], "effect": "deny"}]);
+    assert!(lightbulb::rules::store_doc(&a.store(), &document(deny), now_s()).unwrap());
+    assert_eq!(held(&a).len(), 1);
+    let r = answer(&a, "H1", "allow", "once");
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(a.inbox(&sa).len(), 1);
+    assert_eq!(record(&a, 1)["text"], shown.as_str());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn allow_after_the_senders_outbox_expired_still_delivers() {
+    let (a, b, ep, p, id, _jws, sa) = held_ask(&[]).await;
+    // B gave up and is gone; the row's own 24 h in the mailbox have passed too.
+    drop(p);
+    ep.close().await;
+    until(10, "B offline", || a.status()["peers"]["online"] == 0);
+    let c = rusqlite::Connection::open(a.state.path().join("state.db")).unwrap();
+    c.execute("UPDATE mailbox SET expires_at = 1", []).unwrap();
+    lightbulb::mail::expire(&a.store(), now_s() as u64).unwrap();
+    let r = answer(&a, "H1", "allow", "once");
+    assert_eq!(r["ok"], true, "{r}");
+    let got = a.inbox(&sa);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(record(&a, 1)["authority_id"], "auth_1");
+    // Taken by the session; B never hears.
+    assert_eq!(a.state(&session(&b, "b1"), &format!("r-{id}")), "delivered");
 }
