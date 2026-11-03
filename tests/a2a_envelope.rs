@@ -93,6 +93,30 @@ async fn signed_envelope_with_a2a_is_stored_with_sig_and_signed_at() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unknown_future_field_survives_signature_verification() {
+    let (a, b, _ep, mut p) = a_and_peer_b().await;
+    let (sa, sb) = (session(&a, "a1"), session(&b, "b1"));
+    let id = ulid();
+    let mut v = envelope(&id, &sb, &sa, "hi", Some(user("hi")));
+    v["future"] = json!(1);
+    let v = signed(&b.identity(), v);
+    p.send_raw(&v).await;
+    assert_eq!(p.ack(&id).await.0, "stored");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bad_signature_is_checked_before_the_kind() {
+    let (a, b, _ep, mut p) = a_and_peer_b().await;
+    let (sa, sb) = (session(&a, "a1"), session(&b, "b1"));
+    let id = ulid();
+    let mut v = envelope(&id, &sb, &sa, "hi", None);
+    v["kind"] = "input".into();
+    let v = signed(&a.identity(), v);
+    p.send_raw(&v).await;
+    assert_eq!(p.ack(&id).await, refused("bad_request"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tampered_body_is_refused_bad_request() {
     let (a, b, _ep, mut p) = a_and_peer_b().await;
     let (sa, sb) = (session(&a, "a1"), session(&b, "b1"));

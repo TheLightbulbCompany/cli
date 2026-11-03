@@ -404,7 +404,6 @@ fn assign_hold(
             deadline_at: deadline,
             ..Default::default()
         },
-
         ..Default::default()
     };
     s.put_message(&m).unwrap();

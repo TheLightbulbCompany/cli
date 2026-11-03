@@ -214,9 +214,9 @@ pub enum Frame {
         sent_at: i64,
         #[serde(default, skip_serializing_if = "Meta::is_empty")]
         meta: Meta,
-        /// The A2A Message minus what the envelope carries (`role`, `parts`, `metadata`,
-        /// `extensions`); its text parts joined are `body` (`mail::a2a_text`). Absent from
-        /// older builds.
+        /// The A2A Message's `role`, `parts`, `metadata` and `extensions` (its ids, thread and
+        /// reply ride the envelope); its text parts joined are `body` (`mail::a2a_text`).
+        /// Absent from older builds.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         a2a: Option<serde_json::Value>,
         /// The sending computer's signature (`envelope_sig`). Absent from older builds.
@@ -334,6 +334,7 @@ pub async fn read(recv: &mut (impl AsyncRead + Unpin)) -> Result<Frame> {
 }
 
 /// `read`, with the frame's JSON as received: what an envelope's `sig` is checked over.
+// ponytail: every frame is parsed twice (Value then Frame); keep the Value only for envelopes if this shows up in profiles
 pub async fn read_raw(recv: &mut (impl AsyncRead + Unpin)) -> Result<(Frame, serde_json::Value)> {
     let len = recv.read_u32().await? as usize;
     if len > MAX_FRAME {

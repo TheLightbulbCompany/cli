@@ -513,12 +513,12 @@ pub struct Prepared {
 }
 
 /// An A2A Message's text: its `parts[].text` joined by newlines; `None` when a part has no
-/// `text` (this phase takes text only) or the role is not `ROLE_USER` or `ROLE_AGENT`.
+/// `text` (this phase takes text only), there are no parts, or the role is not `ROLE_USER` or `ROLE_AGENT`.
 pub fn a2a_text(a2a: &Value) -> Option<String> {
     if !matches!(a2a["role"].as_str(), Some("ROLE_USER" | "ROLE_AGENT")) {
         return None;
     }
-    let parts = a2a["parts"].as_array()?;
+    let parts = a2a["parts"].as_array().filter(|p| !p.is_empty())?;
     let texts: Option<Vec<&str>> = parts.iter().map(|p| p["text"].as_str()).collect();
     Some(texts?.join("\n"))
 }
@@ -1491,6 +1491,22 @@ pub fn expire(store: &Store, now: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a2a_text_is_the_text_parts_joined_or_none() {
+        use serde_json::json;
+        let two = json!({"role": "ROLE_AGENT", "parts": [{"text": "a"}, {"text": "b"}]});
+        assert_eq!(a2a_text(&two).as_deref(), Some("a\nb"));
+        for bad in [
+            json!({"role": "ROLE_USER", "parts": []}),
+            json!({"parts": [{"text": "a"}]}),
+            json!({"role": "user", "parts": [{"text": "a"}]}),
+            json!({"role": "ROLE_USER", "parts": {"text": "a"}}),
+            json!("hi"),
+        ] {
+            assert_eq!(a2a_text(&bad), None, "{bad}");
+        }
+    }
 
     /// A config with network workers on (assignments are refused `unsupported` without).
     fn workers_on() -> Config {
