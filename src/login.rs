@@ -524,6 +524,10 @@ pub fn logout() -> Result<i32> {
         ok("/network/proof/revoke", &body)
     });
     let removed = std::fs::remove_file(dir.join(FILE));
+    // The stored rules pin this computer to one workspace: a new sign-in starts clean.
+    if let Ok(store) = crate::store::Store::open(&dir.join("state.db")) {
+        let _ = crate::rules::clear(&store);
+    }
     tell_daemon();
     match removed {
         Ok(()) => match told {

@@ -140,6 +140,24 @@ pub fn load(store: &Store) -> Result<(Option<String>, Rules)> {
     }
 }
 
+/// `(workspace, revision, iat)` of the stored document, if any.
+pub fn stored(store: &Store) -> Result<Option<(String, String, i64)>> {
+    Ok(store
+        .conn()
+        .query_row(
+            "SELECT workspace, revision, iat FROM rules LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?)
+}
+
+/// Forgets the stored document and the workspace it pinned (sign-out).
+pub fn clear(store: &Store) -> Result<()> {
+    store.conn().execute("DELETE FROM rules", [])?;
+    Ok(())
+}
+
 /// A standing choice of this computer's person, from an `approvals` row with no hold.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Exception {
@@ -441,6 +459,16 @@ mod tests {
             operands_hash: hash.map(String::from),
             deny,
         }
+    }
+
+    #[test]
+    fn clear_forgets_the_document_and_the_pin() {
+        let (_d, s) = store();
+        assert!(store_doc(&s, &mint("ws1", NOW, "r1"), NOW).unwrap());
+        assert_eq!(stored(&s).unwrap(), Some(("ws1".into(), "r1".into(), NOW)));
+        clear(&s).unwrap();
+        assert_eq!(stored(&s).unwrap(), None);
+        assert!(store_doc(&s, &mint("ws2", NOW, "r2"), NOW).unwrap());
     }
 
     #[test]

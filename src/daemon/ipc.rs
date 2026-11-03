@@ -429,6 +429,19 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
         // something elsewhere first (`memory approve`) asks before it acts.
         "person" if for_a_person() => Response::ok(id, json!({})),
         "person" => refused(id, "not_a_person"),
+        // `rules.get` -> the stored rules document's `{workspace, revision, iat}`, or
+        // `{workspace: null, revision: "default", iat: null}`; a person's.
+        "rules.get" if !for_a_person() => refused(id, "not_a_person"),
+        "rules.get" => match crate::rules::stored(&daemon.store.lock().unwrap()) {
+            Ok(Some((w, r, iat))) => {
+                Response::ok(id, json!({"workspace": w, "revision": r, "iat": iat}))
+            }
+            Ok(None) => Response::ok(
+                id,
+                json!({"workspace": null, "revision": "default", "iat": null}),
+            ),
+            Err(_) => Response::err(id, INTERNAL),
+        },
         "memory.remember" => {
             memory_remember(id, body, daemon, instance, !instance && for_a_person())
         }
