@@ -286,15 +286,16 @@ fn authority_dialog(store: &Store, h: &Hold, who: String) -> (String, Vec<&'stat
             let chain: Vec<String> = a
                 .chain
                 .iter()
+                // The requester wrote these: one capped line each (`preview`), as the intent.
                 .map(|hop| match &hop.agent {
-                    Some(agent) => format!("{agent} ({})", hop.person),
-                    None => hop.person.clone(),
+                    Some(agent) => format!("{} ({})", preview(agent), preview(&hop.person)),
+                    None => preview(&hop.person),
                 })
                 .collect();
             format!(
                 "{} asks {session} for {}: {}\n\n{body}",
                 chain.join(" → "),
-                a.requester_person,
+                preview(&a.requester_person),
                 preview(&a.intent)
             )
         }
@@ -870,7 +871,8 @@ fn run(
         "hold.answer" => {
             let (by, surface) = match body["decided_by"].as_str() {
                 _ if !instance => (agent.unwrap_or("local"), "cli"),
-                Some(p) if !p.is_empty() => (p, "bridge"),
+                // `local` is this computer's person: the bridge names the one who answered.
+                Some(p) if !p.is_empty() && p != "local" => (p, "bridge"),
                 _ => return Ok(Response::err(id, BAD_REQUEST)),
             };
             let allow = match body["verdict"].as_str() {

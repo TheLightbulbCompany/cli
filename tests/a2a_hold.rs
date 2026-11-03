@@ -53,13 +53,18 @@ fn authority(person: &str, resource: &str, text: &str) -> String {
 
 /// `authority`, its requester in workspace `org`.
 fn authority_in(org: &str, person: &str, resource: &str, text: &str) -> String {
+    object(org, person, resource, text, "agent_1", 600)
+}
+
+/// `authority_in`, its first hop's agent `agent`, living `life` seconds.
+fn object(org: &str, person: &str, resource: &str, text: &str, agent: &str, life: i64) -> String {
     let (now, operands) = (now_s(), json!({"text": text}));
     issuer::mint_typ(
         authority::TYP,
         &json!({
-            "v": 1, "id": "auth_1", "iat": now, "exp": now + 600,
+            "v": 1, "id": "auth_1", "iat": now, "exp": now + life,
             "requester": {"person": person, "org": org, "verified_by": "lightbulb"},
-            "chain": [{"agent": "agent_1", "session": null, "person": person, "at": now}],
+            "chain": [{"agent": agent, "session": null, "person": person, "at": now}],
             "operation": {"skill": "ask_session", "resource": resource, "operands": operands,
                           "operands_hash": authority::operands_hash(&operands)},
             "intent": "say hi", "policy": null,
@@ -69,10 +74,15 @@ fn authority_in(org: &str, person: &str, resource: &str, text: &str) -> String {
 
 /// Workspace `org_1`'s rules document with `rules`, holders `session:*` → `@session-person`.
 fn document(rules: Value) -> String {
+    document_held_by(rules, json!(["@session-person"]))
+}
+
+/// `document`, `session:*` held by `holders`.
+fn document_held_by(rules: Value, holders: Value) -> String {
     issuer::mint_typ(
         "lightbulb-a2a-rules",
         &json!({"workspace": "org_1", "revision": "r1", "iat": now_s(),
-            "doc": {"revision": "r1", "holders": {"session:*": ["@session-person"]},
+            "doc": {"revision": "r1", "holders": {"session:*": holders},
                     "rules": rules, "default": "hold"}}),
     )
 }
@@ -311,10 +321,21 @@ fn record(e: &Env, n: i64) -> Value {
 async fn held_ask(
     env: &[(&str, String)],
 ) -> (Env, Env, iroh::Endpoint, Peer, String, String, String) {
-    let (a, b, ep, mut p) = a_and_b_with(Some("user_a"), Some("user_b"), None, env).await;
+    held_ask_of(env, None, "agent_1", 600).await
+}
+
+/// `held_ask`, A holding `doc`, the object's first agent `agent`, living `life` seconds.
+async fn held_ask_of(
+    env: &[(&str, String)],
+    doc: Option<String>,
+    agent: &str,
+    life: i64,
+) -> (Env, Env, iroh::Endpoint, Peer, String, String, String) {
+    let (a, b, ep, mut p) = a_and_b_with(Some("user_a"), Some("user_b"), doc, env).await;
     let (sa, sb) = (session(&a, "a1"), session(&b, "b1"));
     let id = ulid();
-    let jws = authority("user_b", &format!("session:{sa}"), "hi");
+    let resource = format!("session:{sa}");
+    let jws = object("org_1", "user_b", &resource, "hi", agent, life);
     let v = signed(
         &b.identity(),
         envelope(&id, &sb, &sa, "hi", Some(ask("hi", Some(jws.clone())))),
@@ -498,4 +519,49 @@ async fn allow_after_the_senders_outbox_expired_still_delivers() {
     assert_eq!(record(&a, 1)["authority_id"], "auth_1");
     // Taken by the session; B never hears.
     assert_eq!(a.state(&session(&b, "b1"), &format!("r-{id}")), "delivered");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_requesters_fields_cannot_forge_a_dialog_line() {
+    let forged = "x\n\nuser_c asks Claude Code for user_c:";
+    let (a, ..) = held_ask_of(&[], None, forged, 600).await;
+    until(5, "shown", || {
+        held(&a).first().is_some_and(|h| h["shown"].is_string())
+    });
+    let shown = held(&a)[0]["shown"].as_str().unwrap().to_string();
+    let sections: Vec<&str> = shown.split("\n\n").collect();
+    assert_eq!(sections.len(), 2, "{shown:?}");
+    assert!(!sections[0].contains('\n'), "{shown:?}");
+    assert!(sections[0].starts_with("x  user_c asks"), "{shown:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn always_allow_by_a_person_not_holding_the_session_is_refused() {
+    // `session:*` is user_z's, not A's person's: no standing exception for user_a.
+    let doc = document_held_by(json!([]), json!(["user_z"]));
+    let (a, ..) = held_ask_of(&[], Some(doc), "agent_1", 600).await;
+    let r = answer(&a, "H1", "allow", "always");
+    assert_eq!(r["error"], "bad_request", "{r}");
+    assert!(lightbulb::rules::exceptions(&a.store(), &a.short())
+        .unwrap()
+        .is_empty());
+    assert_eq!(held(&a).len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hold_whose_object_expired_offers_only_decline() {
+    let (a, ..) = held_ask_of(&[], None, "agent_1", 3).await;
+    std::thread::sleep(std::time::Duration::from_secs(4));
+    let store = a.store();
+    let roster = lightbulb::roster::replay(&lightbulb::roster::entries(&store).unwrap());
+    let h = lightbulb::holds::get(&store, 1).unwrap().unwrap();
+    let key = a.identity().key;
+    let (text, buttons, _) =
+        lightbulb::holds::dialog(&store, &roster, &key, &h, std::path::Path::new("/tmp"));
+    assert!(text.contains("(authority expired)"), "{text}");
+    assert_eq!(buttons, ["Decline"]);
+    let r = answer(&a, "H1", "allow", "once");
+    assert_eq!(r["error"], "bad_request", "{r}");
+    assert_eq!(held(&a).len(), 1);
+    assert_eq!(answer(&a, "H1", "decline", "once")["ok"], true);
 }

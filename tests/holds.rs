@@ -345,7 +345,8 @@ async fn a_dialog_that_gave_up_is_shown_again_by_held() {
 async fn hold_answer_on_an_instance_needs_decided_by() {
     let dir = tempfile::tempdir().unwrap();
     let (mut child, token, sock) = common::member(dir.path(), json!([]));
-    for decided_by in [Value::Null, json!(""), json!(3)] {
+    // `local` is this computer's own person: the bridge must name the one who answered.
+    for decided_by in [Value::Null, json!(""), json!(3), json!("local")] {
         let body = json!({"hold": "H1", "verdict": "allow", "decided_by": decided_by});
         let r = common::line(&sock, &token, "hold.answer", body);
         assert_eq!(r["error"], "bad_request", "{decided_by}: {r}");
