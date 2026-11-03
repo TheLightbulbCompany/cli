@@ -85,10 +85,11 @@ pub fn verify(jws: &str, now: i64) -> Result<Authority> {
     let sig = Signature::from_slice(&b64(s)?).map_err(|_| "signature")?;
     key.verify_strict(format!("{h}.{p}").as_bytes(), &sig)
         .map_err(|_| "signature")?;
-    let c: Value = serde_json::from_slice(&b64(p)?).map_err(|_| "jws")?;
-    if c["typ"] != TYP {
+    // The issuer puts `typ` in the protected header; a `typ` among the claims is not it.
+    if header["typ"] != TYP {
         return Err("typ".into());
     }
+    let c: Value = serde_json::from_slice(&b64(p)?).map_err(|_| "jws")?;
     let a = shape(&c, jws).ok_or("shape")?;
     if a.iat > now + IAT_SKEW_S {
         Err("iat".into())
@@ -166,7 +167,8 @@ pub fn expected_operands(kind: &str, body: &str, meta: &Meta) -> Value {
 }
 
 /// `a` bound to the envelope it rides: its resource is `to`'s (`worker:<short>/<harness>` for an
-/// assign to a fresh worker, else `session:<to>`), its operands are the envelope's
+/// assign to a fresh worker, else `session:<to>`), its skill fits `kind` (`assign`; `message` or
+/// `ask_session` for a message), its operands are the envelope's
 /// (`expected_operands`), and its requester is the sending computer's proof person
 /// (`sender_person`), or the sender relays a hosted chain (two hops, it is the second).
 pub fn bind(
@@ -183,6 +185,14 @@ pub fn bind(
     };
     if a.resource != resource {
         return Err("resource".into());
+    }
+    let skill_ok = match kind {
+        "assign" => a.skill == "assign",
+        "message" => matches!(a.skill.as_str(), "message" | "ask_session"),
+        _ => false,
+    };
+    if !skill_ok {
+        return Err("skill".into());
     }
     let want = expected_operands(kind, body, meta);
     if operands_hash(&want) != operands_hash(&a.operands) || want != a.operands {
@@ -209,7 +219,7 @@ mod tests {
     fn claims(over: Value) -> Value {
         let operands = json!({"text": BODY});
         let mut c = json!({
-            "typ": TYP, "v": 1, "id": "auth_1", "iat": 1_000, "exp": 1_000 + 3_600,
+            "v": 1, "id": "auth_1", "iat": 1_000, "exp": 1_000 + 3_600,
             "requester": {"person": "user_a", "org": "org_1", "verified_by": "lightbulb"},
             "chain": [{"agent": "agent_1", "session": "s1", "person": "user_a", "at": 1_000}],
             "operation": {"skill": "message", "resource": "session:abc/codex:1",
@@ -223,7 +233,7 @@ mod tests {
     }
 
     fn mint(over: Value) -> String {
-        issuer::mint(&claims(over))
+        issuer::mint_typ(TYP, &claims(over))
     }
 
     fn err(r: Result<Authority>) -> String {
@@ -248,7 +258,11 @@ mod tests {
 
     #[test]
     fn rejects_wrong_typ_expired_long_life_and_bad_sig() {
-        assert_eq!(err(verify(&mint(json!({"typ": "x"})), 1_500)), "typ");
+        let other_typ = issuer::mint_typ("lightbulb-a2a-rules", &claims(json!({})));
+        assert_eq!(err(verify(&other_typ, 1_500)), "typ");
+        // `typ` only among the claims (no header `typ`) is not an authority object.
+        let in_claims = issuer::mint(&claims(json!({"typ": TYP})));
+        assert_eq!(err(verify(&in_claims, 1_500)), "typ");
         assert_eq!(err(verify(&mint(json!({})), 1_000 + 3_601)), "exp");
         let long = json!({"exp": 1_000 + MAX_LIFE_S + 1});
         assert_eq!(err(verify(&mint(long), 1_500)), "exp");
@@ -272,7 +286,10 @@ mod tests {
         assert_eq!(err(verify(&mint(json!({"chain": chain})), 1_500)), "origin");
         let mut c = claims(json!({}));
         c["operation"]["operands_hash"] = operands_hash(&json!({"text": "other"})).into();
-        assert_eq!(err(verify(&issuer::mint(&c), 1_500)), "operands_hash");
+        assert_eq!(
+            err(verify(&issuer::mint_typ(TYP, &c), 1_500)),
+            "operands_hash"
+        );
     }
 
     #[test]
@@ -294,6 +311,13 @@ mod tests {
             "requester"
         );
         assert_eq!(e(bind(&a, "message", to, BODY, &m, None)), "requester");
+        let mut c = claims(json!({}));
+        c["operation"]["skill"] = "assign".into();
+        let wrong_skill = verify(&issuer::mint_typ(TYP, &c), 1_500).unwrap();
+        assert_eq!(
+            e(bind(&wrong_skill, "message", to, BODY, &m, Some("user_a"))),
+            "skill"
+        );
         // The cloud member relays a hosted agent's ask: chain of two, it is the second hop.
         let chain = json!([
             {"agent": "hosted", "session": null, "person": "user_a", "at": 1_000},
@@ -323,7 +347,7 @@ mod tests {
         let mut c = claims(json!({}));
         c["operation"] = json!({"skill": "assign", "resource": "worker:abc/claude",
             "operands": operands, "operands_hash": operands_hash(&operands)});
-        let a = verify(&issuer::mint(&c), 1_500).unwrap();
+        let a = verify(&issuer::mint_typ(TYP, &c), 1_500).unwrap();
         let to = "abc/claude:new";
         assert!(bind(&a, "assign", to, BODY, &meta, Some("user_a")).is_ok());
         let e = |r: Result<()>| r.unwrap_err().to_string();

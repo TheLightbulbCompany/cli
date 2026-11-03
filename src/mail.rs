@@ -1074,27 +1074,6 @@ pub fn receive(
             Some(_) => {}
         }
     }
-    // The issuer-signed authority object, bound to this envelope; a bad one refuses it whole.
-    let authority = match a2a.as_ref().map(|a| &a["metadata"][crate::authority::URI]) {
-        Some(Value::Null) | None => None,
-        Some(jws) => {
-            let bound = jws
-                .as_str()
-                .ok_or_else(|| "jws".into())
-                .and_then(|jws| crate::authority::verify(jws, now as i64))
-                .and_then(|a| {
-                    crate::authority::bind(&a, kind, to, body, meta, judge.sender_person)
-                        .map(|()| a)
-                });
-            match bound {
-                Ok(a) => Some(a),
-                Err(e) => {
-                    eprintln!("net: an envelope's authority object is refused ({e})");
-                    return refused("bad_request");
-                }
-            }
-        }
-    };
     if !KINDS.contains(&kind.as_str())
         || !files.is_empty()
         || body.len() > MAX_TEXT
@@ -1136,6 +1115,28 @@ pub fn receive(
             ..Answer::is(r.state)
         });
     }
+    // The issuer-signed authority object, bound to this envelope; a bad one refuses it whole.
+    // After the resend checks: a resend gets the state it has, though its object has expired.
+    let authority = match a2a.as_ref().map(|a| &a["metadata"][crate::authority::URI]) {
+        Some(Value::Null) | None => None,
+        Some(jws) => {
+            let bound = jws
+                .as_str()
+                .ok_or_else(|| "jws".into())
+                .and_then(|jws| crate::authority::verify(jws, now as i64))
+                .and_then(|a| {
+                    crate::authority::bind(&a, kind, to, body, meta, judge.sender_person)
+                        .map(|()| a)
+                });
+            match bound {
+                Ok(a) => Some(a),
+                Err(e) => {
+                    eprintln!("net: an envelope's authority object is refused ({e})");
+                    return refused("bad_request");
+                }
+            }
+        }
+    };
     // `reply_to` is a message id on the wire.
     let parent = match reply_to {
         Some(r) => store.message(r)?,

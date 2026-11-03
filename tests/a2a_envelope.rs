@@ -202,15 +202,23 @@ async fn non_text_part_is_refused_unsupported() {
 
 /// An authority object from `person` for `resource` binding `{text}`, minted by the test issuer.
 fn authority(person: &str, resource: &str, text: &str) -> String {
+    authority_for(person, resource, text, 600)
+}
+
+/// `authority`, living `life` seconds from now.
+fn authority_for(person: &str, resource: &str, text: &str, life: i64) -> String {
     let (now, operands) = (now_s(), json!({"text": text}));
-    issuer::mint(&json!({
-        "typ": authority::TYP, "v": 1, "id": "auth_1", "iat": now, "exp": now + 600,
-        "requester": {"person": person, "org": "org_1", "verified_by": "lightbulb"},
-        "chain": [{"agent": "agent_1", "session": null, "person": person, "at": now}],
-        "operation": {"skill": "message", "resource": resource, "operands": operands,
-                      "operands_hash": authority::operands_hash(&operands)},
-        "intent": "say hi", "policy": null,
-    }))
+    issuer::mint_typ(
+        authority::TYP,
+        &json!({
+            "v": 1, "id": "auth_1", "iat": now, "exp": now + life,
+            "requester": {"person": person, "org": "org_1", "verified_by": "lightbulb"},
+            "chain": [{"agent": "agent_1", "session": null, "person": person, "at": now}],
+            "operation": {"skill": "message", "resource": resource, "operands": operands,
+                          "operands_hash": authority::operands_hash(&operands)},
+            "intent": "say hi", "policy": null,
+        }),
+    )
 }
 
 /// `user(text)` carrying `jws` as its authority object.
@@ -244,4 +252,22 @@ async fn authority_requester_not_the_sender_is_refused() {
     p.send_raw(&v).await;
     assert_eq!(p.ack(&id).await, refused("bad_request"));
     assert!(a.store().message(&id).unwrap().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resend_after_the_authority_expired_answers_its_stored_state() {
+    let (a, b, _ep, mut p) = a_and_peer_b_as(Some("user_b")).await;
+    let (sa, sb) = (session(&a, "a1"), session(&b, "b1"));
+    let id = ulid();
+    let a2a = asking(
+        "hi",
+        authority_for("user_b", &format!("session:{sa}"), "hi", 2),
+    );
+    let v = signed(&b.identity(), envelope(&id, &sb, &sa, "hi", Some(a2a)));
+    p.send_raw(&v).await;
+    assert_eq!(p.ack(&id).await.0, "stored");
+    // No clock control in the harness: wait past the object's `exp`.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    p.send_raw(&v).await;
+    assert_eq!(p.ack(&id).await.0, "stored");
 }
