@@ -7,26 +7,34 @@ change anything.
 
 ## The workflow
 
+The person should see a first version in Canvas within about 10 minutes of asking, then watch it
+get better. Show a working preview early; finish it after.
+
 1. **Read before you ask.** Read the request, the room, the workspace brand, any linked page or
-   attached file, and `.lightbulb/plan.md`. Ask at most one question card, and only for what you
-   could not read. The playbook lists what never to ask.
-2. **Write the plan** in `.lightbulb/plan.md`: what you build first, what "done" means (from the
-   playbook), what you will check.
-3. **Build the screens first, on sample data.** Put sample rows in `drizzle/seed.sql`. Add real
-   data, then sign-in, only when a feature needs them.
-4. **Check, cheapest first:** run `pnpm install` once (and after changing `package.json`;
-   `check` and `up` answer `not_installed` until you do), then `lightbulb app check` (type check, lint, design lint), then
-   `lightbulb app up` (deploys the preview, runs the health check, reads the logs), then
+   attached file, and `.lightbulb/plan.md`. Ask at most one question card, and only for what is
+   essential and you could not read. The playbook lists what never to ask. Write a few lines in
+   `.lightbulb/plan.md`: what you build first, what "done" means (from the playbook).
+2. **Build the first version yourself, in this conversation.** Don't hand the first version to a
+   sub-agent. The main screen and the main flow first, on sample data labelled "(sample)": put the
+   rows in `drizzle/seed.sql`. Add real data, then sign-in, only when a feature needs them.
+3. **Show it as soon as it checks.** Run `pnpm install` once (and after changing `package.json`;
+   `check` and `up` answer `not_installed` until you do), then `lightbulb app check` (type check,
+   lint, design lint). As soon as it passes, run `lightbulb app up` (deploys the preview, runs the
+   health check, reads the logs). When the preview is up, post the Canvas line (`canvas_url`) once,
+   with one or two plain sentences: it is a first version, and what you are still doing. Never call
+   it ready or live. People open the app from Canvas: never post the preview address, and never
+   post a test link anywhere; it lets its holder in as the builder.
+4. **Keep going.** Finish the flows, write a small test for each business rule (see Tests), run
+   `pnpm test`, and run `lightbulb app up` again: each `up` refreshes the same preview. Then
    `lightbulb app verify` (signs in past the door and opens every page; never install a browser).
    Verify doesn't press buttons, so also try the main flow: `lightbulb app test-link --json` gives a
    `url` for the shared browser. Record what you saw with
    `lightbulb app evidence --kind browser --file .lightbulb/evidence/<name>.png`. Keep the file
    under `.lightbulb/evidence/` (git ignores it) or outside the app, so it never changes the
    version. `lightbulb app status` shows `done` without redeploying.
-5. **Post nothing until `up` says `done: true`.** Then post the Canvas line (`canvas_url`) and what
-   you built, in two or three plain sentences. Call it a preview: it is not live until
-   `lightbulb app publish` returns. People open the app from Canvas: never post the
-   preview address, and never post a test link anywhere; it lets its holder in as the builder.
+5. **When `up` or `status` says `done: true`, post the ready line:** what it does and what you
+   checked, in two or three plain sentences. Call it a preview: it is not live until
+   `lightbulb app publish` returns.
 6. **Same error twice: stop patching.** When `up` or `check` says `next: "diagnose"`, read the
    logs (`lightbulb app status --errors`), check `.lightbulb/known-fixes.md`, and write a fresh
    plan before touching code. When it says `next: "undo"`, roll back and tell the room plainly what
@@ -126,4 +134,5 @@ Keep tests that pass; they run on every check.
 - Using `useState` or `onClick` in a file without `"use client"` at the top.
 - Editing a migration in `drizzle/` after it has run. Change `schema.ts` and generate a new one.
 - Reading `process.env.SOME_KEY` in a client component. It is undefined there, and it must stay so.
-- Saying it works before `up` says `done: true`.
+- Saying it works, or calling the first version ready, before `up` says `done: true`.
+- Handing the first version to a sub-agent, or holding the preview back until every test is written.

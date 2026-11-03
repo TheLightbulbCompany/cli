@@ -1910,7 +1910,7 @@ fn done_needs_ready_health_and_browser_evidence_for_head() {
     assert_eq!((code, &v["done"]), (0, &json!(false)), "{v}");
     assert_eq!(v["missing"], json!(["browser_evidence"]));
     let want = format!(
-        "run lightbulb app verify (it signs in past the door of {base} and opens every page)"
+        "the preview is up. If you haven't yet, post the Canvas line (canvas_url) once: one or two sentences saying it is a first version and what you are still doing; never call it ready or live. Then keep building: finish the flows, pnpm test, lightbulb app up again, and run lightbulb app verify (it signs in past the door of {base} and opens every page)"
     );
     assert_eq!(v["next"], want.as_str());
     assert!(lines(&seen).contains(&"GET /api/_lightbulb/health".to_string()));

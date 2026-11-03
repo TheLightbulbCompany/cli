@@ -16,6 +16,9 @@ pub(crate) struct DoneState {
     pub next: String,
 }
 
+/// `next` for a healthy preview of HEAD that nobody has checked yet: show it early, keep building.
+const FIRST_VERSION: &str = "the preview is up. If you haven't yet, post the Canvas line (canvas_url) once: one or two sentences saying it is a first version and what you are still doing; never call it ready or live. Then keep building: finish the flows, pnpm test, lightbulb app up again, and ";
+
 fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -163,7 +166,7 @@ pub(crate) fn done_with(
     if !seen {
         return not(
             "browser_evidence",
-            format!("run lightbulb app verify (it signs in past the door of {url} and opens every page)"),
+            format!("{FIRST_VERSION}run lightbulb app verify (it signs in past the door of {url} and opens every page)"),
         );
     }
     Ok(DoneState {
