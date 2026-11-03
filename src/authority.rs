@@ -57,6 +57,45 @@ pub struct Hop {
     pub at: i64,
 }
 
+/// What an inbox shows of a verified object (`frame::framed_kind`'s `[A2A]` line).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Summary {
+    pub requester: String,
+    pub for_whom: String,
+    pub intent: String,
+}
+
+impl Authority {
+    /// The chain's agents (a hop without one, its person) joined with " → ", for the first hop's person.
+    pub fn summary(&self) -> Summary {
+        let hop = |h: &Hop| h.agent.clone().unwrap_or_else(|| h.person.clone());
+        Summary {
+            requester: self.chain.iter().map(hop).collect::<Vec<_>>().join(" → "),
+            for_whom: self
+                .chain
+                .first()
+                .map(|h| h.person.clone())
+                .unwrap_or_default(),
+            intent: self.intent.clone(),
+        }
+    }
+}
+
+/// The summary of the object `m` carries, verified again at `now` (never read from unverified
+/// fields); an empty one when it no longer verifies. `None` for a message with no bound object.
+pub fn summary_of(m: &crate::store::Message, now: i64) -> Option<Summary> {
+    m.authority_id.as_ref()?;
+    let jws = m.a2a.as_ref()?["metadata"][URI].as_str()?;
+    Some(verify(jws, now).map_or(
+        Summary {
+            requester: String::new(),
+            for_whom: String::new(),
+            intent: String::new(),
+        },
+        |a| a.summary(),
+    ))
+}
+
 /// `"sha256:" + hex(sha256(canonical(operands)))`, as phase 1 hashes them.
 pub fn operands_hash(operands: &Value) -> String {
     let digest = Sha256::digest(crate::identity::canonical(operands));

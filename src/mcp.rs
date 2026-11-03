@@ -8,7 +8,7 @@
 use crate::agents::source::{self, SourceError};
 use crate::os::Process;
 use crate::sessions::{Key, Session, Tier};
-use crate::{daemon, hook, login, mail, paths};
+use crate::{authority, daemon, hook, login, mail, paths};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ListToolsResult,
     PaginatedRequestParams, RequestMetaObject,
@@ -132,6 +132,7 @@ struct SendArgs {
     reply_to_message_id: Option<String>,
     mention_ids: Option<Vec<String>>,
     status: Option<String>,
+    authority: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -839,11 +840,16 @@ impl Server {
         {
             return code("group_send_not_allowed");
         }
+        let a2a = a.authority.as_ref().map(|jws| {
+            json!({ "role": "ROLE_AGENT", "parts": [{ "text": a.text }],
+                "metadata": { authority::URI: jws }, "extensions": [authority::URI] })
+        });
         let r = ask(
             "send",
             json!({ "from": call.from, "to": a.session_id, "text": a.text,
                 "request_id": a.request_id, "reply_to": a.reply_to, "wait": true,
-                "kind": a.status.is_some().then_some("result"), "status": a.status }),
+                "kind": a.status.is_some().then_some("result"), "status": a.status,
+                "a2a": a2a }),
         )
         .await;
         Self::sent(&call, r).await

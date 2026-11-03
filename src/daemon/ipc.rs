@@ -4,7 +4,7 @@ use super::Daemon;
 use crate::agents::listing::{self, Listed};
 use crate::sessions::{self, Key};
 use crate::store;
-use crate::{doing, frame, label, mail, outbox, presence};
+use crate::{authority, doing, frame, label, mail, outbox, presence};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -2003,6 +2003,30 @@ pub(crate) fn send_as(
         return Err(refused(id, "not_declared"));
     }
     let from = Key(from);
+    // An A2A body: its `metadata` and `extensions` as given, `role` and `parts` from the text
+    // when absent; its text must be the text.
+    let a2a = match body.get("a2a") {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(o)) => {
+            let mut a = Value::Object(o.clone());
+            if a["role"].is_null() {
+                let role = if mail::is_person(&from.0) {
+                    "ROLE_USER"
+                } else {
+                    "ROLE_AGENT"
+                };
+                a["role"] = role.into();
+            }
+            if a["parts"].is_null() {
+                a["parts"] = json!([{ "text": text }]);
+            }
+            if mail::a2a_text(&a).as_deref() != Some(text) {
+                return Err(Response::err(id, BAD_REQUEST));
+            }
+            Some(a)
+        }
+        Some(_) => return Err(Response::err(id, BAD_REQUEST)),
+    };
     let team = daemon.team.lock().unwrap();
     let store = daemon.store.lock().unwrap();
     let internal = |_| Response::err(id, INTERNAL);
@@ -2021,6 +2045,7 @@ pub(crate) fn send_as(
         mail::Prep::Go(p) => p,
         mail::Prep::Done(r) => return Ok((from, r)),
     };
+    p.a2a = a2a;
     if app {
         p.hops = p.hops.max(1);
     }
@@ -2364,7 +2389,7 @@ pub(crate) fn records(daemon: &Daemon, messages: &[store::Message]) -> Vec<Value
                 "done_when": m.meta.done_when, "deadline_at": m.meta.deadline_at,
                 "framed": frame::framed_kind(&m.kind, label, &m.request_id,
                     m.reply_to.as_deref().and_then(|id| parents.get(id)).map(String::as_str),
-                    &m.meta, &m.body) })
+                    &m.meta, authority::summary_of(m, now() as i64).as_ref(), &m.body) })
         })
         .collect()
 }

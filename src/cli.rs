@@ -527,6 +527,7 @@ fn said(r: &Value, to: Option<&str>, rid: &str, check: bool) -> String {
     let p = crate::mail::ForPerson {
         to,
         rid,
+        kind: "message",
         cmd: command(),
         check,
     };

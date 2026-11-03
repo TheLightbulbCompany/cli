@@ -307,7 +307,7 @@ pub fn workspace(base: &Path, id: &str, meta: &Meta) -> Result<(PathBuf, bool)> 
 /// The worker's first prompt: assignment `a` framed as an agent gets it from `label`, its
 /// header line saying how to answer it.
 pub fn first_prompt(label: &str, a: &Message) -> String {
-    frame::framed_kind("assign", label, &a.request_id, None, &a.meta, &a.body)
+    frame::framed_kind("assign", label, &a.request_id, None, &a.meta, None, &a.body)
 }
 
 /// `start`'s half under the store lock, the one place the cap is kept: assignment `a`, not yet
