@@ -360,6 +360,8 @@ fn envelope(id: &str, rid: &str, from: &str, to: &str) -> Frame {
         files: vec![],
         sent_at: 0,
         meta: Default::default(),
+        a2a: None,
+        sig: None,
     }
 }
 
@@ -424,6 +426,8 @@ async fn assign(p: &mut Peer, who: &Identity, rid: &str, to: &str) -> (String, O
             deadline_at: Some(now_s() + 300),
             ..Default::default()
         },
+        a2a: None,
+        sig: None,
     })
     .await;
     match p

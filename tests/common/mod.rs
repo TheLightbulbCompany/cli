@@ -544,6 +544,16 @@ impl Peer {
         frames::write(&mut self.send, f).await.unwrap();
     }
 
+    /// A frame as raw JSON (`v`), for fields a `Frame` cannot spell (a hand-set `sig`).
+    pub async fn send_raw(&mut self, v: &Value) {
+        let body = serde_json::to_vec(v).unwrap();
+        self.send
+            .write_all(&(body.len() as u32).to_be_bytes())
+            .await
+            .unwrap();
+        self.send.write_all(&body).await.unwrap();
+    }
+
     pub async fn hello(&mut self, heads: Vec<String>) {
         self.hello_with(heads, None).await;
     }

@@ -1186,6 +1186,7 @@ mod tests {
                 deadline_at: Some(deadline),
                 ..Meta::default()
             },
+            ..Default::default()
         }
     }
 

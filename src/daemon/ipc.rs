@@ -2055,7 +2055,7 @@ fn dispatch_locked(
         let Some(member) = team.roster.by_short(prefix) else {
             return Err(Failed::NotMember);
         };
-        let r = outbox::enqueue(&store, p.clone(), member).map_err(internal)?;
+        let r = outbox::enqueue(&store, &daemon.identity, p.clone(), member).map_err(internal)?;
         daemon.peers.outbox.notify_one();
         return Ok(r);
     }

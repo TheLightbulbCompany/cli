@@ -120,6 +120,7 @@ pub fn file_permission(store: &Store, session: &str, prompt: &str, now: i64) -> 
         sent_at: now,
         reply_to: None,
         meta: Default::default(),
+        ..Default::default()
     };
     let tx = store.conn().unchecked_transaction()?;
     store.put_message(&m)?;

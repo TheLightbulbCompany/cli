@@ -504,9 +504,28 @@ pub struct Prepared {
     pub kind: String,
     pub meta: Meta,
     pub sent_at: i64,
+    /// The A2A Message the envelope carries (`Frame::Envelope`'s `a2a`).
+    pub a2a: Option<Value>,
+    /// The sending computer's envelope signature: set by `outbox::enqueue`, or as received.
+    pub sig: Option<String>,
+    /// The `sent_at` that `sig` covers (the sender's stamp).
+    pub signed_at: Option<i64>,
+}
+
+/// An A2A Message's text: its `parts[].text` joined by newlines; `None` when a part has no
+/// `text` (this phase takes text only) or the role is not `ROLE_USER` or `ROLE_AGENT`.
+pub fn a2a_text(a2a: &Value) -> Option<String> {
+    if !matches!(a2a["role"].as_str(), Some("ROLE_USER" | "ROLE_AGENT")) {
+        return None;
+    }
+    let parts = a2a["parts"].as_array()?;
+    let texts: Option<Vec<&str>> = parts.iter().map(|p| p["text"].as_str()).collect();
+    Some(texts?.join("\n"))
 }
 
 /// What `prepare` decided.
+// Short-lived, one per send: boxing `Go` would only touch every caller.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum Prep {
     /// To be stored.
@@ -540,6 +559,10 @@ impl From<&Prepared> for Message {
             sent_at: p.sent_at,
             reply_to: p.reply_to.clone(),
             meta: p.meta.clone(),
+            a2a: p.a2a.clone(),
+            sig: p.sig.clone(),
+            signed_at: p.signed_at,
+            authority_id: None,
         }
     }
 }
@@ -560,6 +583,8 @@ impl From<&Prepared> for Frame {
             files: vec![],
             sent_at: p.sent_at,
             meta: p.meta.clone(),
+            a2a: p.a2a.clone(),
+            sig: None,
         }
     }
 }
@@ -851,6 +876,9 @@ pub fn prepare(
         kind: kind.into(),
         meta,
         sent_at: now as i64,
+        a2a: None,
+        sig: None,
+        signed_at: None,
     }))
 }
 
@@ -953,7 +981,10 @@ pub fn send(
 }
 
 /// What member `peer`'s envelope `env` becomes on this computer (member prefix `me`), checked
-/// in this order: a `from` outside `peer`'s prefix is dropped unanswered (`Err`); a `kind` outside `KINDS` (`message`, `assign`, `result`, `cancel`; the `app_*` kinds never reach here: `net::receive` drops them), any `files`, a body over `MAX_TEXT`, or a malformed id, `thread` or `request_id`
+/// in this order: a `from` outside `peer`'s prefix is dropped unanswered (`Err`); a `sig` that
+/// is not `peer`'s over `raw` (the frame's JSON as received; `env` re-serialized when `None`),
+/// or an `a2a` without `sig` or whose text parts (`a2a_text`) are not exactly `body`, is
+/// `bad_request`, one with a non-text part `unsupported`; a `kind` outside `KINDS` (`message`, `assign`, `result`, `cancel`; the `app_*` kinds never reach here: `net::receive` drops them), any `files`, a body over `MAX_TEXT`, or a malformed id, `thread` or `request_id`
 /// is `unsupported`; a `to` that is not one address is `policy`, one under another prefix
 /// `not_member`; a `to` of the form `<member>/<provider>:new` is `no_worker` (this build starts
 /// no workers); an envelope seen before gets the state it has now and is not delivered again;
@@ -972,6 +1003,7 @@ pub fn send(
 pub fn receive(
     store: &Store,
     env: &Frame,
+    raw: Option<&Value>,
     peer: &Member,
     roster: &Roster,
     me: &str,
@@ -992,7 +1024,9 @@ pub fn receive(
         body,
         files,
         meta,
-        ..
+        sent_at,
+        a2a,
+        sig,
     } = env
     else {
         return Err("not an envelope".into());
@@ -1003,6 +1037,31 @@ pub fn receive(
     let ulid = |a: &str| ulid::Ulid::from_string(a).is_ok();
     if !address(from) || sessions::member_of(from) != Some(peer.short.as_str()) {
         return Err("an envelope from outside its member's prefix".into());
+    }
+    // The signature is over the JSON as received (fields a later build adds included).
+    if sig.is_some() {
+        let own;
+        let raw = match raw {
+            Some(r) => r,
+            None => {
+                own = serde_json::to_value(env)?;
+                &own
+            }
+        };
+        if !crate::net::frames::verify_envelope_sig(&peer.key, raw) {
+            return refused("bad_request");
+        }
+    }
+    if let Some(a2a) = a2a {
+        if sig.is_none() {
+            return refused("bad_request");
+        }
+        match a2a_text(a2a) {
+            None => return refused("unsupported"),
+            // Exact bytes: an old build reads `body` alone, so it must be the same text.
+            Some(text) if text != *body => return refused("bad_request"),
+            Some(_) => {}
+        }
     }
     if !KINDS.contains(&kind.as_str())
         || !files.is_empty()
@@ -1091,6 +1150,9 @@ pub fn receive(
         kind: kind.clone(),
         meta: meta.clone(),
         sent_at: now as i64,
+        a2a: a2a.clone(),
+        sig: sig.clone(),
+        signed_at: sig.as_ref().map(|_| *sent_at),
     };
     let tx = store.conn().unchecked_transaction()?;
     // A cancel reaches the worker module only for an assignment to a fresh worker.
@@ -1269,6 +1331,9 @@ fn close_assignment(
             ..Meta::default()
         },
         sent_at: now as i64,
+        a2a: None,
+        sig: None,
+        signed_at: None,
     };
     // One transaction each: an assignment that cannot be closed never stops the others.
     let stored = (|| -> Result<()> {
@@ -1548,6 +1613,7 @@ mod tests {
                 deadline_at: Some(5),
                 ..Meta::default()
             },
+            ..Default::default()
         };
         store.put_message(&assign("a1", "me/x")).unwrap();
         store.put_message(&assign("a2", "me/y")).unwrap();
@@ -2110,6 +2176,8 @@ mod tests {
             files: vec![],
             sent_at: 0,
             meta: Default::default(),
+            a2a: None,
+            sig: None,
         };
         (peer, roster, env)
     }
@@ -2137,6 +2205,7 @@ mod tests {
         let got = receive(
             &s,
             &env,
+            None,
             &peer,
             &roster,
             "m",
@@ -2169,6 +2238,7 @@ mod tests {
         let got = receive(
             &s,
             &env,
+            None,
             &peer,
             &roster,
             "m",
@@ -2215,6 +2285,7 @@ mod tests {
         let got = receive(
             &s,
             &third,
+            None,
             &peer,
             &roster,
             "m",
@@ -2231,6 +2302,7 @@ mod tests {
         let got = receive(
             &s,
             &env,
+            None,
             &peer,
             &roster,
             "m",
@@ -2252,6 +2324,7 @@ mod tests {
         receive(
             &s,
             &plain,
+            None,
             &peer,
             &roster,
             "m",
@@ -2271,6 +2344,7 @@ mod tests {
         let got = receive(
             &s,
             &env,
+            None,
             &peer,
             &roster,
             "m",
@@ -2294,6 +2368,7 @@ mod tests {
         let got = receive(
             &s,
             &env,
+            None,
             &peer,
             &roster,
             "m",
@@ -2317,6 +2392,7 @@ mod tests {
             let got = receive(
                 &s,
                 &env,
+                None,
                 &peer,
                 &roster,
                 "m",
@@ -2346,6 +2422,7 @@ mod tests {
             let r = receive(
                 &s,
                 &env,
+                None,
                 &peer,
                 &roster,
                 "m",
@@ -2360,6 +2437,7 @@ mod tests {
         receive(
             &s,
             &env,
+            None,
             &peer,
             &roster,
             "m",
@@ -2937,6 +3015,7 @@ mod tests {
         let got = receive(
             &s,
             &env,
+            None,
             &peer,
             &roster,
             "m",
@@ -2966,6 +3045,7 @@ mod tests {
             sent_at: 1,
             reply_to: None,
             meta: terms("x", 100),
+            ..Default::default()
         };
         let mut config = workers_on();
         let take =
@@ -3041,7 +3121,10 @@ mod tests {
         };
         for kind in ["assign", "result", "cancel"] {
             let env = peer_env("p/codex:a", "m/claude:new", "r1", kind, terms("x", 1060));
-            let got = receive(&s, &env, &peer, &roster, "m", None, None, &config, 1000).unwrap();
+            let got = receive(
+                &s, &env, None, &peer, &roster, "m", None, None, &config, 1000,
+            )
+            .unwrap();
             assert_eq!(
                 (got.state, got.reason.as_deref()),
                 (State::Refused, Some("unsupported")),
@@ -3066,11 +3149,17 @@ mod tests {
             "assign",
             terms("x", 1060),
         );
-        let first = receive(&s, &env, &peer, &roster, "m", None, None, &config, 1000).unwrap();
+        let first = receive(
+            &s, &env, None, &peer, &roster, "m", None, None, &config, 1000,
+        )
+        .unwrap();
         assert_eq!((first.state, first.fresh), (State::Held, true));
         assert!(matches!(first.taken, Some(Taken::Held { .. })));
         // The same envelope again, and the same request under another envelope id.
-        let again = receive(&s, &env, &peer, &roster, "m", None, None, &config, 1001).unwrap();
+        let again = receive(
+            &s, &env, None, &peer, &roster, "m", None, None, &config, 1001,
+        )
+        .unwrap();
         assert_eq!(
             (again.state, again.fresh, again.taken),
             (State::Held, false, None)
@@ -3082,7 +3171,10 @@ mod tests {
             "assign",
             terms("x", 1060),
         );
-        let again = receive(&s, &other, &peer, &roster, "m", None, None, &config, 1002).unwrap();
+        let again = receive(
+            &s, &other, None, &peer, &roster, "m", None, None, &config, 1002,
+        )
+        .unwrap();
         assert_eq!((again.state, again.fresh), (State::Held, false));
         let holds: i64 = s
             .conn()

@@ -31,6 +31,8 @@ fn envelope(id: &str, rid: &str, from: &str, to: &str, body: &str) -> Frame {
         files: vec![],
         sent_at: 0,
         meta: Default::default(),
+        a2a: None,
+        sig: None,
     }
 }
 
@@ -402,6 +404,8 @@ fn assign_hold(
             deadline_at: deadline,
             ..Default::default()
         },
+
+        ..Default::default()
     };
     s.put_message(&m).unwrap();
     holds::insert(s, m, member, 1_000).unwrap()

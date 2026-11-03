@@ -1050,9 +1050,9 @@ impl Net {
                 let mut sync = Incoming::default();
                 // After a `hello` of another protocol nothing more is served.
                 let mut stale = false;
-                while let Ok(f) = frames::read(&mut recv).await {
+                while let Ok((f, raw)) = frames::read_raw(&mut recv).await {
                     if !stale {
-                        stale = !self.on_frame(&key, &conn, f, &mut sync, &tx);
+                        stale = !self.on_frame(&key, &conn, f, raw, &mut sync, &tx);
                     }
                 }
             };
@@ -1093,12 +1093,14 @@ impl Net {
         eprintln!("net: disconnected {}", short(&key));
     }
 
-    /// Handles one frame from `key`; `false` once the peer speaks another protocol.
+    /// Handles one frame from `key` (`raw`, its JSON as received); `false` once the peer
+    /// speaks another protocol.
     fn on_frame(
         &self,
         key: &str,
         conn: &Connection,
         f: Frame,
+        raw: serde_json::Value,
         sync: &mut Incoming,
         tx: &Tx,
     ) -> bool {
@@ -1164,7 +1166,7 @@ impl Net {
         } else if matches!(f, Frame::Presence { .. }) {
             presence = Some(f);
         } else if matches!(f, Frame::Envelope { .. }) {
-            envelope = Some(f);
+            envelope = Some((f, raw));
         } else if matches!(f, Frame::ShareGrant { .. }) {
             grant = Some(f);
         } else if matches!(f, Frame::Ack { .. }) && d.peers.knobs().drop_acks {
@@ -1238,8 +1240,8 @@ impl Net {
             let first = !std::mem::replace(&mut sync.presence_stored, true);
             crate::presence::put(d, key, &p, ipc::now(), first);
         }
-        if let Some(env) = envelope.filter(|_| d.peers.speaks_ours(key, conn)) {
-            receive(d, key, &env, tx);
+        if let Some((env, raw)) = envelope.filter(|_| d.peers.speaks_ours(key, conn)) {
+            receive(d, key, &env, &raw, tx);
         }
         if let Some(g) = grant.filter(|_| d.peers.speaks_ours(key, conn)) {
             if let Err(e) = crate::streams::store(&d.store.lock().unwrap(), &g, ipc::now() as i64) {
@@ -1287,7 +1289,7 @@ impl Net {
 /// Member `key`'s envelope: checked and stored (`mail::receive`), answered with an `ack`.
 /// One whose `from` is not the member's own is dropped unanswered.
 /// An `app_*` envelope (the retired relay of a hosted app's call) is dropped unanswered.
-fn receive(d: &Arc<Daemon>, key: &str, env: &Frame, tx: &Tx) {
+fn receive(d: &Arc<Daemon>, key: &str, env: &Frame, raw: &serde_json::Value, tx: &Tx) {
     let Frame::Envelope { id, to, kind, .. } = env else {
         return;
     };
@@ -1322,6 +1324,7 @@ fn receive(d: &Arc<Daemon>, key: &str, env: &Frame, tx: &Tx) {
     match mail::receive(
         &store,
         env,
+        Some(raw),
         peer,
         &team.roster,
         me,

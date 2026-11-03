@@ -4,6 +4,7 @@
 use crate::daemon::{ipc, Daemon};
 use crate::doing::TEXT_MAX;
 use crate::frame::Sender;
+use crate::identity::{self, Identity};
 use crate::mail::{self, Meta, State};
 use crate::memory;
 use crate::roster::{Entry, Member};
@@ -156,8 +157,8 @@ pub(crate) fn own(short: &str, a: &str) -> bool {
         && sessions::split_addr(a).is_some_and(|(m, _)| m == short)
 }
 
-/// Transient frames carry no `sig`: the QUIC handshake authenticates the peer.
-/// ponytail: sign envelopes if they are ever forwarded.
+/// Transient frames carry no `sig`: the QUIC handshake authenticates the peer. An envelope
+/// carries its sending computer's (`envelope_sig`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum Frame {
@@ -213,6 +214,14 @@ pub enum Frame {
         sent_at: i64,
         #[serde(default, skip_serializing_if = "Meta::is_empty")]
         meta: Meta,
+        /// The A2A Message minus what the envelope carries (`role`, `parts`, `metadata`,
+        /// `extensions`); its text parts joined are `body` (`mail::a2a_text`). Absent from
+        /// older builds.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        a2a: Option<serde_json::Value>,
+        /// The sending computer's signature (`envelope_sig`). Absent from older builds.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sig: Option<String>,
     },
     /// `limit` (`hops` or `rate`) names the limit a `loop` refusal hit; a peer may leave it out.
     Ack {
@@ -321,13 +330,31 @@ pub async fn write(send: &mut (impl AsyncWrite + Unpin), f: &Frame) -> Result<()
 }
 
 pub async fn read(recv: &mut (impl AsyncRead + Unpin)) -> Result<Frame> {
+    Ok(read_raw(recv).await?.0)
+}
+
+/// `read`, with the frame's JSON as received: what an envelope's `sig` is checked over.
+pub async fn read_raw(recv: &mut (impl AsyncRead + Unpin)) -> Result<(Frame, serde_json::Value)> {
     let len = recv.read_u32().await? as usize;
     if len > MAX_FRAME {
         return Err(format!("a frame of {len} bytes").into());
     }
     let mut body = vec![0; len];
     recv.read_exact(&mut body).await?;
-    Ok(serde_json::from_slice(&body)?)
+    let raw: serde_json::Value = serde_json::from_slice(&body)?;
+    Ok((Frame::deserialize(&raw)?, raw))
+}
+
+/// Computer `id`'s `sig` for envelope `frame` (JSON): over `canonical(frame without sig)`.
+pub fn envelope_sig(id: &Identity, frame: &serde_json::Value) -> String {
+    id.sign(frame)
+}
+
+/// Whether `frame` (JSON, as received) carries member `member_key`'s valid `sig`.
+pub fn verify_envelope_sig(member_key: &str, frame: &serde_json::Value) -> bool {
+    frame["sig"]
+        .as_str()
+        .is_some_and(|sig| identity::verify(member_key, frame, sig))
 }
 
 /// The one per-frame check on what a member sends. `roster` entries are checked by
@@ -650,6 +677,8 @@ mod tests {
                 files,
                 sent_at,
                 meta,
+                a2a: None,
+                sig: None,
             },
             _ => unreachable!(),
         };
