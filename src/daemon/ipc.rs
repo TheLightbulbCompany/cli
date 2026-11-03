@@ -345,11 +345,17 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
         "receipt" => match (body["from"].as_str(), body["request_id"].as_str()) {
             (Some(from), Some(rid)) => {
                 let from = Key(from.into());
-                let got = mail::receipt(&daemon.store.lock().unwrap(), &from, rid);
+                let (got, kind) = {
+                    let store = daemon.store.lock().unwrap();
+                    (
+                        mail::receipt(&store, &from, rid),
+                        store.kind_of(&from.0, rid).ok().flatten(),
+                    )
+                };
                 match got {
                     Ok(Some(r)) => {
                         let r = finish(daemon, &from, r, false).await;
-                        Response::ok(id, json!({ "receipt": r }))
+                        Response::ok(id, json!({ "receipt": r, "kind": kind }))
                     }
                     Ok(None) => Response::err(id, NOT_FOUND),
                     Err(_) => Response::err(id, INTERNAL),
@@ -2009,6 +2015,11 @@ pub(crate) fn send_as(
         None | Some(Value::Null) => None,
         Some(Value::Object(o)) => {
             let mut a = Value::Object(o.clone());
+            if !a["role"].is_null()
+                && !matches!(a["role"].as_str(), Some("ROLE_USER" | "ROLE_AGENT"))
+            {
+                return Err(Response::err(id, BAD_REQUEST));
+            }
             if a["role"].is_null() {
                 let role = if mail::is_person(&from.0) {
                     "ROLE_USER"

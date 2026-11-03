@@ -164,7 +164,7 @@ pub struct ForPerson<'a> {
     pub to: Option<&'a str>,
     pub rid: &'a str,
     /// The kind of message the receipt is for (`KINDS`).
-    pub kind: &'a str,
+    pub kind: Option<&'a str>,
     pub cmd: &'a str,
     /// Whether to end with `Check: <cmd> receipt <rid>` (not when `receipt` itself prints it).
     pub check: bool,
@@ -271,8 +271,8 @@ fn receipt_text(r: &Value, person: Option<&ForPerson>) -> Option<String> {
                 "request_id_reused" => "that request id was used for another message".into(),
                 "unsupported" => "their computer cannot take it".into(),
                 "no_worker" => no_worker(p.to.and_then(new_harness).unwrap_or_default(), ""),
-                "bad_request" if p.kind == "assign" => "the assignment's terms were refused".into(),
-                "bad_request" => "the message was refused as malformed (signature or body)".into(),
+                "bad_request" if p.kind == Some("assign") => "the assignment's terms were refused".into(),
+                "bad_request" if p.kind.is_some() => "the message was refused as malformed (signature or body)".into(),
                 _ => shown("reason").replace('_', " "),
             }
         ),
@@ -1698,7 +1698,7 @@ mod tests {
         let to_aden = ForPerson {
             to: Some("m/claude:new"),
             rid: "r1",
-            kind: "message",
+            kind: Some("message"),
             cmd: "lightbulb",
             check: false,
         };
@@ -1714,7 +1714,7 @@ mod tests {
         let p = ForPerson {
             to: Some("m/claude:new"),
             rid: "r1",
-            kind: "message",
+            kind: Some("message"),
             cmd: "lightbulb",
             check: false,
         };
@@ -1725,7 +1725,7 @@ mod tests {
     #[test]
     fn a_bad_request_refusal_names_the_terms() {
         let r = serde_json::json!({"state": "refused", "reason": "bad_request"});
-        let note = |kind| {
+        let note = |kind: Option<&str>| {
             let p = ForPerson {
                 to: Some("m/codex:b"),
                 rid: "r1",
@@ -1736,13 +1736,14 @@ mod tests {
             receipt_note(&r, Some(&p)).unwrap()
         };
         assert_eq!(
-            note("message"),
+            note(Some("message")),
             "Not sent: the message was refused as malformed (signature or body)."
         );
         assert_eq!(
-            note("assign"),
+            note(Some("assign")),
             "Not sent: the assignment's terms were refused."
         );
+        assert_eq!(note(None), "Not sent: bad request.");
     }
 
     #[test]
@@ -2776,7 +2777,7 @@ mod tests {
         let p = ForPerson {
             to: Some("w/friday"),
             rid: "r1",
-            kind: "message",
+            kind: Some("message"),
             cmd: "lightbulb",
             check: false,
         };
@@ -2802,7 +2803,7 @@ mod tests {
         let p = ForPerson {
             to: Some("m/codex:b"),
             rid: "r1",
-            kind: "message",
+            kind: Some("message"),
             cmd: "lightbulb",
             check: false,
         };

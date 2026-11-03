@@ -1142,6 +1142,17 @@ impl Store {
             .map(Option::flatten)
     }
 
+    /// The kind of `from`'s message `request_id`, if it is here.
+    pub fn kind_of(&self, from: &str, request_id: &str) -> rusqlite::Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT kind FROM messages WHERE from_key = ?1 AND request_id = ?2",
+                [from, request_id],
+                |r| r.get(0),
+            )
+            .optional()
+    }
+
     pub fn put_mailbox(&self, to: &str, id: &str, at: i64, expires: i64) -> rusqlite::Result<()> {
         self.conn.execute(
             "INSERT INTO mailbox (to_key, message_id, queued_at, expires_at) VALUES (?1, ?2, ?3, ?4)",

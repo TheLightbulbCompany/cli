@@ -1850,3 +1850,18 @@ fn find_workers_shows_a_teammates_worker_host() {
     assert_eq!(host["folder"], "lightbulb-work", "{v}");
     assert_eq!(v["total"], 1, "{v}");
 }
+
+#[test]
+fn send_message_refuses_an_authority_that_is_not_a_compact_jws_without_echoing_it() {
+    let net = Net::new();
+    let key = net.register("claude", "c1", &me());
+    let mut m = net.mcp(&me());
+    for bad in ["secret-not-a-jws", "a.b", "a..c", "a.b.c.d", ".b.c"] {
+        let out = m.tool(
+            "send_message",
+            json!({"request_id": "j1", "text": "t", "session_id": key, "authority": bad}),
+        );
+        assert!(out.error, "{bad}: {}", out.text);
+        assert!(!out.text.contains(bad), "{}", out.text);
+    }
+}

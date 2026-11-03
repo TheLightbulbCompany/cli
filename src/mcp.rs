@@ -840,6 +840,13 @@ impl Server {
         {
             return code("group_send_not_allowed");
         }
+        // A compact JWS is three non-empty dot-separated parts; the value is never echoed.
+        if a.authority.as_ref().is_some_and(|j| {
+            let p: Vec<&str> = j.split('.').collect();
+            p.len() != 3 || p.iter().any(|s| s.is_empty())
+        }) {
+            return code("bad_authority");
+        }
         let a2a = a.authority.as_ref().map(|jws| {
             json!({ "role": "ROLE_AGENT", "parts": [{ "text": a.text }],
                 "metadata": { authority::URI: jws }, "extensions": [authority::URI] })

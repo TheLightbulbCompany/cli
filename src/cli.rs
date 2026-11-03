@@ -512,7 +512,7 @@ pub fn send(
         if receipt["state"] == "refused" {
             code = 1;
         }
-        let line = said(receipt, Some(&to), &rid, true);
+        let line = said(receipt, Some(&to), &rid, Some("message"), true);
         if group {
             println!("{line} ({})", cell(&handle));
         } else {
@@ -523,11 +523,11 @@ pub fn send(
 }
 
 /// What receipt `r` of message `rid` (to `to`, when known) means, for the person who sent it.
-fn said(r: &Value, to: Option<&str>, rid: &str, check: bool) -> String {
+fn said(r: &Value, to: Option<&str>, rid: &str, kind: Option<&str>, check: bool) -> String {
     let p = crate::mail::ForPerson {
         to,
         rid,
-        kind: "message",
+        kind,
         cmd: command(),
         check,
     };
@@ -597,7 +597,10 @@ pub fn receipt(request_id: &str, from: Option<String>, as_json: bool) -> Result<
         if as_json {
             println!("{}", r["receipt"]);
         } else {
-            println!("{}", said(&r["receipt"], None, request_id, false));
+            println!(
+                "{}",
+                said(&r["receipt"], None, request_id, r["kind"].as_str(), false)
+            );
         }
         Ok(0)
     } else if r["error"] == "not_found" {

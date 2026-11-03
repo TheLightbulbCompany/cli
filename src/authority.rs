@@ -63,6 +63,8 @@ pub struct Summary {
     pub requester: String,
     pub for_whom: String,
     pub intent: String,
+    /// Whether the object verified when the summary was made.
+    pub verified: bool,
 }
 
 impl Authority {
@@ -77,6 +79,7 @@ impl Authority {
                 .map(|h| h.person.clone())
                 .unwrap_or_default(),
             intent: self.intent.clone(),
+            verified: true,
         }
     }
 }
@@ -91,6 +94,7 @@ pub fn summary_of(m: &crate::store::Message, now: i64) -> Option<Summary> {
             requester: String::new(),
             for_whom: String::new(),
             intent: String::new(),
+            verified: false,
         },
         |a| a.summary(),
     ))
