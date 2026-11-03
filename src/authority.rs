@@ -18,6 +18,8 @@ pub const MAX_LIFE_S: i64 = 86_400;
 pub const MAX_TOKEN: usize = 16 * 1024;
 /// How far ahead of our clock the issuer may stamp `iat` (the proof's skew).
 const IAT_SKEW_S: i64 = 300;
+/// The longest `intent` phase 1 mints, in bytes.
+const MAX_INTENT: usize = 2048;
 
 /// A verified authority object. `raw` is the token itself: never printed (`Debug` leaves it out).
 #[derive(Clone, PartialEq)]
@@ -75,27 +77,36 @@ pub fn verify(jws: &str, now: i64) -> Result<Authority> {
         return Err("jws".into());
     };
     let b64 = |x: &str| BASE64URL_NOPAD.decode(x.as_bytes()).map_err(|_| "jws");
-    let header: Value = serde_json::from_slice(&b64(h)?).map_err(|_| "jws")?;
+    let (header, payload, sig) = (b64(h)?, b64(p)?, b64(s)?);
+    let header: Value = serde_json::from_slice(&header).map_err(|_| "jws")?;
+    if !header.is_object() {
+        return Err("jws".into());
+    }
     if header["alg"] != "EdDSA" {
         return Err("alg".into());
     }
     let kid = header["kid"].as_str().unwrap_or_default();
     let key = crate::proof::issuer_key(kid).ok_or("kid")?;
     let key = VerifyingKey::from_bytes(&key).map_err(|_| "kid")?;
-    let sig = Signature::from_slice(&b64(s)?).map_err(|_| "signature")?;
+    let sig = Signature::from_slice(&sig).map_err(|_| "signature")?;
     key.verify_strict(format!("{h}.{p}").as_bytes(), &sig)
         .map_err(|_| "signature")?;
     // The issuer puts `typ` in the protected header; a `typ` among the claims is not it.
     if header["typ"] != TYP {
         return Err("typ".into());
     }
-    let c: Value = serde_json::from_slice(&b64(p)?).map_err(|_| "jws")?;
+    let c: Value = serde_json::from_slice(&payload).map_err(|_| "jws")?;
     let a = shape(&c, jws).ok_or("shape")?;
-    if a.iat > now + IAT_SKEW_S {
+    let on_behalf_of = &c["on_behalf_of"];
+    if a.intent.len() > MAX_INTENT {
+        Err("intent_length".into())
+    } else if a.iat > now + IAT_SKEW_S {
         Err("iat".into())
-    } else if a.iat >= a.exp || a.exp - a.iat > MAX_LIFE_S || now > a.exp {
+    } else if a.iat >= a.exp || a.exp - a.iat > MAX_LIFE_S || now >= a.exp {
         Err("exp".into())
-    } else if a.chain[0].person != a.requester_person {
+    } else if a.chain[0].person != a.requester_person
+        || !(on_behalf_of.is_null() || *on_behalf_of == *a.requester_person)
+    {
         Err("origin".into())
     } else if c["operation"]["operands_hash"] != operands_hash(&a.operands) {
         Err("operands_hash".into())
@@ -107,6 +118,7 @@ pub fn verify(jws: &str, now: i64) -> Result<Authority> {
 /// `c` read as the phase-1 shape, or `None` when it does not fit.
 fn shape(c: &Value, raw: &str) -> Option<Authority> {
     let s = |v: &Value| v.as_str().map(String::from);
+    let full = |v: &Value| s(v).filter(|x| !x.is_empty());
     let opt = |v: &Value| match v {
         Value::Null => Some(None),
         v => v.as_str().map(|x| Some(x.to_string())),
@@ -131,10 +143,10 @@ fn shape(c: &Value, raw: &str) -> Option<Authority> {
         })
         .collect::<Option<Vec<_>>>()?;
     ok.then_some(Authority {
-        id: s(&c["id"]).filter(|i| !i.is_empty())?,
-        requester_person: s(&r["person"])?,
-        requester_org: s(&r["org"])?,
-        verified_by: s(&r["verified_by"])?,
+        id: full(&c["id"])?,
+        requester_person: full(&r["person"])?,
+        requester_org: full(&r["org"])?,
+        verified_by: full(&r["verified_by"])?,
         chain,
         skill: s(&op["skill"])?,
         resource: s(&op["resource"])?,
@@ -171,6 +183,8 @@ pub fn expected_operands(kind: &str, body: &str, meta: &Meta) -> Value {
 /// `ask_session` for a message), its operands are the envelope's
 /// (`expected_operands`), and its requester is the sending computer's proof person
 /// (`sender_person`), or the sender relays a hosted chain (two hops, it is the second).
+/// An authority id is not single-use on the network in this phase: binding it to its sender
+/// stops a third party reusing it, and the hosted door enforces single use when it mints.
 pub fn bind(
     a: &Authority,
     kind: &str,
@@ -186,6 +200,7 @@ pub fn bind(
     if a.resource != resource {
         return Err("resource".into());
     }
+    // A `result` or `cancel` carrying an object is refused: phase 1 never mints for them.
     let skill_ok = match kind {
         "assign" => a.skill == "assign",
         "message" => matches!(a.skill.as_str(), "message" | "ask_session"),
@@ -195,7 +210,7 @@ pub fn bind(
         return Err("skill".into());
     }
     let want = expected_operands(kind, body, meta);
-    if operands_hash(&want) != operands_hash(&a.operands) || want != a.operands {
+    if want != a.operands {
         return Err("operands".into());
     }
     let relayed = a.chain.len() == 2 && sender_person == Some(a.chain[1].person.as_str());
@@ -272,6 +287,81 @@ mod tests {
         let bad = format!("{signing}.{}", other.rsplit_once('.').unwrap().1);
         assert_ne!(bad, jws);
         assert_eq!(err(verify(&bad, 1_500)), "signature");
+    }
+
+    #[test]
+    fn every_refusal_names_its_check() {
+        use data_encoding::BASE64URL_NOPAD as B64;
+        let b64 = |v: &str| B64.encode(v.as_bytes());
+        let good = mint(json!({}));
+        let (h, rest) = good.split_once('.').unwrap();
+        let sig = rest.split_once('.').unwrap().1;
+        let header = |hd: Value| format!("{}.{}", b64(&hd.to_string()), rest);
+        let kid = issuer::KID;
+        let with = |f: &dyn Fn(&mut Value)| {
+            let mut c = claims(json!({}));
+            f(&mut c);
+            issuer::mint_typ(TYP, &c)
+        };
+        let rows: Vec<(&str, String, i64)> = vec![
+            ("size", "a".repeat(MAX_TOKEN + 1), 1_500),
+            ("jws", format!("{h}.{sig}"), 1_500),
+            ("jws", format!("{h}.!!!.{sig}"), 1_500),
+            ("jws", format!("{}.{rest}", b64("1")), 1_500),
+            ("jws", format!("{}.{rest}", b64("\"x\"")), 1_500),
+            (
+                "alg",
+                header(json!({"alg": "RS256", "kid": kid, "typ": TYP})),
+                1_500,
+            ),
+            (
+                "kid",
+                header(json!({"alg": "EdDSA", "kid": "nope", "typ": TYP})),
+                1_500,
+            ),
+            ("shape", with(&|c| c["v"] = true.into()), 1_500),
+            (
+                "shape",
+                with(&|c| c["requester"]["person"] = 1.into()),
+                1_500,
+            ),
+            (
+                "shape",
+                with(&|c| c["requester"]["person"] = "".into()),
+                1_500,
+            ),
+            ("shape", with(&|c| c["requester"]["org"] = "".into()), 1_500),
+            (
+                "shape",
+                with(&|c| c["requester"]["verified_by"] = "".into()),
+                1_500,
+            ),
+            ("shape", with(&|c| c["policy"] = json!({})), 1_500),
+            ("shape", with(&|c| c["chain"] = json!([])), 1_500),
+            (
+                "shape",
+                with(&|c| c["operation"]["operands"] = "x".into()),
+                1_500,
+            ),
+            (
+                "origin",
+                with(&|c| c["on_behalf_of"] = "user_x".into()),
+                1_500,
+            ),
+            (
+                "intent_length",
+                with(&|c| c["intent"] = "i".repeat(2049).into()),
+                1_500,
+            ),
+            ("exp", good.clone(), 1_000 + 3_600),
+        ];
+        for (want, jws, now) in rows {
+            assert_eq!(err(verify(&jws, now)), want, "row {want}");
+        }
+        assert_eq!(MAX_TOKEN + 1, 16_385);
+        let mine = with(&|c| c["on_behalf_of"] = "user_a".into());
+        assert!(verify(&mine, 1_500).is_ok(), "on_behalf_of the requester");
+        assert!(verify(&with(&|c| c["intent"] = "i".repeat(2048).into()), 1_500).is_ok());
     }
 
     #[test]
