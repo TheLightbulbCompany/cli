@@ -255,6 +255,10 @@ pub(crate) async fn boot(
     });
     // No join connection outlives a restart: its open requests are over.
     daemon.store.lock().unwrap().expire_joins(i64::MAX, now)?;
+    // Every member's card, a daemon's and an instance's alike.
+    if let Err(e) = publish_card(&daemon) {
+        eprintln!("card: {e}");
+    }
     let net = net::Net::start(daemon.clone()).await?;
     tokio::spawn(presence::run(daemon.clone()));
     Ok((daemon, net))
@@ -379,10 +383,6 @@ pub(crate) fn publish(d: &Daemon) -> Result<()> {
 /// the one computed now (the first start, a new name, workers switched on or off). A computer
 /// that is no member of its team publishes nothing.
 pub(crate) fn publish_card(d: &Daemon) -> Result<()> {
-    // For suites that count the roster's entries or feed it exact frames.
-    if std::env::var_os("LIGHTBULB_CONNECT_DEBUG_NO_CARD").is_some_and(|v| !v.is_empty()) {
-        return Ok(());
-    }
     let mut team = d.team.lock().unwrap();
     let Some(me) = team.roster.members.get(&d.identity.key) else {
         return Ok(());

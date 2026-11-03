@@ -370,9 +370,12 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
         "card" => {
             let team = daemon.team.lock().unwrap();
             let r = &team.roster;
-            let key = match body["member"].as_str() {
+            let key = match body.get("member").filter(|m| !m.is_null()) {
                 None => Some(&daemon.identity.key),
-                Some(m) => r.members.get(m).or_else(|| r.by_short(m)).map(|m| &m.key),
+                Some(m) => match m.as_str() {
+                    None => return Response::err(id, BAD_REQUEST),
+                    Some(m) => r.members.get(m).or_else(|| r.by_short(m)).map(|m| &m.key),
+                },
             };
             match key.and_then(|k| r.cards.get(k)) {
                 Some(card) => Response::ok(id, json!({ "card": card })),

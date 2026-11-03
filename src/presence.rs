@@ -554,7 +554,6 @@ struct Owner {
     seen_at: Option<u64>,
     wakes: bool,
     user_id: Option<String>,
-    card: Option<Value>,
 }
 
 /// The Lightbulb user a proof names, unverified: a claim to show, never to gate on. `None`
@@ -601,9 +600,6 @@ fn record(o: &Owner, s: &Remote, cwd: &str) -> Value {
     if let Some(u) = &o.user_id {
         v["user_id"] = u.as_str().into();
     }
-    if let Some(c) = &o.card {
-        v["card"] = c.clone();
-    }
     v
 }
 
@@ -637,7 +633,7 @@ const LOCAL_FIELDS: [&str; 7] = [
     "job",
 ];
 
-/// `directory {query?}` -> `{sessions}`: this computer's live sessions, every member's from its
+/// `directory {query?}` -> `{sessions, cards}`: this computer's live sessions, every member's from its
 /// latest presence, then those that ended in the same order; `query` matches session id, person, computer,
 /// agent, folder (and this computer's full path), repo, branch, what it is doing or its title,
 /// any case. An ended row of this computer carries `resume`; no one else's can.
@@ -654,7 +650,7 @@ pub fn directory(d: &Daemon, query: Option<&str>) -> Value {
     // A row that ended yet is seen live again (no hook said so) is shown live.
     own_ended.retain(|(r, _)| live.iter().all(|s| s.key.0 != r.key));
     let remote_ones = stored(d);
-    let (own, wakes, cards): (Member, HashSet<String>, BTreeMap<String, Value>) = {
+    let (own, wakes, cards_by_short): (Member, HashSet<String>, BTreeMap<String, Value>) = {
         let t = d.team.lock().unwrap();
         let own = t.roster.members.get(&d.identity.key).cloned();
         let own = own.unwrap_or_else(|| Member {
@@ -670,13 +666,17 @@ pub fn directory(d: &Daemon, query: Option<&str>) -> Value {
         (
             own,
             t.roster.wakes.keys().cloned().collect(),
-            t.roster.cards.clone(),
+            // One copy per member, by short, whether or not it has a session.
+            t.roster
+                .cards
+                .iter()
+                .filter_map(|(k, c)| Some((t.roster.members.get(k)?.short.clone(), c.clone())))
+                .collect(),
         )
     };
     let me = Owner {
         wakes: wakes.contains(&own.key),
         user_id: claimed_user(crate::login::stored_proof(&d.dir).as_deref()),
-        card: cards.get(&own.key).cloned(),
         member: own,
         verified: true,
         online: true,
@@ -759,7 +759,6 @@ pub fn directory(d: &Daemon, query: Option<&str>) -> Value {
             seen_at: (!online).then_some(l.seen_at),
             wakes: wakes.contains(&m.key),
             user_id: claimed_user(proof.as_deref()),
-            card: cards.get(&m.key).cloned(),
             member: m,
         };
         for r in l.sessions.iter().filter(|r| hit(&o.member, r, "")) {
@@ -779,7 +778,7 @@ pub fn directory(d: &Daemon, query: Option<&str>) -> Value {
     // Stable, so each keeps its order: a page (`find_sessions`' limit) reaches live teammates
     // before anything that ended.
     out.sort_by_key(|r| r["status"] == "ended");
-    json!({ "sessions": out })
+    json!({ "sessions": out, "cards": cards_by_short })
 }
 
 #[cfg(test)]

@@ -427,6 +427,17 @@ pub fn from_peer_ok(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn every_reason_is_in_the_a2a_binding_page() {
+        let page = include_str!("../../docs/a2a-binding.md");
+        for r in super::REASONS {
+            assert!(
+                page.contains(&format!("`{r}`")),
+                "{r} is missing from the page"
+            );
+        }
+    }
+
     use super::*;
 
     /// A session as a build before `waiting_for` declares it.

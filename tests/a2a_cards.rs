@@ -6,18 +6,13 @@ use serde_json::json;
 
 mod common;
 
-use common::{seed_pair, until, Env};
+use common::{seed_pair, start_pair, until, Env};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_members_card_appears_in_the_roster_and_directory() {
     let (a, b) = (Env::new(), Env::new());
     seed_pair(&a, &b);
-    let on = [("LIGHTBULB_CONNECT_DEBUG_NO_CARD", String::new())];
-    b.daemon(false, "", &on);
-    a.daemon(false, "", &[common::peers(&[&b]), on[0].clone()]);
-    until(10, "both online", || {
-        a.status()["peers"]["online"] == 1 && b.status()["peers"]["online"] == 1
-    });
+    start_pair(&a, &b, "", &[]);
     let sb = b.short();
     until(15, "A holds B's card", || {
         a.ask(json!({"id": 1, "op": "card", "member": sb}))["card"]["supportedInterfaces"][0]["url"]
@@ -33,23 +28,62 @@ async fn a_members_card_appears_in_the_roster_and_directory() {
         a.ask(json!({"id": 1, "op": "card", "member": "nobody"}))["ok"],
         false
     );
-    // B's session, seen from A, carries the card.
-    let pid = std::process::id();
-    let birth = lightbulb::os::process(pid).unwrap().birth_micros;
-    b.ask(
-        json!({"id": 1, "op": "register", "session": {"provider": "codex",
-        "conversation": "b1", "pid": pid, "birth_micros": birth, "cwd": "/tmp/work/web"}}),
+    // The directory carries B's card once, by short, though B has no session.
+    let d = a.ask(json!({"id": 1, "op": "directory"}));
+    assert_eq!(
+        d["cards"][&sb]["capabilities"]["extensions"][0]["required"],
+        true
     );
-    until(10, "A's directory shows B's session with its card", || {
-        a.ask(json!({"id": 1, "op": "directory"}))["sessions"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|r| {
-                r["session_id"].as_str().unwrap().starts_with(&sb)
-                    && r["card"]["capabilities"]["extensions"][0]["required"] == true
-            })
+    assert_eq!(d["cards"].as_object().unwrap().len(), 2);
+    assert!(d["sessions"][0]["card"].is_null());
+    // A member that is no string is a bad request.
+    assert_eq!(
+        a.ask(json!({"id": 1, "op": "card", "member": 7}))["error"],
+        "bad_request"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_embedded_member_publishes_its_card() {
+    let home = tempfile::tempdir().unwrap();
+    let i = common::instance(home.path(), &[], "The Lightbulb Company", None, &[])
+        .await
+        .unwrap();
+    let r = common::call(&i, "card", json!({})).await;
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(r["card"]["name"], "The Lightbulb Company");
+    i.shutdown().await;
+}
+
+#[test]
+fn a_joiner_publishes_its_card_and_a_restart_writes_no_second_entry() {
+    let (a, b) = (Env::new(), Env::new());
+    a.daemon(false, "", &[common::dialog("Allow")]);
+    let t = common::invite(&a, "reusable");
+    b.daemon(false, "", &[common::peers(&[&a])]);
+    let r = common::person(
+        &b,
+        json!({"id": 1, "op": "team.join", "ticket": t, "name": "bob"}),
+    );
+    assert_eq!(r["state"], "admitted", "{r}");
+    let (sa, sb) = (a.short(), b.short());
+    until(10, "A holds B's card and B holds A's", || {
+        a.ask(json!({"id": 1, "op": "card", "member": sb}))["ok"] == true
+            && b.ask(json!({"id": 1, "op": "card", "member": sa}))["ok"] == true
     });
+    // An unchanged card on restart is no new entry.
+    let before = roster::entries(&b.store()).unwrap().len();
+    {
+        use std::io::{Read, Write};
+        let mut s = std::os::unix::net::UnixStream::connect(b.state.path().join("sock")).unwrap();
+        writeln!(s, r#"{{"id":1,"op":"shutdown"}}"#).unwrap();
+        let _ = s.read_to_end(&mut vec![]);
+        let lock = std::fs::File::open(b.state.path().join("daemon.lock")).unwrap();
+        lock.lock().unwrap();
+    }
+    b.daemon(false, "", &[common::peers(&[&a])]);
+    assert_eq!(b.ask(json!({"id": 1, "op": "card"}))["ok"], true);
+    assert_eq!(roster::entries(&b.store()).unwrap().len(), before);
 }
 
 #[test]
@@ -70,6 +104,16 @@ fn a_card_over_16_kib_is_rejected() {
     let over = Entry::signed(&ib, vec![small.hash()], Kind::Meta, big, 21);
     assert!(roster::accept(&store, &over, 30).is_err());
     // Even replayed as if stored, it does not replace the card.
-    let r = roster::replay(&[g, admit, small, over]);
+    let r = roster::replay(&[g.clone(), admit.clone(), small.clone(), over]);
+    assert_eq!(r.cards.get(&ib.key).unwrap()["name"], "bob");
+    // A card that is no object does not replace one either.
+    let odd = Entry::signed(
+        &ib,
+        vec![small.hash()],
+        Kind::Meta,
+        json!({"card": "gone"}),
+        22,
+    );
+    let r = roster::replay(&[g, admit, small, odd]);
     assert_eq!(r.cards.get(&ib.key).unwrap()["name"], "bob");
 }

@@ -695,6 +695,10 @@ mod tests {
             crate::authority::URI
         );
         assert_eq!(c["capabilities"]["extensions"][0]["required"], true);
+        assert_eq!(c["supportedInterfaces"][0]["protocolVersion"], "1.0");
+        assert_eq!(c["defaultInputModes"], serde_json::json!(["text/plain"]));
+        assert_eq!(c["defaultOutputModes"], serde_json::json!(["text/plain"]));
+        assert_eq!(c["capabilities"]["streaming"], false);
         let ids = |c: &serde_json::Value| -> Vec<String> {
             c["skills"]
                 .as_array()

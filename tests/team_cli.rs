@@ -148,7 +148,8 @@ fn a_plain_member_opens_links_but_cannot_remove_the_founder() {
         ),
         "{team}"
     );
-    assert_eq!(e.entries().len(), 2, "no genesis over a joined team");
+    // The two seeded entries and this member's card: no genesis over a joined team.
+    assert_eq!(e.entries().len(), 3);
     // Every network is flat: any member makes an open link; nobody removes the founder.
     let r = common::person(&e, json!({"id": 1, "op": "team.invite", "mode": "open"}));
     assert_eq!(r["ok"], true, "{r}");
@@ -222,7 +223,8 @@ fn restart_keeps_the_team_and_writes_no_second_genesis() {
     e.stop();
     assert!(e.run(&["team"]).status.success());
     assert_eq!(e.team_id(), id);
-    assert_eq!(e.entries().len(), 1);
+    // The genesis and the card, not a second genesis.
+    assert_eq!(e.entries().len(), 2);
 }
 
 #[test]
