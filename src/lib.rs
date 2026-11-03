@@ -2,6 +2,7 @@ pub mod admission;
 pub mod agents;
 pub mod app_send;
 pub mod apps;
+pub mod authority;
 pub mod capture;
 pub mod cli;
 pub mod code;

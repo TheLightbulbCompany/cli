@@ -36,7 +36,7 @@ pub const TEST_ISSUER: (&str, [u8; 32]) = (
     ],
 );
 
-fn issuer_key(kid: &str) -> Option<[u8; 32]> {
+pub(crate) fn issuer_key(kid: &str) -> Option<[u8; 32]> {
     #[cfg(debug_assertions)]
     if kid == TEST_ISSUER.0 {
         return Some(TEST_ISSUER.1);

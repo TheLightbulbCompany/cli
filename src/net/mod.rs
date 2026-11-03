@@ -1321,6 +1321,12 @@ fn receive(d: &Arc<Daemon>, key: &str, env: &Frame, raw: &serde_json::Value, tx:
     let store = d.store.lock().unwrap();
     let me = &d.identity.short;
     let now = ipc::now();
+    // The person the sender's `hello` proof names, when it verifies.
+    let proof = d.proofs.lock().unwrap().get(key).cloned();
+    let person = proof.and_then(|t| crate::proof::verify(&t, key, now as i64).ok());
+    let judge = mail::Judge {
+        sender_person: person.as_ref().map(|p| p.sub.as_str()),
+    };
     match mail::receive(
         &store,
         env,
@@ -1332,6 +1338,7 @@ fn receive(d: &Arc<Daemon>, key: &str, env: &Frame, raw: &serde_json::Value, tx:
         members,
         &team.config,
         now,
+        &judge,
     ) {
         Ok(mail::Answer {
             state,

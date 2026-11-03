@@ -2,13 +2,14 @@
 //! verifies `sig` over the raw JSON it got, checks `body` against the text parts, and keeps
 //! `a2a`, `sig` and the signed `sent_at`. A real daemon (A) and B played by the test (`Peer`).
 
+use lightbulb::authority;
 use lightbulb::identity::Identity;
 use lightbulb::net::frames::{envelope_sig, Frame};
 use serde_json::{json, Value};
 
 mod common;
 
-use common::{endpoint, seed_pair, session, ulid, until};
+use common::{endpoint, issuer, now_s, seed_pair, session, ulid, until};
 use common::{Env, Peer};
 
 const SIGNED_AT: i64 = 1_700_000_000;
@@ -59,12 +60,18 @@ impl Peer {
 
 /// A running alone, B played by the test (connected, past its `hello`).
 async fn a_and_peer_b() -> (Env, Env, iroh::Endpoint, Peer) {
+    a_and_peer_b_as(None).await
+}
+
+/// `a_and_peer_b`, B's `hello` showing a sign-in proof for Lightbulb user `user`.
+async fn a_and_peer_b_as(user: Option<&str>) -> (Env, Env, iroh::Endpoint, Peer) {
     let (a, b) = (Env::new(), Env::new());
     seed_pair(&a, &b);
     a.daemon(false, "", &[]);
     let ep = endpoint(&b.identity()).await;
     let mut p = Peer::dial(&ep, &a).await;
-    p.hello(vec![]).await;
+    let proof = user.map(|u| issuer::proof(&b.identity().key, u, now_s()));
+    p.hello_with(vec![], proof).await;
     until(5, "B online", || a.status()["peers"]["online"] == 1);
     (a, b, ep, p)
 }
@@ -190,5 +197,51 @@ async fn non_text_part_is_refused_unsupported() {
     let v = signed(&b.identity(), envelope(&id, &sb, &sa, "", Some(a2a)));
     p.send_raw(&v).await;
     assert_eq!(p.ack(&id).await, refused("unsupported"));
+    assert!(a.store().message(&id).unwrap().is_none());
+}
+
+/// An authority object from `person` for `resource` binding `{text}`, minted by the test issuer.
+fn authority(person: &str, resource: &str, text: &str) -> String {
+    let (now, operands) = (now_s(), json!({"text": text}));
+    issuer::mint(&json!({
+        "typ": authority::TYP, "v": 1, "id": "auth_1", "iat": now, "exp": now + 600,
+        "requester": {"person": person, "org": "org_1", "verified_by": "lightbulb"},
+        "chain": [{"agent": "agent_1", "session": null, "person": person, "at": now}],
+        "operation": {"skill": "message", "resource": resource, "operands": operands,
+                      "operands_hash": authority::operands_hash(&operands)},
+        "intent": "say hi", "policy": null,
+    }))
+}
+
+/// `user(text)` carrying `jws` as its authority object.
+fn asking(text: &str, jws: String) -> Value {
+    let mut m = user(text);
+    m["metadata"] = json!({ authority::URI: jws });
+    m["extensions"] = json!([authority::URI]);
+    m
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn envelope_with_valid_authority_is_stored_with_authority_id() {
+    let (a, b, _ep, mut p) = a_and_peer_b_as(Some("user_b")).await;
+    let (sa, sb) = (session(&a, "a1"), session(&b, "b1"));
+    let id = ulid();
+    let a2a = asking("hi", authority("user_b", &format!("session:{sa}"), "hi"));
+    let v = signed(&b.identity(), envelope(&id, &sb, &sa, "hi", Some(a2a)));
+    p.send_raw(&v).await;
+    assert_eq!(p.ack(&id).await.0, "stored");
+    let m = a.store().message(&id).unwrap().expect("stored");
+    assert_eq!(m.authority_id.as_deref(), Some("auth_1"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn authority_requester_not_the_sender_is_refused() {
+    let (a, b, _ep, mut p) = a_and_peer_b_as(Some("user_b")).await;
+    let (sa, sb) = (session(&a, "a1"), session(&b, "b1"));
+    let id = ulid();
+    let a2a = asking("hi", authority("user_x", &format!("session:{sa}"), "hi"));
+    let v = signed(&b.identity(), envelope(&id, &sb, &sa, "hi", Some(a2a)));
+    p.send_raw(&v).await;
+    assert_eq!(p.ack(&id).await, refused("bad_request"));
     assert!(a.store().message(&id).unwrap().is_none());
 }

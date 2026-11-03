@@ -510,6 +510,15 @@ pub struct Prepared {
     pub sig: Option<String>,
     /// The `sent_at` that `sig` covers (the sender's stamp).
     pub signed_at: Option<i64>,
+    /// The authority object `a2a` carried, verified and bound to this envelope (`receive`).
+    pub authority: Option<crate::authority::Authority>,
+}
+
+/// What `receive` knows of the sender beyond the envelope.
+#[derive(Default)]
+pub struct Judge<'a> {
+    /// The person the sending computer's `hello` proof names (`Proof::sub`), when it verified.
+    pub sender_person: Option<&'a str>,
 }
 
 /// An A2A Message's text: its `parts[].text` joined by newlines; `None` when a part has no
@@ -562,7 +571,7 @@ impl From<&Prepared> for Message {
             a2a: p.a2a.clone(),
             sig: p.sig.clone(),
             signed_at: p.signed_at,
-            authority_id: None,
+            authority_id: p.authority.as_ref().map(|a| a.id.clone()),
         }
     }
 }
@@ -879,6 +888,7 @@ pub fn prepare(
         a2a: None,
         sig: None,
         signed_at: None,
+        authority: None,
     }))
 }
 
@@ -1011,6 +1021,7 @@ pub fn receive(
     members: Option<&std::collections::HashSet<String>>,
     config: &Config,
     now: u64,
+    judge: &Judge,
 ) -> Result<Answer> {
     let Frame::Envelope {
         id,
@@ -1063,6 +1074,27 @@ pub fn receive(
             Some(_) => {}
         }
     }
+    // The issuer-signed authority object, bound to this envelope; a bad one refuses it whole.
+    let authority = match a2a.as_ref().map(|a| &a["metadata"][crate::authority::URI]) {
+        Some(Value::Null) | None => None,
+        Some(jws) => {
+            let bound = jws
+                .as_str()
+                .ok_or_else(|| "jws".into())
+                .and_then(|jws| crate::authority::verify(jws, now as i64))
+                .and_then(|a| {
+                    crate::authority::bind(&a, kind, to, body, meta, judge.sender_person)
+                        .map(|()| a)
+                });
+            match bound {
+                Ok(a) => Some(a),
+                Err(e) => {
+                    eprintln!("net: an envelope's authority object is refused ({e})");
+                    return refused("bad_request");
+                }
+            }
+        }
+    };
     if !KINDS.contains(&kind.as_str())
         || !files.is_empty()
         || body.len() > MAX_TEXT
@@ -1153,6 +1185,7 @@ pub fn receive(
         a2a: a2a.clone(),
         sig: sig.clone(),
         signed_at: sig.as_ref().map(|_| *sent_at),
+        authority,
     };
     let tx = store.conn().unchecked_transaction()?;
     // A cancel reaches the worker module only for an assignment to a fresh worker.
@@ -1334,6 +1367,7 @@ fn close_assignment(
         a2a: None,
         sig: None,
         signed_at: None,
+        authority: None,
     };
     // One transaction each: an assignment that cannot be closed never stops the others.
     let stored = (|| -> Result<()> {
@@ -2229,6 +2263,7 @@ mod tests {
             None,
             &workers_on(),
             1000,
+            &Judge::default(),
         )
         .unwrap();
         assert_eq!(
@@ -2262,6 +2297,7 @@ mod tests {
             None,
             &workers_on(),
             1000,
+            &Judge::default(),
         )
         .unwrap();
         assert_eq!(
@@ -2309,6 +2345,7 @@ mod tests {
             None,
             &workers_on(),
             1000,
+            &Judge::default(),
         )
         .unwrap();
         assert_eq!(
@@ -2326,6 +2363,7 @@ mod tests {
             None,
             &workers_on(),
             1000,
+            &Judge::default(),
         )
         .unwrap();
         assert_eq!(got.state, State::Stored);
@@ -2348,6 +2386,7 @@ mod tests {
             None,
             &workers_on(),
             1000,
+            &Judge::default(),
         )
         .unwrap();
         let Frame::Envelope { id: plain_id, .. } = &plain else {
@@ -2368,6 +2407,7 @@ mod tests {
             None,
             &workers_on(),
             1000,
+            &Judge::default(),
         )
         .unwrap();
         assert_eq!(
@@ -2392,6 +2432,7 @@ mod tests {
             None,
             &workers_on(),
             1000,
+            &Judge::default(),
         )
         .unwrap();
         assert_eq!(
@@ -2416,6 +2457,7 @@ mod tests {
                 None,
                 &workers_on(),
                 1000,
+                &Judge::default(),
             )
             .unwrap();
             let fresh = Answer {
@@ -2446,6 +2488,7 @@ mod tests {
                 None,
                 &workers_on(),
                 1001,
+                &Judge::default(),
             )
             .unwrap();
             (r.state, r.reason, r.fresh)
@@ -2461,6 +2504,7 @@ mod tests {
             None,
             &workers_on(),
             1000,
+            &Judge::default(),
         )
         .unwrap();
         advance(
@@ -3039,6 +3083,7 @@ mod tests {
             None,
             &workers_on(),
             1000,
+            &Judge::default(),
         )
         .unwrap();
         assert_eq!(got.state, State::Stored);
@@ -3138,7 +3183,17 @@ mod tests {
         for kind in ["assign", "result", "cancel"] {
             let env = peer_env("p/codex:a", "m/claude:new", "r1", kind, terms("x", 1060));
             let got = receive(
-                &s, &env, None, &peer, &roster, "m", None, None, &config, 1000,
+                &s,
+                &env,
+                None,
+                &peer,
+                &roster,
+                "m",
+                None,
+                None,
+                &config,
+                1000,
+                &Judge::default(),
             )
             .unwrap();
             assert_eq!(
@@ -3166,14 +3221,34 @@ mod tests {
             terms("x", 1060),
         );
         let first = receive(
-            &s, &env, None, &peer, &roster, "m", None, None, &config, 1000,
+            &s,
+            &env,
+            None,
+            &peer,
+            &roster,
+            "m",
+            None,
+            None,
+            &config,
+            1000,
+            &Judge::default(),
         )
         .unwrap();
         assert_eq!((first.state, first.fresh), (State::Held, true));
         assert!(matches!(first.taken, Some(Taken::Held { .. })));
         // The same envelope again, and the same request under another envelope id.
         let again = receive(
-            &s, &env, None, &peer, &roster, "m", None, None, &config, 1001,
+            &s,
+            &env,
+            None,
+            &peer,
+            &roster,
+            "m",
+            None,
+            None,
+            &config,
+            1001,
+            &Judge::default(),
         )
         .unwrap();
         assert_eq!(
@@ -3188,7 +3263,17 @@ mod tests {
             terms("x", 1060),
         );
         let again = receive(
-            &s, &other, None, &peer, &roster, "m", None, None, &config, 1002,
+            &s,
+            &other,
+            None,
+            &peer,
+            &roster,
+            "m",
+            None,
+            None,
+            &config,
+            1002,
+            &Judge::default(),
         )
         .unwrap();
         assert_eq!((again.state, again.fresh), (State::Held, false));
