@@ -1253,6 +1253,30 @@ fn body(r: &Req) -> Value {
     serde_json::from_slice(&r.body).unwrap()
 }
 
+/// macOS tar packs a binary `._name` beside each file with extended attributes; `tar -t` hides it.
+#[cfg(target_os = "macos")]
+#[test]
+fn archive_has_no_appledouble_entries() {
+    let c = Checked::new();
+    let st = Command::new("xattr")
+        .args(["-w", "com.example.t", "1"])
+        .arg(c.dir.join("app.yaml"))
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let (tgz, _) = lightbulb::apps::archive(&c.dir).unwrap();
+    let raw = Command::new("gzip")
+        .arg("-dc")
+        .arg(&tgz)
+        .output()
+        .unwrap()
+        .stdout;
+    let raw = String::from_utf8_lossy(&raw);
+    assert!(raw.contains("app.yaml"), "app.yaml missing");
+    assert!(!raw.contains("._app.yaml"), "AppleDouble entry shipped");
+    std::fs::remove_file(tgz).unwrap();
+}
+
 #[test]
 fn archive_excludes_env_and_build_dirs() {
     let c = Checked::new();
