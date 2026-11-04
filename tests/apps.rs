@@ -711,9 +711,14 @@ struct Checked {
 
 impl Checked {
     fn new() -> Checked {
+        Checked::with(&["team-lunch"])
+    }
+
+    /// `lightbulb app new <args>`; the app must be named team-lunch.
+    fn with(args: &[&str]) -> Checked {
         let e = Env::new();
         let tmp = tempfile::tempdir().unwrap();
-        app_new(&e, tmp.path(), &["team-lunch"]);
+        app_new(&e, tmp.path(), args);
         let bin = tempfile::tempdir().unwrap();
         let pnpm = bin.path().join("pnpm");
         std::fs::write(
@@ -1301,7 +1306,10 @@ fn up_prints_cards_and_exits_zero_when_waiting() {
     assert_eq!(v["cards"][0]["provider"], "stripe");
     assert_eq!(v["done"], false);
     assert!(v["next"].as_str().unwrap().contains("Inbox"), "{v}");
-    assert_eq!(c.app_json(), json!({"app_id": "a-1", "room_id": "r-9"}));
+    assert_eq!(
+        c.app_json(),
+        json!({"app_id": "a-1", "room_id": "r-9", "up_commit": c.head()})
+    );
     assert_eq!(
         lines(&seen),
         [format!("POST {BUILD}/source"), format!("POST {BUILD}/up")]
@@ -1683,14 +1691,51 @@ fn a_building_publish_records_no_migrations() {
 #[test]
 fn an_up_still_building_times_out_with_exit_2_and_says_status() {
     let c = Checked::new();
-    let (base, _) = building_stub(json!({"app_id": "a-1", "state": "provisioning"}));
+    let (base, seen) = building_stub(json!({"app_id": "a-1", "state": "provisioning"}));
     let (code, v) = c.app(&["up"], &base, true);
     assert_eq!(code, 2, "{v}");
+    assert!(!source_form(&seen).contains("name=\"placeholder\""));
     assert_eq!(
         v,
         json!({"code": "timeout", "message": "The preview is still building after 10 minutes.",
             "next": "run `lightbulb app status`; the preview may still finish"})
     );
+}
+
+#[test]
+fn an_up_of_the_starter_placeholder_returns_at_once_and_says_build_it() {
+    // A form keeps the base starter's "Being built" home page; a site's home is the CMS page.
+    let c = Checked::with(&["team-lunch", "--kind", "form"]);
+    let (base, seen) = gate_stub(
+        json!({"app_id": "a-1", "state": "building", "preview_url": "https://p.example"}),
+        |_| json!({"app_id": "a-1", "state": "building"}),
+        json!({}),
+    );
+    let (code, v) = c.app(&["up"], &base, true);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(
+        (&v["state"], &v["done"]),
+        (&json!("building"), &json!(false)),
+        "{v}"
+    );
+    assert_eq!(
+        v["next"],
+        "the app is still the starter's placeholder page; build the app, then run lightbulb app up again"
+    );
+    assert!(
+        !lines(&seen).iter().any(|l| l.ends_with("/a-1/status")),
+        "{:?}",
+        lines(&seen)
+    );
+    assert!(source_form(&seen).contains("name=\"placeholder\""));
+    assert!(v["preview_url"].is_null(), "{v}");
+}
+
+/// The multipart body of the source upload, as text.
+fn source_form(seen: &Arc<Mutex<Vec<Req>>>) -> String {
+    let seen = seen.lock().unwrap();
+    let r = seen.iter().find(|r| r.line.contains("/source")).unwrap();
+    String::from_utf8_lossy(&r.body).into_owned()
 }
 
 #[test]
