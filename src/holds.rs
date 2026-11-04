@@ -309,12 +309,20 @@ fn authority_dialog(
                 &h.relayed_by,
                 a.chain.last().and_then(|hop| hop.agent.as_ref()),
             ) {
-                (Some(_), Some(agent)) => format!(
-                    "{} for {}, via your workspace's agent: {}\n\n{body}",
-                    preview(agent),
-                    preview(&a.requester_person),
-                    preview(&a.intent)
-                ),
+                (Some(by), Some(agent)) => {
+                    let mine = crate::rules::load(store).ok().and_then(|(w, _)| w);
+                    let whose = if mine.as_deref() == Some(by.as_str()) {
+                        "your workspace".to_string()
+                    } else {
+                        preview(by)
+                    };
+                    format!(
+                        "{} asks {session} for {}, via {whose}'s agent: {}\n\n{body}",
+                        preview(agent),
+                        preview(&a.requester_person),
+                        preview(&a.intent)
+                    )
+                }
                 _ => format!(
                     "{} asks {session} for {}: {}\n\n{body}",
                     chain.join(" → "),

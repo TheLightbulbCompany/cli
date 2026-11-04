@@ -98,13 +98,38 @@ async fn a_and_workspace_b(
     config: &str,
     env: &[(&str, String)],
 ) -> (Env, Env, iroh::Endpoint, Peer) {
+    a_and_workspace_b_with(config, env, false, None).await
+}
+
+/// `a_and_workspace_b`, A holding workspace `org_1`'s rules document when `rules`, B's proof
+/// expired when `expired`.
+async fn a_and_workspace_b_with(
+    config: &str,
+    env: &[(&str, String)],
+    rules: bool,
+    expired: Option<i64>,
+) -> (Env, Env, iroh::Endpoint, Peer) {
     let (a, b) = (Env::new(), Env::new());
     seed_team(&a, &b);
     a.sign_in("user_a", None);
+    if rules {
+        let doc = issuer::mint_typ(
+            "lightbulb-a2a-rules",
+            &json!({"workspace": "org_1", "revision": "r1", "iat": now_s(),
+                "doc": {"revision": "r1", "holders": {"session:*": ["@session-person"]}, "rules": [], "default": "hold"}}),
+        );
+        assert!(lightbulb::rules::store_doc(&a.store(), &doc, now_s()).unwrap());
+    }
     a.daemon(false, config, env);
     let ep = endpoint(&b.identity()).await;
     let mut p = Peer::dial(&ep, &a).await;
-    let proof = issuer::workspace_proof(&b.identity().key, "org_1", now_s());
+    let proof = match expired {
+        Some(exp) => issuer::mint(
+            &json!({"iat": exp - 100, "exp": exp, "sub": "org_1", "org": "org_1",
+                "computer": b.identity().key}),
+        ),
+        None => issuer::workspace_proof(&b.identity().key, "org_1", now_s()),
+    };
     p.hello_with(vec![], Some(proof)).await;
     until(5, "B online", || a.status()["peers"]["online"] == 1);
     (a, b, ep, p)
@@ -176,12 +201,16 @@ async fn a_workspace_senders_assign_to_new_still_matches_its_member_row() {
 
 /// A hosted agent's note for `user_p` of `org`: two hops, the second `friday`'s.
 fn relayed_note(org: &str, resource: &str) -> String {
+    relayed_note_by(org, resource, "origin-message")
+}
+
+fn relayed_note_by(org: &str, resource: &str, verified_by: &str) -> String {
     let (now, operands) = (now_s(), json!({"text": "hi"}));
     issuer::mint_typ(
         lightbulb::authority::TYP,
         &json!({
             "v": 1, "id": "auth_r", "iat": now, "exp": now + 600,
-            "requester": {"person": "user_p", "org": org, "verified_by": "lightbulb"},
+            "requester": {"person": "user_p", "org": org, "verified_by": verified_by},
             "chain": [{"agent": null, "session": null, "person": "user_p", "at": now},
                       {"agent": "friday", "session": "run1", "person": "user_p", "at": now}],
             "operation": {"skill": "ask_session", "resource": resource, "operands": operands,
@@ -220,7 +249,11 @@ async fn a_relayed_hosted_ask_is_held_and_names_the_workspace() {
     let h = &open_holds(&a)[0];
     assert_eq!(h["kind"], "authority");
     let shown = h["shown"].as_str().unwrap().to_string();
-    assert!(shown.contains("via your workspace's agent"), "{shown}");
+    assert_eq!(
+        shown.lines().next().unwrap(),
+        "friday asks Codex for user_p, via org_1's agent: say hi",
+        "{shown}"
+    );
     let r = person(
         &a,
         json!({"id": 1, "op": "hold.answer", "hold": "H1", "verdict": "allow", "scope": "once"}),
@@ -261,4 +294,63 @@ async fn a_hosted_ask_from_another_workspace_is_refused_and_stores_nothing() {
     assert!(open_holds(&a).is_empty());
     assert!(a.store().message(&id).unwrap().is_none());
     assert!(a.inbox(&sa).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relayed_hold_says_your_workspace_when_the_laptop_has_its_rules() {
+    let (a, b, _ep, mut p) = a_and_workspace_b_with("", &[], true, None).await;
+    let (sa, sb) = (session(&a, "a1"), session(&b, "b1"));
+    let jws = relayed_note("org_1", &format!("session:{sa}"));
+    let (id, v) = envelope(&b.identity(), "message", &sb, &sa, Some(relayed_ask(&jws)));
+    p.send_raw(&v).await;
+    let got = ack(&mut p, &id).await;
+    assert_eq!(got.0, "held", "{got:?}");
+    until(5, "the dialog's text kept", || {
+        open_holds(&a)
+            .first()
+            .is_some_and(|h| h["shown"].is_string())
+    });
+    let shown = open_holds(&a)[0]["shown"].as_str().unwrap().to_string();
+    assert_eq!(
+        shown.lines().next().unwrap(),
+        "friday asks Codex for user_p, via your workspace's agent: say hi",
+        "{shown}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_agent_runtime_note_is_held_too() {
+    let (a, b, _ep, mut p) = a_and_workspace_b("", &[]).await;
+    let (sa, sb) = (session(&a, "a1"), session(&b, "b1"));
+    let jws = relayed_note_by("org_1", &format!("session:{sa}"), "agent-runtime");
+    let (id, v) = envelope(&b.identity(), "message", &sb, &sa, Some(relayed_ask(&jws)));
+    p.send_raw(&v).await;
+    assert_eq!(ack(&mut p, &id).await.0, "held");
+    assert_eq!(open_holds(&a).len(), 1);
+    assert!(a.inbox(&sa).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_expired_workspace_proof_relays_nothing_and_is_judged_as_a_member() {
+    let (a, b, _ep, mut p) = a_and_workspace_b_with("", &[], false, Some(now_s() - 3600)).await;
+    let (sa, sb) = (session(&a, "a1"), session(&b, "b1"));
+    let jws = relayed_note("org_1", &format!("session:{sa}"));
+    let (id, v) = envelope(&b.identity(), "message", &sb, &sa, Some(relayed_ask(&jws)));
+    p.send_raw(&v).await;
+    let got = ack(&mut p, &id).await;
+    assert_eq!(
+        (got.0.as_str(), got.1.as_deref()),
+        ("refused", Some("bad_request"))
+    );
+    assert!(open_holds(&a).is_empty());
+    assert!(a.store().message(&id).unwrap().is_none());
+    // A plain ask: held, judged as B's member.
+    let ask = json!({"role": "ROLE_USER", "parts": [{"text": "hi"}]});
+    let (id, v) = envelope(&b.identity(), "message", &sb, &sa, Some(ask));
+    p.send_raw(&v).await;
+    assert_eq!(ack(&mut p, &id).await.0, "held");
+    let h = lightbulb::holds::get(&a.store(), 1)
+        .unwrap()
+        .expect("a hold");
+    assert_eq!(h.requester, Some(format!("member:{}", b.short())));
 }
