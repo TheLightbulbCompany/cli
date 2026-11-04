@@ -1565,12 +1565,9 @@ fn hello(r: &Roster, protocol: u32, addrs: Vec<String>, proof: Option<String>) -
     }
 }
 
-/// This computer's sign-in proof, shown in every `hello` (an instance has none).
+/// This computer's sign-in proof, shown in every `hello` (an instance's is its workspace's).
 fn own_proof(d: &Daemon) -> Option<String> {
-    d.cloud
-        .is_none()
-        .then(|| crate::login::stored_proof(&d.dir))
-        .flatten()
+    crate::login::stored_proof(&d.dir)
 }
 
 /// Answers a removed member's `hello` with the roster pages it lacks, the removal among them,

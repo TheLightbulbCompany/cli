@@ -25,7 +25,12 @@ fn sendable(e: &memory::Entry, same_person: bool) -> bool {
 /// verified `hello` proof names the same `sub` as our own sign-in. Else a `me` entry stays home.
 pub(super) fn same_person(d: &Daemon, key: &str) -> bool {
     let now = ipc::now() as i64;
-    let sub = |token: &str, k: &str| proof::verify(token, k, now).ok().map(|p| p.sub);
+    let sub = |token: &str, k: &str| {
+        proof::verify(token, k, now)
+            .ok()
+            .filter(|p| !proof::is_workspace(p))
+            .map(|p| p.sub)
+    };
     let mine = crate::login::stored_proof(&d.dir).and_then(|t| sub(&t, &d.identity.key));
     let theirs = d.proofs.lock().unwrap().get(key).and_then(|t| sub(t, key));
     mine.is_some() && mine == theirs
