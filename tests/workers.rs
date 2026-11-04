@@ -2299,3 +2299,135 @@ fn opencode_a_worktree_that_allows_without_asking_refuses_the_start() {
         "// shared\n{\"permission\": {\"bash\": {\"*\": \"allow\"}},}",
     );
 }
+
+/// Workspace `org_1`'s rules document holding `rules` (no holders, default hold).
+fn document(rules: Value) -> String {
+    common::issuer::mint_typ(
+        "lightbulb-a2a-rules",
+        &json!({"workspace": "org_1", "revision": "r1", "iat": now_s(),
+            "doc": {"revision": "r1", "holders": {}, "rules": rules, "default": "hold"}}),
+    )
+}
+
+#[test]
+fn assign_with_no_standing_rows_asks_as_today() {
+    let p = hosted(json!([{"result": "ok"}]), Opts::default());
+    let (me, them) = (p.b.short(), p.a.short());
+    assert_eq!(
+        workers::policy(&p.b.store(), &me, &them).unwrap(),
+        Policy::Ask
+    );
+    p.assign("as1", "one", 300);
+    p.wait_state("as1", "held");
+    let (_, text, _) = p.dialog(1);
+    assert!(text.contains(": \"one\". Always allow"), "{text}");
+}
+
+#[test]
+fn an_always_row_allows() {
+    let p = hosted(
+        json!([{"result": "ok"}]),
+        Opts {
+            always: true,
+            ..Opts::default()
+        },
+    );
+    let (me, them) = (p.b.short(), p.a.short());
+    assert_eq!(
+        workers::policy(&p.b.store(), &me, &them).unwrap(),
+        Policy::Allow
+    );
+    p.assign("as1", "one", 300);
+    assert_eq!(p.result("as1", 15)["status"], "done");
+    assert!(p.pids().is_empty());
+}
+
+/// A rules document's deny on `worker:*` refuses, over the person's standing allow.
+#[test]
+fn a_deny_rule_on_worker_star_refuses_policy() {
+    let p = hosted(
+        json!([{"result": "never"}]),
+        Opts {
+            always: true,
+            ..Opts::default()
+        },
+    );
+    let deny = json!([{"id": "no-workers", "resource": "worker:*", "skill": "assign",
+                       "requesters": ["*"], "effect": "deny"}]);
+    assert!(lightbulb::rules::store_doc(&p.b.store(), &document(deny), now_s()).unwrap());
+    let (me, them) = (p.b.short(), p.a.short());
+    assert_eq!(
+        workers::policy(&p.b.store(), &me, &them).unwrap(),
+        Policy::Refuse
+    );
+    p.assign("as1", "one", 300);
+    p.wait_state("as1", "refused");
+    assert_eq!(p.a.receipt(&p.asker(), "as1")["reason"], "declined");
+    assert!(p.workers().is_empty());
+    assert!(p.pids().is_empty());
+}
+
+/// An authority object on an assign binds its terms: a `deadline_at` other than the envelope's
+/// refuses it `bad_request`, and nothing starts.
+#[test]
+fn assign_with_authority_binds_meta_operands() {
+    let p = hosted(
+        json!([{"result": "never"}]),
+        Opts {
+            always: true,
+            ..Opts::default()
+        },
+    );
+    let uri = lightbulb::authority::URI;
+    let (now, b) = (now_s(), p.b.short());
+    let operands = json!({"text": "one", "done_when": "done", "deadline_at": 1});
+    let jws = common::issuer::mint_typ(
+        lightbulb::authority::TYP,
+        &json!({
+            "v": 1, "id": "auth_1", "iat": now, "exp": now + 600,
+            "requester": {"person": "user_a", "org": "org_1", "verified_by": "lightbulb"},
+            "chain": [{"agent": "agent_1", "session": null, "person": "user_a", "at": now}],
+            "operation": {"skill": "assign", "resource": format!("worker:{b}/claude"),
+                          "operands": operands,
+                          "operands_hash": lightbulb::authority::operands_hash(&operands)},
+            "intent": "do one", "policy": null,
+        }),
+    );
+    let r = p.a.ask(json!({"id": 1, "op": "send", "from": p.asker(),
+        "to": format!("{b}/claude:new"), "kind": "assign", "text": "one", "done_when": "done",
+        "deadline_s": 300, "request_id": "as1",
+        "a2a": {"metadata": {uri: jws}, "extensions": [uri]}}));
+    assert_eq!(r["ok"], true, "{r}");
+    p.wait_state("as1", "refused");
+    assert_eq!(p.a.receipt(&p.asker(), "as1")["reason"], "bad_request");
+    assert!(p.workers().is_empty());
+}
+
+/// An assign to a teammate's existing session is judged like a message: the default document
+/// delivers a roster member's (no sign-in) with no hold; a deny rule refuses it `policy`.
+#[test]
+fn an_assign_to_an_existing_session_is_judged_like_a_message() {
+    let p = hosted(json!([]), Opts::default());
+    let sb = session(&p.b, "b1");
+    let assign = |rid: &str| {
+        let r =
+            p.a.ask(json!({"id": 1, "op": "send", "from": p.asker(), "to": sb,
+            "kind": "assign", "text": "take this", "done_when": "done", "deadline_s": 300,
+            "request_id": rid}));
+        assert_eq!(r["ok"], true, "{r}");
+    };
+    assign("as1");
+    p.wait_state("as1", "stored");
+    let got = p.b.inbox(&sb);
+    assert!(
+        got.iter()
+            .any(|m| m["kind"] == "assign" && m["text"] == "take this"),
+        "{got:?}"
+    );
+    let deny = json!([{"id": "no-assign", "resource": "session:*", "skill": "assign",
+                       "requesters": ["*"], "effect": "deny"}]);
+    assert!(lightbulb::rules::store_doc(&p.b.store(), &document(deny), now_s()).unwrap());
+    assign("as2");
+    p.wait_state("as2", "refused");
+    assert_eq!(p.a.receipt(&p.asker(), "as2")["reason"], "policy");
+}

@@ -80,7 +80,8 @@
         "done_when": {"type": "string", "description": "What finished looks like."},
         "deadline_s": {"type": "integer", "minimum": 1, "maximum": 14400, "description": "Seconds the job may take (default 3600)."},
         "repo": {"type": "string", "description": "The repository the job is in, if any."},
-        "branch": {"type": "string", "description": "The branch to work on, if any."}
+        "branch": {"type": "string", "description": "The branch to work on, if any."},
+        "authority": {"type": "string", "description": "A compact JWS authority object you were given, sent as given; the receiving computer verifies it."}
       },
       "required": ["request_id", "to", "brief", "done_when"]
     }

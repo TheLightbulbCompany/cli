@@ -144,6 +144,7 @@ struct AssignArgs {
     deadline_s: Option<u64>,
     repo: Option<String>,
     branch: Option<String>,
+    authority: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -206,6 +207,20 @@ struct Call {
 
 fn fail(body: Value) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(body.to_string())])
+}
+
+/// The A2A body carrying authority object `jws` for `text`, if any; `Err` when `jws` is not a
+/// compact JWS (three non-empty dot-separated parts). The value is never echoed.
+fn a2a_of(jws: Option<&str>, text: &str) -> Result<Option<Value>, ()> {
+    let Some(jws) = jws else { return Ok(None) };
+    let p: Vec<&str> = jws.split('.').collect();
+    if p.len() != 3 || p.iter().any(|s| s.is_empty()) {
+        return Err(());
+    }
+    Ok(Some(
+        json!({ "role": "ROLE_AGENT", "parts": [{ "text": text }],
+        "metadata": { authority::URI: jws }, "extensions": [authority::URI] }),
+    ))
 }
 
 fn code(code: &str) -> CallToolResult {
@@ -840,17 +855,9 @@ impl Server {
         {
             return code("group_send_not_allowed");
         }
-        // A compact JWS is three non-empty dot-separated parts; the value is never echoed.
-        if a.authority.as_ref().is_some_and(|j| {
-            let p: Vec<&str> = j.split('.').collect();
-            p.len() != 3 || p.iter().any(|s| s.is_empty())
-        }) {
+        let Ok(a2a) = a2a_of(a.authority.as_deref(), &a.text) else {
             return code("bad_authority");
-        }
-        let a2a = a.authority.as_ref().map(|jws| {
-            json!({ "role": "ROLE_AGENT", "parts": [{ "text": a.text }],
-                "metadata": { authority::URI: jws }, "extensions": [authority::URI] })
-        });
+        };
         let r = ask(
             "send",
             json!({ "from": call.from, "to": a.session_id, "text": a.text,
@@ -873,11 +880,14 @@ impl Server {
 
     /// Hands a job to one agent; the daemon checks the deadline and the rest.
     async fn assign(&self, call: Call, a: AssignArgs) -> CallToolResult {
+        let Ok(a2a) = a2a_of(a.authority.as_deref(), &a.brief) else {
+            return code("bad_authority");
+        };
         let r = ask(
             "send",
             json!({ "from": call.from, "to": a.to, "text": a.brief, "request_id": a.request_id,
                 "kind": "assign", "done_when": a.done_when, "deadline_s": a.deadline_s,
-                "repo": a.repo, "branch": a.branch, "wait": true }),
+                "repo": a.repo, "branch": a.branch, "wait": true, "a2a": a2a }),
         )
         .await;
         Self::sent(&call, r).await

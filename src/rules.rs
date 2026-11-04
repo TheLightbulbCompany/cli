@@ -61,19 +61,24 @@ fn hold() -> Effect {
     Effect::Hold
 }
 
-/// The document used when none is stored: members may message sessions, everything else holds.
+/// The document used when none is stored: members may message and assign to sessions,
+/// everything else holds.
 pub fn default_rules() -> Rules {
+    let members = |id: &str, skill: &str| Rule {
+        id: id.into(),
+        resource: "session:*".into(),
+        skill: skill.into(),
+        requesters: vec!["org:*".into()],
+        effect: Effect::Allow,
+        when: None,
+    };
     Rules {
         revision: "default".into(),
         holders: BTreeMap::from([("session:*".into(), vec!["@session-person".into()])]),
-        rules: vec![Rule {
-            id: "members-message".into(),
-            resource: "session:*".into(),
-            skill: "message".into(),
-            requesters: vec!["org:*".into()],
-            effect: Effect::Allow,
-            when: None,
-        }],
+        rules: vec![
+            members("members-message", "message"),
+            members("members-assign", "assign"),
+        ],
         default: Effect::Hold,
     }
 }
@@ -509,6 +514,16 @@ mod tests {
         assert_eq!(d.holders, vec!["user_a".to_string()]);
         let d = decide(&r, &[], &input("member:k1", "worker:abc/claude", "assign"));
         assert_eq!(d.effect, Effect::Hold);
+        // A member's assign to a session is delivered as its message is.
+        let d = decide(
+            &r,
+            &[],
+            &input("member:k1", "session:abc/claude:1", "assign"),
+        );
+        assert_eq!(
+            (d.effect, d.rule.as_str()),
+            (Effect::Allow, "members-assign")
+        );
         // Not a roster member and no proof: org:* does not match.
         let mut i = input("member:k1", "session:abc/claude:1", "message");
         i.requester_org = None;

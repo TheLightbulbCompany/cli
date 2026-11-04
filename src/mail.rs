@@ -689,7 +689,7 @@ pub fn is_new_worker(to: &str) -> bool {
 /// The rule for sending `kind` with `meta` from `from` to `to`, answering `parent`:
 /// `Err(reason)` is the refusal. An `assign` carries its terms (`done_when`, a deadline;
 /// `repo`/`branch` short); a `result` answers an assignment made to `from`, goes back to its
-/// asker and has a known status; a `cancel` is the asker's alone.
+/// asker and has a known status; a `cancel` is the asker's alone, to its assignment's target.
 pub(crate) fn check_kind(
     kind: &str,
     meta: &Meta,
@@ -732,7 +732,12 @@ pub(crate) fn check_kind(
                 Err("bad_request")
             }
         }
-        "cancel" if parent.is_some_and(|p| p.kind == "assign" && p.from_key == from) => Ok(()),
+        "cancel"
+            if parent
+                .is_some_and(|p| p.kind == "assign" && p.from_key == from && p.to_key == to) =>
+        {
+            Ok(())
+        }
         "cancel" => Err("policy"),
         _ => Err("unsupported"),
     }
@@ -1206,11 +1211,19 @@ pub fn receive(
     if roster.by_short(me).is_none() {
         return refused("not_member");
     }
-    // The workspace rules judge every message (an assignment keeps its own path); a hold keeps
-    // the requester and skill it was judged as.
-    let held = if kind == "message" {
-        let (d, requester, skill) =
-            judge_message(judge, peer, roster, to, a2a.is_some(), authority.as_ref());
+    // The workspace rules judge every message and every assign to an existing session (one to
+    // a fresh worker keeps Workers' own path); a hold keeps the requester and skill it was
+    // judged as.
+    let held = if kind == "message" || (kind == "assign" && !is_new_worker(to)) {
+        let (d, requester, skill) = judge_message(
+            judge,
+            peer,
+            roster,
+            to,
+            kind,
+            a2a.is_some(),
+            authority.as_ref(),
+        );
         match d.effect {
             Effect::Allow => None,
             Effect::Deny => return refused("policy"),
@@ -1304,16 +1317,17 @@ pub fn receive(
     })
 }
 
-/// The rules' decision on a `message` from `peer` to `to`, with the requester and skill it
-/// judged: requester `person:<sub>` (the bound object's requester, else the sender's proof
-/// person) or `member:<short>`; skill the object's, else `ask_session` for an A2A Message, else
-/// `message`; the requester's org the object's, else the sender's, else (every peer is a roster
-/// member) the workspace.
+/// The rules' decision on a `message` (or an `assign`, `kind`) from `peer` to `to`, with the
+/// requester and skill it judged: requester `person:<sub>` (the bound object's requester, else
+/// the sender's proof person) or `member:<short>`; skill the object's, else `assign` for an
+/// assign, else `ask_session` for an A2A Message, else `message`; the requester's org the
+/// object's, else the sender's, else (every peer is a roster member) the workspace.
 fn judge_message(
     judge: &Judge,
     peer: &Member,
     roster: &Roster,
     to: &str,
+    kind: &str,
     is_a2a: bool,
     a: Option<&crate::authority::Authority>,
 ) -> (crate::rules::Decision, String, String) {
@@ -1334,6 +1348,7 @@ fn judge_message(
     let resource = format!("session:{to}");
     let skill = match a {
         Some(a) => a.skill.as_str(),
+        None if kind == "assign" => "assign",
         None if is_a2a => "ask_session",
         None => "message",
     };
@@ -3234,6 +3249,45 @@ mod tests {
         )
         .unwrap();
         assert_eq!(got.state, State::Stored);
+    }
+
+    /// A cancel must target the session its assignment targeted.
+    #[test]
+    fn receive_refuses_a_cancel_to_another_session_than_its_assigns() {
+        let (_d, s) = setup();
+        let (peer, roster, _) = peer_mail("m/claude:new", "x");
+        // The host's copy of p's assignment to a fresh worker.
+        let a = assigned_new(&s, "p/codex:a", "m/claude:new", "a1");
+        let cancel = |to: &str, rid: &str| {
+            let mut env = peer_env("p/codex:a", to, rid, "cancel", Meta::default());
+            if let Frame::Envelope { reply_to, hops, .. } = &mut env {
+                (*reply_to, *hops) = (Some(a.message_id.clone()), a.hops as u32 + 1);
+            }
+            receive(
+                &s,
+                &env,
+                None,
+                &peer,
+                &roster,
+                "m",
+                None,
+                None,
+                &workers_on(),
+                1000,
+                &Judge::default(),
+            )
+            .unwrap()
+        };
+        let got = cancel("m/claude:x1", "c1");
+        assert_eq!(
+            (got.state, got.reason.as_deref()),
+            (State::Refused, Some("policy"))
+        );
+        let got = cancel("m/claude:new", "c2");
+        assert_eq!(
+            (got.state, got.cancelled),
+            (State::Stored, Some(a.message_id))
+        );
     }
 
     #[test]

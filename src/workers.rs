@@ -19,6 +19,7 @@ use crate::daemon::{ipc, Daemon, TeamState};
 use crate::holds::{self, signed_record};
 use crate::identity::Identity;
 use crate::mail::{self, Meta, State};
+use crate::rules::{self, Effect};
 use crate::sessions::{self, Key, PROVIDERS};
 use crate::store::{Message, Store, Worker};
 use crate::{frame, label, Result};
@@ -39,28 +40,42 @@ pub enum Policy {
     Refuse,
 }
 
-/// `member`'s policy: the latest standing record, else this computer's own key may, others ask.
-pub fn policy(store: &Store, me: &str, member: &str) -> rusqlite::Result<Policy> {
-    let scope: Option<String> = store
-        .conn()
-        .query_row(
-            "SELECT scope FROM approvals WHERE hold_id IS NULL \
-             AND scope IN ('always', 'refused', 'revoked') \
-             AND json_extract(record, '$.member') = ?1 ORDER BY rowid DESC LIMIT 1",
-            [member],
-            |r| r.get(0),
-        )
-        .map(Some)
-        .or_else(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => Ok(None),
-            e => Err(e),
-        })?;
-    Ok(match scope.as_deref() {
-        Some("always") => Policy::Allow,
-        Some("refused") => Policy::Refuse,
-        Some("revoked") => Policy::Ask,
-        _ if member == me => Policy::Allow,
-        _ => Policy::Ask,
+/// `member`'s policy for any worker here (`policy_for` with provider `*`).
+pub fn policy(store: &Store, me: &str, member: &str) -> Result<Policy> {
+    policy_for(store, me, member, "*")
+}
+
+/// `member`'s policy for a `provider` worker on this computer `me`, judged by the rules
+/// (`rules::decide`, resource `worker:<me>/<provider>`, skill `assign`, requester
+/// `member:<member>`) with the standing rows as exceptions: allow is Allow, deny Refuse, hold
+/// Ask. This computer's own key may, unless a row of any kind names it.
+fn policy_for(store: &Store, me: &str, member: &str, provider: &str) -> Result<Policy> {
+    let exceptions = rules::exceptions(store, me)?;
+    let requester = format!("member:{member}");
+    if member == me && !exceptions.iter().any(|e| e.requester == requester) {
+        return Ok(Policy::Allow);
+    }
+    // Every asker reaching here is a roster member: its org is the workspace's.
+    let (workspace, doc) = rules::load(store)?;
+    let resource = format!("worker:{me}/{provider}");
+    let input = rules::Input {
+        org: workspace.as_deref(),
+        requester: &requester,
+        requester_org: workspace.as_deref(),
+        chain_agents: &[],
+        resource: &resource,
+        skill: "assign",
+        session_person: None,
+        operands: None,
+        intent: None,
+        verified_by: None,
+        operands_hash: None,
+        origin_is_person: false,
+    };
+    Ok(match rules::decide(&doc, &exceptions, &input).effect {
+        Effect::Allow => Policy::Allow,
+        Effect::Deny => Policy::Refuse,
+        Effect::Hold => Policy::Ask,
     })
 }
 
@@ -144,7 +159,7 @@ pub fn take_assign(
         return Ok(Taken::Refused("busy"));
     }
     let member = sessions::member_of(&assign.from_key).unwrap_or_default();
-    let verdict = policy(store, me, member)?;
+    let verdict = policy_for(store, me, member, provider)?;
     if verdict == Policy::Refuse {
         return Ok(Taken::Refused("declined"));
     }
@@ -1188,6 +1203,25 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    /// This computer's own key may, unless a standing row names it.
+    #[test]
+    fn my_own_rows_override_the_built_in_allow() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("state.db")).unwrap();
+        let id = Identity::load_or_create(dir.path()).unwrap();
+        assert_eq!(policy(&s, "m", "m").unwrap(), Policy::Allow);
+        set_policy(&s, &id, "m", "revoked", "me", 1).unwrap();
+        assert_eq!(policy(&s, "m", "m").unwrap(), Policy::Ask);
+        set_policy(&s, &id, "m", "refused", "me", 2).unwrap();
+        assert_eq!(policy(&s, "m", "m").unwrap(), Policy::Refuse);
+        // Another member's row leaves mine alone.
+        let t = tempfile::tempdir().unwrap();
+        let s = Store::open(&t.path().join("state.db")).unwrap();
+        set_policy(&s, &id, "q", "refused", "me", 1).unwrap();
+        assert_eq!(policy(&s, "m", "m").unwrap(), Policy::Allow);
+        assert_eq!(policy(&s, "m", "q").unwrap(), Policy::Refuse);
     }
 
     /// A config offering Claude Code workers (the tests' assignments are to `m/claude:new`).
