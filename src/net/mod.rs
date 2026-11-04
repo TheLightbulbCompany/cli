@@ -1346,8 +1346,6 @@ fn receive(d: &Arc<Daemon>, key: &str, env: &Frame, raw: &serde_json::Value, tx:
     };
     let judge = mail::Judge {
         sender_person: person.as_ref().map(|p| p.sub.as_str()),
-        // Sign-in proofs carry no org claim.
-        sender_org: None,
         my_person: mine.as_ref().map(|p| p.sub.as_str()),
         rules: &rules,
         exceptions: &exceptions,

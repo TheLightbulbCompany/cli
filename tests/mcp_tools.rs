@@ -1887,11 +1887,13 @@ fn assign_takes_an_authority_object_and_refuses_one_that_is_not_a_compact_jws() 
         assert_eq!(out.json()["error"], "bad_authority", "{bad}");
         assert!(!out.text.contains(bad), "{}", out.text);
     }
+    // A compact JWS reaches the daemon, which takes the assign's terms from it: one that does
+    // not verify is refused there.
     let out = m.tool(
         "assign",
         json!({"request_id": "as2", "to": t, "brief": "b", "done_when": "d",
                "authority": "x.y.z"}),
     );
-    assert!(!out.error, "{}", out.text);
-    assert_eq!(out.json()["state"], "stored");
+    assert!(out.error, "{}", out.text);
+    assert_eq!(out.json()["error"], "bad_request", "{}", out.text);
 }

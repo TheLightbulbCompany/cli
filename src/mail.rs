@@ -526,8 +526,6 @@ pub struct Prepared {
 pub struct Judge<'a> {
     /// The person the sending computer's `hello` proof names (`Proof::sub`), when it verified.
     pub sender_person: Option<&'a str>,
-    /// The sender's org, when its proof names one.
-    pub sender_org: Option<&'a str>,
     /// The person this computer is signed in as (its own proof's `sub`): `@session-person`.
     pub my_person: Option<&'a str>,
     pub rules: &'a crate::rules::Rules,
@@ -543,7 +541,6 @@ impl Default for Judge<'static> {
             std::sync::LazyLock::new(crate::rules::default_rules);
         Judge {
             sender_person: None,
-            sender_org: None,
             my_person: None,
             rules: &RULES,
             exceptions: &[],
@@ -551,10 +548,6 @@ impl Default for Judge<'static> {
         }
     }
 }
-
-/// A `mailbox` row whose message no open hold parks: one a session may be handed.
-pub(crate) const NOT_HELD: &str = "NOT EXISTS (SELECT 1 FROM holds h \
-     WHERE h.message_id = mailbox.message_id AND h.state = 'open')";
 
 /// An A2A Message's text: its `parts[].text` joined by newlines; `None` when a part has no
 /// `text` (this phase takes text only), there are no parts, or the role is not `ROLE_USER` or `ROLE_AGENT`.
@@ -1185,6 +1178,18 @@ pub fn receive(
     if let Err(reason) = check_kind(kind, meta, parent.as_ref(), from, to) {
         return refused(reason);
     }
+    // A cancel reaches a session only for an assign it was handed: one held, declined or
+    // expired never was, and its cancel would carry any text past the rules.
+    if kind == "cancel" && !is_new_worker(to) {
+        let released = match &parent {
+            Some(p) => receipt(store, &Key(p.from_key.clone()), &p.request_id)?
+                .is_some_and(|r| matches!(r.state, State::Stored | State::Delivered | State::Read)),
+            None => false,
+        };
+        if !released {
+            return refused("policy");
+        }
+    }
     if declared.is_some_and(|d| !d.contains(to)) {
         return refused("policy");
     }
@@ -1264,7 +1269,13 @@ pub fn receive(
         let state = if kind == "assign" {
             let mut m = Message::from(&p);
             m.origin = Some(format!("net:{}", peer.short));
-            let t = workers::take_assign(store, config, me, &m, now as i64)?;
+            let (requester, origin_is_person) = requester_of(judge, peer, p.authority.as_ref());
+            let asker = workers::Asker {
+                requester: &requester,
+                origin_is_person,
+                authority: p.authority.as_ref(),
+            };
+            let t = workers::take_assign(store, config, me, &m, Some(&asker), now as i64)?;
             let state = match t {
                 Taken::Refused(r) => return refused(r), // nothing written: the tx rolls back
                 Taken::Held { .. } => State::Held,
@@ -1287,10 +1298,9 @@ pub fn receive(
         });
     }
     if let Some((requester, skill)) = held {
-        // In the mailbox, but no session is handed it while its hold is open.
+        // No mailbox row until its person allows it (`holds::answer`): a build that knows no
+        // holds never hands it to a session.
         put(store, &p, Origin::Net(&peer.short), State::Held)?;
-        let expires = expires_for(&p.to.0, p.sent_at);
-        store.put_mailbox(&p.to.0, &p.message_id, p.sent_at, expires)?;
         let mut m = Message::from(&p);
         m.origin = Some(format!("net:{}", peer.short));
         let h = crate::holds::insert_kind(store, m, &peer.short, HoldKind::Authority, now as i64)?;
@@ -1317,11 +1327,31 @@ pub fn receive(
     })
 }
 
+/// Who `peer`'s mail is judged as: `person:<sub>` (the bound object's requester, else the
+/// sender's proof person) or `member:<short>`, and whether a person originated it (the
+/// object's `verified_by` is not `agent-runtime`; without one, the proof verified).
+fn requester_of(
+    judge: &Judge,
+    peer: &Member,
+    a: Option<&crate::authority::Authority>,
+) -> (String, bool) {
+    let requester = match (a, judge.sender_person) {
+        (Some(a), _) => format!("person:{}", a.requester_person),
+        (None, Some(p)) => format!("person:{p}"),
+        (None, None) => format!("member:{}", peer.short),
+    };
+    let person = match a {
+        Some(a) => a.verified_by != "agent-runtime",
+        None => judge.sender_person.is_some(),
+    };
+    (requester, person)
+}
+
 /// The rules' decision on a `message` (or an `assign`, `kind`) from `peer` to `to`, with the
 /// requester and skill it judged: requester `person:<sub>` (the bound object's requester, else
 /// the sender's proof person) or `member:<short>`; skill the object's, else `assign` for an
 /// assign, else `ask_session` for an A2A Message, else `message`; the requester's org the
-/// object's, else the sender's, else (every peer is a roster member) the workspace.
+/// object's, else (every peer is a roster member) the workspace.
 fn judge_message(
     judge: &Judge,
     peer: &Member,
@@ -1331,16 +1361,11 @@ fn judge_message(
     is_a2a: bool,
     a: Option<&crate::authority::Authority>,
 ) -> (crate::rules::Decision, String, String) {
-    let requester = match (a, judge.sender_person) {
-        (Some(a), _) => format!("person:{}", a.requester_person),
-        (None, Some(p)) => format!("person:{p}"),
-        (None, None) => format!("member:{}", peer.short),
-    };
+    let (requester, origin_is_person) = requester_of(judge, peer, a);
+    let member = format!("member:{}", peer.short);
     // With no document, the roster is the workspace (`org:*` matches its members).
     let member_org = judge.workspace.unwrap_or(&roster.team_id);
-    let requester_org = a.map_or(judge.sender_org.unwrap_or(member_org), |a| {
-        a.requester_org.as_str()
-    });
+    let requester_org = a.map_or(member_org, |a| a.requester_org.as_str());
     let chain_agents: Vec<String> = a.map_or(vec![], |a| {
         a.chain.iter().filter_map(|h| h.agent.clone()).collect()
     });
@@ -1355,6 +1380,7 @@ fn judge_message(
     let input = crate::rules::Input {
         org: judge.workspace,
         requester: &requester,
+        requester_member: Some(&member),
         requester_org: Some(requester_org),
         chain_agents: &chain_agents,
         resource: &resource,
@@ -1364,10 +1390,7 @@ fn judge_message(
         intent: a.map(|a| a.intent.as_str()),
         verified_by: a.map(|a| a.verified_by.as_str()),
         operands_hash: hash.as_deref(),
-        origin_is_person: match a {
-            Some(a) => a.verified_by != "agent-runtime",
-            None => judge.sender_person.is_some(),
-        },
+        origin_is_person,
     };
     let d = crate::rules::decide(judge.rules, judge.exceptions, &input);
     (d, requester, skill.into())
@@ -1406,10 +1429,9 @@ pub fn take_one(store: &Store, to: &Key, message_id: &str, now: u64) -> Result<O
 
 /// The messages waiting for `to`, oldest first, left where they are.
 pub fn waiting(store: &Store, to: &Key, now: u64) -> Result<Vec<Message>> {
-    let mut stmt = store.conn().prepare(&format!(
-        "SELECT message_id FROM mailbox WHERE to_key = ?1 AND expires_at >= ?2 \
-             AND {NOT_HELD} ORDER BY id"
-    ))?;
+    let mut stmt = store.conn().prepare(
+        "SELECT message_id FROM mailbox WHERE to_key = ?1 AND expires_at >= ?2 ORDER BY id",
+    )?;
     let ids = stmt.query_map(params![to.0, now as i64], |r| r.get::<_, String>(0))?;
     let mut out = vec![];
     for id in ids {
@@ -1543,10 +1565,10 @@ fn delivered_ids(store: &Store, short: &str, bound: &str, at: i64) -> Result<Vec
 
 /// The addresses with waiting mail, newest mail first.
 pub fn waiting_keys(store: &Store, now: u64) -> Result<Vec<String>> {
-    let mut stmt = store.conn().prepare(&format!(
-        "SELECT to_key FROM mailbox WHERE expires_at >= ?1 AND {NOT_HELD} \
-             GROUP BY to_key ORDER BY MAX(id) DESC"
-    ))?;
+    let mut stmt = store.conn().prepare(
+        "SELECT to_key FROM mailbox WHERE expires_at >= ?1 \
+             GROUP BY to_key ORDER BY MAX(id) DESC",
+    )?;
     let keys = stmt.query_map([now as i64], |r| r.get(0))?;
     Ok(keys.collect::<rusqlite::Result<_>>()?)
 }
@@ -1555,10 +1577,10 @@ fn take_where(store: &Store, to: &Key, only: Option<&str>, now: u64) -> Result<V
     let conn = store.conn();
     let tx = conn.unchecked_transaction()?;
     let rows: Vec<(i64, String)> = {
-        let mut stmt = tx.prepare(&format!(
+        let mut stmt = tx.prepare(
             "SELECT id, message_id FROM mailbox WHERE to_key = ?1 AND expires_at >= ?2 \
-             AND (?3 IS NULL OR message_id = ?3) AND {NOT_HELD} ORDER BY id"
-        ))?;
+             AND (?3 IS NULL OR message_id = ?3) ORDER BY id",
+        )?;
         let rows = stmt.query_map(params![to.0, now as i64, only], |r| {
             Ok((r.get(0)?, r.get(1)?))
         })?;
@@ -1587,9 +1609,7 @@ fn take_where(store: &Store, to: &Key, only: Option<&str>, now: u64) -> Result<V
 /// How many messages wait for `to`, without taking them.
 pub fn unread(store: &Store, to: &Key, now: u64) -> Result<u64> {
     let n: i64 = store.conn().query_row(
-        &format!(
-            "SELECT COUNT(*) FROM mailbox WHERE to_key = ?1 AND expires_at >= ?2 AND {NOT_HELD}"
-        ),
+        "SELECT COUNT(*) FROM mailbox WHERE to_key = ?1 AND expires_at >= ?2",
         params![to.0, now as i64],
         |r| r.get(0),
     )?;
@@ -1649,24 +1669,23 @@ pub fn forget(store: &Store) -> Result<()> {
     Ok(())
 }
 
-/// Mail that waited past `HOLD_S` becomes `expired` and leaves the mailbox; mail an open hold
-/// parks waits for it (`holds::expire` closes it).
+/// Mail that waited past `HOLD_S` becomes `expired` and leaves the mailbox. A held message has
+/// no mailbox row (`holds::expire` closes it).
 pub fn expire(store: &Store, now: u64) -> Result<()> {
     let conn = store.conn();
     let tx = conn.unchecked_transaction()?;
     let due: Vec<(String, String)> = {
-        let mut stmt = tx.prepare(&format!(
+        let mut stmt = tx.prepare(
             "SELECT m.from_key, m.request_id FROM mailbox JOIN messages m \
-             ON m.id = mailbox.message_id WHERE mailbox.expires_at < ?1 AND {NOT_HELD}"
-        ))?;
+             ON m.id = mailbox.message_id WHERE mailbox.expires_at < ?1",
+        )?;
         let rows = stmt.query_map([now as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
         rows.collect::<rusqlite::Result<_>>()?
     };
     for (from, request_id) in due {
         advance(&tx, &from, &request_id, State::Expired, None, None, now)?;
     }
-    let sql = format!("DELETE FROM mailbox WHERE expires_at < ?1 AND {NOT_HELD}");
-    tx.execute(&sql, [now as i64])?;
+    tx.execute("DELETE FROM mailbox WHERE expires_at < ?1", [now as i64])?;
     tx.commit()?;
     Ok(())
 }
@@ -3310,8 +3329,9 @@ mod tests {
             ..Default::default()
         };
         let mut config = workers_on();
-        let take =
-            |config: &Config, a: &Message| workers::take_assign(&s, config, "m", a, 10).unwrap();
+        let take = |config: &Config, a: &Message| {
+            workers::take_assign(&s, config, "m", a, None, 10).unwrap()
+        };
         let st = |a: &Message| state(&s, &a.request_id);
         // Not offered, nor for this harness.
         let a = assign("r1", "p/codex:a");

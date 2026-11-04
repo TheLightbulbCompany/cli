@@ -86,7 +86,7 @@ pub fn default_rules() -> Rules {
 /// `(workspace, iat, rules)` of `jws` when it is a rules document from a known issuer key whose
 /// `iat` is at most `IAT_SKEW_S` ahead of `now`. It does not expire. Errors name the check.
 pub fn verify_doc(jws: &str, now: i64) -> Result<(String, i64, Rules)> {
-    let c = crate::authority::verify_jws(jws, MAX_DOC, TYP, now)?;
+    let c = crate::authority::verify_jws(jws, MAX_DOC, TYP)?;
     let iat = c["iat"].as_i64().ok_or("shape")?;
     if iat > now + IAT_SKEW_S {
         return Err("iat".into());
@@ -176,7 +176,8 @@ pub struct Exception {
 
 /// The local exceptions, oldest first. A row without an `operands_hash` is a standing policy
 /// (`always` allows, `refused` denies, `revoked` removes the earlier one for the same
-/// resource, skill and requester); a row with one is a one-shot allow. Workers' rows (no
+/// resource, skill and requester); a row with one is a standing allow bound to those operands
+/// (nothing consumes it). Workers' rows (no
 /// `resource`, `$.member` in the record) read as `worker:<me>/*`, `assign`,
 /// `member:<member short>`; the latest per member wins, a `revoked` one as a `Hold` exception
 /// (ask, never the `member == me` allow). Nothing is rewritten on disk.
@@ -246,11 +247,14 @@ pub fn exceptions(store: &Store, me: &str) -> Result<Vec<Exception>> {
     Ok(out)
 }
 
-/// What `decide` judges. `requester` is `person:<sub>` (verified) or `member:<short>`;
-/// `requester_org` is the sender's proof org, or `org` itself for a roster member without one.
+/// What `decide` judges. `requester` is `person:<sub>` (verified) or `member:<short>`, and
+/// `requester_member` the sending computer (`member:<short>`), when known: a rule or exception
+/// naming either matches. `requester_org` is the object's org, or `org` itself for a roster
+/// member without one.
 pub struct Input<'a> {
     pub org: Option<&'a str>,
     pub requester: &'a str,
+    pub requester_member: Option<&'a str>,
     pub requester_org: Option<&'a str>,
     pub chain_agents: &'a [String],
     pub resource: &'a str,
@@ -343,6 +347,7 @@ fn requester_matches(r: &str, i: &Input) -> bool {
             .is_some_and(|o| i.org.is_none_or(|w| w == o)),
         _ => {
             r == i.requester
+                || i.requester_member == Some(r)
                 || r.strip_prefix("org:")
                     .is_some_and(|o| i.requester_org == Some(o))
                 || r.strip_prefix("agent:")
@@ -443,6 +448,7 @@ mod tests {
         Input {
             org: Some("org_1"),
             requester,
+            requester_member: None,
             requester_org: Some("org_1"),
             chain_agents: &[],
             resource,

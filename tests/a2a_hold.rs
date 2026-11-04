@@ -129,6 +129,17 @@ async fn a_and_b_with(
     doc: Option<String>,
     env: &[(&str, String)],
 ) -> (Env, Env, iroh::Endpoint, Peer) {
+    a_and_b_config(a_user, b_user, doc, env, "").await
+}
+
+/// `a_and_b_with`, A's daemon reading `config`.
+async fn a_and_b_config(
+    a_user: Option<&str>,
+    b_user: Option<&str>,
+    doc: Option<String>,
+    env: &[(&str, String)],
+    config: &str,
+) -> (Env, Env, iroh::Endpoint, Peer) {
     let (a, b) = (Env::new(), Env::new());
     seed_team(&a, &b);
     if let Some(u) = a_user {
@@ -137,7 +148,7 @@ async fn a_and_b_with(
     if let Some(d) = doc {
         assert!(lightbulb::rules::store_doc(&a.store(), &d, now_s()).unwrap());
     }
-    a.daemon(false, "", env);
+    a.daemon(false, config, env);
     let ep = endpoint(&b.identity()).await;
     let mut p = Peer::dial(&ep, &a).await;
     let proof = b_user.map(|u| issuer::proof(&b.identity().key, u, now_s()));
@@ -193,8 +204,8 @@ async fn a2a_ask_with_no_document_is_held_for_the_session_person() {
     assert_eq!(open[0]["target_session"], sa.as_str());
     let m = a.store().message(&id).unwrap().expect("stored");
     assert_eq!(m.authority_id.as_deref(), Some("auth_1"));
-    // In the mailbox, but A's session does not get it until the person answers.
-    assert_eq!(mailbox(&a), 1);
+    // No mailbox row until the person allows it: no build can hand it to a session.
+    assert_eq!(mailbox(&a), 0);
     assert_eq!(a.unread(&sa), 0);
     assert!(a.inbox(&sa).is_empty());
     assert_eq!(a.state(&sb, &format!("r-{id}")), "held");
@@ -364,10 +375,13 @@ async fn allow_delivers_the_held_message_and_writes_the_record_with_authority_id
         shown,
         "agent_1 (user_b) asks Codex for user_b: say hi\n\nhi"
     );
+    assert_eq!(mailbox(&a), 0);
     let r = answer(&a, "H1", "allow", "once");
     assert_eq!(r["ok"], true, "{r}");
     assert_eq!(p.receipt(&id, "stored").await, None);
     assert_eq!(a.state(&sb, &format!("r-{id}")), "stored");
+    // Released: the mailbox row is written now.
+    assert_eq!(mailbox(&a), 1);
     let got = a.inbox(&sa);
     assert_eq!(got.len(), 1, "{got:?}");
     assert_eq!(got[0]["text"], "hi");
@@ -471,12 +485,12 @@ async fn authority_hold_expires_after_24h_with_receipt_expired() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn held_mailbox_row_survives_mail_expire_while_its_hold_is_open() {
+async fn a_held_message_outlives_mail_expire_with_no_mailbox_row() {
     let (a, b, _ep, _p, id, _jws, sa) = held_ask(&[]).await;
     let store = a.store();
     let later = now_s() as u64 + lightbulb::mail::HOLD_S + 60;
     lightbulb::mail::expire(&store, later).unwrap();
-    assert_eq!(mailbox(&a), 1);
+    assert_eq!(mailbox(&a), 0);
     assert_eq!(a.state(&session(&b, "b1"), &format!("r-{id}")), "held");
     assert_eq!(held(&a).len(), 1);
     // Still answerable, and the answer delivers.
@@ -505,13 +519,11 @@ async fn rules_set_while_a_hold_is_open_leaves_it_answerable() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn allow_after_the_senders_outbox_expired_still_delivers() {
     let (a, b, ep, p, id, _jws, sa) = held_ask(&[]).await;
-    // B gave up and is gone; the row's own 24 h in the mailbox have passed too.
+    // B gave up and is gone; mail expiry runs meanwhile.
     drop(p);
     ep.close().await;
     until(10, "B offline", || a.status()["peers"]["online"] == 0);
-    let c = rusqlite::Connection::open(a.state.path().join("state.db")).unwrap();
-    c.execute("UPDATE mailbox SET expires_at = 1", []).unwrap();
-    lightbulb::mail::expire(&a.store(), now_s() as u64).unwrap();
+    lightbulb::mail::expire(&a.store(), now_s() as u64 + lightbulb::mail::HOLD_S + 60).unwrap();
     let r = answer(&a, "H1", "allow", "once");
     assert_eq!(r["ok"], true, "{r}");
     let got = a.inbox(&sa);
@@ -564,4 +576,88 @@ async fn a_hold_whose_object_expired_offers_only_decline() {
     assert_eq!(r["error"], "bad_request", "{r}");
     assert_eq!(held(&a).len(), 1);
     assert_eq!(answer(&a, "H1", "decline", "once")["ok"], true);
+}
+
+// A cancel to a session reaches it only after its assign was released.
+
+/// An envelope of `kind` from `from` to `to` answering `reply_to`, with `meta`.
+fn of_kind(
+    id: &str,
+    kind: &str,
+    from: &str,
+    to: &str,
+    reply_to: Option<&str>,
+    meta: Value,
+) -> Value {
+    let mut v = envelope(id, from, to, "do it", None);
+    v["kind"] = kind.into();
+    v["reply_to"] = reply_to.into();
+    v["meta"] = meta;
+    v
+}
+
+/// A (signed in as `user_a`, workers on, a document holding every assign) and B's assign to
+/// A's session, held: the envelope id.
+async fn held_assign() -> (Env, Env, iroh::Endpoint, Peer, String) {
+    let (a, b, ep, mut p) = a_and_b_config(
+        Some("user_a"),
+        Some("user_b"),
+        Some(document(json!([]))),
+        &[],
+        "network_workers = true\n",
+    )
+    .await;
+    let (sa, sb) = (session(&a, "a1"), session(&b, "b1"));
+    let id = ulid();
+    let terms = json!({"done_when": "done", "deadline_at": now_s() + 600});
+    p.send_raw(&of_kind(&id, "assign", &sb, &sa, None, terms))
+        .await;
+    assert_eq!(p.ack(&id).await.0, "held");
+    (a, b, ep, p, id)
+}
+
+/// B cancels assign `parent` to A's session: the ack.
+async fn cancel(
+    a: &Env,
+    b: &Env,
+    p: &mut Peer,
+    parent: &str,
+) -> (String, (String, Option<String>)) {
+    let (sa, sb) = (session(a, "a1"), session(b, "b1"));
+    let id = ulid();
+    p.send_raw(&of_kind(&id, "cancel", &sb, &sa, Some(parent), json!({})))
+        .await;
+    let ack = p.ack(&id).await;
+    (id, ack)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancel_of_a_held_assign_is_refused_policy() {
+    let (a, b, _ep, mut p, parent) = held_assign().await;
+    let (id, ack) = cancel(&a, &b, &mut p, &parent).await;
+    assert_eq!(ack, refused("policy"));
+    assert!(a.store().message(&id).unwrap().is_none());
+    assert_eq!(mailbox(&a), 0);
+    assert!(a.inbox(&session(&a, "a1")).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancel_of_a_declined_assign_is_refused_policy() {
+    let (a, b, _ep, mut p, parent) = held_assign().await;
+    assert_eq!(answer(&a, "H1", "decline", "once")["ok"], true);
+    let (id, ack) = cancel(&a, &b, &mut p, &parent).await;
+    assert_eq!(ack, refused("policy"));
+    assert!(a.store().message(&id).unwrap().is_none());
+    assert_eq!(mailbox(&a), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancel_of_a_released_assign_is_stored() {
+    let (a, b, _ep, mut p, parent) = held_assign().await;
+    assert_eq!(answer(&a, "H1", "allow", "once")["ok"], true);
+    let (id, ack) = cancel(&a, &b, &mut p, &parent).await;
+    assert_eq!(ack.0, "stored");
+    assert!(a.store().message(&id).unwrap().is_some());
+    let got = a.inbox(&session(&a, "a1"));
+    assert!(got.iter().any(|m| m["kind"] == "cancel"), "{got:?}");
 }

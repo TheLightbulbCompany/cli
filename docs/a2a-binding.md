@@ -17,7 +17,8 @@ Each member signs its own card into the team's roster as a `meta` entry with a `
 most 16 KiB. The roster is a hash-linked log replicated to every member, so a card reaches the
 team with it; a member's latest card wins, and an entry over 16 KiB never replaces one. The
 `card` operation on a computer returns a member's card (the member's short or key; default: its
-own), and each `directory` record carries the card of the member that owns the session.
+own), and a `directory` answer carries a top-level `cards` map, keyed by member short, holding the
+card of each member that owns a listed session.
 
 The card declares one extension, the signed authority object, with `required: true`. Its skills are
 `message` and `ask_session`, plus `assign` when the member's computer offers workers.
@@ -60,7 +61,7 @@ an A2A error as follows.
 | `policy` | `-32603` with `reason: "policy"`: the team's rules deny the message |
 | `declined` | `-32603` with `reason: "declined"`: the person answered no |
 | `not_member` | `-32603` with `reason: "not_member"`: the sender is not a member of the receiver's team |
-| `not_a_member` | `-32603` with `reason: "not_a_member"`: the recipient is not a member of the team |
+| `not_a_member` | `-32603` with `reason: "not_a_member"`: the sending computer is not among the people a workspace instance admits |
 | `loop` | `-32000`: the message would loop between agents |
 | `no_worker` | `-32603` with `reason: "no_worker"`: no worker of that kind is offered |
 | `busy` | `-32603` with `reason: "busy"`: the worker host is at its limit; try later |
@@ -68,3 +69,4 @@ an A2A error as follows.
 
 A message held for a person's answer is not an error. Its receipt state is `held`, which maps to
 the task state `TASK_STATE_AUTH_REQUIRED` until the person allows or declines it (`declined` above).
+A hold that nobody answers in time runs out, and its receipt state becomes `expired`.

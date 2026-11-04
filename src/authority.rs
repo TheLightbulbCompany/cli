@@ -109,7 +109,7 @@ pub fn operands_hash(operands: &Value) -> String {
 /// `token`'s claims when it is a compact EdDSA JWS of at most `max` bytes, signed by a known
 /// issuer key, whose protected header `typ` is `typ`. Errors name the check: `size`, `jws`,
 /// `alg`, `kid`, `signature`, `typ`. The claims' own checks are the caller's.
-pub(crate) fn verify_jws(token: &str, max: usize, typ: &str, _now: i64) -> Result<Value> {
+pub(crate) fn verify_jws(token: &str, max: usize, typ: &str) -> Result<Value> {
     if token.len() > max {
         return Err("size".into());
     }
@@ -145,7 +145,7 @@ pub(crate) fn verify_jws(token: &str, max: usize, typ: &str, _now: i64) -> Resul
 /// (`iat` at most `IAT_SKEW_S` ahead), living at most `MAX_LIFE_S`, of the phase-1 shape, its
 /// first hop the requester and its `operands_hash` its operands'. Errors name the check.
 pub fn verify(jws: &str, now: i64) -> Result<Authority> {
-    let c = verify_jws(jws, MAX_TOKEN, TYP, now)?;
+    let c = verify_jws(jws, MAX_TOKEN, TYP)?;
     let a = shape(&c, jws).ok_or("shape")?;
     let on_behalf_of = &c["on_behalf_of"];
     if a.intent.len() > MAX_INTENT {

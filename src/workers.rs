@@ -40,37 +40,61 @@ pub enum Policy {
     Refuse,
 }
 
-/// `member`'s policy for any worker here (`policy_for` with provider `*`).
+/// `member`'s policy for any worker here (`policy_for` with provider `*`), judged as the
+/// member alone.
 pub fn policy(store: &Store, me: &str, member: &str) -> Result<Policy> {
-    policy_for(store, me, member, "*")
+    policy_for(store, me, member, "*", None)
+}
+
+/// Who asks for a fresh worker as `mail::receive` judged them: the requester (`person:<sub>`
+/// when the sender's proof verified or an object is bound, else `member:<short>`), whether a
+/// person originated it, and the bound authority object.
+pub struct Asker<'a> {
+    pub requester: &'a str,
+    pub origin_is_person: bool,
+    pub authority: Option<&'a crate::authority::Authority>,
 }
 
 /// `member`'s policy for a `provider` worker on this computer `me`, judged by the rules
-/// (`rules::decide`, resource `worker:<me>/<provider>`, skill `assign`, requester
-/// `member:<member>`) with the standing rows as exceptions: allow is Allow, deny Refuse, hold
-/// Ask. This computer's own key may, unless a row of any kind names it.
-fn policy_for(store: &Store, me: &str, member: &str, provider: &str) -> Result<Policy> {
+/// (`rules::decide`, resource `worker:<me>/<provider>`, skill `assign`, requester `asker`'s,
+/// else `member:<member>`, the member matching too) with the standing rows as exceptions:
+/// allow is Allow, deny Refuse, hold Ask. This computer's own key may, unless a row of any
+/// kind names it.
+fn policy_for(
+    store: &Store,
+    me: &str,
+    member: &str,
+    provider: &str,
+    asker: Option<&Asker>,
+) -> Result<Policy> {
     let exceptions = rules::exceptions(store, me)?;
-    let requester = format!("member:{member}");
-    if member == me && !exceptions.iter().any(|e| e.requester == requester) {
+    let as_member = format!("member:{member}");
+    if member == me && !exceptions.iter().any(|e| e.requester == as_member) {
         return Ok(Policy::Allow);
     }
-    // Every asker reaching here is a roster member: its org is the workspace's.
+    // Every asker reaching here is a roster member: its org is the workspace's, unless its
+    // object names another.
     let (workspace, doc) = rules::load(store)?;
     let resource = format!("worker:{me}/{provider}");
+    let a = asker.and_then(|k| k.authority);
+    let chain_agents: Vec<String> = a.map_or(vec![], |a| {
+        a.chain.iter().filter_map(|h| h.agent.clone()).collect()
+    });
+    let hash = a.map(|a| crate::authority::operands_hash(&a.operands));
     let input = rules::Input {
         org: workspace.as_deref(),
-        requester: &requester,
-        requester_org: workspace.as_deref(),
-        chain_agents: &[],
+        requester: asker.map_or(&as_member, |k| k.requester),
+        requester_member: Some(&as_member),
+        requester_org: a.map_or(workspace.as_deref(), |a| Some(&a.requester_org)),
+        chain_agents: &chain_agents,
         resource: &resource,
         skill: "assign",
         session_person: None,
-        operands: None,
-        intent: None,
-        verified_by: None,
-        operands_hash: None,
-        origin_is_person: false,
+        operands: a.map(|a| &a.operands),
+        intent: a.map(|a| a.intent.as_str()),
+        verified_by: a.map(|a| a.verified_by.as_str()),
+        operands_hash: hash.as_deref(),
+        origin_is_person: asker.is_some_and(|k| k.origin_is_person),
     };
     Ok(match rules::decide(&doc, &exceptions, &input).effect {
         Effect::Allow => Policy::Allow,
@@ -140,13 +164,14 @@ pub enum Taken {
 /// short key): refused when this computer does not offer the harness, is running `workers_max`
 /// workers, or refuses the asker; else stored (in no mailbox) and either held for the person
 /// (their policy for the asker is Ask) or ready to start; a deadline past `now +
-/// workers_max_deadline_s` is stored as that. The caller holds the store lock and a
-/// transaction.
+/// workers_max_deadline_s` is stored as that. `asker` is who `mail::receive` judged (none: the
+/// asking member alone). The caller holds the store lock and a transaction.
 pub fn take_assign(
     store: &Store,
     config: &Config,
     me: &str,
     assign: &Message,
+    asker: Option<&Asker>,
     now: i64,
 ) -> Result<Taken> {
     let provider = sessions::split_addr(&assign.to_key)
@@ -159,7 +184,7 @@ pub fn take_assign(
         return Ok(Taken::Refused("busy"));
     }
     let member = sessions::member_of(&assign.from_key).unwrap_or_default();
-    let verdict = policy_for(store, me, member, provider)?;
+    let verdict = policy_for(store, me, member, provider, asker)?;
     if verdict == Policy::Refuse {
         return Ok(Taken::Refused("declined"));
     }

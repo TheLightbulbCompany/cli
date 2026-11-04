@@ -1929,7 +1929,9 @@ pub fn now() -> u64 {
 /// `sessions::qualify` (a bare name is this member's; anything else, groups included, is
 /// refused with reason `bad_address`). `kind` is one of `mail::KINDS` (`message` by default); an `assign` also takes
 /// `done_when`, `deadline_s` (1..=14 400, default 3 600) and `repo`/`branch`, a `result` its
-/// `status`/`reason`; a bad `deadline_s` is `bad_request`.
+/// `status`/`reason`; a bad `deadline_s` is `bad_request`. An assign whose `a2a` carries an
+/// authority object takes `done_when`, `deadline_at`, `repo` and `branch` from its operands
+/// instead (`object_terms`; `bad_request` when it does not verify or does not fit).
 /// Mail for a session here is stored, then pushed into a Claude or Codex session
 /// (`super::deliver`) if its tier is `push`; mail under another member's prefix goes to the
 /// outbox (`queued`, `where` that member's computer), `not_member` for a prefix no member has.
@@ -1979,17 +1981,6 @@ pub(crate) fn send_as(
         reason: text_of("reason"),
         ..Default::default()
     };
-    if kind == "assign" {
-        // An integer in 1..=14 400 seconds; anything else is refused, never clamped.
-        let secs = match body.get("deadline_s") {
-            None | Some(Value::Null) => 3_600,
-            Some(v) => match v.as_i64().filter(|n| (1..=14_400).contains(n)) {
-                Some(n) => n,
-                None => return Err(Response::err(id, BAD_REQUEST)),
-            },
-        };
-        meta.deadline_at = Some(now() as i64 + secs);
-    }
     let reply_to = body["reply_to"].as_str();
     let to = match body["to"].as_str() {
         Some(t) => match sessions::qualify(&daemon.identity.short, t) {
@@ -2038,6 +2029,30 @@ pub(crate) fn send_as(
         }
         Some(_) => return Err(Response::err(id, BAD_REQUEST)),
     };
+    // An assign carrying an authority object takes its terms from the object's operands, so the
+    // receiver binds what was minted; else from the arguments.
+    let jws = a2a.as_ref().map(|a| &a["metadata"][authority::URI]);
+    match jws.filter(|j| !j.is_null()) {
+        Some(jws) if kind == "assign" => match object_terms(jws, text) {
+            Some(terms) => {
+                (meta.done_when, meta.deadline_at) = (terms.done_when, terms.deadline_at);
+                (meta.repo, meta.branch) = (terms.repo, terms.branch);
+            }
+            None => return Err(Response::err(id, BAD_REQUEST)),
+        },
+        _ if kind == "assign" => {
+            // An integer in 1..=14 400 seconds; anything else is refused, never clamped.
+            let secs = match body.get("deadline_s") {
+                None | Some(Value::Null) => 3_600,
+                Some(v) => match v.as_i64().filter(|n| (1..=MAX_DEADLINE_S).contains(n)) {
+                    Some(n) => n,
+                    None => return Err(Response::err(id, BAD_REQUEST)),
+                },
+            };
+            meta.deadline_at = Some(now() as i64 + secs);
+        }
+        _ => {}
+    }
     let team = daemon.team.lock().unwrap();
     let store = daemon.store.lock().unwrap();
     let internal = |_| Response::err(id, INTERNAL);
@@ -2070,6 +2085,33 @@ pub(crate) fn send_as(
         Err(Failed::NotMember) => Err(Response::err(id, super::net_ops::NOT_MEMBER)),
         Err(Failed::Internal(_)) => Err(Response::err(id, INTERNAL)),
     }
+}
+
+/// The longest an assignment may run from its send.
+const MAX_DEADLINE_S: i64 = 14_400;
+
+/// An assign's terms from authority object `jws` (verified now): its operands' `done_when`,
+/// `deadline_at` (at most `MAX_DEADLINE_S` from now), `repo` and `branch`; `None` when it does
+/// not verify, its `text` is not `text`, or a term has the wrong type.
+fn object_terms(jws: &Value, text: &str) -> Option<mail::Meta> {
+    let a = authority::verify(jws.as_str()?, now() as i64).ok()?;
+    let o = &a.operands;
+    let s = |k: &str| match &o[k] {
+        Value::Null => Some(None),
+        v => v.as_str().map(|s| Some(s.to_string())),
+    };
+    let deadline_at = match &o["deadline_at"] {
+        Value::Null => None,
+        v => Some(v.as_i64().filter(|d| *d <= now() as i64 + MAX_DEADLINE_S)?),
+    };
+    (o["text"].as_str() == Some(text)).then_some(())?;
+    Some(mail::Meta {
+        done_when: s("done_when")?,
+        deadline_at,
+        repo: s("repo")?,
+        branch: s("branch")?,
+        ..Default::default()
+    })
 }
 
 /// Why `dispatch` did not route a message.
@@ -2158,7 +2200,8 @@ fn fresh_worker(
         if let mail::Origin::App = origin {
             m.origin = Some(mail::APP_ORIGIN.into());
         }
-        match workers::take_assign(&store, &team.config, &daemon.identity.short, &m, now as i64)
+        let me = &daemon.identity.short;
+        match workers::take_assign(&store, &team.config, me, &m, None, now as i64)
             .map_err(internal)?
         {
             Taken::Refused(reason) => {

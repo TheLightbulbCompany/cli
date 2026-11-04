@@ -30,7 +30,8 @@ pub enum Kind {
     Permission,
     /// A worker-start hold: its message is an `assign` to `<member>/<provider>:new`.
     Worker,
-    /// A message the workspace rules hold for a person: it waits in the mailbox, receipt `held`.
+    /// A message the workspace rules hold for a person: receipt `held`, in no mailbox until
+    /// allowed.
     Authority,
 }
 
@@ -514,19 +515,16 @@ pub fn answer(
         let (f, rid, at) = (&m.from_key, &m.request_id, now as u64);
         mail::advance(store.conn(), f, rid, state, reason, None, at)?;
     }
-    // An authority hold's message is released to its session (its mailbox time from now), or
-    // leaves the mailbox refused.
+    // An authority hold's message is released to its session (into its mailbox, its time from
+    // now), or refused.
     if authority {
         let m = &c.hold.message;
         let (f, rid, at) = (&m.from_key, &m.request_id, now as u64);
         if allow {
-            let sql = "UPDATE mailbox SET expires_at = ?2 WHERE message_id = ?1";
             let expires = mail::expires_for(&m.to_key, now);
-            store.conn().execute(sql, params![m.id, expires])?;
+            store.put_mailbox(&m.to_key, &m.id, now, expires)?;
             mail::advance(store.conn(), f, rid, State::Stored, None, None, at)?;
         } else {
-            let sql = "DELETE FROM mailbox WHERE message_id = ?1";
-            store.conn().execute(sql, [&m.id])?;
             mail::advance(
                 store.conn(),
                 f,
@@ -552,8 +550,8 @@ pub(crate) fn signed_record(me: &Identity, mut fields: serde_json::Value) -> (St
 }
 
 /// Closes the open holds past their time at `now`: a permission prompt whose session is gone or
-/// that waited `PERMISSION_S`, an authority hold that waited `AUTHORITY_S` (its message leaves
-/// the mailbox), and any message hold of an older build. Returns them.
+/// that waited `PERMISSION_S`, an authority hold that waited `AUTHORITY_S`, and any message
+/// hold of an older build. Returns them.
 pub fn expire(store: &Store, now: i64) -> Result<Vec<Hold>> {
     let tx = store.conn().unchecked_transaction()?;
     let mut out = vec![];
@@ -582,10 +580,6 @@ pub fn expire(store: &Store, now: i64) -> Result<Vec<Hold>> {
         store
             .conn()
             .execute("UPDATE holds SET state = 'expired' WHERE id = ?1", [h.id])?;
-        if h.kind() == Kind::Authority {
-            let sql = "DELETE FROM mailbox WHERE message_id = ?1";
-            store.conn().execute(sql, [&h.message.id])?;
-        }
         if h.kind() != Kind::Permission {
             let m = &h.message;
             let (f, rid) = (&m.from_key, &m.request_id);
