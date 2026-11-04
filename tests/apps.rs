@@ -1983,7 +1983,13 @@ fn evidence_for_an_old_commit_does_not_satisfy_the_gate() {
         assert_eq!(v["done"], false, "{e}");
         assert_eq!(v["missing"], json!(["browser_evidence"]), "{e}");
         // Checked before: not a first version any more.
-        assert!(v["next"].as_str().unwrap().starts_with("run lightbulb app verify"), "{v}");
+        assert!(
+            v["next"]
+                .as_str()
+                .unwrap()
+                .starts_with("run lightbulb app verify"),
+            "{v}"
+        );
     }
     // A published app is never "a first version", even with no evidence on file.
     std::fs::write(c.dir.join(".lightbulb/progress.json"), "{}").unwrap();
@@ -2002,7 +2008,13 @@ fn evidence_for_an_old_commit_does_not_satisfy_the_gate() {
     *cell.lock().unwrap() = live.clone();
     let (_, v) = c.app(&["up"], &live, true);
     assert_eq!(v["missing"], json!(["browser_evidence"]), "{v}");
-    assert!(v["next"].as_str().unwrap().starts_with("run lightbulb app verify"), "{v}");
+    assert!(
+        v["next"]
+            .as_str()
+            .unwrap()
+            .starts_with("run lightbulb app verify"),
+        "{v}"
+    );
     put(
         json!({"kind": "browser", "verdict": "pass", "commit": head, "at": "2020-01-01T00:00:00Z"}),
     );
