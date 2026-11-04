@@ -341,6 +341,11 @@ async fn candidate_with_a_bad_signature_is_dropped() {
 fn admitted_candidate_that_lost_the_roster_rejoins() {
     let (a, b, t) = pair("Allow", "reusable");
     assert_eq!(join(&b, &t, "bob")["state"], "admitted");
+    // B's card reaches A after the join returns (it is written once B's roster is in sync).
+    let sb = b.short();
+    until(10, "A holds B's card", || {
+        a.ask(json!({"id": 1, "op": "card", "member": sb}))["ok"] == true
+    });
     let log = roster::entries(&a.store()).unwrap().len();
     // B loses its roster: back to a solo network.
     b.ask(json!({"id": 1, "op": "shutdown"}));

@@ -602,9 +602,6 @@ pub async fn join(id: u64, body: &Value, d: &Arc<Daemon>, agent: bool) -> Respon
                     if let Err(e) = crate::embed::publish(d) {
                         eprintln!("join: wake: {e}");
                     }
-                    if let Err(e) = crate::embed::publish_card(d) {
-                        eprintln!("join: card: {e}");
-                    }
                     let team = d.team.lock().unwrap().roster.team_name.clone();
                     return done("admitted", None, &team, d.peers.online().len() + 1);
                 }

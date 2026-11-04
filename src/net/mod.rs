@@ -1111,6 +1111,8 @@ impl Net {
         };
         let short = peer.short.clone();
         let mut synced = false;
+        // A sync's last page arrived (`more: false`), empty or not.
+        let mut complete = false;
         let mut hello_ok = false;
         let (mut presence, mut envelope, mut answer) = (None, None, None);
         let mut grant = None;
@@ -1159,6 +1161,7 @@ impl Net {
         } else if let Frame::Roster { entries, more } = f {
             sync.page.extend(entries);
             // A sync is applied once, at its last page (or when it alone would overflow).
+            complete = !more;
             if !more || sync.page.len() >= MAX_PENDING {
                 synced = !sync.page.is_empty();
                 sync.pending.append(&mut sync.page);
@@ -1280,6 +1283,13 @@ impl Net {
             match apply(d, &mut sync.pending, &short) {
                 Ok(heads) => sync.tried = heads,
                 Err(e) => eprintln!("net: applying roster from {short}: {e}"),
+            }
+        }
+        // In sync with this peer: its copy of our card is ours now, so one is written only when
+        // the team holds none or a stale one (`publish_card` compares).
+        if complete && sync.pending.is_empty() {
+            if let Err(e) = crate::embed::publish_card(d) {
+                eprintln!("card: {e}");
             }
         }
         true
