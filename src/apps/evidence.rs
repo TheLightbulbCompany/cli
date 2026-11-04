@@ -16,8 +16,8 @@ pub(crate) struct DoneState {
     pub next: String,
 }
 
-/// `next` for a healthy preview of HEAD that nobody has checked yet: show it early, keep building.
-const FIRST_VERSION: &str = "the preview is up. If you haven't yet, post the Canvas line (canvas_url) once: one or two sentences saying it is a first version and what you are still doing; never call it ready or live. Then keep building: finish the flows, pnpm test, lightbulb app up again, and ";
+/// `next` prefix for the first healthy preview of an app never published or verified: show it early, keep building.
+const FIRST_VERSION: &str = "the preview is up. If you haven't yet, post the Canvas line (canvas_url) once: one or two sentences saying it is a first version and what you are still doing; never call it ready or live. Then keep building: finish the flows, pnpm test, run lightbulb app up again if you changed anything, and ";
 
 fn now() -> i64 {
     std::time::SystemTime::now()
@@ -164,9 +164,13 @@ pub(crate) fn done_with(
         })
     });
     if !seen {
+        // Only an app that was never published nor checked is on its first version.
+        let first = s["live_version"].is_null()
+            && progress["evidence"].as_array().is_none_or(Vec::is_empty);
+        let lead = if first { FIRST_VERSION } else { "" };
         return not(
             "browser_evidence",
-            format!("{FIRST_VERSION}run lightbulb app verify (it signs in past the door of {url} and opens every page)"),
+            format!("{lead}run lightbulb app verify (it signs in past the door of {url} and opens every page)"),
         );
     }
     Ok(DoneState {

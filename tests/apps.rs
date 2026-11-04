@@ -1910,7 +1910,7 @@ fn done_needs_ready_health_and_browser_evidence_for_head() {
     assert_eq!((code, &v["done"]), (0, &json!(false)), "{v}");
     assert_eq!(v["missing"], json!(["browser_evidence"]));
     let want = format!(
-        "the preview is up. If you haven't yet, post the Canvas line (canvas_url) once: one or two sentences saying it is a first version and what you are still doing; never call it ready or live. Then keep building: finish the flows, pnpm test, lightbulb app up again, and run lightbulb app verify (it signs in past the door of {base} and opens every page)"
+        "the preview is up. If you haven't yet, post the Canvas line (canvas_url) once: one or two sentences saying it is a first version and what you are still doing; never call it ready or live. Then keep building: finish the flows, pnpm test, run lightbulb app up again if you changed anything, and run lightbulb app verify (it signs in past the door of {base} and opens every page)"
     );
     assert_eq!(v["next"], want.as_str());
     assert!(lines(&seen).contains(&"GET /api/_lightbulb/health".to_string()));
@@ -1982,7 +1982,27 @@ fn evidence_for_an_old_commit_does_not_satisfy_the_gate() {
         let (_, v) = c.app(&["up"], &base, true);
         assert_eq!(v["done"], false, "{e}");
         assert_eq!(v["missing"], json!(["browser_evidence"]), "{e}");
+        // Checked before: not a first version any more.
+        assert!(v["next"].as_str().unwrap().starts_with("run lightbulb app verify"), "{v}");
     }
+    // A published app is never "a first version", even with no evidence on file.
+    std::fs::write(c.dir.join(".lightbulb/progress.json"), "{}").unwrap();
+    let cell = Arc::new(Mutex::new(String::new()));
+    let c2 = cell.clone();
+    let h = head.clone();
+    let (live, _) = gate_stub(
+        json!({"app_id": "a-1", "state": "ready"}),
+        move |_| {
+            let mut s = ready_status(&c2.lock().unwrap(), &h, "2020-01-01T00:00:00Z");
+            s["live_version"] = json!(2);
+            s
+        },
+        json!({"commit": head}),
+    );
+    *cell.lock().unwrap() = live.clone();
+    let (_, v) = c.app(&["up"], &live, true);
+    assert_eq!(v["missing"], json!(["browser_evidence"]), "{v}");
+    assert!(v["next"].as_str().unwrap().starts_with("run lightbulb app verify"), "{v}");
     put(
         json!({"kind": "browser", "verdict": "pass", "commit": head, "at": "2020-01-01T00:00:00Z"}),
     );
