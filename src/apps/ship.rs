@@ -146,6 +146,8 @@ pub fn archive(root: &Path) -> std::result::Result<(PathBuf, String), ApiError> 
         use std::io::Write;
         let mut tar = Command::new("tar")
             .current_dir(root)
+            // macOS tar otherwise packs a binary `._name` beside each file with extended attributes.
+            .env("COPYFILE_DISABLE", "1")
             .arg("-czf")
             .arg(&tgz)
             .args(["--null", "-T", "-"])
