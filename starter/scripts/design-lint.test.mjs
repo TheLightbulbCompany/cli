@@ -15,3 +15,11 @@ it("flags native dialogs, not methods or names that contain the word", () => {
   for (const ok of ["onConfirm()", "dialog.confirm()", "const confirmed = true;", "setAlert(x)"]) expect(lint(ok)).toEqual([]);
 });
 
+
+it("flags promised emails only when the app can't send one", () => {
+  for (const bad of ["We'll send the details to {email}.", "You will receive an email shortly", "Check your inbox", "A confirmation email is on its way"]) {
+    expect(lint(bad)).toHaveLength(1);
+    expect(lint(bad, { canEmail: true })).toEqual([]);
+  }
+  for (const ok of ["Email", "Send a note", "We'll be in touch at the event", "your email address"]) expect(lint(ok)).toEqual([]);
+});

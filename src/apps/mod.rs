@@ -544,6 +544,23 @@ fn app_files(content: bool) -> Vec<(String, &'static [u8])> {
     all.into_iter().collect()
 }
 
+/// Whether the app's home page is still byte for byte the one `lightbulb app new` wrote: the
+/// starter's "Being built" placeholder, so nothing of the app is built yet. A content app's home
+/// page is the CMS page (the base page moved under `(site)/` and the addon replaced it), so it
+/// never is.
+pub(crate) fn placeholder(root: &Path) -> bool {
+    let Ok(name) = AppConfig::load(root).map(|c| c.name) else {
+        return false;
+    };
+    app_files(false)
+        .into_iter()
+        .find(|(p, _)| p == "src/app/page.tsx")
+        .is_some_and(|(p, b)| {
+            let want = String::from_utf8_lossy(b).replace("{{name}}", &name);
+            std::fs::read(root.join(p)).is_ok_and(|have| have == want.as_bytes())
+        })
+}
+
 /// The app's folder (the git root), its `app.yaml`, and how to call the backend. Writes nothing.
 pub fn preflight(json: bool) -> std::result::Result<(PathBuf, AppConfig, api::Auth), i32> {
     let top = std::process::Command::new("git")
@@ -790,6 +807,63 @@ mod tests {
                 "Missing: a finished preview"
             ]
         );
+    }
+
+    #[test]
+    fn an_untouched_starter_page_is_the_placeholder() {
+        let write = |content: bool| {
+            let d = tempfile::tempdir().unwrap();
+            for (p, b) in app_files(content) {
+                let to = d.path().join(p);
+                std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+                match std::str::from_utf8(b) {
+                    Ok(t) => std::fs::write(to, t.replace("{{name}}", "run-8")).unwrap(),
+                    Err(_) => std::fs::write(to, b).unwrap(),
+                }
+            }
+            d
+        };
+        let d = write(false);
+        assert!(placeholder(d.path()));
+        let page = d.path().join("src/app/page.tsx");
+        let mut t = std::fs::read_to_string(&page).unwrap();
+        t.push_str("// built\n");
+        std::fs::write(&page, t).unwrap();
+        assert!(!placeholder(d.path()));
+        // A content site's untouched home page is the CMS page, not a placeholder.
+        assert!(!placeholder(write(true).path()));
+    }
+
+    #[test]
+    fn status_names_the_placeholder_and_a_change_never_sent() {
+        let next =
+            |root: &Path, s: serde_json::Value| evidence::done_with(root, &s, "new").unwrap().next;
+        // A placeholder is never done, even when an old backend calls it ready.
+        let d = tempfile::tempdir().unwrap();
+        for (p, b) in app_files(false) {
+            let to = d.path().join(p);
+            std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+            std::fs::write(to, String::from_utf8_lossy(b).replace("{{name}}", "run-8")).unwrap();
+        }
+        let ready = json!({"state": "ready", "live_version": null,
+            "preview": {"deployment_id": "d-1", "commit": "new", "url": "https://p.example"}});
+        assert_eq!(next(d.path(), ready), ship::PLACEHOLDER_NEXT);
+        // Building with a preview of another commit: only a change the last up never sent says up.
+        let e = tempfile::tempdir().unwrap();
+        let building = json!({"state": "building", "preview": {"commit": "old"}});
+        assert_eq!(
+            next(e.path(), building.clone()),
+            "you changed the app since the last up; run lightbulb app up"
+        );
+        std::fs::create_dir_all(e.path().join(".lightbulb")).unwrap();
+        std::fs::write(
+            e.path().join(".lightbulb/app.json"),
+            r#"{"up_commit": "new"}"#,
+        )
+        .unwrap();
+        let wait = "wait for the build to finish, then run lightbulb app status";
+        assert_eq!(next(e.path(), building), wait);
+        assert_eq!(next(e.path(), json!({"state": "building"})), wait);
     }
 
     #[test]

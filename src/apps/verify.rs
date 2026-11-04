@@ -69,6 +69,102 @@ pub(crate) fn page_problem(status: u16, body: &str) -> Option<String> {
         .then(|| "crashed while rendering".to_string())
 }
 
+/// The fields a form would send, filled with harmless test values. Forms that ask for a password
+/// are left alone: those sign people in, and a guess would only fail or lock someone out.
+pub(crate) fn forms(html: &str) -> Vec<Vec<(String, String)>> {
+    let attr = |tag: &str, name: &str| {
+        regex::Regex::new(&format!(r#"(?i)\b{name}\s*=\s*"([^"]*)""#))
+            .ok()
+            .and_then(|r| r.captures(tag).map(|c| c[1].to_string()))
+    };
+    let form = regex::Regex::new(r"(?is)<form\b[^>]*>(.*?)</form>").unwrap();
+    let input = regex::Regex::new(r"(?is)<input\b[^>]*>").unwrap();
+    let area = regex::Regex::new(r"(?is)<textarea\b[^>]*>").unwrap();
+    let select = regex::Regex::new(r"(?is)(<select\b[^>]*>)(.*?)</select>").unwrap();
+    let option = regex::Regex::new(r"(?is)<option\b[^>]*>").unwrap();
+    let mut out = vec![];
+    for f in form.captures_iter(html) {
+        let body = &f[1];
+        let mut fields = vec![];
+        let mut password = false;
+        for i in input.find_iter(body) {
+            let tag = i.as_str();
+            let Some(name) = attr(tag, "name") else {
+                continue;
+            };
+            let kind = attr(tag, "type")
+                .unwrap_or_else(|| "text".into())
+                .to_lowercase();
+            let value = match kind.as_str() {
+                "password" => {
+                    password = true;
+                    continue;
+                }
+                "submit" | "button" | "image" | "reset" | "file" | "checkbox" | "radio" => continue,
+                "hidden" => attr(tag, "value").unwrap_or_default(),
+                "email" => "verify@example.com".into(),
+                "number" | "range" => attr(tag, "min").unwrap_or_else(|| "1".into()),
+                "date" => "2030-01-15".into(),
+                "time" => "10:00".into(),
+                "url" => "https://example.com".into(),
+                "tel" => "5550100".into(),
+                _ => attr(tag, "value")
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or_else(|| "Verify test".into()),
+            };
+            fields.push((name, value));
+        }
+        for a in area.find_iter(body) {
+            if let Some(name) = attr(a.as_str(), "name") {
+                fields.push((name, "Verify test".into()));
+            }
+        }
+        for s in select.captures_iter(body) {
+            let Some(name) = attr(&s[1], "name") else {
+                continue;
+            };
+            let first = option
+                .find_iter(&s[2])
+                .filter_map(|o| attr(o.as_str(), "value"))
+                .find(|v| !v.is_empty());
+            fields.push((name, first.unwrap_or_default()));
+        }
+        // A server action carries its id in a hidden field; a form without one has nowhere to send.
+        if !password && fields.iter().any(|(n, _)| n.starts_with("$ACTION")) {
+            out.push(fields);
+        }
+    }
+    out
+}
+
+/// Submits one form the way a browser without scripts would.
+fn submit(jar: &Path, url: &str, fields: &[(String, String)]) -> Option<(u16, String)> {
+    let mut c = Command::new("curl");
+    c.args([
+        "-sS",
+        "-L",
+        "--max-time",
+        "30",
+        "-o",
+        "-",
+        "-w",
+        "\n%{http_code}",
+    ])
+    .arg("-b")
+    .arg(jar)
+    .arg("-c")
+    .arg(jar)
+    .stdin(Stdio::null())
+    .stderr(Stdio::null());
+    for (k, v) in fields {
+        c.arg("--form-string").arg(format!("{k}={v}"));
+    }
+    let out = c.arg(url).output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let (body, code) = text.rsplit_once('\n')?;
+    Some((code.trim().parse().ok()?, body.to_string()))
+}
+
 /// Splits a test link into its address and pass.
 pub(crate) fn split_link(link: &str) -> Option<(String, String)> {
     let (base, token) = link.split_once("#token=")?;
@@ -186,18 +282,58 @@ pub(crate) fn run(root: &Path, auth: &Auth, json: bool) -> Result<i32> {
         ),
         None => problems.push(json!({"page": "the door", "problem": "did not answer"})),
     }
+    let (mut submitted, mut tried) = (0, 0);
     if problems.iter().all(|p| p["page"] != "the door") {
         for page in &fixed {
             match curl(&jar.0, &format!("{origin}{page}"), None) {
                 Some((s, b)) => {
                     if let Some(p) = page_problem(s, &b) {
                         problems.push(json!({"page": page, "problem": p}));
+                        continue;
+                    }
+                    for (n, fields) in forms(&b).iter().enumerate() {
+                        tried += 1;
+                        let answer = submit(&jar.0, &format!("{origin}{page}"), fields);
+                        let problem = match answer {
+                            Some((s, b)) => page_problem(s, &b),
+                            None => Some("did not answer".into()),
+                        };
+                        if let Some(p) = problem {
+                            problems.push(json!({"page": page, "problem": format!("form {} {p} when sent", n + 1)}));
+                        } else {
+                            submitted += 1;
+                        }
                     }
                 }
                 None => problems.push(json!({"page": page, "problem": "did not answer"})),
             }
         }
     }
+    // The forms wrote test rows into the preview's database, where the person would see them. Put
+    // it back to its schema and sample data; `false` means another read is busy and the next does it.
+    let mut note = None;
+    let preview_data = if tried == 0 {
+        "untouched"
+    } else {
+        match api::call(
+            auth,
+            "POST",
+            &format!("/{id}/reset-preview-data"),
+            Some(&json!({})),
+        ) {
+            Ok(r) if r["reset"] == true => "reset",
+            Ok(_) => "resets on the next status read",
+            // An older backend has no reset: say so, but the pages and forms decide the verdict.
+            Err(e) if e.code == "no_route" => {
+                note = Some("the preview data could not be reset on this server, so the test entries stay in the preview");
+                "kept"
+            }
+            Err(e) => {
+                problems.push(json!({"page": "the preview data", "problem": format!("test entries were not taken back out: {}", e.message)}));
+                "kept"
+            }
+        }
+    };
     let pass = problems.is_empty() && !fixed.is_empty();
     if pass {
         let saved = evidence::record_verify(root, &head, &fixed);
@@ -206,16 +342,19 @@ pub(crate) fn run(root: &Path, auth: &Auth, json: bool) -> Result<i32> {
         }
     }
     let next = if pass {
-        "run lightbulb app status; this does not test buttons or forms, so try the main flow too"
+        "run lightbulb app status; this sent each form once with test values, then put the preview back to its sample data, but does not press other buttons, so try the main flow too"
     } else {
         "fix what is listed, run lightbulb app up, then verify again"
     };
-    let out = json!({"pass": pass, "opened": fixed, "not_opened": dynamic, "problems": problems, "next": next});
+    let mut out = json!({"pass": pass, "opened": fixed, "forms_sent": submitted, "not_opened": dynamic, "preview_data": preview_data, "problems": problems, "next": next});
+    if let Some(n) = note {
+        out["note"] = json!(n);
+    }
     if json {
         println!("{out}");
     } else {
         println!(
-            "{}: opened {} page(s)",
+            "{}: opened {} page(s), sent {submitted} form(s); preview data {preview_data}",
             if pass { "Pass" } else { "Fail" },
             fixed.len()
         );
@@ -225,6 +364,9 @@ pub(crate) fn run(root: &Path, auth: &Auth, json: bool) -> Result<i32> {
                 p["page"].as_str().unwrap_or(""),
                 p["problem"].as_str().unwrap_or("")
             );
+        }
+        if let Some(n) = note {
+            println!("  note: {n}");
         }
         for d in &dynamic {
             println!("  not opened (needs a real id): {d}");
@@ -268,6 +410,26 @@ mod tests {
             "Application error: a server-side exception has occurred"
         )
         .is_some());
+    }
+
+    #[test]
+    fn forms_are_filled_with_test_values_and_sign_in_forms_are_left_alone() {
+        let html = r#"<form action="" method="POST"><input type="hidden" name="$ACTION_ID_abc" value="">
+            <input name="name" required><input type="email" name="email">
+            <input type="number" name="seats" min="2"><textarea name="note"></textarea>
+            <select name="stage"><option value="">Pick</option><option value="trial">Trial</option></select>
+            <button type="submit">Send</button></form>
+            <form><input type="hidden" name="$ACTION_ID_x" value=""><input type="password" name="pw"></form>
+            <form><input name="q"></form>"#;
+        let got = forms(html);
+        assert_eq!(got.len(), 1);
+        let f: std::collections::HashMap<_, _> = got[0].iter().cloned().collect();
+        assert_eq!(f["email"], "verify@example.com");
+        assert_eq!(f["seats"], "2");
+        assert_eq!(f["note"], "Verify test");
+        assert_eq!(f["stage"], "trial");
+        assert_eq!(f["name"], "Verify test");
+        assert!(f.contains_key("$ACTION_ID_abc"));
     }
 
     #[test]

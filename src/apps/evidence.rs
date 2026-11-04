@@ -16,6 +16,9 @@ pub(crate) struct DoneState {
     pub next: String,
 }
 
+/// `next` prefix for the first healthy preview of an app never published or verified: show it early, keep building.
+const FIRST_VERSION: &str = "the preview is up. If you haven't yet, post the Canvas line (canvas_url) once: one or two sentences saying it is a first version and what you are still doing; never call it ready or live. Then keep building: finish the flows, pnpm test, run lightbulb app up again if you changed anything, and ";
+
 fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -90,10 +93,23 @@ pub(crate) fn done_with(
             next,
         })
     };
+    // Even when an old backend calls it ready, the starter's placeholder is not the app.
+    if super::placeholder(root) {
+        return not("ready", super::ship::PLACEHOLDER_NEXT.into());
+    }
     if !super::ship::finished(&s["state"]) {
+        // The preview shows another commit and HEAD is not what the last up sent: the change was
+        // never sent, so no build is coming for it.
+        let stale = s["preview"]["commit"].as_str().is_some_and(|c| c != head)
+            && super::ship::app_json(root)["up_commit"] != head;
         return not(
             "ready",
-            "wait for the build to finish, then run lightbulb app status".into(),
+            if stale {
+                "you changed the app since the last up; run lightbulb app up"
+            } else {
+                "wait for the build to finish, then run lightbulb app status"
+            }
+            .into(),
         );
     }
     let p = &s["preview"];
@@ -161,9 +177,13 @@ pub(crate) fn done_with(
         })
     });
     if !seen {
+        // Only an app that was never published nor checked is on its first version.
+        let first = s["live_version"].is_null()
+            && progress["evidence"].as_array().is_none_or(Vec::is_empty);
+        let lead = if first { FIRST_VERSION } else { "" };
         return not(
             "browser_evidence",
-            format!("run lightbulb app verify (it signs in past the door of {url} and opens every page)"),
+            format!("{lead}run lightbulb app verify (it signs in past the door of {url} and opens every page)"),
         );
     }
     Ok(DoneState {

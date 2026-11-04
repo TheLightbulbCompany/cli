@@ -69,7 +69,11 @@ fn stub_with(
             std::thread::sleep(std::time::Duration::from_millis(delay_ms));
             let line = log.lock().unwrap().last().unwrap().line.clone();
             let (status, answer) = answer(&line);
-            let text = answer.to_string();
+            // A string answer is a page (HTML), sent as is.
+            let text = match answer {
+                Value::String(page) => page,
+                v => v.to_string(),
+            };
             let _ = write!(
                 s,
                 "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
@@ -711,9 +715,14 @@ struct Checked {
 
 impl Checked {
     fn new() -> Checked {
+        Checked::with(&["team-lunch"])
+    }
+
+    /// `lightbulb app new <args>`; the app must be named team-lunch.
+    fn with(args: &[&str]) -> Checked {
         let e = Env::new();
         let tmp = tempfile::tempdir().unwrap();
-        app_new(&e, tmp.path(), &["team-lunch"]);
+        app_new(&e, tmp.path(), args);
         let bin = tempfile::tempdir().unwrap();
         let pnpm = bin.path().join("pnpm");
         std::fs::write(
@@ -1301,7 +1310,10 @@ fn up_prints_cards_and_exits_zero_when_waiting() {
     assert_eq!(v["cards"][0]["provider"], "stripe");
     assert_eq!(v["done"], false);
     assert!(v["next"].as_str().unwrap().contains("Inbox"), "{v}");
-    assert_eq!(c.app_json(), json!({"app_id": "a-1", "room_id": "r-9"}));
+    assert_eq!(
+        c.app_json(),
+        json!({"app_id": "a-1", "room_id": "r-9", "up_commit": c.head()})
+    );
     assert_eq!(
         lines(&seen),
         [format!("POST {BUILD}/source"), format!("POST {BUILD}/up")]
@@ -1524,6 +1536,76 @@ fn test_link_prints_the_url_and_keeps_it_out_of_every_file() {
     }
 }
 
+/// `lightbulb app verify --json` against a stub that is both the backend and the preview; `reset`
+/// is the reset route's answer.
+fn verify_with(reset: (u16, Value)) -> (i32, Value, Vec<String>) {
+    let c = Checked::new();
+    std::fs::write(c.dir.join(".lightbulb/app.json"), r#"{"app_id":"a-1"}"#).unwrap();
+    // One stub is both the backend and the app's preview; the link points back at it.
+    let origin: Arc<Mutex<String>> = Arc::default();
+    let o = origin.clone();
+    let (base, seen) = stub_with(
+        move |line| match line.trim_end_matches(" HTTP/1.1") {
+            l if l.ends_with("/a-1/test-link") => (
+                200,
+                json!({"url": format!("{}/_lightbulb/session#token=T", o.lock().unwrap())}),
+            ),
+            l if l.ends_with("/a-1/status") => (200, json!({"open_to": "public"})),
+            l if l.ends_with("/a-1/reset-preview-data") => reset.clone(),
+            "POST /api/_lightbulb/session" => (200, json!({})),
+            "GET /" | "POST /" => (
+                200,
+                json!(
+                    r#"<form method="POST"><input type="hidden" name="$ACTION_ID_a" value=""><input name="reason"></form>"#
+                ),
+            ),
+            l => (404, json!({"code": "no_route", "message": l, "next": ""})),
+        },
+        0,
+    );
+    *origin.lock().unwrap() = base.clone();
+    let (code, v) = c.app(&["verify"], &base, true);
+    (code, v, lines(&seen))
+}
+
+#[test]
+fn verify_puts_the_preview_data_back_after_sending_forms() {
+    let (code, v, sent) = verify_with((200, json!({"reset": true})));
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(
+        (&v["forms_sent"], &v["preview_data"]),
+        (&json!(1), &json!("reset")),
+        "{v}"
+    );
+    assert!(v.get("note").is_none());
+    let form = sent.iter().position(|l| l == "POST /").unwrap();
+    let reset = sent
+        .iter()
+        .position(|l| l.ends_with("/a-1/reset-preview-data"))
+        .unwrap();
+    assert!(form < reset, "{sent:?}");
+}
+
+#[test]
+fn verify_on_a_backend_without_the_reset_says_so_and_still_passes() {
+    // FastAPI's answer for a route it does not have.
+    let (code, v, _) = verify_with((404, json!({"detail": "Not Found"})));
+    assert_eq!((code, &v["pass"]), (0, &json!(true)), "{v}");
+    assert_eq!(v["preview_data"], "kept");
+    assert!(v["note"]
+        .as_str()
+        .unwrap()
+        .contains("could not be reset on this server"));
+    assert_eq!(v["problems"], json!([]));
+    // Any other failure still fails verify.
+    let (code, v, _) = verify_with((503, json!({"detail": "down"})));
+    assert_eq!(
+        (code, &v["pass"], &v["preview_data"]),
+        (1, &json!(false), &json!("kept")),
+        "{v}"
+    );
+}
+
 #[test]
 fn test_link_passes_not_ready_on_and_needs_a_first_up() {
     let c = Checked::new();
@@ -1683,14 +1765,51 @@ fn a_building_publish_records_no_migrations() {
 #[test]
 fn an_up_still_building_times_out_with_exit_2_and_says_status() {
     let c = Checked::new();
-    let (base, _) = building_stub(json!({"app_id": "a-1", "state": "provisioning"}));
+    let (base, seen) = building_stub(json!({"app_id": "a-1", "state": "provisioning"}));
     let (code, v) = c.app(&["up"], &base, true);
     assert_eq!(code, 2, "{v}");
+    assert!(!source_form(&seen).contains("name=\"placeholder\""));
     assert_eq!(
         v,
         json!({"code": "timeout", "message": "The preview is still building after 10 minutes.",
             "next": "run `lightbulb app status`; the preview may still finish"})
     );
+}
+
+#[test]
+fn an_up_of_the_starter_placeholder_returns_at_once_and_says_build_it() {
+    // A form keeps the base starter's "Being built" home page; a site's home is the CMS page.
+    let c = Checked::with(&["team-lunch", "--kind", "form"]);
+    let (base, seen) = gate_stub(
+        json!({"app_id": "a-1", "state": "building", "preview_url": "https://p.example"}),
+        |_| json!({"app_id": "a-1", "state": "building"}),
+        json!({}),
+    );
+    let (code, v) = c.app(&["up"], &base, true);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(
+        (&v["state"], &v["done"]),
+        (&json!("building"), &json!(false)),
+        "{v}"
+    );
+    assert_eq!(
+        v["next"],
+        "the app is still the starter's placeholder page; build the app, then run lightbulb app up again"
+    );
+    assert!(
+        !lines(&seen).iter().any(|l| l.ends_with("/a-1/status")),
+        "{:?}",
+        lines(&seen)
+    );
+    assert!(source_form(&seen).contains("name=\"placeholder\""));
+    assert!(v["preview_url"].is_null(), "{v}");
+}
+
+/// The multipart body of the source upload, as text.
+fn source_form(seen: &Arc<Mutex<Vec<Req>>>) -> String {
+    let seen = seen.lock().unwrap();
+    let r = seen.iter().find(|r| r.line.contains("/source")).unwrap();
+    String::from_utf8_lossy(&r.body).into_owned()
 }
 
 #[test]
@@ -1910,7 +2029,7 @@ fn done_needs_ready_health_and_browser_evidence_for_head() {
     assert_eq!((code, &v["done"]), (0, &json!(false)), "{v}");
     assert_eq!(v["missing"], json!(["browser_evidence"]));
     let want = format!(
-        "run lightbulb app verify (it signs in past the door of {base} and opens every page)"
+        "the preview is up. If you haven't yet, post the Canvas line (canvas_url) once: one or two sentences saying it is a first version and what you are still doing; never call it ready or live. Then keep building: finish the flows, pnpm test, run lightbulb app up again if you changed anything, and run lightbulb app verify (it signs in past the door of {base} and opens every page)"
     );
     assert_eq!(v["next"], want.as_str());
     assert!(lines(&seen).contains(&"GET /api/_lightbulb/health".to_string()));
@@ -1982,7 +2101,39 @@ fn evidence_for_an_old_commit_does_not_satisfy_the_gate() {
         let (_, v) = c.app(&["up"], &base, true);
         assert_eq!(v["done"], false, "{e}");
         assert_eq!(v["missing"], json!(["browser_evidence"]), "{e}");
+        // Checked before: not a first version any more.
+        assert!(
+            v["next"]
+                .as_str()
+                .unwrap()
+                .starts_with("run lightbulb app verify"),
+            "{v}"
+        );
     }
+    // A published app is never "a first version", even with no evidence on file.
+    std::fs::write(c.dir.join(".lightbulb/progress.json"), "{}").unwrap();
+    let cell = Arc::new(Mutex::new(String::new()));
+    let c2 = cell.clone();
+    let h = head.clone();
+    let (live, _) = gate_stub(
+        json!({"app_id": "a-1", "state": "ready"}),
+        move |_| {
+            let mut s = ready_status(&c2.lock().unwrap(), &h, "2020-01-01T00:00:00Z");
+            s["live_version"] = json!(2);
+            s
+        },
+        json!({"commit": head}),
+    );
+    *cell.lock().unwrap() = live.clone();
+    let (_, v) = c.app(&["up"], &live, true);
+    assert_eq!(v["missing"], json!(["browser_evidence"]), "{v}");
+    assert!(
+        v["next"]
+            .as_str()
+            .unwrap()
+            .starts_with("run lightbulb app verify"),
+        "{v}"
+    );
     put(
         json!({"kind": "browser", "verdict": "pass", "commit": head, "at": "2020-01-01T00:00:00Z"}),
     );
