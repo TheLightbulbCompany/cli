@@ -24,6 +24,18 @@ pub fn mint(claims: &Value) -> String {
     format!("{signing}.{}", BASE64URL_NOPAD.encode(&sig.to_bytes()))
 }
 
+/// `mint` with protected header `typ` (`{alg, kid, typ}`), as the issuer signs authority objects.
+pub fn mint_typ(typ: &str, claims: &Value) -> String {
+    let b64 = |v: &Value| BASE64URL_NOPAD.encode(v.to_string().as_bytes());
+    let signing = format!(
+        "{}.{}",
+        b64(&json!({"alg": "EdDSA", "kid": KID, "typ": typ})),
+        b64(claims)
+    );
+    let sig = SigningKey::from_bytes(&SECRET).sign(signing.as_bytes());
+    format!("{signing}.{}", BASE64URL_NOPAD.encode(&sig.to_bytes()))
+}
+
 /// A sign-in proof: computer `computer` belongs to Lightbulb user `sub`, from `iat`, 30 days.
 pub fn proof(computer: &str, sub: &str, iat: i64) -> String {
     mint(&json!({"iat": iat, "exp": iat + 30 * 86_400, "sub": sub, "computer": computer}))

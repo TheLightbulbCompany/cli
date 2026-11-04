@@ -4,8 +4,9 @@
 //! outlives its first ack, as the binding of the envelope to the one member whose `Ack` and
 //! `Receipt` frames may move it, until `KEEP_S` past a final state (or past any answer).
 
+use crate::identity::Identity;
 use crate::mail::{self, Prepared, Receipt, State};
-use crate::net::frames::Frame;
+use crate::net::frames::{self, Frame};
 use crate::roster::Member;
 use crate::store::Store;
 use crate::Result;
@@ -16,9 +17,14 @@ pub const TTL_S: u64 = 86_400;
 /// `HELD_S`, so a hold answered on its last day still finds its binding.
 const KEEP_S: u64 = mail::HELD_S + 86_400;
 
-/// Keeps `p` for member `to`, due now: its receipt, `queued` on `to`'s computer.
-pub fn enqueue(store: &Store, p: Prepared, to: &Member) -> Result<Receipt> {
-    let frame = serde_json::to_string(&Frame::from(&p))?;
+/// Keeps `p` for member `to`, due now, signed by this computer (`me`, `frames::envelope_sig`)
+/// so the signed `sent_at` is ours: its receipt, `queued` on `to`'s computer.
+pub fn enqueue(store: &Store, me: &Identity, mut p: Prepared, to: &Member) -> Result<Receipt> {
+    let mut frame = serde_json::to_value(Frame::from(&p))?;
+    let sig = frames::envelope_sig(me, &frame);
+    frame["sig"] = sig.clone().into();
+    let frame = frame.to_string();
+    (p.sig, p.signed_at) = (Some(sig), Some(p.sent_at));
     let tx = store.conn().unchecked_transaction()?;
     mail::record_queued(store, &p)?;
     store.put_outbox(&p.message_id, &to.key, &frame, p.sent_at)?;
@@ -167,7 +173,18 @@ mod tests {
             panic!("refused");
         };
         let id = p.message_id.clone();
-        let r = enqueue(s, p, &member("b")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let me = Identity::load_or_create(dir.path()).unwrap();
+        let r = enqueue(s, &me, p, &member("b")).unwrap();
+        let due = s.outbox_due(&["b".into()], i64::MAX).unwrap();
+        let (_, _, frame) = due.into_iter().find(|(row, ..)| *row == id).unwrap();
+        let frame: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        assert!(frames::verify_envelope_sig(&me.key, &frame));
+        let m = s.message(&id).unwrap().unwrap();
+        assert_eq!(
+            (m.sig.as_deref(), m.signed_at),
+            (frame["sig"].as_str(), Some(now as i64))
+        );
         assert_eq!((r.state, r.where_.as_deref()), (State::Queued, Some("mbp")));
         id
     }

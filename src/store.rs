@@ -217,7 +217,7 @@ pub struct Session {
     pub headless: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Message {
     pub id: String,
     pub request_id: String,
@@ -232,6 +232,14 @@ pub struct Message {
     /// The message this answers, by id.
     pub reply_to: Option<String>,
     pub meta: crate::mail::Meta,
+    /// The A2A Message the envelope carried.
+    pub a2a: Option<serde_json::Value>,
+    /// The sending computer's envelope signature.
+    pub sig: Option<String>,
+    /// The sender's `sent_at` that `sig` covers (`sent_at` is this computer's arrival time).
+    pub signed_at: Option<i64>,
+    /// The authority object (phase-1 JWS) the envelope's A2A Message carried, by id.
+    pub authority_id: Option<String>,
 }
 
 fn row_session(r: &rusqlite::Row) -> rusqlite::Result<Session> {
@@ -305,6 +313,12 @@ pub(crate) fn row_message(r: &rusqlite::Row) -> rusqlite::Result<Message> {
             .get::<_, Option<String>>("meta")?
             .and_then(|j| serde_json::from_str(&j).ok())
             .unwrap_or_default(),
+        a2a: r
+            .get::<_, Option<String>>("a2a")?
+            .and_then(|j| serde_json::from_str(&j).ok()),
+        sig: r.get("sig")?,
+        signed_at: r.get("signed_at")?,
+        authority_id: r.get("authority_id")?,
     })
 }
 
@@ -312,14 +326,29 @@ pub(crate) fn row_message(r: &rusqlite::Row) -> rusqlite::Result<Message> {
 /// build can still open this db (it ignores them), even with network workers never turned on.
 /// `sessions`: why it ended, what a waiting one waits for, whether it is headless, and when its
 /// Stop hook last held it for unanswered work. `messages`: the message an answer answers
-/// (`reply_to`) and an assignment's terms (`meta`, JSON).
-const ADDED_COLUMNS: [(&str, &str, &str); 6] = [
+/// (`reply_to`), an assignment's terms (`meta`, JSON), the A2A Message the envelope carried
+/// (`a2a`, JSON), the sender's signature and the stamp it covers (`sig`, `signed_at`), and the
+/// authority object it carried (`authority_id`). `approvals`: a local exception's `resource`,
+/// `skill`, `requester` and `operands_hash`. `holds`: its kind, and an Authority hold's judged
+/// `requester` and `skill`. `rules`: the newest verified rules document per workspace.
+const ADDED_COLUMNS: [(&str, &str, &str); 17] = [
     ("sessions", "reason", "TEXT"),
     ("sessions", "waiting_for", "TEXT"),
     ("sessions", "headless", "INTEGER"),
     ("sessions", "stop_guard_at", "INTEGER"),
     ("messages", "reply_to", "TEXT"),
     ("messages", "meta", "TEXT"),
+    ("messages", "a2a", "TEXT"),
+    ("messages", "sig", "TEXT"),
+    ("messages", "signed_at", "INTEGER"),
+    ("messages", "authority_id", "TEXT"),
+    ("approvals", "resource", "TEXT"),
+    ("approvals", "skill", "TEXT"),
+    ("approvals", "requester", "TEXT"),
+    ("approvals", "operands_hash", "TEXT"),
+    ("holds", "kind", "TEXT"),
+    ("holds", "requester", "TEXT"),
+    ("holds", "skill", "TEXT"),
 ];
 /// Network workers: one row per headless worker a computer started for an assignment
 /// (`assignment` is the assign message id; `state` is starting, running, done, failed, stopped
@@ -332,6 +361,10 @@ CREATE TABLE IF NOT EXISTS workers (
     ended_at INTEGER, state TEXT NOT NULL, by TEXT
 );
 CREATE INDEX IF NOT EXISTS workers_session ON workers (session);
+CREATE TABLE IF NOT EXISTS rules (
+    workspace TEXT PRIMARY KEY, revision TEXT NOT NULL, iat INTEGER NOT NULL,
+    jws TEXT NOT NULL, doc TEXT NOT NULL
+);
 ";
 
 fn add_schema_on_open(conn: &Connection) -> crate::Result<()> {
@@ -864,8 +897,8 @@ impl Store {
     pub fn put_message(&self, m: &Message) -> rusqlite::Result<()> {
         self.conn.execute(
             "INSERT INTO messages (id, request_id, from_key, to_key, kind, thread, hops, origin, \
-             body, sent_at, reply_to, meta) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+             body, sent_at, reply_to, meta, a2a, sig, signed_at, authority_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 m.id,
                 m.request_id,
@@ -878,7 +911,11 @@ impl Store {
                 m.body,
                 m.sent_at,
                 m.reply_to,
-                (!m.meta.is_empty()).then(|| serde_json::to_string(&m.meta).unwrap_or_default())
+                (!m.meta.is_empty()).then(|| serde_json::to_string(&m.meta).unwrap_or_default()),
+                m.a2a.as_ref().map(|v| v.to_string()),
+                m.sig,
+                m.signed_at,
+                m.authority_id,
             ],
         )?;
         Ok(())
@@ -1099,6 +1136,17 @@ impl Store {
             )
             .optional()
             .map(Option::flatten)
+    }
+
+    /// The kind of `from`'s message `request_id`, if it is here.
+    pub fn kind_of(&self, from: &str, request_id: &str) -> rusqlite::Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT kind FROM messages WHERE from_key = ?1 AND request_id = ?2",
+                [from, request_id],
+                |r| r.get(0),
+            )
+            .optional()
     }
 
     pub fn put_mailbox(&self, to: &str, id: &str, at: i64, expires: i64) -> rusqlite::Result<()> {
@@ -1351,6 +1399,7 @@ mod tests {
             sent_at: 9,
             reply_to: None,
             meta: Default::default(),
+            ..Default::default()
         };
         store.put_message(&message).unwrap();
         assert_eq!(store.message("m1").unwrap(), Some(message));
@@ -1391,6 +1440,7 @@ mod tests {
             sent_at: 9,
             reply_to: None,
             meta: Default::default(),
+            ..Default::default()
         };
         Store::open(&path).unwrap();
         let store = Store::open(&path).unwrap();
@@ -1711,6 +1761,7 @@ mod tests {
             sent_at: 1,
             reply_to: Some("01Z".into()),
             meta: meta.clone(),
+            ..Default::default()
         };
         s.put_message(&m).unwrap();
         let back = s.message("01A").unwrap().unwrap();

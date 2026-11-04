@@ -63,8 +63,10 @@ async fn ipc_answers_ping_and_rejects_unknown_op() {
     // The team id is the solo network's genesis hash.
     let store = lightbulb::store::Store::open(&dir.path().join("state.db")).unwrap();
     let entries = lightbulb::roster::entries(&store).unwrap();
-    assert_eq!(entries.len(), 1);
-    assert_eq!(status["team"]["id"], entries[0].hash());
+    // The genesis, and this member's card.
+    assert_eq!(entries.len(), 2);
+    let genesis = entries.iter().find(|e| e.parents.is_empty()).unwrap();
+    assert_eq!(status["team"]["id"], genesis.hash());
 
     // A subscriber sees the shutdown event; the daemon exits cleanly.
     let (mut sub_lines, mut sub_w) = connect(dir.path()).await;

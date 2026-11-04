@@ -382,6 +382,7 @@ pub async fn deliver(daemon: Arc<Daemon>, to: Key) {
             &m.request_id,
             parent_rid.as_deref(),
             &m.meta,
+            crate::authority::summary_of(&m, ipc::now() as i64).as_ref(),
             &m.body,
         );
         let pushed = match session.provider.as_str() {

@@ -1050,9 +1050,9 @@ impl Net {
                 let mut sync = Incoming::default();
                 // After a `hello` of another protocol nothing more is served.
                 let mut stale = false;
-                while let Ok(f) = frames::read(&mut recv).await {
+                while let Ok((f, raw)) = frames::read_raw(&mut recv).await {
                     if !stale {
-                        stale = !self.on_frame(&key, &conn, f, &mut sync, &tx);
+                        stale = !self.on_frame(&key, &conn, f, raw, &mut sync, &tx);
                     }
                 }
             };
@@ -1093,12 +1093,14 @@ impl Net {
         eprintln!("net: disconnected {}", short(&key));
     }
 
-    /// Handles one frame from `key`; `false` once the peer speaks another protocol.
+    /// Handles one frame from `key` (`raw`, its JSON as received); `false` once the peer
+    /// speaks another protocol.
     fn on_frame(
         &self,
         key: &str,
         conn: &Connection,
         f: Frame,
+        raw: serde_json::Value,
         sync: &mut Incoming,
         tx: &Tx,
     ) -> bool {
@@ -1109,6 +1111,8 @@ impl Net {
         };
         let short = peer.short.clone();
         let mut synced = false;
+        // A sync's last page arrived (`more: false`), empty or not.
+        let mut complete = false;
         let mut hello_ok = false;
         let (mut presence, mut envelope, mut answer) = (None, None, None);
         let mut grant = None;
@@ -1157,6 +1161,7 @@ impl Net {
         } else if let Frame::Roster { entries, more } = f {
             sync.page.extend(entries);
             // A sync is applied once, at its last page (or when it alone would overflow).
+            complete = !more;
             if !more || sync.page.len() >= MAX_PENDING {
                 synced = !sync.page.is_empty();
                 sync.pending.append(&mut sync.page);
@@ -1164,7 +1169,7 @@ impl Net {
         } else if matches!(f, Frame::Presence { .. }) {
             presence = Some(f);
         } else if matches!(f, Frame::Envelope { .. }) {
-            envelope = Some(f);
+            envelope = Some((f, raw));
         } else if matches!(f, Frame::ShareGrant { .. }) {
             grant = Some(f);
         } else if matches!(f, Frame::Ack { .. }) && d.peers.knobs().drop_acks {
@@ -1238,8 +1243,8 @@ impl Net {
             let first = !std::mem::replace(&mut sync.presence_stored, true);
             crate::presence::put(d, key, &p, ipc::now(), first);
         }
-        if let Some(env) = envelope.filter(|_| d.peers.speaks_ours(key, conn)) {
-            receive(d, key, &env, tx);
+        if let Some((env, raw)) = envelope.filter(|_| d.peers.speaks_ours(key, conn)) {
+            receive(d, key, &env, &raw, tx);
         }
         if let Some(g) = grant.filter(|_| d.peers.speaks_ours(key, conn)) {
             if let Err(e) = crate::streams::store(&d.store.lock().unwrap(), &g, ipc::now() as i64) {
@@ -1280,6 +1285,13 @@ impl Net {
                 Err(e) => eprintln!("net: applying roster from {short}: {e}"),
             }
         }
+        // In sync with this peer: its copy of our card is ours now, so one is written only when
+        // the team holds none or a stale one (`publish_card` compares).
+        if complete && sync.pending.is_empty() {
+            if let Err(e) = crate::embed::publish_card(d) {
+                eprintln!("card: {e}");
+            }
+        }
         true
     }
 }
@@ -1287,7 +1299,7 @@ impl Net {
 /// Member `key`'s envelope: checked and stored (`mail::receive`), answered with an `ack`.
 /// One whose `from` is not the member's own is dropped unanswered.
 /// An `app_*` envelope (the retired relay of a hosted app's call) is dropped unanswered.
-fn receive(d: &Arc<Daemon>, key: &str, env: &Frame, tx: &Tx) {
+fn receive(d: &Arc<Daemon>, key: &str, env: &Frame, raw: &serde_json::Value, tx: &Tx) {
     let Frame::Envelope { id, to, kind, .. } = env else {
         return;
     };
@@ -1319,9 +1331,40 @@ fn receive(d: &Arc<Daemon>, key: &str, env: &Frame, tx: &Tx) {
     let store = d.store.lock().unwrap();
     let me = &d.identity.short;
     let now = ipc::now();
+    // The person the sender's `hello` proof names, when it verifies.
+    let proof = d.proofs.lock().unwrap().get(key).cloned();
+    let person = proof.and_then(|t| crate::proof::verify(&t, key, now as i64).ok());
+    // This computer's own person (`@session-person`), and the rules with their exceptions.
+    let mine =
+        crate::login::stored_proof(&crate::paths::state_dir()).and_then(|t| crate::proof::peek(&t));
+    // Fail closed: rules that cannot be read refuse every message.
+    let (workspace, rules, exceptions) = match (
+        crate::rules::load(&store),
+        crate::rules::exceptions(&store, me),
+    ) {
+        (Ok((w, r)), Ok(e)) => (w, r, e),
+        (r, e) => {
+            let why = r.err().or(e.err()).map(|e| e.to_string());
+            eprintln!(
+                "net: the rules are unreadable ({}): refusing",
+                why.unwrap_or_default()
+            );
+            let mut deny = crate::rules::default_rules();
+            (deny.rules, deny.default) = (vec![], crate::rules::Effect::Deny);
+            (None, deny, vec![])
+        }
+    };
+    let judge = mail::Judge {
+        sender_person: person.as_ref().map(|p| p.sub.as_str()),
+        my_person: mine.as_ref().map(|p| p.sub.as_str()),
+        rules: &rules,
+        exceptions: &exceptions,
+        workspace: workspace.as_deref(),
+    };
     match mail::receive(
         &store,
         env,
+        Some(raw),
         peer,
         &team.roster,
         me,
@@ -1329,6 +1372,7 @@ fn receive(d: &Arc<Daemon>, key: &str, env: &Frame, tx: &Tx) {
         members,
         &team.config,
         now,
+        &judge,
     ) {
         Ok(mail::Answer {
             state,
@@ -1337,9 +1381,14 @@ fn receive(d: &Arc<Daemon>, key: &str, env: &Frame, tx: &Tx) {
             fresh,
             taken,
             cancelled,
+            held,
         }) => {
             eprintln!("net: envelope {id} from {short}: {}", state.name());
             ack(state, reason, limit);
+            // Shown to the person, as a worker hold is.
+            if let Some(Ok(Some(h))) = held.map(|h| holds::get(&store, h)) {
+                holds::shown(d, &team, &store, &h);
+            }
             // A fresh worker's address has no mailbox: nothing to wake, only a follow-up.
             match (taken, cancelled) {
                 (Some(Taken::Held { hold }), _) => {

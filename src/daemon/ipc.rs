@@ -4,7 +4,7 @@ use super::Daemon;
 use crate::agents::listing::{self, Listed};
 use crate::sessions::{self, Key};
 use crate::store;
-use crate::{doing, frame, label, mail, outbox, presence};
+use crate::{authority, doing, frame, label, mail, outbox, presence};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -345,11 +345,17 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
         "receipt" => match (body["from"].as_str(), body["request_id"].as_str()) {
             (Some(from), Some(rid)) => {
                 let from = Key(from.into());
-                let got = mail::receipt(&daemon.store.lock().unwrap(), &from, rid);
+                let (got, kind) = {
+                    let store = daemon.store.lock().unwrap();
+                    (
+                        mail::receipt(&store, &from, rid),
+                        store.kind_of(&from.0, rid).ok().flatten(),
+                    )
+                };
                 match got {
                     Ok(Some(r)) => {
                         let r = finish(daemon, &from, r, false).await;
-                        Response::ok(id, json!({ "receipt": r }))
+                        Response::ok(id, json!({ "receipt": r, "kind": kind }))
                     }
                     Ok(None) => Response::err(id, NOT_FOUND),
                     Err(_) => Response::err(id, INTERNAL),
@@ -363,6 +369,23 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
             match tokio::task::spawn_blocking(move || presence::directory(&d, q.as_deref())).await {
                 Ok(v) => Response::ok(id, v),
                 Err(_) => Response::err(id, INTERNAL),
+            }
+        }
+        // `card {member?}` -> `{card}`: that member's (a short or a key; default this one) Agent
+        // Card from the roster.
+        "card" => {
+            let team = daemon.team.lock().unwrap();
+            let r = &team.roster;
+            let key = match body.get("member").filter(|m| !m.is_null()) {
+                None => Some(&daemon.identity.key),
+                Some(m) => match m.as_str() {
+                    None => return Response::err(id, BAD_REQUEST),
+                    Some(m) => r.members.get(m).or_else(|| r.by_short(m)).map(|m| &m.key),
+                },
+            };
+            match key.and_then(|k| r.cards.get(k)) {
+                Some(card) => Response::ok(id, json!({ "card": card })),
+                None => Response::err(id, NOT_FOUND),
             }
         }
         // An agent fed a hostile link must not move this computer into another network: its
@@ -429,6 +452,19 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
         // something elsewhere first (`memory approve`) asks before it acts.
         "person" if for_a_person() => Response::ok(id, json!({})),
         "person" => refused(id, "not_a_person"),
+        // `rules.get` -> the stored rules document's `{workspace, revision, iat}`, or
+        // `{workspace: null, revision: "default", iat: null}`; a person's.
+        "rules.get" if !for_a_person() => refused(id, "not_a_person"),
+        "rules.get" => match crate::rules::stored(&daemon.store.lock().unwrap()) {
+            Ok(Some((w, r, iat))) => {
+                Response::ok(id, json!({"workspace": w, "revision": r, "iat": iat}))
+            }
+            Ok(None) => Response::ok(
+                id,
+                json!({"workspace": null, "revision": "default", "iat": null}),
+            ),
+            Err(_) => Response::err(id, INTERNAL),
+        },
         "memory.remember" => {
             memory_remember(id, body, daemon, instance, !instance && for_a_person())
         }
@@ -1893,7 +1929,9 @@ pub fn now() -> u64 {
 /// `sessions::qualify` (a bare name is this member's; anything else, groups included, is
 /// refused with reason `bad_address`). `kind` is one of `mail::KINDS` (`message` by default); an `assign` also takes
 /// `done_when`, `deadline_s` (1..=14 400, default 3 600) and `repo`/`branch`, a `result` its
-/// `status`/`reason`; a bad `deadline_s` is `bad_request`.
+/// `status`/`reason`; a bad `deadline_s` is `bad_request`. An assign whose `a2a` carries an
+/// authority object takes `done_when`, `deadline_at`, `repo` and `branch` from its operands
+/// instead (`object_terms`; `bad_request` when it does not verify or does not fit).
 /// Mail for a session here is stored, then pushed into a Claude or Codex session
 /// (`super::deliver`) if its tier is `push`; mail under another member's prefix goes to the
 /// outbox (`queued`, `where` that member's computer), `not_member` for a prefix no member has.
@@ -1943,17 +1981,6 @@ pub(crate) fn send_as(
         reason: text_of("reason"),
         ..Default::default()
     };
-    if kind == "assign" {
-        // An integer in 1..=14 400 seconds; anything else is refused, never clamped.
-        let secs = match body.get("deadline_s") {
-            None | Some(Value::Null) => 3_600,
-            Some(v) => match v.as_i64().filter(|n| (1..=14_400).contains(n)) {
-                Some(n) => n,
-                None => return Err(Response::err(id, BAD_REQUEST)),
-            },
-        };
-        meta.deadline_at = Some(now() as i64 + secs);
-    }
     let reply_to = body["reply_to"].as_str();
     let to = match body["to"].as_str() {
         Some(t) => match sessions::qualify(&daemon.identity.short, t) {
@@ -1973,6 +2000,59 @@ pub(crate) fn send_as(
         return Err(refused(id, "not_declared"));
     }
     let from = Key(from);
+    // An A2A body: its `metadata` and `extensions` as given, `role` and `parts` from the text
+    // when absent; its text must be the text.
+    let a2a = match body.get("a2a") {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(o)) => {
+            let mut a = Value::Object(o.clone());
+            if !a["role"].is_null()
+                && !matches!(a["role"].as_str(), Some("ROLE_USER" | "ROLE_AGENT"))
+            {
+                return Err(Response::err(id, BAD_REQUEST));
+            }
+            if a["role"].is_null() {
+                let role = if mail::is_person(&from.0) {
+                    "ROLE_USER"
+                } else {
+                    "ROLE_AGENT"
+                };
+                a["role"] = role.into();
+            }
+            if a["parts"].is_null() {
+                a["parts"] = json!([{ "text": text }]);
+            }
+            if mail::a2a_text(&a).as_deref() != Some(text) {
+                return Err(Response::err(id, BAD_REQUEST));
+            }
+            Some(a)
+        }
+        Some(_) => return Err(Response::err(id, BAD_REQUEST)),
+    };
+    // An assign carrying an authority object takes its terms from the object's operands, so the
+    // receiver binds what was minted; else from the arguments.
+    let jws = a2a.as_ref().map(|a| &a["metadata"][authority::URI]);
+    match jws.filter(|j| !j.is_null()) {
+        Some(jws) if kind == "assign" => match object_terms(jws, text) {
+            Some(terms) => {
+                (meta.done_when, meta.deadline_at) = (terms.done_when, terms.deadline_at);
+                (meta.repo, meta.branch) = (terms.repo, terms.branch);
+            }
+            None => return Err(Response::err(id, BAD_REQUEST)),
+        },
+        _ if kind == "assign" => {
+            // An integer in 1..=14 400 seconds; anything else is refused, never clamped.
+            let secs = match body.get("deadline_s") {
+                None | Some(Value::Null) => 3_600,
+                Some(v) => match v.as_i64().filter(|n| (1..=MAX_DEADLINE_S).contains(n)) {
+                    Some(n) => n,
+                    None => return Err(Response::err(id, BAD_REQUEST)),
+                },
+            };
+            meta.deadline_at = Some(now() as i64 + secs);
+        }
+        _ => {}
+    }
     let team = daemon.team.lock().unwrap();
     let store = daemon.store.lock().unwrap();
     let internal = |_| Response::err(id, INTERNAL);
@@ -1991,6 +2071,7 @@ pub(crate) fn send_as(
         mail::Prep::Go(p) => p,
         mail::Prep::Done(r) => return Ok((from, r)),
     };
+    p.a2a = a2a;
     if app {
         p.hops = p.hops.max(1);
     }
@@ -2004,6 +2085,33 @@ pub(crate) fn send_as(
         Err(Failed::NotMember) => Err(Response::err(id, super::net_ops::NOT_MEMBER)),
         Err(Failed::Internal(_)) => Err(Response::err(id, INTERNAL)),
     }
+}
+
+/// The longest an assignment may run from its send.
+const MAX_DEADLINE_S: i64 = 14_400;
+
+/// An assign's terms from authority object `jws` (verified now): its operands' `done_when`,
+/// `deadline_at` (at most `MAX_DEADLINE_S` from now), `repo` and `branch`; `None` when it does
+/// not verify, its `text` is not `text`, or a term has the wrong type.
+fn object_terms(jws: &Value, text: &str) -> Option<mail::Meta> {
+    let a = authority::verify(jws.as_str()?, now() as i64).ok()?;
+    let o = &a.operands;
+    let s = |k: &str| match &o[k] {
+        Value::Null => Some(None),
+        v => v.as_str().map(|s| Some(s.to_string())),
+    };
+    let deadline_at = match &o["deadline_at"] {
+        Value::Null => None,
+        v => Some(v.as_i64().filter(|d| *d <= now() as i64 + MAX_DEADLINE_S)?),
+    };
+    (o["text"].as_str() == Some(text)).then_some(())?;
+    Some(mail::Meta {
+        done_when: s("done_when")?,
+        deadline_at,
+        repo: s("repo")?,
+        branch: s("branch")?,
+        ..Default::default()
+    })
 }
 
 /// Why `dispatch` did not route a message.
@@ -2055,7 +2163,7 @@ fn dispatch_locked(
         let Some(member) = team.roster.by_short(prefix) else {
             return Err(Failed::NotMember);
         };
-        let r = outbox::enqueue(&store, p.clone(), member).map_err(internal)?;
+        let r = outbox::enqueue(&store, &daemon.identity, p.clone(), member).map_err(internal)?;
         daemon.peers.outbox.notify_one();
         return Ok(r);
     }
@@ -2092,7 +2200,8 @@ fn fresh_worker(
         if let mail::Origin::App = origin {
             m.origin = Some(mail::APP_ORIGIN.into());
         }
-        match workers::take_assign(&store, &team.config, &daemon.identity.short, &m, now as i64)
+        let me = &daemon.identity.short;
+        match workers::take_assign(&store, &team.config, me, &m, None, now as i64)
             .map_err(internal)?
         {
             Taken::Refused(reason) => {
@@ -2334,7 +2443,7 @@ pub(crate) fn records(daemon: &Daemon, messages: &[store::Message]) -> Vec<Value
                 "done_when": m.meta.done_when, "deadline_at": m.meta.deadline_at,
                 "framed": frame::framed_kind(&m.kind, label, &m.request_id,
                     m.reply_to.as_deref().and_then(|id| parents.get(id)).map(String::as_str),
-                    &m.meta, &m.body) })
+                    &m.meta, authority::summary_of(m, now() as i64).as_ref(), &m.body) })
         })
         .collect()
 }

@@ -1850,3 +1850,50 @@ fn find_workers_shows_a_teammates_worker_host() {
     assert_eq!(host["folder"], "lightbulb-work", "{v}");
     assert_eq!(v["total"], 1, "{v}");
 }
+
+#[test]
+fn send_message_refuses_an_authority_that_is_not_a_compact_jws_without_echoing_it() {
+    let net = Net::new();
+    let key = net.register("claude", "c1", &me());
+    let mut m = net.mcp(&me());
+    for bad in ["secret-not-a-jws", "a.b", "a..c", "a.b.c.d", ".b.c"] {
+        let out = m.tool(
+            "send_message",
+            json!({"request_id": "j1", "text": "t", "session_id": key, "authority": bad}),
+        );
+        assert!(out.error, "{bad}: {}", out.text);
+        assert!(!out.text.contains(bad), "{}", out.text);
+    }
+}
+
+#[test]
+fn assign_takes_an_authority_object_and_refuses_one_that_is_not_a_compact_jws() {
+    let net = Net::workers();
+    let codex = Other::new();
+    net.register("claude", "c1", &me());
+    let t = net.register("codex", "t1", &codex.1);
+    let mut m = net.mcp(&me());
+    let listed = m.rpc("tools/list", json!({}));
+    let tools = listed["result"]["tools"].as_array().unwrap();
+    let assign = tools.iter().find(|x| x["name"] == "assign").unwrap();
+    assert!(!assign["inputSchema"]["properties"]["authority"].is_null());
+    for bad in ["secret-not-a-jws", "a.b", "a..c", "a.b.c.d", ".b.c"] {
+        let out = m.tool(
+            "assign",
+            json!({"request_id": "as1", "to": t, "brief": "b", "done_when": "d",
+                   "authority": bad}),
+        );
+        assert!(out.error, "{bad}: {}", out.text);
+        assert_eq!(out.json()["error"], "bad_authority", "{bad}");
+        assert!(!out.text.contains(bad), "{}", out.text);
+    }
+    // A compact JWS reaches the daemon, which takes the assign's terms from it: one that does
+    // not verify is refused there.
+    let out = m.tool(
+        "assign",
+        json!({"request_id": "as2", "to": t, "brief": "b", "done_when": "d",
+               "authority": "x.y.z"}),
+    );
+    assert!(out.error, "{}", out.text);
+    assert_eq!(out.json()["error"], "bad_request", "{}", out.text);
+}

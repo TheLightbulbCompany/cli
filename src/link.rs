@@ -27,13 +27,14 @@ use tokio::sync::mpsc;
 use tokio_websockets::{ClientBuilder, Message};
 
 /// The ops Lightbulb may ask over the link. Nothing else on this computer is reachable.
-pub const OPS: [&str; 6] = [
+pub const OPS: [&str; 7] = [
     "app.send",
     "app.inbox",
     "app.ack",
     "app.unread",
     "app.receipt",
     "directory",
+    "rules.set",
 ];
 /// At most this many hosted apps' sessions at once (the oldest goes first).
 const MAX_APPS: usize = 20;
@@ -251,6 +252,8 @@ async fn answer(d: &Arc<Daemon>, frame: Value) -> Value {
             Ok(v) => ipc::Response::ok(id, this_computers_own_kept(v)),
             Err(_) => ipc::Response::err(id, ipc::INTERNAL),
         }
+    } else if op == "rules.set" {
+        rules_set(id, &frame, d).await
     } else {
         if let Err(code) = declare(d, &frame) {
             return refused(code);
@@ -264,6 +267,31 @@ async fn answer(d: &Arc<Daemon>, frame: Value) -> Value {
         e["id"] = id.into();
         e["ok"] = false.into();
         e
+    }
+}
+
+/// `rules.set {jws}`: stores the signed rules document. Refused `bad_request` when it does not
+/// verify or is for another workspace. The document is never logged.
+async fn rules_set(id: u64, frame: &Value, d: &Arc<Daemon>) -> ipc::Response {
+    let Some(jws) = frame["jws"].as_str().map(String::from) else {
+        return ipc::Response::err(id, ipc::BAD_REQUEST);
+    };
+    let d2 = d.clone();
+    let done = tokio::task::spawn_blocking(move || {
+        let store = d2.store.lock().unwrap();
+        let stored = crate::rules::store_doc(&store, &jws, ipc::now() as i64)?;
+        let revision = crate::rules::stored(&store)?
+            .map(|s| s.1)
+            .unwrap_or_default();
+        crate::Result::Ok((stored, revision))
+    })
+    .await;
+    match done {
+        Ok(Ok((stored, revision))) => {
+            ipc::Response::ok(id, json!({"stored": stored, "revision": revision}))
+        }
+        Ok(Err(_)) => ipc::Response::err(id, ipc::BAD_REQUEST),
+        Err(_) => ipc::Response::err(id, ipc::INTERNAL),
     }
 }
 

@@ -19,6 +19,7 @@ use crate::daemon::{ipc, Daemon, TeamState};
 use crate::holds::{self, signed_record};
 use crate::identity::Identity;
 use crate::mail::{self, Meta, State};
+use crate::rules::{self, Effect};
 use crate::sessions::{self, Key, PROVIDERS};
 use crate::store::{Message, Store, Worker};
 use crate::{frame, label, Result};
@@ -39,28 +40,66 @@ pub enum Policy {
     Refuse,
 }
 
-/// `member`'s policy: the latest standing record, else this computer's own key may, others ask.
-pub fn policy(store: &Store, me: &str, member: &str) -> rusqlite::Result<Policy> {
-    let scope: Option<String> = store
-        .conn()
-        .query_row(
-            "SELECT scope FROM approvals WHERE hold_id IS NULL \
-             AND scope IN ('always', 'refused', 'revoked') \
-             AND json_extract(record, '$.member') = ?1 ORDER BY rowid DESC LIMIT 1",
-            [member],
-            |r| r.get(0),
-        )
-        .map(Some)
-        .or_else(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => Ok(None),
-            e => Err(e),
-        })?;
-    Ok(match scope.as_deref() {
-        Some("always") => Policy::Allow,
-        Some("refused") => Policy::Refuse,
-        Some("revoked") => Policy::Ask,
-        _ if member == me => Policy::Allow,
-        _ => Policy::Ask,
+/// `member`'s policy for any worker here (`policy_for` with provider `*`), judged as the
+/// member alone.
+pub fn policy(store: &Store, me: &str, member: &str) -> Result<Policy> {
+    policy_for(store, me, member, "*", None)
+}
+
+/// Who asks for a fresh worker as `mail::receive` judged them: the requester (`person:<sub>`
+/// when the sender's proof verified or an object is bound, else `member:<short>`), whether a
+/// person originated it, and the bound authority object.
+pub struct Asker<'a> {
+    pub requester: &'a str,
+    pub origin_is_person: bool,
+    pub authority: Option<&'a crate::authority::Authority>,
+}
+
+/// `member`'s policy for a `provider` worker on this computer `me`, judged by the rules
+/// (`rules::decide`, resource `worker:<me>/<provider>`, skill `assign`, requester `asker`'s,
+/// else `member:<member>`, the member matching too) with the standing rows as exceptions:
+/// allow is Allow, deny Refuse, hold Ask. This computer's own key may, unless a row of any
+/// kind names it.
+fn policy_for(
+    store: &Store,
+    me: &str,
+    member: &str,
+    provider: &str,
+    asker: Option<&Asker>,
+) -> Result<Policy> {
+    let exceptions = rules::exceptions(store, me)?;
+    let as_member = format!("member:{member}");
+    if member == me && !exceptions.iter().any(|e| e.requester == as_member) {
+        return Ok(Policy::Allow);
+    }
+    // Every asker reaching here is a roster member: its org is the workspace's, unless its
+    // object names another.
+    let (workspace, doc) = rules::load(store)?;
+    let resource = format!("worker:{me}/{provider}");
+    let a = asker.and_then(|k| k.authority);
+    let chain_agents: Vec<String> = a.map_or(vec![], |a| {
+        a.chain.iter().filter_map(|h| h.agent.clone()).collect()
+    });
+    let hash = a.map(|a| crate::authority::operands_hash(&a.operands));
+    let input = rules::Input {
+        org: workspace.as_deref(),
+        requester: asker.map_or(&as_member, |k| k.requester),
+        requester_member: Some(&as_member),
+        requester_org: a.map_or(workspace.as_deref(), |a| Some(&a.requester_org)),
+        chain_agents: &chain_agents,
+        resource: &resource,
+        skill: "assign",
+        session_person: None,
+        operands: a.map(|a| &a.operands),
+        intent: a.map(|a| a.intent.as_str()),
+        verified_by: a.map(|a| a.verified_by.as_str()),
+        operands_hash: hash.as_deref(),
+        origin_is_person: asker.is_some_and(|k| k.origin_is_person),
+    };
+    Ok(match rules::decide(&doc, &exceptions, &input).effect {
+        Effect::Allow => Policy::Allow,
+        Effect::Deny => Policy::Refuse,
+        Effect::Hold => Policy::Ask,
     })
 }
 
@@ -84,7 +123,7 @@ pub fn set_policy(
         serde_json::json!({"member": member, "scope": scope, "by": by, "decided_at": now}),
     );
     store.conn().execute(
-        "INSERT INTO approvals VALUES (NULL, ?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO approvals (hold_id, verdict, scope, \"by\", nonce, decided_at, record) VALUES (NULL, ?1, ?2, ?3, ?4, ?5, ?6)",
         params![verdict, scope, by, nonce, now, record],
     )?;
     Ok(())
@@ -125,13 +164,14 @@ pub enum Taken {
 /// short key): refused when this computer does not offer the harness, is running `workers_max`
 /// workers, or refuses the asker; else stored (in no mailbox) and either held for the person
 /// (their policy for the asker is Ask) or ready to start; a deadline past `now +
-/// workers_max_deadline_s` is stored as that. The caller holds the store lock and a
-/// transaction.
+/// workers_max_deadline_s` is stored as that. `asker` is who `mail::receive` judged (none: the
+/// asking member alone). The caller holds the store lock and a transaction.
 pub fn take_assign(
     store: &Store,
     config: &Config,
     me: &str,
     assign: &Message,
+    asker: Option<&Asker>,
     now: i64,
 ) -> Result<Taken> {
     let provider = sessions::split_addr(&assign.to_key)
@@ -144,7 +184,7 @@ pub fn take_assign(
         return Ok(Taken::Refused("busy"));
     }
     let member = sessions::member_of(&assign.from_key).unwrap_or_default();
-    let verdict = policy(store, me, member)?;
+    let verdict = policy_for(store, me, member, provider, asker)?;
     if verdict == Policy::Refuse {
         return Ok(Taken::Refused("declined"));
     }
@@ -307,7 +347,7 @@ pub fn workspace(base: &Path, id: &str, meta: &Meta) -> Result<(PathBuf, bool)> 
 /// The worker's first prompt: assignment `a` framed as an agent gets it from `label`, its
 /// header line saying how to answer it.
 pub fn first_prompt(label: &str, a: &Message) -> String {
-    frame::framed_kind("assign", label, &a.request_id, None, &a.meta, &a.body)
+    frame::framed_kind("assign", label, &a.request_id, None, &a.meta, None, &a.body)
 }
 
 /// `start`'s half under the store lock, the one place the cap is kept: assignment `a`, not yet
@@ -1186,7 +1226,27 @@ mod tests {
                 deadline_at: Some(deadline),
                 ..Meta::default()
             },
+            ..Default::default()
         }
+    }
+
+    /// This computer's own key may, unless a standing row names it.
+    #[test]
+    fn my_own_rows_override_the_built_in_allow() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("state.db")).unwrap();
+        let id = Identity::load_or_create(dir.path()).unwrap();
+        assert_eq!(policy(&s, "m", "m").unwrap(), Policy::Allow);
+        set_policy(&s, &id, "m", "revoked", "me", 1).unwrap();
+        assert_eq!(policy(&s, "m", "m").unwrap(), Policy::Ask);
+        set_policy(&s, &id, "m", "refused", "me", 2).unwrap();
+        assert_eq!(policy(&s, "m", "m").unwrap(), Policy::Refuse);
+        // Another member's row leaves mine alone.
+        let t = tempfile::tempdir().unwrap();
+        let s = Store::open(&t.path().join("state.db")).unwrap();
+        set_policy(&s, &id, "q", "refused", "me", 1).unwrap();
+        assert_eq!(policy(&s, "m", "m").unwrap(), Policy::Allow);
+        assert_eq!(policy(&s, "m", "q").unwrap(), Policy::Refuse);
     }
 
     /// A config offering Claude Code workers (the tests' assignments are to `m/claude:new`).
