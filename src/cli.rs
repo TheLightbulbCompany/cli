@@ -568,6 +568,10 @@ fn listen_on(key: &str, once: bool) -> Result<()> {
             // A teammate's text, printed to a terminal: nothing it would act on, and its later
             // lines indented, so none can pass for the Reply line.
             let lines: Vec<String> = at("text").split('\n').map(cell).collect();
+            // The verified authority line, the daemon's own text, before the teammate's.
+            if let Some(a2a) = m["a2a_line"].as_str() {
+                println!("{}", cell(a2a));
+            }
             println!("From {}: {}", cell(at("label")), lines.join("\n  "));
             println!(
                 "Reply: {} send {} \"…\" --reply-to {}",

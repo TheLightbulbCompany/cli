@@ -142,6 +142,8 @@ async fn inbox_shows_the_authority_summary_before_the_text() {
         "{framed}"
     );
     assert_eq!(got["text"], "hi");
+    // `lightbulb listen` prints this line, the daemon's own, before the teammate's text.
+    assert_eq!(got["a2a_line"], "[A2A] agent_1 for user_b: say hi");
 }
 
 #[test]
@@ -225,6 +227,7 @@ async fn inbox_says_authority_expired_once_the_object_no_longer_verifies() {
         shown.starts_with("[A2A] (authority expired)\n\nhi\n"),
         "{framed}"
     );
+    assert_eq!(got["a2a_line"], "[A2A] (authority expired)");
     // A body line that imitates the summary is defanged.
     assert!(shown.contains("\n[\u{200b}A2A] x for y: z"), "{framed}");
 }
