@@ -11,8 +11,8 @@ The person should see a first version in Canvas within about 10 minutes of askin
 get better. Show a working preview early; finish it after.
 
 1. **Read before you ask.** Read the request, the room, the workspace brand, any linked page or
-   attached file, and `.lightbulb/plan.md`. Ask at most one question card, and only for what is
-   essential and you could not read. The playbook lists what never to ask. Write a few lines in
+   attached file, and `.lightbulb/plan.md`. Ask at most one form card of questions, and only for what
+   is essential and you could not read. The playbook lists what never to ask. Write a few lines in
    `.lightbulb/plan.md`: what you build first, what "done" means (from the playbook).
 2. **Build the first version yourself, in this conversation.** Don't hand the first version to a
    sub-agent. The main screen and the main flow first, on sample data labelled "(sample)": put the
@@ -34,7 +34,8 @@ get better. Show a working preview early; finish it after.
    version. `lightbulb app status` shows `done` without redeploying.
 5. **When `up` or `status` says `done: true`, post the ready line:** what it does and what you
    checked, in two or three plain sentences. Call it a preview: it is not live until
-   `lightbulb app publish` returns.
+   `lightbulb app publish` returns. After the first preview, sub-agents for deeper testing or
+   review are fine.
 6. **Same error twice: stop patching.** When `up` or `check` says `next: "diagnose"`, read the
    logs (`lightbulb app status --errors`), check `.lightbulb/known-fixes.md`, and write a fresh
    plan before touching code. When it says `next: "undo"`, roll back and tell the room plainly what
