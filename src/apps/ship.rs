@@ -541,6 +541,15 @@ pub(crate) fn pull(app: &str, dir: Option<PathBuf>, json: bool) -> Result<i32> {
             Err(e) => return Ok(failure(json, e)),
         }
     }
+    // A name is resolved to the app's real id first, so a fresh folder records the id, not the name.
+    let id = if fresh && !id.starts_with("app_") {
+        match api::call(&Auth::detect(), "GET", &format!("/{id}/status"), None) {
+            Ok(v) => v["app_id"].as_str().map(String::from).unwrap_or(id),
+            Err(e) => return Ok(fail(json, &e.code, &e.message, &e.next)),
+        }
+    } else {
+        id
+    };
     let tgz = temp("pull.tar.gz");
     let result = api::download(&Auth::detect(), &format!("/{id}/source"), &tgz).and_then(|c| {
         if fresh {

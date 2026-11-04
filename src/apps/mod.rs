@@ -449,11 +449,18 @@ fn start(request: &str, name: &str, room: Option<&str>, json: bool) -> Result<i3
     if json {
         println!("{out}");
     } else {
-        match v["canvas_url"].as_str() {
-            Some(u) => {
+        let already = v["next"]
+            .as_str()
+            .is_some_and(|n| n.starts_with("this app was already started"));
+        match (already, v["canvas_url"].as_str()) {
+            (true, Some(u)) => println!("{name} was already started. It's in Canvas: {u}"),
+            (true, None) => println!("{name} was already started."),
+            (false, Some(u)) => {
                 println!("Started {name}. It's being built in its own conversation in Canvas: {u}")
             }
-            None => println!("Started {name}. It's being built in its own conversation in Canvas."),
+            (false, None) => {
+                println!("Started {name}. It's being built in its own conversation in Canvas.")
+            }
         }
         if let Some(id) = v["app_id"].as_str() {
             println!("App id: {id}");

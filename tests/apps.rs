@@ -2748,7 +2748,16 @@ fn ask_resolves_the_name_here_and_sends_the_text() {
 fn source_stub(tgz: Vec<u8>, commit: &'static str) -> (String, Arc<Mutex<Vec<Req>>>) {
     stub_raw(
         move |line| {
-            if line.starts_with(&format!("GET {BUILD}/a-1/source ")) {
+            if line.starts_with(&format!("GET {BUILD}/a-1/status "))
+                || line.starts_with(&format!("GET {BUILD}/booking/status "))
+            {
+                // A name resolves to the real id before a fresh pull.
+                (
+                    200,
+                    String::new(),
+                    json!({"app_id": "a-1"}).to_string().into_bytes(),
+                )
+            } else if line.starts_with(&format!("GET {BUILD}/a-1/source ")) {
                 (
                     200,
                     format!("X-Lightbulb-Commit: {commit}\r\n"),
@@ -2797,7 +2806,13 @@ fn pull_into_a_new_folder_is_a_repo_with_the_base_recorded() {
     assert_eq!(code, 0, "{v}");
     assert_eq!(v["commit"], "c2");
     assert_eq!(v["changed"], true);
-    assert_eq!(lines(&seen), [format!("GET {BUILD}/a-1/source")]);
+    assert_eq!(
+        lines(&seen),
+        [
+            format!("GET {BUILD}/a-1/status"),
+            format!("GET {BUILD}/a-1/source")
+        ]
+    );
     assert_eq!(
         std::fs::read_to_string(to.join("theirs.txt")).unwrap(),
         "from canvas"
@@ -2957,4 +2972,24 @@ fn a_stale_base_is_refused_with_the_backends_next() {
     // Refused: the base is unchanged.
     assert_eq!(c.app_json()["base_commit"], Value::Null);
     assert_eq!(c.app_json()["up_commit"], "old");
+}
+
+#[test]
+fn a_pull_by_name_records_the_apps_real_id() {
+    let c = Checked::new();
+    let tgz = changed_source(&c.dir, ("theirs.txt", "from canvas"));
+    let (base, seen) = source_stub(tgz, "c2");
+    let to = c._tmp.path().join("by-name");
+    let (code, v) = c.app(&["pull", "booking", to.to_str().unwrap()], &base, true);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(
+        lines(&seen),
+        [
+            format!("GET {BUILD}/booking/status"),
+            format!("GET {BUILD}/a-1/source")
+        ]
+    );
+    let a: Value =
+        serde_json::from_slice(&std::fs::read(to.join(".lightbulb/app.json")).unwrap()).unwrap();
+    assert_eq!(a["app_id"], "a-1");
 }
