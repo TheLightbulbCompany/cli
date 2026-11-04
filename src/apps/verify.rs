@@ -311,6 +311,7 @@ pub(crate) fn run(root: &Path, auth: &Auth, json: bool) -> Result<i32> {
     }
     // The forms wrote test rows into the preview's database, where the person would see them. Put
     // it back to its schema and sample data; `false` means another read is busy and the next does it.
+    let mut note = None;
     let preview_data = if tried == 0 {
         "untouched"
     } else {
@@ -322,6 +323,11 @@ pub(crate) fn run(root: &Path, auth: &Auth, json: bool) -> Result<i32> {
         ) {
             Ok(r) if r["reset"] == true => "reset",
             Ok(_) => "resets on the next status read",
+            // An older backend has no reset: say so, but the pages and forms decide the verdict.
+            Err(e) if e.code == "no_route" => {
+                note = Some("the preview data could not be reset on this server, so the test entries stay in the preview");
+                "kept"
+            }
             Err(e) => {
                 problems.push(json!({"page": "the preview data", "problem": format!("test entries were not taken back out: {}", e.message)}));
                 "kept"
@@ -340,7 +346,10 @@ pub(crate) fn run(root: &Path, auth: &Auth, json: bool) -> Result<i32> {
     } else {
         "fix what is listed, run lightbulb app up, then verify again"
     };
-    let out = json!({"pass": pass, "opened": fixed, "forms_sent": submitted, "not_opened": dynamic, "preview_data": preview_data, "problems": problems, "next": next});
+    let mut out = json!({"pass": pass, "opened": fixed, "forms_sent": submitted, "not_opened": dynamic, "preview_data": preview_data, "problems": problems, "next": next});
+    if let Some(n) = note {
+        out["note"] = json!(n);
+    }
     if json {
         println!("{out}");
     } else {
@@ -355,6 +364,9 @@ pub(crate) fn run(root: &Path, auth: &Auth, json: bool) -> Result<i32> {
                 p["page"].as_str().unwrap_or(""),
                 p["problem"].as_str().unwrap_or("")
             );
+        }
+        if let Some(n) = note {
+            println!("  note: {n}");
         }
         for d in &dynamic {
             println!("  not opened (needs a real id): {d}");

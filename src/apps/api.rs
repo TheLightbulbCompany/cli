@@ -185,5 +185,7 @@ fn answered(r: crate::Result<(u16, Value)>) -> Result<Value, ApiError> {
     if let (Some(code), Some(message)) = (e["code"].as_str(), e["message"].as_str()) {
         return Err(ApiError::new(code, message, next));
     }
-    Err(ApiError::new("refused", &login::said(status, &v), next))
+    // A 404 the backend did not explain is a route it does not have (an older backend).
+    let code = if status == 404 { "no_route" } else { "refused" };
+    Err(ApiError::new(code, &login::said(status, &v), next))
 }

@@ -1528,8 +1528,9 @@ fn test_link_prints_the_url_and_keeps_it_out_of_every_file() {
     }
 }
 
-#[test]
-fn verify_puts_the_preview_data_back_after_sending_forms() {
+/// `lightbulb app verify --json` against a stub that is both the backend and the preview; `reset`
+/// is the reset route's answer.
+fn verify_with(reset: (u16, Value)) -> (i32, Value, Vec<String>) {
     let c = Checked::new();
     std::fs::write(c.dir.join(".lightbulb/app.json"), r#"{"app_id":"a-1"}"#).unwrap();
     // One stub is both the backend and the app's preview; the link points back at it.
@@ -1542,7 +1543,7 @@ fn verify_puts_the_preview_data_back_after_sending_forms() {
                 json!({"url": format!("{}/_lightbulb/session#token=T", o.lock().unwrap())}),
             ),
             l if l.ends_with("/a-1/status") => (200, json!({"open_to": "public"})),
-            l if l.ends_with("/a-1/reset-preview-data") => (200, json!({"reset": true})),
+            l if l.ends_with("/a-1/reset-preview-data") => reset.clone(),
             "POST /api/_lightbulb/session" => (200, json!({})),
             "GET /" | "POST /" => (
                 200,
@@ -1556,19 +1557,45 @@ fn verify_puts_the_preview_data_back_after_sending_forms() {
     );
     *origin.lock().unwrap() = base.clone();
     let (code, v) = c.app(&["verify"], &base, true);
+    (code, v, lines(&seen))
+}
+
+#[test]
+fn verify_puts_the_preview_data_back_after_sending_forms() {
+    let (code, v, sent) = verify_with((200, json!({"reset": true})));
     assert_eq!(code, 0, "{v}");
     assert_eq!(
         (&v["forms_sent"], &v["preview_data"]),
         (&json!(1), &json!("reset")),
         "{v}"
     );
-    let sent = lines(&seen);
+    assert!(v.get("note").is_none());
     let form = sent.iter().position(|l| l == "POST /").unwrap();
     let reset = sent
         .iter()
         .position(|l| l.ends_with("/a-1/reset-preview-data"))
         .unwrap();
     assert!(form < reset, "{sent:?}");
+}
+
+#[test]
+fn verify_on_a_backend_without_the_reset_says_so_and_still_passes() {
+    // FastAPI's answer for a route it does not have.
+    let (code, v, _) = verify_with((404, json!({"detail": "Not Found"})));
+    assert_eq!((code, &v["pass"]), (0, &json!(true)), "{v}");
+    assert_eq!(v["preview_data"], "kept");
+    assert!(v["note"]
+        .as_str()
+        .unwrap()
+        .contains("could not be reset on this server"));
+    assert_eq!(v["problems"], json!([]));
+    // Any other failure still fails verify.
+    let (code, v, _) = verify_with((503, json!({"detail": "down"})));
+    assert_eq!(
+        (code, &v["pass"], &v["preview_data"]),
+        (1, &json!(false), &json!("kept")),
+        "{v}"
+    );
 }
 
 #[test]
