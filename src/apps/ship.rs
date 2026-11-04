@@ -381,6 +381,10 @@ fn next_for(cmd: &str, r: &Value) -> String {
     }
 }
 
+/// What to do when only the starter's placeholder page has gone up.
+pub(crate) const PLACEHOLDER_NEXT: &str = "the app is still the starter's placeholder page; build \
+the app, then run lightbulb app up again";
+
 /// Still building when the wait gave up.
 fn building(r: &Value) -> bool {
     matches!(r["state"].as_str(), Some("building" | "provisioning"))
@@ -437,6 +441,10 @@ fn upload(
         }
         let mut fields = vec![("name", config.name.as_str()), ("commit", head.as_str())];
         fields.extend(room.map(|r| ("room_id", r)));
+        // An untouched starter page is not the app: the backend must not call its preview ready.
+        if super::placeholder(root) {
+            fields.push(("placeholder", "true"));
+        }
         api::form(auth, "/source", &fields, Some(("archive", &tgz)))
     })();
     let _ = std::fs::remove_file(&tgz);
@@ -537,6 +545,15 @@ pub(crate) fn up(
     }
     let mut r = r;
     let id = r["app_id"].as_str().unwrap_or_default().to_string();
+    // Only the starter's placeholder went up (the hosting card is filed early): the backend keeps
+    // it building until the real app arrives, so waiting here would only time out.
+    if building(&r) && super::placeholder(root) {
+        let mut out = contract(&r);
+        out["done"] = false.into();
+        out["next"] = PLACEHOLDER_NEXT.into();
+        print(&out, "up", json);
+        return Ok(0);
+    }
     if let Err(e) = wait(auth, &id, &mut r) {
         return Ok(failure(json, e));
     }

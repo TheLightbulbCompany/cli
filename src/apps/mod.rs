@@ -544,6 +544,22 @@ fn app_files(content: bool) -> Vec<(String, &'static [u8])> {
     all.into_iter().collect()
 }
 
+/// Whether the app's home page is still byte for byte the one `lightbulb app new` wrote: the
+/// starter's "Being built" placeholder, so nothing of the app is built yet.
+pub(crate) fn placeholder(root: &Path) -> bool {
+    let Ok(name) = AppConfig::load(root).map(|c| c.name) else {
+        return false;
+    };
+    [false, true]
+        .into_iter()
+        .flat_map(app_files)
+        .filter(|(p, _)| p == "src/app/page.tsx" || p == "src/app/(site)/page.tsx")
+        .any(|(p, b)| {
+            let want = String::from_utf8_lossy(b).replace("{{name}}", &name);
+            std::fs::read(root.join(p)).is_ok_and(|have| have == want.as_bytes())
+        })
+}
+
 /// The app's folder (the git root), its `app.yaml`, and how to call the backend. Writes nothing.
 pub fn preflight(json: bool) -> std::result::Result<(PathBuf, AppConfig, api::Auth), i32> {
     let top = std::process::Command::new("git")
@@ -790,6 +806,31 @@ mod tests {
                 "Missing: a finished preview"
             ]
         );
+    }
+
+    #[test]
+    fn an_untouched_starter_page_is_the_placeholder() {
+        for content in [false, true] {
+            let d = tempfile::tempdir().unwrap();
+            for (p, b) in app_files(content) {
+                let to = d.path().join(p);
+                std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+                match std::str::from_utf8(b) {
+                    Ok(t) => std::fs::write(to, t.replace("{{name}}", "run-8")).unwrap(),
+                    Err(_) => std::fs::write(to, b).unwrap(),
+                }
+            }
+            assert!(placeholder(d.path()), "content {content}");
+            let page = d.path().join(if content {
+                "src/app/(site)/page.tsx"
+            } else {
+                "src/app/page.tsx"
+            });
+            let mut t = std::fs::read_to_string(&page).unwrap();
+            t.push_str("// built\n");
+            std::fs::write(&page, t).unwrap();
+            assert!(!placeholder(d.path()), "content {content}");
+        }
     }
 
     #[test]

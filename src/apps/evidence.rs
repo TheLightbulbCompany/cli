@@ -94,6 +94,9 @@ pub(crate) fn done_with(
         })
     };
     if !super::ship::finished(&s["state"]) {
+        if super::placeholder(root) {
+            return not("ready", super::ship::PLACEHOLDER_NEXT.into());
+        }
         return not(
             "ready",
             "wait for the build to finish, then run lightbulb app status".into(),
