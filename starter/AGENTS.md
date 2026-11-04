@@ -25,13 +25,15 @@ get better. Show a working preview early; finish it after.
    it ready or live. People open the app from Canvas: never post the preview address, and never
    post a test link anywhere; it lets its holder in as the builder.
 4. **Keep going.** Finish the flows, write a small test for each business rule (see Tests), run
-   `pnpm test`, and run `lightbulb app up` again: each `up` refreshes the same preview. Then
-   `lightbulb app verify` (signs in past the door and opens every page; never install a browser).
-   Verify doesn't press buttons, so also try the main flow: `lightbulb app test-link --json` gives a
-   `url` for the shared browser. Record what you saw with
+   `pnpm test`, and run `lightbulb app up` again: each `up` refreshes the same preview. Try the
+   main flow yourself: `lightbulb app test-link --json` gives a `url` that signs the shared browser
+   in as the builder. Record what you saw with
    `lightbulb app evidence --kind browser --file .lightbulb/evidence/<name>.png`. Keep the file
    under `.lightbulb/evidence/` (git ignores it) or outside the app, so it never changes the
-   version. `lightbulb app status` shows `done` without redeploying.
+   version. Do every check yourself: never ask the person to test, sign in or click for you.
+   **Run `lightbulb app verify` last**, after your own checks (never install a browser): it opens
+   every page, sends each form, then puts the preview data back to its samples, so the person
+   never sees your test entries. `lightbulb app status` shows `done` without redeploying.
 5. **When `up` or `status` says `done: true`, post the ready line:** what it does and what you
    checked, in two or three plain sentences. Call it a preview: it is not live until
    `lightbulb app publish` returns. After the first preview, sub-agents for deeper testing or
