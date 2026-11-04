@@ -22,9 +22,15 @@ const IAT_SKEW_S: i64 = 300;
 /// workspace runtime is handed). `GET /api/v1/network/issuer` answers it as `env`.
 pub const ISSUER_ENV: &str = "LIGHTBULB_ISSUER_KEY";
 
-/// The issuer's public keys by `kid`, baked in at the key ceremony (owner: fill from the prod
-/// backend's `GET /api/v1/network/issuer`). Until then only `LIGHTBULB_ISSUER_KEY` verifies.
-pub const ISSUER_KEYS: &[(&str, [u8; 32])] = &[];
+/// The issuer's public keys by `kid`: the prod backend's `GET /api/v1/network/issuer` (4 Nov 2026).
+/// A dev backend's key still comes from `LIGHTBULB_ISSUER_KEY`.
+pub const ISSUER_KEYS: &[(&str, [u8; 32])] = &[(
+    "prod1",
+    [
+        118, 236, 205, 44, 130, 188, 100, 30, 134, 146, 98, 44, 161, 115, 102, 133, 254, 157, 215,
+        129, 201, 232, 224, 35, 170, 251, 5, 78, 248, 133, 206, 34,
+    ],
+)];
 
 /// Debug builds only: the tests' issuer (its private half is in `tests/common/issuer.rs`).
 #[cfg(debug_assertions)]
@@ -144,6 +150,15 @@ pub(crate) mod test_issuer;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_built_in_prod_key_is_the_one_the_prod_backend_publishes() {
+        let k = super::issuer_key("prod1").expect("prod1 is built in");
+        assert_eq!(
+            data_encoding::BASE64URL_NOPAD.encode(&k),
+            "duzNLIK8ZB6GkmIsoXNmhf6d14HJ6OAjqvsFTviFziI"
+        );
+    }
+
     use super::test_issuer as issuer;
     use super::*;
     use serde_json::json;
