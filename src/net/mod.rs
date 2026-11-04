@@ -1335,8 +1335,7 @@ fn receive(d: &Arc<Daemon>, key: &str, env: &Frame, raw: &serde_json::Value, tx:
     let proof = d.proofs.lock().unwrap().get(key).cloned();
     let person = proof.and_then(|t| crate::proof::verify(&t, key, now as i64).ok());
     // This computer's own person (`@session-person`), and the rules with their exceptions.
-    let mine =
-        crate::login::stored_proof(&crate::paths::state_dir()).and_then(|t| crate::proof::peek(&t));
+    let mine = crate::holds::my_person(&d.dir);
     // Fail closed: rules that cannot be read refuse every message.
     let (workspace, rules, exceptions) = match (
         crate::rules::load(&store),
@@ -1355,8 +1354,13 @@ fn receive(d: &Arc<Daemon>, key: &str, env: &Frame, raw: &serde_json::Value, tx:
         }
     };
     let judge = mail::Judge {
-        sender_person: person.as_ref().map(|p| p.sub.as_str()),
-        my_person: mine.as_ref().map(|p| p.sub.as_str()),
+        sender_person: (person.as_ref())
+            .filter(|p| !crate::proof::is_workspace(p))
+            .map(|p| p.sub.as_str()),
+        sender_workspace: (person.as_ref())
+            .filter(|p| crate::proof::is_workspace(p))
+            .map(|p| p.sub.as_str()),
+        my_person: mine.as_deref(),
         rules: &rules,
         exceptions: &exceptions,
         workspace: workspace.as_deref(),
@@ -1565,12 +1569,9 @@ fn hello(r: &Roster, protocol: u32, addrs: Vec<String>, proof: Option<String>) -
     }
 }
 
-/// This computer's sign-in proof, shown in every `hello` (an instance has none).
+/// This computer's sign-in proof, shown in every `hello` (an instance's is its workspace's).
 fn own_proof(d: &Daemon) -> Option<String> {
-    d.cloud
-        .is_none()
-        .then(|| crate::login::stored_proof(&d.dir))
-        .flatten()
+    crate::login::stored_proof(&d.dir)
 }
 
 /// Answers a removed member's `hello` with the roster pages it lacks, the removal among them,

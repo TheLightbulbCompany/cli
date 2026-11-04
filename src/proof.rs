@@ -62,6 +62,14 @@ pub struct Proof {
     /// When the person confirmed in the browser; renewals carry it unchanged.
     #[serde(default)]
     pub auth_time: Option<i64>,
+    /// A workspace proof's workspace (`org_<id>`, equal to `sub`); a person's has none.
+    #[serde(default)]
+    pub org: Option<String>,
+}
+
+/// Whether `p` names a workspace's computer, not a person.
+pub fn is_workspace(p: &Proof) -> bool {
+    p.sub.starts_with("org_")
 }
 
 /// `token`'s claims when it is a proof from a known issuer key for `member_key`, in force at
@@ -94,7 +102,11 @@ pub fn verify(token: &str, member_key: &str, now: i64) -> Result<Proof> {
     let c: Proof = serde_json::from_slice(&b64(p)?)?;
     if c.computer != member_key {
         Err("proof is for another computer".into())
-    } else if c.iat >= c.exp || c.exp - c.iat > MAX_LIFE_S || !c.sub.starts_with("user_") {
+    } else if c.iat >= c.exp
+        || c.exp - c.iat > MAX_LIFE_S
+        || !(c.sub.starts_with("user_")
+            || is_workspace(&c) && c.org.as_deref() == Some(c.sub.as_str()))
+    {
         Err("proof claims do not fit".into())
     } else if c.iat > now + IAT_SKEW_S || now > c.exp {
         Err("proof is not in force".into())
@@ -155,5 +167,31 @@ mod tests {
         );
         let ws = json!({"iat": NOW, "exp": NOW + 86_400, "sub": "ws:W1", "computer": "k1"});
         assert!(verify(&issuer::mint(&ws), "k1", NOW).is_err(), "not a user");
+    }
+
+    #[test]
+    fn workspace_proof_verifies() {
+        let t = issuer::workspace_proof("k1", "org_1", NOW);
+        let p = verify(&t, "k1", NOW + 10).unwrap();
+        assert_eq!((p.sub.as_str(), p.org.as_deref()), ("org_1", Some("org_1")));
+        assert!(is_workspace(&p));
+    }
+
+    #[test]
+    fn workspace_proof_with_a_different_org_is_refused() {
+        let mk = |org: Value| {
+            issuer::mint(
+                &json!({"iat": NOW, "exp": NOW + 86_400, "sub": "org_1", "org": org, "computer": "k1"}),
+            )
+        };
+        assert!(verify(&mk(json!("org_2")), "k1", NOW).is_err());
+        assert!(verify(&mk(Value::Null), "k1", NOW).is_err(), "no org");
+    }
+
+    #[test]
+    fn a_user_proof_still_verifies_and_has_no_org() {
+        let p = verify(&issuer::proof("k1", "user_1", NOW), "k1", NOW).unwrap();
+        assert_eq!(p.org, None);
+        assert!(!is_workspace(&p));
     }
 }

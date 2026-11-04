@@ -524,8 +524,12 @@ pub struct Prepared {
 
 /// What `receive` knows of the sender beyond the envelope, and the rules it is judged by.
 pub struct Judge<'a> {
-    /// The person the sending computer's `hello` proof names (`Proof::sub`), when it verified.
+    /// The person the sending computer's `hello` proof names (`Proof::sub`), when it verified
+    /// and names a person.
     pub sender_person: Option<&'a str>,
+    /// The workspace the sending computer's verified proof names instead (`org_<id>`): its
+    /// runtime, never a person.
+    pub sender_workspace: Option<&'a str>,
     /// The person this computer is signed in as (its own proof's `sub`): `@session-person`.
     pub my_person: Option<&'a str>,
     pub rules: &'a crate::rules::Rules,
@@ -541,6 +545,7 @@ impl Default for Judge<'static> {
             std::sync::LazyLock::new(crate::rules::default_rules);
         Judge {
             sender_person: None,
+            sender_workspace: None,
             my_person: None,
             rules: &RULES,
             exceptions: &[],
@@ -1158,8 +1163,16 @@ pub fn receive(
                 .ok_or_else(|| "jws".into())
                 .and_then(|jws| crate::authority::verify(jws, now as i64))
                 .and_then(|a| {
-                    crate::authority::bind(&a, kind, to, body, meta, judge.sender_person)
-                        .map(|()| a)
+                    crate::authority::bind(
+                        &a,
+                        kind,
+                        to,
+                        body,
+                        meta,
+                        judge.sender_person,
+                        judge.sender_workspace,
+                    )
+                    .map(|()| a)
                 });
             match bound {
                 Ok(a) => Some(a),
@@ -1236,7 +1249,14 @@ pub fn receive(
                 eprintln!("net: envelope {id} from {}: no_holder", peer.short);
                 return refused("policy");
             }
-            Effect::Hold => Some((requester, skill)),
+            Effect::Hold => {
+                // Bound by the workspace rule: the sender's workspace relayed the note.
+                let relayed = authority
+                    .as_ref()
+                    .and(judge.sender_workspace)
+                    .map(String::from);
+                Some((requester, skill, relayed))
+            }
         }
     } else {
         None
@@ -1297,7 +1317,7 @@ pub fn receive(
             ..Answer::is(state)
         });
     }
-    if let Some((requester, skill)) = held {
+    if let Some((requester, skill, relayed_by)) = held {
         // No mailbox row until its person allows it (`holds::answer`): a build that knows no
         // holds never hands it to a session.
         put(store, &p, Origin::Net(&peer.short), State::Held)?;
@@ -1305,8 +1325,8 @@ pub fn receive(
         m.origin = Some(format!("net:{}", peer.short));
         let h = crate::holds::insert_kind(store, m, &peer.short, HoldKind::Authority, now as i64)?;
         store.conn().execute(
-            "UPDATE holds SET requester = ?2, skill = ?3 WHERE id = ?1",
-            params![h.id, requester, skill],
+            "UPDATE holds SET requester = ?2, skill = ?3, relayed_by = ?4 WHERE id = ?1",
+            params![h.id, requester, skill, relayed_by],
         )?;
         store.put_seen(&peer.key, id, State::Held.name(), now as i64)?;
         tx.commit()?;
@@ -1328,7 +1348,7 @@ pub fn receive(
 }
 
 /// Who `peer`'s mail is judged as: `person:<sub>` (the bound object's requester, else the
-/// sender's proof person) or `member:<short>`, and whether a person originated it (the
+/// sender's proof person) or `member:<short>` (a sender signed in as a workspace too), and whether a person originated it (the
 /// object's `verified_by` is not `agent-runtime`; without one, the proof verified).
 fn requester_of(
     judge: &Judge,

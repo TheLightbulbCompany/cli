@@ -40,3 +40,10 @@ pub fn mint_typ(typ: &str, claims: &Value) -> String {
 pub fn proof(computer: &str, sub: &str, iat: i64) -> String {
     mint(&json!({"iat": iat, "exp": iat + 30 * 86_400, "sub": sub, "computer": computer}))
 }
+
+/// A workspace proof: computer `computer` is workspace `org`'s runtime, from `iat`, 30 days.
+pub fn workspace_proof(computer: &str, org: &str, iat: i64) -> String {
+    mint(
+        &json!({"iat": iat, "exp": iat + 30 * 86_400, "sub": org, "org": org, "computer": computer}),
+    )
+}
