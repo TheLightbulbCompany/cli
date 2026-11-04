@@ -114,7 +114,7 @@ const A2A_LINE_MAX: usize = 512;
 
 /// `[A2A] <requester chain> for <person>: <intent>`: each field one capped line, the whole at
 /// most `A2A_LINE_MAX` bytes. An unverified `Summary` is an object that no longer verifies.
-fn a2a_line(s: &crate::authority::Summary) -> String {
+pub(crate) fn a2a_line(s: &crate::authority::Summary) -> String {
     let one = |t: &str| line(t).take(160).collect::<String>();
     let mut out = if !s.verified {
         "[A2A] (authority expired)".to_string()

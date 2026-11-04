@@ -2435,15 +2435,17 @@ pub(crate) fn records(daemon: &Daemon, messages: &[store::Message]) -> Vec<Value
                 }
             });
             let label = who["label"].as_str().unwrap_or_default();
+            let summary = authority::summary_of(m, now() as i64);
             json!({ "id": m.id, "request_id": m.request_id, "from": m.from_key, "to": m.to_key,
                 "kind": m.kind, "thread": m.thread, "hops": m.hops, "text": m.body,
                 "sent_at": m.sent_at, "label": who["label"], "person": who["person"],
                 "person_verified": who["person_verified"], "computer": who["computer"],
                 "reply_to": m.reply_to, "status": m.meta.status, "reason": m.meta.reason,
                 "done_when": m.meta.done_when, "deadline_at": m.meta.deadline_at,
+                "a2a_line": summary.as_ref().map(frame::a2a_line),
                 "framed": frame::framed_kind(&m.kind, label, &m.request_id,
                     m.reply_to.as_deref().and_then(|id| parents.get(id)).map(String::as_str),
-                    &m.meta, authority::summary_of(m, now() as i64).as_ref(), &m.body) })
+                    &m.meta, summary.as_ref(), &m.body) })
         })
         .collect()
 }
