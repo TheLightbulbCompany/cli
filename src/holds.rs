@@ -87,6 +87,8 @@ pub struct Hold {
     /// `member:<short>`; `ask_session` or `message`).
     pub requester: Option<String>,
     pub skill: Option<String>,
+    /// The workspace (`org_<id>`) whose runtime relayed an Authority hold's note, if one did.
+    pub relayed_by: Option<String>,
 }
 
 impl Hold {
@@ -150,6 +152,7 @@ pub fn insert_kind(
         shown: None,
         stored_kind: Some(kind),
         requester: None,
+        relayed_by: None,
         skill: None,
     })
 }
@@ -190,7 +193,7 @@ fn rows(
     let mut stmt = store.conn().prepare(&format!(
         "SELECT m.*, h.id AS h_id, h.target_session AS h_to, h.from_session AS h_from, \
          h.from_member AS h_member, h.created_at AS h_at, h.state AS h_state, \
-         h.shown AS h_shown, h.kind AS h_kind, h.requester AS h_req, h.skill AS h_skill, \
+         h.shown AS h_shown, h.kind AS h_kind, h.requester AS h_req, h.skill AS h_skill, h.relayed_by AS h_relay, \
          s.key IS NOT NULL AS s_row, s.ended_at AS s_end \
          FROM holds h JOIN messages m ON m.id = h.message_id \
          LEFT JOIN sessions s ON s.key = h.target_session {filter} ORDER BY h.id"
@@ -217,6 +220,7 @@ fn rows(
                 .and_then(Kind::parse),
             requester: r.get("h_req")?,
             skill: r.get("h_skill")?,
+            relayed_by: r.get("h_relay")?,
         };
         Ok((h, gone_since))
     })?;
@@ -301,12 +305,23 @@ fn authority_dialog(
                     None => preview(&hop.person),
                 })
                 .collect();
-            format!(
-                "{} asks {session} for {}: {}\n\n{body}",
-                chain.join(" → "),
-                preview(&a.requester_person),
-                preview(&a.intent)
-            )
+            match (
+                &h.relayed_by,
+                a.chain.last().and_then(|hop| hop.agent.as_ref()),
+            ) {
+                (Some(_), Some(agent)) => format!(
+                    "{} for {}, via your workspace's agent: {}\n\n{body}",
+                    preview(agent),
+                    preview(&a.requester_person),
+                    preview(&a.intent)
+                ),
+                _ => format!(
+                    "{} asks {session} for {}: {}\n\n{body}",
+                    chain.join(" → "),
+                    preview(&a.requester_person),
+                    preview(&a.intent)
+                ),
+            }
         }
         None => format!("{who} asks {session}\n\n{body}"),
     };
@@ -410,7 +425,7 @@ impl Closed {
 /// policy) or of an authority hold by a person holding its resource (a standing local
 /// exception), and for an Allow of an authority hold whose object no longer verifies. A signed
 /// `approvals` record keeps the text the dialog showed; an authority hold's also its object's
-/// `authority_id` and `authority_hash` (null without one), `resource`, `skill` and `requester`.
+/// `authority_id` and `authority_hash` (null without one), `resource`, `skill`, `requester` and `relayed_by` (the workspace that relayed it, else null).
 #[allow(clippy::too_many_arguments)]
 pub fn answer(
     store: &Store,
@@ -485,6 +500,7 @@ pub fn answer(
         fields["resource"] = resource.clone().into();
         fields["skill"] = c.hold.skill.clone().into();
         fields["requester"] = c.hold.requester.clone().into();
+        fields["relayed_by"] = c.hold.relayed_by.clone().into();
     }
     let (nonce, record) = signed_record(me, fields);
     store.conn().execute(

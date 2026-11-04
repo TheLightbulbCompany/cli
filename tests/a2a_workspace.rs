@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 
 mod common;
 
-use common::{endpoint, issuer, now_s, seed_team, session, ulid, until, Env, Peer};
+use common::{endpoint, issuer, now_s, person, seed_team, session, ulid, until, Env, Peer};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_instance_presents_its_login_json_in_its_hello() {
@@ -172,4 +172,93 @@ async fn a_workspace_senders_assign_to_new_still_matches_its_member_row() {
             "{scope}"
         );
     }
+}
+
+/// A hosted agent's note for `user_p` of `org`: two hops, the second `friday`'s.
+fn relayed_note(org: &str, resource: &str) -> String {
+    let (now, operands) = (now_s(), json!({"text": "hi"}));
+    issuer::mint_typ(
+        lightbulb::authority::TYP,
+        &json!({
+            "v": 1, "id": "auth_r", "iat": now, "exp": now + 600,
+            "requester": {"person": "user_p", "org": org, "verified_by": "lightbulb"},
+            "chain": [{"agent": null, "session": null, "person": "user_p", "at": now},
+                      {"agent": "friday", "session": "run1", "person": "user_p", "at": now}],
+            "operation": {"skill": "ask_session", "resource": resource, "operands": operands,
+                          "operands_hash": lightbulb::authority::operands_hash(&operands)},
+            "intent": "say hi", "policy": null,
+        }),
+    )
+}
+
+fn relayed_ask(jws: &str) -> Value {
+    json!({"role": "ROLE_USER", "parts": [{"text": "hi"}],
+           "metadata": {lightbulb::authority::URI: jws},
+           "extensions": [lightbulb::authority::URI]})
+}
+
+fn open_holds(e: &Env) -> Vec<Value> {
+    person(e, json!({"id": 1, "op": "holds"}))["holds"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relayed_hosted_ask_is_held_and_names_the_workspace() {
+    let (a, b, _ep, mut p) = a_and_workspace_b("", &[]).await;
+    let (sa, sb) = (session(&a, "a1"), session(&b, "b1"));
+    let jws = relayed_note("org_1", &format!("session:{sa}"));
+    let (id, v) = envelope(&b.identity(), "message", &sb, &sa, Some(relayed_ask(&jws)));
+    p.send_raw(&v).await;
+    assert_eq!(ack(&mut p, &id).await.0, "held");
+    until(5, "the dialog's text kept", || {
+        open_holds(&a)
+            .first()
+            .is_some_and(|h| h["shown"].is_string())
+    });
+    let h = &open_holds(&a)[0];
+    assert_eq!(h["kind"], "authority");
+    let shown = h["shown"].as_str().unwrap().to_string();
+    assert!(shown.contains("via your workspace's agent"), "{shown}");
+    let r = person(
+        &a,
+        json!({"id": 1, "op": "hold.answer", "hold": "H1", "verdict": "allow", "scope": "once"}),
+    );
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(a.inbox(&sa).len(), 1);
+    let c = rusqlite::Connection::open(a.state.path().join("state.db")).unwrap();
+    let rec: String = c
+        .query_row("SELECT record FROM approvals WHERE hold_id = 1", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let rec: Value = serde_json::from_str(&rec).unwrap();
+    assert_eq!(rec["relayed_by"], "org_1");
+    assert_eq!(rec["text"], shown.as_str());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hosted_ask_from_another_workspace_is_refused_and_stores_nothing() {
+    let (a, b) = (Env::new(), Env::new());
+    seed_team(&a, &b);
+    a.sign_in("user_a", None);
+    a.daemon(false, "", &[]);
+    let ep = endpoint(&b.identity()).await;
+    let mut p = Peer::dial(&ep, &a).await;
+    let proof = issuer::workspace_proof(&b.identity().key, "org_2", now_s());
+    p.hello_with(vec![], Some(proof)).await;
+    until(5, "B online", || a.status()["peers"]["online"] == 1);
+    let (sa, sb) = (session(&a, "a1"), session(&b, "b1"));
+    let jws = relayed_note("org_1", &format!("session:{sa}"));
+    let (id, v) = envelope(&b.identity(), "message", &sb, &sa, Some(relayed_ask(&jws)));
+    p.send_raw(&v).await;
+    let got = ack(&mut p, &id).await;
+    assert_eq!(
+        (got.0.as_str(), got.1.as_deref()),
+        ("refused", Some("bad_request"))
+    );
+    assert!(open_holds(&a).is_empty());
+    assert!(a.store().message(&id).unwrap().is_none());
+    assert!(a.inbox(&sa).is_empty());
 }

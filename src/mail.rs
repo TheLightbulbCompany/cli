@@ -1249,7 +1249,14 @@ pub fn receive(
                 eprintln!("net: envelope {id} from {}: no_holder", peer.short);
                 return refused("policy");
             }
-            Effect::Hold => Some((requester, skill)),
+            Effect::Hold => {
+                // Bound by the workspace rule: the sender's workspace relayed the note.
+                let relayed = authority
+                    .as_ref()
+                    .and(judge.sender_workspace)
+                    .map(String::from);
+                Some((requester, skill, relayed))
+            }
         }
     } else {
         None
@@ -1310,7 +1317,7 @@ pub fn receive(
             ..Answer::is(state)
         });
     }
-    if let Some((requester, skill)) = held {
+    if let Some((requester, skill, relayed_by)) = held {
         // No mailbox row until its person allows it (`holds::answer`): a build that knows no
         // holds never hands it to a session.
         put(store, &p, Origin::Net(&peer.short), State::Held)?;
@@ -1318,8 +1325,8 @@ pub fn receive(
         m.origin = Some(format!("net:{}", peer.short));
         let h = crate::holds::insert_kind(store, m, &peer.short, HoldKind::Authority, now as i64)?;
         store.conn().execute(
-            "UPDATE holds SET requester = ?2, skill = ?3 WHERE id = ?1",
-            params![h.id, requester, skill],
+            "UPDATE holds SET requester = ?2, skill = ?3, relayed_by = ?4 WHERE id = ?1",
+            params![h.id, requester, skill, relayed_by],
         )?;
         store.put_seen(&peer.key, id, State::Held.name(), now as i64)?;
         tx.commit()?;
