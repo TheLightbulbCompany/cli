@@ -1117,6 +1117,7 @@ pub(crate) fn status_contract(v: &Value) -> Value {
             "app_id",
             "name",
             "room_id",
+            "conversation_id",
             "state",
             "open_to",
             "budget_usd",
@@ -1192,5 +1193,19 @@ mod tests {
         for l in human(&v, "publish").iter().chain(&human(&waiting, "up")) {
             assert!(!l.contains("ready") && !l.contains('_'), "{l}");
         }
+    }
+}
+
+#[cfg(test)]
+mod status_contract_tests {
+    use super::status_contract;
+    use serde_json::json;
+
+    #[test]
+    fn status_shows_the_apps_conversation() {
+        let v = json!({"app_id": "app_1", "conversation_id": "room_c", "secret": "x"});
+        let out = status_contract(&v);
+        assert_eq!(out["conversation_id"], "room_c");
+        assert!(out.get("secret").is_none());
     }
 }
