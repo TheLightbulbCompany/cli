@@ -72,6 +72,31 @@ pub enum AppCommand {
         #[arg(long, value_enum, default_value = "site")]
         kind: Kind,
     },
+    /// Ask Lightbulb to build an app; it is built in its own conversation in Canvas.
+    Start {
+        /// What the app should do, in your words.
+        request: String,
+        /// The app's name: a DNS label, lowercase letters, digits and dashes.
+        #[arg(long)]
+        name: String,
+        /// The room it was asked for in, if any.
+        #[arg(long)]
+        room: Option<String>,
+    },
+    /// Tell an app's builder something, in the app's conversation.
+    Ask {
+        /// The app's id, or its name when this folder or ./<name> is the app.
+        app: String,
+        /// What to tell the builder.
+        text: String,
+    },
+    /// Download the app's latest source: into a new folder, or merged into the app's own folder.
+    Pull {
+        /// The app's id, or its name when this folder or ./<name> is the app.
+        app: String,
+        /// Where (default: this app's folder when you are in it, else ./<app>).
+        dir: Option<PathBuf>,
+    },
     /// Build the preview and say when it is done.
     Up {
         /// An approved card for a destructive migration.
@@ -181,27 +206,42 @@ pub fn valid_name(n: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
 }
 
+/// Refuses a name `new` or `start` cannot use: its exit code.
+fn bad_name(name: &str, json: bool) -> Option<i32> {
+    if name.ends_with("-preview") {
+        return Some(fail(
+            json,
+            "bad_name",
+            &format!("An app's name cannot end in -preview: Lightbulb gives every app a preview at <name>-preview, so {name} would clash with another app's preview."),
+            "pick a name that does not end in -preview",
+        ));
+    }
+    (!valid_name(name)).then(|| {
+        fail(
+            json,
+            "bad_name",
+            "An app's name is 3 to 40 lowercase letters, digits and dashes, starting with a letter.",
+            "pick another name",
+        )
+    })
+}
+
 pub fn run(cmd: AppCommand, json: bool) -> Result<i32> {
     match cmd {
-        AppCommand::New { name, room, kind } => {
-            if name.ends_with("-preview") {
-                return Ok(fail(
-                    json,
-                    "bad_name",
-                    &format!("An app's name cannot end in -preview: Lightbulb gives every app a preview at <name>-preview, so {name} would clash with another app's preview."),
-                    "pick a name that does not end in -preview",
-                ));
-            }
-            if !valid_name(&name) {
-                return Ok(fail(
-                    json,
-                    "bad_name",
-                    "An app's name is 3 to 40 lowercase letters, digits and dashes, starting with a letter.",
-                    "pick another name",
-                ));
-            }
-            new(&name, room.as_deref(), kind, json)
-        }
+        AppCommand::New { name, room, kind } => match bad_name(&name, json) {
+            Some(code) => Ok(code),
+            None => new(&name, room.as_deref(), kind, json),
+        },
+        AppCommand::Start {
+            request,
+            name,
+            room,
+        } => match bad_name(&name, json) {
+            Some(code) => Ok(code),
+            None => start(&request, &name, room.as_deref(), json),
+        },
+        AppCommand::Ask { app, text } => ask(&app, &text, json),
+        AppCommand::Pull { app, dir } => ship::pull(&app, dir, json),
         AppCommand::Status { errors } => status(errors, json),
         AppCommand::Check { publish } => check::check(publish, json),
         AppCommand::Up {
@@ -391,6 +431,90 @@ fn destructive_gate(
     ))
 }
 
+/// `POST /start`: the backend reserves the name and starts the build in the app's own
+/// conversation. Nothing is written here.
+fn start(request: &str, name: &str, room: Option<&str>, json: bool) -> Result<i32> {
+    let mut body = json!({"name": name, "request": request});
+    if let Some(r) = room {
+        body["room_id"] = r.into();
+    }
+    let v = match api::call(&api::Auth::detect(), "POST", "/start", Some(&body)) {
+        Ok(v) => v,
+        Err(e) => return Ok(fail(json, &e.code, &e.message, &e.next)),
+    };
+    let mut out = json!({});
+    for k in ["app_id", "conversation_id", "canvas_url", "next"] {
+        out[k] = v[k].clone();
+    }
+    if json {
+        println!("{out}");
+    } else {
+        match v["canvas_url"].as_str() {
+            Some(u) => {
+                println!("Started {name}. It's being built in its own conversation in Canvas: {u}")
+            }
+            None => println!("Started {name}. It's being built in its own conversation in Canvas."),
+        }
+        if let Some(id) = v["app_id"].as_str() {
+            println!("App id: {id}");
+        }
+        if let Some(n) = v["next"].as_str().filter(|n| !n.trim().is_empty()) {
+            println!("Next: {n}");
+        }
+    }
+    Ok(0)
+}
+
+/// `POST /{id}/ask`: `text` goes to the app's builder.
+fn ask(app: &str, text: &str, json: bool) -> Result<i32> {
+    let id = match app_id_for(app, json) {
+        Ok((id, _)) => id,
+        Err(code) => return Ok(code),
+    };
+    let body = json!({"text": text});
+    match api::call(
+        &api::Auth::detect(),
+        "POST",
+        &format!("/{id}/ask"),
+        Some(&body),
+    ) {
+        Ok(v) if json => println!("{v}"),
+        Ok(_) => println!("Sent to the builder of {app}."),
+        Err(e) => return Ok(fail(json, &e.code, &e.message, &e.next)),
+    }
+    Ok(0)
+}
+
+/// The id for `app` (an id, or a name) and the app's folder when it is here: this folder's app
+/// or `./{app}`, by its name or its id in `.lightbulb/app.json`. Else `app` as given, for the
+/// backend's routes, which take the id.
+pub(crate) fn app_id_for(
+    app: &str,
+    json: bool,
+) -> std::result::Result<(String, Option<PathBuf>), i32> {
+    let mut here = git_root().into_iter().chain([PathBuf::from(app)]);
+    let found = here.find(|root| {
+        AppConfig::load(root).is_ok_and(|c| c.name == app) || ship::app_json(root)["app_id"] == app
+    });
+    let id = found
+        .as_deref()
+        .and_then(|r| ship::app_json(r)["app_id"].as_str().map(String::from))
+        .unwrap_or_else(|| app.to_string());
+    if id.is_empty()
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(fail(
+            json,
+            "bad_app",
+            &format!("{app} is not an app's id or name."),
+            "use the app id lightbulb app start printed, or the app's name inside its folder",
+        ));
+    }
+    Ok((id, found))
+}
+
 /// `./{name}`: the starter, `app.yaml`, the plan, and one git commit.
 pub fn new(name: &str, room: Option<&str>, kind: Kind, json: bool) -> Result<i32> {
     let dir = std::env::current_dir()?.join(name);
@@ -563,13 +687,7 @@ pub(crate) fn placeholder(root: &Path) -> bool {
 
 /// The app's folder (the git root), its `app.yaml`, and how to call the backend. Writes nothing.
 pub fn preflight(json: bool) -> std::result::Result<(PathBuf, AppConfig, api::Auth), i32> {
-    let top = std::process::Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()));
-    let Some(root) = top.filter(|r| r.join("app.yaml").is_file()) else {
+    let Some(root) = git_root() else {
         return Err(fail(
             json,
             "not_an_app",
@@ -581,6 +699,17 @@ pub fn preflight(json: bool) -> std::result::Result<(PathBuf, AppConfig, api::Au
         Ok(c) => Ok((root, c, api::Auth::detect())),
         Err(e) => Err(fail(json, "bad_config", &e.to_string(), "fix app.yaml")),
     }
+}
+
+/// The top of this git repo, when it is an app (has app.yaml).
+fn git_root() -> Option<PathBuf> {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()))
+        .filter(|r| r.join("app.yaml").is_file())
 }
 
 /// `GET /{app_id}/status`, and with `errors` also `/errors`.

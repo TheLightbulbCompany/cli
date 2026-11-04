@@ -435,12 +435,15 @@ fn upload(
     expect: Option<&str>,
 ) -> std::result::Result<String, ApiError> {
     let (tgz, head) = archive(root)?;
+    let base = base_commit(root);
     let sent = (|| {
         if expect.is_some_and(|e| e != head) {
             return Err(review_required(root));
         }
         let mut fields = vec![("name", config.name.as_str()), ("commit", head.as_str())];
         fields.extend(room.map(|r| ("room_id", r)));
+        // Another writer's newer source makes the backend refuse this one (stale_base).
+        fields.extend(base.as_deref().map(|b| ("base_commit", b)));
         // An untouched starter page is not the app: the backend must not call its preview ready.
         if super::placeholder(root) {
             fields.push(("placeholder", "true"));
@@ -448,16 +451,220 @@ fn upload(
         api::form(auth, "/source", &fields, Some(("archive", &tgz)))
     })();
     let _ = std::fs::remove_file(&tgz);
-    sent?["source_id"]
+    let source_id = sent?["source_id"].as_str().map(String::from);
+    // What was sent is now the app's latest source: the next upload's base.
+    if source_id.is_some() {
+        let mut a = app_json(root);
+        a["base_commit"] = head.into();
+        save_app_json(root, &a)
+            .map_err(|e| ApiError::new("write_failed", &e.to_string(), "check the folder"))?;
+    }
+    source_id.ok_or_else(|| {
+        ApiError::new(
+            "bad_answer",
+            "Lightbulb did not return a source id.",
+            "try again",
+        )
+    })
+}
+
+/// The app's latest source as this folder last saw it: what it last uploaded or pulled
+/// (`up_commit` for an app sent before `base_commit` was recorded).
+fn base_commit(root: &Path) -> Option<String> {
+    let a = app_json(root);
+    a["base_commit"]
         .as_str()
+        .or(a["up_commit"].as_str())
         .map(String::from)
+}
+
+/// A new path in the temp folder.
+fn temp(what: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("lightbulb-{what}-{}", ulid::Ulid::generate()))
+}
+
+/// `tar -xzf tgz -C dir`.
+fn untar(tgz: &Path, dir: &Path) -> std::result::Result<(), ApiError> {
+    std::fs::create_dir_all(dir)
+        .ok()
+        .and_then(|_| {
+            Command::new("tar")
+                .arg("-xzf")
+                .arg(tgz)
+                .arg("-C")
+                .arg(dir)
+                .status()
+                .ok()
+        })
+        .filter(|s| s.success())
+        .map(drop)
         .ok_or_else(|| {
             ApiError::new(
-                "bad_answer",
-                "Lightbulb did not return a source id.",
-                "try again",
+                "archive_failed",
+                "Could not unpack the app's source.",
+                "check that tar works, then try again",
             )
         })
+}
+
+/// `lightbulb app pull`: the app's latest source into `dir`. A new or empty folder becomes a
+/// git repo with it as one commit. The app's own folder (clean) gets it as a commit on top of
+/// the one it last sent or pulled (`up_commit`), merged into HEAD: a fast-forward when
+/// nothing changed here since, else a merge of both. Its commit is recorded as the base.
+pub(crate) fn pull(app: &str, dir: Option<PathBuf>, json: bool) -> Result<i32> {
+    let (id, found) = match super::app_id_for(app, json) {
+        Ok(f) => f,
+        Err(code) => return Ok(code),
+    };
+    let dir = dir.or(found).unwrap_or_else(|| PathBuf::from(app));
+    let fresh = !dir.exists() || (dir.is_dir() && std::fs::read_dir(&dir)?.next().is_none());
+    let own = dir.join("app.yaml").is_file() && dir.join(".git").exists();
+    if !fresh && !own {
+        return Ok(fail(
+            json,
+            "dir_not_empty",
+            &format!("{} is not empty and is not an app's folder.", dir.display()),
+            "pick an empty folder, or the app's own folder",
+        ));
+    }
+    if !fresh {
+        match git_ok(&dir, &["status", "--porcelain"]) {
+            Ok(d) if d.is_empty() => {}
+            Ok(_) => {
+                return Ok(fail(
+                    json,
+                    "dirty_tree",
+                    "There are changes that are not committed.",
+                    "commit your changes, then run lightbulb app pull again",
+                ))
+            }
+            Err(e) => return Ok(failure(json, e)),
+        }
+    }
+    let tgz = temp("pull.tar.gz");
+    let result = api::download(&Auth::detect(), &format!("/{id}/source"), &tgz).and_then(|c| {
+        if fresh {
+            pull_fresh(&dir, &tgz, &id, &c).map(|_| (c, true))
+        } else {
+            pull_merge(&dir, &tgz, &c).map(|changed| (c, changed))
+        }
+    });
+    let _ = std::fs::remove_file(&tgz);
+    let (commit, changed) = match result {
+        Ok(r) => r,
+        Err(e) => return Ok(failure(json, e)),
+    };
+    let next = if fresh {
+        format!(
+            "cd {} && pnpm install, then change the app and run lightbulb app up",
+            dir.display()
+        )
+    } else {
+        "change the app, then run lightbulb app up".to_string()
+    };
+    if json {
+        println!(
+            "{}",
+            json!({"app_id": id, "dir": dir, "commit": commit, "changed": changed, "next": next})
+        );
+    } else {
+        let short = commit.get(..7).unwrap_or(&commit);
+        if changed {
+            println!("Pulled {app} (version {short}) into {}.", dir.display());
+        } else {
+            println!(
+                "{} already has the latest version of {app} ({short}).",
+                dir.display()
+            );
+        }
+        println!("Next: {next}");
+    }
+    Ok(0)
+}
+
+fn pull_fresh(dir: &Path, tgz: &Path, id: &str, commit: &str) -> std::result::Result<(), ApiError> {
+    untar(tgz, dir)?;
+    git_ok(dir, &["init", "-q"])?;
+    git_ok(dir, &["add", "-A"])?;
+    self::commit(dir, &format!("lightbulb app pull: version {commit}"))?;
+    let head = git_ok(dir, &["rev-parse", "HEAD"])?;
+    // The backend took `id` for this app's source, so its other routes take it too.
+    let a = json!({"app_id": id, "base_commit": commit, "up_commit": head});
+    save_app_json(dir, &a)
+        .map_err(|e| ApiError::new("write_failed", &e.to_string(), "check the folder"))
+}
+
+/// Whether anything changed.
+fn pull_merge(dir: &Path, tgz: &Path, commit: &str) -> std::result::Result<bool, ApiError> {
+    if base_commit(dir).as_deref() == Some(commit) {
+        return Ok(false);
+    }
+    let a = app_json(dir);
+    let parent = a["up_commit"]
+        .as_str()
+        .filter(|p| git_ok(dir, &["cat-file", "-e", &format!("{p}^{{commit}}")]).is_ok())
+        .ok_or_else(|| {
+            ApiError::new(
+                "no_base",
+                "This folder has no record of the version it last sent or pulled, so the latest version cannot be merged into it.",
+                "pull into an empty folder: lightbulb app pull <app> <new folder>",
+            )
+        })?
+        .to_string();
+    // The latest source's tree, from a scratch index over the unpacked files.
+    let files = temp("pull");
+    let index = temp("pull-index");
+    let tree = untar(tgz, &files).and_then(|_| {
+        let indexed = |args: &[&str]| {
+            Command::new("git")
+                .current_dir(dir)
+                .env("GIT_INDEX_FILE", &index)
+                .arg(format!("--work-tree={}", files.display()))
+                .args(args)
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        };
+        indexed(&["add", "-A", "-f"])
+            .and_then(|_| indexed(&["write-tree"]))
+            .ok_or_else(|| {
+                ApiError::new(
+                    "git_failed",
+                    "git could not read the latest source.",
+                    "try again",
+                )
+            })
+    });
+    let _ = std::fs::remove_dir_all(&files);
+    let _ = std::fs::remove_file(&index);
+    let (tree, msg) = (tree?, format!("lightbulb app pull: version {commit}"));
+    let mut args = identity(dir);
+    args.extend(["commit-tree", tree.as_str(), "-p", &parent, "-m", &msg]);
+    let latest = git_ok(dir, &args)?;
+    let mut a = a;
+    a["base_commit"] = commit.into();
+    a["up_commit"] = latest.as_str().into();
+    save_app_json(dir, &a)
+        .map_err(|e| ApiError::new("write_failed", &e.to_string(), "check the folder"))?;
+    let mut args = identity(dir);
+    args.extend(["merge", "-q", "--no-edit", &latest]);
+    if let Err(e) = git_ok(dir, &args) {
+        let conflicts =
+            git_ok(dir, &["diff", "--name-only", "--diff-filter=U"]).unwrap_or_default();
+        if conflicts.is_empty() {
+            return Err(e);
+        }
+        return Err(ApiError::new(
+            "merge_conflict",
+            &format!(
+                "The latest version and your changes conflict in: {}",
+                conflicts.lines().collect::<Vec<_>>().join(", ")
+            ),
+            "fix the conflicts and commit, then run lightbulb app up",
+        ));
+    }
+    Ok(true)
 }
 
 fn review_required(_root: &Path) -> ApiError {
