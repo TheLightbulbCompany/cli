@@ -442,8 +442,9 @@ fn upload(
         }
         let mut fields = vec![("name", config.name.as_str()), ("commit", head.as_str())];
         fields.extend(room.map(|r| ("room_id", r)));
-        // Another writer's newer source makes the backend refuse this one (stale_base).
-        fields.extend(base.as_deref().map(|b| ("base_commit", b)));
+        // Another writer's newer source makes the backend refuse this one (stale_base). A
+        // folder that never sent or pulled says `new`: refused if the app already has source.
+        fields.push(("base_commit", base.as_deref().unwrap_or("new")));
         // An untouched starter page is not the app: the backend must not call its preview ready.
         if super::placeholder(root) {
             fields.push(("placeholder", "true"));
@@ -635,7 +636,23 @@ fn pull_merge(dir: &Path, tgz: &Path, commit: &str) -> std::result::Result<bool,
                 .filter(|o| o.status.success())
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         };
+        // Tracked files the archive leaves out by design (`.env.example`) are kept as they
+        // were at `parent`; any other file missing from the archive was deleted there.
+        let kept = |_: String| {
+            let listed = indexed(&["ls-tree", "-r", "-z", &parent])?;
+            listed
+                .split('\0')
+                .filter_map(|l| l.split_once('\t'))
+                .filter(|(_, path)| !shipped(path))
+                .try_for_each(|(meta, path)| {
+                    let mut m = meta.split(' ');
+                    let (mode, _, sha) = (m.next()?, m.next()?, m.next()?);
+                    let info = format!("{mode},{sha},{path}");
+                    indexed(&["update-index", "--add", "--cacheinfo", &info]).map(drop)
+                })
+        };
         indexed(&["add", "-A", "-f"])
+            .and_then(kept)
             .and_then(|_| indexed(&["write-tree"]))
             .ok_or_else(|| {
                 ApiError::new(
@@ -651,11 +668,6 @@ fn pull_merge(dir: &Path, tgz: &Path, commit: &str) -> std::result::Result<bool,
     let mut args = identity(dir);
     args.extend(["commit-tree", tree.as_str(), "-p", &parent, "-m", &msg]);
     let latest = git_ok(dir, &args)?;
-    let mut a = a;
-    a["base_commit"] = commit.into();
-    a["up_commit"] = latest.as_str().into();
-    save_app_json(dir, &a)
-        .map_err(|e| ApiError::new("write_failed", &e.to_string(), "check the folder"))?;
     let mut args = identity(dir);
     args.extend(["merge", "-q", "--no-edit", &latest]);
     if let Err(e) = git_ok(dir, &args) {
@@ -673,6 +685,12 @@ fn pull_merge(dir: &Path, tgz: &Path, commit: &str) -> std::result::Result<bool,
             "fix the conflicts and commit, then run lightbulb app up",
         ));
     }
+    // Merged: only now is the latest version this folder's base.
+    let mut a = a;
+    a["base_commit"] = commit.into();
+    a["up_commit"] = latest.as_str().into();
+    save_app_json(dir, &a)
+        .map_err(|e| ApiError::new("write_failed", &e.to_string(), "check the folder"))?;
     Ok(true)
 }
 

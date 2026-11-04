@@ -82,6 +82,9 @@ pub enum AppCommand {
         /// The room it was asked for in, if any.
         #[arg(long)]
         room: Option<String>,
+        /// The person who asked: their user id (a message's sender id).
+        #[arg(long)]
+        requested_by: Option<String>,
     },
     /// Tell an app's builder something, in the app's conversation.
     Ask {
@@ -89,8 +92,20 @@ pub enum AppCommand {
         app: String,
         /// What to tell the builder.
         text: String,
+        /// The room it was said in, if any.
+        #[arg(long)]
+        room: Option<String>,
+        /// The person who said it: their user id (a message's sender id).
+        #[arg(long)]
+        requested_by: Option<String>,
+        /// The message's id: sending the same message twice tells the builder once.
+        #[arg(long)]
+        message_id: Option<String>,
     },
     /// Download the app's latest source: into a new folder, or merged into the app's own folder.
+    #[command(
+        after_help = "Needs curl 7.84 or newer: it reads the version from the answer's headers."
+    )]
     Pull {
         /// The app's id, or its name when this folder or ./<name> is the app.
         app: String,
@@ -236,11 +251,37 @@ pub fn run(cmd: AppCommand, json: bool) -> Result<i32> {
             request,
             name,
             room,
-        } => match bad_name(&name, json) {
+            requested_by,
+        } => match bad_name(&name, json).or_else(|| too_long(&request, json)) {
             Some(code) => Ok(code),
-            None => start(&request, &name, room.as_deref(), json),
+            None => start(&request, &name, room, requested_by, json),
         },
-        AppCommand::Ask { app, text } => ask(&app, &text, json),
+        AppCommand::Ask {
+            app,
+            text,
+            room,
+            requested_by,
+            message_id,
+        } => match too_long(&text, json) {
+            Some(code) => Ok(code),
+            None => {
+                let mut body = json!({"text": text});
+                let mut origin = json!({});
+                if let Some(r) = room {
+                    origin["room_id"] = r.into();
+                }
+                if let Some(p) = requested_by {
+                    origin["requested_by"] = p.into();
+                }
+                if origin != json!({}) {
+                    body["origin"] = origin;
+                }
+                if let Some(m) = message_id {
+                    body["client_message_id"] = m.into();
+                }
+                ask(&app, &body, json)
+            }
+        },
         AppCommand::Pull { app, dir } => ship::pull(&app, dir, json),
         AppCommand::Status { errors } => status(errors, json),
         AppCommand::Check { publish } => check::check(publish, json),
@@ -431,12 +472,37 @@ fn destructive_gate(
     ))
 }
 
+/// The most characters `start` and `ask` send; the backend refuses more.
+const MAX_TEXT: usize = 4000;
+
+/// Refuses text over `MAX_TEXT` characters: its exit code.
+fn too_long(text: &str, json: bool) -> Option<i32> {
+    let n = text.chars().count();
+    (n > MAX_TEXT).then(|| {
+        fail(
+            json,
+            "too_long",
+            &format!("That is {n} characters; Lightbulb takes at most {MAX_TEXT}."),
+            "shorten it, or send it in parts with lightbulb app ask",
+        )
+    })
+}
+
 /// `POST /start`: the backend reserves the name and starts the build in the app's own
 /// conversation. Nothing is written here.
-fn start(request: &str, name: &str, room: Option<&str>, json: bool) -> Result<i32> {
+fn start(
+    request: &str,
+    name: &str,
+    room: Option<String>,
+    requested_by: Option<String>,
+    json: bool,
+) -> Result<i32> {
     let mut body = json!({"name": name, "request": request});
     if let Some(r) = room {
         body["room_id"] = r.into();
+    }
+    if let Some(p) = requested_by {
+        body["requested_by"] = p.into();
     }
     let v = match api::call(&api::Auth::detect(), "POST", "/start", Some(&body)) {
         Ok(v) => v,
@@ -472,18 +538,17 @@ fn start(request: &str, name: &str, room: Option<&str>, json: bool) -> Result<i3
     Ok(0)
 }
 
-/// `POST /{id}/ask`: `text` goes to the app's builder.
-fn ask(app: &str, text: &str, json: bool) -> Result<i32> {
+/// `POST /{id}/ask`: `body` (its `text`, and where it came from) goes to the app's builder.
+fn ask(app: &str, body: &Value, json: bool) -> Result<i32> {
     let id = match app_id_for(app, json) {
         Ok((id, _)) => id,
         Err(code) => return Ok(code),
     };
-    let body = json!({"text": text});
     match api::call(
         &api::Auth::detect(),
         "POST",
         &format!("/{id}/ask"),
-        Some(&body),
+        Some(body),
     ) {
         Ok(v) if json => println!("{v}"),
         Ok(_) => println!("Sent to the builder of {app}."),

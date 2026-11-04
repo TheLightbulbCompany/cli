@@ -467,8 +467,8 @@ When you use it: to build a small web app for your workspace, check it, preview 
 
 ```
 lightbulb app new <NAME> [--room <ROOM>] [--kind <KIND>]
-lightbulb app start <REQUEST> --name <NAME> [--room <ROOM>]
-lightbulb app ask <APP> <TEXT>
+lightbulb app start <REQUEST> --name <NAME> [--room <ROOM>] [--requested-by <USER_ID>]
+lightbulb app ask <APP> <TEXT> [--room <ROOM>] [--requested-by <USER_ID>] [--message-id <ID>]
 lightbulb app pull <APP> [DIR]
 lightbulb app up [--room <ROOM>] [--approved <CARD>] [--requested-by <ID>]
 lightbulb app publish [--reason <TEXT>] [--room <ROOM>] [--approved <CARD>]

@@ -131,8 +131,8 @@ pub fn download(auth: &Auth, path: &str, to: &Path) -> Result<String, ApiError> 
     if commit.is_empty() || commit.chars().any(|c| !c.is_ascii_alphanumeric()) {
         return Err(ApiError::new(
             "bad_answer",
-            "Lightbulb did not say which commit the source is.",
-            "try again",
+            "Lightbulb did not say which commit the source is. Reading it needs curl 7.84 or newer.",
+            "check curl --version; update curl if it is older than 7.84, then try again",
         ));
     }
     Ok(commit)

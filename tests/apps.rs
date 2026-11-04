@@ -2945,6 +2945,9 @@ fn pull_fast_forwards_and_says_where_they_conflict() {
         v["next"],
         "fix the conflicts and commit, then run lightbulb app up"
     );
+    // Not merged: after an abort the base is still the one last sent.
+    git(&c.dir, &["merge", "--abort"]);
+    assert_eq!(c.app_json(), json!({"app_id": "a-1", "up_commit": sent}));
 }
 
 #[test]
@@ -2992,4 +2995,107 @@ fn a_pull_by_name_records_the_apps_real_id() {
     let a: Value =
         serde_json::from_slice(&std::fs::read(to.join(".lightbulb/app.json")).unwrap()).unwrap();
     assert_eq!(a["app_id"], "a-1");
+}
+
+#[test]
+fn start_sends_who_asked_and_refuses_text_over_4000_characters() {
+    let c = Checked::new();
+    let (base, seen) = stub(200, json!({"app_id": "a-7"}), 0);
+    let (code, v) = c.app(
+        &[
+            "start",
+            "x",
+            "--name",
+            "team-lunch",
+            "--requested-by",
+            "user_1",
+        ],
+        &base,
+        true,
+    );
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(
+        body(&seen.lock().unwrap()[0]),
+        json!({"name": "team-lunch", "request": "x", "requested_by": "user_1"})
+    );
+    // 4000 characters (not bytes) is the most; one more never reaches the backend.
+    let (base, seen) = stub(200, json!({"app_id": "a-7"}), 0);
+    let most = "é".repeat(4000);
+    assert_eq!(
+        c.app(&["start", &most, "--name", "team-lunch"], &base, true)
+            .0,
+        0
+    );
+    let over = "x".repeat(4001);
+    let (code, v) = c.app(&["start", &over, "--name", "team-lunch"], &base, true);
+    assert_eq!((code, &v["code"]), (1, &json!("too_long")));
+    assert!(v["message"].as_str().unwrap().contains("4000"), "{v}");
+    assert_eq!(lines(&seen).len(), 1);
+}
+
+#[test]
+fn ask_sends_its_origin_and_message_id_and_refuses_text_over_4000_characters() {
+    let c = Checked::new();
+    let (base, seen) = stub(200, json!({"ok": true}), 0);
+    let args = [
+        "ask",
+        "a-9",
+        "hi",
+        "--room",
+        "r-1",
+        "--requested-by",
+        "user_1",
+        "--message-id",
+        "m-1",
+    ];
+    assert_eq!(c.app(&args, &base, true).0, 0);
+    assert_eq!(
+        body(&seen.lock().unwrap()[0]),
+        json!({"text": "hi", "origin": {"room_id": "r-1", "requested_by": "user_1"},
+            "client_message_id": "m-1"})
+    );
+    let over = "x".repeat(4001);
+    let (code, v) = c.app(&["ask", "a-9", &over], &base, true);
+    assert_eq!((code, &v["code"]), (1, &json!("too_long")));
+    assert_eq!(lines(&seen).len(), 1);
+}
+
+#[test]
+fn a_first_up_says_its_base_is_new() {
+    let c = Checked::new();
+    assert!(!c.dir.join(".lightbulb/app.json").exists());
+    let (base, seen) = ship_stub(waiting());
+    c.app(&["up"], &base, true);
+    assert!(source_form(&seen).contains("name=\"base_commit\"\r\n\r\nnew\r\n"));
+}
+
+#[test]
+fn pull_keeps_tracked_files_the_archive_leaves_out() {
+    let c = Checked::new();
+    let id = ["-c", "user.name=t", "-c", "user.email=t@example.com"];
+    std::fs::write(c.dir.join(".env.example"), "KEY=\n").unwrap();
+    std::fs::write(c.dir.join("old.txt"), "old").unwrap();
+    git(&c.dir, &["add", "-f", ".env.example", "old.txt"]);
+    git(&c.dir, &[&id[..], &["commit", "-qm", "example"]].concat());
+    let sent = c.head();
+    // The backend's source: no .env.example (never shipped), old.txt deleted there.
+    let tmp = tempfile::tempdir().unwrap();
+    let copy = tmp.path().join("copy");
+    git(&c.dir, &["clone", "-q", ".", copy.to_str().unwrap()]);
+    git(&copy, &["rm", "-q", ".env.example", "old.txt"]);
+    git(&copy, &[&id[..], &["commit", "-qm", "theirs"]].concat());
+    let out = tmp.path().join("src.tgz");
+    let o = out.to_str().unwrap();
+    git(&copy, &["archive", "--format=tar.gz", "-o", o, "HEAD"]);
+    std::fs::write(
+        c.dir.join(".lightbulb/app.json"),
+        json!({"app_id": "a-1", "up_commit": sent}).to_string(),
+    )
+    .unwrap();
+    let (base, _) = source_stub(std::fs::read(out).unwrap(), "c2");
+    let (code, v) = c.app(&["pull", "a-1"], &base, true);
+    assert_eq!(code, 0, "{v}");
+    assert!(c.dir.join(".env.example").is_file());
+    assert!(!c.dir.join("old.txt").exists());
+    assert_eq!(c.app_json()["base_commit"], "c2");
 }
