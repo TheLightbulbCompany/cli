@@ -232,7 +232,9 @@ pub fn expected_operands(kind: &str, body: &str, meta: &Meta) -> Value {
 /// assign to a fresh worker, else `session:<to>`), its skill fits `kind` (`assign`; `message` or
 /// `ask_session` for a message), its operands are the envelope's
 /// (`expected_operands`), and its requester is the sending computer's proof person
-/// (`sender_person`), or the sender relays a hosted chain (two hops, it is the second).
+/// (`sender_person`), or the sender relays a hosted chain (two hops, it is the second), or the
+/// sender is signed in as the requester's workspace (`sender_workspace`) and relays its hosted
+/// agent's note (two hops, the second an agent's, as phase 1 mints it).
 /// An authority id is not single-use on the network in this phase: binding it to its sender
 /// stops a third party reusing it, and the hosted door enforces single use when it mints.
 pub fn bind(
@@ -242,6 +244,7 @@ pub fn bind(
     body: &str,
     meta: &Meta,
     sender_person: Option<&str>,
+    sender_workspace: Option<&str>,
 ) -> Result<()> {
     let resource = match to.strip_suffix(":new") {
         Some(worker) if kind == "assign" => format!("worker:{worker}"),
@@ -264,7 +267,10 @@ pub fn bind(
         return Err("operands".into());
     }
     let relayed = a.chain.len() == 2 && sender_person == Some(a.chain[1].person.as_str());
-    if sender_person != Some(a.requester_person.as_str()) && !relayed {
+    let hosted = a.chain.len() == 2
+        && a.chain[1].agent.is_some()
+        && sender_workspace == Some(a.requester_org.as_str());
+    if sender_person != Some(a.requester_person.as_str()) && !relayed && !hosted {
         return Err("requester".into());
     }
     Ok(())
@@ -436,26 +442,45 @@ mod tests {
     fn bind_checks_resource_text_and_requester() {
         let a = verify(&mint(json!({})), 1_500).unwrap();
         let (to, m) = ("abc/codex:1", Meta::default());
-        assert!(bind(&a, "message", to, BODY, &m, Some("user_a")).is_ok());
+        assert!(bind(&a, "message", to, BODY, &m, Some("user_a"), None).is_ok());
         let e = |r: Result<()>| r.unwrap_err().to_string();
         assert_eq!(
-            e(bind(&a, "message", "abc/codex:2", BODY, &m, Some("user_a"))),
+            e(bind(
+                &a,
+                "message",
+                "abc/codex:2",
+                BODY,
+                &m,
+                Some("user_a"),
+                None
+            )),
             "resource"
         );
         assert_eq!(
-            e(bind(&a, "message", to, "other", &m, Some("user_a"))),
+            e(bind(&a, "message", to, "other", &m, Some("user_a"), None)),
             "operands"
         );
         assert_eq!(
-            e(bind(&a, "message", to, BODY, &m, Some("user_b"))),
+            e(bind(&a, "message", to, BODY, &m, Some("user_b"), None)),
             "requester"
         );
-        assert_eq!(e(bind(&a, "message", to, BODY, &m, None)), "requester");
+        assert_eq!(
+            e(bind(&a, "message", to, BODY, &m, None, None)),
+            "requester"
+        );
         let mut c = claims(json!({}));
         c["operation"]["skill"] = "assign".into();
         let wrong_skill = verify(&issuer::mint_typ(TYP, &c), 1_500).unwrap();
         assert_eq!(
-            e(bind(&wrong_skill, "message", to, BODY, &m, Some("user_a"))),
+            e(bind(
+                &wrong_skill,
+                "message",
+                to,
+                BODY,
+                &m,
+                Some("user_a"),
+                None
+            )),
             "skill"
         );
         // The cloud member relays a hosted agent's ask: chain of two, it is the second hop.
@@ -464,9 +489,17 @@ mod tests {
             {"agent": null, "session": null, "person": "user_cloud", "at": 1_001},
         ]);
         let relayed = verify(&mint(json!({"chain": chain})), 1_500).unwrap();
-        assert!(bind(&relayed, "message", to, BODY, &m, Some("user_cloud")).is_ok());
+        assert!(bind(&relayed, "message", to, BODY, &m, Some("user_cloud"), None).is_ok());
         assert_eq!(
-            e(bind(&relayed, "message", to, BODY, &m, Some("user_b"))),
+            e(bind(
+                &relayed,
+                "message",
+                to,
+                BODY,
+                &m,
+                Some("user_b"),
+                None
+            )),
             "requester"
         );
     }
@@ -489,7 +522,7 @@ mod tests {
             "operands": operands, "operands_hash": operands_hash(&operands)});
         let a = verify(&issuer::mint_typ(TYP, &c), 1_500).unwrap();
         let to = "abc/claude:new";
-        assert!(bind(&a, "assign", to, BODY, &meta, Some("user_a")).is_ok());
+        assert!(bind(&a, "assign", to, BODY, &meta, Some("user_a"), None).is_ok());
         let e = |r: Result<()>| r.unwrap_err().to_string();
         assert_eq!(
             e(bind(
@@ -498,7 +531,8 @@ mod tests {
                 "abc/codex:new",
                 BODY,
                 &meta,
-                Some("user_a")
+                Some("user_a"),
+                None
             )),
             "resource"
         );
@@ -507,7 +541,7 @@ mod tests {
             ..meta.clone()
         };
         assert_eq!(
-            e(bind(&a, "assign", to, BODY, &later, Some("user_a"))),
+            e(bind(&a, "assign", to, BODY, &later, Some("user_a"), None)),
             "operands"
         );
         let no_branch = Meta {
@@ -515,8 +549,73 @@ mod tests {
             ..meta
         };
         assert_eq!(
-            e(bind(&a, "assign", to, BODY, &no_branch, Some("user_a"))),
+            e(bind(
+                &a,
+                "assign",
+                to,
+                BODY,
+                &no_branch,
+                Some("user_a"),
+                None
+            )),
             "operands"
         );
+    }
+
+    /// A hosted note for `org_1` as phase 1 mints it: the requester's hop, then the hosted
+    /// agent's (`chain[1].agent` set), its `over` merged on top.
+    fn hosted_note(over: Value) -> Authority {
+        let chain = json!([
+            {"agent": null, "session": null, "person": "user_a", "at": 1_000},
+            {"agent": "agent_9", "session": "run_1", "person": "user_a", "at": 1_001},
+        ]);
+        let mut c = json!({"chain": chain});
+        for (k, v) in over.as_object().unwrap() {
+            c[k] = v.clone();
+        }
+        verify(&mint(c), 1_500).unwrap()
+    }
+
+    fn bound(a: &Authority, workspace: &str) -> std::result::Result<(), String> {
+        let m = Meta::default();
+        bind(a, "message", "abc/codex:1", BODY, &m, None, Some(workspace))
+            .map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn workspace_sender_binds_its_own_workspaces_hosted_note() {
+        assert_eq!(bound(&hosted_note(json!({})), "org_1"), Ok(()));
+    }
+
+    #[test]
+    fn workspace_sender_cannot_bind_another_workspaces_note() {
+        assert_eq!(
+            bound(&hosted_note(json!({})), "org_2"),
+            Err("requester".into())
+        );
+    }
+
+    #[test]
+    fn workspace_sender_cannot_bind_a_one_hop_note() {
+        // `claims`' own chain: the requester's hop alone, an agent on it.
+        let a = verify(&mint(json!({})), 1_500).unwrap();
+        assert_eq!(bound(&a, "org_1"), Err("requester".into()));
+        let three = json!([
+            {"agent": null, "session": null, "person": "user_a", "at": 1_000},
+            {"agent": "agent_9", "session": "run_1", "person": "user_a", "at": 1_001},
+            {"agent": "agent_8", "session": "run_2", "person": "user_a", "at": 1_002},
+        ]);
+        let a = hosted_note(json!({"chain": three}));
+        assert_eq!(bound(&a, "org_1"), Err("requester".into()));
+    }
+
+    #[test]
+    fn workspace_sender_cannot_bind_a_note_without_an_agent_hop() {
+        let chain = json!([
+            {"agent": "agent_1", "session": null, "person": "user_a", "at": 1_000},
+            {"agent": null, "session": "run_1", "person": "user_a", "at": 1_001},
+        ]);
+        let a = hosted_note(json!({"chain": chain}));
+        assert_eq!(bound(&a, "org_1"), Err("requester".into()));
     }
 }

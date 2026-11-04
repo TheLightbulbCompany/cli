@@ -1,15 +1,16 @@
 //! Workspace proofs: an embedded instance shows its own sign-in in its `hello`.
 
 use lightbulb::identity::Identity;
-use lightbulb::net::frames::Frame;
+use lightbulb::net::frames::{envelope_sig, Frame};
 use lightbulb::proof;
 use lightbulb::roster::{self, Entry, Kind};
 use lightbulb::store::Store;
-use serde_json::json;
+use lightbulb::workers;
+use serde_json::{json, Value};
 
 mod common;
 
-use common::{issuer, now_s};
+use common::{endpoint, issuer, now_s, seed_team, session, ulid, until, Env, Peer};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_instance_presents_its_login_json_in_its_hello() {
@@ -46,4 +47,129 @@ async fn an_instance_presents_its_login_json_in_its_hello() {
     let p = proof::verify(&shown.expect("a proof"), &key, now_s()).unwrap();
     assert_eq!(p.sub, "org_1");
     i.shutdown().await;
+}
+
+/// A signed envelope of `kind` (an assign with terms) from `from` to `to`, carrying A2A Message `a2a` when given.
+fn envelope(
+    who: &Identity,
+    kind: &str,
+    from: &str,
+    to: &str,
+    a2a: Option<Value>,
+) -> (String, Value) {
+    let id = ulid();
+    let f = Frame::Envelope {
+        id: id.clone(),
+        request_id: format!("r-{id}"),
+        kind: kind.into(),
+        from: from.into(),
+        to: to.into(),
+        reply_to: None,
+        thread: None,
+        hops: 0,
+        body: "hi".into(),
+        files: vec![],
+        sent_at: 0,
+        meta: Default::default(),
+        a2a,
+        sig: None,
+    };
+    let mut v = serde_json::to_value(&f).unwrap();
+    if kind == "assign" {
+        v["meta"] = json!({"done_when": "done", "deadline_at": now_s() + 600});
+    }
+    v["sig"] = envelope_sig(who, &v).into();
+    (id, v)
+}
+
+async fn ack(p: &mut Peer, id: &str) -> (String, Option<String>) {
+    match p
+        .recv_where(|f| matches!(f, Frame::Ack { id: i, .. } if i == id))
+        .await
+    {
+        Frame::Ack { state, reason, .. } => (state, reason),
+        _ => unreachable!(),
+    }
+}
+
+/// A running (signed in as `user_a`, `config`), B played by the test, its `hello` showing a
+/// workspace proof for `org_1`: what A sees of B's runtime signed in as its workspace.
+async fn a_and_workspace_b(
+    config: &str,
+    env: &[(&str, String)],
+) -> (Env, Env, iroh::Endpoint, Peer) {
+    let (a, b) = (Env::new(), Env::new());
+    seed_team(&a, &b);
+    a.sign_in("user_a", None);
+    a.daemon(false, config, env);
+    let ep = endpoint(&b.identity()).await;
+    let mut p = Peer::dial(&ep, &a).await;
+    let proof = issuer::workspace_proof(&b.identity().key, "org_1", now_s());
+    p.hello_with(vec![], Some(proof)).await;
+    until(5, "B online", || a.status()["peers"]["online"] == 1);
+    (a, b, ep, p)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_workspace_sender_without_a_note_is_judged_as_its_member() {
+    let (a, b, _ep, mut p) = a_and_workspace_b("", &[]).await;
+    let (sa, sb) = (session(&a, "a1"), session(&b, "b1"));
+    // A plain message: `members-message` allows it.
+    let (id, v) = envelope(&b.identity(), "message", &sb, &sa, None);
+    p.send_raw(&v).await;
+    assert_eq!(ack(&mut p, &id).await.0, "stored");
+    // An A2A ask without a note: held, judged as B's member, never as person `org_1`.
+    let ask = json!({"role": "ROLE_USER", "parts": [{"text": "hi"}]});
+    let (id, v) = envelope(&b.identity(), "message", &sb, &sa, Some(ask));
+    p.send_raw(&v).await;
+    assert_eq!(ack(&mut p, &id).await.0, "held");
+    let h = lightbulb::holds::get(&a.store(), 1)
+        .unwrap()
+        .expect("a hold");
+    assert_eq!(h.requester, Some(format!("member:{}", b.short())));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_workspace_senders_assign_to_new_still_matches_its_member_row() {
+    let work = tempfile::tempdir().unwrap();
+    let config = format!(
+        "network_workers = true\nworkers_offer = \"claude\"\nworkers_folder = \"{}\"\n",
+        work.path().display()
+    );
+    let env = [(
+        "LIGHTBULB_CONNECT_DEBUG_CLAUDE",
+        "/usr/bin/false".to_string(),
+    )];
+    for (scope, want) in [
+        ("always", ("stored", None)),
+        ("refused", ("refused", Some("declined"))),
+    ] {
+        let (a, b) = (Env::new(), Env::new());
+        seed_team(&a, &b);
+        a.sign_in("user_a", None);
+        workers::set_policy(
+            &a.store(),
+            &a.identity(),
+            &b.short(),
+            scope,
+            "local",
+            now_s(),
+        )
+        .unwrap();
+        a.daemon(false, &config, &env);
+        let ep = endpoint(&b.identity()).await;
+        let mut p = Peer::dial(&ep, &a).await;
+        let proof = issuer::workspace_proof(&b.identity().key, "org_1", now_s());
+        p.hello_with(vec![], Some(proof)).await;
+        until(5, "B online", || a.status()["peers"]["online"] == 1);
+        let to = format!("{}/claude:new", a.short());
+        let (id, v) = envelope(&b.identity(), "assign", &session(&b, "b1"), &to, None);
+        p.send_raw(&v).await;
+        let got = ack(&mut p, &id).await;
+        assert_eq!((got.0.as_str(), got.1.as_deref()), want, "{scope}");
+        assert!(
+            lightbulb::holds::open(&a.store()).unwrap().is_empty(),
+            "{scope}"
+        );
+    }
 }

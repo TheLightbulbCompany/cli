@@ -254,27 +254,35 @@ fn object_jws(m: &Message) -> Option<&str> {
     m.a2a.as_ref()?["metadata"][crate::authority::URI].as_str()
 }
 
-/// The person this computer is signed in as (its own proof's `sub`): `@session-person`.
-fn my_person() -> Option<String> {
-    let t = crate::login::stored_proof(&crate::paths::state_dir())?;
-    crate::proof::peek(&t).map(|p| p.sub)
+/// The person the computer whose state is `dir` is signed in as (its own proof's `sub`):
+/// `@session-person`. One signed in as a workspace (`org_`) is no person.
+pub(crate) fn my_person(dir: &Path) -> Option<String> {
+    let t = crate::login::stored_proof(dir)?;
+    crate::proof::peek(&t)
+        .filter(|p| !crate::proof::is_workspace(p))
+        .map(|p| p.sub)
 }
 
 /// Whether `person` holds Authority hold `h`'s resource (`session:<to>`) under the stored
 /// rules: only then may they answer it Always allow.
-fn holds_resource(store: &Store, h: &Hold, person: Option<&str>) -> bool {
+fn holds_resource(store: &Store, dir: &Path, h: &Hold, person: Option<&str>) -> bool {
     let Some(person) = person else { return false };
     let Ok((_, rules)) = crate::rules::load(store) else {
         return false;
     };
     let resource = format!("session:{}", h.target_session);
-    crate::rules::holders(&rules, &resource, my_person().as_deref()).contains(&person.into())
+    crate::rules::holders(&rules, &resource, my_person(dir).as_deref()).contains(&person.into())
 }
 
 /// Authority hold `h`'s dialog (`dialog`): the requester chain, the session, for whom, the
 /// intent and the text, from its object re-verified now. An object that no longer verifies
 /// (expired) is shown so, with only Decline.
-fn authority_dialog(store: &Store, h: &Hold, who: String) -> (String, Vec<&'static str>, String) {
+fn authority_dialog(
+    store: &Store,
+    dir: &Path,
+    h: &Hold,
+    who: String,
+) -> (String, Vec<&'static str>, String) {
     let session = agent(&h.target_session);
     let body = preview_long(&h.message.body);
     let verified = object_jws(&h.message).map(|j| crate::authority::verify(j, ipc::now() as i64));
@@ -303,24 +311,25 @@ fn authority_dialog(store: &Store, h: &Hold, who: String) -> (String, Vec<&'stat
         None => format!("{who} asks {session}\n\n{body}"),
     };
     let mut buttons = vec!["Decline", "Allow"];
-    if holds_resource(store, h, my_person().as_deref()) {
+    if holds_resource(store, dir, h, my_person(dir).as_deref()) {
         buttons.push("Always allow");
     }
     (text, buttons, who)
 }
 
 /// `h`'s dialog: its text, its buttons and the asking session's label in it. `folder` is
-/// where workers run (`workers::folder`).
+/// where workers run (`workers::folder`); `dir` this computer's state (its sign-in).
 pub fn dialog(
     store: &Store,
     roster: &Roster,
     me: &str,
     h: &Hold,
     folder: &Path,
+    dir: &Path,
 ) -> (String, Vec<&'static str>, String) {
     let who = label::render(roster, me, &h.from_session);
     if h.kind() == Kind::Authority {
-        return authority_dialog(store, h, who);
+        return authority_dialog(store, dir, h, who);
     }
     let worker = (h.kind() == Kind::Permission)
         .then(|| store.worker_by_session(&h.target_session).ok().flatten())
@@ -408,6 +417,7 @@ pub fn answer(
     roster: &Roster,
     me: &Identity,
     folder: &Path,
+    dir: &Path,
     id: i64,
     allow: bool,
     scope: &str,
@@ -440,12 +450,12 @@ pub fn answer(
     }
     // The answering person: this computer's, or the bridge's.
     let answerer = match by {
-        "local" => my_person(),
+        "local" => my_person(dir),
         p => Some(p.to_string()),
     };
     let always_ok = match kind {
         Kind::Worker => true,
-        Kind::Authority => holds_resource(store, &h, answerer.as_deref()),
+        Kind::Authority => holds_resource(store, dir, &h, answerer.as_deref()),
         _ => false,
     };
     if scope == "always" && !(allow && always_ok) {
@@ -454,7 +464,7 @@ pub fn answer(
     // The text the person saw; one never shown (no dialog yet) is what it would show now.
     let shown = match &h.shown {
         Some(t) => t.clone(),
-        None => dialog(store, roster, &me.key, &h, folder).0,
+        None => dialog(store, roster, &me.key, &h, folder, dir).0,
     };
     let c = Closed { hold: h, allow };
     let verdict = c.verdict();
@@ -632,7 +642,14 @@ pub fn shown(d: &Daemon, team: &TeamState, store: &Store, h: &Hold) {
 /// text could not be kept (nothing is shown).
 fn raise(d: &Daemon, team: &TeamState, store: &Store, h: &Hold) -> Option<String> {
     let me = &d.identity.key;
-    let (text, buttons, who) = dialog(store, &team.roster, me, h, &workers::folder(&team.config));
+    let (text, buttons, who) = dialog(
+        store,
+        &team.roster,
+        me,
+        h,
+        &workers::folder(&team.config),
+        &d.dir,
+    );
     let sql = "UPDATE holds SET shown = ?2 WHERE id = ?1";
     if let Err(e) = store.conn().execute(sql, params![h.id, text]) {
         eprintln!("hold {}: {e}", h.name());
@@ -718,6 +735,7 @@ fn answer_here(
             &team.roster,
             &d.identity,
             &folder,
+            &d.dir,
             id,
             allow,
             scope,
@@ -932,4 +950,21 @@ fn run(
         }
         _ => Response::err(id, ipc::UNKNOWN_OP),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::proof::test_issuer as issuer;
+
+    #[test]
+    fn a_computer_signed_in_as_a_workspace_has_no_session_person() {
+        let dir = tempfile::tempdir().unwrap();
+        let save = |proof: String| {
+            crate::login::save(dir.path(), &serde_json::json!({"proof": proof})).unwrap()
+        };
+        save(issuer::workspace_proof("k", "org_1", 1_000));
+        assert_eq!(super::my_person(dir.path()), None);
+        save(issuer::proof("k", "user_a", 1_000));
+        assert_eq!(super::my_person(dir.path()).as_deref(), Some("user_a"));
+    }
 }

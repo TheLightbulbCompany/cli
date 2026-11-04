@@ -449,6 +449,7 @@ async fn an_agent_session_cannot_answer_an_authority_hold() {
             &roster,
             &a.identity(),
             std::path::Path::new("/tmp"),
+            a.state.path(),
             1,
             allow,
             "once",
@@ -568,8 +569,14 @@ async fn a_hold_whose_object_expired_offers_only_decline() {
     let roster = lightbulb::roster::replay(&lightbulb::roster::entries(&store).unwrap());
     let h = lightbulb::holds::get(&store, 1).unwrap().unwrap();
     let key = a.identity().key;
-    let (text, buttons, _) =
-        lightbulb::holds::dialog(&store, &roster, &key, &h, std::path::Path::new("/tmp"));
+    let (text, buttons, _) = lightbulb::holds::dialog(
+        &store,
+        &roster,
+        &key,
+        &h,
+        std::path::Path::new("/tmp"),
+        a.state.path(),
+    );
     assert!(text.contains("(authority expired)"), "{text}");
     assert_eq!(buttons, ["Decline"]);
     let r = answer(&a, "H1", "allow", "once");

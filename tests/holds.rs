@@ -434,7 +434,7 @@ fn running_worker(s: &Store, session: &str, hold: &holds::Hold) {
 const FOLDER: &str = "/w";
 
 fn dlg(s: &Store, r: &Roster, me: &Identity, h: &holds::Hold) -> (String, Vec<&'static str>) {
-    let (t, b, _) = holds::dialog(s, r, &me.key, h, Path::new(FOLDER));
+    let (t, b, _) = holds::dialog(s, r, &me.key, h, Path::new(FOLDER), Path::new(FOLDER));
     (t, b)
 }
 
@@ -453,6 +453,7 @@ fn ans(
         s,
         r,
         me,
+        Path::new(FOLDER),
         Path::new(FOLDER),
         h.id,
         true,

@@ -524,8 +524,12 @@ pub struct Prepared {
 
 /// What `receive` knows of the sender beyond the envelope, and the rules it is judged by.
 pub struct Judge<'a> {
-    /// The person the sending computer's `hello` proof names (`Proof::sub`), when it verified.
+    /// The person the sending computer's `hello` proof names (`Proof::sub`), when it verified
+    /// and names a person.
     pub sender_person: Option<&'a str>,
+    /// The workspace the sending computer's verified proof names instead (`org_<id>`): its
+    /// runtime, never a person.
+    pub sender_workspace: Option<&'a str>,
     /// The person this computer is signed in as (its own proof's `sub`): `@session-person`.
     pub my_person: Option<&'a str>,
     pub rules: &'a crate::rules::Rules,
@@ -541,6 +545,7 @@ impl Default for Judge<'static> {
             std::sync::LazyLock::new(crate::rules::default_rules);
         Judge {
             sender_person: None,
+            sender_workspace: None,
             my_person: None,
             rules: &RULES,
             exceptions: &[],
@@ -1158,8 +1163,16 @@ pub fn receive(
                 .ok_or_else(|| "jws".into())
                 .and_then(|jws| crate::authority::verify(jws, now as i64))
                 .and_then(|a| {
-                    crate::authority::bind(&a, kind, to, body, meta, judge.sender_person)
-                        .map(|()| a)
+                    crate::authority::bind(
+                        &a,
+                        kind,
+                        to,
+                        body,
+                        meta,
+                        judge.sender_person,
+                        judge.sender_workspace,
+                    )
+                    .map(|()| a)
                 });
             match bound {
                 Ok(a) => Some(a),
@@ -1328,7 +1341,7 @@ pub fn receive(
 }
 
 /// Who `peer`'s mail is judged as: `person:<sub>` (the bound object's requester, else the
-/// sender's proof person) or `member:<short>`, and whether a person originated it (the
+/// sender's proof person) or `member:<short>` (a sender signed in as a workspace too), and whether a person originated it (the
 /// object's `verified_by` is not `agent-runtime`; without one, the proof verified).
 fn requester_of(
     judge: &Judge,
