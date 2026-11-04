@@ -2591,7 +2591,7 @@ pub fn doctor() -> Result<i32> {
 }
 
 /// The words `setup` opens with for a person at a terminal who is not signed in.
-const SIGN_IN_OFFER: &str = "Sign in (free): your memory and sessions follow you across computers; the Claude app reaches your agents; the evaluator can read sessions you upload. Or stay local.\n  [Enter] Sign in    [l] Stay local";
+const SIGN_IN_OFFER: &str = "Sign in (free): your memory and sessions follow you across computers; the Claude app reaches your agents. Or stay local.\n  [Enter] Sign in    [l] Stay local";
 
 /// `setup`'s first screen: the free sign-in, with staying local one key away. Staying local
 /// records that uploads are off. Skipped with nobody at a terminal (an update, the daemon's
@@ -2628,7 +2628,7 @@ pub fn ask_upload_mode() -> Result<()> {
         return Ok(());
     }
     println!(
-        "Send your coding sessions to Lightbulb? The evaluator reads only what you send, and suggests lessons for you to approve.\n  off       Nothing leaves this computer. [default]\n  metadata  The agent, repository, times, token counts and tool names, signed as you; never what the tools did.\n  full      Also a short summary of each tool call (never file contents, diffs, command output or prompts).\nChange it any time: lightbulb sessions upload off|metadata|full\nUpload [off/metadata/full]:"
+        "Send your coding sessions to Lightbulb? In a workspace, the evaluator reads only what you send in full and suggests lessons for you to approve.\n  off       Nothing leaves this computer. [default]\n  metadata  The agent, repository, times, token counts and tool names, signed as you; never what the tools did.\n  full      Also a short summary of each tool call (never file contents, diffs, command output or prompts).\nChange it any time: lightbulb sessions upload off|metadata|full\nUpload [off/metadata/full]:"
     );
     let mut answer = String::new();
     std::io::stdin().read_line(&mut answer)?;

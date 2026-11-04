@@ -86,7 +86,7 @@ enum MemoryCommand {
     },
     /// Print the memory block your last session was handed at its start.
     Last,
-    /// Lessons Lightbulb's evaluator suggests from sessions you uploaded, waiting for you.
+    /// Lessons Lightbulb's evaluator suggests from sessions you uploaded in a workspace.
     Drafts,
     /// Keep a suggested lesson (`--team`: for the whole workspace).
     Approve {

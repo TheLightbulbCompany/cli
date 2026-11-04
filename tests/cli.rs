@@ -1827,7 +1827,7 @@ fn setup_answering(e: &Env, answer: &str) -> Output {
     child.wait_with_output().unwrap()
 }
 
-const SIGN_IN: &str = "Sign in (free): your memory and sessions follow you across computers; the Claude app reaches your agents; the evaluator can read sessions you upload. Or stay local.";
+const SIGN_IN: &str = "Sign in (free): your memory and sessions follow you across computers; the Claude app reaches your agents. Or stay local.";
 
 /// The first screen offers the free sign-in before anything is wired, and staying local is one
 /// key (`l`) away.
