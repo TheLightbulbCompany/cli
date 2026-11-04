@@ -282,7 +282,7 @@ pub(crate) fn run(root: &Path, auth: &Auth, json: bool) -> Result<i32> {
         ),
         None => problems.push(json!({"page": "the door", "problem": "did not answer"})),
     }
-    let mut submitted = 0;
+    let (mut submitted, mut tried) = (0, 0);
     if problems.iter().all(|p| p["page"] != "the door") {
         for page in &fixed {
             match curl(&jar.0, &format!("{origin}{page}"), None) {
@@ -292,6 +292,7 @@ pub(crate) fn run(root: &Path, auth: &Auth, json: bool) -> Result<i32> {
                         continue;
                     }
                     for (n, fields) in forms(&b).iter().enumerate() {
+                        tried += 1;
                         let answer = submit(&jar.0, &format!("{origin}{page}"), fields);
                         let problem = match answer {
                             Some((s, b)) => page_problem(s, &b),
@@ -308,6 +309,25 @@ pub(crate) fn run(root: &Path, auth: &Auth, json: bool) -> Result<i32> {
             }
         }
     }
+    // The forms wrote test rows into the preview's database, where the person would see them. Put
+    // it back to its schema and sample data; `false` means another read is busy and the next does it.
+    let preview_data = if tried == 0 {
+        "untouched"
+    } else {
+        match api::call(
+            auth,
+            "POST",
+            &format!("/{id}/reset-preview-data"),
+            Some(&json!({})),
+        ) {
+            Ok(r) if r["reset"] == true => "reset",
+            Ok(_) => "resets on the next status read",
+            Err(e) => {
+                problems.push(json!({"page": "the preview data", "problem": format!("test entries were not taken back out: {}", e.message)}));
+                "kept"
+            }
+        }
+    };
     let pass = problems.is_empty() && !fixed.is_empty();
     if pass {
         let saved = evidence::record_verify(root, &head, &fixed);
@@ -316,16 +336,16 @@ pub(crate) fn run(root: &Path, auth: &Auth, json: bool) -> Result<i32> {
         }
     }
     let next = if pass {
-        "run lightbulb app status; this sent each form once with test values but does not press other buttons, so try the main flow too"
+        "run lightbulb app status; this sent each form once with test values, then put the preview back to its sample data, but does not press other buttons, so try the main flow too"
     } else {
         "fix what is listed, run lightbulb app up, then verify again"
     };
-    let out = json!({"pass": pass, "opened": fixed, "forms_sent": submitted, "not_opened": dynamic, "problems": problems, "next": next});
+    let out = json!({"pass": pass, "opened": fixed, "forms_sent": submitted, "not_opened": dynamic, "preview_data": preview_data, "problems": problems, "next": next});
     if json {
         println!("{out}");
     } else {
         println!(
-            "{}: opened {} page(s), sent {submitted} form(s)",
+            "{}: opened {} page(s), sent {submitted} form(s); preview data {preview_data}",
             if pass { "Pass" } else { "Fail" },
             fixed.len()
         );

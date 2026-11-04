@@ -69,7 +69,11 @@ fn stub_with(
             std::thread::sleep(std::time::Duration::from_millis(delay_ms));
             let line = log.lock().unwrap().last().unwrap().line.clone();
             let (status, answer) = answer(&line);
-            let text = answer.to_string();
+            // A string answer is a page (HTML), sent as is.
+            let text = match answer {
+                Value::String(page) => page,
+                v => v.to_string(),
+            };
             let _ = write!(
                 s,
                 "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
@@ -1522,6 +1526,49 @@ fn test_link_prints_the_url_and_keeps_it_out_of_every_file() {
             }
         }
     }
+}
+
+#[test]
+fn verify_puts_the_preview_data_back_after_sending_forms() {
+    let c = Checked::new();
+    std::fs::write(c.dir.join(".lightbulb/app.json"), r#"{"app_id":"a-1"}"#).unwrap();
+    // One stub is both the backend and the app's preview; the link points back at it.
+    let origin: Arc<Mutex<String>> = Arc::default();
+    let o = origin.clone();
+    let (base, seen) = stub_with(
+        move |line| match line.trim_end_matches(" HTTP/1.1") {
+            l if l.ends_with("/a-1/test-link") => (
+                200,
+                json!({"url": format!("{}/_lightbulb/session#token=T", o.lock().unwrap())}),
+            ),
+            l if l.ends_with("/a-1/status") => (200, json!({"open_to": "public"})),
+            l if l.ends_with("/a-1/reset-preview-data") => (200, json!({"reset": true})),
+            "POST /api/_lightbulb/session" => (200, json!({})),
+            "GET /" | "POST /" => (
+                200,
+                json!(
+                    r#"<form method="POST"><input type="hidden" name="$ACTION_ID_a" value=""><input name="reason"></form>"#
+                ),
+            ),
+            l => (404, json!({"code": "no_route", "message": l, "next": ""})),
+        },
+        0,
+    );
+    *origin.lock().unwrap() = base.clone();
+    let (code, v) = c.app(&["verify"], &base, true);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(
+        (&v["forms_sent"], &v["preview_data"]),
+        (&json!(1), &json!("reset")),
+        "{v}"
+    );
+    let sent = lines(&seen);
+    let form = sent.iter().position(|l| l == "POST /").unwrap();
+    let reset = sent
+        .iter()
+        .position(|l| l.ends_with("/a-1/reset-preview-data"))
+        .unwrap();
+    assert!(form < reset, "{sent:?}");
 }
 
 #[test]
