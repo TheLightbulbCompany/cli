@@ -35,6 +35,29 @@ fn stub_with(
     answer: impl Fn(&str) -> (u16, Value) + Send + 'static,
     delay_ms: u64,
 ) -> (String, Arc<Mutex<Vec<Req>>>) {
+    stub_raw(
+        move |line| {
+            let (status, answer) = answer(line);
+            // A string answer is a page (HTML), sent as is.
+            let text = match answer {
+                Value::String(page) => page,
+                v => v.to_string(),
+            };
+            (
+                status,
+                "Content-Type: application/json\r\n".into(),
+                text.into_bytes(),
+            )
+        },
+        delay_ms,
+    )
+}
+
+/// A stub backend answering `(status, extra header lines, body bytes)` by request line.
+fn stub_raw(
+    answer: impl Fn(&str) -> (u16, String, Vec<u8>) + Send + 'static,
+    delay_ms: u64,
+) -> (String, Arc<Mutex<Vec<Req>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let seen: Arc<Mutex<Vec<Req>>> = Arc::default();
@@ -68,17 +91,13 @@ fn stub_with(
             });
             std::thread::sleep(std::time::Duration::from_millis(delay_ms));
             let line = log.lock().unwrap().last().unwrap().line.clone();
-            let (status, answer) = answer(&line);
-            // A string answer is a page (HTML), sent as is.
-            let text = match answer {
-                Value::String(page) => page,
-                v => v.to_string(),
-            };
+            let (status, extra, body) = answer(&line);
             let _ = write!(
                 s,
-                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
-                text.len()
+                "HTTP/1.1 {status} X\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
             );
+            let _ = s.write_all(&body);
         }
     });
     (base, seen)
@@ -101,7 +120,7 @@ fn help_lists_app_under_apps_you_build() {
         .unwrap();
     let help = String::from_utf8_lossy(&o.stdout);
     assert!(
-        help.contains("Apps you build:\n  app       Build, check, preview, publish and undo apps: app new|up|publish|rollback|status|destroy|check|test-link|evidence|report-broken-tool\n"),
+        help.contains("Apps you build:\n  app       Build, check, preview, publish and undo apps: app new|start|ask|pull|up|publish|rollback|status|destroy|check|test-link|evidence|report-broken-tool\n"),
         "{help}"
     );
 }
@@ -1312,7 +1331,7 @@ fn up_prints_cards_and_exits_zero_when_waiting() {
     assert!(v["next"].as_str().unwrap().contains("Inbox"), "{v}");
     assert_eq!(
         c.app_json(),
-        json!({"app_id": "a-1", "room_id": "r-9", "up_commit": c.head()})
+        json!({"app_id": "a-1", "room_id": "r-9", "up_commit": c.head(), "base_commit": c.head()})
     );
     assert_eq!(
         lines(&seen),
@@ -2658,4 +2677,425 @@ fn changed_door_files_fail_the_check_unless_no_hash_was_recorded() {
     // Restored, with the hash back: passes.
     std::fs::write(&proxy, original).unwrap();
     assert_eq!(c.check("design.txt", 0, &[]).0, 0);
+}
+
+// ---- start, ask, pull, base_commit ----
+
+#[test]
+fn start_sends_the_request_and_prints_where_it_is_built() {
+    let c = Checked::new();
+    let answer = json!({"app_id": "a-7", "conversation_id": "c-7",
+        "canvas_url": "https://x/chat?panel=canvas&app=a-7", "next": "watch it in Canvas",
+        "token": "SECRET"});
+    let (base, seen) = stub(200, answer, 0);
+    let (code, v) = c.app(
+        &["start", "a lunch sign-up", "--name", "team-lunch"],
+        &base,
+        true,
+    );
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(
+        v,
+        json!({"app_id": "a-7", "conversation_id": "c-7",
+            "canvas_url": "https://x/chat?panel=canvas&app=a-7", "next": "watch it in Canvas"})
+    );
+    assert_eq!(lines(&seen), [format!("POST {BUILD}/start")]);
+    // No room: none is sent.
+    assert_eq!(
+        body(&seen.lock().unwrap()[0]),
+        json!({"name": "team-lunch", "request": "a lunch sign-up"})
+    );
+    let (base, seen) = stub(200, json!({"app_id": "a-7"}), 0);
+    c.app(
+        &["start", "x", "--name", "team-lunch", "--room", "r-1"],
+        &base,
+        true,
+    );
+    assert_eq!(body(&seen.lock().unwrap()[0])["room_id"], "r-1");
+    // A bad name never reaches the backend.
+    let (base, seen) = stub(200, json!({}), 0);
+    let (code, v) = c.app(&["start", "x", "--name", "Bad Name"], &base, true);
+    assert_eq!((code, &v["code"]), (1, &json!("bad_name")));
+    assert!(lines(&seen).is_empty());
+}
+
+#[test]
+fn ask_resolves_the_name_here_and_sends_the_text() {
+    let c = Checked::new();
+    std::fs::write(c.dir.join(".lightbulb/app.json"), r#"{"app_id":"a-9"}"#).unwrap();
+    let (base, seen) = stub(200, json!({"ok": true}), 0);
+    for app in ["team-lunch", "a-9", "a-other"] {
+        let (code, v) = c.app(&["ask", app, "make the button blue"], &base, true);
+        assert_eq!((code, &v), (0, &json!({"ok": true})));
+    }
+    assert_eq!(
+        lines(&seen),
+        [
+            format!("POST {BUILD}/a-9/ask"),
+            format!("POST {BUILD}/a-9/ask"),
+            format!("POST {BUILD}/a-other/ask")
+        ]
+    );
+    assert_eq!(
+        body(&seen.lock().unwrap()[0]),
+        json!({"text": "make the button blue"})
+    );
+    let (code, v) = c.app(&["ask", "../x", "hi"], &base, true);
+    assert_eq!((code, &v["code"]), (1, &json!("bad_app")));
+}
+
+/// A stub serving `tgz` as the source of app a-1 at commit `commit`.
+fn source_stub(tgz: Vec<u8>, commit: &'static str) -> (String, Arc<Mutex<Vec<Req>>>) {
+    stub_raw(
+        move |line| {
+            if line.starts_with(&format!("GET {BUILD}/a-1/status "))
+                || line.starts_with(&format!("GET {BUILD}/booking/status "))
+            {
+                // A name resolves to the real id before a fresh pull.
+                (
+                    200,
+                    String::new(),
+                    json!({"app_id": "a-1"}).to_string().into_bytes(),
+                )
+            } else if line.starts_with(&format!("GET {BUILD}/a-1/source ")) {
+                (
+                    200,
+                    format!("X-Lightbulb-Commit: {commit}\r\n"),
+                    tgz.clone(),
+                )
+            } else {
+                let e =
+                    json!({"code": "no_app", "message": "No such app.", "next": "check the id"});
+                (404, String::new(), e.to_string().into_bytes())
+            }
+        },
+        0,
+    )
+}
+
+/// The app at `dir`'s HEAD, with `change` committed in a clone, as the backend's tar.gz.
+fn changed_source(dir: &std::path::Path, change: (&str, &str)) -> Vec<u8> {
+    let tmp = tempfile::tempdir().unwrap();
+    let copy = tmp.path().join("copy");
+    git(dir, &["clone", "-q", ".", copy.to_str().unwrap()]);
+    std::fs::write(copy.join(change.0), change.1).unwrap();
+    let id = ["-c", "user.name=t", "-c", "user.email=t@example.com"];
+    git(&copy, &["add", "-A"]);
+    git(&copy, &[&id[..], &["commit", "-qm", "theirs"]].concat());
+    let out = tmp.path().join("src.tgz");
+    git(
+        &copy,
+        &[
+            "archive",
+            "--format=tar.gz",
+            "-o",
+            out.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    std::fs::read(out).unwrap()
+}
+
+#[test]
+fn pull_into_a_new_folder_is_a_repo_with_the_base_recorded() {
+    let c = Checked::new();
+    let tgz = changed_source(&c.dir, ("theirs.txt", "from canvas"));
+    let (base, seen) = source_stub(tgz, "c2");
+    let to = c._tmp.path().join("pulled");
+    let (code, v) = c.app(&["pull", "a-1", to.to_str().unwrap()], &base, true);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["commit"], "c2");
+    assert_eq!(v["changed"], true);
+    assert_eq!(
+        lines(&seen),
+        [
+            format!("GET {BUILD}/a-1/status"),
+            format!("GET {BUILD}/a-1/source")
+        ]
+    );
+    assert_eq!(
+        std::fs::read_to_string(to.join("theirs.txt")).unwrap(),
+        "from canvas"
+    );
+    assert!(to.join("app.yaml").is_file());
+    assert_eq!(git(&to, &["status", "--porcelain"]), "");
+    let head = git(&to, &["rev-parse", "HEAD"]).trim().to_string();
+    let a: Value =
+        serde_json::from_slice(&std::fs::read(to.join(".lightbulb/app.json")).unwrap()).unwrap();
+    assert_eq!(
+        a,
+        json!({"app_id": "a-1", "base_commit": "c2", "up_commit": head})
+    );
+    // A folder that is neither empty nor an app is refused; an unknown app is the backend's error.
+    let (code, v) = c.app(
+        &["pull", "a-1", c.bin.path().to_str().unwrap()],
+        &base,
+        true,
+    );
+    assert_eq!((code, &v["code"]), (1, &json!("dir_not_empty")));
+    let gone = c._tmp.path().join("gone");
+    let (code, v) = c.app(&["pull", "a-2", gone.to_str().unwrap()], &base, true);
+    assert_eq!(
+        (code, v),
+        (
+            1,
+            json!({"code": "no_app", "message": "No such app.", "next": "check the id"})
+        )
+    );
+}
+
+#[test]
+fn pull_merges_into_the_apps_own_folder() {
+    let c = Checked::new();
+    let sent = c.head();
+    let tgz = changed_source(&c.dir, ("theirs.txt", "from canvas"));
+    std::fs::write(
+        c.dir.join(".lightbulb/app.json"),
+        json!({"app_id": "a-1", "up_commit": sent}).to_string(),
+    )
+    .unwrap();
+    // A change here not yet sent.
+    std::fs::write(c.dir.join("mine.txt"), "mine").unwrap();
+    let (base, _) = source_stub(tgz.clone(), "c2");
+    let (code, v) = c.app(&["pull", "team-lunch"], &base, true);
+    assert_eq!((code, &v["code"]), (1, &json!("dirty_tree")));
+    git(&c.dir, &["add", "-A"]);
+    git(
+        &c.dir,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.com",
+            "commit",
+            "-qm",
+            "mine",
+        ],
+    );
+    let (code, v) = c.app(&["pull", "team-lunch"], &base, true);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["changed"], true);
+    // Both changes, in a merge whose base is the commit last sent.
+    assert!(c.dir.join("mine.txt").is_file() && c.dir.join("theirs.txt").is_file());
+    assert_eq!(
+        git(&c.dir, &["rev-list", "--count", "--merges", "HEAD"]).trim(),
+        "1"
+    );
+    let a = c.app_json();
+    assert_eq!(a["base_commit"], "c2");
+    let theirs = a["up_commit"].as_str().unwrap().to_string();
+    assert_eq!(
+        git(&c.dir, &["rev-parse", &format!("{theirs}^")]).trim(),
+        sent
+    );
+    // Already at c2: nothing changes.
+    let before = c.head();
+    let (code, v) = c.app(&["pull", "team-lunch"], &base, true);
+    assert_eq!((code, &v["changed"]), (0, &json!(false)));
+    assert_eq!(c.head(), before);
+    // The next upload names c2 as its base, then records what it sent.
+    let (base, seen) = ship_stub(waiting());
+    c.app(&["up"], &base, true);
+    assert!(source_form(&seen).contains("name=\"base_commit\"\r\n\r\nc2\r\n"));
+    assert_eq!(c.app_json()["base_commit"], c.head());
+}
+
+#[test]
+fn pull_fast_forwards_and_says_where_they_conflict() {
+    let c = Checked::new();
+    let sent = c.head();
+    let tgz = changed_source(&c.dir, ("app.yaml", "theirs\n"));
+    let reset = || {
+        std::fs::write(
+            c.dir.join(".lightbulb/app.json"),
+            json!({"app_id": "a-1", "up_commit": sent}).to_string(),
+        )
+        .unwrap();
+    };
+    reset();
+    let (base, _) = source_stub(tgz, "c2");
+    let (code, v) = c.app(&["pull", "a-1"], &base, true);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(git(&c.dir, &["rev-list", "--count", "HEAD"]).trim(), "2");
+    assert_eq!(c.head(), c.app_json()["up_commit"]);
+    // The same file changed here and there: a conflict, named.
+    git(&c.dir, &["reset", "-q", "--hard", &sent]);
+    reset();
+    std::fs::write(c.dir.join("app.yaml"), "mine\n").unwrap();
+    git(
+        &c.dir,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.com",
+            "commit",
+            "-qam",
+            "mine",
+        ],
+    );
+    let (code, v) = c.app(&["pull", "a-1"], &base, true);
+    assert_eq!(code, 1);
+    assert_eq!(v["code"], "merge_conflict");
+    assert!(
+        v["message"].as_str().unwrap().ends_with(": app.yaml"),
+        "{v}"
+    );
+    assert_eq!(
+        v["next"],
+        "fix the conflicts and commit, then run lightbulb app up"
+    );
+    // Not merged: after an abort the base is still the one last sent.
+    git(&c.dir, &["merge", "--abort"]);
+    assert_eq!(c.app_json(), json!({"app_id": "a-1", "up_commit": sent}));
+}
+
+#[test]
+fn a_stale_base_is_refused_with_the_backends_next() {
+    let c = Checked::new();
+    std::fs::write(
+        c.dir.join(".lightbulb/app.json"),
+        json!({"app_id": "a-1", "up_commit": "old"}).to_string(),
+    )
+    .unwrap();
+    let (base, seen) = stub(
+        409,
+        json!({"code": "stale_base", "message": "Someone else changed the app.",
+            "next": "run lightbulb app pull, merge your change, then lightbulb app up"}),
+        0,
+    );
+    let (code, v) = c.app(&["up"], &base, true);
+    assert_eq!(code, 1);
+    assert_eq!(v["code"], "stale_base");
+    assert_eq!(
+        v["next"],
+        "run lightbulb app pull, merge your change, then lightbulb app up"
+    );
+    assert!(source_form(&seen).contains("name=\"base_commit\"\r\n\r\nold\r\n"));
+    // Refused: the base is unchanged.
+    assert_eq!(c.app_json()["base_commit"], Value::Null);
+    assert_eq!(c.app_json()["up_commit"], "old");
+}
+
+#[test]
+fn a_pull_by_name_records_the_apps_real_id() {
+    let c = Checked::new();
+    let tgz = changed_source(&c.dir, ("theirs.txt", "from canvas"));
+    let (base, seen) = source_stub(tgz, "c2");
+    let to = c._tmp.path().join("by-name");
+    let (code, v) = c.app(&["pull", "booking", to.to_str().unwrap()], &base, true);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(
+        lines(&seen),
+        [
+            format!("GET {BUILD}/booking/status"),
+            format!("GET {BUILD}/a-1/source")
+        ]
+    );
+    let a: Value =
+        serde_json::from_slice(&std::fs::read(to.join(".lightbulb/app.json")).unwrap()).unwrap();
+    assert_eq!(a["app_id"], "a-1");
+}
+
+#[test]
+fn start_sends_who_asked_and_refuses_text_over_4000_characters() {
+    let c = Checked::new();
+    let (base, seen) = stub(200, json!({"app_id": "a-7"}), 0);
+    let (code, v) = c.app(
+        &[
+            "start",
+            "x",
+            "--name",
+            "team-lunch",
+            "--requested-by",
+            "user_1",
+        ],
+        &base,
+        true,
+    );
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(
+        body(&seen.lock().unwrap()[0]),
+        json!({"name": "team-lunch", "request": "x", "requested_by": "user_1"})
+    );
+    // 4000 characters (not bytes) is the most; one more never reaches the backend.
+    let (base, seen) = stub(200, json!({"app_id": "a-7"}), 0);
+    let most = "é".repeat(4000);
+    assert_eq!(
+        c.app(&["start", &most, "--name", "team-lunch"], &base, true)
+            .0,
+        0
+    );
+    let over = "x".repeat(4001);
+    let (code, v) = c.app(&["start", &over, "--name", "team-lunch"], &base, true);
+    assert_eq!((code, &v["code"]), (1, &json!("too_long")));
+    assert!(v["message"].as_str().unwrap().contains("4000"), "{v}");
+    assert_eq!(lines(&seen).len(), 1);
+}
+
+#[test]
+fn ask_sends_its_origin_and_message_id_and_refuses_text_over_4000_characters() {
+    let c = Checked::new();
+    let (base, seen) = stub(200, json!({"ok": true}), 0);
+    let args = [
+        "ask",
+        "a-9",
+        "hi",
+        "--room",
+        "r-1",
+        "--requested-by",
+        "user_1",
+        "--message-id",
+        "m-1",
+    ];
+    assert_eq!(c.app(&args, &base, true).0, 0);
+    assert_eq!(
+        body(&seen.lock().unwrap()[0]),
+        json!({"text": "hi", "origin": {"room_id": "r-1", "requested_by": "user_1"},
+            "client_message_id": "m-1"})
+    );
+    let over = "x".repeat(4001);
+    let (code, v) = c.app(&["ask", "a-9", &over], &base, true);
+    assert_eq!((code, &v["code"]), (1, &json!("too_long")));
+    assert_eq!(lines(&seen).len(), 1);
+}
+
+#[test]
+fn a_first_up_says_its_base_is_new() {
+    let c = Checked::new();
+    assert!(!c.dir.join(".lightbulb/app.json").exists());
+    let (base, seen) = ship_stub(waiting());
+    c.app(&["up"], &base, true);
+    assert!(source_form(&seen).contains("name=\"base_commit\"\r\n\r\nnew\r\n"));
+}
+
+#[test]
+fn pull_keeps_tracked_files_the_archive_leaves_out() {
+    let c = Checked::new();
+    let id = ["-c", "user.name=t", "-c", "user.email=t@example.com"];
+    std::fs::write(c.dir.join(".env.example"), "KEY=\n").unwrap();
+    std::fs::write(c.dir.join("old.txt"), "old").unwrap();
+    git(&c.dir, &["add", "-f", ".env.example", "old.txt"]);
+    git(&c.dir, &[&id[..], &["commit", "-qm", "example"]].concat());
+    let sent = c.head();
+    // The backend's source: no .env.example (never shipped), old.txt deleted there.
+    let tmp = tempfile::tempdir().unwrap();
+    let copy = tmp.path().join("copy");
+    git(&c.dir, &["clone", "-q", ".", copy.to_str().unwrap()]);
+    git(&copy, &["rm", "-q", ".env.example", "old.txt"]);
+    git(&copy, &[&id[..], &["commit", "-qm", "theirs"]].concat());
+    let out = tmp.path().join("src.tgz");
+    let o = out.to_str().unwrap();
+    git(&copy, &["archive", "--format=tar.gz", "-o", o, "HEAD"]);
+    std::fs::write(
+        c.dir.join(".lightbulb/app.json"),
+        json!({"app_id": "a-1", "up_commit": sent}).to_string(),
+    )
+    .unwrap();
+    let (base, _) = source_stub(std::fs::read(out).unwrap(), "c2");
+    let (code, v) = c.app(&["pull", "a-1"], &base, true);
+    assert_eq!(code, 0, "{v}");
+    assert!(c.dir.join(".env.example").is_file());
+    assert!(!c.dir.join("old.txt").exists());
+    assert_eq!(c.app_json()["base_commit"], "c2");
 }

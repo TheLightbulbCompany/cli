@@ -467,6 +467,9 @@ When you use it: to build a small web app for your workspace, check it, preview 
 
 ```
 lightbulb app new <NAME> [--room <ROOM>] [--kind <KIND>]
+lightbulb app start <REQUEST> --name <NAME> [--room <ROOM>] [--requested-by <USER_ID>]
+lightbulb app ask <APP> <TEXT> [--room <ROOM>] [--requested-by <USER_ID>] [--message-id <ID>]
+lightbulb app pull <APP> [DIR]
 lightbulb app up [--room <ROOM>] [--approved <CARD>] [--requested-by <ID>]
 lightbulb app publish [--reason <TEXT>] [--room <ROOM>] [--approved <CARD>]
 lightbulb app rollback [VERSION]
@@ -482,6 +485,9 @@ lightbulb app report-broken-tool <TOOL> <WHAT>
 | Command | What it does |
 |---|---|
 | `new` | Creates `./<NAME>` from the starter with one git commit; next, `pnpm install` in it, then `lightbulb app up` for a preview. A name may not end in `-preview`. `--kind` is `site` (default), `content-site`, `form`, `internal-tool`, `dashboard`, `portal`, `payments` or `automation`. `--room` is saved in `.lightbulb/app.json`. |
+| `start` | Asks Lightbulb to build an app in its own conversation in Canvas; prints `app_id`, `conversation_id`, `canvas_url` and `next`. |
+| `ask` | Sends a message to an app's builder. `APP` is its id, or its name when this folder or `./<APP>` is the app. |
+| `pull` | Downloads the app's latest source into a new folder, or merges it into the app's own folder, and records it as the base for the next upload. |
 | `up` | Sends HEAD (at most 9 MiB packed), waits for the preview build and reports `done` or what is `missing`. `--approved` (or `--approved-destructive`) is the approved card for a destructive migration; `--requested-by` names who asked. A failed build exits 1 with `{"code","message","next"}`; still building after 10 minutes exits 2. |
 | `publish` | Puts the preview live as a new version. Needs `check --publish` to pass and a passing review for HEAD. |
 | `rollback` | Makes an earlier version live (default: the one before) and adds one commit with its files. Code only; data is unchanged (the `error.code: "code_only"` it returns says so; it is not a failure). Refuses with uncommitted changes. |
@@ -491,7 +497,7 @@ lightbulb app report-broken-tool <TOOL> <WHAT>
 | `evidence` | Records a browser pass or a review for HEAD. A review needs `--verdict`. The file stays on this computer. |
 | `report-broken-tool` | Notes a failing tool in `.lightbulb/lessons.md`, once per `up`. |
 
-Run all but `new` inside the app's folder. Auth is a workspace agent's hook token when
+Run all but `new`, `start`, `ask` and `pull` inside the app's folder. Auth is a workspace agent's hook token when
 `OPENCLAW_HOOK_TOKEN`, `ISOL8_API_URL` and `ISOL8_OWNER_ID` are all set (`ISOL8_API_URL` is the
 API origin; the CLI appends `/api/v1` once); otherwise `lightbulb login`.
 Details: [apps you build](apps.md).

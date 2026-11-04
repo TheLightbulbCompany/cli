@@ -224,6 +224,47 @@ pub(crate) fn request_form(
     out
 }
 
+/// `GET {base}{path}` with `headers`, the answer's body written to `out`: the status and the
+/// answer's `header` (lowercase). On a failure `out` holds the backend's JSON error.
+pub(crate) fn download_at(
+    base: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    header: &str,
+    out: &std::path::Path,
+) -> Result<(u16, String)> {
+    let mut config = head(base, "GET", path, headers)?;
+    config.push_str(&format!(
+        "output = {}\n",
+        quoted(&out.display().to_string())?
+    ));
+    // A source archive can be large on a slow link: overrides the 30 s below.
+    config.push_str("max-time = 600\n");
+    let mut c = Command::new("curl");
+    c.args(["-q", "-sS", "--connect-timeout", "10", "--max-time", "30"])
+        .args([
+            "-K",
+            "-",
+            "-w",
+            &format!("%header{{{header}}}\n%{{http_code}}"),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = c.spawn().map_err(|e| format!("curl: {e}"))?;
+    child
+        .stdin
+        .take()
+        .ok_or("curl: no stdin")?
+        .write_all(config.as_bytes())?;
+    let text = String::from_utf8_lossy(&child.wait_with_output()?.stdout).to_string();
+    let (value, code) = text.rsplit_once('\n').unwrap_or(("", &text));
+    match code.trim().parse::<u16>() {
+        Ok(code) if code > 0 => Ok((code, value.trim().to_string())),
+        _ => Err("Could not reach Lightbulb. Check your connection and try again.".into()),
+    }
+}
+
 fn curl(config: &str) -> Result<(u16, Value)> {
     curl_after(config).map(|(code, v, _)| (code, v))
 }

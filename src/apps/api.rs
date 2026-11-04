@@ -102,6 +102,42 @@ pub fn call(
     answered(answer)
 }
 
+/// `GET {api}/apps/build{path}` into the file `to`: the answer's `X-Lightbulb-Commit`.
+pub fn download(auth: &Auth, path: &str, to: &Path) -> Result<String, ApiError> {
+    let path = format!("{BUILD}{path}");
+    const COMMIT: &str = "x-lightbulb-commit";
+    let answer = match auth {
+        Auth::HookToken { api, owner, token } => {
+            let bearer = format!("Bearer {token}");
+            let h = [
+                ("Authorization", bearer.as_str()),
+                ("X-Lightbulb-Owner", owner),
+            ];
+            login::download_at(api, &path, &h, COMMIT, to)
+        }
+        Auth::Proof => {
+            let h = proof("GET", &path, b"")?;
+            let h: Vec<(&str, &str)> = h.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            login::download_at(&login::api(), &path, &h, COMMIT, to)
+        }
+    };
+    let (status, commit) = answer.map_err(|_| ApiError::unreachable())?;
+    // On a failure the body in the file is the backend's JSON error.
+    let error = std::fs::read(to)
+        .ok()
+        .filter(|_| !(200..300).contains(&status))
+        .and_then(|b| serde_json::from_slice(&b).ok());
+    answered(Ok((status, error.unwrap_or(Value::Null))))?;
+    if commit.is_empty() || commit.chars().any(|c| !c.is_ascii_alphanumeric()) {
+        return Err(ApiError::new(
+            "bad_answer",
+            "Lightbulb did not say which commit the source is. Reading it needs curl 7.84 or newer.",
+            "check curl --version; update curl if it is older than 7.84, then try again",
+        ));
+    }
+    Ok(commit)
+}
+
 /// `POST {api}/apps/build{path}` as multipart: `fields`, then `file` as `(field, path)`.
 pub fn form(
     auth: &Auth,
