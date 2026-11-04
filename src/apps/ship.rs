@@ -178,7 +178,7 @@ pub fn archive(root: &Path) -> std::result::Result<(PathBuf, String), ApiError> 
     Ok((tgz, head))
 }
 
-fn app_json(root: &Path) -> Value {
+pub(crate) fn app_json(root: &Path) -> Value {
     std::fs::read(root.join(".lightbulb/app.json"))
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
@@ -541,6 +541,11 @@ pub(crate) fn up(
     if let Some(id) = r["app_id"].as_str() {
         let mut a = app_json(root);
         a["app_id"] = id.into();
+        // The commit this up sent (the archive committed everything first): status tells a build
+        // still on its way from a change never sent.
+        if let Ok(h) = git_ok(root, &["rev-parse", "HEAD"]) {
+            a["up_commit"] = h.into();
+        }
         save_app_json(root, &a)?;
     }
     let mut r = r;
@@ -549,6 +554,8 @@ pub(crate) fn up(
     // it building until the real app arrives, so waiting here would only time out.
     if building(&r) && super::placeholder(root) {
         let mut out = contract(&r);
+        // No preview_url: nothing should send the agent to look at the placeholder.
+        out.as_object_mut().map(|o| o.remove("preview_url"));
         out["done"] = false.into();
         out["next"] = PLACEHOLDER_NEXT.into();
         print(&out, "up", json);

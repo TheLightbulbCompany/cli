@@ -93,13 +93,23 @@ pub(crate) fn done_with(
             next,
         })
     };
+    // Even when an old backend calls it ready, the starter's placeholder is not the app.
+    if super::placeholder(root) {
+        return not("ready", super::ship::PLACEHOLDER_NEXT.into());
+    }
     if !super::ship::finished(&s["state"]) {
-        if super::placeholder(root) {
-            return not("ready", super::ship::PLACEHOLDER_NEXT.into());
-        }
+        // The preview shows another commit and HEAD is not what the last up sent: the change was
+        // never sent, so no build is coming for it.
+        let stale = s["preview"]["commit"].as_str().is_some_and(|c| c != head)
+            && super::ship::app_json(root)["up_commit"] != head;
         return not(
             "ready",
-            "wait for the build to finish, then run lightbulb app status".into(),
+            if stale {
+                "you changed the app since the last up; run lightbulb app up"
+            } else {
+                "wait for the build to finish, then run lightbulb app status"
+            }
+            .into(),
         );
     }
     let p = &s["preview"];
