@@ -4,7 +4,7 @@
 mod common;
 
 use common::Env;
-use lightbulb::apps::api::{self, ApiError, Auth};
+use lightbulb::apps::api::{self, ApiError, Auth, RunSecret};
 use lightbulb::apps::migrations::{classify, gate};
 use lightbulb::apps::{AppConfig, Kind, OpenTo, Origin};
 use serde_json::{json, Value};
@@ -183,7 +183,8 @@ fn auth_is_hook_token_only_when_all_three_vars_set() {
         Auth::HookToken {
             api: "https://api.example.com/api/v1".into(),
             owner: "org_1".into(),
-            token: "tok".into()
+            token: "tok".into(),
+            run_secret: None,
         }
     );
     for skip in 0..3 {
@@ -290,6 +291,7 @@ fn hook_token_calls_carry_bearer_and_owner_not_a_proof() {
         api: format!("{base}/api/v1"),
         owner: "org_1".into(),
         token: "tok".into(),
+        run_secret: None,
     };
     api::call(&auth, "GET", "/a1/status", None).unwrap();
     let seen = seen.lock().unwrap();
@@ -302,11 +304,105 @@ fn hook_token_calls_carry_bearer_and_owner_not_a_proof() {
 }
 
 #[test]
+fn run_secret_is_kept_only_with_a_run_id_and_never_printed() {
+    let env = |extra: &'static [(&'static str, &'static str)]| {
+        move |k: &str| {
+            [
+                ("OPENCLAW_HOOK_TOKEN", "tok"),
+                ("ISOL8_API_URL", "https://api.example.com"),
+                ("ISOL8_OWNER_ID", "org_1"),
+            ]
+            .iter()
+            .chain(extra)
+            .find(|(n, _)| *n == k)
+            .map(|(_, v)| v.to_string())
+        }
+    };
+    let secret_of = |a: Auth| match a {
+        Auth::HookToken { run_secret, .. } => run_secret,
+        Auth::Proof => panic!("hook token expected"),
+    };
+    let both = Auth::detect_with(env(&[
+        ("LIGHTBULB_RUN_ID", "run_1"),
+        ("LIGHTBULB_RUN_SECRET", "s3cr3t-run"),
+    ]));
+    assert!(!format!("{both:?}").contains("s3cr3t-run"), "{both:?}");
+    assert_eq!(secret_of(both), Some(RunSecret("s3cr3t-run".into())));
+    for half in [
+        &[("LIGHTBULB_RUN_SECRET", "s3cr3t-run")][..],
+        &[("LIGHTBULB_RUN_ID", "run_1")][..],
+        &[
+            ("LIGHTBULB_RUN_ID", ""),
+            ("LIGHTBULB_RUN_SECRET", "s3cr3t-run"),
+        ][..],
+        &[("LIGHTBULB_RUN_ID", "run_1"), ("LIGHTBULB_RUN_SECRET", "")][..],
+    ] {
+        let half: &'static [(&str, &str)] = Box::leak(half.to_vec().into_boxed_slice());
+        assert_eq!(secret_of(Auth::detect_with(env(half))), None, "{half:?}");
+    }
+}
+
+#[test]
+fn hook_token_calls_carry_the_run_secret_only_when_set() {
+    let auth = |api: String, secret: Option<&str>| Auth::HookToken {
+        api,
+        owner: "org_1".into(),
+        token: "tok".into(),
+        run_secret: secret.map(|s| RunSecret(s.into())),
+    };
+    let (base, seen) = stub(200, json!({"ok": true}), 0);
+    api::call(
+        &auth(format!("{base}/api/v1"), Some("s3cr3t-run")),
+        "GET",
+        "/a1/status",
+        None,
+    )
+    .unwrap();
+    api::call(
+        &auth(format!("{base}/api/v1"), None),
+        "GET",
+        "/a1/status",
+        None,
+    )
+    .unwrap();
+    let file = tempfile::tempdir().unwrap();
+    let file = file.path().join("src.tgz");
+    std::fs::write(&file, b"x").unwrap();
+    api::form(
+        &auth(format!("{base}/api/v1"), Some("s3cr3t-run")),
+        "/source",
+        &[("name", "x")],
+        Some(("archive", &file)),
+    )
+    .unwrap();
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen[0].headers["x-lightbulb-run-secret"], "s3cr3t-run");
+    assert!(!seen[1].headers.contains_key("x-lightbulb-run-secret"));
+    assert_eq!(seen[2].headers["x-lightbulb-run-secret"], "s3cr3t-run");
+
+    // A failure names nothing of the secret.
+    let (base, _) = stub(403, json!({"detail": "Not yours."}), 0);
+    for err in [
+        api::call(&auth(base, Some("s3cr3t-run")), "GET", "/x", None).unwrap_err(),
+        api::call(
+            &auth("http://127.0.0.1:9".into(), Some("s3cr3t-run")),
+            "GET",
+            "/x",
+            None,
+        )
+        .unwrap_err(),
+    ] {
+        assert!(!format!("{err:?}").contains("s3cr3t-run"), "{err:?}");
+    }
+}
+
+#[test]
 fn backend_errors_pass_through_and_unreachable_is_named() {
     let auth = |api: String| Auth::HookToken {
         api,
         owner: "o".into(),
         token: "t".into(),
+        run_secret: None,
     };
     let (base, _) = stub(
         409,
