@@ -13,9 +13,22 @@ pub enum Auth {
         api: String,
         owner: String,
         token: String,
+        /// `LIGHTBULB_RUN_SECRET`, kept only when `LIGHTBULB_RUN_ID` is set too. Sent as
+        /// `X-Lightbulb-Run-Secret`; `X-Lightbulb-Run` already rides on every request.
+        run_secret: Option<RunSecret>,
     },
     /// This computer's sign-in proof.
     Proof,
+}
+
+/// The Worker's run secret. Its `Debug` never prints the value.
+#[derive(PartialEq, Eq)]
+pub struct RunSecret(pub String);
+
+impl std::fmt::Debug for RunSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RunSecret([redacted])")
+    }
 }
 
 impl Auth {
@@ -40,7 +53,15 @@ impl Auth {
                 } else {
                     format!("{url}/api/v1")
                 };
-                Auth::HookToken { api, owner, token }
+                let run_secret = get("LIGHTBULB_RUN_ID")
+                    .and(get("LIGHTBULB_RUN_SECRET"))
+                    .map(RunSecret);
+                Auth::HookToken {
+                    api,
+                    owner,
+                    token,
+                    run_secret,
+                }
             }
             _ => Auth::Proof,
         }
@@ -75,6 +96,22 @@ impl ApiError {
 
 const BUILD: &str = "/apps/build";
 
+/// The headers a hook-token call carries.
+fn hook_headers(owner: &str, token: &str, secret: &Option<RunSecret>) -> Vec<(String, String)> {
+    let mut h = vec![
+        ("Authorization".to_string(), format!("Bearer {token}")),
+        ("X-Lightbulb-Owner".to_string(), owner.to_string()),
+    ];
+    if let Some(RunSecret(s)) = secret {
+        h.push(("X-Lightbulb-Run-Secret".to_string(), s.clone()));
+    }
+    h
+}
+
+fn as_strs(h: &[(String, String)]) -> Vec<(&str, &str)> {
+    h.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect()
+}
+
 /// `method {api}/apps/build{path}` with JSON `body`.
 pub fn call(
     auth: &Auth,
@@ -85,12 +122,14 @@ pub fn call(
     let path = format!("{BUILD}{path}");
     let text = body.map(Value::to_string);
     let answer = match auth {
-        Auth::HookToken { api, owner, token } => {
-            let bearer = format!("Bearer {token}");
-            let h = [
-                ("Authorization", bearer.as_str()),
-                ("X-Lightbulb-Owner", owner),
-            ];
+        Auth::HookToken {
+            api,
+            owner,
+            token,
+            run_secret,
+        } => {
+            let h = hook_headers(owner, token, run_secret);
+            let h = as_strs(&h);
             login::request_at(api, method, &path, text.as_deref(), &h)
         }
         Auth::Proof => {
@@ -107,12 +146,14 @@ pub fn download(auth: &Auth, path: &str, to: &Path) -> Result<String, ApiError> 
     let path = format!("{BUILD}{path}");
     const COMMIT: &str = "x-lightbulb-commit";
     let answer = match auth {
-        Auth::HookToken { api, owner, token } => {
-            let bearer = format!("Bearer {token}");
-            let h = [
-                ("Authorization", bearer.as_str()),
-                ("X-Lightbulb-Owner", owner),
-            ];
+        Auth::HookToken {
+            api,
+            owner,
+            token,
+            run_secret,
+        } => {
+            let h = hook_headers(owner, token, run_secret);
+            let h = as_strs(&h);
             login::download_at(api, &path, &h, COMMIT, to)
         }
         Auth::Proof => {
@@ -159,11 +200,13 @@ pub fn form(
     let refused = std::cell::RefCell::new(None);
     let answer =
         match auth {
-            Auth::HookToken { api, owner, token } => {
-                let h = vec![
-                    ("Authorization".to_string(), format!("Bearer {token}")),
-                    ("X-Lightbulb-Owner".to_string(), owner.clone()),
-                ];
+            Auth::HookToken {
+                api,
+                owner,
+                token,
+                run_secret,
+            } => {
+                let h = hook_headers(owner, token, run_secret);
                 login::request_form(api, &path, fields, file, |_| Ok(h))
             }
             Auth::Proof => login::request_form(&login::api(), &path, fields, file, |body| {
