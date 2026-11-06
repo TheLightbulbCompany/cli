@@ -461,6 +461,12 @@ pub fn answer(
     if (persons || is_workers(store, &h.target_session)) && by_agent {
         return Ok(Err(NOT_A_PERSON));
     }
+    if kind == Kind::Worker && allow {
+        if let Some(why) = workers::sender_refusal(store, roster, &h.message)? {
+            workers::decline(store, &[id], why, now)?;
+            return Ok(Err(why));
+        }
+    }
     let authority = kind == Kind::Authority;
     let jws = object_jws(&h.message).map(String::from);
     if authority

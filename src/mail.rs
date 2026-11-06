@@ -1301,6 +1301,7 @@ pub fn receive(
                 Taken::Held { .. } => State::Held,
                 Taken::Start => State::Stored,
             };
+            workers::bind_sender(store, id, peer, roster)?;
             taken = Some(t);
             state
         } else {
@@ -3449,14 +3450,26 @@ mod tests {
     #[test]
     fn a_replayed_assign_to_a_worker_address_is_answered_held_once() {
         let (_d, s) = setup();
-        let (peer, roster, _) = peer_mail("m/claude:new", "x");
+        let host = crate::identity::Identity::load_or_create(_d.path()).unwrap();
+        std::fs::create_dir(_d.path().join("peer")).unwrap();
+        let identity = crate::identity::Identity::load_or_create(&_d.path().join("peer")).unwrap();
+        let genesis = crate::daemon::net_ops::genesis(&host, "host", "host", "test", 100);
+        let admit = crate::roster::Entry::signed(
+            &host,
+            vec![genesis.hash()],
+            crate::roster::Kind::Admit,
+            serde_json::json!({"member":identity.key,"name":"peer","computer":"peer","role":"member","ticket_id":""}),
+            101,
+        );
+        let roster = crate::roster::replay(&[genesis, admit]);
+        let peer = roster.members[&identity.key].clone();
         let config = Config {
             workers_offer: "claude".into(),
             ..workers_on()
         };
         let env = peer_env(
-            "p/codex:a",
-            "m/claude:new",
+            &format!("{}/codex:a", peer.short),
+            &format!("{}/claude:new", host.short),
             "r1",
             "assign",
             terms("x", 1060),
@@ -3467,7 +3480,7 @@ mod tests {
             None,
             &peer,
             &roster,
-            "m",
+            &host.short,
             None,
             None,
             &config,
@@ -3477,6 +3490,22 @@ mod tests {
         .unwrap();
         assert_eq!((first.state, first.fresh), (State::Held, true));
         assert!(matches!(first.taken, Some(Taken::Held { .. })));
+        let Frame::Envelope { id, .. } = &env else {
+            unreachable!()
+        };
+        let pinned: (String,String,String) = s.conn().query_row(
+            "SELECT member_key, team_id, admission_id FROM worker_senders WHERE assignment = ?1",
+            [id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+        ).unwrap();
+        assert_eq!(
+            pinned,
+            (
+                peer.key.clone(),
+                roster.team_id.clone(),
+                roster.admission_id(&peer.key).unwrap().into()
+            )
+        );
+
         // The same envelope again, and the same request under another envelope id.
         let again = receive(
             &s,
@@ -3484,7 +3513,7 @@ mod tests {
             None,
             &peer,
             &roster,
-            "m",
+            &host.short,
             None,
             None,
             &config,
@@ -3497,8 +3526,8 @@ mod tests {
             (State::Held, false, None)
         );
         let other = peer_env(
-            "p/codex:a",
-            "m/claude:new",
+            &format!("{}/codex:a", peer.short),
+            &format!("{}/claude:new", host.short),
             "r1",
             "assign",
             terms("x", 1060),
@@ -3509,7 +3538,7 @@ mod tests {
             None,
             &peer,
             &roster,
-            "m",
+            &host.short,
             None,
             None,
             &config,

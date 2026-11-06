@@ -2520,3 +2520,44 @@ fn a_person_deny_on_worker_star_refuses_over_the_members_always_row() {
         }
     }
 }
+
+#[test]
+fn sender_leave_stops_a_live_worker_closes_its_next_hold_and_sends_no_result() {
+    let p = hosted(
+        json!([{"sleep": 60}, {"result": "must stay local"}]),
+        Opts::default(),
+    );
+    p.assign("sender-active", "public task", 300);
+    p.wait_state("sender-active", "held");
+    p.dialog(1);
+    p.click("Allow");
+    let worker = running(&p, 1).remove(0);
+    let pid = worker.pid.unwrap();
+    p.assign("sender-held", "another public task", 300);
+    p.wait_state("sender-held", "held");
+    let held = lightbulb::holds::open(&p.b.store()).unwrap().remove(0);
+    let leave = person(&p.a, json!({"id":1,"op":"team.leave"}));
+    assert_eq!(leave["ok"], true, "{leave}");
+    until(10, "removed sender's worker process stopped", || gone(pid));
+    until(10, "removed sender's worker row cancelled", || {
+        p.workers()[0].state == "cancelled"
+    });
+    assert_eq!(
+        lightbulb::holds::get(&p.b.store(), held.id)
+            .unwrap()
+            .unwrap()
+            .state,
+        "declined"
+    );
+    let database = rusqlite::Connection::open(p.b.state.path().join("state.db")).unwrap();
+    assert_eq!(
+        database
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE kind = 'result'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+}
