@@ -35,6 +35,7 @@ pub struct MemberOpts {
     /// message them: a computer whose sign-in proof names one of them (`proof::admitted`).
     pub sessions: PathBuf,
     pub goosetown_origin: Option<String>,
+    pub founder_governed: bool,
 }
 
 /// Runs the sidecar until `stop` or SIGTERM.
@@ -69,18 +70,19 @@ pub async fn run(opts: MemberOpts, token: String) -> Result<()> {
         .as_deref()
         .map(str::parse::<iroh::RelayUrl>)
         .transpose()?;
-    let instance = embed::start(
-        &opts.home,
-        EmbedOpts {
-            relay,
-            snapshot: Some(opts.snapshot),
-            name: opts.name,
-            sessions,
-            members,
-            revoked,
-        },
-    )
-    .await?;
+    let engine_opts = EmbedOpts {
+        relay,
+        snapshot: Some(opts.snapshot),
+        name: opts.name,
+        sessions,
+        members,
+        revoked,
+    };
+    let instance = if opts.founder_governed {
+        embed::start_founder_governed(&opts.home, engine_opts).await?
+    } else {
+        embed::start(&opts.home, engine_opts).await?
+    };
     instance.set_goosetown_origin(opts.goosetown_origin);
     instance.publish_wake(&file["wake"])?;
     let instance = Arc::new(instance);

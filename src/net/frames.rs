@@ -266,6 +266,8 @@ pub enum Frame {
     },
     JoinRequest {
         ticket: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        governed: bool,
         secret_proof: String,
         candidate: String,
         name: String,

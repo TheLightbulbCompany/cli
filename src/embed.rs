@@ -48,6 +48,14 @@ pub struct Instance {
 /// transport and outbox, with `opts`' relay and no LAN discovery. `Err` while
 /// another engine (instance or daemon) holds `home`.
 pub async fn start(home: &Path, opts: EmbedOpts) -> Result<Instance> {
+    start_inner(home, opts, false).await
+}
+
+pub(crate) async fn start_founder_governed(home: &Path, opts: EmbedOpts) -> Result<Instance> {
+    start_inner(home, opts, true).await
+}
+
+async fn start_inner(home: &Path, opts: EmbedOpts, governed: bool) -> Result<Instance> {
     std::fs::create_dir_all(home)?;
     std::fs::set_permissions(home, std::fs::Permissions::from_mode(0o700))?;
     if let Some(p) = &opts.snapshot {
@@ -66,10 +74,11 @@ pub async fn start(home: &Path, opts: EmbedOpts) -> Result<Instance> {
         lan: false,
         ..Config::load(home)?
     };
-    let (daemon, net) = boot(
+    let (daemon, net) = boot_inner(
         home,
         config,
         Some((opts.name, lock, opts.sessions, opts.members, opts.revoked)),
+        governed,
     )
     .await?;
     Ok(Instance {
@@ -157,6 +166,15 @@ pub(crate) async fn boot(
     config: Config,
     cloud: Option<CloudStart>,
 ) -> Result<(Arc<Daemon>, net::Net)> {
+    boot_inner(dir, config, cloud, false).await
+}
+
+async fn boot_inner(
+    dir: &Path,
+    config: Config,
+    cloud: Option<CloudStart>,
+    governed: bool,
+) -> Result<(Arc<Daemon>, net::Net)> {
     let (cloud, home_lock, declared, members, revoked) = match cloud {
         Some((name, lock, sessions, members, revoked)) => {
             (Some(name), Some(lock), sessions, members, revoked)
@@ -170,11 +188,18 @@ pub(crate) async fn boot(
     // The solo network's genesis, written once: a computer that has a roster keeps it.
     let mut entries = roster::entries(&store)?;
     if entries.is_empty() {
-        let g = net_ops::solo_genesis(&identity, cloud.as_deref(), &config.computer, now);
+        let g = if governed {
+            net_ops::founder_solo_genesis(&identity, cloud.as_deref(), &config.computer, now)
+        } else {
+            net_ops::solo_genesis(&identity, cloud.as_deref(), &config.computer, now)
+        };
         roster::accept(&store, &g, now)?;
         entries.push(g);
     }
     let mut roster = roster::replay(&entries);
+    if governed && !roster.governed {
+        return Err("cannot change signed genesis governance".into());
+    }
     if mismatched(&identity, &roster) {
         return Err(KEY_MISMATCH.into());
     }
@@ -531,5 +556,40 @@ pub(crate) fn ack(id: u64, body: &Value, d: &Daemon) -> Response {
         }
         Ok(false) => Response::err(id, NOT_FOUND),
         Err(_) => Response::err(id, INTERNAL),
+    }
+}
+
+#[cfg(test)]
+mod governance_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn founder_opt_in_cannot_rewrite_an_existing_private_genesis() {
+        let home = tempfile::tempdir().unwrap();
+        let identity = Identity::load_or_create(home.path()).unwrap();
+        let store = Store::open(&home.path().join("state.db")).unwrap();
+        let g = net_ops::solo_genesis(&identity, None, "private", 1);
+        roster::accept(&store, &g, ipc::now() as i64).unwrap();
+        drop(store);
+        let result = start_founder_governed(
+            home.path(),
+            EmbedOpts {
+                relay: None,
+                snapshot: None,
+                name: "private".into(),
+                sessions: vec![],
+                members: None,
+                revoked: Default::default(),
+            },
+        )
+        .await;
+        assert!(
+            matches!(result, Err(e) if e.to_string() == "cannot change signed genesis governance")
+        );
+        let store = Store::open(&home.path().join("state.db")).unwrap();
+        let entries = roster::entries(&store).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].hash(), g.hash());
+        assert!(!roster::replay(&entries).governed);
     }
 }

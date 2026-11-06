@@ -683,6 +683,15 @@ pub fn member_with_origin(
     body: Value,
     origin: Option<&str>,
 ) -> (std::process::Child, String, std::path::PathBuf) {
+    member_with_governance(dir, body, origin, false)
+}
+
+pub fn member_with_governance(
+    dir: &std::path::Path,
+    body: Value,
+    origin: Option<&str>,
+    governed: bool,
+) -> (std::process::Child, String, std::path::PathBuf) {
     let file = dir.join("sessions.json");
     std::fs::write(&file, body.to_string()).unwrap();
     let sock = dir.join("sock");
@@ -690,6 +699,9 @@ pub fn member_with_origin(
     let token = ulid();
     let mut command = Command::new(EXE);
     command.arg("member");
+    if governed {
+        command.args(["--governance", "founder"]);
+    }
     if let Some(origin) = origin {
         command.args(["--goosetown-origin", origin]);
     }

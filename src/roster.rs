@@ -112,6 +112,7 @@ pub struct Link {
     pub once: bool,
     pub expires_at: i64,
     pub signer: String,
+    pub for_key: Option<String>,
     /// `invite --new`'s link: it ends every earlier link of its signer, any mode, once ones too.
     pub ends_all: bool,
 }
@@ -120,6 +121,8 @@ pub struct Link {
 pub struct Roster {
     pub team_id: String,
     pub team_name: String,
+    /// Immutable authority mode, signed into this network's genesis.
+    pub governed: bool,
     /// The genesis entry's stamp.
     pub created_at: i64,
     pub members: BTreeMap<String, Member>,
@@ -278,6 +281,12 @@ impl Roster {
         }
     }
 
+    pub(crate) fn is_founder(&self, key: &str) -> bool {
+        self.members
+            .get(key)
+            .is_some_and(|m| m.role == Role::Founder)
+    }
+
     pub fn by_short(&self, short: &str) -> Option<&Member> {
         self.members.values().find(|m| m.short == short)
     }
@@ -406,6 +415,7 @@ fn pass(
                 r.team_id = h.clone();
                 r.team_name = e.text("team_name").to_string();
                 r.created_at = e.at;
+                r.governed = e.body["governance"] == "founder";
                 r.members
                     .insert(e.signer.clone(), new_member(e, Role::Founder));
             }
@@ -436,6 +446,12 @@ fn pass(
         {
             continue;
         }
+        if r.governed
+            && signer.role != Role::Founder
+            && matches!(e.kind, Kind::Admit | Kind::Remove | Kind::Link)
+        {
+            continue;
+        }
         match e.kind {
             Kind::Admit => {
                 let link = links.get(e.text("ticket_id"));
@@ -444,7 +460,8 @@ fn pass(
                 }
                 let via_link = || {
                     link.is_some_and(|(lh, l)| {
-                        anc[h.as_str()].contains(lh)
+                        l.for_key.as_ref().is_none_or(|key| key == &target)
+                            && anc[h.as_str()].contains(lh)
                             && !retired(&links, anc, lh, l, |n| anc[h.as_str()].contains(n))
                             // Every removal the link does not descend from ends it; an
                             // admission it already knew of stands.
@@ -485,9 +502,16 @@ fn pass(
             // A member mints links under its own `<short>.` prefix, and a `ticket_id` names one
             // link ever.
             Kind::Link
-                if e.text("ticket_id")
-                    .strip_prefix(signer.short.as_str())
-                    .is_some_and(|rest| rest.len() > 1 && rest.starts_with('.')) =>
+                if (!r.governed
+                    || e.body.get("for_key").is_none_or(|v| {
+                        v.as_str()
+                            .and_then(crate::identity::key_bytes)
+                            .and_then(|bytes| ed25519_dalek::VerifyingKey::from_bytes(&bytes).ok())
+                            .is_some()
+                    }))
+                    && e.text("ticket_id")
+                        .strip_prefix(signer.short.as_str())
+                        .is_some_and(|rest| rest.len() > 1 && rest.starts_with('.')) =>
             {
                 links
                     .entry(e.text("ticket_id").to_string())
@@ -499,17 +523,23 @@ fn pass(
                             once: e.body["once"].as_bool().unwrap_or(false),
                             expires_at: e.body["expires_at"].as_i64().unwrap_or(0),
                             signer: e.signer.clone(),
+                            for_key: r
+                                .governed
+                                .then(|| e.body["for_key"].as_str().map(str::to_string))
+                                .flatten(),
                             ends_all: e.body["ends_all"] == true,
                         };
                         (h.clone(), link)
                     });
             }
             Kind::Meta => {
-                if let Some(n) = e.body["team_name"].as_str() {
-                    r.team_name = n.to_string();
-                }
-                if let Some(relay) = e.body["relay"].as_str() {
-                    r.relay = Some(relay.to_string());
+                if !r.governed || signer.role == Role::Founder {
+                    if let Some(n) = e.body["team_name"].as_str() {
+                        r.team_name = n.to_string();
+                    }
+                    if let Some(relay) = e.body["relay"].as_str() {
+                        r.relay = Some(relay.to_string());
+                    }
                 }
                 if let Some(w) = Wake::parse(&e.body["wake"]) {
                     r.wakes.insert(e.signer.clone(), w);
@@ -744,6 +774,12 @@ mod tests {
         Entry::signed(f, vec![], Kind::Admit, b, 1)
     }
 
+    fn governed_genesis(f: &Identity) -> Entry {
+        let mut body = genesis(f).body;
+        body["governance"] = json!("founder");
+        Entry::signed(f, vec![], Kind::Admit, body, 1)
+    }
+
     fn admit_via(by: &Identity, parent: &Entry, who: &str, name: &str, ticket: &str) -> Entry {
         let mut b = admit_body(who, name);
         b["ticket_id"] = json!(ticket);
@@ -965,6 +1001,35 @@ mod tests {
     }
 
     #[test]
+    fn governed_members_cannot_change_team_authority_but_can_leave() {
+        let (f, x, b, c) = (id(), id(), id(), id());
+        let g = governed_genesis(&f);
+        let ax = admit(&f, &g, &x.key, "x");
+        let ab = admit(&f, &ax, &b.key, "b");
+        let link = link_with(&x, &ab, &tid(&x, "no"), false);
+        let admitted = admit(&x, &link, &c.key, "c");
+        let removed = member(&x, &admitted, Kind::Remove, &b.key);
+        let meta = op(
+            &x,
+            &removed,
+            Kind::Meta,
+            json!({"team_name":"stolen","relay":"untrusted"}),
+        );
+        let entries = vec![g, ax, ab, link, admitted, removed, meta.clone()];
+        let r = replay(&entries);
+        assert!(r.governed);
+        assert!(r.members.contains_key(&b.key));
+        assert!(!r.members.contains_key(&c.key));
+        assert!(r.links.is_empty());
+        assert_eq!(r.team_name, "acme");
+        assert!(r.relay.is_none());
+        let leave = member(&x, &meta, Kind::Leave, &x.key);
+        assert!(!replay(&[entries, vec![leave]].concat())
+            .members
+            .contains_key(&x.key));
+    }
+
+    #[test]
     fn stale_known_removal_stops_when_its_signers_admission_drops() {
         // Member X admits Y through its link; Y removes
         // member M; the founder removes X concurrently. Y never survives, so neither
@@ -1040,6 +1105,52 @@ mod tests {
         assert!(r.members.contains_key(&c.key));
         assert_eq!(r.links[&t].signer, x.key);
         assert!(!r.links[&t].once);
+    }
+
+    #[test]
+    fn bound_link_replay_rejects_wrong_key_without_spending_the_link() {
+        let (f, c, wrong) = (id(), id(), id());
+        let g = governed_genesis(&f);
+        let t = tid(&f, "bound");
+        let mut body = link_with(&f, &g, &t, true).body;
+        body["for_key"] = json!(c.key);
+        let link = op(&f, &g, Kind::Link, body);
+        let bad = admit_via(&f, &link, &wrong.key, "wrong", &t);
+        let good = admit_via(&f, &bad, &c.key, "correct", &t);
+        let r = replay(&[g, link, bad, good]);
+        assert!(!r.members.contains_key(&wrong.key));
+        assert!(r.members.contains_key(&c.key));
+        assert!(!r.links.contains_key(&t));
+    }
+
+    #[test]
+    fn bound_link_concurrent_with_removal_does_not_admit() {
+        let (f, x, target) = (id(), id(), id());
+        let g = genesis(&f);
+        let ax = admit(&f, &g, &x.key, "x");
+        let t = tid(&x, "bound");
+        let mut body = link_with(&x, &ax, &t, true).body;
+        body["for_key"] = json!(target.key);
+        let link = op(&x, &ax, Kind::Link, body);
+        let ac = admit_via(&x, &link, &target.key, "c", &t);
+        let remove = member(&f, &ax, Kind::Remove, &x.key);
+        let entries = vec![g, ax, link, ac, remove];
+        let r = replay(&entries);
+        assert!(!r.members.contains_key(&target.key));
+        assert!(!r.links.contains_key(&t));
+        let reversed = entries.into_iter().rev().collect::<Vec<_>>();
+        assert_eq!(replay(&reversed), r);
+    }
+
+    #[test]
+    fn malformed_bound_link_is_not_replayed_as_unbound() {
+        let f = id();
+        let g = governed_genesis(&f);
+        let t = tid(&f, "bad");
+        let mut body = link_with(&f, &g, &t, true).body;
+        body["for_key"] = json!({"not": "a key"});
+        let link = op(&f, &g, Kind::Link, body);
+        assert!(!replay(&[g, link]).links.contains_key(&t));
     }
 
     #[test]
