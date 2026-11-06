@@ -90,6 +90,9 @@ pub struct Config {
     pub telemetry: bool,
     /// `remember` and `memory share` may write `team` entries (`memory team on|off`).
     pub memory_team: bool,
+    /// Per-instance network memory replication; disabled only in this instance.
+    /// Not a `config set` setting. Defaults preserve private teams.
+    pub memory_sync: bool,
     /// What of this computer's sessions goes to the account: `off` (the default), and, once
     /// signed in, the modes the sign-in asks for.
     pub capture_upload: String,
@@ -130,6 +133,7 @@ impl Default for Config {
             auto_update: true,
             telemetry: true,
             memory_team: true,
+            memory_sync: true,
             capture_upload: "off".into(),
             capture_turns: true,
             capture_turns_days: 90,
@@ -195,6 +199,12 @@ pub(crate) fn expand_home(p: &str) -> PathBuf {
 fn from_doc(doc: &DocumentMut) -> Result<Config> {
     let mut c = Config::default();
     for (k, item) in doc.iter() {
+        if k == "memory_sync" {
+            c.memory_sync = item
+                .as_bool()
+                .ok_or_else(|| format!("{FILE}: {k} has the wrong type"))?;
+            continue;
+        }
         let Some(kind) = kind(k) else {
             continue; // a setting from a newer version
         };
@@ -222,6 +232,18 @@ fn from_doc(doc: &DocumentMut) -> Result<Config> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn memory_sync_requires_a_boolean_and_keeps_default() {
+        assert!(from_doc(&"".parse().unwrap()).unwrap().memory_sync);
+        assert!(
+            !from_doc(&"memory_sync = false".parse().unwrap())
+                .unwrap()
+                .memory_sync
+        );
+        assert!(from_doc(&"memory_sync = 'false'".parse().unwrap()).is_err());
+        assert!(Config::set(tempfile::tempdir().unwrap().path(), "memory_sync", "false").is_err());
+    }
 
     #[test]
     fn worker_keys_read_write_and_default() {

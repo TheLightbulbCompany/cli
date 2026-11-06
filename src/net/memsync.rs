@@ -74,6 +74,9 @@ pub(super) fn send_pages(
     theirs: &BTreeMap<String, u64>,
     key: &str,
 ) -> Result<BTreeMap<String, u64>> {
+    if !d.team.lock().unwrap().config.memory_sync {
+        return Ok(BTreeMap::new());
+    }
     let same_person = same_person(d, key);
     let withheld = withheld(d, key);
     let ours = memory::heads(&d.store.lock().unwrap())?;
@@ -121,6 +124,9 @@ pub(super) fn send_pages(
 /// Stores the entries of a `memory` frame from `short`; one that does not verify is dropped,
 /// logged without its text.
 pub(super) fn store(d: &Daemon, short: &str, entries: &[memory::Entry]) {
+    if !d.team.lock().unwrap().config.memory_sync {
+        return;
+    }
     let store = d.store.lock().unwrap();
     for e in entries {
         if let Err(err) = memory::accept(&store, e, ipc::now() as i64) {

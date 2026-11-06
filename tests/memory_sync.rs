@@ -397,3 +397,96 @@ async fn a_workspace_computers_entries_are_not_relayed() {
     assert!(got.contains(&mine.id), "{got:?}");
     assert!(!got.contains(&room.id), "{got:?}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn instance_sync_off_refuses_hostile_memory_and_emits_none() {
+    let (a, b) = (Env::new(), Env::new());
+    seed_pair(&a, &b);
+    let local_me = remember(&a, op("local-me", "local-me-canary", Scope::Me));
+    let local_team = remember(&a, op("local-team", "local-team-canary", Scope::Team));
+    let incoming_team = remember(&b, op("incoming-team", "incoming-team-canary", Scope::Team));
+    let incoming_me = remember(&b, op("incoming-me", "incoming-me-canary", Scope::Me));
+    let (ka, kb) = (a.identity().key, b.identity().key);
+    a.daemon(false, "memory_sync = false", &[]);
+    let ep = endpoint(&b.identity()).await;
+    let mut peer = Peer::dial(&ep, &a).await;
+    peer.hello_full(vec![], None, true).await;
+    let hello = peer.recv_where(|f| matches!(f, Frame::Hello { .. })).await;
+    let advertised_off = matches!(hello, Frame::Hello { memory: false, .. });
+    // A noncompliant authenticated member ignores our advertised capability.
+    peer.send(&Frame::Memory {
+        entries: vec![incoming_team, incoming_me],
+        more: false,
+    })
+    .await;
+    peer.send(&Frame::MemoryHeads {
+        heads: Default::default(),
+    })
+    .await;
+    // Exercise the periodic egress path as well as the initial Hello path.
+    let live = remember(&a, op("live", "live-team-canary", Scope::Team));
+    let end = tokio::time::Instant::now() + Duration::from_millis(2500);
+    let mut memory_frames = 0;
+    while let Ok(Ok(frame)) =
+        tokio::time::timeout_at(end, lightbulb::net::frames::read(&mut peer.recv)).await
+    {
+        if matches!(frame, Frame::Memory { .. } | Frame::MemoryHeads { .. }) {
+            memory_frames += 1;
+        }
+    }
+    assert!(
+        held(&a, &kb).is_empty(),
+        "off instance ingested hostile signed memory"
+    );
+    assert_eq!(memory_frames, 0, "off instance sent memory frames");
+    assert!(advertised_off, "off instance advertised memory sync");
+    assert_eq!(held(&a, &ka), [local_me, local_team, live]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn instance_sync_off_blocks_same_person_memory_but_keeps_mail() {
+    let (a, b) = (Env::new(), Env::new());
+    seed_pair(&a, &b);
+    a.sign_in("user_same_person", None);
+    b.sign_in("user_same_person", None);
+    let me = remember(&a, op("mine", "same-person-private-control", Scope::Me));
+    let theirs = remember(&b, op("theirs", "inbound-team-control", Scope::Team));
+    let (ka, kb) = (a.identity().key, b.identity().key);
+    common::start_pair(&a, &b, "", &[]);
+    // Establish a positive control with these exact signed-in identities.
+    until(10, "default profile sends same-person Me", || {
+        held(&b, &ka) == [me.clone()]
+    });
+    until(10, "default profile receives Team", || {
+        held(&a, &kb) == [theirs.clone()]
+    });
+    a.ask(json!({"id": 1, "op": "shutdown"}));
+    until(10, "A stops before profile switch", || {
+        std::os::unix::net::UnixStream::connect(a.state.path().join("sock")).is_err()
+    });
+    a.daemon(false, "memory_sync = false", &[common::peers(&[&b])]);
+    until(10, "off instance reconnects", || {
+        a.status()["peers"]["online"] == 1
+    });
+    let (sa, sb) = (session(&a, "job-a"), session(&b, "job-b"));
+    a.send(&sa, &sb, "brief", "brief", None);
+    assert_eq!(b.take_one(&sb)["text"], "brief");
+    b.send(&sb, &sa, "result", "result", None);
+    assert_eq!(a.take_one(&sa)["text"], "result");
+    let live = remember(&a, op("live-me", "new-private-canary", Scope::Me));
+    let inbound = remember(&b, op("new-theirs", "new-team-canary", Scope::Team));
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(
+        held(&b, &ka),
+        [me.clone()],
+        "new private canary left off instance"
+    );
+    assert_eq!(
+        held(&a, &kb),
+        [theirs.clone()],
+        "new team canary entered off instance"
+    );
+    // Disabling sync does not purge previously replicated entries.
+    assert_eq!(held(&a, &ka), [me, live]);
+    assert_eq!(held(&b, &kb), [theirs, inbound]);
+}
