@@ -675,13 +675,25 @@ pub fn member_with(
     dir: &std::path::Path,
     body: Value,
 ) -> (std::process::Child, String, std::path::PathBuf) {
+    member_with_origin(dir, body, None)
+}
+
+pub fn member_with_origin(
+    dir: &std::path::Path,
+    body: Value,
+    origin: Option<&str>,
+) -> (std::process::Child, String, std::path::PathBuf) {
     let file = dir.join("sessions.json");
     std::fs::write(&file, body.to_string()).unwrap();
     let sock = dir.join("sock");
     let log = std::fs::File::create(dir.join("member.log")).unwrap();
     let token = ulid();
-    let mut child = Command::new(EXE)
-        .arg("member")
+    let mut command = Command::new(EXE);
+    command.arg("member");
+    if let Some(origin) = origin {
+        command.args(["--goosetown-origin", origin]);
+    }
+    let mut child = command
         .arg("--home")
         .arg(dir.join("home"))
         .arg("--snapshot")

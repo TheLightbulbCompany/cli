@@ -2053,6 +2053,7 @@ dependencies = [
  "tokio-websockets",
  "toml_edit",
  "ulid",
+ "url",
 ]
 
 [[package]]

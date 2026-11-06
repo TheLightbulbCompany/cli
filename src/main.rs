@@ -317,6 +317,9 @@ enum Command {
         name: String,
         #[arg(long)]
         relay: Option<String>,
+        /// Trusted origin for GooseTown binding proofs, if enabled.
+        #[arg(long)]
+        goosetown_origin: Option<String>,
         /// The sessions file: {"workspace", "sessions": [{"name", "agent", "title"?}]}.
         #[arg(long)]
         sessions: std::path::PathBuf,
@@ -499,6 +502,7 @@ fn run() -> lightbulb::Result<()> {
             name,
             relay,
             sessions,
+            goosetown_origin,
         } => {
             let mut token = String::new();
             std::io::stdin().read_line(&mut token)?;
@@ -510,6 +514,7 @@ fn run() -> lightbulb::Result<()> {
                 name,
                 relay,
                 sessions,
+                goosetown_origin,
             };
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(member::run(opts, token))?;

@@ -265,6 +265,12 @@ pub(crate) async fn boot(
 }
 
 impl Instance {
+    pub(crate) fn set_goosetown_origin(&self, origin: Option<String>) {
+        if let Some(cloud) = &self.daemon.cloud {
+            *cloud.goosetown_origin.lock().unwrap() = origin;
+        }
+    }
+
     /// One IPC op (`{id, op, ...}`, as on the socket), answered in process. Every person-only
     /// op is refused (`bad_request`, reason `not_a_person`) but `team.join` and `team.leave`:
     /// the caller is the bridge, acting for a
