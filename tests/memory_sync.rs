@@ -486,7 +486,6 @@ async fn instance_sync_off_blocks_same_person_memory_but_keeps_mail() {
         std::slice::from_ref(&theirs),
         "new team canary entered off instance"
     );
-    // Disabling sync does not purge previously replicated entries.
     assert_eq!(held(&a, &ka), [me, live]);
     assert_eq!(held(&b, &kb), [theirs, inbound]);
 }

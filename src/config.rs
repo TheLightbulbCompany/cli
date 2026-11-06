@@ -90,8 +90,8 @@ pub struct Config {
     pub telemetry: bool,
     /// `remember` and `memory share` may write `team` entries (`memory team on|off`).
     pub memory_team: bool,
-    /// Per-instance network memory replication; disabled only in this instance.
-    /// Not a `config set` setting. Defaults preserve private teams.
+    /// Per-instance network memory replication, enabled by default. Not a `config set` setting.
+    /// Turning it off doesn't remove entries already copied to or from peers.
     pub memory_sync: bool,
     /// What of this computer's sessions goes to the account: `off` (the default), and, once
     /// signed in, the modes the sign-in asks for.
