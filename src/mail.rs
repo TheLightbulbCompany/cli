@@ -1385,12 +1385,11 @@ fn judge_message(
     let member = format!("member:{}", peer.short);
     // With no document, the roster is the workspace (`org:*` matches its members).
     let member_org = judge.workspace.unwrap_or(&roster.team_id);
-    let requester_org =
-        if roster.governed && !roster.is_founder(&peer.key) && judge.workspace.is_none() {
-            None
-        } else {
-            Some(a.map_or(member_org, |a| a.requester_org.as_str()))
-        };
+    let requester_org = if roster.governed && !roster.is_founder(&peer.key) {
+        a.map(|a| a.requester_org.as_str())
+    } else {
+        Some(a.map_or(member_org, |a| a.requester_org.as_str()))
+    };
     let chain_agents: Vec<String> = a.map_or(vec![], |a| {
         a.chain.iter().filter_map(|h| h.agent.clone()).collect()
     });
@@ -2449,6 +2448,20 @@ mod tests {
         peer.role = crate::roster::Role::Founder;
         roster.members.insert(peer.key.clone(), peer.clone());
         assert_eq!(decision(&peer, &roster).effect, crate::rules::Effect::Allow);
+    }
+
+    #[test]
+    fn governed_non_founder_does_not_inherit_a_stored_workspace_rules_org() {
+        let (peer, mut roster, _) = peer_mail("m/codex:c", "r-governed-doc");
+        roster.governed = true;
+        let rules = crate::rules::default_rules();
+        let judge = Judge {
+            rules: &rules,
+            workspace: Some("org_host"),
+            ..Judge::default()
+        };
+        let decision = judge_message(&judge, &peer, &roster, "m/codex:c", "message", false, None).0;
+        assert_eq!(decision.effect, crate::rules::Effect::Hold);
     }
 
     fn peer_env(from: &str, to: &str, rid: &str, kind: &str, meta: Meta) -> Frame {

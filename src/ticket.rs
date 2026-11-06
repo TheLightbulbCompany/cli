@@ -38,9 +38,6 @@ pub struct Ticket {
     /// it and keeps dialing while the workspace wakes. Absent from a computer's tickets.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wake: Option<Wake>,
-    /// Optional expected joining member key; covered by the inviter signature.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub for_key: Option<String>,
     /// Signed target hint; false is omitted to preserve legacy private ticket bytes.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub governed: bool,
@@ -115,7 +112,6 @@ pub fn sign(
         members,
         expires_at,
         wake,
-        for_key: None,
         governed: roster.governed,
         sig: String::new(),
     };
@@ -123,42 +119,10 @@ pub fn sign(
     t
 }
 
-/// Mint a one-use ticket bound before its link is published.
-/// Only a governed founder may mint a candidate-bound link.
-pub fn mint_for(
-    id: &Identity,
-    roster: &Roster,
-    candidate: &str,
-    now: i64,
-    hints: (String, Vec<String>),
-    wake: Option<Wake>,
-) -> Result<(Ticket, String)> {
-    if !roster.governed || !roster.is_founder(&id.key) {
-        return Err("unsupported".into());
-    }
-    if !valid_key(candidate) {
-        return Err("bad_ticket".into());
-    }
-    let (mut t, hashed) = mint(id, roster, "open", true, now, hints, wake);
-    t.for_key = Some(candidate.into());
-    t.sig = id.sign(&value(&t));
-    Ok((t, hashed.expect("once link always has a secret hash")))
-}
-
-pub(crate) fn valid_key(candidate: &str) -> bool {
-    identity::key_bytes(candidate)
-        .and_then(|bytes| ed25519_dalek::VerifyingKey::from_bytes(&bytes).ok())
-        .is_some()
-}
-
 /// The `link` entry body for `t`; `hashed` is `mint`'s second value.
 pub fn link_body(t: &Ticket, hashed: Option<&str>) -> Value {
-    let mut body = json!({"ticket_id": t.ticket_id, "secret": hashed.unwrap_or(&t.secret),
-           "mode": t.mode, "once": hashed.is_some(), "expires_at": t.expires_at});
-    if let Some(key) = &t.for_key {
-        body["for_key"] = key.clone().into();
-    }
-    body
+    json!({"ticket_id": t.ticket_id, "secret": hashed.unwrap_or(&t.secret),
+           "mode": t.mode, "once": hashed.is_some(), "expires_at": t.expires_at})
 }
 
 fn value(t: &Ticket) -> Value {
@@ -208,7 +172,6 @@ pub fn verify(t: &Ticket, roster: &Roster) -> Result<()> {
             l.signer == t.inviter
                 && l.mode == t.mode
                 && l.secret == secret
-                && l.for_key == t.for_key
                 && t.governed == roster.governed
         });
     if ok {
@@ -277,17 +240,6 @@ mod tests {
         );
         let r = replay(&[g, ax, l]);
         (f, x, r, t)
-    }
-
-    #[test]
-    fn bound_mint_rejects_malformed_keys() {
-        let f = id();
-        let g = crate::daemon::net_ops::founder_solo_genesis(&f, None, "f", 1);
-        let roster = replay(&[g]);
-        assert!(mint_for(&f, &roster, &id().key, 100, (String::new(), vec![]), None).is_ok());
-        for candidate in ["", "not-a-key", "1234"] {
-            assert!(mint_for(&f, &roster, candidate, 100, (String::new(), vec![]), None).is_err());
-        }
     }
 
     #[test]

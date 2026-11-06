@@ -62,6 +62,10 @@ fn gate(op: &str) -> Gate {
 /// Removes member `key` as the person (the Remove button of an agent-approval notice).
 pub fn remove_member(d: &Daemon, key: &str) {
     let mut team = d.team.lock().unwrap();
+    if team.roster.governed && !team.roster.is_founder(&d.identity.key) {
+        eprintln!("team.remove: {NOT_ADMIN}");
+        return;
+    }
     let store = d.store.lock().unwrap();
     let ops = TeamOps {
         id: 0,
@@ -123,14 +127,6 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, caller: Caller) 
         if op == "team.invite" && actor.is_none() && !instance {
             return refused(id, "not_a_person");
         }
-        let invite = if body.get("for_key").is_some() {
-            if invite == Invite::New {
-                return Response::err(id, BAD_REQUEST);
-            }
-            Invite::Once
-        } else {
-            invite
-        };
         let store = daemon.store.lock().unwrap();
         let ops = TeamOps {
             id,
@@ -374,9 +370,18 @@ async fn tell(daemon: &Daemon, leave: Entry) -> bool {
 
 /// The genesis of a solo network: `me`, called `name`, the founder of a team `team_name`.
 pub fn genesis(me: &Identity, name: &str, computer: &str, team_name: &str, at: i64) -> Entry {
-    let body = json!({"member": me.key, "name": name, "computer": computer,
-        "role": "founder", "ticket_id": "", "team_name": team_name});
-    Entry::signed(me, vec![], Kind::Admit, body, at)
+    Entry::signed(
+        me,
+        vec![],
+        Kind::Admit,
+        genesis_body(me, name, computer, team_name),
+        at,
+    )
+}
+
+fn genesis_body(me: &Identity, name: &str, computer: &str, team_name: &str) -> Value {
+    json!({"member": me.key, "name": name, "computer": computer,
+        "role": "founder", "ticket_id": "", "team_name": team_name})
 }
 
 /// This engine's solo network (`genesis`): a computer's, named for its user, or an instance's
@@ -394,7 +399,9 @@ pub(crate) fn founder_solo_genesis(
     computer: &str,
     at: i64,
 ) -> Entry {
-    let mut body = solo_genesis(me, cloud, computer, at).body;
+    let user = super::user_name();
+    let name = cloud.unwrap_or(&user);
+    let mut body = genesis_body(me, name, computer, name);
     body["governance"] = "founder".into();
     Entry::signed(me, vec![], Kind::Admit, body, at)
 }
@@ -639,37 +646,24 @@ impl TeamOps<'_> {
                     && r.links
                         .values()
                         .any(|l| l.signer == me_key && l.expires_at > self.now);
-                let t = if let Some(value) = body.get("for_key") {
-                    let Some(candidate) = value.as_str() else {
-                        return Ok(Response::err(id, BAD_REQUEST));
-                    };
-                    if !ticket::valid_key(candidate) {
-                        return Ok(Response::err(id, BAD_REQUEST));
+                let t = match live {
+                    // Never an instance's: its links are all once, so none reprints.
+                    Some(l) if invite != Invite::New => {
+                        let hint = self.daemon.peers.hints();
+                        let expires_at = l.expires_at;
+                        ticket::sign(
+                            identity,
+                            r,
+                            l.ticket_id,
+                            l.secret,
+                            mode,
+                            expires_at,
+                            hint,
+                            None,
+                        )
                     }
-                    if !r.governed {
-                        return Ok(Response::err(id, UNSUPPORTED));
-                    }
-                    self.new_bound_link(candidate)?
-                } else {
-                    match live {
-                        // Never an instance's: its links are all once, so none reprints.
-                        Some(l) if invite != Invite::New => {
-                            let hint = self.daemon.peers.hints();
-                            let expires_at = l.expires_at;
-                            ticket::sign(
-                                identity,
-                                r,
-                                l.ticket_id,
-                                l.secret,
-                                mode,
-                                expires_at,
-                                hint,
-                                None,
-                            )
-                        }
-                        // `--new` ends every earlier link of this computer, `open` and once ones too.
-                        _ => self.new_link(mode, invite.once(), invite == Invite::New)?,
-                    }
+                    // `--new` ends every earlier link of this computer, `open` and once ones too.
+                    _ => self.new_link(mode, invite.once(), invite == Invite::New)?,
                 };
                 if let Some(a) = &self.agent {
                     let mut m = self.daemon.agent_invites.lock().unwrap();
@@ -698,6 +692,9 @@ impl TeamOps<'_> {
                     return Ok(Response::err(id, FOUNDER));
                 }
                 self.write(Kind::Remove, json!({"member": t.key}))?;
+                if self.team.roster.governed {
+                    return Ok(Response::ok(id, json!({"name": t.name})));
+                }
                 let link = self.new_link(LINK_MODE, false, false)?;
                 Response::ok(id, json!({"name": t.name, "line": ticket::line(&link)}))
             }
@@ -709,33 +706,6 @@ impl TeamOps<'_> {
         write(self.daemon, self.team, self.store, kind, body, self.now)
     }
 
-    fn new_bound_link(&mut self, candidate: &str) -> crate::Result<ticket::Ticket> {
-        let wake = self
-            .daemon
-            .cloud
-            .as_ref()
-            .and_then(|c| c.wake.lock().unwrap().clone());
-        let (ticket, hashed) = ticket::mint_for(
-            &self.daemon.identity,
-            &self.team.roster,
-            candidate,
-            self.now,
-            self.daemon.peers.hints(),
-            wake,
-        )?;
-        self.write(Kind::Link, ticket::link_body(&ticket, Some(&hashed)))?;
-        self.store.put_link(
-            &ticket.ticket_id,
-            &ticket.secret,
-            Some(&hashed),
-            LINK_MODE,
-            ticket.expires_at,
-        )?;
-        Ok(ticket)
-    }
-
-    /// Mints a link of `mode` off the cached roster (signed into the roster, recorded in
-    /// `team_link`; with `ends_all`, ending every earlier link of ours): its ticket.
     fn new_link(
         &mut self,
         mode: &str,
@@ -772,6 +742,9 @@ impl TeamOps<'_> {
 /// A fresh once `ask` link for an invite code to serve (`code::offer`): its ticket.
 pub(crate) fn code_link(daemon: &Daemon) -> crate::Result<ticket::Ticket> {
     let mut team = daemon.team.lock().unwrap();
+    if team.roster.governed && !team.roster.is_founder(&daemon.identity.key) {
+        return Err(NOT_ADMIN.into());
+    }
     let store = daemon.store.lock().unwrap();
     let mut ops = TeamOps {
         id: 0,
