@@ -127,6 +127,14 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, caller: Caller) 
         if op == "team.invite" && actor.is_none() && !instance {
             return refused(id, "not_a_person");
         }
+        let invite = if body.get("for_key").is_some() {
+            if invite == Invite::New {
+                return Response::err(id, BAD_REQUEST);
+            }
+            Invite::Once
+        } else {
+            invite
+        };
         let store = daemon.store.lock().unwrap();
         let ops = TeamOps {
             id,
@@ -646,24 +654,37 @@ impl TeamOps<'_> {
                     && r.links
                         .values()
                         .any(|l| l.signer == me_key && l.expires_at > self.now);
-                let t = match live {
-                    // Never an instance's: its links are all once, so none reprints.
-                    Some(l) if invite != Invite::New => {
-                        let hint = self.daemon.peers.hints();
-                        let expires_at = l.expires_at;
-                        ticket::sign(
-                            identity,
-                            r,
-                            l.ticket_id,
-                            l.secret,
-                            mode,
-                            expires_at,
-                            hint,
-                            None,
-                        )
+                let t = if let Some(value) = body.get("for_key") {
+                    let Some(candidate) = value.as_str() else {
+                        return Ok(Response::err(id, BAD_REQUEST));
+                    };
+                    if !ticket::valid_key(candidate) {
+                        return Ok(Response::err(id, BAD_REQUEST));
                     }
-                    // `--new` ends every earlier link of this computer, `open` and once ones too.
-                    _ => self.new_link(mode, invite.once(), invite == Invite::New)?,
+                    if !r.governed {
+                        return Ok(Response::err(id, UNSUPPORTED));
+                    }
+                    self.new_bound_link(candidate)?
+                } else {
+                    match live {
+                        // Never an instance's: its links are all once, so none reprints.
+                        Some(l) if invite != Invite::New => {
+                            let hint = self.daemon.peers.hints();
+                            let expires_at = l.expires_at;
+                            ticket::sign(
+                                identity,
+                                r,
+                                l.ticket_id,
+                                l.secret,
+                                mode,
+                                expires_at,
+                                hint,
+                                None,
+                            )
+                        }
+                        // `--new` ends every earlier link of this computer, `open` and once ones too.
+                        _ => self.new_link(mode, invite.once(), invite == Invite::New)?,
+                    }
                 };
                 if let Some(a) = &self.agent {
                     let mut m = self.daemon.agent_invites.lock().unwrap();
@@ -706,6 +727,33 @@ impl TeamOps<'_> {
         write(self.daemon, self.team, self.store, kind, body, self.now)
     }
 
+    fn new_bound_link(&mut self, candidate: &str) -> crate::Result<ticket::Ticket> {
+        let wake = self
+            .daemon
+            .cloud
+            .as_ref()
+            .and_then(|c| c.wake.lock().unwrap().clone());
+        let (ticket, hashed) = ticket::mint_for(
+            &self.daemon.identity,
+            &self.team.roster,
+            candidate,
+            self.now,
+            self.daemon.peers.hints(),
+            wake,
+        )?;
+        self.write(Kind::Link, ticket::link_body(&ticket, Some(&hashed)))?;
+        self.store.put_link(
+            &ticket.ticket_id,
+            &ticket.secret,
+            Some(&hashed),
+            LINK_MODE,
+            ticket.expires_at,
+        )?;
+        Ok(ticket)
+    }
+
+    /// Mints a link of `mode` off the cached roster (signed into the roster, recorded in
+    /// `team_link`; with `ends_all`, ending every earlier link of ours): its ticket.
     fn new_link(
         &mut self,
         mode: &str,

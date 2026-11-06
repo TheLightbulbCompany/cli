@@ -289,6 +289,9 @@ fn check(
     let t = &req.ticket;
     ticket::verify(t, r).map_err(|_| BAD_TICKET)?;
     let link = &r.links[&t.ticket_id];
+    if t.for_key.as_ref().is_some_and(|key| key != &req.candidate) {
+        return Err(BAD_TICKET);
+    }
     if link.expires_at <= now {
         return Err(EXPIRED_TICKET);
     }

@@ -1262,3 +1262,61 @@ fn governed_non_founder_instance_is_not_an_administrator() {
     unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
     exits_zero(child);
 }
+
+#[test]
+fn governed_founder_mints_bound_tickets_and_can_remove_from_instance() {
+    let dir = tempfile::tempdir().unwrap();
+    let (child, token, sock) = common::member_with_governance(
+        dir.path(),
+        json!({"workspace": NAME, "sessions": []}),
+        None,
+        true,
+    );
+    let candidate_env = common::Env::new();
+    let candidate = candidate_env.identity();
+    candidate_env.daemon(false, "", &[]);
+    let invite = ok(
+        &sock,
+        &token,
+        "team.invite",
+        json!({"for_key": candidate.key}),
+    );
+    let encoded = invite["ticket"]
+        .as_str()
+        .or_else(|| invite["link"].as_str())
+        .expect("invite ticket");
+    let ticket = lightbulb::ticket::decode(encoded).unwrap();
+    assert!(ticket.governed);
+    assert_eq!(ticket.for_key.as_deref(), Some(candidate.key.as_str()));
+    assert!(lightbulb::ticket::signed_by_inviter(&ticket));
+    let wrong = common::Env::new();
+    wrong.daemon(false, "", &[]);
+    let refused = common::person(
+        &wrong,
+        json!({"id":1,"op":"team.join","ticket":encoded,"name":"wrong"}),
+    );
+    assert_eq!(refused["state"], "refused", "{refused}");
+    assert_eq!(refused["reason"], "bad_ticket", "{refused}");
+    let joined = common::person(
+        &candidate_env,
+        json!({"id":1,"op":"team.join","ticket":encoded,"name":"candidate"}),
+    );
+    assert_eq!(joined["state"], "admitted", "{joined}");
+    let candidate_roster = roster::replay(&roster::entries(&candidate_env.store()).unwrap());
+    assert!(candidate_roster.governed);
+    assert!(candidate_roster.members.contains_key(&candidate.key));
+    let removed = line(
+        &sock,
+        &token,
+        "team.remove",
+        json!({"member":candidate.key}),
+    );
+    assert_eq!(removed["ok"], true, "{removed}");
+    assert!(removed["result"].get("line").is_none());
+    let bad = line(&sock, &token, "team.invite", json!({"for_key":"not-a-key"}));
+    assert_eq!(bad["error"], "bad_request");
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    exits_zero(child);
+    let store = Store::open(&dir.path().join("home/state.db")).unwrap();
+    assert!(roster::replay(&roster::entries(&store).unwrap()).governed);
+}
