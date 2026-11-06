@@ -830,6 +830,9 @@ impl Net {
                 _ = tick.tick() => {}
                 _ = self.0.endpoint.closed() => return,
             }
+            if !d.team.lock().unwrap().config.memory_sync {
+                continue;
+            }
             let dd = d.clone();
             let ours =
                 tokio::task::spawn_blocking(move || memory::heads(&dd.store.lock().unwrap()));
@@ -920,8 +923,16 @@ impl Net {
                     continue;
                 };
                 push_delta(&l.tx, r, heads, &mut memo, true);
-                let _ =
-                    l.tx.send((hello(r, protocol, addrs.clone(), own_proof(d)), None));
+                let _ = l.tx.send((
+                    hello(
+                        r,
+                        protocol,
+                        addrs.clone(),
+                        own_proof(d),
+                        team.config.memory_sync,
+                    ),
+                    None,
+                ));
                 // After the push the peer holds all of ours: the next change sends only itself.
                 l.protocol = Protocol::Ok(r.heads.clone());
             }
@@ -1009,7 +1020,16 @@ impl Net {
                     // The first frame, written once the stream is open.
                     let protocol = d.peers.knobs().protocol;
                     let addrs = d.peers.own_addrs();
-                    let _ = tx.send((hello(&team.roster, protocol, addrs, own_proof(d)), None));
+                    let _ = tx.send((
+                        hello(
+                            &team.roster,
+                            protocol,
+                            addrs,
+                            own_proof(d),
+                            team.config.memory_sync,
+                        ),
+                        None,
+                    ));
                     None
                 } else {
                     Some((SUPERSEDED, b"superseded"))
@@ -1153,7 +1173,7 @@ impl Net {
             });
             d.peers.connected.notify_waiters();
             hello_ok = true;
-            send_memory_heads = memory;
+            send_memory_heads = memory && team.config.memory_sync;
         } else if let Frame::MemoryHeads { heads } = f {
             memory_heads = Some(heads);
         } else if let Frame::Memory { entries, .. } = f {
@@ -1208,7 +1228,9 @@ impl Net {
                 let _ = tx.send((crate::presence::for_hello(&d), None));
             });
         }
-        if let Some(theirs) = memory_heads.filter(|_| d.peers.speaks_memory(key, conn)) {
+        if let Some(theirs) = memory_heads.filter(|_| {
+            d.team.lock().unwrap().config.memory_sync && d.peers.speaks_memory(key, conn)
+        }) {
             let (d, tx, key, conn) = (d.clone(), tx.clone(), key.to_string(), conn.clone());
             tokio::task::spawn_blocking(move || {
                 // What the peer holds of ours numbers our next entry (`memory::saw`).
@@ -1235,7 +1257,9 @@ impl Net {
                 }
             });
         }
-        if let Some(entries) = memory_entries.filter(|_| d.peers.speaks_memory(key, conn)) {
+        if let Some(entries) = memory_entries.filter(|_| {
+            d.team.lock().unwrap().config.memory_sync && d.peers.speaks_memory(key, conn)
+        }) {
             let (d, short) = (d.clone(), short.clone());
             tokio::task::spawn_blocking(move || memsync::store(&d, &short, &entries));
         }
@@ -1559,13 +1583,19 @@ fn apply(d: &Daemon, pending: &mut Vec<Entry>, from: &str) -> Result<Vec<String>
     Ok(team.roster.heads.clone())
 }
 
-fn hello(r: &Roster, protocol: u32, addrs: Vec<String>, proof: Option<String>) -> Frame {
+fn hello(
+    r: &Roster,
+    protocol: u32,
+    addrs: Vec<String>,
+    proof: Option<String>,
+    memory_sync: bool,
+) -> Frame {
     Frame::Hello {
         protocol,
         heads: r.heads.clone(),
         addrs,
         proof,
-        memory: true,
+        memory: memory_sync,
     }
 }
 
