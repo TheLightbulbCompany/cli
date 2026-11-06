@@ -320,6 +320,9 @@ enum Command {
         /// Trusted origin for GooseTown binding proofs, if enabled.
         #[arg(long)]
         goosetown_origin: Option<String>,
+        /// Create a new founder-governed network; immutable after genesis.
+        #[arg(long, value_parser = ["founder"])]
+        governance: Option<String>,
         /// The sessions file: {"workspace", "sessions": [{"name", "agent", "title"?}]}.
         #[arg(long)]
         sessions: std::path::PathBuf,
@@ -503,6 +506,7 @@ fn run() -> lightbulb::Result<()> {
             relay,
             sessions,
             goosetown_origin,
+            governance,
         } => {
             let mut token = String::new();
             std::io::stdin().read_line(&mut token)?;
@@ -515,6 +519,7 @@ fn run() -> lightbulb::Result<()> {
                 relay,
                 sessions,
                 goosetown_origin,
+                founder_governed: governance.is_some(),
             };
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(member::run(opts, token))?;

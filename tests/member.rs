@@ -1182,3 +1182,83 @@ fn goosetown_binding_without_configured_origin_is_disabled() {
     ok(&sock, &token, "stop", json!({}));
     exits_zero(child);
 }
+
+#[test]
+fn governed_founder_mints_once_tickets_and_removes_without_minting_another_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let (child, token, sock) = common::member_with_governance(
+        dir.path(),
+        json!({"workspace": NAME, "sessions": []}),
+        None,
+        true,
+    );
+    let candidate_env = common::Env::new();
+    let candidate = candidate_env.identity();
+    candidate_env.daemon(false, "", &[]);
+    let invite = ok(&sock, &token, "team.invite", json!({"mode":"once"}));
+    let encoded = invite["ticket"]
+        .as_str()
+        .or_else(|| invite["link"].as_str())
+        .expect("invite ticket");
+    let ticket = lightbulb::ticket::decode(encoded).unwrap();
+    assert!(ticket.governed);
+    assert!(lightbulb::ticket::signed_by_inviter(&ticket));
+    let joined = common::person(
+        &candidate_env,
+        json!({"id":1,"op":"team.join","ticket":encoded,"name":"candidate"}),
+    );
+    assert_eq!(joined["state"], "admitted", "{joined}");
+    let candidate_roster = roster::replay(&roster::entries(&candidate_env.store()).unwrap());
+    assert!(candidate_roster.governed);
+    assert!(candidate_roster.members.contains_key(&candidate.key));
+    let removed = line(
+        &sock,
+        &token,
+        "team.remove",
+        json!({"member":candidate.key}),
+    );
+    assert_eq!(removed["ok"], true, "{removed}");
+    assert!(
+        removed["result"].get("line").is_none(),
+        "a governed removal must not mint a reusable invite: {removed}"
+    );
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    exits_zero(child);
+    let store = Store::open(&dir.path().join("home/state.db")).unwrap();
+    assert!(roster::replay(&roster::entries(&store).unwrap()).governed);
+}
+
+#[test]
+fn governed_non_founder_instance_is_not_an_administrator() {
+    let dir = tempfile::tempdir().unwrap();
+    let founder = seed(dir.path());
+    let db = dir.path().join("home/state.db");
+    let store = Store::open(&db).unwrap();
+    let old = roster::entries(&store).unwrap();
+    let mut body = old
+        .iter()
+        .find(|e| e.parents.is_empty())
+        .unwrap()
+        .body
+        .clone();
+    body["governance"] = json!("founder");
+    let g = Entry::signed(&founder, vec![], Kind::Admit, body, 1);
+    let mine = Identity::load_or_create(&dir.path().join("home")).unwrap();
+    let admitted = common::admit(&founder, &g, &mine, NAME, json!({}));
+    store.clear_roster().unwrap();
+    for e in [&g, &admitted] {
+        roster::accept(&store, e, 10).unwrap();
+    }
+    drop(store);
+    let (child, token, sock) = member(dir.path(), json!([]));
+    for (op, body) in [
+        ("team.invite", json!({})),
+        ("team.remove", json!({"member": founder.key})),
+        ("relay.set", json!({"url": "https://example.test"})),
+    ] {
+        let r = line(&sock, &token, op, body);
+        assert_eq!(r["error"], "not_admin", "{op}: {r}");
+    }
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    exits_zero(child);
+}

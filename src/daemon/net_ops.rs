@@ -62,6 +62,10 @@ fn gate(op: &str) -> Gate {
 /// Removes member `key` as the person (the Remove button of an agent-approval notice).
 pub fn remove_member(d: &Daemon, key: &str) {
     let mut team = d.team.lock().unwrap();
+    if team.roster.governed && !team.roster.is_founder(&d.identity.key) {
+        eprintln!("team.remove: {NOT_ADMIN}");
+        return;
+    }
     let store = d.store.lock().unwrap();
     let ops = TeamOps {
         id: 0,
@@ -111,13 +115,18 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, caller: Caller) 
         // Removal needs a person at the socket, before any authority check; an invite, a join
         // (on macOS once its person confirms) and an answer also take a resolved agent session
         // (`Caller::actor`), and an invite the workspace's bridge, whose token is its authority.
-        if gate.person_only && !caller.is_person() {
+        let mut team = daemon.team.lock().unwrap();
+        let governed_founder = team.roster.governed && team.roster.is_founder(&daemon.identity.key);
+        if team.roster.governed && !governed_founder && matches!(op, "team.invite" | "team.remove")
+        {
+            return Response::err(id, NOT_ADMIN);
+        }
+        if gate.person_only && !caller.is_person() && !(instance && governed_founder) {
             return refused(id, "not_a_person");
         }
         if op == "team.invite" && actor.is_none() && !instance {
             return refused(id, "not_a_person");
         }
-        let mut team = daemon.team.lock().unwrap();
         let store = daemon.store.lock().unwrap();
         let ops = TeamOps {
             id,
@@ -216,6 +225,12 @@ pub fn reload(daemon: &Daemon) -> crate::Result<()> {
 /// `meta {relay}`, so the whole team adopts it (`team: true`). In effect before the answer.
 /// A person only: it moves where this computer's traffic goes.
 fn relay_set(id: u64, body: &Value, daemon: &Daemon, caller: Caller) -> Response {
+    {
+        let team = daemon.team.lock().unwrap();
+        if team.roster.governed && !team.roster.is_founder(&daemon.identity.key) {
+            return Response::err(id, NOT_ADMIN);
+        }
+    }
     if !caller.is_person() {
         return refused(id, "not_a_person");
     }
@@ -355,9 +370,18 @@ async fn tell(daemon: &Daemon, leave: Entry) -> bool {
 
 /// The genesis of a solo network: `me`, called `name`, the founder of a team `team_name`.
 pub fn genesis(me: &Identity, name: &str, computer: &str, team_name: &str, at: i64) -> Entry {
-    let body = json!({"member": me.key, "name": name, "computer": computer,
-        "role": "founder", "ticket_id": "", "team_name": team_name});
-    Entry::signed(me, vec![], Kind::Admit, body, at)
+    Entry::signed(
+        me,
+        vec![],
+        Kind::Admit,
+        genesis_body(me, name, computer, team_name),
+        at,
+    )
+}
+
+fn genesis_body(me: &Identity, name: &str, computer: &str, team_name: &str) -> Value {
+    json!({"member": me.key, "name": name, "computer": computer,
+        "role": "founder", "ticket_id": "", "team_name": team_name})
 }
 
 /// This engine's solo network (`genesis`): a computer's, named for its user, or an instance's
@@ -366,6 +390,20 @@ pub(crate) fn solo_genesis(me: &Identity, cloud: Option<&str>, computer: &str, a
     let user = super::user_name();
     let name = cloud.unwrap_or(&user);
     genesis(me, name, computer, name, at)
+}
+
+/// Only an explicitly opted-in member creates this immutable signed authority mode.
+pub(crate) fn founder_solo_genesis(
+    me: &Identity,
+    cloud: Option<&str>,
+    computer: &str,
+    at: i64,
+) -> Entry {
+    let user = super::user_name();
+    let name = cloud.unwrap_or(&user);
+    let mut body = genesis_body(me, name, computer, name);
+    body["governance"] = "founder".into();
+    Entry::signed(me, vec![], Kind::Admit, body, at)
 }
 
 /// Whether `path` is absolute and names nothing in (or of) state dir `dir`: a snapshot never
@@ -654,6 +692,9 @@ impl TeamOps<'_> {
                     return Ok(Response::err(id, FOUNDER));
                 }
                 self.write(Kind::Remove, json!({"member": t.key}))?;
+                if self.team.roster.governed {
+                    return Ok(Response::ok(id, json!({"name": t.name})));
+                }
                 let link = self.new_link(LINK_MODE, false, false)?;
                 Response::ok(id, json!({"name": t.name, "line": ticket::line(&link)}))
             }
@@ -665,8 +706,6 @@ impl TeamOps<'_> {
         write(self.daemon, self.team, self.store, kind, body, self.now)
     }
 
-    /// Mints a link of `mode` off the cached roster (signed into the roster, recorded in
-    /// `team_link`; with `ends_all`, ending every earlier link of ours): its ticket.
     fn new_link(
         &mut self,
         mode: &str,
@@ -703,6 +742,9 @@ impl TeamOps<'_> {
 /// A fresh once `ask` link for an invite code to serve (`code::offer`): its ticket.
 pub(crate) fn code_link(daemon: &Daemon) -> crate::Result<ticket::Ticket> {
     let mut team = daemon.team.lock().unwrap();
+    if team.roster.governed && !team.roster.is_founder(&daemon.identity.key) {
+        return Err(NOT_ADMIN.into());
+    }
     let store = daemon.store.lock().unwrap();
     let mut ops = TeamOps {
         id: 0,

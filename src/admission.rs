@@ -88,6 +88,7 @@ fn words(v: Verdict) -> (&'static str, &'static str) {
 #[derive(Clone)]
 pub struct Request {
     ticket: Ticket,
+    governed: bool,
     proof: String,
     candidate: String,
     name: String,
@@ -100,6 +101,7 @@ impl Request {
     fn from_frame(f: &Frame) -> Option<Request> {
         let Frame::JoinRequest {
             ticket,
+            governed,
             secret_proof,
             candidate,
             name,
@@ -111,6 +113,7 @@ impl Request {
         };
         Some(Request {
             ticket: ticket::decode(ticket).ok()?,
+            governed: *governed,
             proof: secret_proof.clone(),
             candidate: candidate.clone(),
             name: name.clone(),
@@ -130,6 +133,7 @@ pub fn request(id: &Identity, t: &Ticket, name: &str, computer: &str) -> Frame {
         id,
         Frame::JoinRequest {
             ticket: ticket::encode(t),
+            governed: t.governed,
             secret_proof: proof(&t.secret, &id.key),
             candidate: id.key.clone(),
             name: name.into(),
@@ -279,6 +283,9 @@ fn check(
     me: &str,
     now: i64,
 ) -> Result<bool, &'static str> {
+    if r.governed && (!req.governed || !r.is_founder(me)) {
+        return Err(UNSUPPORTED);
+    }
     let t = &req.ticket;
     ticket::verify(t, r).map_err(|_| BAD_TICKET)?;
     let link = &r.links[&t.ticket_id];
@@ -729,4 +736,52 @@ fn take_roster(d: &Daemon, entries: &[Entry], team_id: &str) -> crate::Result<bo
     tx.commit()?;
     net_ops::install(d, &mut team, &store, new)?;
     Ok(true)
+}
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::*;
+
+    #[test]
+    fn private_ticket_and_request_preserve_old_signed_shapes() {
+        let home = tempfile::tempdir().unwrap();
+        let id = Identity::load_or_create(home.path()).unwrap();
+        let roster = crate::roster::replay(&[net_ops::solo_genesis(&id, None, "host", 1)]);
+        let (ticket, _) =
+            ticket::mint(&id, &roster, "ask", true, 10, (String::new(), vec![]), None);
+        let ticket_json = serde_json::to_value(&ticket).unwrap();
+        assert!(ticket_json.get("governed").is_none());
+        assert!(ticket_json.get("for_key").is_none());
+        assert!(ticket::signed_by_inviter(&ticket));
+        let frame = request(&id, &ticket, "candidate", "host");
+        let old_shape = serde_json::to_value(&frame).unwrap();
+        assert!(old_shape.get("governed").is_none());
+        let restored: Frame = serde_json::from_value(old_shape.clone()).unwrap();
+        assert!(signed_by(&id.key, &restored));
+        assert_eq!(serde_json::to_value(restored).unwrap(), old_shape);
+    }
+
+    #[test]
+    fn governed_target_requires_capable_candidate_before_ticket_checks() {
+        let home = tempfile::tempdir().unwrap();
+        let id = Identity::load_or_create(home.path()).unwrap();
+        let g = net_ops::founder_solo_genesis(&id, None, "host", 1);
+        let roster = crate::roster::replay(&[g]);
+        let (ticket, _) =
+            ticket::mint(&id, &roster, "ask", true, 10, (String::new(), vec![]), None);
+        assert!(ticket.governed);
+        let frame = request(&id, &ticket, "candidate", "host");
+        assert_eq!(serde_json::to_value(&frame).unwrap()["governed"], true);
+        let mut tampered = serde_json::to_value(&frame).unwrap();
+        tampered.as_object_mut().unwrap().remove("governed");
+        let old_shaped: Frame = serde_json::from_value(tampered).unwrap();
+        assert!(!signed_by(&id.key, &old_shaped));
+        let mut changed_ticket = ticket.clone();
+        changed_ticket.governed = false;
+        assert!(!ticket::signed_by_inviter(&changed_ticket));
+        let mut req = Request::from_frame(&frame).unwrap();
+        req.governed = false;
+        let store = Store::open(&home.path().join("state.db")).unwrap();
+        assert_eq!(check(&roster, &store, &req, &id.key, 11), Err(UNSUPPORTED));
+    }
 }

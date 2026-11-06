@@ -38,6 +38,9 @@ pub struct Ticket {
     /// it and keeps dialing while the workspace wakes. Absent from a computer's tickets.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wake: Option<Wake>,
+    /// Signed target hint; false is omitted to preserve legacy private ticket bytes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub governed: bool,
     pub sig: String,
 }
 
@@ -109,6 +112,7 @@ pub fn sign(
         members,
         expires_at,
         wake,
+        governed: roster.governed,
         sig: String::new(),
     };
     t.sig = id.sign(&value(&t));
@@ -165,7 +169,10 @@ pub fn verify(t: &Ticket, roster: &Roster) -> Result<()> {
             } else {
                 t.secret.clone()
             };
-            l.signer == t.inviter && l.mode == t.mode && l.secret == secret
+            l.signer == t.inviter
+                && l.mode == t.mode
+                && l.secret == secret
+                && t.governed == roster.governed
         });
     if ok {
         Ok(())

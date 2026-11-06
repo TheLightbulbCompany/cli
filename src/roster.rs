@@ -120,6 +120,8 @@ pub struct Link {
 pub struct Roster {
     pub team_id: String,
     pub team_name: String,
+    /// Immutable authority mode, signed into this network's genesis.
+    pub governed: bool,
     /// The genesis entry's stamp.
     pub created_at: i64,
     pub members: BTreeMap<String, Member>,
@@ -281,6 +283,12 @@ impl Roster {
         }
     }
 
+    pub(crate) fn is_founder(&self, key: &str) -> bool {
+        self.members
+            .get(key)
+            .is_some_and(|m| m.role == Role::Founder)
+    }
+
     pub fn by_short(&self, short: &str) -> Option<&Member> {
         self.members.values().find(|m| m.short == short)
     }
@@ -413,6 +421,7 @@ fn pass(
                 r.team_id = h.clone();
                 r.team_name = e.text("team_name").to_string();
                 r.created_at = e.at;
+                r.governed = e.body["governance"] == "founder";
                 r.members
                     .insert(e.signer.clone(), new_member(e, Role::Founder));
                 r.admissions.insert(e.signer.clone(), h.clone());
@@ -441,6 +450,12 @@ fn pass(
                     && !anc[rh.as_str()].contains(&h)
                     && !anc[h.as_str()].contains(rh)
             })
+        {
+            continue;
+        }
+        if r.governed
+            && signer.role != Role::Founder
+            && matches!(e.kind, Kind::Admit | Kind::Remove | Kind::Link)
         {
             continue;
         }
@@ -515,11 +530,13 @@ fn pass(
                     });
             }
             Kind::Meta => {
-                if let Some(n) = e.body["team_name"].as_str() {
-                    r.team_name = n.to_string();
-                }
-                if let Some(relay) = e.body["relay"].as_str() {
-                    r.relay = Some(relay.to_string());
+                if !r.governed || signer.role == Role::Founder {
+                    if let Some(n) = e.body["team_name"].as_str() {
+                        r.team_name = n.to_string();
+                    }
+                    if let Some(relay) = e.body["relay"].as_str() {
+                        r.relay = Some(relay.to_string());
+                    }
                 }
                 if let Some(w) = Wake::parse(&e.body["wake"]) {
                     r.wakes.insert(e.signer.clone(), w);
@@ -757,6 +774,12 @@ mod tests {
         Entry::signed(f, vec![], Kind::Admit, b, 1)
     }
 
+    fn governed_genesis(f: &Identity) -> Entry {
+        let mut body = genesis(f).body;
+        body["governance"] = json!("founder");
+        Entry::signed(f, vec![], Kind::Admit, body, 1)
+    }
+
     fn admit_via(by: &Identity, parent: &Entry, who: &str, name: &str, ticket: &str) -> Entry {
         let mut b = admit_body(who, name);
         b["ticket_id"] = json!(ticket);
@@ -975,6 +998,35 @@ mod tests {
         assert_eq!(r.relay.as_deref(), Some("r"));
         assert!(!r.members.contains_key(&b.key));
         assert!(r.members.contains_key(&x.key));
+    }
+
+    #[test]
+    fn governed_members_cannot_change_team_authority_but_can_leave() {
+        let (f, x, b, c) = (id(), id(), id(), id());
+        let g = governed_genesis(&f);
+        let ax = admit(&f, &g, &x.key, "x");
+        let ab = admit(&f, &ax, &b.key, "b");
+        let link = link_with(&x, &ab, &tid(&x, "no"), false);
+        let admitted = admit(&x, &link, &c.key, "c");
+        let removed = member(&x, &admitted, Kind::Remove, &b.key);
+        let meta = op(
+            &x,
+            &removed,
+            Kind::Meta,
+            json!({"team_name":"stolen","relay":"untrusted"}),
+        );
+        let entries = vec![g, ax, ab, link, admitted, removed, meta.clone()];
+        let r = replay(&entries);
+        assert!(r.governed);
+        assert!(r.members.contains_key(&b.key));
+        assert!(!r.members.contains_key(&c.key));
+        assert!(r.links.is_empty());
+        assert_eq!(r.team_name, "acme");
+        assert!(r.relay.is_none());
+        let leave = member(&x, &meta, Kind::Leave, &x.key);
+        assert!(!replay(&[entries, vec![leave]].concat())
+            .members
+            .contains_key(&x.key));
     }
 
     #[test]
