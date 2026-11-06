@@ -362,6 +362,10 @@ CREATE TABLE IF NOT EXISTS workers (
     ended_at INTEGER, state TEXT NOT NULL, by TEXT
 );
 CREATE INDEX IF NOT EXISTS workers_session ON workers (session);
+CREATE TABLE IF NOT EXISTS worker_senders (
+    assignment TEXT PRIMARY KEY, member_key TEXT NOT NULL,
+    team_id TEXT NOT NULL, admission_id TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS rules (
     workspace TEXT PRIMARY KEY, revision TEXT NOT NULL, iat INTEGER NOT NULL,
     jws TEXT NOT NULL, doc TEXT NOT NULL

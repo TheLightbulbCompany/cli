@@ -1,7 +1,7 @@
 //! The network ops, reached from `ipc::handle`'s fallback arm.
 
 use super::ipc::{
-    refused, Caller, Response, BAD_REQUEST, INTERNAL, NOT_FOUND, UNKNOWN_OP, UNSUPPORTED,
+    self, refused, Caller, Response, BAD_REQUEST, INTERNAL, NOT_FOUND, UNKNOWN_OP, UNSUPPORTED,
 };
 use super::{Daemon, TeamState};
 use crate::agents::caller;
@@ -445,6 +445,10 @@ pub fn install(
         daemon.peers.relays_changed(team);
     }
     daemon.roster_changed.notify_waiters();
+    if let Err(e) = crate::workers::reconcile_locked(daemon, store, &team.roster, ipc::now() as i64)
+    {
+        eprintln!("workers: roster reconciliation unavailable: {e}");
+    }
     if let Some((notice, root_at)) = removed {
         return removed_here(daemon, team, store, notice, root_at);
     }

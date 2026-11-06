@@ -19,6 +19,7 @@ use crate::daemon::{ipc, Daemon, TeamState};
 use crate::holds::{self, signed_record};
 use crate::identity::Identity;
 use crate::mail::{self, Meta, State};
+use crate::roster::{Member, Roster};
 use crate::rules::{self, Effect};
 use crate::sessions::{self, Key, PROVIDERS};
 use crate::store::{Message, Store, Worker};
@@ -31,6 +32,161 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::oneshot;
+
+/// Authenticated sender provenance, shared by its start hold and worker. Called in the
+/// receive transaction; a different authenticated sender cannot overwrite the original.
+pub(crate) fn bind_sender(
+    store: &Store,
+    assignment: &str,
+    member: &Member,
+    roster: &Roster,
+) -> Result<()> {
+    if roster.team_id.is_empty() || roster.members.get(&member.key) != Some(member) {
+        return Err("sender is not in the accepted network".into());
+    }
+    let admission = roster
+        .admission_id(&member.key)
+        .ok_or("sender admission unknown")?;
+    store.conn().execute(
+        "INSERT INTO worker_senders (assignment, member_key, team_id, admission_id) \
+         VALUES (?1, ?2, ?3, ?4) ON CONFLICT(assignment) DO NOTHING",
+        params![assignment, member.key, roster.team_id, admission],
+    )?;
+    let pinned: (String, String, String) = store.conn().query_row(
+        "SELECT member_key, team_id, admission_id FROM worker_senders WHERE assignment = ?1",
+        [assignment],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    if pinned != (member.key.clone(), roster.team_id.clone(), admission.into()) {
+        return Err("assignment sender provenance changed".into());
+    }
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SenderState {
+    Local,
+    Current,
+    Removed,
+    /// A legacy remote row has no admission epoch. Never guess one from its session short.
+    Unknown,
+}
+
+fn pinned_sender_state(
+    store: &Store,
+    roster: &Roster,
+    assignment: &str,
+) -> Result<Option<SenderState>> {
+    use rusqlite::OptionalExtension;
+    let pinned: Option<(String, String, String)> = store
+        .conn()
+        .query_row(
+            "SELECT member_key, team_id, admission_id FROM worker_senders WHERE assignment = ?1",
+            [assignment],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    Ok(pinned.map(|(key, team, admission)| {
+        if roster.team_id == team
+            && roster.members.contains_key(&key)
+            && roster.admission_id(&key) == Some(admission.as_str())
+        {
+            SenderState::Current
+        } else {
+            SenderState::Removed
+        }
+    }))
+}
+
+/// Database errors propagate, never masquerade as removal. Legacy rows have no trustworthy
+/// admission epoch: existing work keeps its old result/deadline behavior, while new starts
+/// and approvals require known provenance.
+pub(crate) fn sender_state(store: &Store, roster: &Roster, a: &Message) -> Result<SenderState> {
+    if !a.origin.as_deref().is_some_and(|o| o.starts_with("net:")) {
+        return Ok(SenderState::Local);
+    }
+    if let Some(state) = pinned_sender_state(store, roster, &a.id)? {
+        return Ok(state);
+    }
+    Ok(SenderState::Unknown)
+}
+
+pub(crate) const SENDER_REMOVED: &str = "sender_removed";
+pub(crate) const SENDER_UNKNOWN: &str = "sender_unknown";
+
+/// Plan before mutating: an unreadable/missing assignment cannot look like an empty roster.
+fn removal_plan(store: &Store, roster: &Roster) -> Result<(Vec<String>, Vec<i64>)> {
+    let mut workers = vec![];
+    for w in store.workers(true)? {
+        let state = match store.message(&w.assignment)? {
+            Some(a) => sender_state(store, roster, &a)?,
+            None => {
+                pinned_sender_state(store, roster, &w.assignment)?.unwrap_or(SenderState::Unknown)
+            }
+        };
+        if state == SenderState::Removed {
+            workers.push(w.assignment);
+        }
+    }
+    let mut holds = vec![];
+    for h in holds::open(store)? {
+        if h.kind() == holds::Kind::Worker
+            && sender_state(store, roster, &h.message)? == SenderState::Removed
+        {
+            holds.push(h.id);
+        }
+    }
+    Ok((workers, holds))
+}
+
+/// Called with team then store locks. Uses the accepted current roster (including fork
+/// resolution and remove+readmit), never only a notification or a short member name.
+pub(crate) fn reconcile_locked(d: &Daemon, store: &Store, roster: &Roster, now: i64) -> Result<()> {
+    let (workers, ids) = removal_plan(store, roster)?;
+    let declined = decline(store, &ids, SENDER_REMOVED, now)?;
+    for h in declined {
+        // Closing the notification must not depend on any later process cancellation.
+        holds::closed(d, &h, holds::DECLINE, None, Some(SENDER_REMOVED), None);
+    }
+    let mut first_error = None;
+    for assignment in workers {
+        if let Err(error) = cancel_worker_reason(
+            store,
+            &d.workers,
+            &assignment,
+            "roster",
+            now,
+            SENDER_REMOVED,
+        ) {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+    }
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn reconcile(d: &Daemon, now: i64) -> Result<()> {
+    let team = d.team.lock().unwrap();
+    let store = d.store.lock().unwrap();
+    reconcile_locked(d, &store, &team.roster, now)
+}
+
+/// Launch/approval gate: unlike legacy running work, unknown sender provenance cannot start anew.
+pub(crate) fn sender_refusal(
+    store: &Store,
+    roster: &Roster,
+    a: &Message,
+) -> Result<Option<&'static str>> {
+    Ok(match sender_state(store, roster, a)? {
+        SenderState::Local | SenderState::Current => None,
+        SenderState::Removed => Some(SENDER_REMOVED),
+        SenderState::Unknown => Some(SENDER_UNKNOWN),
+    })
+}
 
 /// What a member may do here: start a worker without asking, be asked, or be refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -420,6 +576,18 @@ pub fn start(d: &Arc<Daemon>, assign_id: &str) -> Result<Option<&'static str>> {
     let (claimed, base, asker) = {
         let team = d.team.lock().unwrap();
         let store = d.store.lock().unwrap();
+        if let Some(why) = sender_refusal(&store, &team.roster, &a)? {
+            mail::advance(
+                store.conn(),
+                &a.from_key,
+                &a.request_id,
+                State::Refused,
+                Some(why),
+                None,
+                now as u64,
+            )?;
+            return Ok(Some(why));
+        }
         let member = sessions::member_of(&a.from_key).unwrap_or_default();
         (
             claim(&store, &team.config, &a, &key.0, now)?,
@@ -742,6 +910,7 @@ fn named(d: &Daemon, team: &TeamState, who: &str) -> String {
 fn finish(d: &Arc<Daemon>, w: &Worker, o: Outcome, stopped: Option<Stop>) {
     let (status, reason, state) = match &stopped {
         Some(("cancelled", _)) => ("cancelled", None, "cancelled"),
+        Some((SENDER_REMOVED, _)) => ("cancelled", Some(SENDER_REMOVED), "cancelled"),
         Some(("stopped", _)) => ("failed", Some("stopped"), "stopped"),
         Some((r, _)) => ("failed", Some(*r), "failed"),
         None => (o.status, o.reason, o.status),
@@ -790,7 +959,7 @@ fn finish(d: &Arc<Daemon>, w: &Worker, o: Outcome, stopped: Option<Stop>) {
     };
     match (ended, prepared) {
         (Ok(true), Ok(Some(p))) => {
-            if let Err(e) = ipc::dispatch(d, &p) {
+            if let Err(e) = ipc::dispatch_worker_result(d, &p, &w.assignment) {
                 eprintln!("worker {}: result not sent: {e}", w.id);
             }
         }
@@ -1011,21 +1180,28 @@ fn stop_in(reg: &Registry, worker_id: i64, reason: &'static str, by: &str) -> Re
         return Ok(());
     };
     let _ = tell.send((reason, by.into()));
-    let below = u32::try_from(pgid)
-        .map(driver::descendants)
-        .unwrap_or_default();
-    driver::signal_each(&below, libc::SIGTERM);
-    kill_group(pgid, libc::SIGTERM);
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(5)).await;
-        driver::signal_each(&below, libc::SIGKILL);
-        // ponytail: a group id is reused only once all of its processes are gone and a new
-        // leader gets that pid; within 5 s that is not a risk worth a pidfd.
-        // SAFETY: signal 0 only asks whether the group exists.
-        if pgid > 0 && unsafe { libc::killpg(pgid, 0) } == 0 {
-            kill_group(pgid, libc::SIGKILL);
-        }
-    });
+    let signal = move || {
+        let below = u32::try_from(pgid)
+            .map(driver::descendants)
+            .unwrap_or_default();
+        driver::signal_each(&below, libc::SIGTERM);
+        kill_group(pgid, libc::SIGTERM);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            driver::signal_each(&below, libc::SIGKILL);
+            // Retains the existing bounded PGID-reuse assumption, not pidfd semantics.
+            if pgid > 0 && unsafe { libc::killpg(pgid, 0) } == 0 {
+                kill_group(pgid, libc::SIGKILL);
+            }
+        });
+    };
+    if reason == SENDER_REMOVED {
+        // Roster install holds team/store; the blocking task holds neither lock.
+        // The five-second escalation retains the existing runtime-lifetime limitation.
+        tokio::task::spawn_blocking(signal);
+    } else {
+        signal(); // preserve existing synchronous stop behavior for other callers
+    }
     eprintln!("worker {worker_id}: stopping ({reason})");
     Ok(())
 }
@@ -1048,7 +1224,7 @@ pub fn stop_requested(d: &Arc<Daemon>, session: &str, by: &str) {
 /// with nothing running here ends `cancelled`.
 pub fn cancel(d: &Arc<Daemon>, assign_id: &str, by: &str) -> Result<()> {
     let now = ipc::now() as i64;
-    let declined = {
+    let (declined, cancelled) = {
         let store = d.store.lock().unwrap();
         let ids: Vec<i64> = {
             let mut stmt = (store.conn())
@@ -1057,10 +1233,11 @@ pub fn cancel(d: &Arc<Daemon>, assign_id: &str, by: &str) -> Result<()> {
             rows.collect::<rusqlite::Result<_>>()?
         };
         let declined = decline(&store, &ids, "cancelled", now)?;
-        cancel_worker(&store, &d.workers, assign_id, by, now)?;
-        declined
+        let cancelled = cancel_worker(&store, &d.workers, assign_id, by, now);
+        (declined, cancelled)
     };
     declined_here(d, &declined, by, Some("cancelled"));
+    cancelled?;
     eprintln!("worker for {assign_id}: cancelled");
     Ok(())
 }
@@ -1102,10 +1279,33 @@ pub(crate) fn declined_here(d: &Daemon, declined: &[holds::Hold], by: &str, reas
 /// stopped (`cancelled`); one not registered yet (or not here) has its row ended `cancelled`,
 /// and a `register` after that kills it.
 fn cancel_worker(store: &Store, reg: &Registry, assign_id: &str, by: &str, now: i64) -> Result<()> {
+    cancel_worker_reason(store, reg, assign_id, by, now, "cancelled")
+}
+
+fn cancel_worker_reason(
+    store: &Store,
+    reg: &Registry,
+    assign_id: &str,
+    by: &str,
+    now: i64,
+    reason: &'static str,
+) -> Result<()> {
     let Some(w) = store.worker_by_assignment(assign_id)? else {
         return Ok(());
     };
-    if w.ended_at.is_none() && stop_in(reg, w.id, "cancelled", by).is_err() {
+    if reason == SENDER_REMOVED
+        && w.ended_at.is_none()
+        && !reg.running.lock().unwrap().contains_key(&w.id)
+        && alive(store, &w)
+    {
+        if let Some(pid) = w.pid {
+            driver::signal_each(&driver::descendants(pid), libc::SIGTERM);
+            kill_group(pid as i32, libc::SIGTERM);
+        }
+        store.end_worker(w.id, "cancelled", Some(by), now)?;
+        return Ok(());
+    }
+    if w.ended_at.is_none() && stop_in(reg, w.id, reason, by).is_err() {
         store.end_worker(w.id, "cancelled", Some(by), now)?;
     }
     Ok(())
@@ -1114,6 +1314,9 @@ fn cancel_worker(store: &Store, reg: &Registry, assign_id: &str, by: &str, now: 
 /// The running workers whose assignment's deadline is at or before `now` are stopped
 /// (`timed_out`); from the 60 s mail timer.
 pub fn tick(d: &Arc<Daemon>, now: i64) {
+    if let Err(e) = reconcile(d, now) {
+        eprintln!("workers: sender reconciliation unavailable: {e}");
+    }
     let due: Vec<i64> = {
         let store = d.store.lock().unwrap();
         let past = |w: &Worker| {
@@ -1201,6 +1404,9 @@ pub fn reap(d: &Arc<Daemon>) {
             };
             finish(&d, &w, o, stopped);
         });
+    }
+    if let Err(e) = reconcile(d, ipc::now() as i64) {
+        eprintln!("workers: post-reap sender reconciliation unavailable: {e}");
     }
 }
 
@@ -1702,5 +1908,656 @@ mod tests {
             &v,
             v["sig"].as_str().unwrap()
         ));
+    }
+
+    fn removal_fixture(dir: &Path) -> (Arc<Daemon>, Identity, Vec<crate::roster::Entry>) {
+        std::fs::create_dir_all(dir.join("host")).unwrap();
+        std::fs::create_dir_all(dir.join("peer")).unwrap();
+        let identity = Identity::load_or_create(&dir.join("host")).unwrap();
+        let peer = Identity::load_or_create(&dir.join("peer")).unwrap();
+        let g = crate::daemon::net_ops::genesis(&identity, "host", "host", "synthetic", 1);
+        let admitted = crate::roster::Entry::signed(
+            &identity,
+            vec![g.hash()],
+            crate::roster::Kind::Admit,
+            serde_json::json!({"member":peer.key,"name":"peer","computer":"peer","role":"member","ticket_id":""}),
+            100,
+        );
+        let entries = vec![g, admitted];
+        let roster = crate::roster::replay(&entries);
+        let (dialogs, answers) = crate::dialog::Queue::headless();
+        let d = Arc::new(Daemon {
+            dir: dir.to_path_buf(),
+            store: Mutex::new(Store::open(&dir.join("state.db")).unwrap()),
+            identity,
+            team: Mutex::new(TeamState {
+                roster,
+                config: offering(),
+                off: vec![],
+            }),
+            claude_home: dir.to_path_buf(),
+            events: tokio::sync::broadcast::channel(32).0,
+            shutdown: Default::default(),
+            mail: Default::default(),
+            mailbox_locks: Mutex::default(),
+            push_failed: Mutex::default(),
+            peers: Default::default(),
+            dialogs,
+            dialog_answers: Mutex::new(Some(answers)),
+            answered_by: Mutex::default(),
+            join_confirm: Mutex::default(),
+            agent_invites: Mutex::default(),
+            roster_changed: Default::default(),
+            joining: tokio::sync::Mutex::new(()),
+            codes: Mutex::default(),
+            presence: Default::default(),
+            built: Mutex::default(),
+            latest: Mutex::default(),
+            streams: Default::default(),
+            workers: Default::default(),
+            cloud: None,
+            proofs: Mutex::default(),
+            link: Mutex::default(),
+            home_lock: None,
+            listing: Default::default(),
+        });
+        (d, peer, entries)
+    }
+
+    fn remote_for(s: &Store, roster: &Roster, key: &str, id: &str) -> Message {
+        let peer = &roster.members[key];
+        let mut a = assign(id, id, &format!("{}/codex:asker", peer.short), i64::MAX);
+        a.origin = Some(format!("net:{}", peer.short));
+        s.put_message(&a).unwrap();
+        mail::advance(
+            s.conn(),
+            &a.from_key,
+            &a.request_id,
+            State::Stored,
+            None,
+            None,
+            101,
+        )
+        .unwrap();
+        bind_sender(s, id, peer, roster).unwrap();
+        a
+    }
+
+    #[tokio::test]
+    async fn sender_provenance_is_immutable_and_does_not_guess_legacy_epochs() {
+        let dir = tempfile::tempdir().unwrap();
+        let (d, peer, _) = removal_fixture(dir.path());
+        let roster = d.team.lock().unwrap().roster.clone();
+        let member = roster.members[&peer.key].clone();
+        let s = d.store.lock().unwrap();
+        let a = remote_for(&s, &roster, &member.key, "pinned");
+        bind_sender(&s, &a.id, &member, &roster).unwrap(); // exact retry is idempotent
+        assert!(bind_sender(&s, &a.id, &roster.members[&d.identity.key], &roster).is_err());
+        assert_eq!(sender_state(&s, &roster, &a).unwrap(), SenderState::Current);
+        let mut other = member.clone();
+        other.key = "different-full-key".into();
+        assert!(bind_sender(&s, &a.id, &other, &roster).is_err());
+        let mut other_network = roster.clone();
+        other_network.team_id = "another-genesis".into();
+        assert_eq!(
+            sender_state(&s, &other_network, &a).unwrap(),
+            SenderState::Removed
+        );
+        assert!(bind_sender(&s, &a.id, &member, &other_network).is_err());
+        let mut legacy = a.clone();
+        legacy.id = "legacy".into();
+        s.put_seen(&peer.key, &legacy.id, "stored", 101).unwrap();
+        assert_eq!(
+            sender_state(&s, &roster, &legacy).unwrap(),
+            SenderState::Unknown
+        );
+        assert_eq!(
+            sender_refusal(&s, &roster, &legacy).unwrap(),
+            Some(SENDER_UNKNOWN)
+        );
+        let mut removed = roster.clone();
+        removed.members.remove(&peer.key);
+        assert_eq!(
+            sender_state(&s, &removed, &legacy).unwrap(),
+            SenderState::Unknown
+        );
+        let local = assign("local", "local", "local/claude:a", 100);
+        assert_eq!(
+            sender_state(&s, &removed, &local).unwrap(),
+            SenderState::Local
+        );
+        s.conn().execute_batch("DROP TABLE worker_senders").unwrap();
+        assert!(sender_state(&s, &roster, &a).is_err());
+    }
+
+    #[tokio::test]
+    async fn sender_removed_hold_cannot_be_approved_or_create_standing_permission() {
+        let dir = tempfile::tempdir().unwrap();
+        let (d, peer, _) = removal_fixture(dir.path());
+        let mut roster = d.team.lock().unwrap().roster.clone();
+        let s = d.store.lock().unwrap();
+        let a = remote_for(&s, &roster, &peer.key, "held");
+        let hold = holds::insert(&s, a, &peer.key, 101).unwrap();
+        roster.members.remove(&peer.key);
+        let r = holds::answer(
+            &s,
+            &roster,
+            &d.identity,
+            dir.path(),
+            dir.path(),
+            hold.id,
+            true,
+            "always",
+            "local",
+            false,
+            102,
+        )
+        .unwrap();
+        assert!(matches!(r, Err(SENDER_REMOVED)));
+        assert_eq!(holds::get(&s, hold.id).unwrap().unwrap().state, "declined");
+        assert_eq!(
+            s.conn()
+                .query_row("SELECT COUNT(*) FROM approvals", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn sender_removal_plan_treats_missing_unbound_assignment_as_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let (d, _, _) = removal_fixture(dir.path());
+        let roster = d.team.lock().unwrap().roster.clone();
+        let s = d.store.lock().unwrap();
+        let a = assign("missing", "missing", "local/claude:a", i64::MAX);
+        let w = claim(&s, &offering(), &a, "m/claude:w", 101)
+            .unwrap()
+            .unwrap();
+        assert!(removal_plan(&s, &roster).unwrap().0.is_empty());
+        assert!(s
+            .worker_by_assignment(&w.assignment)
+            .unwrap()
+            .unwrap()
+            .ended_at
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn sender_removed_install_stops_registered_child_and_suppresses_result() {
+        use std::os::unix::process::ExitStatusExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (d, peer, _) = removal_fixture(dir.path());
+        let mut next = d.team.lock().unwrap().roster.clone();
+        let (a, w) = {
+            let s = d.store.lock().unwrap();
+            let a = remote_for(&s, &next, &peer.key, "running");
+            let w = claim(&s, &offering(), &a, "m/claude:worker", 101)
+                .unwrap()
+                .unwrap();
+            (a, w)
+        };
+        let argv: Vec<String> = ["/bin/sleep", "30"].map(String::from).into();
+        let mut child =
+            driver::spawn(&argv, &[], dir.path(), &dir.path().join("removed.log")).unwrap();
+        let mut unaffected =
+            driver::spawn(&argv, &[], dir.path(), &dir.path().join("other.log")).unwrap();
+        let mut stopped = register(
+            &d.store.lock().unwrap(),
+            &d.workers,
+            &w,
+            child.id().unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        next.members.remove(&peer.key);
+        {
+            let mut team = d.team.lock().unwrap();
+            let s = d.store.lock().unwrap();
+            crate::daemon::net_ops::install(&d, &mut team, &s, next).unwrap();
+        }
+        let reason = tokio::time::timeout(Duration::from_secs(5), &mut stopped)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reason, (SENDER_REMOVED, "roster".into()));
+        let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGTERM));
+        assert!(unaffected.try_wait().unwrap().is_none());
+        finish(
+            &d,
+            &w,
+            Outcome {
+                status: "done",
+                reason: None,
+                body: "synthetic-result-must-stay-local".into(),
+            },
+            Some(reason),
+        );
+        {
+            let s = d.store.lock().unwrap();
+            assert_eq!(
+                s.worker_by_assignment(&a.id).unwrap().unwrap().state,
+                "cancelled"
+            );
+            assert_eq!(
+                s.conn()
+                    .query_row(
+                        "SELECT COUNT(*) FROM messages WHERE kind = 'result'",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                0
+            );
+        }
+        reconcile(&d, 103).unwrap(); // duplicate removal remains terminal
+        unaffected.kill().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sender_removed_during_claim_registration_window_kills_late_child() {
+        use std::os::unix::process::ExitStatusExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (d, peer, _) = removal_fixture(dir.path());
+        let mut roster = d.team.lock().unwrap().roster.clone();
+        let w = {
+            let s = d.store.lock().unwrap();
+            let a = remote_for(&s, &roster, &peer.key, "starting");
+            claim(&s, &offering(), &a, "m/claude:worker", 101)
+                .unwrap()
+                .unwrap()
+        };
+        roster.members.remove(&peer.key);
+        {
+            let s = d.store.lock().unwrap();
+            let (assignments, _) = removal_plan(&s, &roster).unwrap();
+            assert_eq!(assignments, ["starting"]);
+            cancel_worker_reason(&s, &d.workers, &w.assignment, "roster", 102, SENDER_REMOVED)
+                .unwrap();
+        }
+        let argv: Vec<String> = ["/bin/sleep", "30"].map(String::from).into();
+        let mut child =
+            driver::spawn(&argv, &[], dir.path(), &dir.path().join("late.log")).unwrap();
+        assert!(register(
+            &d.store.lock().unwrap(),
+            &d.workers,
+            &w,
+            child.id().unwrap()
+        )
+        .unwrap()
+        .is_none());
+        let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        assert!(!d
+            .store
+            .lock()
+            .unwrap()
+            .end_worker(w.id, "failed", None, 103)
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn sender_same_second_readmission_changes_the_canonical_admission_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let (d, peer, mut entries) = removal_fixture(dir.path());
+        let before = d.team.lock().unwrap().roster.clone();
+        let s = d.store.lock().unwrap();
+        let a = remote_for(&s, &before, &peer.key, "same-second");
+        let removed = crate::roster::Entry::signed(
+            &d.identity,
+            before.heads.clone(),
+            crate::roster::Kind::Remove,
+            serde_json::json!({"member":peer.key}),
+            100,
+        );
+        let readmit = crate::roster::Entry::signed(
+            &d.identity,
+            vec![removed.hash()],
+            crate::roster::Kind::Admit,
+            serde_json::json!({"member":peer.key,"name":"peer","computer":"peer","role":"member","ticket_id":""}),
+            100,
+        );
+        entries.extend([removed, readmit]);
+        for e in &entries {
+            assert!(crate::roster::accept(&s, e, 101).unwrap());
+        }
+        let after = crate::roster::replay(&crate::roster::entries(&s).unwrap());
+        assert_eq!(
+            after.members[&peer.key].admitted_at,
+            before.members[&peer.key].admitted_at
+        );
+        assert_ne!(
+            after.admission_id(&peer.key),
+            before.admission_id(&peer.key)
+        );
+        assert_eq!(sender_state(&s, &after, &a).unwrap(), SenderState::Removed);
+    }
+
+    #[tokio::test]
+    async fn sender_removal_keeps_other_member_and_local_work_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let (d, peer, mut entries) = removal_fixture(dir.path());
+        std::fs::create_dir(dir.path().join("other")).unwrap();
+        let other = Identity::load_or_create(&dir.path().join("other")).unwrap();
+        let before = d.team.lock().unwrap().roster.clone();
+        entries.push(crate::roster::Entry::signed(&d.identity, before.heads, crate::roster::Kind::Admit,
+            serde_json::json!({"member":other.key,"name":"other","computer":"other","role":"member","ticket_id":""}), 101));
+        let mut roster = crate::roster::replay(&entries);
+        let config = Config {
+            workers_max: 4,
+            ..offering()
+        };
+        let s = d.store.lock().unwrap();
+        let a = remote_for(&s, &roster, &peer.key, "removed-work");
+        let b = remote_for(&s, &roster, &other.key, "other-work");
+        let local = assign("local-work", "local-work", "local/claude:owner", i64::MAX);
+        s.put_message(&local).unwrap();
+        for (i, a) in [&a, &b, &local].iter().enumerate() {
+            claim(&s, &config, a, &format!("m/claude:w{i}"), 102)
+                .unwrap()
+                .unwrap();
+        }
+        roster.members.remove(&peer.key);
+        reconcile_locked(&d, &s, &roster, 103).unwrap();
+        assert_eq!(
+            s.worker_by_assignment(&a.id).unwrap().unwrap().state,
+            "cancelled"
+        );
+        assert!(s
+            .worker_by_assignment(&b.id)
+            .unwrap()
+            .unwrap()
+            .ended_at
+            .is_none());
+        assert!(s
+            .worker_by_assignment(&local.id)
+            .unwrap()
+            .unwrap()
+            .ended_at
+            .is_none());
+        assert!(removal_plan(&s, &roster).unwrap().0.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sender_removal_serializes_with_concurrent_registration() {
+        use std::os::unix::process::ExitStatusExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (d, peer, _) = removal_fixture(dir.path());
+        let mut roster = d.team.lock().unwrap().roster.clone();
+        let w = {
+            let s = d.store.lock().unwrap();
+            let a = remote_for(&s, &roster, &peer.key, "concurrent");
+            claim(&s, &offering(), &a, "m/claude:worker", 101)
+                .unwrap()
+                .unwrap()
+        };
+        roster.members.remove(&peer.key);
+        d.team.lock().unwrap().roster = roster;
+        let argv: Vec<String> = ["/bin/sleep", "30"].map(String::from).into();
+        let mut child =
+            driver::spawn(&argv, &[], dir.path(), &dir.path().join("concurrent.log")).unwrap();
+        let pid = child.id().unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let register_task = {
+            let d = d.clone();
+            let barrier = barrier.clone();
+            let w = w.clone();
+            tokio::task::spawn_blocking(move || {
+                barrier.wait();
+                register(&d.store.lock().unwrap(), &d.workers, &w, pid)
+            })
+        };
+        let removal_task = {
+            let d = d.clone();
+            let barrier = barrier.clone();
+            tokio::task::spawn_blocking(move || {
+                barrier.wait();
+                reconcile(&d, 102)
+            })
+        };
+        let (registered, removed) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(register_task, removal_task)
+        })
+        .await
+        .unwrap();
+        removed.unwrap().unwrap();
+        if let Some(mut stop) = registered.unwrap().unwrap() {
+            let reason = tokio::time::timeout(Duration::from_secs(5), &mut stop)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(reason.0, SENDER_REMOVED);
+        }
+        let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            status.signal(),
+            Some(libc::SIGTERM | libc::SIGKILL)
+        ));
+    }
+
+    #[tokio::test]
+    async fn sender_removal_stops_a_verified_survivor_and_closes_other_holds() {
+        use std::os::unix::process::ExitStatusExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (d, peer, _) = removal_fixture(dir.path());
+        let mut roster = d.team.lock().unwrap().roster.clone();
+        let w = {
+            let s = d.store.lock().unwrap();
+            let a = remote_for(&s, &roster, &peer.key, "survivor");
+            claim(&s, &offering(), &a, "m/claude:survivor", 101)
+                .unwrap()
+                .unwrap()
+        };
+        let argv: Vec<String> = ["/bin/sleep", "30"].map(String::from).into();
+        let mut child =
+            driver::spawn(&argv, &[], dir.path(), &dir.path().join("survivor.log")).unwrap();
+        let pid = child.id().unwrap();
+        let birth = crate::os::process(pid).unwrap().birth_micros as i64;
+        {
+            let s = d.store.lock().unwrap();
+            s.set_worker_running(w.id, pid).unwrap();
+            s.put_session(&crate::store::Session {
+                key: w.session.clone(),
+                provider: "claude".into(),
+                conversation: Some("survivor".into()),
+                pid: Some(pid.into()),
+                birth_micros: Some(birth),
+                cwd: dir.path().to_string_lossy().into(),
+                title: None,
+                status: "live".into(),
+                seen_at: 101,
+                executable: None,
+                repo: None,
+                branch: None,
+                handle: None,
+                reason: None,
+                ended_at: None,
+                waiting_for: None,
+                headless: false,
+            })
+            .unwrap();
+        }
+        let mut events = d.events.subscribe();
+        let (held, later) = {
+            let store = d.store.lock().unwrap();
+            let a = remote_for(&store, &roster, &peer.key, "held-during-survivor");
+            let held = holds::insert(&store, a, &peer.key, 101).unwrap();
+            let a = remote_for(&store, &roster, &peer.key, "later-during-survivor");
+            let later = claim(
+                &store,
+                &Config {
+                    workers_max: 4,
+                    ..offering()
+                },
+                &a,
+                "m/claude:later",
+                101,
+            )
+            .unwrap()
+            .unwrap();
+            (held, later)
+        };
+        roster.members.remove(&peer.key);
+        d.team.lock().unwrap().roster = roster;
+        reconcile(&d, 102).unwrap();
+        assert_eq!(
+            d.store
+                .lock()
+                .unwrap()
+                .worker_by_assignment(&later.assignment)
+                .unwrap()
+                .unwrap()
+                .state,
+            "cancelled",
+            "stopping a survivor must not skip later workers"
+        );
+        assert_eq!(events.try_recv().unwrap()["event"], "hold_closed");
+        assert_eq!(
+            holds::get(&d.store.lock().unwrap(), held.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            "declined"
+        );
+        {
+            let store = d.store.lock().unwrap();
+            assert!(store
+                .worker_by_assignment(&w.assignment)
+                .unwrap()
+                .unwrap()
+                .ended_at
+                .is_some());
+            assert!(reaped(&store).unwrap().1.is_empty());
+        }
+        let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGTERM));
+        assert_eq!(
+            d.store
+                .lock()
+                .unwrap()
+                .worker_by_assignment(&w.assignment)
+                .unwrap()
+                .unwrap()
+                .state,
+            "cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn sender_removal_between_result_preparation_and_enqueue_refuses_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let (d, peer, _) = removal_fixture(dir.path());
+        let mut roster = d.team.lock().unwrap().roster.clone();
+        let (assignment, p) = {
+            let s = d.store.lock().unwrap();
+            let a = remote_for(&s, &roster, &peer.key, "prepared-result");
+            s.conn()
+                .execute(
+                    "UPDATE messages SET to_key = ?2 WHERE id = ?1",
+                    params![a.id, format!("{}/claude:new", d.identity.short)],
+                )
+                .unwrap();
+            let a = s.message(&a.id).unwrap().unwrap();
+            let w = claim(
+                &s,
+                &offering(),
+                &a,
+                &format!("{}/claude:worker", d.identity.short),
+                101,
+            )
+            .unwrap()
+            .unwrap();
+            let p = result_for(&s, &w, "done", None, "synthetic-result", 102)
+                .unwrap()
+                .unwrap();
+            (a.id, p)
+        };
+        roster.members.remove(&peer.key);
+        d.team.lock().unwrap().roster = roster;
+        assert!(matches!(
+            ipc::dispatch_worker_result(&d, &p, &assignment),
+            Err(ipc::Failed::NotMember)
+        ));
+        assert_eq!(
+            d.store
+                .lock()
+                .unwrap()
+                .conn()
+                .query_row("SELECT COUNT(*) FROM outbox", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_running_worker_without_provenance_still_sends_its_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let (d, peer, _) = removal_fixture(dir.path());
+        let roster = d.team.lock().unwrap().roster.clone();
+        let w = {
+            let store = d.store.lock().unwrap();
+            let a = remote_for(&store, &roster, &peer.key, "legacy-inflight");
+            store
+                .conn()
+                .execute("DELETE FROM worker_senders WHERE assignment = ?1", [&a.id])
+                .unwrap();
+            store
+                .conn()
+                .execute(
+                    "UPDATE messages SET to_key = ?2 WHERE id = ?1",
+                    params![a.id, format!("{}/claude:new", d.identity.short)],
+                )
+                .unwrap();
+            let a = store.message(&a.id).unwrap().unwrap();
+            assert_eq!(
+                sender_refusal(&store, &roster, &a).unwrap(),
+                Some(SENDER_UNKNOWN)
+            );
+            claim(
+                &store,
+                &offering(),
+                &a,
+                &format!("{}/claude:legacy", d.identity.short),
+                101,
+            )
+            .unwrap()
+            .unwrap()
+        };
+        finish(
+            &d,
+            &w,
+            Outcome {
+                status: "done",
+                reason: None,
+                body: "legacy result".into(),
+            },
+            None,
+        );
+        assert_eq!(
+            d.store
+                .lock()
+                .unwrap()
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM messages WHERE kind = 'result'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1,
+            "upgrade must not silently discard already-running legacy output"
+        );
     }
 }

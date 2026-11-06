@@ -2253,15 +2253,39 @@ fn internal(e: impl std::fmt::Display) -> Failed {
     Failed::Internal(e.to_string())
 }
 
-/// Routes the prepared message `p` from this computer: to the outbox for another member, else
-/// recorded here (`dispatch_locked`); its receipt.
-pub(crate) fn dispatch(daemon: &Arc<Daemon>, p: &mail::Prepared) -> Result<mail::Receipt, Failed> {
+/// A worker's final result: recheck its original sender's network/admission under the
+/// same locks that enqueue it. Removal between finish preparation and dispatch cannot
+/// redirect the result to a reused short or a fresh admission of the same key.
+pub(crate) fn dispatch_worker_result(
+    daemon: &Arc<Daemon>,
+    p: &mail::Prepared,
+    assignment: &str,
+) -> Result<mail::Receipt, Failed> {
     let team = daemon.team.lock().unwrap();
     let store = daemon.store.lock().unwrap();
+    let a = store
+        .message(assignment)
+        .map_err(internal)?
+        .ok_or(Failed::NotMember)?;
+    use crate::workers::SenderState;
+    match crate::workers::sender_state(&store, &team.roster, &a).map_err(internal)? {
+        SenderState::Removed => return Err(Failed::NotMember),
+        SenderState::Unknown
+            if store
+                .worker_by_assignment(assignment)
+                .map_err(internal)?
+                .is_none() =>
+        {
+            return Err(Failed::NotMember);
+        }
+        // A pre-upgrade running worker has no admission row. Its existing result remains
+        // deliverable; the separate start/approval gates still reject Unknown work.
+        _ => {}
+    }
     dispatch_locked(daemon, team, store, p, mail::Origin::Local)
 }
 
-/// `dispatch` under the locks the caller prepared `p` with (they are released here, before any
+/// Dispatch under the locks the caller prepared `p` with (they are released here, before any
 /// wake or follow-up that takes them again). An assignment to this computer's fresh-worker
 /// address is refused, held (its dialog shown) or started (`workers::take_assign`); a cancel
 /// of one is stored and reaches `workers::cancel`; any other mail for a session here is
