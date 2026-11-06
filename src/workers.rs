@@ -1048,7 +1048,7 @@ pub fn stop_requested(d: &Arc<Daemon>, session: &str, by: &str) {
 /// with nothing running here ends `cancelled`.
 pub fn cancel(d: &Arc<Daemon>, assign_id: &str, by: &str) -> Result<()> {
     let now = ipc::now() as i64;
-    let declined = {
+    let (declined, cancelled) = {
         let store = d.store.lock().unwrap();
         let ids: Vec<i64> = {
             let mut stmt = (store.conn())
@@ -1057,10 +1057,11 @@ pub fn cancel(d: &Arc<Daemon>, assign_id: &str, by: &str) -> Result<()> {
             rows.collect::<rusqlite::Result<_>>()?
         };
         let declined = decline(&store, &ids, "cancelled", now)?;
-        cancel_worker(&store, &d.workers, assign_id, by, now)?;
-        declined
+        let cancelled = cancel_worker(&store, &d.workers, assign_id, by, now);
+        (declined, cancelled)
     };
     declined_here(d, &declined, by, Some("cancelled"));
+    cancelled?;
     eprintln!("worker for {assign_id}: cancelled");
     Ok(())
 }
@@ -1105,6 +1106,15 @@ fn cancel_worker(store: &Store, reg: &Registry, assign_id: &str, by: &str, now: 
     let Some(w) = store.worker_by_assignment(assign_id)? else {
         return Ok(());
     };
+    if w.ended_at.is_none() && !reg.running.lock().unwrap().contains_key(&w.id) && alive(store, &w)
+    {
+        if let Some(pid) = w.pid {
+            driver::signal_each(&driver::descendants(pid), libc::SIGTERM);
+            kill_group(pid as i32, libc::SIGTERM);
+        }
+        store.end_worker(w.id, "cancelled", Some(by), now)?;
+        return Ok(());
+    }
     if w.ended_at.is_none() && stop_in(reg, w.id, "cancelled", by).is_err() {
         store.end_worker(w.id, "cancelled", Some(by), now)?;
     }
@@ -1702,5 +1712,84 @@ mod tests {
             &v,
             v["sig"].as_str().unwrap()
         ));
+    }
+
+    #[tokio::test]
+    async fn ordinary_cancel_stops_a_verified_survivor_and_closes_its_hold() {
+        use std::os::unix::process::ExitStatusExt;
+        let dir = tempfile::tempdir().unwrap();
+        let identity = Identity::load_or_create(dir.path()).unwrap();
+        let (dialogs, answers) = crate::dialog::Queue::headless();
+        let d = Arc::new(Daemon {
+            dir: dir.path().to_path_buf(),
+            store: Mutex::new(Store::open(&dir.path().join("state.db")).unwrap()),
+            identity,
+            team: Mutex::new(TeamState {
+                roster: Default::default(),
+                config: offering(),
+                off: vec![],
+            }),
+            claude_home: dir.path().to_path_buf(),
+            events: tokio::sync::broadcast::channel(32).0,
+            shutdown: Default::default(),
+            mail: Default::default(),
+            mailbox_locks: Mutex::default(),
+            push_failed: Mutex::default(),
+            peers: Default::default(),
+            dialogs,
+            dialog_answers: Mutex::new(Some(answers)),
+            answered_by: Mutex::default(),
+            join_confirm: Mutex::default(),
+            agent_invites: Mutex::default(),
+            roster_changed: Default::default(),
+            joining: tokio::sync::Mutex::new(()),
+            codes: Mutex::default(),
+            presence: Default::default(),
+            built: Mutex::default(),
+            latest: Mutex::default(),
+            streams: Default::default(),
+            workers: Default::default(),
+            cloud: None,
+            proofs: Mutex::default(),
+            link: Mutex::default(),
+            home_lock: None,
+            listing: Default::default(),
+        });
+        let argv: Vec<String> = ["/bin/sleep", "30"].map(String::from).into();
+        let mut child =
+            driver::spawn(&argv, &[], dir.path(), &dir.path().join("worker.log")).unwrap();
+        let pid = child.id().unwrap();
+        let mut events = d.events.subscribe();
+        let hold = {
+            let store = d.store.lock().unwrap();
+            let id = worker_row(&store, "survivor", "m/claude:survivor", true);
+            store.set_worker_running(id, pid).unwrap();
+            let birth = crate::os::process(pid).unwrap().birth_micros as i64;
+            store.conn().execute(
+                "UPDATE sessions SET pid = ?1, birth_micros = ?2 WHERE key = 'm/claude:survivor'",
+                params![pid, birth],
+            ).unwrap();
+            let a = assign("survivor", "r-survivor", "p/codex:a", i64::MAX);
+            store.put_message(&a).unwrap();
+            holds::insert(&store, a, "peer", 10).unwrap()
+        };
+        cancel(&d, "survivor", "local").unwrap();
+        assert_eq!(events.try_recv().unwrap()["event"], "hold_closed");
+        {
+            let store = d.store.lock().unwrap();
+            assert_eq!(
+                holds::get(&store, hold.id).unwrap().unwrap().state,
+                "declined"
+            );
+            let w = store.worker_by_assignment("survivor").unwrap().unwrap();
+            assert_eq!(w.state, "cancelled");
+            assert!(w.ended_at.is_some());
+            assert!(reaped(&store).unwrap().1.is_empty());
+        }
+        let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGTERM));
     }
 }
