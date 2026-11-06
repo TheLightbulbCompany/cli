@@ -535,6 +535,7 @@ fn pass(
     r.wakes.retain(|k, _| r.members.contains_key(k));
     r.cards.retain(|k, _| r.members.contains_key(k));
     r.admissions.retain(|k, _| r.members.contains_key(k));
+    debug_assert!(r.members.keys().all(|key| r.admission_id(key).is_some()));
     // Live links: unused, not retired, and descended from every removal (a removal it did not
     // see ends it).
     for (lh, l) in links.values() {
