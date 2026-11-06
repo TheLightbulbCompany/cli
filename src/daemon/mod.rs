@@ -267,6 +267,7 @@ pub struct Cloud {
     /// The workspace's display name: its solo network's member and team name.
     pub name: String,
     declared: Mutex<Declared>,
+    pub(crate) goosetown_origin: Mutex<Option<String>>,
     /// The last `Declared::version` the presence sender (`presence::run`) handed on.
     pub sent: tokio::sync::watch::Sender<u64>,
     /// This member's own doorbell (the sessions file's `wake`), republished after a join.
@@ -292,6 +293,7 @@ impl Cloud {
         Cloud {
             name,
             declared: Mutex::default(),
+            goosetown_origin: Mutex::new(None),
             sent: tokio::sync::watch::Sender::new(0),
             wake: Mutex::default(),
         }

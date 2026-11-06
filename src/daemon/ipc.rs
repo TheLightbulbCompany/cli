@@ -239,6 +239,20 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
     let for_a_person = || instance || caller.is_person();
     match op {
         "ping" => Response::ok(id, json!({})),
+        "goosetown.binding.info" if instance => {
+            let origin = daemon
+                .cloud
+                .as_ref()
+                .and_then(|c| c.goosetown_origin.lock().unwrap().clone());
+            match (body.as_object().is_some_and(|o| o.is_empty()), origin) {
+                (true, Some(origin)) => Response::ok(
+                    id,
+                    json!({"version": 1, "audience": format!("goosetown-runtime-binding-v1:{origin}")}),
+                ),
+                _ => Response::err(id, BAD_REQUEST),
+            }
+        }
+        "goosetown.binding.prove" if instance => goosetown_binding_prove(id, body, daemon),
         // `login.changed` -> `{}`: `login`/`logout` rewrote this computer's sign-in; every
         // connected member hears a fresh `hello` with the proof now on disk (or none).
         "login.changed" => {
@@ -510,6 +524,108 @@ fn fact_json(f: &crate::memory::Fact) -> Value {
         "status": format!("{:?}", f.status).to_lowercase(),
         "history": f.history.iter().map(|(id, v, w)| json!({"id": id, "value": v, "when": w})).collect::<Vec<_>>(),
     })
+}
+
+/// Sign only an exact, fresh GooseTown binding challenge for this member and a declared session.
+/// The member socket token remains broad authority; caller authentication is handled by member.
+/// Actor and owner are server-asserted values, not locally verified identities. The server must
+/// verify actor ownership and issue, expire and atomically consume each one-use challenge.
+fn goosetown_binding_prove(id: u64, body: &Value, daemon: &Daemon) -> Response {
+    use data_encoding::BASE64URL_NOPAD;
+    use ed25519_dalek::Signer;
+    let Some(encoded) = body.get("signing_bytes_b64url").and_then(Value::as_str) else {
+        return Response::err(id, BAD_REQUEST);
+    };
+    if body.as_object().is_none_or(|o| o.len() != 1) || encoded.len() > 4096 {
+        return Response::err(id, BAD_REQUEST);
+    }
+    let Ok(bytes) = BASE64URL_NOPAD.decode(encoded.as_bytes()) else {
+        return Response::err(id, BAD_REQUEST);
+    };
+    if BASE64URL_NOPAD.encode(&bytes) != encoded {
+        return Response::err(id, BAD_REQUEST);
+    }
+    let Some(cloud) = &daemon.cloud else {
+        return Response::err(id, BAD_REQUEST);
+    };
+    let Some(origin) = cloud.goosetown_origin.lock().unwrap().clone() else {
+        return Response::err(id, BAD_REQUEST);
+    };
+    let Some(payload) =
+        validate_goose_challenge(&bytes, &daemon.identity.key, now() as i64, &origin)
+    else {
+        return Response::err(id, BAD_REQUEST);
+    };
+    if !cloud.declares(&payload.session_id) {
+        return Response::err(id, BAD_REQUEST);
+    }
+    let sig = daemon.identity.signing.sign(&bytes);
+    Response::ok(
+        id,
+        json!({"signature": BASE64URL_NOPAD.encode(&sig.to_bytes())}),
+    )
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GooseChallenge {
+    version: u64,
+    actor_id: String,
+    owner_id: String,
+    member_key: String,
+    session_id: String,
+    audience: String,
+    #[serde(rename = "revision")]
+    _revision: u64,
+    challenge_id: String,
+    issued_at: i64,
+    expires_at: i64,
+}
+
+fn validate_goose_challenge(
+    bytes: &[u8],
+    key: &str,
+    now: i64,
+    origin: &str,
+) -> Option<GooseChallenge> {
+    use data_encoding::BASE64URL_NOPAD;
+    const DOMAIN: &[u8] = b"GooseTown runtime binding v1\n";
+    let raw = bytes.strip_prefix(DOMAIN)?;
+    if !raw.is_ascii() {
+        return None;
+    }
+    let value: Value = serde_json::from_slice(raw).ok()?;
+    // Python backend uses sorted keys, compact JSON and ensure_ascii. Require exact bytes.
+    if crate::identity::canonical(&value).as_slice() != raw {
+        return None;
+    }
+    let p: GooseChallenge = serde_json::from_value(value).ok()?;
+    let safe = |s: &str| {
+        !s.is_empty()
+            && s.len() <= 150
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_:-.".contains(&b))
+    };
+    let nonce = BASE64URL_NOPAD.decode(p.challenge_id.as_bytes()).ok()?;
+    if p.version != 1
+        || p.audience != format!("goosetown-runtime-binding-v1:{origin}")
+        || p.member_key != key
+        || !safe(&p.actor_id)
+        || !safe(&p.owner_id)
+        || p.session_id.len() > 150
+        || !p.session_id.starts_with(&format!("{}/", &key[..12]))
+        || nonce.len() != 32
+        || BASE64URL_NOPAD.encode(&nonce) != p.challenge_id
+        || p.issued_at > now + 30
+        || p.issued_at > p.expires_at
+        || p.expires_at <= now
+        || p.expires_at
+            .checked_sub(p.issued_at)
+            .is_none_or(|life| life > 120)
+    {
+        return None;
+    }
+    Some(p)
 }
 
 /// `memory.remember {subject, fact, kind, scope?, replaces?, when?, session?}` ->
@@ -2616,5 +2732,92 @@ async fn inbox(
         if !woke {
             return Response::ok(id, json!({ "messages": [] }));
         }
+    }
+}
+
+#[cfg(test)]
+mod goose_binding_tests {
+    use super::*;
+    use data_encoding::BASE64URL_NOPAD;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    fn bytes(key: &str, now: i64) -> Vec<u8> {
+        let v = json!({"actor_id":"12345678-1234-1234-1234-123456789abc","audience":"goosetown-runtime-binding-v1:https://town.example", "challenge_id":BASE64URL_NOPAD.encode(&[7;32]),"expires_at":now+120,"issued_at":now,"member_key":key,"owner_id":"user_example","revision":0,"session_id":format!("{}/synthetic", &key[..12]),"version":1});
+        [
+            b"GooseTown runtime binding v1\n".as_slice(),
+            serde_json::to_vec(&v).unwrap().as_slice(),
+        ]
+        .concat()
+    }
+    #[test]
+    fn validates_binding_fields_and_rejects_invalid_challenges() {
+        let key = "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrst";
+        let good = bytes(key, 1000);
+        assert!(validate_goose_challenge(&good, key, 1000, "https://town.example").is_some());
+        assert!(validate_goose_challenge(&good, key, 1120, "https://town.example").is_none());
+        assert!(validate_goose_challenge(&good, key, 1000, "https://other.example").is_none());
+        assert!(validate_goose_challenge(
+            &good,
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+            1000,
+            "https://town.example"
+        )
+        .is_none());
+        assert!(validate_goose_challenge(b"wrong", key, 1000, "https://town.example").is_none());
+        let raw = &good[b"GooseTown runtime binding v1\n".len()..];
+        assert!(validate_goose_challenge(raw, key, 1000, "https://town.example").is_none());
+        let mut whitespace = good.clone();
+        whitespace.push(b' ');
+        assert!(validate_goose_challenge(&whitespace, key, 1000, "https://town.example").is_none());
+        let mut nonascii = good.clone();
+        nonascii.push(0xff);
+        assert!(validate_goose_challenge(&nonascii, key, 1000, "https://town.example").is_none());
+        let body = std::str::from_utf8(raw).unwrap();
+        for altered in [
+            body.replacen("12345678", "\\u00312345678", 1),
+            body.replacen("\"revision\":0", "\"revision\":0,\"revision\":0", 1),
+            body.replacen("\"revision\":0", "\"revision\":0.0", 1),
+        ] {
+            let b = [
+                b"GooseTown runtime binding v1\n".as_slice(),
+                altered.as_bytes(),
+            ]
+            .concat();
+            assert!(validate_goose_challenge(&b, key, 1000, "https://town.example").is_none());
+        }
+
+        let payload: Value =
+            serde_json::from_slice(&good[b"GooseTown runtime binding v1\n".len()..]).unwrap();
+        for (field, value) in [
+            ("audience", json!("wrong")),
+            ("issued_at", json!(1031)),
+            ("owner_id", json!("bad id")),
+            ("actor_id", json!("a".repeat(151))),
+            ("member_key", json!("z".repeat(52))),
+            ("session_id", json!("other/synthetic")),
+            ("expires_at", json!(1121)),
+            ("challenge_id", json!("bad")),
+            ("version", json!(2)),
+            ("extra", json!(true)),
+        ] {
+            let mut p = payload.clone();
+            p[field] = value;
+            let b = [
+                b"GooseTown runtime binding v1\n".as_slice(),
+                serde_json::to_vec(&p).unwrap().as_slice(),
+            ]
+            .concat();
+            assert!(
+                validate_goose_challenge(&b, key, 1000, "https://town.example").is_none(),
+                "{field}"
+            );
+        }
+    }
+    #[test]
+    fn backend_compatible_fixed_vector() {
+        let sk = SigningKey::from_bytes(&[42; 32]);
+        let key = crate::identity::key_of(sk.verifying_key().as_bytes());
+        let b = bytes(&key, 1000);
+        assert_eq!(BASE64URL_NOPAD.encode(&sk.sign(&b).to_bytes()), "Ht6Qxgo-DT9kIfeSJqBr3MZ7cN_0MhOZyzOcjka4ZxqIoaYIkhFvS1-V3ppLCvzqhsF_FlHVK0PHMNWQfvwdDw");
     }
 }

@@ -34,12 +34,20 @@ pub struct MemberOpts {
     /// declared before the transport starts; `members`, the workspace's people, gate who may
     /// message them: a computer whose sign-in proof names one of them (`proof::admitted`).
     pub sessions: PathBuf,
+    pub goosetown_origin: Option<String>,
 }
 
 /// Runs the sidecar until `stop` or SIGTERM.
 pub async fn run(opts: MemberOpts, token: String) -> Result<()> {
     if token.is_empty() {
         return Err("lightbulb member reads its token from the first line of stdin".into());
+    }
+    if opts
+        .goosetown_origin
+        .as_deref()
+        .is_some_and(|o| !valid_goosetown_origin(o))
+    {
+        return Err("invalid GooseTown origin".into());
     }
     // Before the start: a SIGTERM during it still stops cleanly once it is up.
     let mut term = signal(SignalKind::terminate())?;
@@ -73,6 +81,7 @@ pub async fn run(opts: MemberOpts, token: String) -> Result<()> {
         },
     )
     .await?;
+    instance.set_goosetown_origin(opts.goosetown_origin);
     instance.publish_wake(&file["wake"])?;
     let instance = Arc::new(instance);
     let _ = std::fs::remove_file(&opts.socket);
@@ -206,4 +215,55 @@ async fn answer(
 /// `a == b` in time that does not depend on where they differ.
 fn same(a: &str, b: &str) -> bool {
     a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0, |x, (p, q)| x | (p ^ q)) == 0
+}
+
+/// The trusted startup origin is already canonical; never derive it from a request.
+fn valid_goosetown_origin(origin: &str) -> bool {
+    if origin.len() > 480 {
+        return false;
+    }
+    let Ok(url) = url::Url::parse(origin) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let secure = url.scheme() == "https";
+    let loopback = url.scheme() == "http" && matches!(host, "localhost" | "127.0.0.1" | "[::1]");
+    (secure || loopback)
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.path() == "/"
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && url.origin().ascii_serialization() == origin
+}
+
+#[cfg(test)]
+mod goosetown_origin_tests {
+    use super::valid_goosetown_origin;
+    #[test]
+    fn origin_is_canonical_and_secure_or_loopback() {
+        for value in [
+            "https://town.example",
+            "https://town.example:8443",
+            "http://localhost:8877",
+            "http://127.0.0.1:8877",
+            "http://[::1]:8877",
+        ] {
+            assert!(valid_goosetown_origin(value), "{value}");
+        }
+        for value in [
+            "http://town.example",
+            "https://Town.example",
+            "https://town.example/",
+            "https://town.example:443",
+            "https://u@town.example",
+            "https://town.example/api",
+            "https://town.example?x=1",
+            "https://town.example#f",
+        ] {
+            assert!(!valid_goosetown_origin(value), "{value}");
+        }
+    }
 }

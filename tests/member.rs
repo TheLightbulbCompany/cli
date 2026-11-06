@@ -1102,3 +1102,83 @@ async fn workspace_entries_reach_only_workspace_members() {
     ok(&sock, &token, "stop", json!({}));
     exits_zero(child);
 }
+
+#[test]
+fn goosetown_binding_signs_only_own_declared_session() {
+    use data_encoding::BASE64URL_NOPAD;
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    let dir = tempfile::tempdir().unwrap();
+    let (child, token, sock) = common::member_with_origin(
+        dir.path(),
+        json!({"workspace":"town", "sessions":[{"name":"synthetic","agent":"generic"}]}),
+        Some("https://town.example"),
+    );
+    assert_eq!(
+        ok(&sock, &token, "goosetown.binding.info", json!({})),
+        json!({"version": 1, "audience": "goosetown-runtime-binding-v1:https://town.example"})
+    );
+    let ident = ok(&sock, &token, "identity.get", json!({}));
+    let key = ident["member_key"].as_str().unwrap();
+    let short = ident["member_key_short"].as_str().unwrap();
+    let now = common::now_s();
+    let challenge = |session: &str| {
+        let p = json!({"version":1,"actor_id":"actor-123","owner_id":"user_123","member_key":key,
+            "session_id":format!("{short}/{session}"),"audience":"goosetown-runtime-binding-v1:https://town.example",
+            "revision":0,"challenge_id":BASE64URL_NOPAD.encode(&[7;32]),"issued_at":now,"expires_at":now+120});
+        [
+            b"GooseTown runtime binding v1\n".as_slice(),
+            serde_json::to_vec(&p).unwrap().as_slice(),
+        ]
+        .concat()
+    };
+    let bytes = challenge("synthetic");
+    let result = ok(
+        &sock,
+        &token,
+        "goosetown.binding.prove",
+        json!({"signing_bytes_b64url":BASE64URL_NOPAD.encode(&bytes)}),
+    );
+    let sig = BASE64URL_NOPAD
+        .decode(result["signature"].as_str().unwrap().as_bytes())
+        .unwrap();
+    let keybytes = lightbulb::identity::key_bytes(key).unwrap();
+    VerifyingKey::from_bytes(&keybytes)
+        .unwrap()
+        .verify(&bytes, &Signature::from_slice(&sig).unwrap())
+        .unwrap();
+    for body in [
+        json!({"signing_bytes_b64url":BASE64URL_NOPAD.encode(&challenge("other"))}),
+        json!({"signing_bytes_b64url":format!("{}=",BASE64URL_NOPAD.encode(&bytes))}),
+        json!({"signing_bytes_b64url":BASE64URL_NOPAD.encode(&bytes),"extra":true}),
+    ] {
+        let response = common::line(&sock, &token, "goosetown.binding.prove", body);
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["error"], "bad_request");
+    }
+    ok(&sock, &token, "stop", json!({}));
+    exits_zero(child);
+}
+
+#[test]
+fn goosetown_binding_is_not_exposed_by_plain_daemon() {
+    let env = common::Env::new();
+    env.daemon(false, "", &[]);
+    for op in ["goosetown.binding.info", "goosetown.binding.prove"] {
+        let result = env.ask(json!({"id":1,"op":op}));
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["error"], "unknown_op");
+    }
+}
+
+#[test]
+fn goosetown_binding_without_configured_origin_is_disabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let (child, token, sock) = member(dir.path(), json!([{"name":"synthetic","agent":"generic"}]));
+    for op in ["goosetown.binding.info", "goosetown.binding.prove"] {
+        let r = common::line(&sock, &token, op, json!({}));
+        assert_eq!(r["ok"], false);
+        assert_eq!(r["error"], "bad_request");
+    }
+    ok(&sock, &token, "stop", json!({}));
+    exits_zero(child);
+}
