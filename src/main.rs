@@ -195,6 +195,9 @@ enum Command {
         /// with `lightbulb login`): confirm in the browser, and the workspace joins.
         #[arg(long, conflicts_with_all = ["new", "once"])]
         agents: bool,
+        /// Bind a one-use invite to this member key (founder-governed networks only).
+        #[arg(long = "for", conflicts_with_all = ["agents", "new"])]
+        for_key: Option<String>,
     },
     /// Sign this computer in to Lightbulb (confirm in the browser): your workspace's agents
     /// answer the computers of its signed-in members. Then joins your workspace's network.
@@ -422,11 +425,16 @@ fn run() -> lightbulb::Result<()> {
         Command::Invite { agents: true, .. } => exit(cli::invite_agents()?),
         Command::Login { app } => exit(lightbulb::login::login(app)?),
         Command::Logout => exit(lightbulb::login::logout()?),
-        Command::Invite { new, once, .. } => exit(cli::invite(match (new, once) {
-            (true, _) => Invite::New,
-            (_, true) => Invite::Once,
-            _ => Invite::Reusable,
-        })?),
+        Command::Invite {
+            new, once, for_key, ..
+        } => exit(cli::invite_for(
+            match (new, once) {
+                (true, _) => Invite::New,
+                (_, true) => Invite::Once,
+                _ => Invite::Reusable,
+            },
+            for_key.as_deref(),
+        )?),
         Command::Team => exit(cli::team()?),
         Command::Remove { name } => exit(cli::remove(&name)?),
         Command::Leave => exit(cli::leave()?),

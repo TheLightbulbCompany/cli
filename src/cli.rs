@@ -1098,7 +1098,15 @@ pub fn invite_agents() -> Result<i32> {
 
 /// `invite [--new|--once|--open]`: this computer's invite line.
 pub fn invite(mode: Invite) -> Result<i32> {
-    let r = connect()?.call("team.invite", json!({ "mode": mode }))?;
+    invite_for(mode, None)
+}
+
+pub fn invite_for(mode: Invite, for_key: Option<&str>) -> Result<i32> {
+    let mut body = json!({"mode": mode});
+    if let Some(key) = for_key {
+        body["for_key"] = key.into();
+    }
+    let r = connect()?.call("team.invite", body)?;
     if r["ok"] != true {
         return refuse(&r, &[]);
     }
