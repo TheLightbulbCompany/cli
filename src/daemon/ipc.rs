@@ -575,7 +575,8 @@ struct GooseChallenge {
     member_key: String,
     session_id: String,
     audience: String,
-    revision: u64,
+    #[serde(rename = "revision")]
+    _revision: u64,
     challenge_id: String,
     issued_at: i64,
     expires_at: i64,
@@ -624,7 +625,6 @@ fn validate_goose_challenge(
     {
         return None;
     }
-    let _ = p.revision;
     Some(p)
 }
 
