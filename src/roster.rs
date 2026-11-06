@@ -123,6 +123,9 @@ pub struct Roster {
     /// The genesis entry's stamp.
     pub created_at: i64,
     pub members: BTreeMap<String, Member>,
+    /// Winning admission's existing canonical entry hash, recorded only when replay applies
+    /// it. A seconds timestamp is not an admission identity (remove/readmit may share it).
+    admissions: BTreeMap<String, String>,
     pub heads: Vec<String>,
     pub links: BTreeMap<String, Link>,
     pub relay: Option<String>,
@@ -282,6 +285,10 @@ impl Roster {
         self.members.values().find(|m| m.short == short)
     }
 
+    pub(crate) fn admission_id(&self, key: &str) -> Option<&str> {
+        self.admissions.get(key).map(String::as_str)
+    }
+
     /// Whether `hash` is one of the replayed entries.
     pub fn knows(&self, hash: &str) -> bool {
         self.parents.contains_key(hash)
@@ -408,6 +415,7 @@ fn pass(
                 r.created_at = e.at;
                 r.members
                     .insert(e.signer.clone(), new_member(e, Role::Founder));
+                r.admissions.insert(e.signer.clone(), h.clone());
             }
             continue;
         }
@@ -464,6 +472,7 @@ fn pass(
                     None | Some("member")
                 );
                 if authorised && !collides && role_ok {
+                    r.admissions.insert(target.clone(), h.clone());
                     r.members.insert(target, new_member(e, Role::Member));
                     if let Some((lh, _)) = link.filter(|(_, l)| l.once) {
                         used_once.insert(lh.clone());
@@ -479,6 +488,7 @@ fn pass(
             }
             Kind::Leave => {
                 if target == e.signer && r.members.remove(&target).is_some() {
+                    r.admissions.remove(&target);
                     r.ended.insert(h.clone());
                 }
             }
@@ -524,6 +534,7 @@ fn pass(
     }
     r.wakes.retain(|k, _| r.members.contains_key(k));
     r.cards.retain(|k, _| r.members.contains_key(k));
+    r.admissions.retain(|k, _| r.members.contains_key(k));
     // Live links: unused, not retired, and descended from every removal (a removal it did not
     // see ends it).
     for (lh, l) in links.values() {
@@ -570,6 +581,7 @@ fn take(
         return false;
     }
     let m = r.members.remove(target).expect("present");
+    r.admissions.remove(target);
     gone.insert(target.to_string(), (m, h.to_string()));
     true
 }
@@ -1332,5 +1344,29 @@ mod tests {
         let r = replay(&[g, ax, la, xk, xm]);
         assert!(r.members.contains_key(&k.key));
         assert!(!r.members.contains_key(&m.key));
+    }
+
+    #[test]
+    fn same_second_readmission_has_a_distinct_canonical_anchor_in_any_order() {
+        let (founder, peer) = (id(), id());
+        let g = genesis(&founder);
+        let first = admit(&founder, &g, &peer.key, "peer");
+        let before = replay(&[g.clone(), first.clone()]);
+        let removed = member(&founder, &first, Kind::Remove, &peer.key);
+        let second = admit(&founder, &removed, &peer.key, "peer");
+        let entries = vec![g, first, removed, second];
+        let after = replay(&entries);
+        assert_eq!(
+            before.members[&peer.key].admitted_at,
+            after.members[&peer.key].admitted_at
+        );
+        assert_ne!(
+            before.admission_id(&peer.key),
+            after.admission_id(&peer.key)
+        );
+        assert_eq!(
+            after,
+            replay(&entries.into_iter().rev().collect::<Vec<_>>())
+        );
     }
 }
