@@ -1105,6 +1105,13 @@ fn cancel_worker(store: &Store, reg: &Registry, assign_id: &str, by: &str, now: 
     let Some(w) = store.worker_by_assignment(assign_id)? else {
         return Ok(());
     };
+    if w.ended_at.is_none()
+        && w.pid.is_some()
+        && !reg.running.lock().unwrap().contains_key(&w.id)
+        && alive(store, &w)
+    {
+        return Err("worker awaits verified re-adoption".into());
+    }
     if w.ended_at.is_none() && stop_in(reg, w.id, "cancelled", by).is_err() {
         store.end_worker(w.id, "cancelled", Some(by), now)?;
     }
@@ -1702,5 +1709,45 @@ mod tests {
             &v,
             v["sig"].as_str().unwrap()
         ));
+    }
+
+    #[tokio::test]
+    async fn ordinary_cancel_preserves_a_live_survivor_until_verified_readoption() {
+        use std::os::unix::process::ExitStatusExt;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("state.db")).unwrap();
+        let reg = Registry::default();
+        let argv: Vec<String> = ["/bin/sleep", "30"].map(String::from).into();
+        let mut child =
+            driver::spawn(&argv, &[], dir.path(), &dir.path().join("worker.log")).unwrap();
+        let pid = child.id().unwrap();
+        let id = worker_row(&store, "survivor", "m/claude:survivor", true);
+        store.set_worker_running(id, pid).unwrap();
+        let birth = crate::os::process(pid).unwrap().birth_micros as i64;
+        store
+            .conn()
+            .execute(
+                "UPDATE sessions SET pid = ?1, birth_micros = ?2 WHERE key = 'm/claude:survivor'",
+                params![pid, birth],
+            )
+            .unwrap();
+        assert!(cancel_worker(&store, &reg, "survivor", "local", 10).is_err());
+        assert!(store
+            .worker_by_assignment("survivor")
+            .unwrap()
+            .unwrap()
+            .ended_at
+            .is_none());
+        let (dead, mut adopted) = reaped(&store).unwrap();
+        assert!(dead.is_empty());
+        let w = adopted.pop().unwrap();
+        let mut stopped = register(&store, &reg, &w, pid).unwrap().unwrap();
+        cancel_worker(&store, &reg, "survivor", "local", 11).unwrap();
+        assert_eq!(stopped.try_recv().unwrap().0, "cancelled");
+        let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGTERM));
     }
 }
