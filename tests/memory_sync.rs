@@ -477,13 +477,13 @@ async fn instance_sync_off_blocks_same_person_memory_but_keeps_mail() {
     let inbound = remember(&b, op("new-theirs", "new-team-canary", Scope::Team));
     tokio::time::sleep(Duration::from_millis(2500)).await;
     assert_eq!(
-        held(&b, &ka),
-        [me.clone()],
+        held(&b, &ka).as_slice(),
+        std::slice::from_ref(&me),
         "new private canary left off instance"
     );
     assert_eq!(
-        held(&a, &kb),
-        [theirs.clone()],
+        held(&a, &kb).as_slice(),
+        std::slice::from_ref(&theirs),
         "new team canary entered off instance"
     );
     // Disabling sync does not purge previously replicated entries.
