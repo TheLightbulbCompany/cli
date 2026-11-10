@@ -1,0 +1,17 @@
+{
+  "browser": "Chromium via Playwright",
+  "checks": [
+    "real API scenario launch",
+    "exact $520 proposal rendered",
+    "owner approval through viewer",
+    "completed supplier order",
+    "mobile390 no horizontal overflow",
+    "no JavaScript errors"
+  ],
+  "errors": [],
+  "mobile": {
+    "scroll": 390,
+    "viewport": 390
+  },
+  "orders": 1
+}

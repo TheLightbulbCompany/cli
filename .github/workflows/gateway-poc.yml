@@ -1,0 +1,21 @@
+name: gateway-poc
+on:
+  pull_request:
+    paths: ['gateway/**', '.github/workflows/gateway-poc.yml']
+  push:
+    paths: ['gateway/**', '.github/workflows/gateway-poc.yml']
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --manifest-path gateway/Cargo.toml --check
+      - run: cargo clippy --locked --manifest-path gateway/Cargo.toml --all-targets -- -D warnings
+      - run: cargo test --locked --manifest-path gateway/Cargo.toml
+      - run: cargo build --locked --manifest-path gateway/Cargo.toml
+      - run: python3 gateway/tests/e2e.py --binary gateway/target/debug/lightbulb-gateway
+      - run: python3 -m venv /tmp/a2a-client && /tmp/a2a-client/bin/pip install a2a-sdk==1.3.0
+      - run: /tmp/a2a-client/bin/python gateway/tests/a2a_smoke.py --binary gateway/target/debug/lightbulb-gateway
