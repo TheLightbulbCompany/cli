@@ -1,0 +1,44 @@
+// __MAX_AMOUNT__ is replaced with a validated non-negative integer at install.
+// Monetary values are integer cents. Approval lasts fifteen minutes and is
+// correlated to owner, task and the hash of the COMPLETE proposal.
+@id("owner_approval_events")
+permit(principal, action in [Lightbulb::Action::"Approve", Lightbulb::Action::"Revoke"], resource)
+when { context.input.actor == context.input.owner };
+
+@id("nonnegative_amount")
+forbid(principal, action in [Lightbulb::Action::"CommitOrder", Lightbulb::Action::"Discount"], resource)
+when { context.input.amount < 0 };
+
+@id("automatic_order")
+permit(principal, action == Lightbulb::Action::"CommitOrder", resource)
+when { context.input.amount <= __MAX_AMOUNT__ && !context.input.substitution };
+
+@id("discount_range")
+forbid(principal, action == Lightbulb::Action::"Discount", resource)
+when { context.input.amount > 100 };
+
+@id("automatic_discount")
+permit(principal, action == Lightbulb::Action::"Discount", resource)
+when { context.input.amount <= 10 };
+
+@id("approved_exact_proposal")
+permit(principal, action in [Lightbulb::Action::"CommitOrder", Lightbulb::Action::"Discount"], resource)
+when temporal {
+  !Lightbulb::Action::"Revoke"::response{
+    input.owner: context.input.owner, input.task: context.input.task,
+    input.proposal: context.input.proposal, output.success: true
+  }
+  since within 15m
+  Lightbulb::Action::"Approve"::response{
+    input.owner: context.input.owner, input.task: context.input.task,
+    input.proposal: context.input.proposal, output.success: true
+  }
+};
+
+@id("confidential_export_forbidden")
+forbid(principal, action == Lightbulb::Action::"Export", resource)
+when { context.input.confidential };
+
+@id("public_export")
+permit(principal, action == Lightbulb::Action::"Export", resource)
+when { !context.input.confidential };

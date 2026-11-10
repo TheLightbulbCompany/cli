@@ -1,0 +1,14 @@
+namespace Lightbulb {
+  entity Scope;
+  entity Resource;
+  type Input = {
+    owner: String, task: String, actor: String, proposal: String,
+    amount: Long, substitution: Bool, confidential: Bool
+  };
+  type Output = { success: Bool };
+  action "Approve" appliesTo { principal: [Scope], resource: [Resource], context: { input: Input, output?: Output } };
+  action "Revoke" appliesTo { principal: [Scope], resource: [Resource], context: { input: Input, output?: Output } };
+  action "CommitOrder" appliesTo { principal: [Scope], resource: [Resource], context: { input: Input, output?: Output } };
+  action "Discount" appliesTo { principal: [Scope], resource: [Resource], context: { input: Input, output?: Output } };
+  action "Export" appliesTo { principal: [Scope], resource: [Resource], context: { input: Input, output?: Output } };
+}

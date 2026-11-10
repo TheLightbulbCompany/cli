@@ -1,0 +1,27 @@
+[package]
+name = "lightbulb-gateway"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.40", features = ["bundled"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+clap = { version = "4", features = ["derive"] }
+uuid = { version = "1", features = ["v4"] }
+sha2 = "0.10"
+hmac = "0.12"
+chrono = { version = "0.4", features = ["serde"] }
+async-trait = "0.1"
+futures = "0.3"
+dogwood-local-engine = "=1.1.1"
+dogwood-language = "=1.1.1"
+a2a = { package = "a2a-lf", git = "https://github.com/a2aproject/a2a-rs", rev = "505dbad198f4dfe6ec8ec8e2f265f1f6dc84d1d9" }
+a2a-server = { package = "a2a-server-lf", git = "https://github.com/a2aproject/a2a-rs", rev = "505dbad198f4dfe6ec8ec8e2f265f1f6dc84d1d9", default-features = false }
+
+[dev-dependencies]
+tempfile = "3"
