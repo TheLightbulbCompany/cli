@@ -7,6 +7,12 @@ use crate::daemon::{ipc, Daemon};
 use crate::memory::{self, Op, Scope};
 use crate::Result;
 use std::collections::BTreeMap;
+use std::time::Duration;
+
+/// How long a page waits for room in a link's send queue before the link is closed as stalled.
+/// It waits with no lock held; links are served one after another, so this bounds the delay one
+/// stalled peer costs the rest.
+pub(super) const PAGE_WAIT: Duration = Duration::from_secs(5);
 
 /// Whether `e` may go to a peer: a `me` fact only to a computer of the same person.
 fn sendable(e: &memory::Entry, same_person: bool) -> bool {
@@ -49,8 +55,9 @@ pub(super) fn send_pages(
         more: false,
     })?
     .len();
-    let page = |entries: Vec<memory::Entry>, more| {
-        let _ = tx.send((Frame::Memory { entries, more }, None));
+    let page = |entries: Vec<memory::Entry>, more| -> Result<()> {
+        tx.send_waiting((Frame::Memory { entries, more }, None), PAGE_WAIT)
+            .map_err(|()| "the link closed".into())
     };
     for (author, mine) in &ours {
         let mine = *mine;
@@ -66,14 +73,14 @@ pub(super) fn send_pages(
             for e in batch.into_iter().filter(|e| sendable(e, same_person)) {
                 let n = serde_json::to_vec(&e)?.len() + 1;
                 if !cur.is_empty() && size + n > PAGE_BYTES {
-                    page(std::mem::take(&mut cur), true);
+                    page(std::mem::take(&mut cur), true)?;
                     size = base;
                 }
                 size += n;
                 cur.push(e);
             }
             if !cur.is_empty() {
-                page(cur, full);
+                page(cur, full)?;
             }
             after = last;
             if !full {

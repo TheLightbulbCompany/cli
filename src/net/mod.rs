@@ -272,9 +272,8 @@ type Queued = (Frame, Option<tokio::sync::oneshot::Sender<()>>);
 /// Frames one connection may have waiting for its writer.
 // ponytail: counted in frames, not bytes: the ceiling is SEND_QUEUE x MAX_FRAME (1 MiB), 256 MiB
 // per stalled peer, though its frames are mostly presence (~100 KB) and memory pages (≤512 KB),
-// and a full queue closes the connection. A memory backlog of more than ~256 pages takes a
-// reconnect or two (each resumes from the heads the peer then holds). Budget bytes, or have
-// `memsync::send_pages` wait for room, if that churn shows up.
+// and a full queue closes the connection (memory pages first wait `memsync::PAGE_WAIT` for
+// room). Budget bytes instead if a peer's queued bytes ever matter more than its frame count.
 const SEND_QUEUE: usize = 256;
 
 /// A connection's outgoing frames. A send finding the queue full refuses the frame and stops
@@ -303,6 +302,21 @@ impl Tx {
                 Err(())
             }
             Err(mpsc::error::TrySendError::Closed(_)) => Err(()),
+        }
+    }
+
+    /// Queues `item`, waiting up to `wait` for room (a bulk sender on a blocking thread, whose
+    /// backlog may outrun a slow but reading link); past `wait`, as `send` on a full queue.
+    pub(crate) fn send_waiting(&self, item: Queued, wait: Duration) -> std::result::Result<(), ()> {
+        let sent = tokio::runtime::Handle::current()
+            .block_on(tokio::time::timeout(wait, self.q.send(item)));
+        match sent {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(()),
+            Err(_) => {
+                self.full.notify_one();
+                Err(())
+            }
         }
     }
 }
@@ -1029,7 +1043,7 @@ impl Net {
             eprintln!("net: connected {}", short(&key));
             let writer = async {
                 if write_queued(&tx, rx, &mut send).await.is_err() {
-                    eprintln!("net: {} is not reading: closing", short(&key));
+                    eprintln!("net: {}: send queue full: closing", short(&key));
                 }
             };
             let reader = async {
@@ -1727,5 +1741,60 @@ mod tests {
         assert_eq!(stopped.expect("the writer stopped").unwrap(), Err(()));
         // Once the writer is gone, sends fail instead of queueing.
         assert!(tx.send(frame()).is_err());
+    }
+
+    fn page() -> Queued {
+        let f = Frame::Memory {
+            entries: vec![],
+            more: true,
+        };
+        (f, None)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn memory_pages_wait_for_a_slow_reader_past_the_queue() {
+        let (tx, rx) = Tx::new();
+        let (mut ours, mut theirs) = tokio::io::duplex(64);
+        let writer = tokio::spawn({
+            let tx = tx.clone();
+            async move { write_queued(&tx, rx, &mut ours).await }
+        });
+        const PAGES: usize = 3 * SEND_QUEUE;
+        // A peer that reads, a millisecond per frame: far slower than the pages are made.
+        let reader = tokio::spawn(async move {
+            for _ in 0..PAGES {
+                frames::read_raw(&mut theirs).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        });
+        let sent = tokio::task::spawn_blocking(move || {
+            (0..PAGES).all(|_| tx.send_waiting(page(), memsync::PAGE_WAIT).is_ok())
+        });
+        assert!(sent.await.unwrap(), "a page was refused");
+        tokio::time::timeout(Duration::from_secs(10), reader)
+            .await
+            .expect("the peer got every page")
+            .unwrap();
+        assert!(!writer.is_finished(), "the link was closed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn memory_pages_to_a_peer_that_reads_nothing_close_it_after_the_wait() {
+        let (tx, rx) = Tx::new();
+        let (mut ours, _theirs) = tokio::io::duplex(64);
+        let writer = tokio::spawn({
+            let tx = tx.clone();
+            async move { write_queued(&tx, rx, &mut ours).await }
+        });
+        let wait = Duration::from_millis(100);
+        let sent = tokio::task::spawn_blocking(move || {
+            (0..2 * SEND_QUEUE)
+                .take_while(|_| tx.send_waiting(page(), wait).is_ok())
+                .count()
+        });
+        let sent = sent.await.unwrap();
+        assert!((SEND_QUEUE..2 * SEND_QUEUE).contains(&sent), "{sent} sent");
+        let stopped = tokio::time::timeout(Duration::from_secs(5), writer).await;
+        assert_eq!(stopped.expect("the writer stopped").unwrap(), Err(()));
     }
 }

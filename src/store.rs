@@ -89,7 +89,8 @@ CREATE INDEX IF NOT EXISTS messages_to_sent ON messages (to_key, sent_at);
 /// A message's text digest, kept when `mail::forget` drops the text, so a retry under the same
 /// request id still compares.
 const V7: &str = "ALTER TABLE messages ADD COLUMN body_sha TEXT;";
-/// Retired (the person links' key -> person map): kept so the schema version still counts, and for rollback compatibility.
+/// Retired (the person links' key -> person map): kept so the schema version still counts, and
+/// for rollback compatibility.
 const V8: &str =
     "CREATE TABLE IF NOT EXISTS persons (key TEXT PRIMARY KEY, person TEXT, at INTEGER);";
 /// The memory block last handed to each session at its start (`lightbulb memory last`).
