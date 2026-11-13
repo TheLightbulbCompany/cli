@@ -266,12 +266,72 @@ pub fn parse_addrs(v: &[String]) -> Option<Vec<SocketAddr>> {
         .collect()
 }
 
-/// A connection's outgoing frames, each with whoever waits to hear it was written.
-pub(crate) type Tx = mpsc::UnboundedSender<(Frame, Option<tokio::sync::oneshot::Sender<()>>)>;
+/// An outgoing frame, with whoever waits to hear it was written.
+type Queued = (Frame, Option<tokio::sync::oneshot::Sender<()>>);
+
+/// Frames one connection may have waiting for its writer.
+// ponytail: counted in frames, not bytes: the ceiling is SEND_QUEUE x MAX_FRAME (1 MiB), 256 MiB
+// per stalled peer, though its frames are mostly presence (~100 KB) and memory pages (≤512 KB),
+// and a full queue closes the connection. A memory backlog of more than ~256 pages takes a
+// reconnect or two (each resumes from the heads the peer then holds). Budget bytes, or have
+// `memsync::send_pages` wait for room, if that churn shows up.
+const SEND_QUEUE: usize = 256;
+
+/// A connection's outgoing frames. A send finding the queue full refuses the frame and stops
+/// the connection's writer, which closes it: the peer redials and resyncs, instead of a peer
+/// that reads nothing growing our memory without bound.
+#[derive(Clone)]
+pub(crate) struct Tx {
+    q: mpsc::Sender<Queued>,
+    full: Arc<Notify>,
+}
+
+impl Tx {
+    fn new() -> (Tx, mpsc::Receiver<Queued>) {
+        let (q, rx) = mpsc::channel(SEND_QUEUE);
+        let full = Arc::new(Notify::new());
+        (Tx { q, full }, rx)
+    }
+
+    /// Queues `item`; an error once the connection closed, or when its queue is full.
+    pub(crate) fn send(&self, item: Queued) -> std::result::Result<(), ()> {
+        match self.q.try_send(item) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                // A permit: the writer stops even when it is not waiting yet.
+                self.full.notify_one();
+                Err(())
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(()),
+        }
+    }
+}
+
+/// Writes what `tx` queues to `send` until a write fails or `tx` finds its queue full; `Err`
+/// when it was full.
+async fn write_queued(
+    tx: &Tx,
+    mut rx: mpsc::Receiver<Queued>,
+    send: &mut (impl tokio::io::AsyncWrite + Unpin),
+) -> std::result::Result<(), ()> {
+    let write = async {
+        while let Some((f, done)) = rx.recv().await {
+            if frames::write(send, &f).await.is_err() {
+                return;
+            }
+            if let Some(done) = done {
+                let _ = done.send(());
+            }
+        }
+    };
+    tokio::select! {
+        _ = write => Ok(()),
+        _ = tx.full.notified() => Err(()),
+    }
+}
 
 struct Link {
     conn: Connection,
-    // ponytail: unbounded; only members get a queue, bound it if one shows up growing.
     tx: Tx,
     /// The member key that dialed this connection.
     dialer: String,
@@ -922,7 +982,7 @@ impl Net {
     async fn serve(&self, conn: Connection, key: String, outgoing: bool) {
         let d = &self.0.daemon;
         let me = d.identity.key.as_str();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, rx) = Tx::new();
         let dialer = if outgoing { me } else { key.as_str() };
         // The gate and the adoption are one section under `team`: a removal installed between
         // them would find nothing to close, and the ex-member's connection would be adopted.
@@ -968,13 +1028,8 @@ impl Net {
         if let Ok((mut send, mut recv)) = streams {
             eprintln!("net: connected {}", short(&key));
             let writer = async {
-                while let Some((f, done)) = rx.recv().await {
-                    if frames::write(&mut send, &f).await.is_err() {
-                        return;
-                    }
-                    if let Some(done) = done {
-                        let _ = done.send(());
-                    }
+                if write_queued(&tx, rx, &mut send).await.is_err() {
+                    eprintln!("net: {} is not reading: closing", short(&key));
                 }
             };
             let reader = async {
@@ -1637,5 +1692,40 @@ mod local {
         // file is skipped (Linux follows when there is a Linux build).
         crate::os::process(pid).ok()?;
         addr.parse().ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_peer_that_reads_nothing_is_cut_off_at_a_full_queue() {
+        let (tx, rx) = Tx::new();
+        // The peer's end, never read: the writer blocks once 64 bytes are in flight.
+        let (mut ours, _theirs) = tokio::io::duplex(64);
+        let writer = tokio::spawn({
+            let tx = tx.clone();
+            async move { write_queued(&tx, rx, &mut ours).await }
+        });
+        let frame = || {
+            (
+                Frame::MemoryHeads {
+                    heads: BTreeMap::new(),
+                },
+                None,
+            )
+        };
+        let mut queued = 0;
+        while tx.send(frame()).is_ok() {
+            queued += 1;
+            assert!(queued <= SEND_QUEUE + 64, "the queue never filled");
+            tokio::task::yield_now().await;
+        }
+        assert!(queued >= SEND_QUEUE);
+        let stopped = tokio::time::timeout(Duration::from_secs(5), writer).await;
+        assert_eq!(stopped.expect("the writer stopped").unwrap(), Err(()));
+        // Once the writer is gone, sends fail instead of queueing.
+        assert!(tx.send(frame()).is_err());
     }
 }
