@@ -6,8 +6,6 @@
 //! the other test files keep their own copies.
 #![allow(dead_code)]
 
-pub mod issuer;
-
 use iroh::endpoint::{presets, Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, PublicKey, SecretKey};
 use lightbulb::daemon::net_ops;
@@ -251,28 +249,13 @@ pub fn admit(by: &Identity, parent: &Entry, who: &Identity, name: &str, extra: V
     Entry::signed(by, vec![parent.hash()], Kind::Admit, body, 2)
 }
 
-/// The test person a played or seeded computer `short` signs in as.
-pub fn user_of(short: &str) -> String {
-    format!("user_{short}")
-}
-
 /// `who` played by the test, dialing the member `key` listening on loopback `port`, `hello` sent.
 pub async fn dial_at(key: &str, port: u64, who: &Identity) -> (Peer, Endpoint) {
-    dial_at_with(key, port, who, None).await
-}
-
-/// `dial_at`, its `hello` showing sign-in proof `proof` (`issuer::proof`).
-pub async fn dial_at_with(
-    key: &str,
-    port: u64,
-    who: &Identity,
-    proof: Option<String>,
-) -> (Peer, Endpoint) {
     let ep = endpoint(who).await;
     let conn = ep.connect(loopback(key, port), ALPN).await.unwrap();
     let (send, recv) = conn.open_bi().await.unwrap();
     let mut p = Peer { conn, send, recv };
-    p.hello_with(vec![], proof).await;
+    p.hello(vec![]).await;
     (p, ep)
 }
 
@@ -475,23 +458,17 @@ impl Peer {
     }
 
     pub async fn hello(&mut self, heads: Vec<String>) {
-        self.hello_with(heads, None).await;
-    }
-
-    /// A `hello` showing sign-in proof `proof` (`common::issuer::proof`).
-    pub async fn hello_with(&mut self, heads: Vec<String>, proof: Option<String>) {
-        self.hello_full(heads, proof, false).await;
+        self.hello_full(heads, false).await;
     }
 
     /// A `hello` that also says whether this peer syncs memory.
-    pub async fn hello_full(&mut self, heads: Vec<String>, proof: Option<String>, memory: bool) {
+    pub async fn hello_full(&mut self, heads: Vec<String>, memory: bool) {
         let protocol = PROTOCOL;
         let addrs = vec![];
         self.send(&Frame::Hello {
             protocol,
             heads,
             addrs,
-            proof,
             memory,
         })
         .await;

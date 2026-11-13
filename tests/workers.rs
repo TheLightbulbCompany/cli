@@ -50,8 +50,6 @@ struct Opts {
     harness: &'static str,
     /// B leaves `network_workers` off (the default) while still offering the harness.
     flag_off: bool,
-    /// A is signed in as this person before it starts (its `hello` shows the proof).
-    a_user: Option<&'static str>,
 }
 
 /// A asks, B hosts workers in `work`; `ui` keeps the fake dialogs and the fake harness's log.
@@ -163,7 +161,6 @@ fn hosted(script: Value, o: Opts) -> Pair {
         o.config
     );
     b.daemon(false, &config, &env);
-    assert!(o.a_user.is_none(), "no sign-in: login was cut");
     let mut a_env = vec![peers(&[&b])];
     a_env.extend(o.a_env);
     a.daemon(false, "network_workers = true\n", &a_env);
@@ -487,7 +484,7 @@ fn row_4_always_allow_skips_the_next_dialog_and_revoke_brings_it_back() {
     assert_eq!(p.result("as1", 15)["status"], "done");
     let (me, them) = (p.b.short(), p.a.short());
     assert_eq!(
-        workers::policy(&p.b.store(), &me, &them).unwrap(),
+        workers::policy_for(&p.b.store(), &me, &them).unwrap(),
         Policy::Allow
     );
     // No dialog for the second.
@@ -925,7 +922,7 @@ fn row_13_held_lists_both_worker_hold_kinds_and_an_agent_is_refused() {
     );
     let (me, them) = (p.b.short(), p.a.short());
     assert_eq!(
-        workers::policy(&p.b.store(), &me, &them).unwrap(),
+        workers::policy_for(&p.b.store(), &me, &them).unwrap(),
         Policy::Allow
     );
 }
@@ -2303,21 +2300,12 @@ fn opencode_a_worktree_that_allows_without_asking_refuses_the_start() {
     );
 }
 
-/// Workspace `org_1`'s rules document holding `rules` (no holders, default hold).
-fn document(rules: Value) -> String {
-    common::issuer::mint_typ(
-        "lightbulb-a2a-rules",
-        &json!({"workspace": "org_1", "revision": "r1", "iat": now_s(),
-            "doc": {"revision": "r1", "holders": {}, "rules": rules, "default": "hold"}}),
-    )
-}
-
 #[test]
 fn assign_with_no_standing_rows_asks_as_today() {
     let p = hosted(json!([{"result": "ok"}]), Opts::default());
     let (me, them) = (p.b.short(), p.a.short());
     assert_eq!(
-        workers::policy(&p.b.store(), &me, &them).unwrap(),
+        workers::policy_for(&p.b.store(), &me, &them).unwrap(),
         Policy::Ask
     );
     p.assign("as1", "one", 300);
@@ -2337,7 +2325,7 @@ fn an_always_row_allows() {
     );
     let (me, them) = (p.b.short(), p.a.short());
     assert_eq!(
-        workers::policy(&p.b.store(), &me, &them).unwrap(),
+        workers::policy_for(&p.b.store(), &me, &them).unwrap(),
         Policy::Allow
     );
     p.assign("as1", "one", 300);
@@ -2345,71 +2333,10 @@ fn an_always_row_allows() {
     assert!(p.pids().is_empty());
 }
 
-/// A rules document's deny on `worker:*` refuses, over the person's standing allow.
+/// An assign to a teammate's existing session is delivered like a message: membership is the
+/// gate, nothing holds it.
 #[test]
-fn a_deny_rule_on_worker_star_refuses_policy() {
-    let p = hosted(
-        json!([{"result": "never"}]),
-        Opts {
-            always: true,
-            ..Opts::default()
-        },
-    );
-    let deny = json!([{"id": "no-workers", "resource": "worker:*", "skill": "assign",
-                       "requesters": ["*"], "effect": "deny"}]);
-    assert!(lightbulb::rules::store_doc(&p.b.store(), &document(deny), now_s()).unwrap());
-    let (me, them) = (p.b.short(), p.a.short());
-    assert_eq!(
-        workers::policy(&p.b.store(), &me, &them).unwrap(),
-        Policy::Refuse
-    );
-    p.assign("as1", "one", 300);
-    p.wait_state("as1", "refused");
-    assert_eq!(p.a.receipt(&p.asker(), "as1")["reason"], "declined");
-    assert!(p.workers().is_empty());
-    assert!(p.pids().is_empty());
-}
-
-/// An authority object on an assign binds its terms: a `deadline_at` other than the envelope's
-/// refuses it `bad_request`, and nothing starts.
-#[test]
-fn assign_with_authority_binds_meta_operands() {
-    let p = hosted(
-        json!([{"result": "never"}]),
-        Opts {
-            always: true,
-            ..Opts::default()
-        },
-    );
-    let uri = lightbulb::authority::URI;
-    let (now, b) = (now_s(), p.b.short());
-    let operands = json!({"text": "one", "done_when": "done", "deadline_at": 1});
-    let jws = common::issuer::mint_typ(
-        lightbulb::authority::TYP,
-        &json!({
-            "v": 1, "id": "auth_1", "iat": now, "exp": now + 600,
-            "requester": {"person": "user_a", "org": "org_1", "verified_by": "lightbulb"},
-            "chain": [{"agent": "agent_1", "session": null, "person": "user_a", "at": now}],
-            "operation": {"skill": "assign", "resource": format!("worker:{b}/claude"),
-                          "operands": operands,
-                          "operands_hash": lightbulb::authority::operands_hash(&operands)},
-            "intent": "do one", "policy": null,
-        }),
-    );
-    let r = p.a.ask(json!({"id": 1, "op": "send", "from": p.asker(),
-        "to": format!("{b}/claude:new"), "kind": "assign", "text": "one", "done_when": "done",
-        "deadline_s": 300, "request_id": "as1",
-        "a2a": {"metadata": {uri: jws}, "extensions": [uri]}}));
-    assert_eq!(r["ok"], true, "{r}");
-    p.wait_state("as1", "refused");
-    assert_eq!(p.a.receipt(&p.asker(), "as1")["reason"], "bad_request");
-    assert!(p.workers().is_empty());
-}
-
-/// An assign to a teammate's existing session is judged like a message: the default document
-/// delivers a roster member's (no sign-in) with no hold; a deny rule refuses it `policy`.
-#[test]
-fn an_assign_to_an_existing_session_is_judged_like_a_message() {
+fn an_assign_to_an_existing_session_is_delivered_with_no_hold() {
     let p = hosted(json!([]), Opts::default());
     let sb = session(&p.b, "b1");
     let assign = |rid: &str| {
@@ -2427,96 +2354,5 @@ fn an_assign_to_an_existing_session_is_judged_like_a_message() {
             .any(|m| m["kind"] == "assign" && m["text"] == "take this"),
         "{got:?}"
     );
-    let deny = json!([{"id": "no-assign", "resource": "session:*", "skill": "assign",
-                       "requesters": ["*"], "effect": "deny"}]);
-    assert!(lightbulb::rules::store_doc(&p.b.store(), &document(deny), now_s()).unwrap());
-    assign("as2");
-    p.wait_state("as2", "refused");
-    assert_eq!(p.a.receipt(&p.asker(), "as2")["reason"], "policy");
-}
-
-/// An `assign` object from `person` for a fresh `<b>/claude` worker binding `operands`.
-fn assign_object(person: &str, b: &str, operands: &Value) -> String {
-    let now = now_s();
-    common::issuer::mint_typ(
-        lightbulb::authority::TYP,
-        &json!({
-            "v": 1, "id": "auth_2", "iat": now, "exp": now + 600,
-            "requester": {"person": person, "org": "org_1", "verified_by": "lightbulb"},
-            "chain": [{"agent": "agent_1", "session": null, "person": person, "at": now}],
-            "operation": {"skill": "assign", "resource": format!("worker:{b}/claude"),
-                          "operands": operands,
-                          "operands_hash": lightbulb::authority::operands_hash(operands)},
-            "intent": "do one", "policy": null,
-        }),
-    )
-}
-
-/// An object minted before the send binds on a real send: the sender takes the assign's terms
-/// from its operands (ignoring `deadline_s`), the receiver binds it and starts the worker.
-#[test]
-#[ignore = "Step 2: needs a signed-in person, cut with login"]
-fn an_assign_with_authority_minted_beforehand_binds_and_starts() {
-    let p = hosted(
-        json!([{"result": "ok"}]),
-        Opts {
-            always: true,
-            a_user: Some("user_x"),
-            ..Opts::default()
-        },
-    );
-    let (uri, b) = (lightbulb::authority::URI, p.b.short());
-    let operands = json!({"text": "one", "done_when": "tests pass",
-        "deadline_at": now_s() + 900, "repo": "nope", "branch": "main"});
-    let jws = assign_object("user_x", &b, &operands);
-    let r = p.a.ask(json!({"id": 1, "op": "send", "from": p.asker(),
-        "to": format!("{b}/claude:new"), "kind": "assign", "text": "one", "done_when": "done",
-        "deadline_s": 60, "request_id": "as1",
-        "a2a": {"metadata": {uri: jws}, "extensions": [uri]}}));
-    assert_eq!(r["ok"], true, "{r}");
-    assert_eq!(p.result("as1", 15)["status"], "done");
-    let c = rusqlite::Connection::open(p.b.state.path().join("state.db")).unwrap();
-    let id: String = c
-        .query_row(
-            "SELECT id FROM messages WHERE request_id = 'as1' AND kind = 'assign'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    let m = p.b.store().message(&id).unwrap().expect("stored on B");
-    assert_eq!(m.authority_id.as_deref(), Some("auth_2"));
-    assert_eq!(m.meta.done_when.as_deref(), Some("tests pass"));
-    assert_eq!(m.meta.deadline_at, operands["deadline_at"].as_i64());
-    assert_eq!(m.meta.branch.as_deref(), Some("main"));
-}
-
-/// The sending computer's person is judged on a fresh-worker assign: a document deny naming
-/// `person:user_x` refuses user_x over the standing allow for its computer; another person's
-/// computer with the same row is allowed.
-#[test]
-#[ignore = "Step 2: needs a signed-in person, cut with login"]
-fn a_person_deny_on_worker_star_refuses_over_the_members_always_row() {
-    let deny = json!([{"id": "no-x", "resource": "worker:*", "skill": "assign",
-                       "requesters": ["person:user_x"], "effect": "deny"}]);
-    for (user, refused) in [("user_x", true), ("user_y", false)] {
-        let p = hosted(
-            json!([{"result": "ok"}]),
-            Opts {
-                always: true,
-                a_user: Some(user),
-                ..Opts::default()
-            },
-        );
-        assert!(
-            lightbulb::rules::store_doc(&p.b.store(), &document(deny.clone()), now_s()).unwrap()
-        );
-        p.assign("as1", "one", 300);
-        if refused {
-            p.wait_state("as1", "refused");
-            assert_eq!(p.a.receipt(&p.asker(), "as1")["reason"], "declined");
-            assert!(p.workers().is_empty());
-        } else {
-            assert_eq!(p.result("as1", 15)["status"], "done", "{user}");
-        }
-    }
+    assert!(lightbulb::holds::open(&p.b.store()).unwrap().is_empty());
 }

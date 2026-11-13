@@ -130,7 +130,7 @@ async fn old_peer_without_capability_gets_no_memory_frames_and_keeps_mail() {
     // The same hello with the capability is told our heads (before the presence).
     let ep2 = endpoint(&b.identity()).await;
     let mut new = Peer::dial(&ep2, &a).await;
-    new.hello_full(vec![], None, true).await;
+    new.hello_full(vec![], true).await;
     let heads = new
         .recv_where(|f| matches!(f, Frame::MemoryHeads { .. }))
         .await;
@@ -178,7 +178,7 @@ async fn gap_of_300_entries_pages() {
     a.daemon(false, "", &[]);
     let ep = endpoint(&b.identity()).await;
     let mut p = Peer::dial(&ep, &a).await;
-    p.hello_full(vec![], None, true).await;
+    p.hello_full(vec![], true).await;
     p.send(&Frame::MemoryHeads {
         heads: Default::default(),
     })
@@ -249,7 +249,7 @@ async fn a_restored_node_numbers_past_what_peers_hold() {
     a.daemon(false, "", &[]);
     let ep = endpoint(&b.identity()).await;
     let mut p = Peer::dial(&ep, &a).await;
-    p.hello_full(vec![], None, true).await;
+    p.hello_full(vec![], true).await;
     p.send(&Frame::MemoryHeads {
         heads: memory::heads(&b.store()).unwrap(),
     })
@@ -359,7 +359,7 @@ async fn instance_sync_off_refuses_hostile_memory_and_emits_none() {
     a.daemon(false, "memory_sync = false", &[]);
     let ep = endpoint(&b.identity()).await;
     let mut peer = Peer::dial(&ep, &a).await;
-    peer.hello_full(vec![], None, true).await;
+    peer.hello_full(vec![], true).await;
     let hello = peer.recv_where(|f| matches!(f, Frame::Hello { .. })).await;
     let advertised_off = matches!(hello, Frame::Hello { memory: false, .. });
     // A noncompliant authenticated member ignores our advertised capability.

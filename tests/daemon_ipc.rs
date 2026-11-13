@@ -63,8 +63,8 @@ async fn ipc_answers_ping_and_rejects_unknown_op() {
     // The team id is the solo network's genesis hash.
     let store = lightbulb::store::Store::open(&dir.path().join("state.db")).unwrap();
     let entries = lightbulb::roster::entries(&store).unwrap();
-    // The genesis, and this member's card.
-    assert_eq!(entries.len(), 2);
+    // The genesis alone.
+    assert_eq!(entries.len(), 1);
     let genesis = entries.iter().find(|e| e.parents.is_empty()).unwrap();
     assert_eq!(status["team"]["id"], genesis.hash());
 

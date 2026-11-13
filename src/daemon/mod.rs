@@ -100,9 +100,6 @@ pub struct Daemon {
     pub latest: Mutex<HashMap<String, crate::presence::Latest>>,
     /// The network workers running here (`workers`).
     pub workers: crate::workers::Registry,
-    /// Each member's sign-in proof from its latest `hello` (`proof`): what a workspace member's
-    /// `members` gate reads.
-    pub proofs: Mutex<HashMap<String, String>>,
     /// Claude's own session listing, last read (`current`).
     pub listing: Arc<Mutex<ListingCache>>,
 }
@@ -302,7 +299,6 @@ pub async fn deliver(daemon: Arc<Daemon>, to: Key) {
             &m.request_id,
             parent_rid.as_deref(),
             &m.meta,
-            crate::authority::summary_of(&m, ipc::now() as i64).as_ref(),
             &m.body,
         );
         let pushed = match session.provider.as_str() {
@@ -506,44 +502,13 @@ async fn boot(dir: &Path, config: Config) -> Result<(Arc<Daemon>, net::Net)> {
         built: Mutex::default(),
         latest: Mutex::new(latest),
         workers: Default::default(),
-        proofs: Mutex::default(),
         listing: Default::default(),
     });
     // No join connection outlives a restart: its open requests are over.
     daemon.store.lock().unwrap().expire_joins(i64::MAX, now)?;
-    if let Err(e) = publish_card(&daemon) {
-        eprintln!("card: {e}");
-    }
     let net = net::Net::start(daemon.clone()).await?;
     tokio::spawn(crate::presence::run(daemon.clone()));
     Ok((daemon, net))
-}
-
-/// Signs this member's Agent Card into its roster as a `meta` when the roster's differs from
-/// the one computed now (the first start, a new name, workers switched on or off). A computer
-/// that is no member of its team publishes nothing.
-pub(crate) fn publish_card(d: &Daemon) -> Result<()> {
-    let mut team = d.team.lock().unwrap();
-    let Some(me) = team.roster.members.get(&d.identity.key) else {
-        return Ok(());
-    };
-    let offers = !crate::workers::offers(&team.config).is_empty();
-    let card = roster::own_card(&d.identity.short, &me.name, offers);
-    if team.roster.cards.get(&d.identity.key) == Some(&card) {
-        return Ok(());
-    }
-    let store = d.store.lock().unwrap();
-    let now = ipc::now() as i64;
-    net_ops::write(
-        d,
-        &mut team,
-        &store,
-        roster::Kind::Meta,
-        serde_json::json!({"card": card}),
-        now,
-    )?;
-    eprintln!("card: published");
-    Ok(())
 }
 
 /// Checks for a newer release ten minutes after the start and then daily (`cli::auto_update`).

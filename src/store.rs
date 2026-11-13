@@ -232,14 +232,10 @@ pub struct Message {
     /// The message this answers, by id.
     pub reply_to: Option<String>,
     pub meta: crate::mail::Meta,
-    /// The A2A Message the envelope carried.
-    pub a2a: Option<serde_json::Value>,
     /// The sending computer's envelope signature.
     pub sig: Option<String>,
     /// The sender's `sent_at` that `sig` covers (`sent_at` is this computer's arrival time).
     pub signed_at: Option<i64>,
-    /// The authority object (phase-1 JWS) the envelope's A2A Message carried, by id.
-    pub authority_id: Option<String>,
 }
 
 fn row_session(r: &rusqlite::Row) -> rusqlite::Result<Session> {
@@ -313,12 +309,8 @@ pub(crate) fn row_message(r: &rusqlite::Row) -> rusqlite::Result<Message> {
             .get::<_, Option<String>>("meta")?
             .and_then(|j| serde_json::from_str(&j).ok())
             .unwrap_or_default(),
-        a2a: r
-            .get::<_, Option<String>>("a2a")?
-            .and_then(|j| serde_json::from_str(&j).ok()),
         sig: r.get("sig")?,
         signed_at: r.get("signed_at")?,
-        authority_id: r.get("authority_id")?,
     })
 }
 
@@ -326,11 +318,10 @@ pub(crate) fn row_message(r: &rusqlite::Row) -> rusqlite::Result<Message> {
 /// build can still open this db (it ignores them), even with network workers never turned on.
 /// `sessions`: why it ended, what a waiting one waits for, whether it is headless, and when its
 /// Stop hook last held it for unanswered work. `messages`: the message an answer answers
-/// (`reply_to`), an assignment's terms (`meta`, JSON), the A2A Message the envelope carried
-/// (`a2a`, JSON), the sender's signature and the stamp it covers (`sig`, `signed_at`), and the
-/// authority object it carried (`authority_id`). `approvals`: a local exception's `resource`,
-/// `skill`, `requester` and `operands_hash`. `holds`: its kind, and an Authority hold's judged
-/// `requester` and `skill`. `rules`: the newest verified rules document per workspace.
+/// (`reply_to`), an assignment's terms (`meta`, JSON), the sender's signature and the stamp it
+/// covers (`sig`, `signed_at`). `holds`: its kind. No longer written (kept so the count and
+/// older builds stay): `messages.a2a`, `messages.authority_id`, `approvals`' `resource`,
+/// `skill`, `requester` and `operands_hash`, `holds`' `requester`, `skill` and `relayed_by`, `rules`.
 const ADDED_COLUMNS: [(&str, &str, &str); 18] = [
     ("sessions", "reason", "TEXT"),
     ("sessions", "waiting_for", "TEXT"),
@@ -898,8 +889,8 @@ impl Store {
     pub fn put_message(&self, m: &Message) -> rusqlite::Result<()> {
         self.conn.execute(
             "INSERT INTO messages (id, request_id, from_key, to_key, kind, thread, hops, origin, \
-             body, sent_at, reply_to, meta, a2a, sig, signed_at, authority_id) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+             body, sent_at, reply_to, meta, sig, signed_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 m.id,
                 m.request_id,
@@ -913,10 +904,8 @@ impl Store {
                 m.sent_at,
                 m.reply_to,
                 (!m.meta.is_empty()).then(|| serde_json::to_string(&m.meta).unwrap_or_default()),
-                m.a2a.as_ref().map(|v| v.to_string()),
                 m.sig,
                 m.signed_at,
-                m.authority_id,
             ],
         )?;
         Ok(())

@@ -110,7 +110,7 @@ async fn sync_sends_only_the_delta_in_pages() {
     else {
         panic!("hello first");
     };
-    assert_eq!((protocol, a_heads.len()), (PROTOCOL, 1)); // A's card entry joins the 120 branches
+    assert_eq!((protocol, a_heads.len()), (PROTOCOL, 120)); // the 120 branches
 
     let pages = p.pages().await;
     let more: Vec<bool> = pages
@@ -119,7 +119,7 @@ async fn sync_sends_only_the_delta_in_pages() {
         .collect();
     assert_eq!(more, [true, true, false]);
     let sent = entries_of(&pages);
-    assert_eq!(sent.len(), 1_201, "the lag and A's card");
+    assert_eq!(sent.len(), 1_200, "the lag");
     // Parents before children, across page boundaries.
     let mut seen: HashSet<String> = [g.hash(), admit.hash()].into();
     for e in &sent {
@@ -148,14 +148,14 @@ async fn child_before_parent_in_one_frame_still_converges() {
     until(2, "B applies both", || {
         heads(b.heads()).contains(&pc[1].hash())
     });
-    // The genesis, the admission, B's card and the two.
-    assert_eq!(roster::entries(&b.store()).unwrap().len(), 5);
+    // The genesis, the admission and the two.
+    assert_eq!(roster::entries(&b.store()).unwrap().len(), 4);
 }
 
 /// Dials `env`'s daemon as `id` and finishes the opening exchange (`hello`s, empty delta).
 async fn synced(ep: &Endpoint, env: &Env, head: &Entry) -> Peer {
     let mut p = Peer::dial(ep, env).await;
-    // At the daemon's own heads: its card entry is one of them.
+    // At the daemon's own heads.
     let _ = head;
     p.hello(heads(env.heads())).await;
     assert!(matches!(p.recv().await, Frame::Hello { .. }));
@@ -184,8 +184,8 @@ async fn child_and_parent_in_separate_frames_converge() {
     until(2, "B applies both", || {
         heads(b.heads()).contains(&pc[1].hash())
     });
-    // The genesis, the admission, B's card and the two.
-    assert_eq!(roster::entries(&b.store()).unwrap().len(), 5);
+    // The genesis, the admission and the two.
+    assert_eq!(roster::entries(&b.store()).unwrap().len(), 4);
 }
 
 /// A member's connection is authenticated, but each roster entry it relays carries its own
@@ -210,7 +210,7 @@ async fn tampered_or_misattributed_roster_entries_are_refused() {
     until(2, "B applies the good entry", || {
         heads(b.heads()).contains(&good.hash())
     });
-    assert_eq!(roster::entries(&b.store()).unwrap().len(), 4);
+    assert_eq!(roster::entries(&b.store()).unwrap().len(), 3);
     let log = std::fs::read_to_string(b.state.path().join("daemon.log")).unwrap();
     assert_eq!(log.matches("refused a roster entry").count(), 2, "{log}");
 }
@@ -234,11 +234,11 @@ async fn waiting_entries_are_dropped_on_close() {
     let mut q = synced(&ep, &b, &admit).await;
     q.send(&roster_frame(vec![pc[0].clone()])).await;
     until(2, "B applies the parent", || {
-        roster::entries(&b.store()).unwrap().len() >= 4
+        roster::entries(&b.store()).unwrap().len() >= 3
     });
     assert!(heads(b.heads()).contains(&pc[0].hash()));
     assert!(!heads(b.heads()).contains(&pc[1].hash()));
-    assert_eq!(roster::entries(&b.store()).unwrap().len(), 4);
+    assert_eq!(roster::entries(&b.store()).unwrap().len(), 3);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -260,7 +260,7 @@ async fn roster_pages_split_by_bytes_not_only_count() {
         let size = serde_json::to_vec(f).unwrap().len();
         assert!(size <= PAGE_BYTES, "a {size}-byte frame");
     }
-    assert_eq!(entries_of(&pages).len(), 301, "300 and A's card");
+    assert_eq!(entries_of(&pages).len(), 300);
 
     // Handed to B's daemon as A: all applied.
     let ep_a = endpoint(&a.identity()).await;
@@ -268,9 +268,9 @@ async fn roster_pages_split_by_bytes_not_only_count() {
     for f in &pages {
         to_b.send(f).await;
     }
-    // The genesis, the admission, the 300, and each daemon's card.
+    // The genesis, the admission and the 300.
     until(5, "B applies every page", || {
-        roster::entries(&b.store()).unwrap().len() == 304
+        roster::entries(&b.store()).unwrap().len() == 302
     });
 }
 
@@ -355,7 +355,6 @@ async fn older_protocol_is_reported_not_served() {
         protocol: 0,
         heads: vec![],
         addrs: vec![],
-        proof: None,
         memory: false,
     })
     .await;

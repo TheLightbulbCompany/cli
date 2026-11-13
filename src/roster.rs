@@ -8,7 +8,7 @@ use crate::Result;
 use data_encoding::HEXLOWER;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
@@ -129,63 +129,11 @@ pub struct Roster {
     pub heads: Vec<String>,
     pub links: BTreeMap<String, Link>,
     pub relay: Option<String>,
-    /// A member's A2A Agent Card, by member key: its own latest `meta` with a `card` object.
-    pub cards: BTreeMap<String, Value>,
     /// The `remove` and `leave` entries replay applied (it took their member), by hash.
     pub ended: BTreeSet<String>,
     parents: BTreeMap<String, Vec<String>>,
     /// Every replayed entry with its hash, parents first.
     log: Vec<(String, Entry)>,
-}
-
-/// The A2A Agent Card a member publishes: `short`'s address, the authority extension, and the
-/// skills it offers (`assign` only when it offers workers). `name` is its roster name.
-pub fn own_card(short: &str, name: &str, offers_workers: bool) -> Value {
-    let skill = |id: &str, n: &str, d: &str, tag: &str| json!({"id": id, "name": n, "description": d, "tags": [tag]});
-    let mut skills = vec![
-        skill(
-            "message",
-            "Message",
-            "Send this computer's sessions a message.",
-            "message",
-        ),
-        skill(
-            "ask_session",
-            "Ask a session",
-            "Ask one of this computer's sessions to do something.",
-            "session",
-        ),
-    ];
-    if offers_workers {
-        skills.push(skill(
-            "assign",
-            "Start a worker",
-            "Start a worker on this computer.",
-            "worker",
-        ));
-    }
-    json!({
-        "name": name,
-        "description": format!("{name}'s computer on Lightbulb."),
-        "version": "1",
-        "supportedInterfaces": [{
-            "url": format!("lightbulb://{short}"),
-            "protocolBinding": "https://thelightbulb.company/a2a/binding/p2p/v1",
-            "protocolVersion": "1.0",
-        }],
-        "capabilities": {
-            "streaming": false,
-            "pushNotifications": false,
-            "extensions": [{
-                "uri": crate::authority::URI,
-                "required": true,
-                "description": "Signed authority on every message.",
-            }],
-        },
-        "defaultInputModes": ["text/plain"],
-        "defaultOutputModes": ["text/plain"],
-        "skills": skills,
-    })
 }
 
 impl Roster {
@@ -458,15 +406,10 @@ fn pass(
                 if let Some(relay) = e.body["relay"].as_str() {
                     r.relay = Some(relay.to_string());
                 }
-                // `accept` already refuses an oversized entry; a replay of one never replaces.
-                if e.body["card"].is_object() && canonical(&e.value()).len() <= MAX_ENTRY_BYTES {
-                    r.cards.insert(e.signer.clone(), e.body["card"].clone());
-                }
             }
             Kind::Link | Kind::Other => {}
         }
     }
-    r.cards.retain(|k, _| r.members.contains_key(k));
     r.admissions.retain(|k, _| r.members.contains_key(k));
     debug_assert!(r.members.keys().all(|key| r.admission_id(key).is_some()));
     // Live links: unused, not retired, and descended from every removal (a removal it did not
@@ -628,44 +571,6 @@ pub fn accept(store: &Store, entry: &Entry, now: i64) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn own_card_has_the_required_a2a_fields() {
-        let c = super::own_card("ab12", "bob", false);
-        assert_eq!(c["supportedInterfaces"][0]["url"], "lightbulb://ab12");
-        assert_eq!(
-            c["supportedInterfaces"][0]["protocolBinding"],
-            "https://thelightbulb.company/a2a/binding/p2p/v1"
-        );
-        assert_eq!(
-            c["capabilities"]["extensions"][0]["uri"],
-            crate::authority::URI
-        );
-        assert_eq!(c["capabilities"]["extensions"][0]["required"], true);
-        assert_eq!(c["supportedInterfaces"][0]["protocolVersion"], "1.0");
-        assert_eq!(c["defaultInputModes"], serde_json::json!(["text/plain"]));
-        assert_eq!(c["defaultOutputModes"], serde_json::json!(["text/plain"]));
-        assert_eq!(c["capabilities"]["streaming"], false);
-        let ids = |c: &serde_json::Value| -> Vec<String> {
-            c["skills"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|s| {
-                    for f in ["id", "name", "description"] {
-                        assert!(s[f].as_str().is_some_and(|x| !x.is_empty()), "{s}");
-                    }
-                    assert!(s["tags"].as_array().is_some_and(|t| !t.is_empty()), "{s}");
-                    s["id"].as_str().unwrap().to_string()
-                })
-                .collect()
-        };
-        assert_eq!(ids(&c), ["message", "ask_session"]);
-        assert_eq!(
-            ids(&super::own_card("ab12", "bob", true)),
-            ["message", "ask_session", "assign"]
-        );
-    }
-
     use super::*;
     use serde_json::json;
 

@@ -14,7 +14,7 @@
   {
     "name": "send_message",
     "scope": "network",
-    "description": "Sends text to session_id (a coding session from find_sessions, on this computer or a teammate's, sent peer to peer). reply_to (the request_id of a message you got from check_inbox) answers that message; reply_to alone replies to whoever sent it. request_id: a new [A-Za-z0-9._-]{1,128} string; reuse it only to retry that same send. Returns its receipt; its note says where the message waits. Answering an assignment (reply_to its request_id) makes your reply its result; add status if it is not done. authority: a compact JWS authority object you were given, which the receiving computer verifies; it shows who this message is on behalf of.",
+    "description": "Sends text to session_id (a coding session from find_sessions, on this computer or a teammate's, sent peer to peer). reply_to (the request_id of a message you got from check_inbox) answers that message; reply_to alone replies to whoever sent it. request_id: a new [A-Za-z0-9._-]{1,128} string; reuse it only to retry that same send. Returns its receipt; its note says where the message waits. Answering an assignment (reply_to its request_id) makes your reply its result; add status if it is not done.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -22,8 +22,7 @@
         "text": {"type": "string"},
         "session_id": {"type": "string", "description": "A session_id from find_sessions."},
         "reply_to": {"type": "string", "description": "The request_id of the message this answers."},
-        "status": {"type": "string", "enum": ["done", "failed", "cancelled"], "description": "Only when answering an assignment: how it ended. Absent means done."},
-        "authority": {"type": "string", "description": "A compact JWS authority object, sent as given."}
+        "status": {"type": "string", "enum": ["done", "failed", "cancelled"], "description": "Only when answering an assignment: how it ended. Absent means done."}
       },
       "required": ["request_id", "text"]
     }
@@ -76,8 +75,7 @@
         "done_when": {"type": "string", "description": "What finished looks like."},
         "deadline_s": {"type": "integer", "minimum": 1, "maximum": 14400, "description": "Seconds the job may take (default 3600)."},
         "repo": {"type": "string", "description": "The repository the job is in, if any."},
-        "branch": {"type": "string", "description": "The branch to work on, if any."},
-        "authority": {"type": "string", "description": "A compact JWS authority object you were given, sent as given; the receiving computer verifies it."}
+        "branch": {"type": "string", "description": "The branch to work on, if any."}
       },
       "required": ["request_id", "to", "brief", "done_when"]
     }

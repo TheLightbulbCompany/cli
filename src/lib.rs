@@ -1,6 +1,5 @@
 pub mod admission;
 pub mod agents;
-pub mod authority;
 pub mod capture;
 pub mod cli;
 pub mod code;
@@ -23,10 +22,8 @@ pub mod os;
 pub mod outbox;
 pub mod paths;
 pub mod presence;
-pub mod proof;
 pub mod relay;
 pub mod roster;
-pub mod rules;
 pub mod sessions;
 pub mod setup;
 pub mod store;

@@ -444,7 +444,7 @@ async fn person_confirms(d: &Daemon, t: Option<&Ticket>) -> Result<(), &'static 
     let (waiter, answer) = tokio::sync::oneshot::channel();
     *d.join_confirm.lock().unwrap() = Some(waiter);
     let args = dialog::args("Lightbulb", &text, &["Don't join", "Join"]);
-    d.dialogs.show_over_claim(dialog::JOIN_CONFIRM, args);
+    d.dialogs.show_next(dialog::JOIN_CONFIRM, args);
     let answer = tokio::time::timeout(CONFIRM_WAIT, answer).await;
     if answer.is_err() {
         d.dialogs.withdraw(dialog::JOIN_CONFIRM);

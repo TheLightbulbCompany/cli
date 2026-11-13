@@ -169,10 +169,6 @@ pub enum Frame {
         /// that moved networks can be dialed without mDNS. Absent from older builds.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         addrs: Vec<String>,
-        /// The sender's sign-in proof (`proof`), when its person ran `lightbulb login`: what a
-        /// workspace member admits it by. Absent from older builds.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        proof: Option<String>,
         /// The sender syncs shared memory (`MemoryHeads`, `Memory`). Absent from older builds.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         memory: bool,
@@ -214,9 +210,7 @@ pub enum Frame {
         sent_at: i64,
         #[serde(default, skip_serializing_if = "Meta::is_empty")]
         meta: Meta,
-        /// The A2A Message's `role`, `parts`, `metadata` and `extensions` (its ids, thread and
-        /// reply ride the envelope); its text parts joined are `body` (`mail::a2a_text`).
-        /// Absent from older builds.
+        /// An A2A Message from an older build: this build refuses it `unsupported`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         a2a: Option<serde_json::Value>,
         /// The sending computer's signature (`envelope_sig`). Absent from older builds.
@@ -423,8 +417,8 @@ pub fn from_peer_ok(f: &Frame, peer: &Member) -> std::result::Result<(), &'stati
 #[cfg(test)]
 mod tests {
     #[test]
-    fn every_reason_is_in_the_a2a_binding_page() {
-        let page = include_str!("../../docs/a2a-binding.md");
+    fn every_reason_is_in_the_wire_page() {
+        let page = include_str!("../../docs/wire.md");
         for r in super::REASONS {
             assert!(
                 page.contains(&format!("`{r}`")),
@@ -741,7 +735,6 @@ mod tests {
             protocol: 1,
             heads: vec!["h".into()],
             addrs: vec!["127.0.0.1:1".into()],
-            proof: None,
             memory: true,
         };
         write(&mut a, &hello).await.unwrap();

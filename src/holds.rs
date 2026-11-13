@@ -15,11 +15,9 @@ use crate::sessions;
 use crate::store::{row_message, Message, Store};
 use crate::workers;
 use crate::{dialog, label, Result};
-use data_encoding::HEXLOWER;
 use rusqlite::params;
 use serde::Serialize;
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -30,25 +28,16 @@ pub enum Kind {
     Permission,
     /// A worker-start hold: its message is an `assign` to `<member>/<provider>:new`.
     Worker,
-    /// A message the workspace rules hold for a person: receipt `held`, in no mailbox until
-    /// allowed.
-    Authority,
 }
 
 impl Kind {
-    const ALL: [Kind; 4] = [
-        Kind::Message,
-        Kind::Permission,
-        Kind::Worker,
-        Kind::Authority,
-    ];
+    const ALL: [Kind; 3] = [Kind::Message, Kind::Permission, Kind::Worker];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Kind::Message => "message",
             Kind::Permission => "permission",
             Kind::Worker => "worker",
-            Kind::Authority => "authority",
         }
     }
 
@@ -81,14 +70,9 @@ pub struct Hold {
     pub state: String,
     /// The dialog's text, once shown.
     pub shown: Option<String>,
-    /// The `holds.kind` column (`None` on a row from before it).
+    /// The `holds.kind` column (`None` on a row from before it, or of a retired kind: an
+    /// `authority` hold reads as the message hold it holds, closed by `expire`).
     pub stored_kind: Option<Kind>,
-    /// An Authority hold's requester and skill as the rules judged them (`person:<sub>` or
-    /// `member:<short>`; `ask_session` or `message`).
-    pub requester: Option<String>,
-    pub skill: Option<String>,
-    /// The workspace (`org_<id>`) whose runtime relayed an Authority hold's note, if one did.
-    pub relayed_by: Option<String>,
 }
 
 impl Hold {
@@ -151,9 +135,6 @@ pub fn insert_kind(
         state: "open".into(),
         shown: None,
         stored_kind: Some(kind),
-        requester: None,
-        relayed_by: None,
-        skill: None,
     })
 }
 
@@ -193,7 +174,7 @@ fn rows(
     let mut stmt = store.conn().prepare(&format!(
         "SELECT m.*, h.id AS h_id, h.target_session AS h_to, h.from_session AS h_from, \
          h.from_member AS h_member, h.created_at AS h_at, h.state AS h_state, \
-         h.shown AS h_shown, h.kind AS h_kind, h.requester AS h_req, h.skill AS h_skill, h.relayed_by AS h_relay, \
+         h.shown AS h_shown, h.kind AS h_kind, \
          s.key IS NOT NULL AS s_row, s.ended_at AS s_end \
          FROM holds h JOIN messages m ON m.id = h.message_id \
          LEFT JOIN sessions s ON s.key = h.target_session {filter} ORDER BY h.id"
@@ -218,9 +199,6 @@ fn rows(
                 .get::<_, Option<String>>("h_kind")?
                 .as_deref()
                 .and_then(Kind::parse),
-            requester: r.get("h_req")?,
-            skill: r.get("h_skill")?,
-            relayed_by: r.get("h_relay")?,
         };
         Ok((h, gone_since))
     })?;
@@ -250,101 +228,16 @@ fn agent(session: &str) -> String {
     }
 }
 
-/// An Authority hold lasts this long unanswered (`mail::HOLD_S`).
-pub const AUTHORITY_S: i64 = mail::HOLD_S as i64;
-
-/// The authority object (raw JWS) `m`'s A2A Message carried.
-fn object_jws(m: &Message) -> Option<&str> {
-    m.a2a.as_ref()?["metadata"][crate::authority::URI].as_str()
-}
-
-/// The person this computer is signed in as (`@session-person`): none, with no sign-in.
-pub(crate) fn my_person(_dir: &Path) -> Option<String> {
-    None
-}
-
-/// Whether `person` holds Authority hold `h`'s resource (`session:<to>`) under the stored
-/// rules: only then may they answer it Always allow.
-fn holds_resource(store: &Store, dir: &Path, h: &Hold, person: Option<&str>) -> bool {
-    let Some(person) = person else { return false };
-    let Ok((_, rules)) = crate::rules::load(store) else {
-        return false;
-    };
-    let resource = format!("session:{}", h.target_session);
-    crate::rules::holders(&rules, &resource, my_person(dir).as_deref()).contains(&person.into())
-}
-
-/// Authority hold `h`'s dialog (`dialog`): the requester chain, the session, for whom, the
-/// intent and the text, from its object re-verified now. An object that no longer verifies
-/// (expired) is shown so, with only Decline.
-fn authority_dialog(
-    store: &Store,
-    dir: &Path,
-    h: &Hold,
-    who: String,
-) -> (String, Vec<&'static str>, String) {
-    let session = agent(&h.target_session);
-    let body = preview_long(&h.message.body);
-    let verified = object_jws(&h.message).map(|j| crate::authority::verify(j, ipc::now() as i64));
-    let text = match verified {
-        Some(Err(_)) => {
-            let text = format!("{who} asks {session} (authority expired)\n\n{body}");
-            return (text, vec!["Decline"], who);
-        }
-        Some(Ok(a)) => {
-            let chain: Vec<String> = a
-                .chain
-                .iter()
-                // The requester wrote these: one capped line each (`preview`), as the intent.
-                .map(|hop| match &hop.agent {
-                    Some(agent) => format!("{} ({})", preview(agent), preview(&hop.person)),
-                    None => preview(&hop.person),
-                })
-                .collect();
-            match (
-                &h.relayed_by,
-                a.chain.last().and_then(|hop| hop.agent.as_ref()),
-            ) {
-                (Some(by), Some(agent)) => {
-                    format!(
-                        "{} asks {session} for {}, via {}'s agent: {}\n\n{body}",
-                        preview(agent),
-                        preview(by),
-                        preview(&a.requester_person),
-                        preview(&a.intent)
-                    )
-                }
-                _ => format!(
-                    "{} asks {session} for {}: {}\n\n{body}",
-                    chain.join(" → "),
-                    preview(&a.requester_person),
-                    preview(&a.intent)
-                ),
-            }
-        }
-        None => format!("{who} asks {session}\n\n{body}"),
-    };
-    let mut buttons = vec!["Decline", "Allow"];
-    if holds_resource(store, dir, h, my_person(dir).as_deref()) {
-        buttons.push("Always allow");
-    }
-    (text, buttons, who)
-}
-
 /// `h`'s dialog: its text, its buttons and the asking session's label in it. `folder` is
-/// where workers run (`workers::folder`); `dir` this computer's state (its sign-in).
+/// where workers run (`workers::folder`).
 pub fn dialog(
     store: &Store,
     roster: &Roster,
     me: &str,
     h: &Hold,
     folder: &Path,
-    dir: &Path,
 ) -> (String, Vec<&'static str>, String) {
     let who = label::render(roster, me, &h.from_session);
-    if h.kind() == Kind::Authority {
-        return authority_dialog(store, dir, h, who);
-    }
     let worker = (h.kind() == Kind::Permission)
         .then(|| store.worker_by_session(&h.target_session).ok().flatten())
         .flatten()
@@ -416,22 +309,18 @@ impl Closed {
     }
 }
 
-/// The answer to permission, worker or authority hold `id` (`by` `local`, the bridge's person
-/// or an agent's session): `Err(not_found)`, `Err(not_open)` once answered or expired (a worker
-/// hold at its assignment's deadline too), `Err(not_a_person)` when `by_agent` (an agent
-/// answers) a worker or authority hold or a worker's prompt, `Err(bad_request)` for scope
-/// `always` on anything but an Allow of a worker hold (which also records the asker's standing
-/// policy) or of an authority hold by a person holding its resource (a standing local
-/// exception), and for an Allow of an authority hold whose object no longer verifies. A signed
-/// `approvals` record keeps the text the dialog showed; an authority hold's also its object's
-/// `authority_id` and `authority_hash` (null without one), `resource`, `skill`, `requester` and `relayed_by` (the workspace that relayed it, else null).
+/// The answer to permission or worker hold `id` (`by` `local`, the bridge's person or an
+/// agent's session): `Err(not_found)`, `Err(not_open)` once answered or expired (a worker hold
+/// at its assignment's deadline too), `Err(not_a_person)` when `by_agent` (an agent answers) a
+/// worker hold or a worker's prompt, `Err(bad_request)` for scope `always` on anything but an
+/// Allow of a worker hold (which also records the asker's standing policy). A signed
+/// `approvals` record keeps the text the dialog showed.
 #[allow(clippy::too_many_arguments)]
 pub fn answer(
     store: &Store,
     roster: &Roster,
     me: &Identity,
     folder: &Path,
-    dir: &Path,
     id: i64,
     allow: bool,
     scope: &str,
@@ -448,37 +337,16 @@ pub fn answer(
     if !h.is_open() || kind == Kind::Message || late {
         return Ok(Err(NOT_OPEN));
     }
-    let persons = matches!(kind, Kind::Worker | Kind::Authority);
-    if (persons || is_workers(store, &h.target_session)) && by_agent {
+    if (kind == Kind::Worker || is_workers(store, &h.target_session)) && by_agent {
         return Ok(Err(NOT_A_PERSON));
     }
-    let authority = kind == Kind::Authority;
-    let jws = object_jws(&h.message).map(String::from);
-    if authority
-        && allow
-        && jws
-            .as_deref()
-            .is_some_and(|j| crate::authority::verify(j, now).is_err())
-    {
-        return Ok(Err(BAD_REQUEST));
-    }
-    // The answering person: this computer's, or the bridge's.
-    let answerer = match by {
-        "local" => my_person(dir),
-        p => Some(p.to_string()),
-    };
-    let always_ok = match kind {
-        Kind::Worker => true,
-        Kind::Authority => holds_resource(store, dir, &h, answerer.as_deref()),
-        _ => false,
-    };
-    if scope == "always" && !(allow && always_ok) {
+    if scope == "always" && !(allow && kind == Kind::Worker) {
         return Ok(Err(BAD_REQUEST));
     }
     // The text the person saw; one never shown (no dialog yet) is what it would show now.
     let shown = match &h.shown {
         Some(t) => t.clone(),
-        None => dialog(store, roster, &me.key, &h, folder, dir).0,
+        None => dialog(store, roster, &me.key, &h, folder).0,
     };
     let c = Closed { hold: h, allow };
     let verdict = c.verdict();
@@ -488,46 +356,14 @@ pub fn answer(
         "UPDATE holds SET state = ?2 WHERE id = ?1",
         params![id, state],
     )?;
-    let mut fields = json!({"hold": c.hold.name(), "verdict": verdict, "scope": scope,
+    let fields = json!({"hold": c.hold.name(), "verdict": verdict, "scope": scope,
         "by": by, "decided_at": now, "member": me.key, "text": shown});
-    let resource = format!("session:{}", c.hold.target_session);
-    if authority {
-        let jws = jws.as_deref();
-        let hash = jws.map(|j| format!("sha256:{}", HEXLOWER.encode(&Sha256::digest(j))));
-        fields["authority_id"] = c.hold.message.authority_id.clone().into();
-        fields["authority_hash"] = hash.into();
-        fields["resource"] = resource.clone().into();
-        fields["skill"] = c.hold.skill.clone().into();
-        fields["requester"] = c.hold.requester.clone().into();
-        fields["relayed_by"] = c.hold.relayed_by.clone().into();
-    }
     let (nonce, record) = signed_record(me, fields);
     store.conn().execute(
         "INSERT INTO approvals (hold_id, verdict, scope, \"by\", nonce, decided_at, record) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![id, verdict, scope, by, nonce, now, record],
     )?;
-    if scope == "always" && authority {
-        // A standing local exception (`rules::exceptions`) for this requester's skill here.
-        let (nonce, record) = signed_record(
-            me,
-            json!({"resource": resource, "skill": c.hold.skill, "requester": c.hold.requester,
-                "scope": "always", "by": by, "decided_at": now}),
-        );
-        store.conn().execute(
-            "INSERT INTO approvals (hold_id, verdict, scope, \"by\", nonce, decided_at, record, \
-             resource, skill, requester, operands_hash) \
-             VALUES (NULL, 'allow', 'always', ?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)",
-            params![
-                by,
-                nonce,
-                now,
-                record,
-                resource,
-                c.hold.skill,
-                c.hold.requester
-            ],
-        )?;
-    } else if scope == "always" {
+    if scope == "always" {
         workers::set_policy(store, me, &c.hold.from_member, "always", by, now)?;
     }
     // A worker-start hold's assignment is stored (to start) or refused.
@@ -539,27 +375,6 @@ pub fn answer(
         };
         let (f, rid, at) = (&m.from_key, &m.request_id, now as u64);
         mail::advance(store.conn(), f, rid, state, reason, None, at)?;
-    }
-    // An authority hold's message is released to its session (into its mailbox, its time from
-    // now), or refused.
-    if authority {
-        let m = &c.hold.message;
-        let (f, rid, at) = (&m.from_key, &m.request_id, now as u64);
-        if allow {
-            let expires = mail::expires_for(&m.to_key, now);
-            store.put_mailbox(&m.to_key, &m.id, now, expires)?;
-            mail::advance(store.conn(), f, rid, State::Stored, None, None, at)?;
-        } else {
-            mail::advance(
-                store.conn(),
-                f,
-                rid,
-                State::Refused,
-                Some("declined"),
-                None,
-                at,
-            )?;
-        }
     }
     tx.commit()?;
     Ok(Ok(c))
@@ -575,8 +390,8 @@ pub(crate) fn signed_record(me: &Identity, mut fields: serde_json::Value) -> (St
 }
 
 /// Closes the open holds past their time at `now`: a permission prompt whose session is gone or
-/// that waited `PERMISSION_S`, an authority hold that waited `AUTHORITY_S`, and any message
-/// hold of an older build. Returns them.
+/// that waited `PERMISSION_S`, and any message hold of an older build (a retired authority
+/// hold among them). Returns them.
 pub fn expire(store: &Store, now: i64) -> Result<Vec<Hold>> {
     let tx = store.conn().unchecked_transaction()?;
     let mut out = vec![];
@@ -592,7 +407,6 @@ pub fn expire(store: &Store, now: i64) -> Result<Vec<Hold>> {
                 None,
             ),
             Kind::Message => (true, Some("not_allowed")),
-            Kind::Authority => (h.created_at <= now - AUTHORITY_S, None),
             // Its target (`<m>/<p>:new`) never has a session row: only the deadline closes it.
             Kind::Worker => (
                 h.message.meta.deadline_at.is_some_and(|d| now >= d),
@@ -657,14 +471,7 @@ pub fn shown(d: &Daemon, team: &TeamState, store: &Store, h: &Hold) {
 /// text could not be kept (nothing is shown).
 fn raise(d: &Daemon, team: &TeamState, store: &Store, h: &Hold) -> Option<String> {
     let me = &d.identity.key;
-    let (text, buttons, who) = dialog(
-        store,
-        &team.roster,
-        me,
-        h,
-        &workers::folder(&team.config),
-        &d.dir,
-    );
+    let (text, buttons, who) = dialog(store, &team.roster, me, h, &workers::folder(&team.config));
     let sql = "UPDATE holds SET shown = ?2 WHERE id = ?1";
     if let Err(e) = store.conn().execute(sql, params![h.id, text]) {
         eprintln!("hold {}: {e}", h.name());
@@ -750,7 +557,6 @@ fn answer_here(
             &team.roster,
             &d.identity,
             &folder,
-            &d.dir,
             id,
             allow,
             scope,
@@ -769,13 +575,6 @@ fn answer_here(
                     Ok(refused) => note = refused,
                     Err(e) => eprintln!("hold {}: worker not started: {e}", c.hold.name()),
                 }
-            }
-        }
-        if c.hold.kind() == Kind::Authority {
-            d.peers.outbox.notify_one(); // its receipt moved
-            if c.allow {
-                let m = &c.hold.message;
-                ipc::stored(d, &sessions::Key(m.to_key.clone()));
             }
         }
     }

@@ -78,10 +78,6 @@ async fn send_wakes_a_waiting_inbox_and_the_receipt_walks_to_delivered() {
     let got = waiter.await.unwrap();
     assert_eq!(got["ok"], true);
     assert_eq!(got["messages"][0]["text"], "hello");
-    assert!(
-        got["messages"][0]["a2a_line"].is_null(),
-        "a plain message has no authority line: {got}"
-    );
     assert_eq!(got["messages"][0]["from"], "x/codex:a");
 
     let r = call(
