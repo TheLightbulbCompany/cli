@@ -41,7 +41,12 @@ impl Kind {
         }
     }
 
+    /// A stored kind. The retired `authority` hold (a message the workspace rules held) reads
+    /// as a message hold: nothing answers it, and `expire` closes it `not_allowed`.
     fn parse(s: &str) -> Option<Kind> {
+        if s == "authority" {
+            return Some(Kind::Message);
+        }
         Kind::ALL.into_iter().find(|k| k.as_str() == s)
     }
 }
@@ -70,8 +75,8 @@ pub struct Hold {
     pub state: String,
     /// The dialog's text, once shown.
     pub shown: Option<String>,
-    /// The `holds.kind` column (`None` on a row from before it, or of a retired kind: an
-    /// `authority` hold reads as the message hold it holds, closed by `expire`).
+    /// The `holds.kind` column (`None` on a row from before it; a retired `authority` hold
+    /// reads as `Message`, closed by `expire`).
     pub stored_kind: Option<Kind>,
 }
 

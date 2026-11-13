@@ -811,3 +811,43 @@ async fn a_cancel_of_a_released_assign_is_stored() {
     let got = a.inbox(&session(&a, "a1"));
     assert!(got.iter().any(|m| m["kind"] == "cancel"), "{got:?}");
 }
+
+/// An open hold of the retired `authority` kind (an older build's held assign to an existing
+/// session) reads as a message hold: never the worker dialog or Always allow, not answerable,
+/// and closed `not_allowed` by the next `expire`.
+#[test]
+fn a_retired_authority_hold_is_a_message_hold_and_expires_not_allowed() {
+    let (_d, s, r, me, aden) = lib();
+    let from = format!("{}/codex:a1", aden.short);
+    let to = format!("{}/codex:b1", me.short);
+    let h = assign_hold(&s, &from, &aden.key, &to, Some(1_000_000));
+    let db = rusqlite::Connection::open(_d.path().join("state.db")).unwrap();
+    db.execute("UPDATE holds SET kind = 'authority' WHERE id = ?1", [h.id])
+        .unwrap();
+    let h = holds::get(&s, h.id).unwrap().unwrap();
+    assert_eq!(h.kind(), holds::Kind::Message);
+    let (text, buttons) = dlg(&s, &r, &me, &h);
+    assert!(!text.contains("worker"), "{text}");
+    assert!(!buttons.contains(&"Always allow"), "{buttons:?}");
+    assert_eq!(
+        ans(&s, &r, &me, &h, "always", "local", false, 1_001),
+        Err("not_open")
+    );
+    assert_eq!(
+        workers::policy_for(&s, &me.key, &aden.key).unwrap(),
+        Policy::Ask
+    );
+    assert_eq!(ids(holds::expire(&s, 1_001).unwrap()), [h.id]);
+    assert_eq!(holds::get(&s, h.id).unwrap().unwrap().state, "expired");
+    let (state, reason): (String, Option<String>) = db
+        .query_row(
+            "SELECT state, reason FROM receipts WHERE from_key = ?1 AND request_id = ?2",
+            [&h.from_session, &h.message.request_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (state.as_str(), reason.as_deref()),
+        ("expired", Some("not_allowed"))
+    );
+}
