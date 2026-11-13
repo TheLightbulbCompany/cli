@@ -2,7 +2,7 @@
 
 > **Historical record.** This is the 0.3.7 verify-gate record. The workspace, hosted-app, sign-in,
 > telemetry, upload and A2A features it once covered were removed (the essentials CLI); their rows
-> were dropped from this page. File:line references and some test names predate that cut. The
+> were dropped from this page. The remaining rows have not been re-verified since 0.3.7. File:line references and some test names predate that cut. The
 > controls that remain are the peer-to-peer ones: sender authentication, signing, replay,
 > removal, person-only approval of worker holds, fail-closed policy, result binding and display
 > sanitising.

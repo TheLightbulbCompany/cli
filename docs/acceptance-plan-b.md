@@ -4,7 +4,7 @@
 
 - Date: 2026-10-23, 10:28–10:50 local (EDT).
 - Build: `e08b3fa` (`plan-b`), `cargo build --release`, sha256 `6346fdddbe0541e82256335fc6e7e28da205a211991a05fc6d98284da37ce8b9`, `lightbulb-connect 0.1.0`. A debug build of the same commit was used for the network rows (see "Why the network rows ran on a debug build").
-- Machine: the owner's Mac (Apple silicon, Darwin 25.2.0), with Claude Code, Codex, Cursor, Grok CLI and the Lightbulb desktop app installed. The app owns the `lightbulb` command and the `lightbulb` MCP server name, so Connect is `lightbulb-connect` in both places.
+- Machine: the owner's Mac (Apple silicon, Darwin 25.2.0), with Claude Code, Codex, Cursor, Grok CLI and the Lightbulb desktop app (since removed from this CLI) installed. At the time the app owned the `lightbulb` command and the `lightbulb` MCP server name, so Connect is `lightbulb-connect` in both places.
 - A = the real install (`~/.lightbulb/connect`). B = a second daemon, `LIGHTBULB_CONNECT_HOME=/tmp/lbc-b`, `computer = "mac-b"`.
 - Every person-side command ran inside a tmux window. The CLI refuses `held`, `approve` and the other person-only commands from an agent's shell ("Run this from your own terminal, not from an agent."), and a tmux server is a terminal program. No text was typed into any agent app.
 

@@ -1,8 +1,6 @@
 # Plan A acceptance on a real Mac
 
-> Historical record of the 0.2.0 build (the `lightbulb-connect` binary). Commands and output for features since removed (workspace agents, hosted apps, sign-in, streams) are kept as they were run.
-
-> Historical record: the product was renamed Lightbulb Connect afterwards (binary `lightbulb-connect`, state dir `~/.lightbulb/connect`). The commands and paths below are kept as recorded, under the old names.
+> Historical record of the 0.2.0 build. The product was renamed Lightbulb Connect afterwards (binary `lightbulb-connect`, state dir `~/.lightbulb/connect`). Commands and paths below are kept as recorded, under the old names, including features since removed (workspace agents, hosted apps, sign-in, streams).
 
 - Date: 2026-10-22, 14:36–14:50 local.
 - Build: `d9185a275540d6ac1a05a3be5ede6c82058cfc95` (`cargo build --release`, cargo 1.96.0), copied to `~/.lightbulb/network/bin/lightbulb-network`.
