@@ -32,7 +32,8 @@ CREATE TABLE IF NOT EXISTS team (
 ";
 
 /// The network tables. `team_link` holds one row per link minted on this computer (`secret`
-/// NULL for a once link, which keeps only `secret_hash`).
+/// NULL for a once link, which keeps only `secret_hash`). `grants` is no longer read or written:
+/// kept for rollback compatibility (`lightbulb update --version <older>`).
 const V2: &str = "
 CREATE TABLE IF NOT EXISTS roster (hash TEXT PRIMARY KEY, entry TEXT, received_at INTEGER);
 CREATE TABLE IF NOT EXISTS team_link (
@@ -88,7 +89,7 @@ CREATE INDEX IF NOT EXISTS messages_to_sent ON messages (to_key, sent_at);
 /// A message's text digest, kept when `mail::forget` drops the text, so a retry under the same
 /// request id still compares.
 const V7: &str = "ALTER TABLE messages ADD COLUMN body_sha TEXT;";
-/// Retired (the person links' key -> person map): kept so the schema version still counts.
+/// Retired (the person links' key -> person map): kept so the schema version still counts, and for rollback compatibility.
 const V8: &str =
     "CREATE TABLE IF NOT EXISTS persons (key TEXT PRIMARY KEY, person TEXT, at INTEGER);";
 /// The memory block last handed to each session at its start (`lightbulb memory last`).
@@ -321,7 +322,7 @@ pub(crate) fn row_message(r: &rusqlite::Row) -> rusqlite::Result<Message> {
 /// (`reply_to`), an assignment's terms (`meta`, JSON), the sender's signature and the stamp it
 /// covers (`sig`, `signed_at`). `holds`: its kind. No longer written (kept so the count and
 /// older builds stay): `messages.a2a`, `messages.authority_id`, `approvals`' `resource`,
-/// `skill`, `requester` and `operands_hash`, `holds`' `requester`, `skill` and `relayed_by`.
+/// `skill`, `requester` and `operands_hash`, `holds`' `requester`, `skill` and `relayed_by`, `rules`.
 const ADDED_COLUMNS: [(&str, &str, &str); 18] = [
     ("sessions", "reason", "TEXT"),
     ("sessions", "waiting_for", "TEXT"),
@@ -344,7 +345,7 @@ const ADDED_COLUMNS: [(&str, &str, &str); 18] = [
 ];
 /// Network workers: one row per headless worker a computer started for an assignment
 /// (`assignment` is the assign message id; `state` is starting, running, done, failed, stopped
-/// or cancelled).
+/// or cancelled). `rules` is no longer read or written: kept for rollback compatibility.
 const ADDED_TABLES: &str = "
 CREATE INDEX IF NOT EXISTS messages_reply_to ON messages (reply_to);
 CREATE TABLE IF NOT EXISTS workers (
@@ -353,35 +354,11 @@ CREATE TABLE IF NOT EXISTS workers (
     ended_at INTEGER, state TEXT NOT NULL, by TEXT
 );
 CREATE INDEX IF NOT EXISTS workers_session ON workers (session);
+CREATE TABLE IF NOT EXISTS rules (
+    workspace TEXT PRIMARY KEY, revision TEXT NOT NULL, iat INTEGER NOT NULL,
+    jws TEXT NOT NULL, doc TEXT NOT NULL
+);
 ";
-
-/// Tables nothing reads or writes any more, dropped on open (their migrations stay as they
-/// were): `grants` (streams), `rules` (workspace rules), `persons` (retired) and
-/// `memory_import_keys` (`memory.import`'s side table).
-const DEAD_TABLES: [&str; 4] = ["grants", "rules", "persons", "memory_import_keys"];
-
-/// Drops the `DEAD_TABLES` this db still has; when an existing db (`vacuum`) had one, a `VACUUM`
-/// gives the space back. That runs once: after it, there is none left to drop.
-fn drop_dead_tables(conn: &Connection, vacuum: bool) -> crate::Result<()> {
-    let mut dropped = false;
-    for t in DEAD_TABLES {
-        let had = conn
-            .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1")?
-            .exists([t])?;
-        if had {
-            // `IF EXISTS`: a second connection opening beside this one may have just dropped it.
-            conn.execute_batch(&format!("DROP TABLE IF EXISTS {t}"))?;
-            dropped = true;
-        }
-    }
-    if dropped && vacuum {
-        // Best effort: a reader holding the db keeps the free pages, which SQLite reuses.
-        if let Err(e) = conn.execute_batch("VACUUM") {
-            eprintln!("store: vacuum after dropping retired tables: {e}");
-        }
-    }
-    Ok(())
-}
 
 fn add_schema_on_open(conn: &Connection) -> crate::Result<()> {
     let has = |table: &str, column: &str| -> rusqlite::Result<bool> {
@@ -434,7 +411,6 @@ impl Store {
             tx.commit()?;
         }
         add_schema_on_open(&conn)?;
-        drop_dead_tables(&conn, version > 0)?;
         let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
         Ok(Store { conn, dir })
     }
@@ -1470,57 +1446,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(holds, 1);
-    }
-
-    #[test]
-    fn an_old_db_drops_the_retired_tables_once_and_still_opens() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.db");
-        Store::open(&path).unwrap();
-        {
-            // What a build before the cut left: its rows in every retired table.
-            let conn = Connection::open(&path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE grants (grant_id TEXT PRIMARY KEY, \"grant\" TEXT, expires_at INTEGER);
-                 CREATE TABLE persons (key TEXT PRIMARY KEY, person TEXT, at INTEGER);
-                 CREATE TABLE rules (workspace TEXT PRIMARY KEY, revision TEXT NOT NULL,
-                     iat INTEGER NOT NULL, jws TEXT NOT NULL, doc TEXT NOT NULL);
-                 CREATE TABLE memory_import_keys (key TEXT PRIMARY KEY, id TEXT NOT NULL);
-                 INSERT INTO grants VALUES ('g', zeroblob(65536), 1);
-                 INSERT INTO persons VALUES ('k', 'p', 1);
-                 INSERT INTO rules VALUES ('w', 'r', 1, 'j', 'd');
-                 INSERT INTO memory_import_keys VALUES ('k', 'i');
-                 INSERT INTO memory_tombstones VALUES ('kept');",
-            )
-            .unwrap();
-        }
-        let tables = |s: &Store| -> Vec<String> {
-            let mut stmt = s
-                .conn()
-                .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
-                .unwrap();
-            let names = stmt.query_map([], |r| r.get(0)).unwrap();
-            names.map(Result::unwrap).collect()
-        };
-        let store = Store::open(&path).unwrap();
-        for t in DEAD_TABLES {
-            assert!(!tables(&store).contains(&t.to_string()), "{t} kept");
-        }
-        // Memory stays, the version stays, and the VACUUM gave the pages back.
-        let kept: String = store
-            .conn()
-            .query_row("SELECT target FROM memory_tombstones", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(kept, "kept");
-        assert_eq!(user_version(&path), MIGRATIONS.len() as i64);
-        let free: i64 = store
-            .conn()
-            .query_row("PRAGMA freelist_count", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(free, 0);
-        drop(store);
-        let again = Store::open(&path).unwrap();
-        assert!(tables(&again).contains(&"memory_entries".to_string()));
     }
 
     #[test]
