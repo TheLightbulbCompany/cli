@@ -276,6 +276,12 @@ type Queued = (Frame, Option<tokio::sync::oneshot::Sender<()>>);
 // room). Budget bytes instead if a peer's queued bytes ever matter more than its frame count.
 const SEND_QUEUE: usize = 256;
 
+/// Free slots memory pages leave in a link's send queue, for the frames sent without waiting
+/// (presence, acks, envelopes, receipts, heads): bulk sync never fills the queue they close on.
+// ponytail: a fixed 32 frames, far more control frames than a link queues in the seconds a full
+// bulk queue takes to drain; size it from the control traffic if a link ever queues more.
+const HEADROOM: usize = 32;
+
 /// A connection's outgoing frames. A send finding the queue full refuses the frame and stops
 /// the connection's writer, which closes it: the peer redials and resyncs, instead of a peer
 /// that reads nothing growing our memory without bound.
@@ -283,13 +289,23 @@ const SEND_QUEUE: usize = 256;
 pub(crate) struct Tx {
     q: mpsc::Sender<Queued>,
     full: Arc<Notify>,
+    /// Per author, the memory the peer is known to hold: its last heads, plus what was queued
+    /// to it (`claim`). One per connection, so it goes when the connection does.
+    held: Arc<Mutex<BTreeMap<String, u64>>>,
 }
 
 impl Tx {
     fn new() -> (Tx, mpsc::Receiver<Queued>) {
         let (q, rx) = mpsc::channel(SEND_QUEUE);
         let full = Arc::new(Notify::new());
-        (Tx { q, full }, rx)
+        let held = Arc::default();
+        (Tx { q, full, held }, rx)
+    }
+
+    /// Stops the connection's writer, which closes it. A permit: the writer stops even when it
+    /// is not waiting yet.
+    fn close(&self) {
+        self.full.notify_one();
     }
 
     /// Queues `item`; an error once the connection closed, or when its queue is full.
@@ -297,27 +313,51 @@ impl Tx {
         match self.q.try_send(item) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_)) => {
-                // A permit: the writer stops even when it is not waiting yet.
-                self.full.notify_one();
+                self.close();
                 Err(())
             }
             Err(mpsc::error::TrySendError::Closed(_)) => Err(()),
         }
     }
 
-    /// Queues `item`, waiting up to `wait` for room (a bulk sender on a blocking thread, whose
-    /// backlog may outrun a slow but reading link); past `wait`, as `send` on a full queue.
+    /// Queues `item` once the queue has more than `HEADROOM` free slots, waiting up to `wait`
+    /// (a bulk sender, whose backlog may outrun a slow but reading link); past `wait` it closes
+    /// the connection, as `send` on a full queue. Blocking threads only: it sleeps the thread.
     pub(crate) fn send_waiting(&self, item: Queued, wait: Duration) -> std::result::Result<(), ()> {
-        let sent = tokio::runtime::Handle::current()
-            .block_on(tokio::time::timeout(wait, self.q.send(item)));
-        match sent {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(_)) => Err(()),
-            Err(_) => {
-                self.full.notify_one();
-                Err(())
+        let deadline = std::time::Instant::now() + wait;
+        while self.q.capacity() <= HEADROOM {
+            if self.q.is_closed() {
+                return Err(());
+            }
+            if std::time::Instant::now() >= deadline {
+                self.close();
+                return Err(());
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        self.send(item)
+    }
+
+    /// Where memory pushed here starts, per author: past `theirs` (heads the peer just said)
+    /// and past all known held or queued before. Marks `ours` as held before its pages are
+    /// queued, so a second push (a repeated `MemoryHeads`, the memory loop) never queues them
+    /// again; a page that fails closes the connection, and the mark goes with it.
+    pub(crate) fn claim(
+        &self,
+        theirs: &BTreeMap<String, u64>,
+        ours: &BTreeMap<String, u64>,
+    ) -> BTreeMap<String, u64> {
+        fn raise(held: &mut BTreeMap<String, u64>, heads: &BTreeMap<String, u64>) {
+            for (a, n) in heads {
+                let h = held.entry(a.clone()).or_default();
+                *h = (*h).max(*n);
             }
         }
+        let mut held = self.held.lock().unwrap();
+        raise(&mut held, theirs);
+        let from = held.clone();
+        raise(&mut held, ours);
+        from
     }
 }
 
@@ -352,10 +392,8 @@ struct Link {
     protocol: Protocol,
     /// Its last `hello` said it syncs memory.
     memory: bool,
-    /// The heads last sent here (`MemoryHeads` goes out only when ours differ), and what the
-    /// peer is known to hold: its last heads, plus what we pushed since.
+    /// The heads last sent here (`MemoryHeads` goes out only when ours differ).
     heads_sent: Option<BTreeMap<String, u64>>,
-    peer_heads: BTreeMap<String, u64>,
 }
 
 /// What a link's peer said in its last `hello`.
@@ -583,7 +621,6 @@ impl Peers {
             protocol: Protocol::Unknown,
             memory: false,
             heads_sent: None,
-            peer_heads: BTreeMap::new(),
         };
         live.insert(key.to_string(), link);
         true
@@ -596,18 +633,11 @@ impl Peers {
     }
 
     /// The links that said `hello` in our protocol with `memory`.
-    fn memory_links(&self) -> Vec<(String, Connection, Tx, BTreeMap<String, u64>)> {
+    fn memory_links(&self) -> Vec<(String, Connection, Tx)> {
         let live = self.live.lock().unwrap();
         live.iter()
             .filter(|(_, l)| l.memory && matches!(l.protocol, Protocol::Ok(_)))
-            .map(|(k, l)| {
-                (
-                    k.clone(),
-                    l.conn.clone(),
-                    l.tx.clone(),
-                    l.peer_heads.clone(),
-                )
-            })
+            .map(|(k, l)| (k.clone(), l.conn.clone(), l.tx.clone()))
             .collect()
     }
 
@@ -620,16 +650,6 @@ impl Peers {
                 eprintln!("net: sent memory heads to {}", short(key));
                 let heads = ours.clone();
                 let _ = l.tx.send((Frame::MemoryHeads { heads }, None));
-            }
-        });
-    }
-
-    /// Records that `key`'s peer holds `heads` (and `ours` where we pushed or kept back).
-    fn peer_holds(&self, key: &str, conn: &Connection, heads: &BTreeMap<String, u64>) {
-        self.with_link(key, conn, |l| {
-            for (a, n) in heads {
-                let h = l.peer_heads.entry(a.clone()).or_default();
-                *h = (*h).max(*n);
             }
         });
     }
@@ -873,11 +893,10 @@ impl Net {
             }
             let dd = d.clone();
             let _ = tokio::task::spawn_blocking(move || {
-                for (key, conn, tx, theirs) in dd.peers.memory_links() {
+                for (key, conn, tx) in dd.peers.memory_links() {
                     dd.peers.send_heads(&key, &conn, &ours);
-                    match memsync::send_pages(&dd, &tx, &theirs, &key) {
-                        Ok(ours) => dd.peers.peer_holds(&key, &conn, &ours),
-                        Err(e) => eprintln!("net: memory pages: {e}"),
+                    if let Err(e) = memsync::send_pages(&dd, &tx, &BTreeMap::new(), &key) {
+                        eprintln!("net: memory pages: {e}");
                     }
                 }
             })
@@ -1182,7 +1201,7 @@ impl Net {
         if let Some(theirs) = memory_heads.filter(|_| {
             d.team.lock().unwrap().config.memory_sync && d.peers.speaks_memory(key, conn)
         }) {
-            let (d, tx, key, conn) = (d.clone(), tx.clone(), key.to_string(), conn.clone());
+            let (d, tx, key) = (d.clone(), tx.clone(), key.to_string());
             tokio::task::spawn_blocking(move || {
                 // What the peer holds of ours numbers our next entry (`memory::saw`).
                 if let Some(&n) = theirs.get(&d.identity.key) {
@@ -1199,12 +1218,8 @@ impl Net {
                     }
                 }
                 // No answer with our own heads: they are sent when they change.
-                match memsync::send_pages(&d, &tx, &theirs, &key) {
-                    Ok(ours) => {
-                        d.peers.peer_holds(&key, &conn, &theirs);
-                        d.peers.peer_holds(&key, &conn, &ours);
-                    }
-                    Err(e) => eprintln!("net: memory pages: {e}"),
+                if let Err(e) = memsync::send_pages(&d, &tx, &theirs, &key) {
+                    eprintln!("net: memory pages: {e}");
                 }
             });
         }
@@ -1760,16 +1775,35 @@ mod tests {
             async move { write_queued(&tx, rx, &mut ours).await }
         });
         const PAGES: usize = 3 * SEND_QUEUE;
+        const CONTROL: usize = 50;
         // A peer that reads, a millisecond per frame: far slower than the pages are made.
         let reader = tokio::spawn(async move {
-            for _ in 0..PAGES {
+            for _ in 0..PAGES + CONTROL {
                 frames::read_raw(&mut theirs).await.unwrap();
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
         });
-        let sent = tokio::task::spawn_blocking(move || {
-            (0..PAGES).all(|_| tx.send_waiting(page(), memsync::PAGE_WAIT).is_ok())
+        let sent = tokio::task::spawn_blocking({
+            let tx = tx.clone();
+            move || (0..PAGES).all(|_| tx.send_waiting(page(), memsync::PAGE_WAIT).is_ok())
         });
+        // Frames sent without waiting (presence, acks) find room while the pages wait.
+        let mut while_paging = 0;
+        for _ in 0..CONTROL {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            while_paging += usize::from(!sent.is_finished());
+            let heads = Frame::MemoryHeads {
+                heads: BTreeMap::new(),
+            };
+            assert!(
+                tx.send((heads, None)).is_ok(),
+                "a control frame was refused"
+            );
+        }
+        assert!(
+            while_paging > CONTROL / 2,
+            "the pages were done: {while_paging}"
+        );
         assert!(sent.await.unwrap(), "a page was refused");
         tokio::time::timeout(Duration::from_secs(10), reader)
             .await
@@ -1793,8 +1827,29 @@ mod tests {
                 .count()
         });
         let sent = sent.await.unwrap();
-        assert!((SEND_QUEUE..2 * SEND_QUEUE).contains(&sent), "{sent} sent");
+        // The pages stop short of the headroom, plus what the writer took off the queue.
+        assert!(
+            (SEND_QUEUE - HEADROOM..SEND_QUEUE).contains(&sent),
+            "{sent} sent"
+        );
         let stopped = tokio::time::timeout(Duration::from_secs(5), writer).await;
         assert_eq!(stopped.expect("the writer stopped").unwrap(), Err(()));
+    }
+
+    #[test]
+    fn memory_queued_on_a_link_is_not_claimed_again() {
+        let (tx, _rx) = Tx::new();
+        let heads = |n| BTreeMap::from([("a".to_string(), n)]);
+        // The peer says it holds 3 of our 10: paging starts past 3, and 10 is marked.
+        assert_eq!(tx.claim(&heads(3), &heads(10)), heads(3));
+        // The same heads again (a repeated `MemoryHeads`), or the memory loop's push: nothing
+        // is paged again.
+        assert_eq!(tx.claim(&heads(3), &heads(10)), heads(10));
+        assert_eq!(tx.claim(&BTreeMap::new(), &heads(10)), heads(10));
+        // A new entry: only it.
+        assert_eq!(tx.claim(&BTreeMap::new(), &heads(11)), heads(10));
+        // A new connection knows nothing yet.
+        let (tx, _rx) = Tx::new();
+        assert_eq!(tx.claim(&heads(3), &heads(11)), heads(3));
     }
 }

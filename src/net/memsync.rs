@@ -34,21 +34,31 @@ fn same_person(_d: &Daemon, _key: &str) -> bool {
     false
 }
 
-/// Answers member `key`'s heads, or pushes to it past what it is known to hold: sends `tx` every
-/// entry we hold past `theirs`, per author in order, a page closing before the next entry
-/// would take it past `PAGE_BYTES`. Returns our heads, which `theirs` now covers (what a
-/// `me` filter kept back is not owed again).
+/// Answers member `key`'s heads (`theirs`, empty for a push), or pushes to it: sends `tx`
+/// every entry we hold past `theirs` and past what its link holds or has queued
+/// (`Tx::claim`), per author in order, a page closing before the next entry would take it
+/// past `PAGE_BYTES`. What a `me` filter kept back is not owed again. A failure closes the
+/// link: what it claimed was never all queued.
 pub(super) fn send_pages(
     d: &Daemon,
     tx: &Tx,
     theirs: &BTreeMap<String, u64>,
     key: &str,
-) -> Result<BTreeMap<String, u64>> {
+) -> Result<()> {
     if !d.team.lock().unwrap().config.memory_sync {
-        return Ok(BTreeMap::new());
+        return Ok(());
     }
+    let sent = pages(d, tx, theirs, key);
+    if sent.is_err() {
+        tx.close();
+    }
+    sent
+}
+
+fn pages(d: &Daemon, tx: &Tx, theirs: &BTreeMap<String, u64>, key: &str) -> Result<()> {
     let same_person = same_person(d, key);
     let ours = memory::heads(&d.store.lock().unwrap())?;
+    let from = tx.claim(theirs, &ours);
     // `"more":false` is the longer spelling, so this bounds every page's overhead.
     let base = serde_json::to_vec(&Frame::Memory {
         entries: vec![],
@@ -61,7 +71,7 @@ pub(super) fn send_pages(
     };
     for (author, mine) in &ours {
         let mine = *mine;
-        let mut after = theirs.get(author).copied().unwrap_or(0);
+        let mut after = from.get(author).copied().unwrap_or(0);
         while mine > after {
             let batch = memory::since(&d.store.lock().unwrap(), author, after, PAGE_ENTRIES)?;
             let Some(last) = batch.last().map(|e| e.seq) else {
@@ -88,7 +98,7 @@ pub(super) fn send_pages(
             }
         }
     }
-    Ok(ours)
+    Ok(())
 }
 
 /// Stores the entries of a `memory` frame from `short`; one that does not verify is dropped,
