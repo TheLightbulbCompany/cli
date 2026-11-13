@@ -147,28 +147,26 @@ async fn handle(
             Response::ok(id, json!({}))
         }
         "inbox" => inbox(id, &req.body, daemon, peer).await,
-        op => self::op(id, op, &req.body, daemon, Caller::Socket(peer_pid)).await,
+        op => self::op(id, op, &req.body, daemon, Caller(peer_pid)).await,
     }
 }
 
-/// Who an op comes from.
+/// Who an op comes from: a socket connection, by its peer's pid (`None` when the OS will not
+/// say).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Caller {
-    /// A socket connection, by its peer's pid (`None` when the OS will not say).
-    Socket(Option<u32>),
-}
+pub struct Caller(pub Option<u32>);
 
 impl Caller {
     /// Whether a person asked: a socket peer with no agent above it.
     pub fn is_person(self) -> bool {
-        matches!(self, Caller::Socket(Some(pid)) if super::net_ops::person_only(pid))
+        matches!(self, Caller(Some(pid)) if super::net_ops::person_only(pid))
     }
 
     /// Who is asking, for the ops an agent may also run: `local` for a person, else the agent
     /// session above the socket peer (`<member>/<handle>`, `agent` before it registers). `None`
     /// for a caller that cannot be resolved (no pid, a failed lookup).
     pub fn actor(self, store: &crate::store::Store) -> Option<String> {
-        let Caller::Socket(Some(pid)) = self else {
+        let Caller(Some(pid)) = self else {
             return None;
         };
         if super::net_ops::person_only(pid) {

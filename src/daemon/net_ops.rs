@@ -703,11 +703,9 @@ mod tests {
     fn an_unresolved_caller_is_nobody() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("state.db")).unwrap();
-        assert_eq!(super::super::ipc::Caller::Socket(None).actor(&store), None);
+        assert_eq!(super::super::ipc::Caller(None).actor(&store), None);
         assert_eq!(
-            super::super::ipc::Caller::Socket(Some(1))
-                .actor(&store)
-                .as_deref(),
+            super::super::ipc::Caller(Some(1)).actor(&store).as_deref(),
             Some("local")
         );
     }
