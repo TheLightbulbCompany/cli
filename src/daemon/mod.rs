@@ -460,13 +460,11 @@ async fn boot(dir: &Path, config: Config) -> Result<(Arc<Daemon>, net::Net)> {
         roster::accept(&store, &g, now)?;
         roster = roster::replay(&[g]);
     }
-    let mut team = TeamState {
+    let team = TeamState {
         roster,
-        config: Config::default(),
-        off: vec![],
+        off: canonical_off(&config),
+        config,
     };
-    let off = canonical_off(&config);
-    team.set_config(config, off);
     net_ops::sync_team_row(&store, &roster::Roster::default(), &team.roster)?;
     let latest = crate::presence::load(&store);
     let peers = net::Peers::default();

@@ -59,17 +59,6 @@ fn envelope(id: &str, rid: &str, from: &str, to: &str, body: &str) -> Frame {
 }
 
 impl Peer {
-    /// The `ack` for envelope `id`, as `(state, reason)`.
-    async fn ack(&mut self, id: &str) -> (String, Option<String>) {
-        match self
-            .recv_where(|f| matches!(f, Frame::Ack { id: i, .. } if i == id))
-            .await
-        {
-            Frame::Ack { state, reason, .. } => (state, reason),
-            _ => unreachable!(),
-        }
-    }
-
     /// The next frame that is an ack (of any envelope): its id.
     async fn any_ack(&mut self) -> String {
         match self.recv_where(|f| matches!(f, Frame::Ack { .. })).await {

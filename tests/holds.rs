@@ -15,7 +15,7 @@ use std::time::Duration;
 
 mod common;
 
-use common::{dialog, endpoint, person, seed_team, ulid, until, Env, Peer};
+use common::{dialog, endpoint, now_s, person, seed_team, ulid, until, Env, Peer};
 
 fn envelope(id: &str, rid: &str, from: &str, to: &str, body: &str) -> Frame {
     Frame::Envelope {
@@ -33,18 +33,6 @@ fn envelope(id: &str, rid: &str, from: &str, to: &str, body: &str) -> Frame {
         meta: Default::default(),
         a2a: None,
         sig: None,
-    }
-}
-
-impl Peer {
-    async fn ack(&mut self, id: &str) -> (String, Option<String>) {
-        match self
-            .recv_where(|f| matches!(f, Frame::Ack { id: i, .. } if i == id))
-            .await
-        {
-            Frame::Ack { state, reason, .. } => (state, reason),
-            _ => unreachable!(),
-        }
     }
 }
 
@@ -746,13 +734,6 @@ fn assign_env(id: &str, rid: &str, from: &str, to: &str, reply_to: Option<&str>)
         }
     }
     serde_json::from_value(v).unwrap()
-}
-
-fn now_s() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64
 }
 
 /// B's assign to A's session, stored there, then its receipt set to `state`/`reason` (as an

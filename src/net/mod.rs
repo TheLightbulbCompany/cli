@@ -277,10 +277,10 @@ type Queued = (Frame, Option<tokio::sync::oneshot::Sender<()>>);
 const SEND_QUEUE: usize = 256;
 
 /// Free slots memory pages leave in a link's send queue, for the frames sent without waiting
-/// (presence, acks, envelopes, receipts, heads): bulk sync never fills the queue they close on.
-// ponytail: a fixed 32 frames, far more control frames than a link queues in the seconds a full
-// bulk queue takes to drain; size it from the control traffic if a link ever queues more.
-const HEADROOM: usize = 32;
+/// (presence, acks, envelopes, receipts, heads): bulk sync queues at most 16 pages (≤8 MB),
+/// enough to keep the writer busy, and never fills the queue the others close on.
+// ponytail: a fixed 16-page bulk depth; budget bytes if pages ever need to queue deeper.
+const HEADROOM: usize = SEND_QUEUE - 16;
 
 /// A connection's outgoing frames. A send finding the queue full refuses the frame and stops
 /// the connection's writer, which closes it: the peer redials and resyncs, instead of a peer
@@ -895,9 +895,7 @@ impl Net {
             let _ = tokio::task::spawn_blocking(move || {
                 for (key, conn, tx) in dd.peers.memory_links() {
                     dd.peers.send_heads(&key, &conn, &ours);
-                    if let Err(e) = memsync::send_pages(&dd, &tx, &BTreeMap::new(), &key) {
-                        eprintln!("net: memory pages: {e}");
-                    }
+                    memsync::send_pages(&dd, &tx, &BTreeMap::new());
                 }
             })
             .await;
@@ -1201,7 +1199,7 @@ impl Net {
         if let Some(theirs) = memory_heads.filter(|_| {
             d.team.lock().unwrap().config.memory_sync && d.peers.speaks_memory(key, conn)
         }) {
-            let (d, tx, key) = (d.clone(), tx.clone(), key.to_string());
+            let (d, tx) = (d.clone(), tx.clone());
             tokio::task::spawn_blocking(move || {
                 // What the peer holds of ours numbers our next entry (`memory::saw`).
                 if let Some(&n) = theirs.get(&d.identity.key) {
@@ -1218,9 +1216,7 @@ impl Net {
                     }
                 }
                 // No answer with our own heads: they are sent when they change.
-                if let Err(e) = memsync::send_pages(&d, &tx, &theirs, &key) {
-                    eprintln!("net: memory pages: {e}");
-                }
+                memsync::send_pages(&d, &tx, &theirs);
             });
         }
         if let Some(entries) = memory_entries.filter(|_| {

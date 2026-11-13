@@ -487,6 +487,17 @@ impl Peer {
         }
     }
 
+    /// The `ack` for envelope `id`, as `(state, reason)`.
+    pub async fn ack(&mut self, id: &str) -> (String, Option<String>) {
+        match self
+            .recv_where(|f| matches!(f, Frame::Ack { id: i, .. } if i == id))
+            .await
+        {
+            Frame::Ack { state, reason, .. } => (state, reason),
+            _ => unreachable!(),
+        }
+    }
+
     /// The next frame other than a `presence` (each `hello` is also answered with one).
     pub async fn recv(&mut self) -> Frame {
         self.recv_where(|f| !matches!(f, Frame::Presence { .. }))

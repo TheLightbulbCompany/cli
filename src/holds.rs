@@ -542,16 +542,17 @@ pub(crate) fn closed(
     }
 }
 
-/// `answer` under the daemon's locks (from `surface`), then `closed`.
+/// `answer` under the daemon's locks (from `surface`; by `agent`'s session, else `local`),
+/// then `closed`.
 fn answer_here(
     d: &Arc<Daemon>,
     id: i64,
     allow: bool,
     scope: &str,
-    by: &str,
-    by_agent: bool,
+    agent: Option<&str>,
     surface: &'static str,
 ) -> Result<std::result::Result<(Closed, Option<&'static str>), &'static str>> {
+    let (by, by_agent) = (agent.unwrap_or("local"), agent.is_some());
     let r = {
         let team = d.team.lock().unwrap();
         let store = d.store.lock().unwrap();
@@ -596,7 +597,7 @@ pub fn expire_here(d: &Daemon, store: &Store, now: i64) -> Result<()> {
 
 /// Dialog `H<n>` answered `button`: `Allow`, `Always allow`, `Stop worker`, else a decline.
 pub fn on_dialog(d: &Arc<Daemon>, n: i64, button: &str) {
-    let r = |allow, scope| answer_here(d, n, allow, scope, "local", false, "dialog");
+    let r = |allow, scope| answer_here(d, n, allow, scope, None, "dialog");
     let done = match button {
         "Allow" => r(true, "once"),
         "Always allow" => r(true, "always"),
@@ -637,7 +638,6 @@ pub fn op(id: u64, op: &str, body: &Value, d: &Arc<Daemon>, caller: Caller) -> R
 
 fn run(id: u64, op: &str, body: &Value, d: &Arc<Daemon>, agent: Option<&str>) -> Result<Response> {
     let me = &d.identity.key;
-    let missing = NOT_FOUND;
     let hold_id = body["hold"].as_str().and_then(|s| dialog::number(s, 'H'));
     Ok(match op {
         // `holds {reshow?}` -> `{holds: [{id, kind, target_session, from, label, verified, preview,
@@ -669,7 +669,7 @@ fn run(id: u64, op: &str, body: &Value, d: &Arc<Daemon>, agent: Option<&str>) ->
             let team = d.team.lock().unwrap();
             let store = d.store.lock().unwrap();
             let Some(h) = hold_id.map(|n| get(&store, n)).transpose()?.flatten() else {
-                return Ok(Response::err(id, missing));
+                return Ok(Response::err(id, NOT_FOUND));
             };
             let birth = store
                 .session(&h.target_session)?
@@ -687,7 +687,6 @@ fn run(id: u64, op: &str, body: &Value, d: &Arc<Daemon>, agent: Option<&str>) ->
         // scope, note?}`. A worker hold and a worker's prompt are a person's to answer; the
         // answer's `by` is `local`, or an agent's session.
         "hold.answer" => {
-            let (by, surface) = (agent.unwrap_or("local"), "cli");
             let allow = match body["verdict"].as_str() {
                 Some(ALLOW) => true,
                 Some(DECLINE) => false,
@@ -699,16 +698,16 @@ fn run(id: u64, op: &str, body: &Value, d: &Arc<Daemon>, agent: Option<&str>) ->
                 Some(_) => return Ok(Response::err(id, BAD_REQUEST)),
             };
             let Some(n) = hold_id else {
-                return Ok(Response::err(id, missing));
+                return Ok(Response::err(id, NOT_FOUND));
             };
-            match answer_here(d, n, allow, scope, by, agent.is_some(), surface)? {
+            match answer_here(d, n, allow, scope, agent, "cli")? {
                 // `note: "busy"`: allowed, but at `workers_max` nothing started.
                 Ok((c, note)) => Response::ok(
                     id,
                     json!({"id": c.hold.name(), "verdict": c.verdict(), "scope": scope,
                         "note": note}),
                 ),
-                Err(NOT_FOUND) => Response::err(id, missing),
+                Err(NOT_FOUND) => Response::err(id, NOT_FOUND),
                 Err(NOT_A_PERSON) => refused(id, NOT_A_PERSON),
                 Err(BAD_REQUEST) => Response::err(id, BAD_REQUEST),
                 Err(code) => {

@@ -44,19 +44,6 @@ fn user(text: &str) -> Value {
     json!({"role": "ROLE_USER", "parts": [{"text": text}]})
 }
 
-impl Peer {
-    /// The `ack` for envelope `id`, as `(state, reason)`.
-    async fn ack(&mut self, id: &str) -> (String, Option<String>) {
-        match self
-            .recv_where(|f| matches!(f, Frame::Ack { id: i, .. } if i == id))
-            .await
-        {
-            Frame::Ack { state, reason, .. } => (state, reason),
-            _ => unreachable!(),
-        }
-    }
-}
-
 /// A running alone, B played by the test (connected, past its `hello`).
 async fn a_and_peer_b() -> (Env, Env, iroh::Endpoint, Peer) {
     let (a, b) = (Env::new(), Env::new());

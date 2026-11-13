@@ -14,49 +14,35 @@ use std::time::Duration;
 /// stalled peer costs the rest.
 pub(super) const PAGE_WAIT: Duration = Duration::from_secs(5);
 
-/// Whether `e` may go to a peer: a `me` fact only to a computer of the same person.
-fn sendable(e: &memory::Entry, same_person: bool) -> bool {
-    same_person
-        || !matches!(
-            e.op,
-            Op::Remember {
-                scope: Scope::Me,
-                ..
-            }
-        )
+/// Whether `e` may go to a peer: a `me` fact never leaves this computer.
+// ponytail: nothing proves two computers are one person without a sign-in, so `me` memory
+// never syncs; compare roster `person_id`s to sync it between one person's computers.
+fn sendable(e: &memory::Entry) -> bool {
+    !matches!(
+        e.op,
+        Op::Remember {
+            scope: Scope::Me,
+            ..
+        }
+    )
 }
 
-/// Whether member `key` is the same person as this computer. Nothing proves it without a
-/// sign-in, so never: a `me` entry stays home (fails closed).
-// ponytail: `me` memory never syncs; compare roster `person_id`s to sync it between one
-// person's computers.
-fn same_person(_d: &Daemon, _key: &str) -> bool {
-    false
-}
-
-/// Answers member `key`'s heads (`theirs`, empty for a push), or pushes to it: sends `tx`
-/// every entry we hold past `theirs` and past what its link holds or has queued
-/// (`Tx::claim`), per author in order, a page closing before the next entry would take it
-/// past `PAGE_BYTES`. What a `me` filter kept back is not owed again. A failure closes the
+/// Answers a peer's heads (`theirs`, empty for a push), or pushes to it: sends `tx` every
+/// entry we hold past `theirs` and past what its link holds or has queued (`Tx::claim`), per
+/// author in order, a page closing before the next entry would take it past `PAGE_BYTES`.
+/// What the `me` filter kept back is not owed again. A failure is logged and closes the
 /// link: what it claimed was never all queued.
-pub(super) fn send_pages(
-    d: &Daemon,
-    tx: &Tx,
-    theirs: &BTreeMap<String, u64>,
-    key: &str,
-) -> Result<()> {
+pub(super) fn send_pages(d: &Daemon, tx: &Tx, theirs: &BTreeMap<String, u64>) {
     if !d.team.lock().unwrap().config.memory_sync {
-        return Ok(());
+        return;
     }
-    let sent = pages(d, tx, theirs, key);
-    if sent.is_err() {
+    if let Err(e) = pages(d, tx, theirs) {
+        eprintln!("net: memory pages: {e}");
         tx.close();
     }
-    sent
 }
 
-fn pages(d: &Daemon, tx: &Tx, theirs: &BTreeMap<String, u64>, key: &str) -> Result<()> {
-    let same_person = same_person(d, key);
+fn pages(d: &Daemon, tx: &Tx, theirs: &BTreeMap<String, u64>) -> Result<()> {
     let ours = memory::heads(&d.store.lock().unwrap())?;
     let from = tx.claim(theirs, &ours);
     // `"more":false` is the longer spelling, so this bounds every page's overhead.
@@ -80,7 +66,7 @@ fn pages(d: &Daemon, tx: &Tx, theirs: &BTreeMap<String, u64>, key: &str) -> Resu
             // A short batch is the end of the stream (seqs have gaps: never wait for one).
             let full = batch.len() == PAGE_ENTRIES;
             let (mut cur, mut size) = (vec![], base);
-            for e in batch.into_iter().filter(|e| sendable(e, same_person)) {
+            for e in batch.into_iter().filter(sendable) {
                 let n = serde_json::to_vec(&e)?.len() + 1;
                 if !cur.is_empty() && size + n > PAGE_BYTES {
                     page(std::mem::take(&mut cur), true)?;
@@ -147,14 +133,13 @@ mod tests {
     }
 
     #[test]
-    fn me_goes_only_to_the_same_person() {
-        assert!(sendable(&entry(Scope::Me), true));
-        assert!(!sendable(&entry(Scope::Me), false));
-        assert!(sendable(&entry(Scope::Team), false));
+    fn me_stays_home() {
+        assert!(!sendable(&entry(Scope::Me)));
+        assert!(sendable(&entry(Scope::Team)));
         let forget = memory::Entry {
             op: Op::Forget { target: "x".into() },
             ..entry(Scope::Me)
         };
-        assert!(sendable(&forget, false));
+        assert!(sendable(&forget));
     }
 }
