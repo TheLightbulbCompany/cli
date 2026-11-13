@@ -835,14 +835,22 @@ fn remove_takes_only_our_entries() {
 }
 
 #[test]
-fn setup_takes_the_lightbulb_name_from_the_app_entry_only() {
+fn setup_takes_the_lightbulb_name_from_the_app_or_hosted_entry_only() {
     let desk = "/Applications/Lightbulb.app/Contents/MacOS/lightbulb-desktop";
+    // The retired hosted MCP: an upgrader's dead entry gives way to ours.
+    let hosted = "https://api.thelightbulb.company/mcp";
     // (a `lightbulb` entry's JSON, OpenCode JSON and TOML; whether ours replaces it)
     let cases = [
         (
             json!({"command": desk, "args": ["session-mcp"], "env": {"A": "1"}}),
             json!({"type": "local", "command": [desk, "session-mcp"]}),
             format!("command = \"{desk}\"\nargs = [\"session-mcp\"]\nstartup_timeout_sec = 30\n"),
+            true,
+        ),
+        (
+            json!({"type": "http", "url": hosted}),
+            json!({"type": "remote", "url": hosted}),
+            format!("url = \"{hosted}\"\n"),
             true,
         ),
         (

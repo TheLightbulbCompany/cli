@@ -225,9 +225,6 @@ fn receipt_text(r: &Value, person: Option<&ForPerson>) -> Option<String> {
             "refused" if at("reason") == "no_worker" => format!("not sent: {}", no_worker(at("harness"), " (find_workers lists who takes assignments)")),
             "refused" if at("reason") == "busy" && remote => format!("not sent: {person}'s computer is running all the workers it allows; try later or another worker"),
             "refused" if at("reason") == "declined" && remote => format!("not sent: {person} declined to start a worker"),
-            "queued" if remote && r["waking"] == true => {
-                format!("queued: {computer} is waking up and gets it in a moment.")
-            }
             "queued" if remote => {
                 let why = if r["online"] == true {
                     "has not confirmed yet"
@@ -268,9 +265,6 @@ fn receipt_text(r: &Value, person: Option<&ForPerson>) -> Option<String> {
             }
         ),
         "held" => format!("Not yet sent: held until {who} allows it.{check}"),
-        "queued" if remote && r["waking"] == true => {
-            format!("Sent. {computer} is waking up and gets it in a moment.{check}")
-        }
         "queued" if remote => {
             let why = if r["online"] == true {
                 "has not confirmed it yet"
@@ -2428,32 +2422,6 @@ mod tests {
         advance(s.conn(), "m/codex:b", "r2", State::Read, None, None, 3).unwrap();
         forget(&s).unwrap();
         assert_eq!(body("r2").as_deref(), Some("yo"));
-    }
-
-    #[test]
-    fn a_parked_workspace_reads_as_waking_not_offline() {
-        let p = ForPerson {
-            to: Some("w/friday"),
-            rid: "r1",
-            kind: Some("message"),
-            cmd: "lightbulb",
-            check: false,
-        };
-        let r = |waking: bool| {
-            serde_json::json!({"state": "queued", "where": "Acme", "person": "Acme",
-                "online": false, "waking": waking, "until": 0})
-        };
-        assert_eq!(
-            receipt_note(&r(true), Some(&p)).unwrap(),
-            "Sent. Acme is waking up and gets it in a moment."
-        );
-        assert!(receipt_note(&r(false), Some(&p))
-            .unwrap()
-            .contains("is offline"));
-        assert_eq!(
-            receipt_note(&r(true), None).unwrap(),
-            "queued: Acme is waking up and gets it in a moment."
-        );
     }
 
     #[test]
