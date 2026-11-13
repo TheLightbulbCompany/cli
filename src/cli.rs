@@ -2,7 +2,6 @@
 //! `daemon --install/--uninstall`, and the `lightbulb` alias.
 //! Each is a client of the daemon, like the hook.
 
-use crate::code::Via;
 use crate::daemon::ipc;
 use crate::daemon::net_ops::Invite;
 use crate::hook::{self, Conn};
@@ -25,38 +24,6 @@ const NO_LAUNCHCTL: &str = "LIGHTBULB_CONNECT_NO_LAUNCHCTL";
 const SESSION_ENV: &str = "LIGHTBULB_CONNECT_SESSION";
 /// (tests) Treat stdout as a terminal: a person at it (`install_running`).
 const TTY_ENV: &str = "LIGHTBULB_CONNECT_DEBUG_TTY";
-
-/// (tests) The Lightbulb app bundle to use instead of the installed one.
-const APP_ENV: &str = "LIGHTBULB_CONNECT_DEBUG_APP";
-/// The words the Lightbulb app answers (`lightbulb claude …`); none is one of ours.
-pub const APP_WORDS: [&str; 5] = ["claude", "codex", "continue", "share", "pair"];
-
-/// Runs `lightbulb <word> …` as the Lightbulb app's `cli <word> …` in this process (stdin,
-/// stdout and the exit code are the app's); without the app, says where to get it and exits 1.
-pub fn app_command(args: &[std::ffi::OsString]) -> Result<i32> {
-    let bundles = match test_env(APP_ENV) {
-        Some(p) => vec![PathBuf::from(p)],
-        None if cfg!(target_os = "macos") => vec![
-            PathBuf::from("/Applications/Lightbulb.app"),
-            home()?.join("Applications/Lightbulb.app"),
-        ],
-        None => vec![],
-    };
-    let exe = bundles
-        .iter()
-        .map(|b| b.join("Contents/MacOS/lightbulb-desktop"))
-        .find(|e| e.is_file());
-    let Some(exe) = exe else {
-        eprintln!(
-            "\"lightbulb {}\" needs the Lightbulb app: https://thelightbulb.company/download",
-            args[0].to_string_lossy()
-        );
-        return Ok(1);
-    };
-    use std::os::unix::process::CommandExt;
-    let e = Command::new(&exe).arg("cli").args(args).exec();
-    Err(format!("{}: {e}", exe.display()).into())
-}
 
 /// A "(tests)" environment override: read in debug builds only, as `net::Knobs::read` does.
 pub(crate) fn test_env(name: &str) -> Option<std::ffi::OsString> {
@@ -244,9 +211,6 @@ fn recent_folder(s: &Value) -> String {
 /// computer's rows carry `pid`, and only they wait for the person reading this.
 fn status_cell(s: &Value, now: u64) -> String {
     if s["online"] == false {
-        if s["wakes"] == true {
-            return "parked, wakes when messaged".into();
-        }
         let seen = now.saturating_sub(s["seen_at"].as_u64().unwrap_or(0));
         // Mail is held a day: past that, nothing waits for it.
         let queued = if seen > crate::presence::DAY {
@@ -412,7 +376,6 @@ pub fn who(as_json: bool, all: bool) -> Result<i32> {
             println!("… {} more: lightbulb who --json", ended.len() - RECENT);
         }
     }
-    println!("{}", setup::UPSELL);
     Ok(0)
 }
 
@@ -670,19 +633,10 @@ pub enum Memory {
     Export(bool),
     Last,
     Team(bool),
-    Drafts,
-    Approve(String, bool),
-    Dismiss(String),
 }
 
 /// `memory ...`: a person's view of what is remembered, through the daemon.
 pub fn memory(cmd: Memory) -> Result<i32> {
-    if matches!(
-        cmd,
-        Memory::Drafts | Memory::Approve(..) | Memory::Dismiss(_)
-    ) {
-        return drafts(cmd);
-    }
     let texts = [
         (
             "not_found",
@@ -715,7 +669,6 @@ pub fn memory(cmd: Memory) -> Result<i32> {
             json!({ "session": calling_session(&mut conn) }),
         ),
         Memory::Team(on) => ("memory.team", json!({ "on": on })),
-        Memory::Drafts | Memory::Approve(..) | Memory::Dismiss(_) => unreachable!("handled above"),
     };
     let r = conn.call(op, body)?;
     if r["error"] == "replaced" {
@@ -792,151 +745,8 @@ pub fn memory(cmd: Memory) -> Result<i32> {
             "Team memory is {} on this computer.",
             if on { "on" } else { "off" }
         ),
-        Memory::Drafts | Memory::Approve(..) | Memory::Dismiss(_) => {}
     }
     Ok(0)
-}
-
-/// `memory drafts | approve <id> [--team] | dismiss <id>`: the lessons Lightbulb's evaluator
-/// suggests from sessions you uploaded. A person's terminal only; signed calls to the backend.
-fn drafts(cmd: Memory) -> Result<i32> {
-    use crate::memory::Source;
-    let mut conn = connect()?;
-    if let Err(e) = ask(&mut conn, "person", json!({})) {
-        eprintln!("{e}");
-        return Ok(1);
-    }
-    // Before anything is settled on the server: a `team` entry cannot be stored here while
-    // team memory is off, and a retry would find the draft already approved.
-    if matches!(cmd, Memory::Approve(_, true))
-        && !crate::config::Config::load(&paths::state_dir())?.memory_team
-    {
-        eprintln!(
-            "Team memory is off on this computer. Turn it on with `lightbulb memory team on`, then approve again."
-        );
-        return Ok(1);
-    }
-    let call = |method: &str, path: &str, body: Option<Value>| {
-        crate::mcp::rest(method, path, body.as_ref(), "memory").map_err(|e| {
-            match (e["status"].as_u64(), e["error"].as_str()) {
-                (Some(409), _) => "That draft was settled somewhere else already.".to_string(),
-                (_, Some("not_signed_in")) => {
-                    format!(
-                        "Sign in first: lightbulb login ({})",
-                        e["hint"].as_str().unwrap_or("")
-                    )
-                }
-                (_, Some("unreachable")) => {
-                    "Could not reach Lightbulb. Check your connection and try again.".into()
-                }
-                (_, Some(m)) => m.to_string(),
-                _ => "Lightbulb could not do that.".into(),
-            }
-        })
-    };
-    let all = match call("GET", "/memory/drafts", None) {
-        Ok(v) => v["drafts"].as_array().cloned().unwrap_or_default(),
-        Err(e) => {
-            eprintln!("{e}");
-            return Ok(1);
-        }
-    };
-    let (Memory::Approve(prefix, _) | Memory::Dismiss(prefix)) = &cmd else {
-        if all.is_empty() {
-            println!("No suggested lessons are waiting.");
-            return Ok(0);
-        }
-        let mut rows = vec![["Id", "Kind", "Suggestion", "Sessions"]
-            .map(String::from)
-            .to_vec()];
-        for d in &all {
-            let first = d["text"]
-                .as_str()
-                .unwrap_or_default()
-                .lines()
-                .next()
-                .unwrap_or_default();
-            rows.push(vec![
-                cell(d["id"].as_str().unwrap_or_default())
-                    .chars()
-                    .take(8)
-                    .collect(),
-                cell(d["kind"].as_str().unwrap_or_default()),
-                cell(first),
-                d["evidence"].as_array().map_or(0, Vec::len).to_string(),
-            ]);
-        }
-        table(&rows);
-        return Ok(0);
-    };
-    let hits: Vec<&Value> = all
-        .iter()
-        .filter(|d| {
-            !prefix.is_empty()
-                && d["id"]
-                    .as_str()
-                    .is_some_and(|i| i.starts_with(prefix.as_str()))
-        })
-        .collect();
-    let [d] = hits[..] else {
-        let why = if hits.is_empty() {
-            "No suggestion starts with that id. `lightbulb memory drafts` shows them."
-        } else {
-            "More than one suggestion starts with that id. Give more of it."
-        };
-        eprintln!("{why}");
-        return Ok(1);
-    };
-    let path = format!("/memory/drafts/{}", d["id"].as_str().unwrap_or_default());
-    if matches!(cmd, Memory::Dismiss(_)) {
-        return match call("POST", &format!("{path}/dismiss"), None) {
-            Ok(_) => {
-                println!("Dismissed.");
-                Ok(0)
-            }
-            Err(e) => {
-                eprintln!("{e}");
-                Ok(1)
-            }
-        };
-    }
-    let team = matches!(cmd, Memory::Approve(_, true));
-    let r = match call(
-        "POST",
-        &format!("{path}/approve"),
-        Some(json!({ "scope": team.then_some("team") })),
-    ) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("{e}");
-            return Ok(1);
-        }
-    };
-    let (Some(subject), Some(fact)) = (r["subject"].as_str(), r["fact"].as_str()) else {
-        // In a workspace the entry arrives through the network.
-        println!("Approved; the workspace will remember it");
-        return Ok(0);
-    };
-    let source = Source {
-        harness: "cloud-evaluator".into(),
-        repo: None,
-        session: d["evidence"][0].as_str().map(String::from),
-        on_behalf_of: None,
-        shared_from: None,
-    };
-    let kept = ask(
-        &mut conn,
-        "memory.remember",
-        json!({"subject": subject, "fact": fact, "kind": r["kind"], "scope": r["scope"], "source": source}),
-    )?;
-    if kept["stored"] == true {
-        println!("Approved and remembered on this computer.");
-        return Ok(0);
-    }
-    // The draft is approved on the server now: print the lesson so nothing is lost.
-    let reason = kept["refused"].as_str().unwrap_or("it could not be stored");
-    eprintln!("Approved, but not stored locally: {reason}; the lesson is:\n{fact}");
-    Ok(1)
 }
 
 /// A `sessions` subcommand.
@@ -945,35 +755,12 @@ pub enum Sessions {
     Show(String),
     Forget(String),
     Export,
-    Upload(Option<String>),
     /// `Some(on)` sets whether turns are kept; `None` says which.
     Turns(Option<bool>),
 }
 
 /// `sessions ...`: what was captured of your coding sessions on this computer.
 pub fn sessions(cmd: Sessions) -> Result<i32> {
-    if let Sessions::Upload(mode) = &cmd {
-        let dir = paths::state_dir();
-        let now = match mode {
-            // Through the daemon, which refuses an agent's shell: uploading is a person's choice.
-            Some(m) => {
-                let r = connect()?.call("sessions.upload", json!({ "mode": m }))?;
-                if r["ok"] != true {
-                    return refuse(&r, &[]);
-                }
-                m.clone()
-            }
-            None => crate::config::Config::load(&dir)?.capture_upload,
-        };
-        println!("Uploads are {now}. {}", crate::upload::describe(&now));
-        let now_s = crate::daemon::ipc::now() as i64;
-        let signed_out =
-            crate::login::stored_proof(&dir).is_none() || crate::login::ended(&dir, now_s);
-        if now != "off" && signed_out {
-            println!("Nothing is sent until you sign in: lightbulb login");
-        }
-        return Ok(0);
-    }
     if let Sessions::Turns(on) = cmd {
         let dir = paths::state_dir();
         if let Some(on) = on {
@@ -999,7 +786,7 @@ pub fn sessions(cmd: Sessions) -> Result<i32> {
         Sessions::Show(id) => ("sessions.show", json!({ "session": id })),
         Sessions::Forget(id) => ("sessions.forget", json!({ "session": id })),
         Sessions::Export => ("sessions.export", json!({})),
-        Sessions::Upload(_) | Sessions::Turns(_) => unreachable!("handled above"),
+        Sessions::Turns(_) => unreachable!("handled above"),
     };
     let r = connect()?.call(op, body)?;
     if r["ok"] != true {
@@ -1066,7 +853,7 @@ pub fn sessions(cmd: Sessions) -> Result<i32> {
             println!("Forgotten. The session, its tool calls and its turns are deleted.")
         }
         Sessions::Export => println!("{}", serde_json::to_string_pretty(&r["sessions"])?),
-        Sessions::Upload(_) | Sessions::Turns(_) => {}
+        Sessions::Turns(_) => {}
     }
     Ok(0)
 }
@@ -1084,28 +871,12 @@ fn refuse(r: &Value, texts: &[(&str, String)]) -> Result<i32> {
     Ok(1)
 }
 
-/// `invite --agents`: a once link for the workspace to join with (`login::invite_agents`).
-pub fn invite_agents() -> Result<i32> {
-    let r = connect()?.call(
-        "team.invite",
-        json!({ "mode": Invite::Once, "code": false }),
-    )?;
-    match r["ticket"].as_str() {
-        Some(t) if r["ok"] == true => crate::login::invite_agents(t),
-        _ => refuse(&r, &[]),
-    }
-}
-
 /// `invite [--new|--once|--open]`: this computer's invite line.
 pub fn invite(mode: Invite) -> Result<i32> {
     let r = connect()?.call("team.invite", json!({ "mode": mode }))?;
     if r["ok"] != true {
         return refuse(&r, &[]);
     }
-    crate::telemetry::send(
-        &paths::state_dir(),
-        crate::telemetry::Event::InviteCreated(crate::telemetry::Via::Line),
-    );
     let line = r["line"].as_str().unwrap_or_default();
     match mode {
         Invite::Once => {
@@ -1118,12 +889,6 @@ pub fn invite(mode: Invite) -> Result<i32> {
         _ => {}
     }
     // Code first (the easy way), then the link, then the full line.
-    // The form the invite leads with, for usage counts.
-    let _via = if r["code"].is_string() {
-        Via::Code
-    } else {
-        Via::Link
-    };
     if let Some(code) = r["code"].as_str() {
         println!(
             "Tell them to run:  {} join {code}   (the code works for {} minutes)",
@@ -1143,29 +908,9 @@ pub fn invite(mode: Invite) -> Result<i32> {
 /// `join '<ticket>' [--name <n>]`: joins the network the join line `link` is for, waiting up to 600 s
 /// (the invite is the approval).
 pub fn join(link: &str, name: Option<String>) -> Result<i32> {
-    // Which form the person was given; usage counts read it.
-    let (code, _via) = match crate::code::normalize(link) {
-        Some(c) => (Some(c), Via::Code),
-        None if link.trim().starts_with("https://") => (None, Via::Link),
-        None => (None, Via::Line),
-    };
+    let code = crate::code::normalize(link);
     let name = name.unwrap_or_else(daemon::user_name);
     let mut conn = connect()?;
-    // Said once the daemon rang a parked workspace's doorbell (`join_waking`); never before a
-    // ticket it refuses at once.
-    let ticket = crate::ticket::decode(link).ok();
-    if code.is_some() || ticket.is_some_and(|t| t.wake.is_some()) {
-        let mut asking = Conn::open()?;
-        asking.call("subscribe", json!({}))?;
-        asking.wait_up_to(Duration::from_secs(660))?;
-        std::thread::spawn(move || {
-            while let Ok(e) = asking.next_line() {
-                if e["event"] == "join_waking" {
-                    println!("Waking your workspace… this takes about a minute.");
-                }
-            }
-        });
-    }
     conn.wait_up_to(Duration::from_secs(660))?;
     let body = match &code {
         Some(c) => json!({"code": c, "name": name}),
@@ -1173,8 +918,6 @@ pub fn join(link: &str, name: Option<String>) -> Result<i32> {
     };
     let r = ask(&mut conn, "team.join", body)?;
     let team = r["team"].as_str().unwrap_or_default();
-    // The ticket named a workspace (for a code, the daemon saw the ticket, not this process).
-    let has_wake = r["wake"] == true;
     let text = match (r["state"].as_str(), r["reason"].as_str()) {
         (Some("admitted"), _) => {
             let computer = ask(&mut conn, "identity.get", json!({}))?["computer"]
@@ -1182,10 +925,6 @@ pub fn join(link: &str, name: Option<String>) -> Result<i32> {
                 .unwrap_or_default()
                 .to_string();
             let n = r["online"].as_u64().unwrap_or(1);
-            crate::telemetry::send(
-                &paths::state_dir(),
-                crate::telemetry::Event::NetworkJoined(crate::telemetry::Via::of_join(link)),
-            );
             println!("Connected as {name} ({computer}). Team \"{team}\": {n} computers online.");
             println!(
                 "Your agents here can now see and message the team's agents. Try: {} who --all",
@@ -1199,7 +938,6 @@ pub fn join(link: &str, name: Option<String>) -> Result<i32> {
             "The name \"{name}\" is already used in this network. Run the same command again with: --name {name}-2"
         ),
         (_, Some(admission::NO_CODE)) => "That code did not work. Check the words. Ask them to open their computer, or send the full line instead. A code works once.".to_string(),
-        (_, Some(admission::UNREACHABLE)) if has_wake => "Your workspace did not answer. Run the same command again in a minute. Your key is ready; nothing was lost.".to_string(),
         (_, Some(admission::UNREACHABLE)) => "No one from this network is online right now. Ask them to open their laptop, then run the same command again. Your key is ready; nothing was lost.".to_string(),
         (_, Some(admission::NEEDS_A_PERSON)) => admission::NEEDS_A_PERSON_TEXT.to_string(),
         (_, Some(admission::PERSON_SAID_NO)) => admission::PERSON_SAID_NO_TEXT.to_string(),
@@ -1214,12 +952,6 @@ pub fn join(link: &str, name: Option<String>) -> Result<i32> {
     };
     eprintln!("{text}");
     Ok(1)
-}
-
-/// `signin`: verified names need the issuer's real keys (the key ceremony), so this refuses.
-pub fn signin() -> Result<i32> {
-    eprintln!("Verified names are not available yet.");
-    Ok(2)
 }
 
 /// `config set <key> <value>`: a `true`/`false` or integer setting (`Config::settable`), then
@@ -1574,7 +1306,6 @@ pub fn team() -> Result<i32> {
         println!("{line}");
     }
     println!("Invite someone: {} invite", command());
-    println!("{}", setup::UPSELL);
     Ok(0)
 }
 
@@ -1638,7 +1369,7 @@ fn leave_unsigned(dir: &std::path::Path) -> Result<i32> {
 /// service keeps running.
 pub fn leave() -> Result<i32> {
     let dir = paths::state_dir();
-    if crate::embed::key_mismatch(&dir)? {
+    if crate::daemon::key_mismatch(&dir)? {
         return leave_unsigned(&dir);
     }
     let mut conn = connect()?;
@@ -2429,12 +2160,12 @@ pub fn doctor() -> Result<i32> {
     let mut conn = Conn::open().ok();
     let mut call = |op: &str| conn.as_mut().and_then(|c| c.call(op, json!({})).ok());
     let up = call("ping").is_some_and(|r| r["ok"] == true);
-    // A daemon refuses to start under a mismatched key (`embed::KEY_MISMATCH`): name that,
+    // A daemon refuses to start under a mismatched key (`daemon::KEY_MISMATCH`): name that,
     // not setup, which cannot fix it.
     let dir = paths::state_path();
-    let mismatch = !up && crate::embed::key_mismatch(&dir).unwrap_or(false);
+    let mismatch = !up && crate::daemon::key_mismatch(&dir).unwrap_or(false);
     let fix = if mismatch {
-        crate::embed::KEY_MISMATCH
+        crate::daemon::KEY_MISMATCH
     } else {
         &setup
     };
@@ -2499,18 +2230,6 @@ pub fn doctor() -> Result<i32> {
         let bad = if installed { "no (disabled)" } else { "no" };
         row("Starts at login", installed && enabled, good, bad, &setup);
     }
-    if crate::login::stored(&dir).is_some() {
-        let now = crate::daemon::ipc::now() as i64;
-        let ended = crate::login::ended(&dir, now);
-        let fix = "Sign in again: lightbulb login";
-        row(
-            "Lightbulb sign-in",
-            !ended,
-            "signed in",
-            "ended: run lightbulb login",
-            fix,
-        );
-    }
     let mode = |p: &Path| fs::metadata(p).map(|m| m.permissions().mode() & 0o777).ok();
     let socket = dir.join(paths::SOCKET);
     if dir.exists() {
@@ -2566,15 +2285,6 @@ pub fn doctor() -> Result<i32> {
     row("Memory model", true, model, "", "");
     let on = crate::config::Config::load(&dir).is_ok_and(|c| auto_update_on(&c));
     row("Auto-update", true, if on { "on" } else { "off" }, "", "");
-    crate::telemetry::sync_env_optout(&dir);
-    let counts = crate::telemetry::active(&dir);
-    row(
-        "Usage counts",
-        true,
-        if counts { "on" } else { "off" },
-        "",
-        "",
-    );
     for (name, state, _) in &rows {
         println!("{name:<20} {state}");
     }
@@ -2588,58 +2298,6 @@ pub fn doctor() -> Result<i32> {
             Ok(0)
         }
     }
-}
-
-/// The words `setup` opens with for a person at a terminal who is not signed in.
-const SIGN_IN_OFFER: &str = "Sign in (free): your memory and sessions follow you across computers; the Claude app reaches your agents. Or stay local.\n  [Enter] Sign in    [l] Stay local";
-
-/// `setup`'s first screen: the free sign-in, with staying local one key away. Staying local
-/// records that uploads are off. Skipped with nobody at a terminal (an update, the daemon's
-/// refresh) and when this computer is already signed in.
-/// (`login::login` asks what to upload once signed in, so this does not.)
-fn first_screen() -> Result<()> {
-    use std::io::IsTerminal;
-    let dir = paths::state_dir();
-    let person = std::io::stdin().is_terminal() || test_env(TTY_ENV).is_some();
-    if !person || crate::login::stored_proof(&dir).is_some() {
-        return Ok(());
-    }
-    println!("{SIGN_IN_OFFER}");
-    let mut answer = String::new();
-    // Only Enter or `y` signs in; anything else, and end of input, stays local.
-    let n = std::io::stdin().read_line(&mut answer)?;
-    let a = answer.trim();
-    if n > 0 && (a.is_empty() || a.eq_ignore_ascii_case("y")) {
-        match crate::login::login(false) {
-            Ok(0) => return Ok(()),
-            Ok(_) => {}
-            Err(e) => eprintln!("{e}"),
-        }
-        println!("Staying local.");
-    }
-    crate::config::Config::set(&dir, "capture_upload", "off")
-}
-
-/// What `lightbulb login` asks right after signing in, to a person at a terminal: what to
-/// upload of the sessions captured here. Enter, end of input and anything unknown are `off`.
-pub fn ask_upload_mode() -> Result<()> {
-    use std::io::IsTerminal;
-    if !std::io::stdin().is_terminal() && test_env(TTY_ENV).is_none() {
-        return Ok(());
-    }
-    println!(
-        "Send your coding sessions to Lightbulb? In a workspace, the evaluator reads only what you send in full and suggests lessons for you to approve.\n  off       Nothing leaves this computer. [default]\n  metadata  The agent, repository, times, token counts and tool names, signed as you; never what the tools did.\n  full      Also a short summary of each tool call (never file contents, diffs, command output or prompts).\nChange it any time: lightbulb sessions upload off|metadata|full\nUpload [off/metadata/full]:"
-    );
-    let mut answer = String::new();
-    std::io::stdin().read_line(&mut answer)?;
-    let mode = answer.trim().to_lowercase();
-    let mode = crate::upload::MODES
-        .iter()
-        .find(|m| **m == mode)
-        .unwrap_or(&"off");
-    crate::upload::set_mode(&paths::state_dir(), mode)?;
-    println!("Uploads are {mode}. {}", crate::upload::describe(mode));
-    Ok(())
 }
 
 /// `setup [--remove]`: wires the installed agents to the canonical binary (or `executable`)
@@ -2667,7 +2325,6 @@ pub fn setup(
     }
     let home = home()?;
     if !remove {
-        first_screen()?;
         install_running(&home)?;
     }
     // Wired to the canonical copy, never to wherever this binary was built.
@@ -2739,9 +2396,6 @@ pub fn setup(
     if !fixes.is_empty() {
         return Ok(1);
     }
-    if crate::telemetry::on_setup(&paths::state_dir()) {
-        println!("{}\n", crate::telemetry::NOTICE);
-    }
     let connected: Vec<String> = (report.agents.iter())
         .filter(|a| a.connected())
         .map(|a| a.product())
@@ -2806,19 +2460,17 @@ mod tests {
             says(json!({"status": "idle", "tier": "push", "hidden": true})),
             "idle, gets messages instantly, hidden from teammates"
         );
-        let offline = json!({"status": "busy", "online": false, "seen_at": 880, "wakes": false});
+        let offline = json!({"status": "busy", "online": false, "seen_at": 880});
         assert_eq!(
             says(offline),
             "offline, last seen 2 min ago, messages queued"
         );
         // Mail is held a day: past that, nothing is queued.
-        let long = json!({"status": "busy", "online": false, "seen_at": 1, "wakes": false});
+        let long = json!({"status": "busy", "online": false, "seen_at": 1});
         assert_eq!(
             super::status_cell(&long, 3 * 86_400),
             "offline, last seen 2 d ago"
         );
-        let parked = json!({"status": "busy", "online": false, "seen_at": 880, "wakes": true});
-        assert_eq!(says(parked), "parked, wakes when messaged");
     }
 
     #[test]

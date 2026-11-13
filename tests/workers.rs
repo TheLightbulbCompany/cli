@@ -163,9 +163,7 @@ fn hosted(script: Value, o: Opts) -> Pair {
         o.config
     );
     b.daemon(false, &config, &env);
-    if let Some(u) = o.a_user {
-        a.sign_in(u, None);
-    }
+    assert!(o.a_user.is_none(), "no sign-in: login was cut");
     let mut a_env = vec![peers(&[&b])];
     a_env.extend(o.a_env);
     a.daemon(false, "network_workers = true\n", &a_env);
@@ -2457,6 +2455,7 @@ fn assign_object(person: &str, b: &str, operands: &Value) -> String {
 /// An object minted before the send binds on a real send: the sender takes the assign's terms
 /// from its operands (ignoring `deadline_s`), the receiver binds it and starts the worker.
 #[test]
+#[ignore = "Step 2: needs a signed-in person, cut with login"]
 fn an_assign_with_authority_minted_beforehand_binds_and_starts() {
     let p = hosted(
         json!([{"result": "ok"}]),
@@ -2495,6 +2494,7 @@ fn an_assign_with_authority_minted_beforehand_binds_and_starts() {
 /// `person:user_x` refuses user_x over the standing allow for its computer; another person's
 /// computer with the same row is allowed.
 #[test]
+#[ignore = "Step 2: needs a signed-in person, cut with login"]
 fn a_person_deny_on_worker_star_refuses_over_the_members_always_row() {
     let deny = json!([{"id": "no-x", "resource": "worker:*", "skill": "assign",
                        "requesters": ["person:user_x"], "effect": "deny"}]);

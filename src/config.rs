@@ -20,20 +20,14 @@ enum Kind {
 }
 
 /// Every setting: the one list `load` and `set` read.
-const KEYS: [(&str, Kind); 19] = [
+const KEYS: [(&str, Kind); 16] = [
     ("computer", Kind::Str(|c| &mut c.computer)),
-    (
-        "preview_to_workspace",
-        Kind::Bool(|c| &mut c.preview_to_workspace),
-    ),
     ("share_paths", Kind::Bool(|c| &mut c.share_paths)),
     ("lan", Kind::Bool(|c| &mut c.lan)),
     ("relay", Kind::OptStr(|c| &mut c.relay)),
     ("folders_off", Kind::Paths(|c| &mut c.folders_off)),
     ("auto_update", Kind::Bool(|c| &mut c.auto_update)),
-    ("telemetry", Kind::Bool(|c| &mut c.telemetry)),
     ("memory_team", Kind::Bool(|c| &mut c.memory_team)),
-    ("capture_upload", Kind::Str(|c| &mut c.capture_upload)),
     ("capture_turns", Kind::Bool(|c| &mut c.capture_turns)),
     (
         "capture_turns_days",
@@ -60,7 +54,6 @@ pub fn settable(key: &str) -> Option<String> {
     let other = match key {
         "relay" => "relay <url>",
         "folders_off" => "folder <path> off",
-        "capture_upload" => "sessions upload off|metadata|full",
         "workers_offer" => "workers on --offer <harnesses>",
         "workers_folder" => "workers on --folder <path>",
         _ => "your config.toml",
@@ -79,25 +72,18 @@ fn kind(key: &str) -> Option<Kind> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub computer: String,
-    pub preview_to_workspace: bool,
     pub share_paths: bool,
     pub lan: bool,
     pub relay: Option<String>,
     pub folders_off: Vec<PathBuf>,
     /// The daemon installs a newer release once found (`cli::auto_update`).
     pub auto_update: bool,
-    /// Anonymous usage counts (`telemetry`).
-    pub telemetry: bool,
     /// `remember` and `memory share` may write `team` entries (`memory team on|off`).
     pub memory_team: bool,
     /// Per-instance network memory replication, enabled by default. Not a `config set` setting.
     /// Turning it off doesn't remove entries already copied to or from peers.
     pub memory_sync: bool,
-    /// What of this computer's sessions goes to the account: `off` (the default), and, once
-    /// signed in, the modes the sign-in asks for.
-    pub capture_upload: String,
-    /// Your prompts and the agent's replies are kept on this computer (`sessions turns on|off`);
-    /// never uploaded.
+    /// Your prompts and the agent's replies are kept on this computer (`sessions turns on|off`).
     pub capture_turns: bool,
     /// Days a turn is kept.
     pub capture_turns_days: i64,
@@ -125,16 +111,13 @@ impl Default for Config {
     fn default() -> Config {
         Config {
             computer: os::hostname(),
-            preview_to_workspace: false,
             share_paths: false,
             lan: true,
             relay: None,
             folders_off: vec![],
             auto_update: true,
-            telemetry: true,
             memory_team: true,
             memory_sync: true,
-            capture_upload: "off".into(),
             capture_turns: true,
             capture_turns_days: 90,
             memory_model: true,
@@ -284,7 +267,7 @@ mod tests {
         let d = dir.path();
         let c = Config::load(d).unwrap();
         assert_eq!(c.computer, crate::os::hostname());
-        assert!(!c.preview_to_workspace && !c.share_paths && c.lan);
+        assert!(!c.share_paths && c.lan);
         assert_eq!((c.relay, c.folders_off.len()), (None, 0));
 
         Config::set(d, "computer", "mac-b").unwrap();

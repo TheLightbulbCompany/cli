@@ -59,8 +59,9 @@ async fn team_entry_reaches_the_other_member() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_me_scope_syncs_only_same_person() {
-    // A and B are signed in as one person, C as another; one team of three.
+async fn me_scope_stays_home_team_scope_syncs() {
+    // One team of three: with no sign-in nothing proves two computers are one person, so a
+    // `me` entry goes to none of them (fails closed); a `team` entry goes to all.
     let (a, b, c) = (Env::new(), Env::new(), Env::new());
     let (ia, ib, ic) = (a.identity(), b.identity(), c.identity());
     let g = net_ops::genesis(&ia, "prasiddha", "mac", "acme", 1);
@@ -72,23 +73,19 @@ async fn test_me_scope_syncs_only_same_person() {
             roster::accept(&store, e, 10).unwrap();
         }
     }
-    a.sign_in("user_one", None);
-    b.sign_in("user_one", None);
-    c.sign_in("user_two", None);
     let mine = remember(&a, op("mine", "private", Scope::Me));
     let ours = remember(&a, op("ours", "shared", Scope::Team));
     b.daemon(false, "", &[]);
     c.daemon(false, "", &[]);
     a.daemon(false, "", &[common::peers(&[&b, &c])]);
     let ka = ia.key;
-    until(
-        10,
-        "both entries reach B, the other person's computer",
-        || held(&b, &ka) == [mine.clone(), ours.clone()],
-    );
-    until(10, "the team entry reaches C", || !held(&c, &ka).is_empty());
-    // C is connected and caught up: it was sent the team entry only.
+    until(10, "the team entry reaches B and C", || {
+        !held(&b, &ka).is_empty() && !held(&c, &ka).is_empty()
+    });
+    // Connected and caught up: each was sent the team entry only.
+    assert_eq!(held(&b, &ka), std::slice::from_ref(&ours));
     assert_eq!(held(&c, &ka), [ours]);
+    assert!(held(&a, &ka).contains(&mine));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -218,8 +215,6 @@ async fn me_latest_on_both_sides_does_not_ping_pong() {
     // Two people, each whose newest entry is `me`: neither head can ever reach the other.
     let (a, b) = (Env::new(), Env::new());
     seed_pair(&a, &b);
-    a.sign_in("user_one", None);
-    b.sign_in("user_two", None);
     remember(&a, op("ta", "team a", Scope::Team));
     remember(&a, op("ma", "mine a", Scope::Me));
     remember(&b, op("tb", "team b", Scope::Team));
@@ -352,52 +347,6 @@ fn an_entry_with_a_secret_only_in_its_source_is_refused_on_accept() {
     assert_eq!(memory::heads(&b.store()).unwrap()[&e.author], 1);
 }
 
-/// A workspace computer's entries (its member has a doorbell in the roster) are not relayed by
-/// another member, which cannot tell who is in that workspace; that computer sends them itself
-/// (`member::workspace_entries_reach_only_workspace_members`). A's own team entry still goes.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_workspace_computers_entries_are_not_relayed() {
-    let (a, b) = (Env::new(), Env::new());
-    seed_pair(&a, &b);
-    let w = common::identity();
-    let store = a.store();
-    let head = roster::entries(&store).unwrap().pop().unwrap();
-    let admit = common::admit(&a.identity(), &head, &w, "w", json!({}));
-    let wake = json!({"wake": {"url": "https://example.test/w", "token": "o.s"}});
-    let meta = roster::Entry::signed(&w, vec![admit.hash()], roster::Kind::Meta, wake, 3);
-    for e in [&admit, &meta] {
-        roster::accept(&store, e, 10).unwrap();
-    }
-    let room = memory::remember(
-        &store,
-        &w,
-        op("room", "from a workspace room", Scope::Team),
-        5,
-    )
-    .unwrap();
-    drop(store);
-    let mine = remember(&a, op("db", "postgres 16", Scope::Team));
-    a.daemon(false, "", &[]);
-    let ep = endpoint(&b.identity()).await;
-    let mut p = Peer::dial(&ep, &a).await;
-    p.hello_full(vec![], None, true).await;
-    p.send(&Frame::MemoryHeads {
-        heads: Default::default(),
-    })
-    .await;
-    let mut got = vec![];
-    let end = tokio::time::Instant::now() + Duration::from_secs(2);
-    while let Ok(Ok(f)) =
-        tokio::time::timeout_at(end, lightbulb::net::frames::read(&mut p.recv)).await
-    {
-        if let Frame::Memory { entries, .. } = f {
-            got.extend(entries.into_iter().map(|e| e.id));
-        }
-    }
-    assert!(got.contains(&mine.id), "{got:?}");
-    assert!(!got.contains(&room.id), "{got:?}");
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn instance_sync_off_refuses_hostile_memory_and_emits_none() {
     let (a, b) = (Env::new(), Env::new());
@@ -444,17 +393,15 @@ async fn instance_sync_off_refuses_hostile_memory_and_emits_none() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn instance_sync_off_blocks_same_person_memory_but_keeps_mail() {
+async fn instance_sync_off_blocks_memory_but_keeps_mail() {
     let (a, b) = (Env::new(), Env::new());
     seed_pair(&a, &b);
-    a.sign_in("user_same_person", None);
-    b.sign_in("user_same_person", None);
-    let me = remember(&a, op("mine", "same-person-private-control", Scope::Me));
+    let me = remember(&a, op("mine", "outbound-team-control", Scope::Team));
     let theirs = remember(&b, op("theirs", "inbound-team-control", Scope::Team));
     let (ka, kb) = (a.identity().key, b.identity().key);
     common::start_pair(&a, &b, "", &[]);
-    // Establish a positive control with these exact signed-in identities.
-    until(10, "default profile sends same-person Me", || {
+    // Establish a positive control.
+    until(10, "default profile sends Team", || {
         held(&b, &ka) == [me.clone()]
     });
     until(10, "default profile receives Team", || {
@@ -473,13 +420,13 @@ async fn instance_sync_off_blocks_same_person_memory_but_keeps_mail() {
     assert_eq!(b.take_one(&sb)["text"], "brief");
     b.send(&sb, &sa, "result", "result", None);
     assert_eq!(a.take_one(&sa)["text"], "result");
-    let live = remember(&a, op("live-me", "new-private-canary", Scope::Me));
+    let live = remember(&a, op("live-team", "new-outbound-canary", Scope::Team));
     let inbound = remember(&b, op("new-theirs", "new-team-canary", Scope::Team));
     tokio::time::sleep(Duration::from_millis(2500)).await;
     assert_eq!(
         held(&b, &ka).as_slice(),
         std::slice::from_ref(&me),
-        "new private canary left off instance"
+        "new outbound canary left off instance"
     );
     assert_eq!(
         held(&a, &kb).as_slice(),

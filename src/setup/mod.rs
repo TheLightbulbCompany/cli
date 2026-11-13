@@ -6,8 +6,8 @@
 //! nothing from the backups (they are the person's safety net).
 //!
 //! Installing writes our MCP entry under our server name. An entry already under that name is
-//! replaced only when it is ours, the desktop app's old `session-mcp` server or the hosted
-//! Lightbulb MCP (`replaceable`); any other stays, and the agent is left with hooks only.
+//! replaced only when it is ours or the desktop app's old `session-mcp` server
+//! (`replaceable`); any other stays, and the agent is left with hooks only.
 //! Removing takes it out only when its command is our executable. Our allow rule exists only
 //! while the MCP entry is ours.
 //!
@@ -77,13 +77,10 @@ pub const DEFAULT_SERVER: &str = "lightbulb";
 /// runs a `lightbulb` binary, and the allow rules named for it.
 pub(crate) const OLD_SERVER: &str = "lightbulb-network";
 
-/// The hosted Lightbulb MCP's URL: an entry for it under our name gives way to ours.
-pub(super) const HOSTED: &str = "https://api.thelightbulb.company/mcp";
-
 /// Whether an entry under our name that is not ours gives way to ours: the desktop app's old
-/// server (args `["session-mcp"]`) or the hosted MCP's URL.
-fn replaceable(args: &[&str], url: Option<&str>) -> bool {
-    args == ["session-mcp"] || url == Some(HOSTED)
+/// server (args `["session-mcp"]`).
+fn replaceable(args: &[&str]) -> bool {
+    args == ["session-mcp"]
 }
 
 /// Whether `command` runs a `lightbulb` binary (any copy of this engine).
@@ -194,9 +191,6 @@ pub fn status(home: &Path, agent: &str, dir: &str) -> State {
     }
 }
 
-/// The one quiet mention of the paid workspace: last line of `setup`, `who` and `team`.
-pub const UPSELL: &str = "Add an always-on AI teammate: https://thelightbulb.company";
-
 /// `setup`'s closing words: what is connected (product names) and what to try next, with
 /// `cmd` the command name that works on this computer.
 pub fn summary(connected: &[&str], cmd: &str) -> String {
@@ -214,7 +208,7 @@ pub fn summary(connected: &[&str], cmd: &str) -> String {
         ""
     };
     format!(
-        "Lightbulb is on.\n  Connected: {list}\n\nTry it: open {first} in any folder and ask \"list my other sessions\".\n{opencode}Add your other computer or a teammate: {cmd} invite\nCheck everything: {cmd} doctor\n{UPSELL}"
+        "Lightbulb is on.\n  Connected: {list}\n\nTry it: open {first} in any folder and ask \"list my other sessions\".\n{opencode}Add your other computer or a teammate: {cmd} invite\nCheck everything: {cmd} doctor"
     )
 }
 
@@ -394,19 +388,13 @@ impl Ctx<'_> {
         crate::sessions::shell_quoted(self.exe)
     }
 
-    /// The owner of a server entry, given its command (`None`: the entry has none), its args
-    /// and its URL. Installing replaces a `replaceable` entry; any other one is foreign.
-    pub fn owner(
-        &self,
-        exists: bool,
-        command: Option<&str>,
-        args: &[&str],
-        url: Option<&str>,
-    ) -> Owner {
+    /// The owner of a server entry, given its command (`None`: the entry has none) and its
+    /// args. Installing replaces a `replaceable` entry; any other one is foreign.
+    pub fn owner(&self, exists: bool, command: Option<&str>, args: &[&str]) -> Owner {
         match (exists, command) {
             (false, _) => Owner::Absent,
             (true, Some(c)) if c == self.exe => Owner::Ours,
-            _ if !self.remove && replaceable(args, url) => Owner::Absent,
+            _ if !self.remove && replaceable(args) => Owner::Absent,
             _ => Owner::Foreign,
         }
     }
@@ -633,12 +621,7 @@ fn json_args(entry: &Value) -> Vec<&str> {
 
 /// The owner of the JSON entry `e` (`Value::Null`: none).
 fn json_owner(ctx: &Ctx, e: &Value) -> Owner {
-    ctx.owner(
-        !e.is_null(),
-        json_command(e),
-        &json_args(e),
-        e["url"].as_str(),
-    )
+    ctx.owner(!e.is_null(), json_command(e), &json_args(e))
 }
 
 /// `text` with JSONC's comments and trailing commas taken out. For reading only: setup never
@@ -771,7 +754,6 @@ pub(crate) fn set_toml_server(
         current.is_some(),
         field("command").and_then(Item::as_str),
         &args,
-        field("url").and_then(Item::as_str),
     );
     if current.is_some() && owner == Owner::Absent {
         // None of the replaced entry's keys (env, timeouts) stay under ours.

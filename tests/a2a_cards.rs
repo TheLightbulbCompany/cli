@@ -43,18 +43,6 @@ async fn a_members_card_appears_in_the_roster_and_directory() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_embedded_member_publishes_its_card() {
-    let home = tempfile::tempdir().unwrap();
-    let i = common::instance(home.path(), &[], "The Lightbulb Company", None, &[])
-        .await
-        .unwrap();
-    let r = common::call(&i, "card", json!({})).await;
-    assert_eq!(r["ok"], true, "{r}");
-    assert_eq!(r["card"]["name"], "The Lightbulb Company");
-    i.shutdown().await;
-}
-
 #[test]
 fn a_joiner_publishes_its_card_and_a_restart_writes_no_second_entry() {
     let (a, b) = (Env::new(), Env::new());

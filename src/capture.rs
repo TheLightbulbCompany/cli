@@ -3,7 +3,7 @@
 //! summary (a command, a path, a pattern), never file contents, diffs or output.
 //! A summary that looks like a credential is stored as `[refused: <pattern>]`.
 //! The session's own turns (your prompts and the agent's replies) are kept too, on this
-//! computer only: never uploaded (`upload.rs` does not read them).
+//! computer only: never sent anywhere.
 
 use crate::memory::refuse_secret;
 use crate::store::Store;

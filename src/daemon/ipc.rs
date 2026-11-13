@@ -9,7 +9,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::os::fd::AsRawFd;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::Lines;
@@ -157,21 +156,17 @@ async fn handle(
 pub enum Caller {
     /// A socket connection, by its peer's pid (`None` when the OS will not say).
     Socket(Option<u32>),
-    /// An embedded instance's caller: the bridge.
-    Instance,
 }
 
 impl Caller {
-    /// Whether a person asked: a socket peer with no agent above it. Never an instance's
-    /// caller, but for the ops it may run for the workspace admin who confirmed in the app
-    /// (`team.join`, `team.leave`, `snapshot`), which also take `Caller::Instance`.
+    /// Whether a person asked: a socket peer with no agent above it.
     pub fn is_person(self) -> bool {
         matches!(self, Caller::Socket(Some(pid)) if super::net_ops::person_only(pid))
     }
 
     /// Who is asking, for the ops an agent may also run: `local` for a person, else the agent
     /// session above the socket peer (`<member>/<handle>`, `agent` before it registers). `None`
-    /// for a caller that cannot be resolved (no pid, a failed lookup) and for an instance's.
+    /// for a caller that cannot be resolved (no pid, a failed lookup).
     pub fn actor(self, store: &crate::store::Store) -> Option<String> {
         let Caller::Socket(Some(pid)) = self else {
             return None;
@@ -183,16 +178,7 @@ impl Caller {
     }
 }
 
-/// What an instance does not do: its settings are its `EmbedOpts`, it asks no one (`ui.claim`),
-/// and it stops by `Instance::shutdown`. (Its links are once links only: `net_ops`.)
-const NOT_ON_AN_INSTANCE: [&str; 3] = ["reload", "ui.claim", "shutdown"];
-
-/// What only an instance does: the workspace's memory ops on its cloud member. `memory.list`
-/// is one of them when it carries `since_seq` (without, it is the person's `memory list`).
-const ONLY_ON_AN_INSTANCE: [&str; 2] = ["memory.import", "memory.forget_author"];
-
-/// The fields of an `inbox` record an agent (MCP `check_inbox`) or an instance's caller is
-/// handed.
+/// The fields of an `inbox` record an agent (MCP `check_inbox`) is handed.
 pub const INBOX_RECORD: [&str; 17] = [
     "id",
     "request_id",
@@ -226,49 +212,11 @@ const CAPTURE_DELAY_ENV: &str = "LIGHTBULB_CONNECT_DEBUG_CAPTURE_DELAY_MS";
 
 /// One op, from `caller`: every person-only op refuses without a person.
 pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: Caller) -> Response {
-    let instance = caller == Caller::Instance;
-    if instance && NOT_ON_AN_INSTANCE.contains(&op) {
-        return Response::err(id, UNSUPPORTED);
-    }
-    let cloud_list = op == "memory.list" && body.get("since_seq").is_some();
-    if !instance && (ONLY_ON_AN_INSTANCE.contains(&op) || cloud_list) {
-        return Response::err(id, UNSUPPORTED);
-    }
-    // Admitted for an instance's caller; for a socket, a person only (asked only when needed:
-    // it walks the peer's process tree).
-    let for_a_person = || instance || caller.is_person();
+    // A person only, asked only when needed: it walks the peer's process tree.
+    let for_a_person = || caller.is_person();
     match op {
         "ping" => Response::ok(id, json!({})),
-        "goosetown.binding.info" if instance => {
-            let origin = daemon
-                .cloud
-                .as_ref()
-                .and_then(|c| c.goosetown_origin.lock().unwrap().clone());
-            match (body.as_object().is_some_and(|o| o.is_empty()), origin) {
-                (true, Some(origin)) => Response::ok(
-                    id,
-                    json!({"version": 1, "audience": format!("goosetown-runtime-binding-v1:{origin}")}),
-                ),
-                _ => Response::err(id, BAD_REQUEST),
-            }
-        }
-        "goosetown.binding.prove" if instance => goosetown_binding_prove(id, body, daemon),
-        // `login.changed` -> `{}`: `login`/`logout` rewrote this computer's sign-in; every
-        // connected member hears a fresh `hello` with the proof now on disk (or none).
-        "login.changed" => {
-            daemon.peers.changed.notify_one();
-            Response::ok(id, json!({}))
-        }
-        // Events come from `Instance::events`.
-        "subscribe" if instance => Response::ok(id, json!({})),
-        "inbox" if instance => crate::embed::inbox(id, body, daemon),
-        "inbox.peek" if instance => crate::embed::peek(id, daemon),
-        "inbox.ack" if instance => crate::embed::ack(id, body, daemon),
         "inbox.peek" | "inbox.ack" => peek_or_ack(id, op, body, daemon).await,
-        "cloud.sessions.set" => super::net_ops::cloud_sessions_set(id, body, daemon).await,
-        "app.send" | "app.inbox" | "app.ack" | "app.unread" | "app.receipt" if instance => {
-            crate::app_send::op(id, op, body, daemon).await
-        }
         "status" => {
             // Before the team lock: `live_sessions` takes it.
             let sessions = live_count(daemon);
@@ -303,7 +251,6 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
                     // Local discovery: "on", "off" (`config.lan`) or "blocked" (macOS).
                     "lan": daemon.peers.lan_status(),
                     "needs_update": needs_update,
-                    "claim_live": daemon.claim_live(now() as i64),
                     "dropped": dropped(daemon),
                 }),
             )
@@ -405,11 +352,11 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
         // An agent fed a hostile link must not move this computer into another network: its
         // person confirms (`admission::join`), and an unresolved caller is refused. The threat is
         // a hosted page driving the desktop app, which exists only on macOS.
-        "team.join" if !instance && caller.actor(&daemon.store.lock().unwrap()).is_none() => {
+        "team.join" if caller.actor(&daemon.store.lock().unwrap()).is_none() => {
             refused(id, "not_a_person")
         }
         "team.join" => {
-            let agent = cfg!(target_os = "macos") && !instance && !caller.is_person();
+            let agent = cfg!(target_os = "macos") && !caller.is_person();
             crate::admission::join(id, body, daemon, agent).await
         }
         // `mark_read {key}` -> `{}`: `key`'s session took a step (an MCP tool call), so the mail
@@ -435,7 +382,6 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
             },
             None => Response::err(id, BAD_REQUEST),
         },
-        "sessions.upload" => sessions_upload(id, body, daemon, for_a_person()),
         "sessions.turns" => sessions_turns(id, body, daemon, for_a_person()),
         "capture.session_start"
         | "capture.tool_call"
@@ -462,10 +408,6 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
             }
             r
         }
-        // `person` -> `{}` for a person's terminal, else refused: a command that settles
-        // something elsewhere first (`memory approve`) asks before it acts.
-        "person" if for_a_person() => Response::ok(id, json!({})),
-        "person" => refused(id, "not_a_person"),
         // `rules.get` -> the stored rules document's `{workspace, revision, iat}`, or
         // `{workspace: null, revision: "default", iat: null}`; a person's.
         "rules.get" if !for_a_person() => refused(id, "not_a_person"),
@@ -479,9 +421,7 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
             ),
             Err(_) => Response::err(id, INTERNAL),
         },
-        "memory.remember" => {
-            memory_remember(id, body, daemon, instance, !instance && for_a_person())
-        }
+        "memory.remember" => memory_remember(id, body, daemon),
         "assignments.guard" => assignments_guard(id, body, daemon),
         "memory.recall" => memory_recall(id, body, daemon),
         #[cfg(feature = "bench")]
@@ -490,25 +430,16 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
         "bench.settle" => bench_settle(id, daemon),
         // Takes the team lock and no store lock; `memory_manage` reads the team first.
         "memory.team" => memory_team(id, body, daemon, for_a_person()),
-        "memory.import" => memory_import(id, body, daemon),
-        "memory.forget_author" => memory_forget_author(id, body, daemon),
-        "memory.list" if cloud_list => memory_list_since(id, body, daemon),
         "memory.list" | "memory.show" | "memory.forget" | "memory.share" | "memory.last"
         | "memory.export" => memory_manage(id, op, body, daemon, for_a_person()),
         "team.leave" => super::net_ops::leave(id, daemon, for_a_person()).await,
-        "holds" | "hold.get" | "hold.answer" | "hold.file" => {
-            crate::holds::op(id, op, body, daemon, caller)
-        }
+        "holds" | "hold.get" | "hold.answer" => crate::holds::op(id, op, body, daemon, caller),
         "workers.list" | "workers.show" | "workers.stop" | "workers.off" | "workers.policy" => {
             crate::workers::op(id, op, body, daemon, caller)
         }
-        "share.grant" | "stream.open" | "stream.send" | "stream.close" => {
-            crate::streams::handle(id, op, body, daemon, caller).await
-        }
         "team.invite" => {
             let mut r = super::net_ops::handle(id, op, body, daemon, caller);
-            // `code: false` (`invite --agents`): the link alone, no second link behind a code.
-            if r.ok && body["code"] != false {
+            if r.ok {
                 crate::code::offer(daemon, &mut r.body).await;
             }
             r
@@ -526,120 +457,11 @@ fn fact_json(f: &crate::memory::Fact) -> Value {
     })
 }
 
-/// Sign only an exact, fresh GooseTown binding challenge for this member and a declared session.
-/// The member socket token remains broad authority; caller authentication is handled by member.
-/// Actor and owner are server-asserted values, not locally verified identities. The server must
-/// verify actor ownership and issue, expire and atomically consume each one-use challenge.
-fn goosetown_binding_prove(id: u64, body: &Value, daemon: &Daemon) -> Response {
-    use data_encoding::BASE64URL_NOPAD;
-    use ed25519_dalek::Signer;
-    let Some(encoded) = body.get("signing_bytes_b64url").and_then(Value::as_str) else {
-        return Response::err(id, BAD_REQUEST);
-    };
-    if body.as_object().is_none_or(|o| o.len() != 1) || encoded.len() > 4096 {
-        return Response::err(id, BAD_REQUEST);
-    }
-    let Ok(bytes) = BASE64URL_NOPAD.decode(encoded.as_bytes()) else {
-        return Response::err(id, BAD_REQUEST);
-    };
-    if BASE64URL_NOPAD.encode(&bytes) != encoded {
-        return Response::err(id, BAD_REQUEST);
-    }
-    let Some(cloud) = &daemon.cloud else {
-        return Response::err(id, BAD_REQUEST);
-    };
-    let Some(origin) = cloud.goosetown_origin.lock().unwrap().clone() else {
-        return Response::err(id, BAD_REQUEST);
-    };
-    let Some(payload) =
-        validate_goose_challenge(&bytes, &daemon.identity.key, now() as i64, &origin)
-    else {
-        return Response::err(id, BAD_REQUEST);
-    };
-    if !cloud.declares(&payload.session_id) {
-        return Response::err(id, BAD_REQUEST);
-    }
-    let sig = daemon.identity.signing.sign(&bytes);
-    Response::ok(
-        id,
-        json!({"signature": BASE64URL_NOPAD.encode(&sig.to_bytes())}),
-    )
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct GooseChallenge {
-    version: u64,
-    actor_id: String,
-    owner_id: String,
-    member_key: String,
-    session_id: String,
-    audience: String,
-    #[serde(rename = "revision")]
-    _revision: u64,
-    challenge_id: String,
-    issued_at: i64,
-    expires_at: i64,
-}
-
-fn validate_goose_challenge(
-    bytes: &[u8],
-    key: &str,
-    now: i64,
-    origin: &str,
-) -> Option<GooseChallenge> {
-    use data_encoding::BASE64URL_NOPAD;
-    const DOMAIN: &[u8] = b"GooseTown runtime binding v1\n";
-    let raw = bytes.strip_prefix(DOMAIN)?;
-    if !raw.is_ascii() {
-        return None;
-    }
-    let value: Value = serde_json::from_slice(raw).ok()?;
-    // Python backend uses sorted keys, compact JSON and ensure_ascii. Require exact bytes.
-    if crate::identity::canonical(&value).as_slice() != raw {
-        return None;
-    }
-    let p: GooseChallenge = serde_json::from_value(value).ok()?;
-    let safe = |s: &str| {
-        !s.is_empty()
-            && s.len() <= 150
-            && s.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"_:-.".contains(&b))
-    };
-    let nonce = BASE64URL_NOPAD.decode(p.challenge_id.as_bytes()).ok()?;
-    if p.version != 1
-        || p.audience != format!("goosetown-runtime-binding-v1:{origin}")
-        || p.member_key != key
-        || !safe(&p.actor_id)
-        || !safe(&p.owner_id)
-        || p.session_id.len() > 150
-        || !p.session_id.starts_with(&format!("{}/", &key[..12]))
-        || nonce.len() != 32
-        || BASE64URL_NOPAD.encode(&nonce) != p.challenge_id
-        || p.issued_at > now + 30
-        || p.issued_at > p.expires_at
-        || p.expires_at <= now
-        || p.expires_at
-            .checked_sub(p.issued_at)
-            .is_none_or(|life| life > 120)
-    {
-        return None;
-    }
-    Some(p)
-}
-
 /// `memory.remember {subject, fact, kind, scope?, replaces?, when?, session?}` ->
 /// `{stored, entry_id?, neighbours, refused?}`: stores a signed entry, with the harness and repo
 /// of `session` (an MCP caller's key) as its source. `neighbours` are the current facts on the
 /// subject from before this one. A secret or an oversize entry is `stored: false` with `refused`.
-/// On an instance (the workspace) the source is `workspace`, on behalf of `on_behalf_of`.
-fn memory_remember(
-    id: u64,
-    body: &Value,
-    daemon: &Arc<Daemon>,
-    instance: bool,
-    person: bool,
-) -> Response {
+fn memory_remember(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
     use crate::memory::{self, Kind, Op, Scope, Source, Status};
     let (Some(subject), Some(fact), Ok(kind)) = (
         body["subject"].as_str(),
@@ -669,26 +491,15 @@ fn memory_remember(
     let found = session
         .as_deref()
         .and_then(|k| live_sessions(daemon).into_iter().find(|s| s.key.0 == k));
-    // A person's terminal names the source itself (`memory approve`: the cloud evaluator).
-    let named = person
-        .then(|| serde_json::from_value::<Source>(body["source"].clone()).ok())
-        .flatten();
-    let source = named.unwrap_or_else(|| Source {
-        harness: if instance {
-            "workspace".into()
-        } else {
-            found
-                .as_ref()
-                .map_or("unknown".into(), |s| crate::frame::agent_name(&s.provider))
-        },
+    let source = Source {
+        harness: found
+            .as_ref()
+            .map_or("unknown".into(), |s| crate::frame::agent_name(&s.provider)),
         repo: found.and_then(|s| s.repo),
         session,
-        on_behalf_of: body["on_behalf_of"]
-            .as_str()
-            .filter(|_| instance)
-            .map(String::from),
+        on_behalf_of: None,
         shared_from: None,
-    });
+    };
     let op = Op::Remember {
         subject: subject.into(),
         fact: fact.into(),
@@ -1039,23 +850,6 @@ fn member_names(daemon: &Daemon) -> std::collections::HashMap<String, String> {
         .collect()
 }
 
-/// `sessions.upload {mode}` -> `{}`: a person chooses what is uploaded (`upload::MODES`).
-fn sessions_upload(id: u64, body: &Value, daemon: &Arc<Daemon>, person: bool) -> Response {
-    if !person {
-        return refused(id, "not_a_person");
-    }
-    let Some(mode) = body["mode"]
-        .as_str()
-        .filter(|m| crate::upload::MODES.contains(m))
-    else {
-        return Response::err(id, BAD_REQUEST);
-    };
-    match crate::upload::set_mode(&daemon.dir, mode) {
-        Ok(()) => Response::ok(id, json!({})),
-        Err(_) => Response::err(id, INTERNAL),
-    }
-}
-
 /// Embeds what has no vector yet (turns, and memory entries, received ones too) in the
 /// background, taking the store lock only to read and to write. Run after each turn and by the
 /// housekeeping loop every minute; one pass at a time, a kick during a pass is dropped.
@@ -1110,150 +904,6 @@ fn memory_team(id: u64, body: &Value, daemon: &Arc<Daemon>, person: bool) -> Res
         Ok(_) => Response::ok(id, json!({})),
         Err(_) => Response::err(id, INTERNAL),
     }
-}
-
-/// `memory.import {entries: [{subject, fact, kind, scope, when?, source, replaces?}]}` ->
-/// `{ids, refused}`: the cloud member signs each as its own, in order. All are parsed before any
-/// is stored; a refused one (`secret:..`, `too_long`, `no_subject`) is `null` in `ids` and
-/// `{index, reason}` in `refused`, and the rest go on. An entry's `key` is written on the entry as
-/// its `source.session`, and also kept in the `memory_import_keys` side table, because a
-/// forgotten entry loses its body (and the key with it) while a held key must still answer
-/// with its id (idempotent).
-fn memory_import(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
-    use crate::memory::{self, Op, Source};
-    let Some(items) = body["entries"].as_array() else {
-        return Response::err(id, BAD_REQUEST);
-    };
-    let ops: Option<Vec<(Op, Option<String>)>> = items
-        .iter()
-        .map(|e| {
-            let s = &e["source"];
-            let key = e["key"].as_str().map(String::from);
-            let op = Op::Remember {
-                subject: e["subject"].as_str()?.into(),
-                fact: e["fact"].as_str()?.into(),
-                kind: serde_json::from_value(e["kind"].clone()).ok()?,
-                scope: serde_json::from_value(e["scope"].clone()).ok()?,
-                when: e["when"].as_i64(),
-                source: Source {
-                    harness: s["harness"].as_str()?.into(),
-                    repo: s["repo"].as_str().map(String::from),
-                    session: key
-                        .clone()
-                        .or_else(|| s["session"].as_str().map(String::from)),
-                    on_behalf_of: s["on_behalf_of"].as_str().map(String::from),
-                    shared_from: None,
-                },
-                replaces: match e.get("replaces") {
-                    None | Some(Value::Null) => vec![],
-                    Some(v) => serde_json::from_value(v.clone()).ok()?,
-                },
-            };
-            Some((op, key))
-        })
-        .collect();
-    let Some(ops) = ops else {
-        return Response::err(id, BAD_REQUEST);
-    };
-    let store = daemon.store.lock().unwrap();
-    // key -> entry id, kept apart from the entries: a forgotten entry loses its body (and its
-    // key with it), but a replay of its key must still answer with its id.
-    let conn = store.conn();
-    if conn
-        .execute_batch(
-            "CREATE TABLE IF NOT EXISTS memory_import_keys (key TEXT PRIMARY KEY, id TEXT NOT NULL)",
-        )
-        .is_err()
-    {
-        return Response::err(id, INTERNAL);
-    }
-    let (mut ids, mut refusals) = (Vec::new(), Vec::new());
-    for (index, (op, key)) in ops.into_iter().enumerate() {
-        let held: Option<String> = key.as_ref().and_then(|k| {
-            conn.query_row(
-                "SELECT id FROM memory_import_keys WHERE key = ?1",
-                [k],
-                |r| r.get(0),
-            )
-            .ok()
-        });
-        if held.is_some() {
-            ids.push(json!(held));
-            continue;
-        }
-        match memory::remember(&store, &daemon.identity, op, now() as i64) {
-            Ok(e) => {
-                if let Some(k) = key {
-                    if conn
-                        .execute(
-                            "INSERT INTO memory_import_keys (key, id) VALUES (?1, ?2)",
-                            [&k, &e.id],
-                        )
-                        .is_err()
-                    {
-                        return Response::err(id, INTERNAL);
-                    }
-                }
-                ids.push(json!(e.id));
-            }
-            Err(e) => {
-                let reason = e.to_string();
-                if !(reason.starts_with("secret:")
-                    || reason == "too_long"
-                    || reason == "no_subject")
-                {
-                    return Response::err(id, INTERNAL);
-                }
-                ids.push(Value::Null);
-                refusals.push(json!({ "index": index, "reason": reason }));
-            }
-        }
-    }
-    daemon.peers.outbox.notify_one();
-    Response::ok(id, json!({ "ids": ids, "refused": refusals }))
-}
-
-/// `memory.list {since_seq}` -> `{entries, next}`: up to 200 rows after `since_seq` in insertion
-/// order, each stored entry as `memory.export` shows it with `seq` the row's number; a tombstoned
-/// row is `{seq, id, author, tombstone: true}`.
-fn memory_list_since(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
-    let Some(since) = body["since_seq"].as_i64() else {
-        return Response::err(id, BAD_REQUEST);
-    };
-    match crate::memory::page_since(&daemon.store.lock().unwrap(), since, 200) {
-        Ok(rows) => {
-            let next = rows.last().map_or(since, |(seq, _)| *seq);
-            let entries: Vec<Value> = rows.into_iter().map(|(_, v)| v).collect();
-            Response::ok(id, json!({ "entries": entries, "next": next }))
-        }
-        Err(_) => Response::err(id, INTERNAL),
-    }
-}
-
-/// `memory.forget_author {author}` -> `{forgotten}`: a `Forget` for every entry held from
-/// `author` (a member wipe).
-fn memory_forget_author(id: u64, body: &Value, daemon: &Arc<Daemon>) -> Response {
-    use crate::memory::{self, Op};
-    let Some(author) = body["author"].as_str() else {
-        return Response::err(id, BAD_REQUEST);
-    };
-    let store = daemon.store.lock().unwrap();
-    let Ok(held) = memory::entries(&store) else {
-        return Response::err(id, INTERNAL);
-    };
-    let mut forgotten = 0;
-    for e in held
-        .into_iter()
-        .filter(|e| e.author == author && matches!(e.op, Op::Remember { .. }))
-    {
-        let op = Op::Forget { target: e.id };
-        if memory::remember(&store, &daemon.identity, op, now() as i64).is_err() {
-            return Response::err(id, INTERNAL);
-        }
-        forgotten += 1;
-    }
-    daemon.peers.outbox.notify_one();
-    Response::ok(id, json!({ "forgotten": forgotten }))
 }
 
 /// The `memory.*` ops a person manages memory with: `list {scope?, repo?}` -> `{facts}`;
@@ -1997,11 +1647,9 @@ fn ended_json(r: &store::Session, hidden: bool) -> Value {
     v
 }
 
-/// `status`'s `dropped`: frames `from_peer_ok` dropped, by kind, and viewer `input` frames.
+/// `status`'s `dropped`: frames `from_peer_ok` dropped, by kind.
 fn dropped(daemon: &Daemon) -> Value {
-    let mut v = json!(*daemon.peers.dropped.lock().unwrap());
-    v["input"] = daemon.streams.dropped_input.load(Ordering::Relaxed).into();
-    v
+    json!(*daemon.peers.dropped.lock().unwrap())
 }
 
 /// Whether `s` is a `who` handle: `<provider>-<n>`.
@@ -2016,10 +1664,6 @@ fn live_count(daemon: &Daemon) -> usize {
 
 /// `m`'s sender as this computer's agents are told it (`label::sender`).
 pub(crate) fn sender_label(daemon: &Daemon, m: &store::Message) -> String {
-    if m.origin.as_deref() == Some(mail::APP_ORIGIN) {
-        let title = crate::link::title_of(daemon, &m.from_key);
-        return label::hosted_app(&m.from_key, title.as_deref());
-    }
     let from = label::from(&daemon.identity.short, m);
     let declared = presence::declared_agents(daemon).remove(&from);
     let team = daemon.team.lock().unwrap();
@@ -2055,19 +1699,6 @@ pub(crate) fn send(
     id: u64,
     body: &Value,
     daemon: &Arc<Daemon>,
-) -> Result<(Key, mail::Receipt), Response> {
-    send_as(id, body, daemon, false)
-}
-
-/// `send`; with `app`, from a hosted app's session on this computer (`link`): never hop 0 (the
-/// agents' loop limits apply), and its mail for a session here is stored as from that app
-/// (origin `app`: framed as "<App> (you)", never as typed at the terminal). Not held: the person
-/// connected the app themselves.
-pub(crate) fn send_as(
-    id: u64,
-    body: &Value,
-    daemon: &Arc<Daemon>,
-    app: bool,
 ) -> Result<(Key, mail::Receipt), Response> {
     let (Some(from), Some(text), Some(rid)) = (
         body["from"].as_str(),
@@ -2111,10 +1742,6 @@ pub(crate) fn send_as(
         true => format!("{}/{from}", daemon.identity.short),
         false => from.to_string(),
     };
-    // A workspace member sends only as the agents it declared.
-    if daemon.cloud.as_ref().is_some_and(|c| !c.declares(&from)) {
-        return Err(refused(id, "not_declared"));
-    }
     let from = Key(from);
     // An A2A body: its `metadata` and `extensions` as given, `role` and `parts` from the text
     // when absent; its text must be the text.
@@ -2188,15 +1815,7 @@ pub(crate) fn send_as(
         mail::Prep::Done(r) => return Ok((from, r)),
     };
     p.a2a = a2a;
-    if app {
-        p.hops = p.hops.max(1);
-    }
-    let origin = if app {
-        mail::Origin::App
-    } else {
-        mail::Origin::Local
-    };
-    match dispatch_locked(daemon, team, store, &p, origin) {
+    match dispatch_locked(daemon, team, store, &p, mail::Origin::Local) {
         Ok(r) => Ok((from, r)),
         Err(Failed::NotMember) => Err(Response::err(id, super::net_ops::NOT_MEMBER)),
         Err(Failed::Internal(_)) => Err(Response::err(id, INTERNAL)),
@@ -2294,7 +1913,7 @@ fn dispatch_locked(
     let sent = mail::store_local_from(&store, p, origin).map_err(internal)?;
     drop(store);
     if sent.state == mail::State::Stored {
-        stored(daemon, &p.to, Some(&p.message_id));
+        stored(daemon, &p.to);
     }
     Ok(sent)
 }
@@ -2312,10 +1931,7 @@ fn fresh_worker(
     let tx = store.conn().unchecked_transaction().map_err(internal)?;
     let (mut taken, mut cancelled) = (None, None);
     if p.kind == "assign" {
-        let mut m = store::Message::from(p);
-        if let mail::Origin::App = origin {
-            m.origin = Some(mail::APP_ORIGIN.into());
-        }
+        let m = store::Message::from(p);
         let me = &daemon.identity.short;
         match workers::take_assign(&store, &team.config, me, &m, None, now as i64)
             .map_err(internal)?
@@ -2357,19 +1973,9 @@ fn fresh_worker(
 }
 
 /// Mail was stored for `to` here: a waiting `inbox` looks again, a Claude or Codex session is
-/// pushed it (`super::deliver`) if its tier is `push`, and for new mail `id` (not a resend)
-/// an embedded instance's caller hears `message {to_session, id}` (the declared name).
-pub(crate) fn stored(daemon: &Arc<Daemon>, to: &Key, id: Option<&str>) {
+/// pushed it (`super::deliver`) if its tier is `push`.
+pub(crate) fn stored(daemon: &Arc<Daemon>, to: &Key) {
     daemon.mail.notify_waiters();
-    if daemon.cloud.is_none() && id.is_some() {
-        crate::link::stored(daemon, &to.0); // a hosted app's session: wake its bot, if it asked
-    }
-    if let (Some(_), Some(id)) = (&daemon.cloud, id) {
-        if let Some((_, name)) = sessions::split_addr(&to.0) {
-            let e = json!({"event": "message", "to_session": name, "id": id});
-            let _ = daemon.events.send(e);
-        }
-    }
     if matches!(
         frame::Sender::of("", &to.0),
         frame::Sender::Agent("claude" | "codex")
@@ -2418,10 +2024,9 @@ pub(crate) async fn finish(daemon: &Daemon, from: &Key, mut r: mail::Receipt, wa
             .filter(|m| m.key != daemon.identity.key)?;
         let mine = m.person_id == team.roster.person_of(&daemon.identity.key);
         let person = if mine { "you".into() } else { label::name(m) };
-        let bell = team.roster.wakes.contains_key(&m.key);
-        Some((m.key.clone(), m.computer.clone(), person, bell))
+        Some((m.key.clone(), m.computer.clone(), person))
     });
-    let Some((member, computer, person, bell)) = member else {
+    let Some((member, computer, person)) = member else {
         return with_thread(&r, None);
     };
     if wait {
@@ -2433,10 +2038,7 @@ pub(crate) async fn finish(daemon: &Daemon, from: &Key, mut r: mail::Receipt, wa
     if let Some(h) = r.to.as_deref().and_then(mail::new_harness) {
         v["harness"] = h.into();
     }
-    let online = daemon.peers.is_online(&member);
-    v["online"] = online.into();
-    // A parked workspace with a doorbell: the outbox rang it, so it is starting, not gone.
-    v["waking"] = (bell && !online).into();
+    v["online"] = daemon.peers.is_online(&member).into();
     let latest = daemon.latest.lock().unwrap();
     let to = r.to.as_deref().unwrap_or_default();
     if let Some(s) = latest
@@ -2506,8 +2108,6 @@ pub(crate) fn records(daemon: &Daemon, messages: &[store::Message]) -> Vec<Value
     let (key, short) = (&daemon.identity.key, &daemon.identity.short);
     // Before `team`: the presences' own lock.
     let declared = presence::declared_agents(daemon);
-    // A hosted app's session here (`link`): named as the app, never as this computer's person.
-    let apps = crate::link::apps(daemon);
     // Parents' request ids (a header's `replyTo`). Every caller has dropped the store lock, and
     // this one is taken and released before `team`, the order everywhere else.
     let parents: HashMap<&str, String> = {
@@ -2524,20 +2124,7 @@ pub(crate) fn records(daemon: &Daemon, messages: &[store::Message]) -> Vec<Value
         .iter()
         .map(|m| {
             let from = label::from(short, m);
-            let app = m.origin.as_deref() == Some(mail::APP_ORIGIN);
-            let entry = if app {
-                format!("app:{from}")
-            } else {
-                from.clone()
-            };
-            let who = senders.entry(entry).or_insert_with(|| {
-                if app {
-                    let title = apps.iter().find(|r| r.session_id == m.from_key);
-                    let title = title.and_then(|r| r.title.as_deref());
-                    return json!({ "label": label::hosted_app(&m.from_key, title),
-                        "person": super::user_name(), "person_verified": false,
-                        "computer": team.config.computer });
-                }
+            let who = senders.entry(from.clone()).or_insert_with(|| {
                 let agent = declared.get(&from).map(String::as_str);
                 let label = label::render_as(&team.roster, key, &from, agent);
                 match team
@@ -2702,7 +2289,7 @@ async fn inbox(
         let lapsed = mail::expire_assignments(&daemon.store.lock().unwrap(), short, now());
         match lapsed {
             Err(e) => eprintln!("ipc: expire assignments: {e}"),
-            Ok(woken) => woken.iter().for_each(|(k, id)| stored(daemon, k, Some(id))),
+            Ok(woken) => woken.iter().for_each(|(k, _)| stored(daemon, k)),
         }
         let taken = mail::take(&daemon.store.lock().unwrap(), &key, now());
         match taken {
@@ -2732,92 +2319,5 @@ async fn inbox(
         if !woke {
             return Response::ok(id, json!({ "messages": [] }));
         }
-    }
-}
-
-#[cfg(test)]
-mod goose_binding_tests {
-    use super::*;
-    use data_encoding::BASE64URL_NOPAD;
-    use ed25519_dalek::{Signer, SigningKey};
-
-    fn bytes(key: &str, now: i64) -> Vec<u8> {
-        let v = json!({"actor_id":"12345678-1234-1234-1234-123456789abc","audience":"goosetown-runtime-binding-v1:https://town.example", "challenge_id":BASE64URL_NOPAD.encode(&[7;32]),"expires_at":now+120,"issued_at":now,"member_key":key,"owner_id":"user_example","revision":0,"session_id":format!("{}/synthetic", &key[..12]),"version":1});
-        [
-            b"GooseTown runtime binding v1\n".as_slice(),
-            serde_json::to_vec(&v).unwrap().as_slice(),
-        ]
-        .concat()
-    }
-    #[test]
-    fn validates_binding_fields_and_rejects_invalid_challenges() {
-        let key = "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrst";
-        let good = bytes(key, 1000);
-        assert!(validate_goose_challenge(&good, key, 1000, "https://town.example").is_some());
-        assert!(validate_goose_challenge(&good, key, 1120, "https://town.example").is_none());
-        assert!(validate_goose_challenge(&good, key, 1000, "https://other.example").is_none());
-        assert!(validate_goose_challenge(
-            &good,
-            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
-            1000,
-            "https://town.example"
-        )
-        .is_none());
-        assert!(validate_goose_challenge(b"wrong", key, 1000, "https://town.example").is_none());
-        let raw = &good[b"GooseTown runtime binding v1\n".len()..];
-        assert!(validate_goose_challenge(raw, key, 1000, "https://town.example").is_none());
-        let mut whitespace = good.clone();
-        whitespace.push(b' ');
-        assert!(validate_goose_challenge(&whitespace, key, 1000, "https://town.example").is_none());
-        let mut nonascii = good.clone();
-        nonascii.push(0xff);
-        assert!(validate_goose_challenge(&nonascii, key, 1000, "https://town.example").is_none());
-        let body = std::str::from_utf8(raw).unwrap();
-        for altered in [
-            body.replacen("12345678", "\\u00312345678", 1),
-            body.replacen("\"revision\":0", "\"revision\":0,\"revision\":0", 1),
-            body.replacen("\"revision\":0", "\"revision\":0.0", 1),
-        ] {
-            let b = [
-                b"GooseTown runtime binding v1\n".as_slice(),
-                altered.as_bytes(),
-            ]
-            .concat();
-            assert!(validate_goose_challenge(&b, key, 1000, "https://town.example").is_none());
-        }
-
-        let payload: Value =
-            serde_json::from_slice(&good[b"GooseTown runtime binding v1\n".len()..]).unwrap();
-        for (field, value) in [
-            ("audience", json!("wrong")),
-            ("issued_at", json!(1031)),
-            ("owner_id", json!("bad id")),
-            ("actor_id", json!("a".repeat(151))),
-            ("member_key", json!("z".repeat(52))),
-            ("session_id", json!("other/synthetic")),
-            ("expires_at", json!(1121)),
-            ("challenge_id", json!("bad")),
-            ("version", json!(2)),
-            ("extra", json!(true)),
-        ] {
-            let mut p = payload.clone();
-            p[field] = value;
-            let b = [
-                b"GooseTown runtime binding v1\n".as_slice(),
-                serde_json::to_vec(&p).unwrap().as_slice(),
-            ]
-            .concat();
-            assert!(
-                validate_goose_challenge(&b, key, 1000, "https://town.example").is_none(),
-                "{field}"
-            );
-        }
-    }
-    #[test]
-    fn backend_compatible_fixed_vector() {
-        let sk = SigningKey::from_bytes(&[42; 32]);
-        let key = crate::identity::key_of(sk.verifying_key().as_bytes());
-        let b = bytes(&key, 1000);
-        assert_eq!(BASE64URL_NOPAD.encode(&sk.sign(&b).to_bytes()), "Ht6Qxgo-DT9kIfeSJqBr3MZ7cN_0MhOZyzOcjka4ZxqIoaYIkhFvS1-V3ppLCvzqhsF_FlHVK0PHMNWQfvwdDw");
     }
 }

@@ -68,7 +68,6 @@ async fn a_and_peer_b() -> (Env, Env, iroh::Endpoint, Peer) {
 async fn a_and_peer_b_as(user: Option<&str>) -> (Env, Env, iroh::Endpoint, Peer) {
     let (a, b) = (Env::new(), Env::new());
     seed_pair(&a, &b);
-    a.sign_in("user_a", None);
     a.daemon(false, "", &[]);
     let ep = endpoint(&b.identity()).await;
     let mut p = Peer::dial(&ep, &a).await;
@@ -83,6 +82,7 @@ fn refused(reason: &str) -> (String, Option<String>) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "Step 2: needs a signed-in person, cut with login"]
 async fn signed_envelope_with_a2a_is_stored_with_sig_and_signed_at() {
     let (a, b, _ep, mut p) = a_and_peer_b().await;
     let (sa, sb) = (session(&a, "a1"), session(&b, "b1"));
@@ -107,11 +107,11 @@ async fn unknown_future_field_survives_signature_verification() {
     let (a, b, _ep, mut p) = a_and_peer_b().await;
     let (sa, sb) = (session(&a, "a1"), session(&b, "b1"));
     let id = ulid();
-    let mut v = envelope(&id, &sb, &sa, "hi", Some(user("hi")));
+    let mut v = envelope(&id, &sb, &sa, "hi", None);
     v["future"] = json!(1);
     let v = signed(&b.identity(), v);
     p.send_raw(&v).await;
-    assert_eq!(p.ack(&id).await.0, "held");
+    assert_eq!(p.ack(&id).await.0, "stored");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

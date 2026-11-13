@@ -4,13 +4,11 @@
 //! peer's offline against the issuer's public key and answers only the people in its
 //! `members`. Nothing here calls the issuer.
 
-use crate::daemon::Daemon;
 use crate::Result;
 use data_encoding::BASE64URL_NOPAD;
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::HashSet;
 
 /// A token past this is refused unread.
 pub const MAX_TOKEN: usize = 4096;
@@ -126,21 +124,6 @@ pub fn verify(token: &str, member_key: &str, now: i64) -> Result<Proof> {
 pub fn peek(token: &str) -> Option<Proof> {
     let payload = token.split('.').nth(1)?;
     serde_json::from_slice(&BASE64URL_NOPAD.decode(payload.as_bytes()).ok()?).ok()
-}
-
-/// The online members whose shown proof (their latest `hello`'s) names one of `people`: the
-/// computers a workspace member answers (`members`).
-pub fn admitted(d: &Daemon, people: &HashSet<String>) -> HashSet<String> {
-    let now = crate::daemon::ipc::now() as i64;
-    let revoked = d.cloud.as_ref().map(|c| c.declared().revoked);
-    d.proofs
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|(key, _)| !revoked.as_ref().is_some_and(|r| r.contains(*key)))
-        .filter(|(key, token)| verify(token, key, now).is_ok_and(|p| people.contains(&p.sub)))
-        .map(|(key, _)| key.clone())
-        .collect()
 }
 
 /// The tests' issuer (`tests/common/issuer.rs`), for the unit tests.

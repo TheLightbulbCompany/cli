@@ -2032,7 +2032,6 @@ dependencies = [
  "data-encoding",
  "dirs",
  "ed25519-dalek",
- "futures-util",
  "iroh",
  "iroh-mdns-address-lookup",
  "iroh-relay",
@@ -2042,7 +2041,6 @@ dependencies = [
  "regex",
  "rmcp",
  "rusqlite",
- "rustls",
  "security-framework",
  "serde",
  "serde_json",
@@ -2050,10 +2048,8 @@ dependencies = [
  "tempfile",
  "tokenizers",
  "tokio",
- "tokio-websockets",
  "toml_edit",
  "ulid",
- "url",
 ]
 
 [[package]]
@@ -4255,7 +4251,6 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-util",
- "webpki-roots",
 ]
 
 [[package]]

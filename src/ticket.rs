@@ -1,7 +1,7 @@
 //! Invite tickets: a signed, base64url JSON naming a roster `link`, carried in the join line.
 
 use crate::identity::{self, canonical, Identity};
-use crate::roster::{Role, Roster, Wake};
+use crate::roster::{Role, Roster};
 use crate::Result;
 use data_encoding::{BASE64URL_NOPAD, HEXLOWER};
 use serde::{Deserialize, Serialize};
@@ -34,10 +34,6 @@ pub struct Ticket {
     pub addrs: Vec<String>,
     pub members: Vec<String>,
     pub expires_at: i64,
-    /// A workspace member's doorbell (its roster `wake`): a joiner that reaches no member rings
-    /// it and keeps dialing while the workspace wakes. Absent from a computer's tickets.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub wake: Option<Wake>,
     pub sig: String,
 }
 
@@ -49,7 +45,7 @@ pub fn hash(secret: &str) -> String {
 /// A new ticket from `id` for a new link, and, for a `once` one, its secret's hash (what the
 /// link entry carries in place of the secret). `relay_hint` is the first relay in effect
 /// (`""` for none): a joiner dials through it before it knows its own list; `addrs` this
-/// computer's direct addresses (`Peers::hints`); `wake` a workspace member's doorbell (`sign`).
+/// computer's direct addresses (`Peers::hints`).
 pub fn mint(
     id: &Identity,
     roster: &Roster,
@@ -57,7 +53,6 @@ pub fn mint(
     once: bool,
     now: i64,
     hints: (String, Vec<String>),
-    wake: Option<Wake>,
 ) -> (Ticket, Option<String>) {
     let secret = BASE64URL_NOPAD.encode(&rand::random::<[u8; 32]>());
     let ttl = if once { ONCE_S } else { REUSABLE_S };
@@ -70,15 +65,12 @@ pub fn mint(
         mode,
         now + ttl,
         hints,
-        wake,
     );
     (t, hashed)
 }
 
 /// The ticket `id` signs for its link `ticket_id`: the same bytes each time for the same link
-/// and roster (Ed25519 is deterministic), so a reusable link reprints unchanged. `wake`, only
-/// from a workspace member, is covered by the signature.
-#[allow(clippy::too_many_arguments)]
+/// and roster (Ed25519 is deterministic), so a reusable link reprints unchanged.
 pub fn sign(
     id: &Identity,
     roster: &Roster,
@@ -87,7 +79,6 @@ pub fn sign(
     mode: &str,
     expires_at: i64,
     (relay_hint, addrs): (String, Vec<String>),
-    wake: Option<Wake>,
 ) -> Ticket {
     // The inviter first, then the founder, by key.
     let mut members = vec![id.key.clone()];
@@ -108,7 +99,6 @@ pub fn sign(
         addrs,
         members,
         expires_at,
-        wake,
         sig: String::new(),
     };
     t.sig = id.sign(&value(&t));
@@ -223,7 +213,7 @@ mod tests {
             2,
         );
         let before = replay(&[g.clone(), ax.clone()]);
-        let (t, hashed) = mint(&x, &before, mode, once, 100, (String::new(), vec![]), None);
+        let (t, hashed) = mint(&x, &before, mode, once, 100, (String::new(), vec![]));
         let l = Entry::signed(
             &x,
             vec![ax.hash()],
@@ -265,27 +255,6 @@ mod tests {
     }
 
     #[test]
-    fn a_tickets_wake_is_covered_by_the_signature() {
-        let (_, x, r, t) = team("ask", true);
-        let w = Wake {
-            url: "https://example.test/api/v1/network/wake".into(),
-            token: "org_1.abc".into(),
-        };
-        let mut added = t.clone();
-        added.wake = Some(w.clone());
-        assert!(
-            !signed_by_inviter(&added),
-            "an added wake breaks the signature"
-        );
-        let mut signed = added;
-        signed.sig = x.sign(&value(&signed));
-        assert!(signed_by_inviter(&signed));
-        verify(&signed, &r).unwrap();
-        assert_eq!(decode(&encode(&signed)).unwrap().wake, Some(w));
-        assert_eq!(t.wake, None);
-    }
-
-    #[test]
     fn ticket_mode_is_covered_by_the_signature() {
         let (_, _, r, t) = team("ask", false);
         let mut open = decode(&encode(&t)).unwrap();
@@ -307,7 +276,6 @@ mod tests {
                 mode,
                 t.expires_at,
                 (String::new(), vec![]),
-                None,
             )
         };
         assert!(verify(&forge(&f, "open"), &r).is_err());

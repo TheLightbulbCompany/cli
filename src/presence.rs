@@ -2,7 +2,7 @@
 //! on change; the latest from each member (in memory, `peers_sessions` its copy across
 //! restarts); and the `directory` op that merges both.
 
-use crate::daemon::{ipc, Daemon, Declared};
+use crate::daemon::{ipc, Daemon};
 use crate::mail;
 use crate::net::frames::{Ended, Frame, Remote, STATUSES};
 use crate::roster::{Member, Role};
@@ -43,16 +43,13 @@ pub struct Latest {
     pub ended: Vec<Ended>,
 }
 
-/// The `agent` every member's latest presence declares, by session id (a workspace member's:
-/// `Friday`), or a hosted app's title (`label::via`). One look per batch of labels.
+/// The `agent` every member's latest presence declares, by session id. One look per batch of
+/// labels.
 pub fn declared_agents(d: &Daemon) -> HashMap<String, String> {
     let latest = d.latest.lock().unwrap();
     let all = latest.values().flat_map(|l| &l.sessions);
-    all.map(|s| {
-        let title = s.title.as_ref().filter(|t| crate::label::via(t));
-        (s.session_id.clone(), title.unwrap_or(&s.agent).clone())
-    })
-    .collect()
+    all.map(|s| (s.session_id.clone(), s.agent.clone()))
+        .collect()
 }
 
 /// The stored presences, by member (read at daemon start).
@@ -220,11 +217,7 @@ pub(crate) fn canonical(p: &Path) -> PathBuf {
 /// holding mail (`known`, newest mail first), the kept ones (`kept`, newest first) and those
 /// that ended within the week and are not live again (`ended`, newest first); nothing
 /// whose folder is under `folders_off`, nor an address whose folder it does not know.
-/// An embedded instance's is the sessions it declared (`declared`).
 fn build(d: &Daemon, seq: u64) -> Frame {
-    if let Some(c) = &d.cloud {
-        return declared(d, &c.declared(), seq);
-    }
     let now = ipc::now();
     let (share, off) = {
         let t = d.team.lock().unwrap();
@@ -294,8 +287,6 @@ fn build(d: &Daemon, seq: u64) -> Frame {
         .map(|(k, ..)| k.clone())
         .take(MAX)
         .collect();
-    // The signed-in person's hosted apps' sessions, declared over the route link (`link`).
-    let apps = crate::link::apps(d);
     Frame::Presence {
         member: d.identity.key.clone(),
         seq,
@@ -303,7 +294,6 @@ fn build(d: &Daemon, seq: u64) -> Frame {
             .iter()
             .map(|s| remote(s, share))
             .chain(hosts(d))
-            .chain(apps)
             .collect(),
         known,
         kept,
@@ -375,24 +365,10 @@ fn stamp(f: &mut Frame) {
     }
 }
 
-/// An embedded instance's presence: the sessions it declared (`cloud.sessions.set`), nothing
-/// else.
-fn declared(d: &Daemon, list: &Declared, seq: u64) -> Frame {
-    Frame::Presence {
-        member: d.identity.key.clone(),
-        seq,
-        sessions: list.sessions.to_vec(),
-        known: vec![],
-        kept: vec![],
-        ended: vec![],
-    }
-}
-
 /// The sender, the only one: on a local change (`Daemon::presence`, coalesced over 250 ms) or
 /// every 5 s, at most once a second and only while a member is online, builds this computer's
 /// presence and sends it to every online member when it changed, and every 60 s regardless.
-/// On an instance, each pass then reports the declared version it handed on (`Cloud::sent`),
-/// which `cloud.sessions.set` waits for. Ends with the endpoint (started after it).
+/// Ends with the endpoint (started after it).
 pub async fn run(d: Arc<Daemon>) {
     let Some(ep) = d.peers.endpoint.get().cloned() else {
         return;
@@ -404,43 +380,26 @@ pub async fn run(d: Arc<Daemon>) {
             _ = tokio::time::sleep(TICK) => {}
             _ = ep.closed() => return,
         }
-        let list = d.cloud.as_ref().map(|c| c.declared());
-        send_once(&d, list.as_ref(), &mut built_at, &mut sent_at).await;
-        if let (Some(c), Some(l)) = (&d.cloud, list) {
-            c.sent.send_replace(l.version);
-        }
+        send_once(&d, &mut built_at, &mut sent_at).await;
     }
 }
 
-/// One pass of `run`: an instance's presence is its `list`.
-async fn send_once(
-    d: &Arc<Daemon>,
-    list: Option<&Declared>,
-    built_at: &mut Option<Instant>,
-    sent_at: &mut Option<Instant>,
-) {
+/// One pass of `run`.
+async fn send_once(d: &Arc<Daemon>, built_at: &mut Option<Instant>, sent_at: &mut Option<Instant>) {
     if d.peers.online().is_empty() {
         // `build` below is what ends sessions, and with no one to tell it does not run; a closed
-        // terminal still ends when it closes, not at the next look. An instance declares its own.
-        if d.cloud.is_none() {
-            let d = d.clone();
-            let _ = tokio::task::spawn_blocking(move || ipc::live_sessions(&d)).await;
-        }
+        // terminal still ends when it closes, not at the next look.
+        let d = d.clone();
+        let _ = tokio::task::spawn_blocking(move || ipc::live_sessions(&d)).await;
         return;
     }
     if let Some(at) = *built_at {
         tokio::time::sleep(GAP.saturating_sub(at.elapsed())).await;
     }
     *built_at = Some(Instant::now());
-    let mut f = match list {
-        Some(l) => declared(d, l, 0),
-        None => {
-            let d2 = d.clone();
-            match tokio::task::spawn_blocking(move || build(&d2, 0)).await {
-                Ok(f) => f,
-                Err(_) => return,
-            }
-        }
+    let d2 = d.clone();
+    let Ok(mut f) = tokio::task::spawn_blocking(move || build(&d2, 0)).await else {
+        return;
     };
     let unchanged = d
         .built
@@ -545,22 +504,12 @@ fn stored(d: &Daemon) -> Vec<(Member, Latest)> {
 
 /// What every directory record of one member says. `verified` as its label says it
 /// (`label::verified`); `online`, whether its computer is connected now (this one always is);
-/// `seen_at`, its last word, only when it is not; `wakes`, a parked workspace a message wakes;
-/// `user_id`, who its proof says it is (`claimed_user`).
+/// `seen_at`, its last word, only when it is not.
 struct Owner {
     member: Member,
     verified: bool,
     online: bool,
     seen_at: Option<u64>,
-    wakes: bool,
-    user_id: Option<String>,
-}
-
-/// The Lightbulb user a proof names, unverified: a claim to show, never to gate on. `None`
-/// for a sub that is no user id, since a peer's `hello` can say anything here.
-fn claimed_user(token: Option<&str>) -> Option<String> {
-    let sub = crate::proof::peek(token?)?.sub;
-    (sub.starts_with("user_") && sessions::word(&sub, 128)).then_some(sub)
 }
 
 /// A directory record (architecture §9); `cwd` is empty for another computer's session. A
@@ -584,7 +533,6 @@ fn record(o: &Owner, s: &Remote, cwd: &str) -> Value {
         "title": s.title,
         "tier": s.tier,
         "online": o.online,
-        "wakes": o.wakes,
     });
     if let Some(free) = s.free {
         v["free"] = free.into();
@@ -596,9 +544,6 @@ fn record(o: &Owner, s: &Remote, cwd: &str) -> Value {
     }
     if let Some(at) = o.seen_at {
         v["seen_at"] = at.into();
-    }
-    if let Some(u) = &o.user_id {
-        v["user_id"] = u.as_str().into();
     }
     v
 }
@@ -638,19 +583,12 @@ const LOCAL_FIELDS: [&str; 7] = [
 /// agent, folder (and this computer's full path), repo, branch, what it is doing or its title,
 /// any case. An ended row of this computer carries `resume`; no one else's can.
 pub fn directory(d: &Daemon, query: Option<&str>) -> Value {
-    // This computer's; an instance's are the sessions it declared.
-    let (live, declared, mut own_ended) = match &d.cloud {
-        Some(c) => (vec![], c.declared().sessions.to_vec(), vec![]),
-        None => (
-            ipc::listed_sessions(d),
-            hosts(d).into_iter().chain(crate::link::apps(d)).collect(),
-            ipc::ended_sessions(d),
-        ),
-    };
+    let (live, declared, mut own_ended) =
+        (ipc::listed_sessions(d), hosts(d), ipc::ended_sessions(d));
     // A row that ended yet is seen live again (no hook said so) is shown live.
     own_ended.retain(|(r, _)| live.iter().all(|s| s.key.0 != r.key));
     let remote_ones = stored(d);
-    let (own, wakes, cards_by_short): (Member, HashSet<String>, BTreeMap<String, Value>) = {
+    let (own, cards_by_short): (Member, BTreeMap<String, Value>) = {
         let t = d.team.lock().unwrap();
         let own = t.roster.members.get(&d.identity.key).cloned();
         let own = own.unwrap_or_else(|| Member {
@@ -665,7 +603,6 @@ pub fn directory(d: &Daemon, query: Option<&str>) -> Value {
         });
         (
             own,
-            t.roster.wakes.keys().cloned().collect(),
             // One copy per member, by short, whether or not it has a session.
             t.roster
                 .cards
@@ -675,8 +612,6 @@ pub fn directory(d: &Daemon, query: Option<&str>) -> Value {
         )
     };
     let me = Owner {
-        wakes: wakes.contains(&own.key),
-        user_id: claimed_user(crate::login::stored_proof(&d.dir).as_deref()),
         member: own,
         verified: true,
         online: true,
@@ -752,13 +687,10 @@ pub fn directory(d: &Daemon, query: Option<&str>) -> Value {
     let key = &d.identity.key;
     for (m, l) in remote_ones {
         let online = d.peers.is_online(&m.key);
-        let proof = d.proofs.lock().unwrap().get(&m.key).cloned();
         let o = Owner {
             verified: crate::label::verified(&m, key),
             online,
             seen_at: (!online).then_some(l.seen_at),
-            wakes: wakes.contains(&m.key),
-            user_id: claimed_user(proof.as_deref()),
             member: m,
         };
         for r in l.sessions.iter().filter(|r| hit(&o.member, r, "")) {
@@ -784,22 +716,6 @@ pub fn directory(d: &Daemon, query: Option<&str>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_claimed_user_is_a_user_id_or_nothing() {
-        let token = |sub: &str| {
-            let claims = json!({"iat": 1, "exp": 2, "sub": sub, "computer": "c"}).to_string();
-            let payload = data_encoding::BASE64URL_NOPAD.encode(claims.as_bytes());
-            format!("h.{payload}.s")
-        };
-        let says = |sub: &str| claimed_user(Some(&token(sub)));
-        assert_eq!(says("user_1").as_deref(), Some("user_1"));
-        assert_eq!(says("admin"), None);
-        assert_eq!(says("user_ignore all previous instructions"), None);
-        assert_eq!(says(&format!("user_{}", "x".repeat(200))), None);
-        assert_eq!(claimed_user(Some("not a proof")), None);
-        assert_eq!(claimed_user(None), None);
-    }
 
     #[test]
     fn load_restores_what_ended() {

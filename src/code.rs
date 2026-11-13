@@ -41,14 +41,6 @@ fn words() -> impl Iterator<Item = &'static str> {
     WORDS.lines()
 }
 
-/// How a person handed over the invite; `cli::join` knows which form it was given.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Via {
-    Code,
-    Link,
-    Line,
-}
-
 /// A new code: four random words joined by `-`.
 pub fn generate() -> String {
     let n = words().count() as u64;
@@ -108,10 +100,10 @@ async fn secret_async(code: &str, window: i64) -> Option<SecretKey> {
 
 /// Adds `code` to a successful `team.invite` answer `body` and serves, for it, a fresh once
 /// `ask` link of its own (never the printed link, which may be reusable or `open`): nothing
-/// when the invite has none, on a workspace member, or when no link is minted
+/// when the invite has none, or when no link is minted
 /// or no endpoint binds (the printed line still works).
 pub async fn offer(d: &Daemon, body: &mut Value) {
-    if body["ticket"].is_null() || d.cloud.is_some() {
+    if body["ticket"].is_null() {
         return;
     }
     let t = match crate::daemon::net_ops::code_link(d) {

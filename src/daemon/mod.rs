@@ -73,8 +73,7 @@ pub struct Daemon {
     pub push_failed: Mutex<HashSet<String>>,
     /// The member connections (`net`).
     pub peers: net::Peers,
-    /// The person's OS dialogs, one at a time, none while `ui.claim` is live. An embedded
-    /// instance's answers every dialog "not shown" at once: it asks no one.
+    /// The person's OS dialogs, one at a time.
     pub dialogs: dialog::Queue,
     /// `dialogs`' answers, for the task that routes them (admission, holds) to take.
     pub dialog_answers: Mutex<Option<dialog::Answers>>,
@@ -99,21 +98,11 @@ pub struct Daemon {
     pub built: Mutex<Option<net::frames::Frame>>,
     /// Each member's latest presence (`peers_sessions` is its copy across restarts).
     pub latest: Mutex<HashMap<String, crate::presence::Latest>>,
-    /// The open streams (`streams`).
-    pub streams: crate::streams::Streams,
     /// The network workers running here (`workers`).
     pub workers: crate::workers::Registry,
-    /// What an embedded (cloud) instance is; `None` on a computer.
-    pub cloud: Option<Cloud>,
     /// Each member's sign-in proof from its latest `hello` (`proof`): what a workspace member's
     /// `members` gate reads.
     pub proofs: Mutex<HashMap<String, String>>,
-    /// A computer's route link to Lightbulb, for its person's hosted apps (`link`).
-    pub link: Mutex<crate::link::State>,
-    /// An instance's `daemon.lock` (`lock_dir`): released only when the last task holding the
-    /// daemon ends, so no second engine starts on this home while one still runs. The socket
-    /// daemon holds its own across `run`.
-    pub home_lock: Option<File>,
     /// Claude's own session listing, last read (`current`).
     pub listing: Arc<Mutex<ListingCache>>,
 }
@@ -180,8 +169,8 @@ fn read_due(
 /// read costs about 0.2 s of CPU and a 155 MB spike); until the first ends, `None` (the pid
 /// files). A failed read counts as a read: a hung `claude` is asked once per 30 s, or 60 s with
 /// no pid file, so what this returns may be up to 60 s old. Ends of live rows do not wait for
-/// it: they come from pid liveness on the 5 s tick. `None` when the Claude home is not `HOME` (an embedded
-/// instance's, a test's): `claude` lists `HOME`'s sessions, not those.
+/// it: they come from pid liveness on the 5 s tick. `None` when the Claude home is not `HOME` (a
+/// test's): `claude` lists `HOME`'s sessions, not those.
 pub(crate) fn current(daemon: &Daemon) -> Option<Vec<Listed>> {
     current_at(daemon).map(|(rows, _)| rows)
 }
@@ -262,72 +251,6 @@ fn refresh(cache: &Mutex<ListingCache>, home: &Path) {
     }
 }
 
-/// An embedded instance: a Lightbulb workspace's member.
-pub struct Cloud {
-    /// The workspace's display name: its solo network's member and team name.
-    pub name: String,
-    declared: Mutex<Declared>,
-    pub(crate) goosetown_origin: Mutex<Option<String>>,
-    /// The last `Declared::version` the presence sender (`presence::run`) handed on.
-    pub sent: tokio::sync::watch::Sender<u64>,
-    /// This member's own doorbell (the sessions file's `wake`), republished after a join.
-    pub wake: Mutex<Option<crate::roster::Wake>>,
-}
-
-/// The sessions an instance declared (`cloud.sessions.set`), as published; each set is a new
-/// `version`.
-#[derive(Clone, Default)]
-pub struct Declared {
-    pub version: u64,
-    pub sessions: Arc<Vec<net::frames::Remote>>,
-    pub ids: Arc<HashSet<String>>,
-    /// The people (Lightbulb user ids) whose computers may message these sessions, by their
-    /// sign-in proof (`proof::admitted`); `None`: anyone the policy admits.
-    pub members: Option<Arc<HashSet<String>>>,
-    /// Computers refused even with a valid proof (the backend's remote sign-out).
-    pub revoked: Arc<HashSet<String>>,
-}
-
-impl Cloud {
-    pub fn new(name: String) -> Cloud {
-        Cloud {
-            name,
-            declared: Mutex::default(),
-            goosetown_origin: Mutex::new(None),
-            sent: tokio::sync::watch::Sender::new(0),
-            wake: Mutex::default(),
-        }
-    }
-
-    pub fn declared(&self) -> Declared {
-        self.declared.lock().unwrap().clone()
-    }
-
-    /// Whether `addr` is one of the declared sessions.
-    pub fn declares(&self, addr: &str) -> bool {
-        self.declared.lock().unwrap().ids.contains(addr)
-    }
-
-    /// Makes `sessions` the declared list: its version.
-    pub fn set(
-        &self,
-        sessions: Vec<net::frames::Remote>,
-        members: Option<HashSet<String>>,
-        revoked: HashSet<String>,
-    ) -> u64 {
-        let mut d = self.declared.lock().unwrap();
-        let ids = sessions.iter().map(|s| s.session_id.clone()).collect();
-        *d = Declared {
-            version: d.version + 1,
-            sessions: Arc::new(sessions),
-            ids: Arc::new(ids),
-            members: members.map(Arc::new),
-            revoked: Arc::new(revoked),
-        };
-        d.version
-    }
-}
-
 impl Daemon {
     pub fn key_lock(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
         self.mailbox_locks
@@ -336,11 +259,6 @@ impl Daemon {
             .entry(key.into())
             .or_default()
             .clone()
-    }
-
-    /// Whether the Lightbulb app holds a `ui.claim` at `now`.
-    pub fn claim_live(&self, now: i64) -> bool {
-        self.dialogs.claim_live(now)
     }
 }
 
@@ -415,8 +333,8 @@ pub(crate) fn lock_path(dir: &Path) -> PathBuf {
     dir.join("daemon.lock")
 }
 
-/// `dir`'s `daemon.lock`, held (and our pid written in it) until the file drops: one engine,
-/// daemon or embedded instance, per state dir. With `wait` it blocks until the holder is gone;
+/// `dir`'s `daemon.lock`, held (and our pid written in it) until the file drops: one daemon
+/// per state dir. With `wait` it blocks until the holder is gone;
 /// without, it fails at once.
 pub(crate) fn lock_dir(dir: &Path, wait: bool) -> Result<File> {
     let mut lock = OpenOptions::new()
@@ -442,7 +360,7 @@ pub async fn run(dir: &Path) -> Result<()> {
     // Blocks this (otherwise idle) thread; nothing else runs until the lock is ours.
     let _lock = lock_dir(dir, true)?;
     let config = Config::load(dir)?;
-    let (daemon, net) = crate::embed::boot(dir, config, None).await?;
+    let (daemon, net) = boot(dir, config).await?;
     // Workers whose process went with the last daemon end; live ones are re-adopted.
     crate::workers::reap(&daemon);
     // The dialogs of the holds still open went with the last daemon.
@@ -463,11 +381,6 @@ pub async fn run(dir: &Path) -> Result<()> {
     cli::refresh_setup(dir);
     tokio::spawn(auto_update(daemon.clone(), dir.to_path_buf()));
     tokio::spawn(housekeeping(daemon.clone()));
-    tokio::spawn(crate::telemetry::run_daily(daemon.clone()));
-    // While signed in: the route link for this person's hosted apps.
-    tokio::spawn(crate::link::run(daemon.clone()));
-    // While signed in and the person chose it: closed sessions go to Lightbulb.
-    tokio::spawn(crate::upload::run(daemon.clone()));
     // SIGTERM (launchd's stop) and SIGINT end it like a `shutdown` op: the socket and the
     // loopback address file (`net::local`) are removed on the way out.
     let d = daemon.clone();
@@ -489,6 +402,148 @@ pub async fn run(dir: &Path) -> Result<()> {
     net.close().await;
     let _ = fs::remove_file(&sock);
     Ok(()) // `lock` drops here, after the socket is gone.
+}
+
+/// `boot`'s refusal when `identity.key` was replaced (or lost) under a kept `state.db`: the
+/// team record is signed for the old key, which nothing here can sign as any more.
+pub const KEY_MISMATCH: &str = "identity.key does not match this computer's team record. Run lightbulb leave, then join again with a new invite.";
+
+/// Whether `roster` never knew `identity`'s key, as a member or a signer: `identity.key` is
+/// not the key the team record was made for.
+fn mismatched(identity: &Identity, roster: &roster::Roster) -> bool {
+    let key = identity.key.as_str();
+    !roster.members.contains_key(key)
+        && !(roster.log().iter()).any(|(_, e)| e.signer == key || e.body["member"] == key)
+}
+
+/// `mismatched` for `dir` as it is on disk, for a caller that does not hold the lock: nothing
+/// is written. No roster: `false`; a roster but no key: `true` (a start would make a key the
+/// record never knew).
+pub fn key_mismatch(dir: &Path) -> Result<bool> {
+    if !dir.join("state.db").exists() {
+        return Ok(false);
+    }
+    let entries = roster::entries(&Store::open(&dir.join("state.db"))?)?;
+    if entries.is_empty() {
+        return Ok(false);
+    }
+    if !crate::identity::exists(dir)? {
+        return Ok(true);
+    }
+    Ok(mismatched(
+        &Identity::load_or_create(dir)?,
+        &roster::replay(&entries),
+    ))
+}
+
+/// The daemon's start, under `dir`'s lock (the caller's): identity, store, the solo genesis on
+/// first start, the team, the transport and the presence sender.
+async fn boot(dir: &Path, config: Config) -> Result<(Arc<Daemon>, net::Net)> {
+    let identity = Identity::load_or_create(dir)?;
+    let store = Store::open(&dir.join("state.db"))?;
+    let now = ipc::now() as i64;
+    // The solo network's genesis, written once: a computer that has a roster keeps it.
+    let mut entries = roster::entries(&store)?;
+    if entries.is_empty() {
+        let g = net_ops::solo_genesis(&identity, &config.computer, now);
+        roster::accept(&store, &g, now)?;
+        entries.push(g);
+    }
+    let mut roster = roster::replay(&entries);
+    if mismatched(&identity, &roster) {
+        return Err(KEY_MISMATCH.into());
+    }
+    // Known but no member: removed (a stop before `removed_here`'s new genesis, a fork that
+    // dropped us, or a roster this build's rules no longer replay us into). On our own network
+    // again, as `removed_here` leaves it.
+    if !roster.members.contains_key(&identity.key) {
+        crate::outbox::refuse_all(&store, now as u64, "not_member")?;
+        store.clear_roster()?;
+        let at = now.max(roster.created_at + 1);
+        let g = net_ops::solo_genesis(&identity, &config.computer, at);
+        roster::accept(&store, &g, now)?;
+        roster = roster::replay(&[g]);
+    }
+    let mut team = TeamState {
+        roster,
+        config: Config::default(),
+        off: vec![],
+    };
+    let off = canonical_off(&config);
+    team.set_config(config, off);
+    net_ops::sync_team_row(&store, &roster::Roster::default(), &team.roster)?;
+    let latest = crate::presence::load(&store);
+    let peers = net::Peers::default();
+    let (dialogs, answers) = dialog::Queue::new(peers.knobs().osascript.clone());
+    dialogs.set_knob(peers.knobs().dialog.clone());
+    let claude_home = (cfg!(debug_assertions)
+        .then(|| std::env::var_os("LIGHTBULB_CONNECT_CLAUDE_HOME"))
+        .flatten())
+    .map(PathBuf::from)
+    .or_else(dirs::home_dir)
+    .ok_or("no home directory")?;
+    let daemon = Arc::new(Daemon {
+        dir: dir.to_path_buf(),
+        store: Mutex::new(store),
+        identity,
+        team: Mutex::new(team),
+        claude_home,
+        events: broadcast::channel(256).0,
+        shutdown: Default::default(),
+        mail: Default::default(),
+        mailbox_locks: Mutex::default(),
+        push_failed: Mutex::default(),
+        peers,
+        dialogs,
+        dialog_answers: Mutex::new(Some(answers)),
+        answered_by: Mutex::default(),
+        join_confirm: Mutex::default(),
+        agent_invites: Mutex::default(),
+        roster_changed: Default::default(),
+        joining: tokio::sync::Mutex::new(()),
+        codes: Mutex::default(),
+        presence: Default::default(),
+        built: Mutex::default(),
+        latest: Mutex::new(latest),
+        workers: Default::default(),
+        proofs: Mutex::default(),
+        listing: Default::default(),
+    });
+    // No join connection outlives a restart: its open requests are over.
+    daemon.store.lock().unwrap().expire_joins(i64::MAX, now)?;
+    if let Err(e) = publish_card(&daemon) {
+        eprintln!("card: {e}");
+    }
+    let net = net::Net::start(daemon.clone()).await?;
+    tokio::spawn(crate::presence::run(daemon.clone()));
+    Ok((daemon, net))
+}
+
+/// Signs this member's Agent Card into its roster as a `meta` when the roster's differs from
+/// the one computed now (the first start, a new name, workers switched on or off). A computer
+/// that is no member of its team publishes nothing.
+pub(crate) fn publish_card(d: &Daemon) -> Result<()> {
+    let mut team = d.team.lock().unwrap();
+    let Some(me) = team.roster.members.get(&d.identity.key) else {
+        return Ok(());
+    };
+    let offers = !crate::workers::offers(&team.config).is_empty();
+    let card = roster::own_card(&d.identity.short, &me.name, offers);
+    if team.roster.cards.get(&d.identity.key) == Some(&card) {
+        return Ok(());
+    }
+    let store = d.store.lock().unwrap();
+    let now = ipc::now() as i64;
+    net_ops::write(
+        d,
+        &mut team,
+        &store,
+        roster::Kind::Meta,
+        serde_json::json!({"card": card}),
+        now,
+    )?;
+    eprintln!("card: published");
+    Ok(())
 }
 
 /// Checks for a newer release ten minutes after the start and then daily (`cli::auto_update`).
@@ -543,15 +598,14 @@ pub fn user_name() -> String {
 /// never a second owner; otherwise this binary spawns one.
 pub fn ensure_running() -> Result<()> {
     let dir = paths::state_dir();
-    crate::telemetry::sync_env_optout(&dir);
     let sock = dir.join(paths::SOCKET);
     if answers_ping(&sock) {
         return Ok(());
     }
-    // A daemon would refuse at boot (`embed::KEY_MISMATCH`): say so now, so a hook or the MCP
+    // A daemon would refuse at boot (`KEY_MISMATCH`): say so now, so a hook or the MCP
     // server does not wait out a start that cannot happen.
-    if crate::embed::key_mismatch(&dir).unwrap_or(false) {
-        return Err(crate::embed::KEY_MISMATCH.into());
+    if key_mismatch(&dir).unwrap_or(false) {
+        return Err(KEY_MISMATCH.into());
     }
     let launchd = cfg!(target_os = "macos")
         && cli::use_launchctl()

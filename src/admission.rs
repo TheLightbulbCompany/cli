@@ -62,8 +62,8 @@ const REASONS: &[&str] = &[
 
 /// A dial, a first frame, a `roster` page, the goodbye: each gets this long.
 const STEP: Duration = Duration::from_secs(10);
-/// Between dial rounds while a rung workspace wakes.
-const WAKE_RETRY: Duration = Duration::from_secs(5);
+/// Between dial rounds while no member has answered.
+const DIAL_RETRY: Duration = Duration::from_secs(5);
 /// How long a member's silence on a join request means it is asking its person.
 const ASKING: Duration = Duration::from_secs(1);
 /// How long an agent's join waits for its person: past the dialog's own 600 s.
@@ -544,16 +544,6 @@ pub async fn join(id: u64, body: &Value, d: &Arc<Daemon>, agent: bool) -> Respon
         d.peers
             .learn(&d.dir, &t.inviter, inviter_addrs.clone(), &team.roster);
     }
-    // A workspace member's ticket carries its doorbell: when no member answers, ring it once
-    // and keep dialing while the workspace wakes (`join_waking`, for the CLI). The ticket is
-    // its inviter's (checked above); the wake is re-parsed so a ticket cannot hand curl
-    // anything `Wake::parse` refuses. A workspace member never rings.
-    let mut wake = t
-        .wake
-        .as_ref()
-        .filter(|_| d.cloud.is_none())
-        .and_then(|w| crate::roster::Wake::parse(&json!({"url": w.url, "token": w.token})));
-    let mut until: Option<tokio::time::Instant> = None;
     // A computer that has just started may reach nobody on its first pass (its relay and paths
     // are still coming up): while no member has answered, keep dialing for `dial_wait`.
     let dial_until = tokio::time::Instant::now() + d.peers.knobs().dial_wait;
@@ -598,36 +588,17 @@ pub async fn join(id: u64, body: &Value, d: &Arc<Daemon>, agent: bool) -> Respon
                         }
                     })
                     .await;
-                    // A workspace member's doorbell goes into the team it just joined.
-                    if let Err(e) = crate::embed::publish(d) {
-                        eprintln!("join: wake: {e}");
-                    }
                     let team = d.team.lock().unwrap().roster.team_name.clone();
                     return done("admitted", None, &team, d.peers.online().len() + 1);
                 }
             }
         }
-        if last.is_none() {
-            if let Some(w) = wake.take() {
-                let _ = d.events.send(json!({"event": "join_waking"}));
-                net::doorbell(w, net::short(&t.inviter).to_string()).await;
-                until = Some(tokio::time::Instant::now() + d.peers.knobs().wake_wait);
-            }
-        }
-        let now = tokio::time::Instant::now();
-        let keep = match until {
-            Some(u) => now < u,
-            None => last.is_none() && now < dial_until,
-        };
-        if !keep {
+        if last.is_some() || tokio::time::Instant::now() >= dial_until {
             break;
         }
-        tokio::time::sleep(WAKE_RETRY).await;
+        tokio::time::sleep(DIAL_RETRY).await;
     }
-    // `wake`: the ticket named a workspace, whose doorbell was rung (the CLI says so).
-    let mut r = done("refused", Some(last.unwrap_or(UNREACHABLE)), "", 0);
-    r.body["wake"] = t.wake.is_some().into();
-    r
+    done("refused", Some(last.unwrap_or(UNREACHABLE)), "", 0)
 }
 
 /// One member's answer to `req` on `conn`.

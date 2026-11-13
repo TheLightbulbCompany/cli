@@ -415,7 +415,7 @@ pub fn start(d: &Arc<Daemon>, assign_id: &str) -> Result<Option<&'static str>> {
         return Ok(Some("no_worker"));
     };
     let label = ipc::sender_label(d, &a); // takes the team lock
-    let conv = crate::telemetry::uuid_v4();
+    let conv = uuid_v4();
     let key = Key::new(&d.identity.short, &provider, &conv);
     let (claimed, base, asker) = {
         let team = d.team.lock().unwrap();
@@ -839,6 +839,21 @@ fn result_for(
             None
         }
     })
+}
+
+/// A random (version 4) UUID: a worker's conversation id, as the harnesses expect one.
+fn uuid_v4() -> String {
+    let mut b = rand::random::<[u8; 16]>();
+    (b[6], b[8]) = ((b[6] & 0x0f) | 0x40, (b[8] & 0x3f) | 0x80);
+    let h = data_encoding::HEXLOWER.encode(&b);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &h[..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..]
+    )
 }
 
 /// The person-only ops of `lightbulb workers` (`caller` must be a person, as `hold.file`):

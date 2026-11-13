@@ -1,7 +1,7 @@
 //! What the CLI and network test files share: a temp state dir and HOME, a daemon shut down
 //! on drop, a person's shell (`detached`) and socket client (`person`), the daemon env knobs,
 //! a two-member team seeded before start, and a member played by the test (`Peer`).
-//! ponytail: only `cli.rs`, `team_cli.rs`, `net_two.rs`, `join.rs`, `ui_claim.rs`, `dialog.rs`,
+//! ponytail: only `cli.rs`, `team_cli.rs`, `net_two.rs`, `join.rs`, `dialog.rs`,
 //! `directory.rs`, `envelope.rs` and `perf.rs` use it;
 //! the other test files keep their own copies.
 #![allow(dead_code)]
@@ -33,18 +33,6 @@ pub struct Env {
 }
 
 impl Env {
-    /// This computer signed in (`lightbulb login`) as Lightbulb user `user`: a test-issuer proof
-    /// in `login.json`, shown in its `hello`s (start the daemon after).
-    pub fn sign_in(&self, user: &str, route_url: Option<&str>) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
-        let proof = issuer::proof(&self.identity().key, user, now);
-        let v = serde_json::json!({"proof": proof, "route_url": route_url, "name": user});
-        std::fs::write(self.state.path().join("login.json"), v.to_string()).unwrap();
-    }
-
     pub fn new() -> Env {
         Env {
             state: tempfile::tempdir().unwrap(),
@@ -61,11 +49,8 @@ impl Env {
             // A suite run from `claude -p` must not read as one: hooks would register nothing.
             .env_remove("CLAUDE_CODE_ENTRYPOINT")
             .env("LIGHTBULB_CONNECT_DEBUG_NO_DEFAULT_RELAYS", "1")
-            .env("LIGHTBULB_CONNECT_DEBUG_NO_TELEMETRY", "1")
             // Never the real model download: a closed port (`embed_model`).
             .env("LIGHTBULB_CONNECT_DEBUG_MODEL_URL", "http://127.0.0.1:9")
-            // Never the real Lightbulb: a closed port unless a test points it at its stub.
-            .env("LIGHTBULB_API", "http://127.0.0.1:9")
             .env("HOME", self.home.path())
             .env("USER", "prasiddha");
         c
@@ -264,71 +249,6 @@ pub fn admit(by: &Identity, parent: &Entry, who: &Identity, name: &str, extra: V
         body[k] = v.clone();
     }
     Entry::signed(by, vec![parent.hash()], Kind::Admit, body, 2)
-}
-
-/// `LIGHTBULB_CONNECT_PEERS` is read from this process's environment when an instance starts:
-/// one start at a time.
-static STARTING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-/// An embedded instance on `home`, workspace `name`, that dials `envs`
-/// at their running daemons, leaving a final snapshot at `snapshot` on shutdown; `knobs` are
-/// set while it starts (its knobs are read then).
-pub async fn instance(
-    home: &std::path::Path,
-    envs: &[&Env],
-    name: &str,
-    snapshot: Option<&std::path::Path>,
-    knobs: &[(&str, String)],
-) -> lightbulb::Result<lightbulb::embed::Instance> {
-    let _one = STARTING.lock().await;
-    let knobs: Vec<(&str, String)> = [peers(envs)]
-        .into_iter()
-        .chain(knobs.iter().cloned())
-        .collect();
-    for (k, v) in &knobs {
-        std::env::set_var(k, v);
-    }
-    let opts = lightbulb::embed::EmbedOpts {
-        relay: None,
-        snapshot: snapshot.map(std::path::Path::to_path_buf),
-        name: name.into(),
-        sessions: vec![],
-        members: None,
-        revoked: Default::default(),
-    };
-    let i = lightbulb::embed::start(home, opts).await;
-    for (k, _) in &knobs {
-        std::env::remove_var(k);
-    }
-    i
-}
-
-/// Instance `i`'s answer to `op` with `body`.
-pub async fn call(i: &lightbulb::embed::Instance, op: &str, body: Value) -> Value {
-    let mut req = body;
-    req["id"] = 1.into();
-    req["op"] = op.into();
-    i.call(req).await
-}
-
-/// Waits (up to 10 s) until instance `i` has `n` members online.
-pub async fn online(i: &lightbulb::embed::Instance, n: u64) {
-    for _ in 0..500 {
-        if call(i, "status", json!({})).await["peers"]["online"] == n {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("{n} online");
-}
-
-/// `who` played by the test, dialing instance `i` on the member ALPN, `hello` sent.
-pub async fn dial_instance(i: &lightbulb::embed::Instance, who: &Identity) -> (Peer, Endpoint) {
-    let key = call(i, "identity.get", json!({})).await["member_key"].clone();
-    let port = call(i, "status", json!({})).await["port"].as_u64().unwrap();
-    // Signed in as its own test person (`user_of`): a workspace's `members` decide the rest.
-    let proof = issuer::proof(&who.key, &user_of(&who.short), now_s());
-    dial_at_with(key.as_str().unwrap(), port, who, Some(proof)).await
 }
 
 /// The test person a played or seeded computer `short` signs in as.
@@ -655,176 +575,4 @@ pub async fn played(who: &Identity, env: &Env) -> (Peer, Endpoint) {
 pub fn count(db: &std::path::Path, sql: &str) -> i64 {
     let c = rusqlite::Connection::open(db).unwrap();
     c.query_row(sql, [], |r| r.get(0)).unwrap()
-}
-
-/// `lightbulb member` on `dir/home`, declaring `sessions` (`dir/sessions.json`), its socket at
-/// `dir/sock` and its final snapshot at `dir/last.db`, started and answering: the child, its
-/// token and its socket. Its log is `dir/member.log`.
-pub fn member(
-    dir: &std::path::Path,
-    sessions: Value,
-) -> (std::process::Child, String, std::path::PathBuf) {
-    member_with(
-        dir,
-        json!({"workspace": "The Lightbulb Company", "sessions": sessions}),
-    )
-}
-
-/// `member` with `body` (`{workspace, sessions, wake?}`) as its sessions file.
-pub fn member_with(
-    dir: &std::path::Path,
-    body: Value,
-) -> (std::process::Child, String, std::path::PathBuf) {
-    member_with_origin(dir, body, None)
-}
-
-pub fn member_with_origin(
-    dir: &std::path::Path,
-    body: Value,
-    origin: Option<&str>,
-) -> (std::process::Child, String, std::path::PathBuf) {
-    let file = dir.join("sessions.json");
-    std::fs::write(&file, body.to_string()).unwrap();
-    let sock = dir.join("sock");
-    let log = std::fs::File::create(dir.join("member.log")).unwrap();
-    let token = ulid();
-    let mut command = Command::new(EXE);
-    command.arg("member");
-    if let Some(origin) = origin {
-        command.args(["--goosetown-origin", origin]);
-    }
-    let mut child = command
-        .arg("--home")
-        .arg(dir.join("home"))
-        .arg("--snapshot")
-        .arg(dir.join("last.db"))
-        .arg("--socket")
-        .arg(&sock)
-        .args(["--name", "The Lightbulb Company", "--sessions"])
-        .arg(&file)
-        .env("HOME", dir)
-        .env("LIGHTBULB_CONNECT_DEBUG_NO_DEFAULT_RELAYS", "1")
-        .env("LIGHTBULB_CONNECT_DEBUG_NO_TELEMETRY", "1")
-        .env_remove("LIGHTBULB_CONNECT_PEERS")
-        .stdin(Stdio::piped())
-        .stdout(log.try_clone().unwrap())
-        .stderr(log)
-        .spawn()
-        .unwrap();
-    writeln!(child.stdin.take().unwrap(), "{token}").unwrap();
-    until(10, "the member answers", || {
-        assert!(child.try_wait().unwrap().is_none(), "the member exited");
-        UnixStream::connect(&sock).is_ok() && line(&sock, &token, "ping", json!({}))["ok"] == true
-    });
-    (child, token, sock)
-}
-
-/// A member socket op's `result` (the op must succeed).
-pub fn ok(sock: &std::path::Path, token: &str, op: &str, body: Value) -> Value {
-    let r = line(sock, token, op, body);
-    assert_eq!(
-        (r["ok"].clone(), r["id"].clone()),
-        (json!(true), json!(7)),
-        "{op}: {r}"
-    );
-    r["result"].clone()
-}
-
-/// One line to a member's socket, `{token, id, op, ...body}`, on a fresh connection: its answer.
-pub fn line(sock: &std::path::Path, token: &str, op: &str, body: Value) -> Value {
-    let mut req = body;
-    req["token"] = token.into();
-    req["id"] = 7.into();
-    req["op"] = op.into();
-    let mut s = UnixStream::connect(sock).unwrap();
-    writeln!(s, "{req}").unwrap();
-    let mut answer = String::new();
-    BufReader::new(s).read_line(&mut answer).unwrap();
-    serde_json::from_str(&answer).unwrap_or_else(|_| panic!("{op}: {answer:?}"))
-}
-
-/// A request the stub Lightbulb API (`api_stub`) got.
-#[derive(Clone, Debug)]
-pub struct Req {
-    pub method: String,
-    pub path: String,
-    /// Lowercased header names.
-    pub headers: Vec<(String, String)>,
-    pub body: Value,
-    /// The body as sent.
-    pub raw: String,
-}
-
-impl Req {
-    pub fn header(&self, name: &str) -> Option<&str> {
-        let name = name.to_lowercase();
-        self.headers
-            .iter()
-            .find(|(k, _)| *k == name)
-            .map(|(_, v)| v.as_str())
-    }
-}
-
-pub type Seen = std::sync::Arc<std::sync::Mutex<Vec<Req>>>;
-
-/// A stub Lightbulb API on loopback answering each request with `answer(&req, n)` (`n`: how
-/// many requests to that method and path came before): `(status, json)`. Its base URL (for
-/// `LIGHTBULB_API`) and what it saw.
-pub fn api_stub(answer: impl Fn(&Req, usize) -> (u16, Value) + Send + 'static) -> (String, Seen) {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let base = format!("http://{}", listener.local_addr().unwrap());
-    let seen: Seen = Default::default();
-    let log = seen.clone();
-    std::thread::spawn(move || {
-        for s in listener.incoming() {
-            let mut s = s.unwrap();
-            let mut r = BufReader::new(s.try_clone().unwrap());
-            let mut first = String::new();
-            r.read_line(&mut first).unwrap();
-            let mut parts = first.split(' ');
-            let method = parts.next().unwrap_or_default().to_string();
-            let path = parts.next().unwrap_or_default().to_string();
-            let (mut len, mut headers) = (0, vec![]);
-            loop {
-                let mut h = String::new();
-                r.read_line(&mut h).unwrap();
-                if h == "\r\n" {
-                    break;
-                }
-                if let Some((k, v)) = h.trim_end().split_once(':') {
-                    let (k, v) = (k.to_lowercase(), v.trim().to_string());
-                    if k == "content-length" {
-                        len = v.parse().unwrap();
-                    }
-                    headers.push((k, v));
-                }
-            }
-            let mut body = vec![0; len];
-            r.read_exact(&mut body).unwrap();
-            let req = Req {
-                method,
-                path,
-                headers,
-                body: serde_json::from_slice(&body).unwrap_or(Value::Null),
-                raw: String::from_utf8_lossy(&body).into_owned(),
-            };
-            let n = {
-                let mut l = log.lock().unwrap();
-                let n = l
-                    .iter()
-                    .filter(|q| q.method == req.method && q.path == req.path)
-                    .count();
-                l.push(req.clone());
-                n
-            };
-            let (code, v) = answer(&req, n);
-            let text = v.to_string();
-            let _ = write!(
-                s,
-                "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
-                text.len()
-            );
-        }
-    });
-    (base, seen)
 }

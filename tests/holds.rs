@@ -97,13 +97,7 @@ async fn permission_hold_round_trip() {
     let key = register(&a, "claude", "c1", "/tmp/app");
     let mut events = Events::on(&a);
 
-    let r = person(
-        &a,
-        json!({"id": 1, "op": "hold.file", "kind": "permission", "session": key,
-            "prompt": "Run `rm -rf build`?"}),
-    );
-    assert_eq!(r["ok"], true, "{r}");
-    let h = r["hold"].as_str().unwrap().to_string();
+    let h = file(&a, &key, "Run `rm -rf build`?");
     let listed = held(&a);
     assert_eq!(listed[0]["kind"], "permission");
     assert_eq!(listed[0]["preview"], "Run `rm -rf build`?");
@@ -213,6 +207,14 @@ fn register(e: &Env, provider: &str, conv: &str, cwd: &str) -> String {
     r["key"].as_str().unwrap().to_string()
 }
 
+/// Files a permission hold on `e`'s session `key` asking `prompt`, as a worker's prompt is
+/// filed (the store, under the running daemon): its name.
+fn file(e: &Env, key: &str, prompt: &str) -> String {
+    holds::file_permission(&e.store(), key, prompt, common::now_s())
+        .unwrap()
+        .name()
+}
+
 /// A fake `osascript` in `dir`: each dialog writes its argv to `args.<pid>` and its pid to
 /// `pids`, then waits to be killed (withdrawn).
 fn fake_osascript(dir: &std::path::Path) -> (&'static str, String) {
@@ -262,11 +264,8 @@ async fn a_permission_hold_expires_with_its_session_and_its_dialog_goes() {
     a.daemon(false, "", &[fake_osascript(dir.path()), fast]);
     let key = register(&a, "claude", "c1", "/tmp/app");
     let mut events = Events::on(&a);
-    let r = person(
-        &a,
-        json!({"id": 1, "op": "hold.file", "kind": "permission", "session": key, "prompt": "ok?"}),
-    );
-    let h = r["hold"].as_str().unwrap().to_string();
+    let h = file(&a, &key, "ok?");
+    assert!(a.detached(&[common::EXE, "held"], "").status.success());
     let (pid, argv) = the_dialog(dir.path());
     assert_eq!(argv[1], "Claude Code asks: \"ok?\"");
     a.ask(json!({"id": 1, "op": "end", "key": key}));
@@ -277,17 +276,6 @@ async fn a_permission_hold_expires_with_its_session_and_its_dialog_goes() {
     );
     until(10, "the dialog is withdrawn", || gone(&pid));
     assert!(held(&a).is_empty());
-    // One for a session with no row is refused outright.
-    let r = person(
-        &a,
-        json!({"id": 1, "op": "hold.file", "kind": "permission",
-            "session": format!("{}/claude:none", a.short()), "prompt": "ok?"}),
-    );
-    assert_eq!(
-        (&r["error"], &r["reason"]),
-        (&json!("bad_request"), &json!("unknown_session")),
-        "{r}"
-    );
 }
 
 /// A dialog that gave up unanswered comes back when the person looks (`lightbulb held`), and
@@ -315,12 +303,9 @@ async fn a_dialog_that_gave_up_is_shown_again_by_held() {
         )],
     );
     let key = register(&a, "claude", "c1", "/tmp/app");
-    let r = person(
-        &a,
-        json!({"id": 1, "op": "hold.file", "kind": "permission", "session": key, "prompt": "ok?"}),
-    );
-    assert_eq!(r["ok"], true, "{r}");
+    file(&a, &key, "ok?");
     let pids = || std::fs::read_to_string(dir.path().join("pids")).unwrap_or_default();
+    assert!(a.detached(&[common::EXE, "held"], "").status.success());
     until(10, "the first dialog gives up", || {
         pids().lines().next().is_some_and(|p| gone(p.trim()))
     });
@@ -339,20 +324,6 @@ async fn a_dialog_that_gave_up_is_shown_again_by_held() {
     std::thread::sleep(Duration::from_millis(500));
     assert_eq!(pids().lines().count(), 2);
     assert_eq!(held(&a).len(), 1);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn hold_answer_on_an_instance_needs_decided_by() {
-    let dir = tempfile::tempdir().unwrap();
-    let (mut child, token, sock) = common::member(dir.path(), json!([]));
-    // `local` is this computer's own person: the bridge must name the one who answered.
-    for decided_by in [Value::Null, json!(""), json!(3), json!("local")] {
-        let body = json!({"hold": "H1", "verdict": "allow", "decided_by": decided_by});
-        let r = common::line(&sock, &token, "hold.answer", body);
-        assert_eq!(r["error"], "bad_request", "{decided_by}: {r}");
-    }
-    common::ok(&sock, &token, "stop", json!({}));
-    assert!(child.wait().unwrap().success());
 }
 
 /// Another person's message is stored at once: membership is the only gate, and nothing is
@@ -663,11 +634,7 @@ async fn lightbulb_held_prints_the_dialog_text_and_the_kind() {
     let a = Env::new();
     a.daemon(false, "", &[]);
     let key = register(&a, "claude", "c1", "/tmp/app");
-    let r = person(
-        &a,
-        json!({"id": 1, "op": "hold.file", "kind": "permission", "session": key, "prompt": "ok?"}),
-    );
-    assert_eq!(r["ok"], true, "{r}");
+    file(&a, &key, "ok?");
     let o = a.detached(&[common::EXE, "held"], "");
     assert_eq!(
         common::out(&o),

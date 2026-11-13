@@ -23,7 +23,7 @@ pub fn render(roster: &Roster, viewer: &str, from: &str) -> String {
 }
 
 /// `render`, `declared` the agent the sender's presence declares for `from` (a named
-/// session's: `Friday`, or a hosted app's title, `ChatGPT via Aden`).
+/// session's: `Friday`).
 pub fn render_as(roster: &Roster, viewer: &str, from: &str, declared: Option<&str>) -> String {
     let prefix = member_of(from).unwrap_or(from);
     let Some(m) = roster.by_short(prefix) else {
@@ -51,28 +51,6 @@ pub fn render_as(roster: &Roster, viewer: &str, from: &str, declared: Option<&st
     } else {
         format!("{label} (not verified)")
     }
-}
-
-/// A hosted app's session `addr` on this computer as its person's agents read it: the app's
-/// name and "(you)" (`Claude (you)`), from its declared `title` (`Claude via Aden`) or, without
-/// one, its address. Never the person at the terminal.
-pub fn hosted_app(addr: &str, title: Option<&str>) -> String {
-    let app = match title.filter(|t| via(t)).and_then(|t| t.split_once(" via ")) {
-        Some((app, _)) => app.to_string(),
-        None => {
-            let name = split_addr(addr).map_or(addr, |(_, n)| n);
-            name.rsplit_once('-').map_or(name, |(a, _)| a).to_string()
-        }
-    };
-    format!("{} (you)", shown(&app, 32, "An app"))
-}
-
-/// Whether a declared `title` is a hosted app's, `<App> via <Person>` (`app_send`): shown in
-/// place of the session's agent.
-pub fn via(title: &str) -> bool {
-    title
-        .split_once(" via ")
-        .is_some_and(|(app, who)| !app.trim().is_empty() && !who.trim().is_empty())
 }
 
 /// Whether member `m` reads as verified to the computer `own` (its key): only `own` itself,

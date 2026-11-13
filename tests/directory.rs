@@ -99,7 +99,6 @@ async fn each_member_sees_the_whole_directory() {
         ("agent", json!("claude")),
         ("status", json!("idle")),
         ("folder", json!("web")),
-        ("wakes", json!(false)),
         ("online", json!(true)),
     ] {
         assert_eq!(theirs[field], want, "{field}: {theirs}");
@@ -186,31 +185,6 @@ async fn each_member_sees_the_whole_directory() {
         .unwrap()
         .get("seen_at")
         .is_none());
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn every_record_says_who_its_proof_claims() {
-    let (a, b) = (Env::new(), Env::new());
-    seed_pair(&a, &b);
-    a.sign_in("user_aden", None);
-    start_pair(&a, &b, "", &[]);
-    assert_eq!(register(&a, "codex", "a1", "/tmp/work/api")["ok"], true);
-    assert_eq!(register(&b, "codex", "b1", "/tmp/work/web")["ok"], true);
-    let (ka, kb) = (
-        format!("{}/codex:a1", a.short()),
-        format!("{}/codex:b1", b.short()),
-    );
-    until(10, "each sees both", || sees(&a, &kb) && sees(&b, &ka));
-    let of = |e: &Env, key: &str| {
-        directory(e, None)
-            .into_iter()
-            .find(|r| r["session_id"] == key)
-            .unwrap()
-    };
-    assert_eq!(of(&a, &ka)["user_id"], "user_aden");
-    assert_eq!(of(&b, &ka)["user_id"], "user_aden");
-    assert!(of(&a, &kb).get("user_id").is_none());
-    assert!(of(&b, &kb).get("user_id").is_none());
 }
 
 /// A bad row costs only itself: not its sessions, not the other ended rows, whatever else the

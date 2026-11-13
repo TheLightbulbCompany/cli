@@ -143,9 +143,7 @@ fn a_plain_member_opens_links_but_cannot_remove_the_founder() {
     );
     assert!(team.contains("  aden · "), "{team}");
     assert!(
-        team.ends_with(
-            "Invite someone: lightbulb invite\nAdd an always-on AI teammate: https://thelightbulb.company\n"
-        ),
+        team.ends_with("Invite someone: lightbulb invite\n"),
         "{team}"
     );
     // The two seeded entries and this member's card: no genesis over a joined team.
@@ -309,7 +307,7 @@ fn a_computer_outside_the_roster_is_told_so() {
     roster::accept(&store, &g, 10).unwrap();
     let o = e.run(&["remove", "aden"]);
     assert_eq!(o.status.code(), Some(1));
-    assert_eq!(err(&o).trim(), lightbulb::embed::KEY_MISMATCH);
+    assert_eq!(err(&o).trim(), lightbulb::daemon::KEY_MISMATCH);
 }
 
 #[test]

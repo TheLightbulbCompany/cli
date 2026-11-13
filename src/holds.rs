@@ -258,13 +258,9 @@ fn object_jws(m: &Message) -> Option<&str> {
     m.a2a.as_ref()?["metadata"][crate::authority::URI].as_str()
 }
 
-/// The person the computer whose state is `dir` is signed in as (its own proof's `sub`):
-/// `@session-person`. One signed in as a workspace (`org_`) is no person.
-pub(crate) fn my_person(dir: &Path) -> Option<String> {
-    let t = crate::login::stored_proof(dir)?;
-    crate::proof::peek(&t)
-        .filter(|p| !crate::proof::is_workspace(p))
-        .map(|p| p.sub)
+/// The person this computer is signed in as (`@session-person`): none, with no sign-in.
+pub(crate) fn my_person(_dir: &Path) -> Option<String> {
+    None
 }
 
 /// Whether `person` holds Authority hold `h`'s resource (`session:<to>`) under the stored
@@ -310,15 +306,10 @@ fn authority_dialog(
                 a.chain.last().and_then(|hop| hop.agent.as_ref()),
             ) {
                 (Some(by), Some(agent)) => {
-                    let mine = crate::rules::load(store).ok().and_then(|(w, _)| w);
-                    let whose = if mine.as_deref() == Some(by.as_str()) {
-                        "your workspace".to_string()
-                    } else {
-                        preview(by)
-                    };
                     format!(
-                        "{} asks {session} for {}, via {whose}'s agent: {}\n\n{body}",
+                        "{} asks {session} for {}, via {}'s agent: {}\n\n{body}",
                         preview(agent),
+                        preview(by),
                         preview(&a.requester_person),
                         preview(&a.intent)
                     )
@@ -784,7 +775,7 @@ fn answer_here(
             d.peers.outbox.notify_one(); // its receipt moved
             if c.allow {
                 let m = &c.hold.message;
-                ipc::stored(d, &sessions::Key(m.to_key.clone()), Some(&m.id));
+                ipc::stored(d, &sessions::Key(m.to_key.clone()));
             }
         }
     }
@@ -817,17 +808,11 @@ pub fn on_dialog(d: &Arc<Daemon>, n: i64, button: &str) {
     }
 }
 
-/// An instance's word for a hold id it does not have (a computer's is `not_found`).
-const HOLD_NOT_FOUND: &str = "hold_not_found";
-
-/// The hold ops: `holds`, `hold.get`, `hold.answer`, `hold.file` (person-only). An
-/// instance's caller (the bridge, for the workspace's people) may run `holds`, `hold.get` and
-/// `hold.answer`, the last with `decided_by`, the person who answered.
+/// The hold ops: `holds`, `hold.get`, `hold.answer` (person-only; an agent may answer).
 pub fn op(id: u64, op: &str, body: &Value, d: &Arc<Daemon>, caller: Caller) -> Response {
-    let instance = caller == Caller::Instance && matches!(op, "holds" | "hold.get" | "hold.answer");
     // An agent may answer a hold (the answer records its session); nothing else here.
     let mut agent = None;
-    if !instance && !caller.is_person() {
+    if !caller.is_person() {
         // Only a resolved agent session may answer; an unresolved caller is refused.
         let actor = (op == "hold.answer")
             .then(|| caller.actor(&d.store.lock().unwrap()))
@@ -837,7 +822,7 @@ pub fn op(id: u64, op: &str, body: &Value, d: &Arc<Daemon>, caller: Caller) -> R
         };
         agent = Some(actor);
     }
-    match run(id, op, body, d, instance, agent.as_deref()) {
+    match run(id, op, body, d, agent.as_deref()) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("{op}: {e}");
@@ -846,23 +831,16 @@ pub fn op(id: u64, op: &str, body: &Value, d: &Arc<Daemon>, caller: Caller) -> R
     }
 }
 
-fn run(
-    id: u64,
-    op: &str,
-    body: &Value,
-    d: &Arc<Daemon>,
-    instance: bool,
-    agent: Option<&str>,
-) -> Result<Response> {
+fn run(id: u64, op: &str, body: &Value, d: &Arc<Daemon>, agent: Option<&str>) -> Result<Response> {
     let me = &d.identity.key;
-    let missing = if instance { HOLD_NOT_FOUND } else { NOT_FOUND };
+    let missing = NOT_FOUND;
     let hold_id = body["hold"].as_str().and_then(|s| dialog::number(s, 'H'));
     Ok(match op {
         // `holds {reshow?}` -> `{holds: [{id, kind, target_session, from, label, verified, preview,
         // shown, created_at}]}` (`verified` as the label says it)
         "holds" => {
             // `lightbulb held` asks: any dialog that gave up comes back (never a bridge's poll).
-            if !instance && body["reshow"] == true {
+            if body["reshow"] == true {
                 reraise(d);
             }
             let team = d.team.lock().unwrap();
@@ -902,15 +880,10 @@ fn run(
             )
         }
         // `hold.answer {hold, verdict: allow|decline, scope?: once|always}` -> `{id, verdict,
-        // scope, note?}`. A worker hold and a worker's prompt are a person's to answer. On an instance also
-        // `decided_by`, recorded as the answer's `by` (a computer's is `local`, an agent's its session).
+        // scope, note?}`. A worker hold and a worker's prompt are a person's to answer; the
+        // answer's `by` is `local`, or an agent's session.
         "hold.answer" => {
-            let (by, surface) = match body["decided_by"].as_str() {
-                _ if !instance => (agent.unwrap_or("local"), "cli"),
-                // `local` is this computer's person: the bridge names the one who answered.
-                Some(p) if !p.is_empty() && p != "local" => (p, "bridge"),
-                _ => return Ok(Response::err(id, BAD_REQUEST)),
-            };
+            let (by, surface) = (agent.unwrap_or("local"), "cli");
             let allow = match body["verdict"].as_str() {
                 Some(ALLOW) => true,
                 Some(DECLINE) => false,
@@ -924,15 +897,7 @@ fn run(
             let Some(n) = hold_id else {
                 return Ok(Response::err(id, missing));
             };
-            match answer_here(
-                d,
-                n,
-                allow,
-                scope,
-                by,
-                agent.is_some() && !instance,
-                surface,
-            )? {
+            match answer_here(d, n, allow, scope, by, agent.is_some(), surface)? {
                 // `note: "busy"`: allowed, but at `workers_max` nothing started.
                 Ok((c, note)) => Response::ok(
                     id,
@@ -948,47 +913,6 @@ fn run(
                 }
             }
         }
-        // `hold.file {kind: "permission", session, prompt}` -> `{hold}`: the app asks the
-        // person to answer an agent's permission prompt (dialog, or phone via the bridge).
-        "hold.file" => {
-            let short = &d.identity.short;
-            let session = body["session"]
-                .as_str()
-                .and_then(|s| sessions::qualify(short, s))
-                .filter(|s| sessions::member_of(s) == Some(short.as_str()));
-            let prompt = body["prompt"].as_str().unwrap_or_default();
-            let fits = body["kind"] == "permission"
-                && !prompt.is_empty()
-                && prompt.len() <= mail::MAX_TEXT;
-            let (Some(session), true) = (session, fits) else {
-                return Ok(Response::err(id, BAD_REQUEST));
-            };
-            let team = d.team.lock().unwrap();
-            let store = d.store.lock().unwrap();
-            if store.session(&session)?.is_none() {
-                return Ok(refused(id, "unknown_session"));
-            }
-            let h = file_permission(&store, &session, prompt, ipc::now() as i64)?;
-            shown(d, &team, &store, &h);
-            Response::ok(id, json!({ "hold": h.name() }))
-        }
         _ => Response::err(id, ipc::UNKNOWN_OP),
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::proof::test_issuer as issuer;
-
-    #[test]
-    fn a_computer_signed_in_as_a_workspace_has_no_session_person() {
-        let dir = tempfile::tempdir().unwrap();
-        let save = |proof: String| {
-            crate::login::save(dir.path(), &serde_json::json!({"proof": proof})).unwrap()
-        };
-        save(issuer::workspace_proof("k", "org_1", 1_000));
-        assert_eq!(super::my_person(dir.path()), None);
-        save(issuer::proof("k", "user_a", 1_000));
-        assert_eq!(super::my_person(dir.path()).as_deref(), Some("user_a"));
-    }
 }

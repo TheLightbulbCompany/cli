@@ -1,7 +1,7 @@
 //! The wire: one `Frame` per message, a u32 big-endian length then that many bytes of JSON
 //! tagged by `t`, at most 1 MiB. The one definition of every frame later tasks send.
 
-use crate::daemon::{ipc, Daemon};
+use crate::daemon::ipc;
 use crate::doing::TEXT_MAX;
 use crate::frame::Sender;
 use crate::identity::{self, Identity};
@@ -364,14 +364,10 @@ pub fn verify_envelope_sig(member_key: &str, frame: &serde_json::Value) -> bool 
 /// under its prefix (ended rows are filtered one by one, `presence::put`), a `seq` at most a day ahead of now. An `envelope` is
 /// checked by `mail::receive`. An `ack` or `receipt` names a state past `queued`, with a known
 /// reason exactly when it is `refused`, and a `limit` only on a `loop` refusal (that it is bound
-/// to this member is `outbox::acked`'s check). A `share_grant` passes `streams::grant_ok`. A
+/// to this member is `outbox::acked`'s check). A `share_grant` (retired) is ignored. A
 /// `stream` never rides the control stream, and a `hold_notice` or a
 /// `decision` (retired) is served nowhere. `Err` names the check.
-pub fn from_peer_ok(
-    f: &Frame,
-    peer: &Member,
-    daemon: &Daemon,
-) -> std::result::Result<(), &'static str> {
+pub fn from_peer_ok(f: &Frame, peer: &Member) -> std::result::Result<(), &'static str> {
     let check = |ok: bool, why| if ok { Ok(()) } else { Err(why) };
     match f {
         // Its `addrs` are a hint, checked where they are kept (`parse_addrs`).
@@ -418,9 +414,8 @@ pub fn from_peer_ok(
                 && known.iter().chain(kept).all(|a| own(&peer.short, a));
             check(ok, "presence")
         }
-        Frame::ShareGrant { .. } => {
-            crate::streams::grant_ok(f, peer, &daemon.identity.key, ipc::now() as i64)
-        }
+        // Retired with the desktop app's streams: decoded, then ignored.
+        Frame::ShareGrant { .. } => Ok(()),
         _ => Err("not served"),
     }
 }

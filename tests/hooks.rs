@@ -43,7 +43,6 @@ impl Net {
             .arg("daemon")
             .envs(env.iter().copied())
             .env("LIGHTBULB_CONNECT_DEBUG_NO_DEFAULT_RELAYS", "1")
-            .env("LIGHTBULB_CONNECT_DEBUG_NO_TELEMETRY", "1")
             .env(paths::HOME_ENV, dir.path())
             .env("LIGHTBULB_CONNECT_CLAUDE_HOME", claude.path())
             .stdout(Stdio::null())
@@ -153,8 +152,7 @@ impl Net {
         pin: Option<&os::Process>,
     ) -> std::process::Output {
         let mut cmd = Command::new(EXE);
-        cmd.env("LIGHTBULB_CONNECT_DEBUG_NO_TELEMETRY", "1")
-            .env_remove("CLAUDE_CODE_ENTRYPOINT");
+        cmd.env_remove("CLAUDE_CODE_ENTRYPOINT");
         if let Some(e) = entrypoint {
             cmd.env("CLAUDE_CODE_ENTRYPOINT", e);
         }
@@ -760,7 +758,6 @@ fn claude_start_as(net: &Net, caller: &os::Process) -> String {
         .join("tests/fixtures/hooks/claude-session-start.json");
     let out = Command::new(EXE)
         .args(["hook", "claude", "session-start"])
-        .env("LIGHTBULB_CONNECT_DEBUG_NO_TELEMETRY", "1")
         .env(
             "LIGHTBULB_CONNECT_HOOK_CALLER",
             format!("{}:{}", caller.pid, caller.birth_micros),

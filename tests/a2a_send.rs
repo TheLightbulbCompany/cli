@@ -14,7 +14,6 @@ use common::{issuer, now_s, seed_team, session, ulid, until, Env, Peer};
 async fn a_and_b(doc: Option<String>) -> (Env, Env, iroh::Endpoint, Peer) {
     let (a, b) = (Env::new(), Env::new());
     seed_team(&a, &b);
-    a.sign_in("user_a", None);
     if let Some(d) = doc {
         assert!(lightbulb::rules::store_doc(&a.store(), &d, now_s()).unwrap());
     }
