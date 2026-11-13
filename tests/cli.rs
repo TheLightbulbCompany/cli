@@ -354,6 +354,23 @@ fn help_hides_the_agent_plumbing() {
     assert!(e.run(&["daemon", "--help"]).status.success());
 }
 
+/// Every command the top-level HELP names is a real subcommand.
+#[test]
+fn every_command_in_help_parses() {
+    let e = Env::new();
+    let help = out(&e.run(&["--help"]));
+    let names: Vec<&str> = help
+        .lines()
+        .filter(|l| l.starts_with("  ") && !l.starts_with("   "))
+        .filter_map(|l| l.split_whitespace().next())
+        .collect();
+    assert!(names.len() >= 15, "{help}");
+    for n in names {
+        let o = e.run(&[n, "--help"]);
+        assert!(o.status.success(), "{n}: {}", err(&o));
+    }
+}
+
 #[test]
 fn directory_shows_the_hooks_repo_and_never_reads_the_folder() {
     let e = Env::new();

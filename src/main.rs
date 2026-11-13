@@ -30,7 +30,7 @@ Everyday:
   config    Set a true/false or number setting: config set network_workers true
 
 Workers:
-  workers   Let teammates start Claude Code or Codex workers here: workers on|off, workers show <name>,
+  workers   Let teammates start Claude Code, Codex, Cursor, Grok CLI or OpenCode workers here: workers on|off, workers show <name>,
             workers stop <name>, workers policy, workers clean
 
 Team:

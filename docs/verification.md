@@ -1,5 +1,12 @@
 # Verification
 
+> **Historical record.** This is the 0.3.7 verify-gate record. The workspace, hosted-app, sign-in,
+> telemetry, upload and A2A features it once covered were removed (the essentials CLI); their rows
+> were dropped from this page. File:line references and some test names predate that cut. The
+> controls that remain are the peer-to-peer ones: sender authentication, signing, replay,
+> removal, person-only approval of worker holds, fail-closed policy, result binding and display
+> sanitising.
+
 > Updated: message holds, Allow and per-person policy were removed (everyone on the network is trusted; an invite is the approval). Rows below that mention them are marked retired; the old test names no longer exist. map — lightbulb 0.3.7
 
 > 0.4.0 (one member kind): the rows that existed only for cloud members, cloud markers, vouched
@@ -65,7 +72,6 @@ disabled in a scratch change to see the test fail before the control was restore
 | 5 | (retired) A held message arrives after Allow; a stored one arrives at the next hook | `tests/hooks.rs` (stored → next step) | n/a | RETIRED |
 | 6 | Loop limit: the 13th message from one sender to one session in 10 minutes is refused | `src/mail.rs::thirteenth_send_in_ten_minutes_is_refused_with_loop`, `tests/envelope.rs::hop_limit_and_thirteenth_send_are_refused_loop` | plan A row 3 PASS | PASS |
 | 7 | A body that forges the owner header is neutralised | `src/frame.rs::a_forged_owner_line_in_the_body_is_neutralised`, `tests/cli.rs::a_listened_body_cannot_forge_the_reply_line`, `tests/holds.rs::a_forged_prefix_behind_a_hidden_character_is_defanged` | plan A row 4 PASS | PASS |
-| 8 | Friday (through the bridge) → a session: agent label; delivered once the workspace is a member and the sender's proof is admitted | Engine side only: `tests/embed.rs::an_admins_once_link_brings_the_workspace_in_and_only_members_reach_friday`, `tests/embed.rs::embedded_instance_joins_and_talks_without_a_socket`, `src/label.rs::a_named_session_renders_its_declared_agent_under_its_member` | not run (needs the bridge) | Engine PASS; the member sidecar the bridge talks to is tested (`tests/member.rs`); **the bridge itself is not in this repo and not run here** |
 | 9 | Recipient's Mac asleep: queued message arrives after wake, `stored` → `delivered` | proxy: `tests/envelope.rs::offline_recipient_stays_queued_then_stores_on_reconnect` | plan B re-run row 5 (stop/start, not sleep) PASS on 0.2.0 | **Real-Mac only, not run on 0.3.7** (recipe in B, "Sleep / wake") |
 | 10 | `join` on a fresh Mac ends with "Connected as <you>" at once (an invite is the approval); `leave` | `tests/join.rs::joining_says_nothing_of_asking_and_the_commands_know_no_join_requests`, `…::join_takes_the_bare_ticket`, `…::join_takes_the_app_link`, `tests/team_cli.rs::leave_locally_recreates_a_solo_network`, `tests/envelope.rs::leave_reaches_a_peer_or_warns_after_5s` | plan B re-run row 1 PASS (0.2.0, two homes on one Mac); a fresh second Mac: not run | Automated PASS; **fresh-Mac run not done on 0.2.2.** (0.3.x joins by a four-word code or a link; see D and "Real computers".) Two differences from the spec text: the join line is `lightbulb join '<ticket-or-code>' --name NAME`, and `leave` returns this computer to its own network but does not stop the background service (`setup --remove` does). |
 
@@ -99,7 +105,6 @@ server (`fake-opencode.py`). Real Cursor, Grok and OpenCode runs are not done.
 | 6 | The deadline stops it | `…::cursor_row_6_deadline_stops_it`, `…::grok_row_6_deadline_stops_it`, `…::opencode_row_6_deadline_stops_it` | PASS (fakes) |
 | 12 | No bypass flag in argv, and a harness config that skips approvals refuses the start | `…::row_12_no_bypass_flag_in_argv` (exact argv for each), `…::cursor_a_worktree_that_allows_everything_refuses_the_start`, `…::grok_a_worktree_that_skips_approvals_refuses_the_start`, `…::opencode_a_worktree_that_allows_without_asking_refuses_the_start` | PASS |
 | off | `network_workers` off: an assignment to `<m>/cursor:new` is refused `unsupported` | `…::a_cursor_assign_is_unsupported_while_network_workers_is_off` | PASS |
-| ws | A workspace agent (an instance) takes an assignment only when its own config turns `network_workers` on | `tests/embed.rs::an_instance_refuses_assignments_until_its_config_turns_them_on`, `…::an_instance_stores_an_assignment_for_a_declared_agent_when_on` | PASS (engine side) |
 
 ## D. Controls added since 0.2.2 (v0.2.3 – v0.3.7)
 
@@ -125,16 +130,6 @@ proves a computer ignores app envelopes). The "no admins" rule is the flat netwo
 | **Policy** (retired: no per-person policy rows; membership is the gate). | n/a | n/a |
 | ~~A workspace network from before the cloud marker is **founded again**.~~ | **Removed in 0.4.0** (one member kind, `docs/security.md` "The signed roster"): an instance not in its stored roster founds a fresh network, as any removed member does (`boot`, `src/embed.rs`). | none (the not-a-member path) | REMOVED |
 
-### D2. Workspace members gate and wake
-
-| Control added | Where | Tests | Result |
-|---|---|---|---|
-| **Hosted-app mail here**: a hosted app's message to a session on its person's computer is framed as "<App> (you)" (defanged), never as typed at the terminal, and is never hop 0, so the agents' loop limits count it. Not held: the person connected the app. | `src/daemon/ipc.rs` (`send_as`), `src/label.rs` (`hosted_app`) | `tests/app_send.rs::app_mail_is_framed_as_the_app_never_as_its_person`, `tests/app_send.rs::app_mail_is_never_hop_zero` | PASS |
-| **Route link**: a signed-in computer keeps one WebSocket to Lightbulb, proves its key over the nonce and shows its proof, runs only `app.*` and `directory` for its own person's app sessions, sends a content-free mail notice, and drops the link on logout. | `src/link.rs` | `tests/link.rs` | PASS |
-| **Members gate**: when an instance has `members` (people), mail from a computer whose sign-in proof (shown in its `hello`, verified offline) does not name one of them is refused `not_a_member`, with no hold: no proof, another person's, another computer's, or an expired one. Absent keeps the gate, `null` removes it, a list replaces it, a bad value is refused. | `src/mail.rs` (`receive`), `src/holds.rs` (`answer`); set by the sessions file and `cloud.sessions.set`. | `tests/embed.rs::an_admins_once_link_brings_the_workspace_in_and_only_members_reach_friday`, `tests/embed.rs::only_listed_computers_reach_its_sessions`, `tests/member.rs::the_members_list_gates_who_may_message_the_sessions`, `tests/member.rs::sessions_set_members_absent_keeps_null_removes_list_replaces_bad_refuses`, `tests/member.rs::a_computer_without_a_members_proof_is_refused`, `src/proof.rs` unit test. That no turn starts: the turn is the bridge's, not in this repo, **NO TEST** | gate PASS; turn NO TEST |
-| **Per-member wake**: the roster carries a member's own `wake {url, token}` only if the URL is `https` with a public-looking DNS host (no IP, `localhost`, userinfo or single label) and the token is a plain word. | `wake_host`, `Wake::parse`, taken in `pass` (`src/roster.rs`). | `src/roster.rs::wake_parse_takes_http_s_and_a_plain_token_only`, `src/roster.rs::each_members_own_wake_is_taken`. A DNS name that resolves to a private address is accepted by design | PASS |
-| The doorbell is rung only after a failed dial; the token goes to curl on **stdin** (`-K -`), never its command line or a log. | `doorbell` `src/net/mod.rs:1196`. | `tests/member.rs::a_computer_rings_the_doorbell_only_after_a_failed_dial`, `tests/member.rs::a_computer_rings_a_non_founder_members_doorbell`, `tests/member.rs::the_doorbell_token_is_absent_from_logs` (asserts curl's stdin and that argv and logs lack the token), `tests/member.rs::a_join_to_a_parked_member_rings_its_doorbell` | PASS |
-
 ### D3. Four-word codes and links
 
 | Control added | Where | Tests | Result |
@@ -147,7 +142,7 @@ proves a computer ignores app envelopes). The "no admins" rule is the flat netwo
 | A wrong code ends in bounded time with a plain `no_code`, never repeating the code. | Joiner `FETCH` 15 s `src/code.rs:25`/`:212`. | `tests/code.rs::a_code_joins_once_and_a_second_try_or_a_wrong_code_fails` (answer is `no_code` and does not repeat the code). The 15 s bound itself: **NO TEST** | answer PASS; bound NO TEST |
 | `https://thelightbulb.company/j#<ticket>` decodes like the bare ticket and the app link. | `WEB` `src/ticket.rs:13`, `decode` `:140`. | `src/ticket.rs::ticket_round_trips_through_every_link_form`, `tests/join.rs::join_takes_the_app_link`, `tests/join.rs::join_takes_the_bare_ticket`, `tests/code.rs::a_code_joins_once_and_a_second_try_or_a_wrong_code_fails` (the printed link starts with the `/j#` form) | PASS |
 
-### D4. Updates, usage counts, setup
+### D4. Updates, setup
 
 | Control added | Where | Tests | Result |
 |---|---|---|---|
@@ -159,11 +154,7 @@ proves a computer ignores app envelopes). The "no admins" rule is the flat netwo
 | The daemon never edits a shell profile; only a terminal command adds `~/.local/bin`, once, and never through a symlinked profile. | `src/cli.rs:1433` (`person`), `:1463` (`add_to_path`). | `tests/cli.rs::setup_off_a_terminal_or_on_a_symlinked_profile_leaves_the_profile_alone` (macOS only), `tests/cli.rs::daemon_install_adds_local_bin_to_the_zsh_profile_once` (macOS only) | PASS (macOS) |
 | `update --auto off|on` and `auto_update` in config / `LIGHTBULB_NO_AUTO_UPDATE=1` turn the daily check off; doctor shows it. | `auto_update_on` `src/cli.rs:1290`; daemon loop `src/daemon/mod.rs:298`. | `tests/cli.rs::update_auto_off_and_on_set_the_daily_update`, `src/cli.rs::auto_update_is_off_by_config` | PASS |
 | After an auto-update the daemon runs the new `setup` once. | `refresh_setup` `src/cli.rs:1314`. | `src/cli.rs::setup_reruns_after_a_version_change` (the decision only; the spawn: **NO TEST**) | decision PASS |
-| **Usage counts**: allowed fields only (`arch`, `os`, `version`, plus fixed per-event counts). | `build` `src/telemetry.rs:94`. | `src/telemetry.rs::events_carry_only_allowed_fields`, `src/telemetry.rs::join_input_is_classified` | PASS |
-| An env opt-out (`DO_NOT_TRACK`, `LIGHTBULB_NO_TELEMETRY`) always wins, and is saved to config so a launchd daemon obeys it. | `env_off` `src/telemetry.rs:144`, `send` `:225`, `sync_env_optout` `:166`. | `src/telemetry.rs::an_env_opt_out_is_saved_to_config_and_gates_the_daemon`, `tests/cli.rs::telemetry_on_under_do_not_track_stays_off` | PASS |
-| Test builds send nothing unless `LIGHTBULB_TELEMETRY_FORCE` is set. | `enabled` `src/telemetry.rs:136`. | `src/telemetry.rs::the_gate_reads_config_and_build` | PASS |
-| Counting never blocks the command: one `curl` with a 3 s limit, reaped off the caller's path. | `post` `src/telemetry.rs:242`. | **NO TEST** | NO TEST |
-| MCP server is registered as `lightbulb`; an old `lightbulb-network` entry is removed when it runs a `lightbulb` binary; a `lightbulb` entry is replaced only when it is ours, the app's `session-mcp` one or the hosted MCP's. | `DEFAULT_SERVER`/`OLD_SERVER`/`replaceable` `src/setup/mod.rs`. | `src/setup/tests.rs::our_old_lightbulb_network_entry_moves_to_the_new_name_and_anothers_stays`, `src/setup/tests.rs::setup_takes_the_lightbulb_name_from_the_app_or_hosted_entry_only`, `tests/cli.rs::setup_replaces_the_apps_lightbulb_tool_server`, `tests/mcp_tools.rs::the_server_advertises_its_installed_name` | PASS |
+| MCP server is registered as `lightbulb`; an old `lightbulb-network` entry is removed when it runs a `lightbulb` binary; a `lightbulb` entry is replaced only when it is ours. | `DEFAULT_SERVER`/`OLD_SERVER`/`replaceable` `src/setup/mod.rs`. | `src/setup/tests.rs::our_old_lightbulb_network_entry_moves_to_the_new_name_and_anothers_stays`, `src/setup/tests.rs::setup_takes_the_lightbulb_name_from_the_app_or_hosted_entry_only`, `tests/cli.rs::setup_replaces_the_apps_lightbulb_tool_server`, `tests/mcp_tools.rs::the_server_advertises_its_installed_name` | PASS |
 | `find_sessions` takes a session's `who` name (`claude-5`) as a query and returns it as `name`. | `src/mcp.rs:280`, `src/presence.rs:522`. | `tests/mcp_tools.rs::find_sessions_marks_is_this_session` | PASS |
 | Off macOS, `setup` restarts a daemon whose version differs from the binary; `doctor` names such a daemon and the fix. | `restart_if_old` `src/cli.rs:1557` (called `:1864`), doctor `:1706`. | **NO TEST** (found on a real Linux computer; see "Real computers") | NO TEST |
 
@@ -171,8 +162,6 @@ proves a computer ignores app envelopes). The "no admins" rule is the flat netwo
 
 | Control | Where | Test | Result |
 |---|---|---|---|
-| A bare `from` (`friday`) is this member's own session, as `to` already was; before, every workspace agent send was refused `not_declared`. | `src/daemon/ipc.rs`, `send` | `tests/embed.rs::a_person_line_reaches_friday_and_an_unlisted_teammate_does_not` (sends in the bridge's shape: bare `from`, no `to`, `reply_to` = the request id) | PASS |
-| A receipt to a parked member with a doorbell carries `waking`; the CLI says it is waking up, not offline. | `src/daemon/ipc.rs`, `finish`; `src/mail.rs`, `receipt_text` | `src/mail.rs::a_parked_workspace_reads_as_waking_not_offline` | PASS |
 | OpenCode: provider, caller, hooks, setup (MCP entry and plugin). Every pushed message carries the session's own agent and model, so a teammate's mail cannot switch a session from `plan` to `build`; with none recorded the plugin does not push and the mail waits for `check_inbox`. | `src/setup/opencode.rs`, `src/hook.rs`, `src/agents/caller.rs` | the OpenCode cases in `tests/hooks.rs` and `src/setup/tests.rs`, and the plugin smoke test (needs node) | PASS (unit and integration); **not run in a live OpenCode session** |
 
 ### E. One session list (0.8.0)
@@ -201,13 +190,6 @@ Mac (home network) and a Windows/WSL computer elsewhere, over the n0 relays.
   (fixed in 0.3.7: `setup` restarts it, `doctor` names it; D4, NO TEST).
 - A fresh Claude Code session found the `lightbulb-network` tools through the skill, and its
   message's receipt went `stored` then `delivered`.
-
-On 2026-10-25, on prod (engine 0.4.1 in the workspace, 0.4.1 on WSL): WSL sent
-`emxq…/friday` "reply with OK"; the parked workspace was woken by its doorbell (wake to stored
-about 10 s), Friday ran one turn, and WSL read "From The Lightbulb Company's hermes (not
-verified): OK" with nothing held. The label now reads the agent's name (backend change). Three
-earlier tries failed on the bugs D5 and the bridge fixed: the bridge's reply needed `to`, the
-engine refused a bare `from`, and the bridge's request ids held a `:`.
 
 Earlier real-Mac passes are cited row by row above from `docs/acceptance-plan-a.md` and
 `docs/acceptance-plan-b.md` (0.2.0 builds) and from `docs/acceptance-two-mac.md`; they stay as
@@ -240,14 +222,11 @@ Red rows: none. Untested or open:
 6. **C1**: the Grok to Claude hop has never passed on a real Mac (Grok's usage cap); the ring was
    not re-run on 0.3.7.
 7. **C5**: held, Allow, next Cursor/Grok step is proven in two halves, not as one test.
-8. **C8**: the bridge (Friday) is not in this repo; only the engine's cloud-member side and the
-   member sidecar (`tests/member.rs`) are tested here. A real reply from Friday passed on prod on
-   2026-10-25 (see "Real computers").
 9. **C10**: no fresh-Mac join on 0.3.7 with a Mac as the joiner.
 10. **NO TEST rows in D**: a self-signed `remove` entry; a started turn on a refused
     non-member; the 64 MiB Argon2 cost in a test run; the
     10-minute code expiry and the 15 s wrong-code bound; a symlinked release binary; the
-    installed-binary-only check; the spawn after an auto-update; counting never blocking; the
+    installed-binary-only check; the spawn after an auto-update; the
     off-macOS daemon restart and the doctor line.
 11. **Replay after 8 days.** `seen_ids` and finished outbox rows are pruned after 8 days
     (`src/outbox.rs:17`, `:88`). An envelope its own sender resends after that is stored as new.

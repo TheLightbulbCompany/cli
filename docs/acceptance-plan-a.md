@@ -1,5 +1,7 @@
 # Plan A acceptance on a real Mac
 
+> Historical record of the 0.2.0 build (the `lightbulb-connect` binary). Commands and output for features since removed (workspace agents, hosted apps, sign-in, streams) are kept as they were run.
+
 > Historical record: the product was renamed Lightbulb Connect afterwards (binary `lightbulb-connect`, state dir `~/.lightbulb/connect`). The commands and paths below are kept as recorded, under the old names.
 
 - Date: 2026-10-22, 14:36–14:50 local.

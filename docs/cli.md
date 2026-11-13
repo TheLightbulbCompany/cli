@@ -49,7 +49,7 @@ lightbulb doctor
 `--help`: Check the daemon, state permissions, agent wiring, alias and launchd job.
 
 Checks the background service, the relay, the local network (macOS only), the login item (macOS
-only), the state folder, each agent, the `lightbulb` command, the memory model, auto-update and usage counts, and
+only), the state folder, each agent, the `lightbulb` command, the memory model, auto-update, and
 prints the fix for the first thing that is wrong.
 Exits 1 when something is wrong. Every line: [troubleshooting](troubleshooting.md).
 
@@ -71,7 +71,6 @@ for 7 days). After `--new` it says `Every earlier invite from this computer stop
 |---|---|
 | `--new` | A new invite; every earlier one from this computer stops working. |
 | `--once` | An invite for one join, valid 24 hours. |
-| `--agents` | Add your Lightbulb workspace's agents to this network. You must be a workspace admin, signed in here with `lightbulb login`: confirm in the browser, and the workspace joins. |
 
 ### join
 
@@ -172,7 +171,7 @@ Prints the receipt of a message sent from this terminal. States: `queued`, `stor
 
 ### held
 
-When you use it: to see the permission prompts the Lightbulb app filed for you to answer.
+When you use it: to see the permission prompts waiting for your answer.
 
 ```
 lightbulb held
@@ -180,8 +179,8 @@ lightbulb held
 
 `--help`: The permission prompts waiting for your answer.
 
-Lists them as `H<n>`, each with the command that answers it. Joins and messages never wait
-here: an invite is the approval, and everyone on the network is trusted.
+Lists them as `H<n>`, each with the command that answers it. Joins and messages to existing sessions never wait
+here: an invite is the approval, and everyone on the network is trusted. A teammate asking to start a fresh worker here does.
 
 ### approve
 
@@ -284,29 +283,6 @@ lightbulb leave
 Asks `[y/N]` first. This computer is on its own network again. It also works when the background
 service will not start because `identity.key` no longer matches the team record.
 
-### login
-
-When you use it: to use your Lightbulb workspace's agents from this computer.
-
-```
-lightbulb login
-```
-
-Prints a code and opens `thelightbulb.company` in your browser; sign in (or make a free account)
-and type the code there. This computer is then yours in Lightbulb: it keeps a sign-in proof
-(`login.json`, renewed before its 30 days end), your workspaces' agents answer it, and while it
-runs it keeps one connection to Lightbulb for your hosted apps ([apps](connect/apps.md)). The code
-works for 10 minutes.
-
-### logout
-
-```
-lightbulb logout
-```
-
-Deletes this computer's sign-in proof and drops its connection for hosted apps; workspaces stop
-answering it on their next connection to it.
-
 ### folder
 
 When you use it: to hide a project's sessions from your teammates.
@@ -370,20 +346,6 @@ lightbulb --version
 
 Prints the version, for example `lightbulb 0.6.4`.
 
-### telemetry
-
-When you use it: to see or change anonymous usage counts.
-
-```
-lightbulb telemetry [on|off|status]
-```
-
-`--help`: Anonymous usage counts: `on`, `off`, or (no argument) their state.
-
-Prints `Usage counts  on` or `Usage counts  off (…reason…)`. `off` and `on` save the choice in
-`config.toml`. `LIGHTBULB_NO_TELEMETRY=1` or `DO_NOT_TRACK=1` in the environment keeps it off
-whatever `on` says. What is counted: [README](../README.md#usage-counts).
-
 ### memory
 
 When you use it: to see, share or delete what your agents have remembered, on your computer or your team's.
@@ -396,16 +358,13 @@ lightbulb memory share <ID>
 lightbulb memory export [--json]
 lightbulb memory last
 lightbulb memory team <on|off>
-lightbulb memory drafts
-lightbulb memory approve <ID> [--team]
-lightbulb memory dismiss <ID>
 ```
 
-`--help`: What your agents and your team remember: list, show, forget, share, export, and the lessons suggested for you: drafts, approve, dismiss.
+`--help`: What your agents and your team remember: list, show, forget, share, export.
 
 Agents write memory with the `remember` tool and read it with `recall`. These commands are your
 own view of it. An `<ID>` is the first characters of an entry's id as `list` prints it (six or
-more). `forget`, `share`, `team`, `drafts`, `approve` and `dismiss` must be run from your own terminal; an agent's shell is refused.
+more). `forget`, `share` and `team` must be run from your own terminal; an agent's shell is refused.
 
 | Command | What it does |
 |---|---|
@@ -416,9 +375,6 @@ more). `forget`, `share`, `team`, `drafts`, `approve` and `dismiss` must be run 
 | `export` | Every entry this computer holds, as stored: one JSON object per line, or one array with `--json`. A forgotten entry has no text left to export. |
 | `last` | The memory block the last session was handed at its start, word for word. Any `forget` clears it (`No session has been handed a memory block yet.`) until the next session starts. |
 | `team on\|off` | Whether team memory may be written from this computer (`memory_team` in `config.toml`, on by default). `off` makes `remember` and `share` refuse `team` entries; what is already held stays. |
-| `drafts` | The lessons Lightbulb's evaluator suggests from sessions you uploaded in full (see `sessions upload`): the id, the kind, the first line and how many sessions it came from. Needs `lightbulb login`. |
-| `approve <ID> [--team]` | Keeps a suggested lesson. Signed in on your own, it becomes a `me` entry on this computer (a `team` entry with `--team`), marked as from the cloud evaluator. In a workspace it says `Approved; the workspace will remember it` and the entry arrives through the network; `--team` shares it with the whole workspace. It says so if the draft was settled elsewhere, or refused (a secret, or too long). |
-| `dismiss <ID>` | Throws a suggested lesson away. |
 
 ### sessions
 
@@ -429,11 +385,10 @@ lightbulb sessions list
 lightbulb sessions show <ID>
 lightbulb sessions forget <ID>
 lightbulb sessions export
-lightbulb sessions upload [off|metadata|full]
 lightbulb sessions turns [on|off]
 ```
 
-`--help`: The sessions captured on this computer: list, show, forget, export, and what is uploaded.
+`--help`: The sessions captured on this computer: list, show, forget, export, turns.
 
 Each agent's hooks tell the background service when a session starts, after each tool call, at
 the end of each turn and when the session ends. It keeps, on this computer only: the session (its
@@ -456,51 +411,7 @@ answered within 10 ms (250 ms for the end-of-turn answer that decides the nudge)
 | `show <ID>` | One session, its tool calls in order, then its prompts and replies in order. |
 | `forget <ID>` | Deletes the session, its tool calls and its prompts and replies. |
 | `export` | Every session with its tool calls, as one JSON array on stdout. Prompts and replies are left out. |
-| `upload [off\|metadata\|full]` | Choose what, if anything, is sent to Lightbulb (`capture_upload` in `config.toml`). `off` is the default: nothing leaves this computer. (The one request memory makes is setup's download of the memory model; `setup --no-model` skips it.) `metadata` sends, for each finished session, the agent, repository, branch, times and token counts, and for each tool call its number, time, tool, duration and whether it worked, without the summary. `full` adds the summary. Uploads are signed with this computer's identity, only while it is signed in, only for sessions that finish after you turn them on, and never for a hidden folder; signed out, it says nothing is sent until `lightbulb login`. Setting a mode must be run from your own terminal (an agent's shell is refused); with no mode it says which is set, from anywhere. `lightbulb login` asks once. |
 | `turns [on\|off]` | Records your prompts and replies on your computer only; never uploaded, in any mode (`capture_turns` in `config.toml`, on by default). Each is cut to 4 KB and deleted after 90 days (`capture_turns_days`). `sessions turns off` stops it, and `recall` stops using the turns already stored (they stay until you delete them with `sessions forget <ID>`); setting it must be run from your own terminal (an agent's shell is refused); with no state it says which is set. |
-
-## Apps you build
-
-### app
-
-When you use it: to build a small web app for your workspace, check it, preview it, publish it and undo it. Not the hosted assistants; see [apps you build](apps.md).
-
-```
-lightbulb app new <NAME> [--room <ROOM>] [--kind <KIND>]
-lightbulb app start <REQUEST> --name <NAME> [--room <ROOM>] [--requested-by <USER_ID>]
-lightbulb app ask <APP> <TEXT> [--room <ROOM>] [--requested-by <USER_ID>] [--message-id <ID>]
-lightbulb app pull <APP> [DIR]
-lightbulb app up [--room <ROOM>] [--approved <CARD>] [--requested-by <ID>]
-lightbulb app publish [--reason <TEXT>] [--room <ROOM>] [--approved <CARD>]
-lightbulb app rollback [VERSION]
-lightbulb app status [--errors]
-lightbulb app destroy
-lightbulb app check [--publish]
-lightbulb app evidence --kind <browser|review> --file <FILE> [--note <TEXT>] [--verdict <pass|fail>]
-lightbulb app report-broken-tool <TOOL> <WHAT>
-```
-
-`--help`: Build, check, preview, publish and undo apps. Every subcommand takes `--json` (the default when stdout is not a terminal); a failure prints `{"code","message","next"}` and exits 1; `up` or `publish` still building after 10 minutes exits 2 (`timeout`).
-
-| Command | What it does |
-|---|---|
-| `new` | Creates `./<NAME>` from the starter with one git commit; next, `pnpm install` in it, then `lightbulb app up` for a preview. A name may not end in `-preview`. `--kind` is `site` (default), `content-site`, `form`, `internal-tool`, `dashboard`, `portal`, `payments` or `automation`. `--room` is saved in `.lightbulb/app.json`. |
-| `start` | Asks Lightbulb to build an app in its own conversation in Canvas; prints `app_id`, `conversation_id`, `canvas_url` and `next`. |
-| `ask` | Sends a message to an app's builder. `APP` is its id, or its name when this folder or `./<APP>` is the app. |
-| `pull` | Downloads the app's latest source into a new folder, or merges it into the app's own folder, and records it as the base for the next upload. |
-| `up` | Sends HEAD (at most 9 MiB packed), waits for the preview build and reports `done` or what is `missing`. `--approved` (or `--approved-destructive`) is the approved card for a destructive migration; `--requested-by` names who asked. A failed build exits 1 with `{"code","message","next"}`; still building after 10 minutes exits 2. |
-| `publish` | Puts the preview live as a new version. Needs `check --publish` to pass and a passing review for HEAD. |
-| `rollback` | Makes an earlier version live (default: the one before) and adds one commit with its files. Code only; data is unchanged (the `error.code: "code_only"` it returns says so; it is not a failure). Refuses with uncommitted changes. |
-| `status` | State, URLs, versions and the done gate. `--errors` adds the last client and server errors. |
-| `destroy` | Asks for removal and prints the backend's state (`awaiting_owner` until the owner removes it in Canvas). |
-| `check` | Type check, lint and design lint (`pnpm check`), errors parsed. `--publish` adds the dependency audit (`pnpm check:publish`). Fails with `not_installed` before `pnpm install`. |
-| `evidence` | Records a browser pass or a review for HEAD. A review needs `--verdict`. The file stays on this computer. |
-| `report-broken-tool` | Notes a failing tool in `.lightbulb/lessons.md`, once per `up`. |
-
-Run all but `new`, `start`, `ask` and `pull` inside the app's folder. Auth is a workspace agent's hook token when
-`OPENCLAW_HOOK_TOKEN`, `ISOL8_API_URL` and `ISOL8_OWNER_ID` are all set (`ISOL8_API_URL` is the
-API origin; the CLI appends `/api/v1` once); otherwise `lightbulb login`.
-Details: [apps you build](apps.md).
 
 ## Commands the agents and macOS run
 

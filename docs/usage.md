@@ -26,7 +26,7 @@ other people can see. For a first run, see the quick start in the [README](../RE
   in each agent's own config files (`~/.claude/settings.json`, `~/.claude.json`, `~/.codex/`,
   `~/.cursor/`, `~/.grok/`, `~/.config/opencode/`). Each file
   is backed up once as `<file>.lightbulb-backup`. The tool server is named `lightbulb`; `setup` replaces an
-  existing `lightbulb` entry only when it is ours, the desktop app's or the hosted MCP's. Run `setup --verbose` to
+  existing `lightbulb` entry only when it is ours. Run `setup --verbose` to
   list the files it changed.
 
 It does not change your projects, your repositories or any other entry in those config files.
@@ -38,14 +38,14 @@ Run `lightbulb <command> --help` for the options of each one.
 
 | Command | What it does |
 |---|---|
-| `setup` | Connect Claude Code, Codex, Cursor, Grok CLI and OpenCode here and start the background service. At a terminal it first offers the free sign-in (your memory and sessions follow you across computers, the Claude app reaches your agents, the evaluator can read sessions you upload); press `l` to stay local. Staying local keeps uploads off (`capture_upload = "off"` in `config.toml`). Already signed in, or run without a terminal, it skips the question. |
+| `setup` | Connect Claude Code, Codex, Cursor, Grok CLI and OpenCode here and start the background service. |
 | `update` | Install the latest release over this one and restart the background service. `--version v0.2.3` installs that release instead (0.2.2 or later; an example tag). `--auto on\|off` turns the daily automatic update on or off and installs nothing. |
 | `setup --remove` | Take out only what `setup` wrote. Backups are left as they are. |
 | `doctor` | Check the service, the local network, the state folder and each agent, and say how to fix what is not right. |
-| `who` | List the sessions on this computer. Status reads busy, waiting for you (a permission prompt or a question, shown with what it waits for), idle, offline (a computer that is not reachable, with when it was last seen), parked (a workspace that a message wakes), or ended. Under `Recent`, sessions that ended in the last seven days, with when they ended and, for your own, the command that resumes them. `who --all` adds your teammates' sessions. |
-| `invite` | Print a four-word code (works once, for 10 minutes), a `https://thelightbulb.company/j#…` link, and the join command (`lightbulb join '<ticket>'`) that add your other computer or a teammate. The link and line are reusable for 7 days. `--once`: one join, valid 24 hours. `--new`: a new invite; every earlier one from this computer, `--once` ones too, stops working. `--agents`: add your Lightbulb workspace's agents to this network (a workspace admin, signed in; confirm in the browser). |
+| `who` | List the sessions on this computer. Status reads busy, waiting for you (a permission prompt or a question, shown with what it waits for), idle, offline (a computer that is not reachable, with when it was last seen), or ended. Under `Recent`, sessions that ended in the last seven days, with when they ended and, for your own, the command that resumes them. `who --all` adds your teammates' sessions. |
+| `invite` | Print a four-word code (works once, for 10 minutes), a `https://thelightbulb.company/j#…` link, and the join command (`lightbulb join '<ticket>'`) that add your other computer or a teammate. The link and line are reusable for 7 days. `--once`: one join, valid 24 hours. `--new`: a new invite; every earlier one from this computer, `--once` ones too, stops working. |
 | `join '<ticket>'` | Join the team the invite is for. Takes the four-word code, the `https://thelightbulb.company/j#…` link, the `lightbulb://join/…` link or the bare ticket. The name you go by is your user name; `--name <name>` sets another. The computer must be on its own first. |
-| `approve H1` / `decline H1` | Answer a permission prompt the Lightbulb app filed. |
+| `approve H1` / `decline H1` | Answer a held permission prompt. |
 | `held` | The permission prompts waiting for your answer. |
 | `send <to> "<text>"` | Send a message from the terminal: `send codex-1 "hi"`, or to a teammate's name: `send sam/inbox "hi"`. From your own terminal, `send 'sam/*' "hi"` sends to each of sam's sessions (as `who --all` lists them), and `send '*' "hi"` to every session on this computer. |
 | `listen --as <name>` | Print the messages sent to a name on this computer. |
@@ -55,11 +55,8 @@ Run `lightbulb <command> --help` for the options of each one.
 | `leave` | Leave the team. This computer is on its own network again. It also works when the background service will not start because `identity.key` no longer matches the team record. |
 | `relay [<url>]` | Show the relays this computer uses, or set one. With nothing set it uses the iroh project's public relays (`default`). It sets the team's relay; `--local` sets only this computer's; `--clear` clears yours and goes back to the default. Relays carry encrypted bytes only. Lightbulb fetches no relay list of its own. |
 | `folder <path> on\|off` | Show or hide the sessions under a folder from your teammates. |
-| `login` | Sign this computer in to Lightbulb (confirm in the browser), so your workspace's agents answer it. A computer alone on its own network then joins your workspace's network, and `login` tells you what teammates see. One on another network with members stays there, and `login` says how to move: `lightbulb leave`, then `lightbulb login`. |
-| `logout` | Sign this computer out. |
-| `memory list\|show\|forget\|share\|export\|last\|team\|drafts\|approve\|dismiss` | See and control what your agents remember (see "Memory" below), and keep or drop the lessons suggested from sessions you uploaded. |
-| `sessions list\|show\|forget\|export\|upload` | See and delete what was captured of your coding sessions here: the agent, the repository, each tool call and a short summary of it, never file contents or output. Dot folders in your home folder (`~/.config`) are skipped; a repository's own (`.claude/worktrees`) are captured. Tokens are filled for Claude Code only (from its transcript, when the session ends); the other agents leave them blank until their payloads are verified, and OpenCode's tool calls are captured on 1.x only. `sessions upload off\|metadata\|full` chooses what is sent to Lightbulb (off by default). |
-| `telemetry [on\|off\|status]` | Show or set anonymous usage counts (see the [README](../README.md#usage-counts)). |
+| `memory list\|show\|forget\|share\|export\|last\|team` | See and control what your agents remember (see "Memory" below). |
+| `sessions list\|show\|forget\|export` | See and delete what was captured of your coding sessions here: the agent, the repository, each tool call and a short summary of it, never file contents or output. Dot folders in your home folder (`~/.config`) are skipped; a repository's own (`.claude/worktrees`) are captured. Tokens are filled for Claude Code only (from its transcript, when the session ends); the other agents leave them blank until their payloads are verified, and OpenCode's tool calls are captured on 1.x only. |
 | `version` | Print the version. |
 
 `held`, `remove`, `leave` and `relay <url>` refuse to run from an agent's shell
@@ -84,8 +81,7 @@ recall's answer is one page of about 8,000 tokens, up to about 9,000 on a full p
 call it when a task needs memory, not on every turn.
 
 - `team` entries go to every member of the team.
-- `me` entries go only to your own signed-in computers. If this computer is not signed in, a `me`
-  entry stays on this computer.
+- `me` entries stay on the computer that made them; they do not sync to your other computers.
 
 An agent writes `me` unless you tell it to share. `lightbulb memory list` shows everything, who
 wrote it and whether two people disagree. `lightbulb memory share <id>` turns one of yours into a
@@ -113,13 +109,7 @@ that session is handed this, unless messages are waiting for it:
 online. A computer that stays offline for good keeps what it held. Secrets are refused, not
 scrubbed (see [security](security.md#memory)).
 
-Signed in, you can send finished sessions to Lightbulb: `lightbulb sessions upload metadata` or
-`full` (`lightbulb login` asks once; the default is `off`, and nothing leaves the computer; the one
-request memory makes is setup's download of the memory model, skipped with `setup --no-model`, a
-choice kept until you run `lightbulb setup` again without it). Sent in
-full, they let the evaluator suggest lessons: `lightbulb memory drafts` lists them,
-`lightbulb memory approve <id>` keeps one (`--team` for the workspace) and
-`lightbulb memory dismiss <id>` drops it.
+Nothing is sent anywhere but your teammates' computers; the one request memory makes is setup's download of the memory model, skipped with `setup --no-model`, a choice kept until you run `lightbulb setup` again without it.
 
 ## Trust
 
@@ -143,10 +133,7 @@ encrypted between the two computers, and their text is not written to the log. A
 text is deleted from `state.db` once nothing waits on it (read, refused or expired); messages to
 your own terminal keep theirs.
 
-Apart from anonymous usage counts (`lightbulb telemetry off`), the engine calls Lightbulb only for
-`login` (the sign-in, then your workspace's network and its one-time join link), renewing a
-signed-in computer's proof, `invite --agents`, and, while signed in, the live connection hosted
-apps use. Otherwise it talks only to your teammates' computers and, when no
+The engine talks only to your teammates' computers and, when no
 direct path exists, to the relays. The background service checks this project's GitHub releases
 once a day for an update (`lightbulb update --auto off` stops it), and `update` downloads from them. After an update, `setup` runs again with the new binary (the daemon's own run is `setup --refresh`), which rewrites the agents' hooks, so an existing install gets new hooks, such as the ones that mark a session as waiting, without anything from you. The refresh does not stop or reload the background service.
 

@@ -9,6 +9,5 @@ the memory model (about 31 MB; `--no-model` skips it).
 - [Grok CLI](grok-cli.md)
 - [OpenCode](opencode.md)
 - [Join a network](join-a-network.md): connect to a teammate.
-- [Hosted apps](apps.md): the Claude app, ChatGPT, Muse and bots, through your signed-in computer.
 
 After setup, restart any agent session that was already open, then run `lightbulb doctor`.

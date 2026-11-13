@@ -53,7 +53,7 @@
   {
     "name": "find_workers",
     "scope": "network",
-    "description": "The agents that take an assignment: always-on agents (workspace agents and connected apps) now; computers that start fresh workers once they opt in. Pass one's session_id to assign.",
+    "description": "The agents that take an assignment: teammates' computers that start fresh workers once they opt in. Pass one's session_id to assign.",
     "inputSchema": {
       "type": "object",
       "properties": {

@@ -60,7 +60,7 @@ in `src/embed_model.rs` (`config.json`, `tokenizer.json`, `model.safetensors`). 
 `lightbulb setup` downloads and checks the same files into `~/.lightbulb/connect/model/`; copy that
 folder.
 
-The runner starts one daemon per conversation under `/bench/<project>/`, with LAN and telemetry off
+The runner starts one daemon per conversation under `/bench/<project>/`, with LAN off
 and a config that keeps captured turns for 100 years. It talks to each socket through one
 `docker exec -i lb-bench perl …` bridge. The runner is in [`bench/beam/`](../bench/beam/README.md);
 the method and numbers are in [benchmarks/beam-100k.md](benchmarks/beam-100k.md#reproducing).

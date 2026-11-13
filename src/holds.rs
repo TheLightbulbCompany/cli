@@ -612,7 +612,7 @@ pub fn on_dialog(d: &Arc<Daemon>, n: i64, button: &str) {
     }
 }
 
-/// The hold ops: `holds`, `hold.get`, `hold.answer` (person-only; an agent may answer).
+/// The hold ops: `holds`, `hold.get`, `hold.answer` (person-only, except that `hold.answer` from a resolved agent session is allowed; it is still refused for Worker holds and worker prompts).
 pub fn op(id: u64, op: &str, body: &Value, d: &Arc<Daemon>, caller: Caller) -> Response {
     // An agent may answer a hold (the answer records its session); nothing else here.
     let mut agent = None;

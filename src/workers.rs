@@ -814,7 +814,7 @@ fn uuid_v4() -> String {
     )
 }
 
-/// The person-only ops of `lightbulb workers` (`caller` must be a person, as `hold.file`):
+/// The person-only ops of `lightbulb workers` (`caller` must be a person):
 /// `workers.list` -> `{workers: [{handle, asker, provider, folder, started_at, ended_at?, state,
 /// assignment, result_status?}]}`; `workers.show {worker}` -> that row (a handle or an assignment
 /// id) with `result`, `conversation`; `workers.stop {worker}`; `workers.off` (stops every running
