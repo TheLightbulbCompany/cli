@@ -2025,7 +2025,7 @@ dependencies = [
 
 [[package]]
 name = "lightbulb"
-version = "0.9.14"
+version = "0.10.0"
 dependencies = [
  "argon2",
  "clap",
