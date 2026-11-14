@@ -181,15 +181,7 @@ async fn claude_push_frames_an_assignment_as_one() {
                 deadline_at: Some(t + 600),
                 ..Default::default()
             };
-            frame::framed_kind(
-                "assign",
-                "Your Codex",
-                "as1",
-                None,
-                &meta,
-                None,
-                "run the tests",
-            )
+            frame::framed_kind("assign", "Your Codex", "as1", None, &meta, "run the tests")
         })
         .find(|f| f == content);
     assert!(framed.is_some(), "{content}");

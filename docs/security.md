@@ -35,28 +35,8 @@ not verified (shown "(not verified)"). Accepted: members are trusted. Removing a
 dialog tells the person and offers Remove; an agent's invite is always one-time.
 
 There is one kind of member. Every member is its own person: its person id is its own key, and
-nothing in the roster can say otherwise (an admit's other claims are ignored). A Lightbulb
-workspace's member (`lightbulb member`) is a member like any other; what it answers is its own
-local rule. The Lightbulb backend writes it `members`: its people's Lightbulb user ids. It takes
-a message for one of its agents only from a computer whose sign-in proof names one of them; any
-other member's message (no proof, an expired one, another person's, another computer's) is
-refused (`not_a_member`). `lightbulb login` proves the key: the backend sends a
-one-time challenge (2 minutes), this computer signs `{challenge, key, purpose}` with its member
-key, and the signed-in person types the code their terminal shows on the confirm page (10
-minutes, single use). The answer is the sign-in proof: a compact EdDSA JWS from Lightbulb,
-`{iat, exp, sub: <user id>, computer: <member key>}`, kept in `login.json` (0600) and shown in
-this computer's `hello`. A workspace member verifies it offline against the issuer's public key.
-Proofs last 30 days and are renewed in their last week (renewal asks the account server, which
-can refuse); removing a person from a workspace takes effect at once (`members`), and a computer
-whose key is in the sessions file's `revoked_keys` is refused even with a valid proof. `lightbulb logout` deletes
-the proof. A
-workspace member joins one network when a workspace admin runs
-`lightbulb invite --agents`, which hands it a one-time link that admin's computer signed (the admin
-confirmed it in the browser, so that computer admits it without a dialog). It also mints one-time
-links, each carrying its doorbell under its signature, which Lightbulb gives only to a signed-in
-person of that workspace: `lightbulb login` joins a computer that is alone on its own network with
-one. Labels ending "(not verified)" are unproven names, never an
-identity.
+nothing in the roster can say otherwise (an admit's other claims are ignored). Labels ending
+"(not verified)" are unproven names, never an identity.
 
 ### Invite codes
 
@@ -108,7 +88,7 @@ Joins still work, because the invite carries the inviter's addresses.
 
 Everyone on the network is trusted. A message from a member reaches the session it names; nothing
 is held and there is no per-person Allow or policy. Membership is the only gate, and `lightbulb
-remove <name>` ends it. (A workspace member also checks the sender's sign-in proof, see above.)
+remove <name>` ends it. Messaging and assigning to a session that already exists are gated only by team membership.
 Messages between sessions on this computer always get through.
 
 A join is admitted by its invite, with no dialog on the inviter's side. The signed `admit` records who minted the
@@ -119,26 +99,28 @@ An agent may invite; only a person at a terminal can remove a member, leave a ne
 the relay: a command run from an agent's shell or tools is refused. It does not stop a program
 that you run yourself as your own user.
 
-On macOS, where a script on the hosted page could drive the desktop app into starting an agent, an
-agent's join first asks the person in a native dialog on this computer, before anything is dialed: `An agent on this computer asked to join a team, invited by computer <key>. Teammates
+On macOS an agent's join first asks the person in a native dialog on this computer, before anything is dialed: `An agent on this computer asked to join a team, invited by computer <key>. Teammates
 there will see your sessions' names, folders and status.`, with Join and Don't join. Don't join is
-the default, and it gives up after 10 minutes as a no. It shows even while the Lightbulb app holds
-its `ui.claim`, so a script on the hosted page can neither answer nor delay it. With no dialog
+the default, and it gives up after 10 minutes as a no. With no dialog
 (over SSH, say) the join is refused, and the person runs `lightbulb join` in their own terminal. A
-person's terminal, the desktop app's own join, a workspace member's and an agent's off macOS are not
-asked. This confirm stops a prompted agent from joining by the normal route; it isn't a boundary
+person's terminal and an agent's join off macOS are not asked. This confirm stops a prompted agent from joining by the normal route; it isn't a boundary
 against code running as the person, which can also detach or edit local state.
 
-The other prompts are that notice for an agent's invite and an agent's permission request that the
-Lightbulb app files (`lightbulb held`, `approve H<n>`).
+The other prompts are that notice for an agent's invite and the request to start a fresh worker
+on this computer (`lightbulb held`, `approve H<n>`). That request is answered by the person only,
+once per member: Always allow or refuse, and revocable with `lightbulb workers policy`. An
+envelope that carries an A2A body is refused `unsupported`.
+
+Each peer connection's send queue is bounded (256 frames). A peer that stalls is disconnected and
+reconnects, so one slow peer cannot grow this computer's memory.
 
 ## Memory
 
 What your agents remember is stored in `state.db` as entries, each signed by the computer that
 wrote it.
 
-- **What syncs where.** `team` entries go to every member of the team. `me` entries go only to
-  your own signed-in computers; without a sign-in a `me` entry stays on this computer.
+- **What syncs where.** `team` entries go to every member of the team. `me` entries stay on the
+  computer that made them and never sync to your other computers.
   `lightbulb memory team off` stops this computer writing `team` entries.
 - **Secrets are refused, not scrubbed.** `remember` rejects an entry that looks like an API key,
   a token, a private key, or a credential in a URL (`https://user:password@host`), and stores
@@ -158,7 +140,7 @@ wrote it.
 - **Who can change it.** `memory forget`, `memory share` and `memory team` are refused when run from an agent's shell or tools, like `remove`; `list`, `show`, `last` and `export` are open. An agent still writes entries with `remember`.
 - **The log.** `daemon.log` never holds an entry's text.
 
-## Capture and upload
+## Capture
 
 - **What is captured.** Each agent's hooks tell the background service when a session starts,
   after each tool call, at the end of each turn and when it ends. It keeps the session (its id,
@@ -175,19 +157,9 @@ wrote it.
   from the same repository ([usage](usage.md#memory)). Sessions under a folder hidden with `lightbulb folder <path> off`, or under a dot
   folder in your home folder (`~/.config`), are not captured.
 - **Where it lives.** In `state.db` on this computer. Teammates never receive it.
-- **What is uploaded.** Nothing unless you choose. `lightbulb sessions upload off` (the default)
-  sends nothing and makes no request. `metadata` sends each finished session's agent,
-  repository, branch, times and token counts, and for each tool call its number, time, tool,
-  duration and whether it worked, without the summary. `full` adds the summary. Uploads go only
-  while this computer is signed in, only for sessions that finish after you turn them on, and
-  are signed with this computer's identity. Only you can change the mode: `sessions upload
-  <mode>` is refused when run from an agent's shell or tools.
-- **The evaluator.** It reads only sessions you uploaded in `full`, when they arrive, and
-  suggests lessons. A suggestion does nothing until you keep it with `lightbulb memory approve`;
-  `lightbulb memory dismiss` drops it. `metadata` uploads are never read by it.
+- **Nothing is uploaded.** Captured sessions never leave this computer.
 - **Deleting.** `lightbulb sessions forget <id>` deletes a session, its tool calls and its prompts and replies on this
-  computer; it does not delete a copy already uploaded. `lightbulb sessions upload off` stops
-  further uploads and forgets where the last one stopped.
+  computer.
 
 ## Loop limits
 
@@ -218,9 +190,8 @@ is `0600`):
 |---|---|
 | `identity.key` | This computer's secret key. |
 | `config.toml` | Settings (computer name, relay, `lan`, hidden folders). |
-| `state.db` | SQLite: the roster, sessions, messages, receipts, memory entries, the memory block each session was last handed (`lightbulb memory last`), captured sessions, their tool calls and your prompts and replies (see "Capture and upload"), the vectors for memory search, permission prompts and their answers. A message's text is deleted once nothing waits on it (read, refused or expired); messages to your own terminal keep theirs. |
+| `state.db` | SQLite: the roster, sessions, messages, receipts, memory entries, the memory block each session was last handed (`lightbulb memory last`), captured sessions, their tool calls and your prompts and replies (see "Capture"), the vectors for memory search, permission prompts and their answers. Tables of removed features stay in the file, unused, so a rollback to an older build still opens it. A message's text is deleted once nothing waits on it (read, refused or expired); messages to your own terminal keep theirs. |
 | `model/` | The memory model, if setup downloaded it. |
-| `upload.mark` | While uploads are on: the time up to which finished sessions were sent. Deleted by `lightbulb sessions upload off`. |
 | `daemon.log` | The log (see above). |
 | `addrs.json` | Teammates' last known network addresses. |
 | `sock`, `daemon.lock` | The service's socket and lock. |
@@ -257,20 +228,11 @@ it is doing now (from the agent's to-do list). For seven days after a session en
 its name, folder, repository, branch, when it ended and why; the command that resumes it stays on your computer. They never see your files or your agents'
 conversations, only the messages sent to them. Hide a folder with `lightbulb folder <path> off`.
 
-## Telemetry and network requests
+## Network requests
 
-Lightbulb sends anonymous usage counts (see "Usage counts" in the README; off with `lightbulb telemetry off`, or `DO_NOT_TRACK=1` / `LIGHTBULB_NO_TELEMETRY=1`, which always win). It sends no crash reports and no message content. The first `setup` sends one `cli_installed` event before it prints the opt-out notice; set one of those variables before installing to send nothing at all.
-
-Apart from those counts, the engine calls Lightbulb only for these: `lightbulb login` (a device
-sign-in you confirm in the browser), renewing a signed-in computer's proof, `lightbulb invite
---agents`, while this computer is signed in one live connection that hosted apps reach your
-sessions through, `POST /sessions` (the uploader: every five minutes while signed in and
-uploads are `metadata` or `full`, and only when a session has finished since the last one; never
-while uploads are `off`), and `GET /memory/drafts` with `POST /memory/drafts/<id>/approve` or
-`/dismiss` (only when you run `lightbulb memory drafts`, `approve` or `dismiss`). It fetches no
-relay list from Lightbulb. Otherwise it talks only to your
-teammates' computers and, when no direct path exists, to the relays (the iroh project's public
-relays unless you or your team set one).
+Lightbulb sends no usage counts and no crash reports. The engine talks only to your teammates'
+computers and, when no direct path exists, to the relays (the iroh project's public relays unless
+you or your team set one). It fetches no relay list.
 
 `lightbulb setup` downloads the memory model once from Hugging Face (`huggingface.co`, one pinned
 revision, each file checked by SHA-256); `setup --no-model` skips it.

@@ -6,8 +6,8 @@
 //! nothing from the backups (they are the person's safety net).
 //!
 //! Installing writes our MCP entry under our server name. An entry already under that name is
-//! replaced only when it is ours, the desktop app's old `session-mcp` server or the hosted
-//! Lightbulb MCP (`replaceable`); any other stays, and the agent is left with hooks only.
+//! replaced only when it is ours, the desktop app's old `session-mcp` server or the retired
+//! hosted Lightbulb MCP (`replaceable`); any other stays, and the agent is left with hooks only.
 //! Removing takes it out only when its command is our executable. Our allow rule exists only
 //! while the MCP entry is ours.
 //!
@@ -77,8 +77,9 @@ pub const DEFAULT_SERVER: &str = "lightbulb";
 /// runs a `lightbulb` binary, and the allow rules named for it.
 pub(crate) const OLD_SERVER: &str = "lightbulb-network";
 
-/// The hosted Lightbulb MCP's URL: an entry for it under our name gives way to ours.
-pub(super) const HOSTED: &str = "https://api.thelightbulb.company/mcp";
+/// The retired hosted Lightbulb MCP's URL: an entry for it under our name gives way to ours,
+/// so an upgrade does not leave the agent with a dead server and no tools.
+const HOSTED: &str = "https://api.thelightbulb.company/mcp";
 
 /// Whether an entry under our name that is not ours gives way to ours: the desktop app's old
 /// server (args `["session-mcp"]`) or the hosted MCP's URL.
@@ -194,9 +195,6 @@ pub fn status(home: &Path, agent: &str, dir: &str) -> State {
     }
 }
 
-/// The one quiet mention of the paid workspace: last line of `setup`, `who` and `team`.
-pub const UPSELL: &str = "Add an always-on AI teammate: https://thelightbulb.company";
-
 /// `setup`'s closing words: what is connected (product names) and what to try next, with
 /// `cmd` the command name that works on this computer.
 pub fn summary(connected: &[&str], cmd: &str) -> String {
@@ -214,7 +212,7 @@ pub fn summary(connected: &[&str], cmd: &str) -> String {
         ""
     };
     format!(
-        "Lightbulb is on.\n  Connected: {list}\n\nTry it: open {first} in any folder and ask \"list my other sessions\".\n{opencode}Add your other computer or a teammate: {cmd} invite\nCheck everything: {cmd} doctor\n{UPSELL}"
+        "Lightbulb is on.\n  Connected: {list}\n\nTry it: open {first} in any folder and ask \"list my other sessions\".\n{opencode}Add your other computer or a teammate: {cmd} invite\nCheck everything: {cmd} doctor"
     )
 }
 
@@ -394,8 +392,8 @@ impl Ctx<'_> {
         crate::sessions::shell_quoted(self.exe)
     }
 
-    /// The owner of a server entry, given its command (`None`: the entry has none), its args
-    /// and its URL. Installing replaces a `replaceable` entry; any other one is foreign.
+    /// The owner of a server entry, given its command (`None`: the entry has none) and its
+    /// args and its URL. Installing replaces a `replaceable` entry; any other one is foreign.
     pub fn owner(
         &self,
         exists: bool,

@@ -1,10 +1,8 @@
 //! Messages, the mailbox, receipts and the loop limit. Time is passed in (`now`, unix seconds).
 
 use crate::config::Config;
-use crate::holds::Kind as HoldKind;
 use crate::net::frames::Frame;
 use crate::roster::{Member, Roster};
-use crate::rules::Effect;
 use crate::sessions::{self, Key};
 use crate::store::{Message, Store, MSG_RECEIPT};
 use crate::workers::{self, Taken};
@@ -19,9 +17,6 @@ pub const KINDS: [&str; 4] = ["message", "assign", "result", "cancel"];
 pub const LOOP_LIMIT: u32 = 12;
 /// Half-open: a send counts while `sent_at > now - LOOP_WINDOW_S`, so one sent at T stops counting at T + 600.
 pub const LOOP_WINDOW_S: u64 = 600;
-/// What a sender the workspace does not answer is told (`not_a_member`).
-pub const NOT_A_MEMBER: &str =
-    "This workspace answers its members. Ask an admin to add you, then run `lightbulb login`";
 /// Offline mail (and, later, the outbox) waits this long.
 pub const HOLD_S: u64 = 86_400;
 /// A row is kept this long after its final state; nothing is held (owner ruling 2026-10-26).
@@ -44,8 +39,6 @@ pub struct Answer {
     pub taken: Option<Taken>,
     /// The assignment (message id) a cancel for a fresh worker names.
     pub cancelled: Option<String>,
-    /// The Authority hold (its id) the workspace rules parked fresh mail under.
-    pub held: Option<i64>,
 }
 
 impl Answer {
@@ -57,7 +50,6 @@ impl Answer {
             fresh: false,
             taken: None,
             cancelled: None,
-            held: None,
         }
     }
 
@@ -233,9 +225,6 @@ fn receipt_text(r: &Value, person: Option<&ForPerson>) -> Option<String> {
             "refused" if at("reason") == "no_worker" => format!("not sent: {}", no_worker(at("harness"), " (find_workers lists who takes assignments)")),
             "refused" if at("reason") == "busy" && remote => format!("not sent: {person}'s computer is running all the workers it allows; try later or another worker"),
             "refused" if at("reason") == "declined" && remote => format!("not sent: {person} declined to start a worker"),
-            "queued" if remote && r["waking"] == true => {
-                format!("queued: {computer} is waking up and gets it in a moment.")
-            }
             "queued" if remote => {
                 let why = if r["online"] == true {
                     "has not confirmed yet"
@@ -267,7 +256,6 @@ fn receipt_text(r: &Value, person: Option<&ForPerson>) -> Option<String> {
                 "declined" => "they declined it".into(),
                 "busy" => format!("{who}'s computer is running all the workers it allows; try later or another worker"),
                 "not_member" => "that computer is not in your team".into(),
-                "not_a_member" => NOT_A_MEMBER.into(),
                 "request_id_reused" => "that request id was used for another message".into(),
                 "unsupported" => "their computer cannot take it".into(),
                 "no_worker" => no_worker(p.to.and_then(new_harness).unwrap_or_default(), ""),
@@ -277,9 +265,6 @@ fn receipt_text(r: &Value, person: Option<&ForPerson>) -> Option<String> {
             }
         ),
         "held" => format!("Not yet sent: held until {who} allows it.{check}"),
-        "queued" if remote && r["waking"] == true => {
-            format!("Sent. {computer} is waking up and gets it in a moment.{check}")
-        }
         "queued" if remote => {
             let why = if r["online"] == true {
                 "has not confirmed it yet"
@@ -512,57 +497,10 @@ pub struct Prepared {
     pub kind: String,
     pub meta: Meta,
     pub sent_at: i64,
-    /// The A2A Message the envelope carries (`Frame::Envelope`'s `a2a`).
-    pub a2a: Option<Value>,
     /// The sending computer's envelope signature: set by `outbox::enqueue`, or as received.
     pub sig: Option<String>,
     /// The `sent_at` that `sig` covers (the sender's stamp).
     pub signed_at: Option<i64>,
-    /// The authority object `a2a` carried, verified and bound to this envelope (`receive`).
-    pub authority: Option<crate::authority::Authority>,
-}
-
-/// What `receive` knows of the sender beyond the envelope, and the rules it is judged by.
-pub struct Judge<'a> {
-    /// The person the sending computer's `hello` proof names (`Proof::sub`), when it verified
-    /// and names a person.
-    pub sender_person: Option<&'a str>,
-    /// The workspace the sending computer's verified proof names instead (`org_<id>`): its
-    /// runtime, never a person.
-    pub sender_workspace: Option<&'a str>,
-    /// The person this computer is signed in as (its own proof's `sub`): `@session-person`.
-    pub my_person: Option<&'a str>,
-    pub rules: &'a crate::rules::Rules,
-    pub exceptions: &'a [crate::rules::Exception],
-    /// The stored rules document's workspace; `None` when none is stored.
-    pub workspace: Option<&'a str>,
-}
-
-impl Default for Judge<'static> {
-    /// An unknown sender on a computer not signed in, judged by the shipped default rules.
-    fn default() -> Self {
-        static RULES: std::sync::LazyLock<crate::rules::Rules> =
-            std::sync::LazyLock::new(crate::rules::default_rules);
-        Judge {
-            sender_person: None,
-            sender_workspace: None,
-            my_person: None,
-            rules: &RULES,
-            exceptions: &[],
-            workspace: None,
-        }
-    }
-}
-
-/// An A2A Message's text: its `parts[].text` joined by newlines; `None` when a part has no
-/// `text` (this phase takes text only), there are no parts, or the role is not `ROLE_USER` or `ROLE_AGENT`.
-pub fn a2a_text(a2a: &Value) -> Option<String> {
-    if !matches!(a2a["role"].as_str(), Some("ROLE_USER" | "ROLE_AGENT")) {
-        return None;
-    }
-    let parts = a2a["parts"].as_array().filter(|p| !p.is_empty())?;
-    let texts: Option<Vec<&str>> = parts.iter().map(|p| p["text"].as_str()).collect();
-    Some(texts?.join("\n"))
 }
 
 /// What `prepare` decided.
@@ -581,8 +519,6 @@ pub enum Prep {
 pub enum Origin<'a> {
     Local,
     Net(&'a str),
-    /// A hosted app's session on this computer (`link`): never framed as the person's own.
-    App,
 }
 
 impl From<&Prepared> for Message {
@@ -601,10 +537,8 @@ impl From<&Prepared> for Message {
             sent_at: p.sent_at,
             reply_to: p.reply_to.clone(),
             meta: p.meta.clone(),
-            a2a: p.a2a.clone(),
             sig: p.sig.clone(),
             signed_at: p.signed_at,
-            authority_id: p.authority.as_ref().map(|a| a.id.clone()),
         }
     }
 }
@@ -625,7 +559,7 @@ impl From<&Prepared> for Frame {
             files: vec![],
             sent_at: p.sent_at,
             meta: p.meta.clone(),
-            a2a: p.a2a.clone(),
+            a2a: None,
             sig: None,
         }
     }
@@ -923,10 +857,8 @@ pub fn prepare(
         kind: kind.into(),
         meta,
         sent_at: now as i64,
-        a2a: None,
         sig: None,
         signed_at: None,
-        authority: None,
     }))
 }
 
@@ -935,7 +867,6 @@ pub(crate) fn put(store: &Store, p: &Prepared, origin: Origin, state: State) -> 
     let mut m = Message::from(p);
     match origin {
         Origin::Net(short) => m.origin = Some(format!("net:{short}")),
-        Origin::App => m.origin = Some(APP_ORIGIN.into()),
         Origin::Local => {}
     }
     store.put_message(&m)?;
@@ -986,9 +917,6 @@ pub(crate) fn record_queued(store: &Store, p: &Prepared) -> Result<()> {
     answered(store, p)
 }
 
-/// A stored message's `origin` when a hosted app's session on this computer sent it.
-pub const APP_ORIGIN: &str = "app";
-
 /// Stores `p` here, in its recipient's mailbox; its receipt.
 pub fn store_local(store: &Store, p: &Prepared) -> Result<Receipt> {
     store_local_from(store, p, Origin::Local)
@@ -1030,9 +958,8 @@ pub fn send(
 
 /// What member `peer`'s envelope `env` becomes on this computer (member prefix `me`), checked
 /// in this order: a `from` outside `peer`'s prefix is dropped unanswered (`Err`); a `sig` that
-/// is not `peer`'s over `raw` (the frame's JSON as received; `env` re-serialized when `None`),
-/// or an `a2a` without `sig` or whose text parts (`a2a_text`) are not exactly `body`, is
-/// `bad_request`, one with a non-text part `unsupported`; a `kind` outside `KINDS` (`message`, `assign`, `result`, `cancel`; the `app_*` kinds never reach here: `net::receive` drops them), any `files`, a body over `MAX_TEXT`, or a malformed id, `thread` or `request_id`
+/// is not `peer`'s over `raw` (the frame's JSON as received; `env` re-serialized when `None`)
+/// is `bad_request`; an `a2a` (an older build's A2A Message) is `unsupported`; a `kind` outside `KINDS` (`message`, `assign`, `result`, `cancel`; the `app_*` kinds never reach here: `net::receive` drops them), any `files`, a body over `MAX_TEXT`, or a malformed id, `thread` or `request_id`
 /// is `unsupported`; a `to` that is not one address is `policy`, one under another prefix
 /// `not_member`; a `to` of the form `<member>/<provider>:new` is `no_worker` (this build starts
 /// no workers); an envelope seen before gets the state it has now and is not delivered again;
@@ -1042,11 +969,7 @@ pub fn send(
 /// `MAX_HOPS` or more, or below one past a message of ours it answers (`hops_ok`), or the
 /// `LOOP_LIMIT`th send in `LOOP_WINDOW_S` from one member to `to`, is `loop`; then
 /// stored for `to` with origin `net:<peer short>`, timed by its arrival (`now`), and
-/// remembered in `seen_ids`. (No one holds a member's message: membership is the gate.) On a workspace member, `declared` are its sessions: new mail for
-/// any other is `policy` (after the resend checks, so a resend gets the state it has). With
-/// `members` (the member keys the workspace answers: those whose sign-in proof names one of its
-/// people, `proof::admitted`), mail from a peer whose key
-/// is not listed is `not_a_member`: refused, no hold.
+/// remembered in `seen_ids`. (No one holds a member's message: membership is the gate.)
 #[allow(clippy::too_many_arguments)]
 pub fn receive(
     store: &Store,
@@ -1055,11 +978,8 @@ pub fn receive(
     peer: &Member,
     roster: &Roster,
     me: &str,
-    declared: Option<&std::collections::HashSet<String>>,
-    members: Option<&std::collections::HashSet<String>>,
     config: &Config,
     now: u64,
-    judge: &Judge,
 ) -> Result<Answer> {
     let Frame::Envelope {
         id,
@@ -1101,23 +1021,13 @@ pub fn receive(
             return refused("bad_request");
         }
     }
-    if let Some(a2a) = a2a {
-        if sig.is_none() {
-            return refused("bad_request");
-        }
-        match a2a_text(a2a) {
-            None => return refused("unsupported"),
-            // Exact bytes: an old build reads `body` alone, so it must be the same text.
-            Some(text) if text != *body => return refused("bad_request"),
-            Some(_) => {}
-        }
-    }
     if !KINDS.contains(&kind.as_str())
         || !files.is_empty()
         || body.len() > MAX_TEXT
         || !sessions::word(request_id, MAX_REQUEST_ID)
         || !ulid(id)
         || !thread.as_deref().is_none_or(ulid)
+        || a2a.is_some()
     {
         return refused("unsupported");
     }
@@ -1153,36 +1063,6 @@ pub fn receive(
             ..Answer::is(r.state)
         });
     }
-    // The issuer-signed authority object, bound to this envelope; a bad one refuses it whole.
-    // After the resend checks: a resend gets the state it has, though its object has expired.
-    let authority = match a2a.as_ref().map(|a| &a["metadata"][crate::authority::URI]) {
-        Some(Value::Null) | None => None,
-        Some(jws) => {
-            let bound = jws
-                .as_str()
-                .ok_or_else(|| "jws".into())
-                .and_then(|jws| crate::authority::verify(jws, now as i64))
-                .and_then(|a| {
-                    crate::authority::bind(
-                        &a,
-                        kind,
-                        to,
-                        body,
-                        meta,
-                        judge.sender_person,
-                        judge.sender_workspace,
-                    )
-                    .map(|()| a)
-                });
-            match bound {
-                Ok(a) => Some(a),
-                Err(e) => {
-                    eprintln!("net: an envelope's authority object is refused ({e})");
-                    return refused("bad_request");
-                }
-            }
-        }
-    };
     // `reply_to` is a message id on the wire.
     let parent = match reply_to {
         Some(r) => store.message(r)?,
@@ -1192,7 +1072,7 @@ pub fn receive(
         return refused(reason);
     }
     // A cancel reaches a session only for an assign it was handed: one held, declined or
-    // expired never was, and its cancel would carry any text past the rules.
+    // expired never was, and its cancel would carry any text past the person's answer.
     if kind == "cancel" && !is_new_worker(to) {
         let released = match &parent {
             Some(p) => receipt(store, &Key(p.from_key.clone()), &p.request_id)?
@@ -1202,12 +1082,6 @@ pub fn receive(
         if !released {
             return refused("policy");
         }
-    }
-    if declared.is_some_and(|d| !d.contains(to)) {
-        return refused("policy");
-    }
-    if members.is_some_and(|m| !m.contains(&peer.key)) {
-        return refused("not_a_member");
     }
     // An answer to (or in the thread of) a message this computer sent is at least one hop
     // past it, whatever `hops` the peer claims; only a person (`/terminal`, fenced by the
@@ -1229,38 +1103,6 @@ pub fn receive(
     if roster.by_short(me).is_none() {
         return refused("not_member");
     }
-    // The workspace rules judge every message and every assign to an existing session (one to
-    // a fresh worker keeps Workers' own path); a hold keeps the requester and skill it was
-    // judged as.
-    let held = if kind == "message" || (kind == "assign" && !is_new_worker(to)) {
-        let (d, requester, skill) = judge_message(
-            judge,
-            peer,
-            roster,
-            to,
-            kind,
-            a2a.is_some(),
-            authority.as_ref(),
-        );
-        match d.effect {
-            Effect::Allow => None,
-            Effect::Deny => return refused("policy"),
-            Effect::Hold if d.holders.is_empty() => {
-                eprintln!("net: envelope {id} from {}: no_holder", peer.short);
-                return refused("policy");
-            }
-            Effect::Hold => {
-                // Bound by the workspace rule: the sender's workspace relayed the note.
-                let relayed = authority
-                    .as_ref()
-                    .and(judge.sender_workspace)
-                    .map(String::from);
-                Some((requester, skill, relayed))
-            }
-        }
-    } else {
-        None
-    };
     let p = Prepared {
         message_id: id.clone(),
         from: Key(from.clone()),
@@ -1273,10 +1115,8 @@ pub fn receive(
         kind: kind.clone(),
         meta: meta.clone(),
         sent_at: now as i64,
-        a2a: a2a.clone(),
         sig: sig.clone(),
         signed_at: sig.as_ref().map(|_| *sent_at),
-        authority,
     };
     let tx = store.conn().unchecked_transaction()?;
     // A cancel reaches the worker module only for an assignment to a fresh worker.
@@ -1289,13 +1129,7 @@ pub fn receive(
         let state = if kind == "assign" {
             let mut m = Message::from(&p);
             m.origin = Some(format!("net:{}", peer.short));
-            let (requester, origin_is_person) = requester_of(judge, peer, p.authority.as_ref());
-            let asker = workers::Asker {
-                requester: &requester,
-                origin_is_person,
-                authority: p.authority.as_ref(),
-            };
-            let t = workers::take_assign(store, config, me, &m, Some(&asker), now as i64)?;
+            let t = workers::take_assign(store, config, me, &m, now as i64)?;
             let state = match t {
                 Taken::Refused(r) => return refused(r), // nothing written: the tx rolls back
                 Taken::Held { .. } => State::Held,
@@ -1317,25 +1151,6 @@ pub fn receive(
             ..Answer::is(state)
         });
     }
-    if let Some((requester, skill, relayed_by)) = held {
-        // No mailbox row until its person allows it (`holds::answer`): a build that knows no
-        // holds never hands it to a session.
-        put(store, &p, Origin::Net(&peer.short), State::Held)?;
-        let mut m = Message::from(&p);
-        m.origin = Some(format!("net:{}", peer.short));
-        let h = crate::holds::insert_kind(store, m, &peer.short, HoldKind::Authority, now as i64)?;
-        store.conn().execute(
-            "UPDATE holds SET requester = ?2, skill = ?3, relayed_by = ?4 WHERE id = ?1",
-            params![h.id, requester, skill, relayed_by],
-        )?;
-        store.put_seen(&peer.key, id, State::Held.name(), now as i64)?;
-        tx.commit()?;
-        return Ok(Answer {
-            fresh: true,
-            held: Some(h.id),
-            ..Answer::is(State::Held)
-        });
-    }
     // Seen with what the sender is told, so a resend makes no second copy.
     let state = State::Stored;
     record(store, &p, Origin::Net(&peer.short), false)?;
@@ -1345,75 +1160,6 @@ pub fn receive(
         fresh: true,
         ..Answer::is(state)
     })
-}
-
-/// Who `peer`'s mail is judged as: `person:<sub>` (the bound object's requester, else the
-/// sender's proof person) or `member:<short>` (a sender signed in as a workspace too), and whether a person originated it (the
-/// object's `verified_by` is not `agent-runtime`; without one, the proof verified).
-fn requester_of(
-    judge: &Judge,
-    peer: &Member,
-    a: Option<&crate::authority::Authority>,
-) -> (String, bool) {
-    let requester = match (a, judge.sender_person) {
-        (Some(a), _) => format!("person:{}", a.requester_person),
-        (None, Some(p)) => format!("person:{p}"),
-        (None, None) => format!("member:{}", peer.short),
-    };
-    let person = match a {
-        Some(a) => a.verified_by != "agent-runtime",
-        None => judge.sender_person.is_some(),
-    };
-    (requester, person)
-}
-
-/// The rules' decision on a `message` (or an `assign`, `kind`) from `peer` to `to`, with the
-/// requester and skill it judged: requester `person:<sub>` (the bound object's requester, else
-/// the sender's proof person) or `member:<short>`; skill the object's, else `assign` for an
-/// assign, else `ask_session` for an A2A Message, else `message`; the requester's org the
-/// object's, else (every peer is a roster member) the workspace.
-fn judge_message(
-    judge: &Judge,
-    peer: &Member,
-    roster: &Roster,
-    to: &str,
-    kind: &str,
-    is_a2a: bool,
-    a: Option<&crate::authority::Authority>,
-) -> (crate::rules::Decision, String, String) {
-    let (requester, origin_is_person) = requester_of(judge, peer, a);
-    let member = format!("member:{}", peer.short);
-    // With no document, the roster is the workspace (`org:*` matches its members).
-    let member_org = judge.workspace.unwrap_or(&roster.team_id);
-    let requester_org = a.map_or(member_org, |a| a.requester_org.as_str());
-    let chain_agents: Vec<String> = a.map_or(vec![], |a| {
-        a.chain.iter().filter_map(|h| h.agent.clone()).collect()
-    });
-    let hash = a.map(|a| crate::authority::operands_hash(&a.operands));
-    let resource = format!("session:{to}");
-    let skill = match a {
-        Some(a) => a.skill.as_str(),
-        None if kind == "assign" => "assign",
-        None if is_a2a => "ask_session",
-        None => "message",
-    };
-    let input = crate::rules::Input {
-        org: judge.workspace,
-        requester: &requester,
-        requester_member: Some(&member),
-        requester_org: Some(requester_org),
-        chain_agents: &chain_agents,
-        resource: &resource,
-        skill,
-        session_person: judge.my_person,
-        operands: a.map(|a| &a.operands),
-        intent: a.map(|a| a.intent.as_str()),
-        verified_by: a.map(|a| a.verified_by.as_str()),
-        operands_hash: hash.as_deref(),
-        origin_is_person,
-    };
-    let d = crate::rules::decide(judge.rules, judge.exceptions, &input);
-    (d, requester, skill.into())
 }
 
 /// What senders are owed about the messages they sent here: a `Receipt` for each whose state
@@ -1458,42 +1204,6 @@ pub fn waiting(store: &Store, to: &Key, now: u64) -> Result<Vec<Message>> {
         out.extend(store.message(&id?)?);
     }
     Ok(out)
-}
-
-/// The messages to member `short`'s names (`<short>/<name>`) that were delivered and are not
-/// yet read, oldest first: taken from the mailbox, their text kept until `mark_read`. Only
-/// those delivered within `outbox::TTL_S` of `now`; `expire_delivered` ends the rest.
-pub fn delivered_unread(store: &Store, short: &str, now: u64) -> Result<Vec<Message>> {
-    let since = now.saturating_sub(crate::outbox::TTL_S) as i64;
-    let ids = delivered_ids(store, short, "r.updated_at >= ?3", since)?;
-    let mut out = vec![];
-    for id in ids {
-        out.extend(store.message(&id)?);
-    }
-    Ok(out)
-}
-
-/// Member `short`'s delivered-unread mail (`delivered_unread`) delivered more than
-/// `outbox::TTL_S` before `now` becomes `expired` (its text is `forget`'s then): a turn that
-/// never completes is not handed out for ever.
-pub fn expire_delivered(store: &Store, short: &str, now: u64) -> Result<()> {
-    let before = now.saturating_sub(crate::outbox::TTL_S) as i64;
-    let tx = store.conn().unchecked_transaction()?;
-    for id in delivered_ids(store, short, "r.updated_at < ?3", before)? {
-        if let Some(m) = store.message(&id)? {
-            advance(
-                &tx,
-                &m.from_key,
-                &m.request_id,
-                State::Expired,
-                None,
-                None,
-                now,
-            )?;
-        }
-    }
-    tx.commit()?;
-    Ok(())
 }
 
 /// Closes member `me`'s unanswered assignments whose deadline (`meta.deadline_at`) is at or
@@ -1549,10 +1259,8 @@ fn close_assignment(
             ..Meta::default()
         },
         sent_at: now as i64,
-        a2a: None,
         sig: None,
         signed_at: None,
-        authority: None,
     };
     // One transaction each: an assignment that cannot be closed never stops the others.
     let stored = (|| -> Result<()> {
@@ -1564,23 +1272,6 @@ fn close_assignment(
         Ok(()) => askers.push((Key(a.from_key.clone()), p.message_id)),
         Err(e) => eprintln!("mail: assignment {} not closed: {e}", a.id),
     }
-}
-
-/// The ids of `delivered_unread`'s messages for which `bound` (on `r.updated_at`, the delivery
-/// time, against `?3` = `at`) holds, oldest first.
-fn delivered_ids(store: &Store, short: &str, bound: &str, at: i64) -> Result<Vec<String>> {
-    let mut stmt = store.conn().prepare(&format!(
-        "SELECT m.id FROM messages m JOIN receipts r \
-         ON r.from_key = m.from_key AND r.request_id = m.request_id \
-         WHERE r.state = 'delivered' AND m.body IS NOT NULL AND substr(m.to_key, 1, ?2) = ?1 \
-         AND {bound} AND NOT EXISTS (SELECT 1 FROM mailbox b WHERE b.message_id = m.id) \
-         ORDER BY m.rowid"
-    ))?;
-    let prefix = format!("{short}/");
-    let ids = stmt.query_map(params![prefix, prefix.len() as i64, at], |r| {
-        r.get::<_, String>(0)
-    })?;
-    Ok(ids.collect::<rusqlite::Result<_>>()?)
 }
 
 /// The addresses with waiting mail, newest mail first.
@@ -1713,22 +1404,6 @@ pub fn expire(store: &Store, now: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a2a_text_is_the_text_parts_joined_or_none() {
-        use serde_json::json;
-        let two = json!({"role": "ROLE_AGENT", "parts": [{"text": "a"}, {"text": "b"}]});
-        assert_eq!(a2a_text(&two).as_deref(), Some("a\nb"));
-        for bad in [
-            json!({"role": "ROLE_USER", "parts": []}),
-            json!({"parts": [{"text": "a"}]}),
-            json!({"role": "user", "parts": [{"text": "a"}]}),
-            json!({"role": "ROLE_USER", "parts": {"text": "a"}}),
-            json!("hi"),
-        ] {
-            assert_eq!(a2a_text(&bad), None, "{bad}");
-        }
-    }
 
     /// A config with network workers on (assignments are refused `unsupported` without).
     fn workers_on() -> Config {
@@ -2451,20 +2126,7 @@ mod tests {
         let (peer, roster, _) = peer_mail("m/claude:2", "x");
         let meta = terms("green", 1060);
         let env = peer_env("p/codex:a", "m/claude:2", "r1", "assign", meta);
-        let got = receive(
-            &s,
-            &env,
-            None,
-            &peer,
-            &roster,
-            "m",
-            None,
-            None,
-            &workers_on(),
-            1000,
-            &Judge::default(),
-        )
-        .unwrap();
+        let got = receive(&s, &env, None, &peer, &roster, "m", &workers_on(), 1000).unwrap();
         assert_eq!(
             got,
             Answer {
@@ -2485,20 +2147,7 @@ mod tests {
             "assign",
             terms("green", 1060),
         );
-        let got = receive(
-            &s,
-            &env,
-            None,
-            &peer,
-            &roster,
-            "m",
-            None,
-            None,
-            &workers_on(),
-            1000,
-            &Judge::default(),
-        )
-        .unwrap();
+        let got = receive(&s, &env, None, &peer, &roster, "m", &workers_on(), 1000).unwrap();
         assert_eq!(
             (got.state, got.reason.as_deref()),
             (State::Refused, Some("no_worker"))
@@ -2533,38 +2182,12 @@ mod tests {
         if let Frame::Envelope { reply_to, hops, .. } = &mut third {
             (*reply_to, *hops) = (Some(a.message_id.clone()), a.hops as u32 + 1);
         }
-        let got = receive(
-            &s,
-            &third,
-            None,
-            &peer,
-            &roster,
-            "m",
-            None,
-            None,
-            &workers_on(),
-            1000,
-            &Judge::default(),
-        )
-        .unwrap();
+        let got = receive(&s, &third, None, &peer, &roster, "m", &workers_on(), 1000).unwrap();
         assert_eq!(
             (got.state, got.reason.as_deref()),
             (State::Refused, Some("policy"))
         );
-        let got = receive(
-            &s,
-            &env,
-            None,
-            &peer,
-            &roster,
-            "m",
-            None,
-            None,
-            &workers_on(),
-            1000,
-            &Judge::default(),
-        )
-        .unwrap();
+        let got = receive(&s, &env, None, &peer, &roster, "m", &workers_on(), 1000).unwrap();
         assert_eq!(got.state, State::Stored);
         let Frame::Envelope { id, .. } = &env else {
             unreachable!()
@@ -2574,20 +2197,7 @@ mod tests {
         assert!(stored.hops >= 1);
         // A result to a plain message is not an answer to an assignment.
         let plain = peer_env("p/claude:9", "m/codex:1", "r2", "message", Meta::default());
-        receive(
-            &s,
-            &plain,
-            None,
-            &peer,
-            &roster,
-            "m",
-            None,
-            None,
-            &workers_on(),
-            1000,
-            &Judge::default(),
-        )
-        .unwrap();
+        receive(&s, &plain, None, &peer, &roster, "m", &workers_on(), 1000).unwrap();
         let Frame::Envelope { id: plain_id, .. } = &plain else {
             unreachable!()
         };
@@ -2595,20 +2205,7 @@ mod tests {
         if let Frame::Envelope { reply_to, hops, .. } = &mut env {
             (*reply_to, *hops) = (Some(plain_id.clone()), 1);
         }
-        let got = receive(
-            &s,
-            &env,
-            None,
-            &peer,
-            &roster,
-            "m",
-            None,
-            None,
-            &workers_on(),
-            1000,
-            &Judge::default(),
-        )
-        .unwrap();
+        let got = receive(&s, &env, None, &peer, &roster, "m", &workers_on(), 1000).unwrap();
         assert_eq!(
             (got.state, got.reason.as_deref()),
             (State::Refused, Some("policy"))
@@ -2620,20 +2217,7 @@ mod tests {
         let (_d, s) = setup();
         let (peer, roster, _) = peer_mail("m/codex:c", "x");
         let env = peer_env("p/codex:a", "m/codex:c", "r1", "poke", Meta::default());
-        let got = receive(
-            &s,
-            &env,
-            None,
-            &peer,
-            &roster,
-            "m",
-            None,
-            None,
-            &workers_on(),
-            1000,
-            &Judge::default(),
-        )
-        .unwrap();
+        let got = receive(&s, &env, None, &peer, &roster, "m", &workers_on(), 1000).unwrap();
         assert_eq!(
             (got.state, got.reason.as_deref()),
             (State::Refused, Some("unsupported"))
@@ -2645,20 +2229,7 @@ mod tests {
         let (_d, s) = setup();
         for (i, to) in ["m/terminal", "m/codex:c"].iter().enumerate() {
             let (peer, roster, env) = peer_mail(to, &format!("r{i}"));
-            let got = receive(
-                &s,
-                &env,
-                None,
-                &peer,
-                &roster,
-                "m",
-                None,
-                None,
-                &workers_on(),
-                1000,
-                &Judge::default(),
-            )
-            .unwrap();
+            let got = receive(&s, &env, None, &peer, &roster, "m", &workers_on(), 1000).unwrap();
             let fresh = Answer {
                 fresh: true,
                 ..Answer::is(State::Stored)
@@ -2676,36 +2247,10 @@ mod tests {
         let (_d, s) = setup();
         let (peer, roster, env) = peer_mail("m/codex:c", "r1");
         let again = || {
-            let r = receive(
-                &s,
-                &env,
-                None,
-                &peer,
-                &roster,
-                "m",
-                None,
-                None,
-                &workers_on(),
-                1001,
-                &Judge::default(),
-            )
-            .unwrap();
+            let r = receive(&s, &env, None, &peer, &roster, "m", &workers_on(), 1001).unwrap();
             (r.state, r.reason, r.fresh)
         };
-        receive(
-            &s,
-            &env,
-            None,
-            &peer,
-            &roster,
-            "m",
-            None,
-            None,
-            &workers_on(),
-            1000,
-            &Judge::default(),
-        )
-        .unwrap();
+        receive(&s, &env, None, &peer, &roster, "m", &workers_on(), 1000).unwrap();
         advance(
             s.conn(),
             "p/codex:a",
@@ -2824,32 +2369,6 @@ mod tests {
         advance(s.conn(), "m/codex:b", "r2", State::Read, None, None, 3).unwrap();
         forget(&s).unwrap();
         assert_eq!(body("r2").as_deref(), Some("yo"));
-    }
-
-    #[test]
-    fn a_parked_workspace_reads_as_waking_not_offline() {
-        let p = ForPerson {
-            to: Some("w/friday"),
-            rid: "r1",
-            kind: Some("message"),
-            cmd: "lightbulb",
-            check: false,
-        };
-        let r = |waking: bool| {
-            serde_json::json!({"state": "queued", "where": "Acme", "person": "Acme",
-                "online": false, "waking": waking, "until": 0})
-        };
-        assert_eq!(
-            receipt_note(&r(true), Some(&p)).unwrap(),
-            "Sent. Acme is waking up and gets it in a moment."
-        );
-        assert!(receipt_note(&r(false), Some(&p))
-            .unwrap()
-            .contains("is offline"));
-        assert_eq!(
-            receipt_note(&r(true), None).unwrap(),
-            "queued: Acme is waking up and gets it in a moment."
-        );
     }
 
     #[test]
@@ -3273,20 +2792,7 @@ mod tests {
         if let Frame::Envelope { reply_to, hops, .. } = &mut env {
             (*reply_to, *hops) = (Some(a.message_id.clone()), a.hops as u32 + 1);
         }
-        let got = receive(
-            &s,
-            &env,
-            None,
-            &peer,
-            &roster,
-            "m",
-            None,
-            None,
-            &workers_on(),
-            1000,
-            &Judge::default(),
-        )
-        .unwrap();
+        let got = receive(&s, &env, None, &peer, &roster, "m", &workers_on(), 1000).unwrap();
         assert_eq!(got.state, State::Stored);
     }
 
@@ -3302,20 +2808,7 @@ mod tests {
             if let Frame::Envelope { reply_to, hops, .. } = &mut env {
                 (*reply_to, *hops) = (Some(a.message_id.clone()), a.hops as u32 + 1);
             }
-            receive(
-                &s,
-                &env,
-                None,
-                &peer,
-                &roster,
-                "m",
-                None,
-                None,
-                &workers_on(),
-                1000,
-                &Judge::default(),
-            )
-            .unwrap()
+            receive(&s, &env, None, &peer, &roster, "m", &workers_on(), 1000).unwrap()
         };
         let got = cancel("m/claude:x1", "c1");
         assert_eq!(
@@ -3349,9 +2842,8 @@ mod tests {
             ..Default::default()
         };
         let mut config = workers_on();
-        let take = |config: &Config, a: &Message| {
-            workers::take_assign(&s, config, "m", a, None, 10).unwrap()
-        };
+        let take =
+            |config: &Config, a: &Message| workers::take_assign(&s, config, "m", a, 10).unwrap();
         let st = |a: &Message| state(&s, &a.request_id);
         // Not offered, nor for this harness.
         let a = assign("r1", "p/codex:a");
@@ -3423,20 +2915,7 @@ mod tests {
         };
         for kind in ["assign", "result", "cancel"] {
             let env = peer_env("p/codex:a", "m/claude:new", "r1", kind, terms("x", 1060));
-            let got = receive(
-                &s,
-                &env,
-                None,
-                &peer,
-                &roster,
-                "m",
-                None,
-                None,
-                &config,
-                1000,
-                &Judge::default(),
-            )
-            .unwrap();
+            let got = receive(&s, &env, None, &peer, &roster, "m", &config, 1000).unwrap();
             assert_eq!(
                 (got.state, got.reason.as_deref()),
                 (State::Refused, Some("unsupported")),
@@ -3461,37 +2940,11 @@ mod tests {
             "assign",
             terms("x", 1060),
         );
-        let first = receive(
-            &s,
-            &env,
-            None,
-            &peer,
-            &roster,
-            "m",
-            None,
-            None,
-            &config,
-            1000,
-            &Judge::default(),
-        )
-        .unwrap();
+        let first = receive(&s, &env, None, &peer, &roster, "m", &config, 1000).unwrap();
         assert_eq!((first.state, first.fresh), (State::Held, true));
         assert!(matches!(first.taken, Some(Taken::Held { .. })));
         // The same envelope again, and the same request under another envelope id.
-        let again = receive(
-            &s,
-            &env,
-            None,
-            &peer,
-            &roster,
-            "m",
-            None,
-            None,
-            &config,
-            1001,
-            &Judge::default(),
-        )
-        .unwrap();
+        let again = receive(&s, &env, None, &peer, &roster, "m", &config, 1001).unwrap();
         assert_eq!(
             (again.state, again.fresh, again.taken),
             (State::Held, false, None)
@@ -3503,20 +2956,7 @@ mod tests {
             "assign",
             terms("x", 1060),
         );
-        let again = receive(
-            &s,
-            &other,
-            None,
-            &peer,
-            &roster,
-            "m",
-            None,
-            None,
-            &config,
-            1002,
-            &Judge::default(),
-        )
-        .unwrap();
+        let again = receive(&s, &other, None, &peer, &roster, "m", &config, 1002).unwrap();
         assert_eq!((again.state, again.fresh), (State::Held, false));
         let holds: i64 = s
             .conn()

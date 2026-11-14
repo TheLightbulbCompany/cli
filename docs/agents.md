@@ -15,15 +15,15 @@ it adds two things:
   `'~/.lightbulb/connect/bin/lightbulb' hook <agent> <event>` (with your real home path).
   Hooks tell Lightbulb which sessions are open, and hand waiting messages to the agent.
 - **A tool server** (an MCP server) named `lightbulb`. Its command is
-  `~/.lightbulb/connect/bin/lightbulb mcp`. It always gives the agent six network tools (`recall` and `remember` among them), and three more for assignments while network workers are on. While this computer is signed in (`lightbulb login`), it also gives the workspace tools (`find_rooms`, `read_messages`, `find_tasks`, `read_task`, `update_task`, `use_browser`), and `send_message` can post to a room (`room_id`) or a person (`person_id`). The names, descriptions and schemas are `src/mcp/tools.json`; `lightbulb mcp --tools-json` prints it.
+  `~/.lightbulb/connect/bin/lightbulb mcp`. It always gives the agent six network tools (`recall` and `remember` among them), and three more for assignments while network workers are on. The names, descriptions and schemas are `src/mcp/tools.json`; `lightbulb mcp --tools-json` prints it.
 
   | Tool | What it does |
   |---|---|
-  | `find_sessions` | Lists the sessions you can message: this computer's first, then your teammates', with those that ended last. `status` is busy, waiting (`waiting_for` says for what; its person must answer), idle or ended; `online: false` with `seen_at` is an offline computer, and `wakes: true` a parked workspace that a message wakes. Ended sessions stay seven days, with `ended_at` and `reason`; your own carry `resume`, the command that resumes them. An ended session reads nothing unless resumed; a message to one waits a day. Takes an optional search text and a limit (default 20). |
+  | `find_sessions` | Lists the sessions you can message: this computer's first, then your teammates', with those that ended last. `status` is busy, waiting (`waiting_for` says for what; its person must answer), idle or ended; `online: false` with `seen_at` is an offline computer. Ended sessions stay seven days, with `ended_at` and `reason`; your own carry `resume`, the command that resumes them. An ended session reads nothing unless resumed; a message to one waits a day. Takes an optional search text and a limit (default 20). |
   | `send_message` | Sends text to a session by its `session_id`, or answers a message with `reply_to`. Returns a receipt. |
   | `message_receipt` | Shows the receipt of a message this session sent. |
   | `check_inbox` | Takes the messages waiting for this session. It can wait up to 600 seconds per call for one to arrive. |
-  | `find_workers` | Lists the agents that take an assignment: for now the always-on agents (workspace agents and connected apps). |
+  | `find_workers` | Lists the agents that take an assignment: teammates' computers that start a fresh worker for you. |
   | `assign` | Hands one job to one session: a brief, a `done_when` line and a deadline (default an hour). Its reply is the result. |
   | `cancel_assignment` | Tells the session working on an assignment to stop. |
 
@@ -31,11 +31,11 @@ it adds two things:
 
 `find_workers` also lists computers that start a fresh worker for you (`<member>/claude:new`). Assign to one and its person is asked once; the worker then runs headless in a folder of its own, its permission prompts go to that person (never to you), and its reply is the result. The person manages them with `lightbulb workers`.
 
-**Workspace agents.** An assignment reaches a workspace agent once its runtime runs an engine with this feature and its `config.toml` turns `network_workers` on; until then it is refused `unsupported`, like on any computer. The frame names no tool, only `reply_to` with the assignment's `requestId`. The bridge half is TheLightbulbCompany/lightbulb#4489.
+Messaging and assigning to a session that already exists are gated only by team membership. Starting a fresh worker on someone's computer asks that computer's person once: Always allow or refuse, per member, and revocable (`lightbulb workers policy`).
 
 Before it changes a file for the first time, `setup` saves a copy beside it as
 `<file>.lightbulb-backup`. It never overwrites a backup. It does not touch other entries in
-those files. Setup removes an older `lightbulb-network` entry that runs a `lightbulb` program, with its allow rules. It replaces an entry already called `lightbulb` only when it is ours, the Lightbulb desktop app's old `session-mcp` server, or the hosted Lightbulb MCP (`https://api.thelightbulb.company/mcp`). Any other `lightbulb` entry stays: that agent gets hooks only, and `doctor` says which entry is in the way.
+those files. Setup removes an older `lightbulb-network` entry that runs a `lightbulb` program, with its allow rules. It replaces an entry already called `lightbulb` only when it is ours. Any other `lightbulb` entry stays: that agent gets hooks only, and `doctor` says which entry is in the way.
 
 `lightbulb setup --verbose` lists every file it changed. `lightbulb setup --server-name <name>`
 uses another name for the tool server (letters, digits, `-` and `_`).
@@ -177,22 +177,6 @@ Lightbulb header, Lightbulb breaks it with an invisible character, so a sender c
 Where you see it depends on the agent. A pushed message appears in the session as its own turn.
 A message handed over by a hook goes to the agent as hook context; you see it through what the
 agent says and does next.
-
-**From a Lightbulb workspace.** A workspace joins your team as one more member,
-`lightbulb member`: the engine run beside the workspace's agents in its cloud machine. Its
-agents (Friday, and the others the workspace declares) send and read like any session. An
-assistant you use through Lightbulb's hosted connector, such as ChatGPT or Claude.ai, sends
-through that member too, from its own session for you, and your teammates see it as
-`<workspace>'s ChatGPT via <your first name>`. Your computer does not need to be on for that.
-The workspace's agents answer only its people's computers: run `lightbulb login` on each
-computer you use with them; a computer alone on its own network joins the workspace's network
-then. A workspace admin adds the agents to a network with
-`lightbulb invite --agents` (confirm in the browser, and the workspace joins).
-Anyone else sees Friday in `who --all`, but its messages are refused: "This workspace answers its
-members. Ask an admin to add you, then run `lightbulb login`." A message Friday sends you reaches your sessions, as any member's does. The
-workspace's machine sleeps when it is idle: when your computer has messages for it and cannot
-reach it, it rings the workspace's wake address once with `curl` (again after 30 seconds, then
-less often, at most every 15 minutes), and sends the messages when the machine is up.
 
 ## Asking an agent to message someone
 

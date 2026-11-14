@@ -1,7 +1,7 @@
 //! The wire: one `Frame` per message, a u32 big-endian length then that many bytes of JSON
 //! tagged by `t`, at most 1 MiB. The one definition of every frame later tasks send.
 
-use crate::daemon::{ipc, Daemon};
+use crate::daemon::ipc;
 use crate::doing::TEXT_MAX;
 use crate::frame::Sender;
 use crate::identity::{self, Identity};
@@ -169,10 +169,6 @@ pub enum Frame {
         /// that moved networks can be dialed without mDNS. Absent from older builds.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         addrs: Vec<String>,
-        /// The sender's sign-in proof (`proof`), when its person ran `lightbulb login`: what a
-        /// workspace member admits it by. Absent from older builds.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        proof: Option<String>,
         /// The sender syncs shared memory (`MemoryHeads`, `Memory`). Absent from older builds.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         memory: bool,
@@ -214,9 +210,7 @@ pub enum Frame {
         sent_at: i64,
         #[serde(default, skip_serializing_if = "Meta::is_empty")]
         meta: Meta,
-        /// The A2A Message's `role`, `parts`, `metadata` and `extensions` (its ids, thread and
-        /// reply ride the envelope); its text parts joined are `body` (`mail::a2a_text`).
-        /// Absent from older builds.
+        /// An A2A Message from an older build: this build refuses it `unsupported`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         a2a: Option<serde_json::Value>,
         /// The sending computer's signature (`envelope_sig`). Absent from older builds.
@@ -364,14 +358,10 @@ pub fn verify_envelope_sig(member_key: &str, frame: &serde_json::Value) -> bool 
 /// under its prefix (ended rows are filtered one by one, `presence::put`), a `seq` at most a day ahead of now. An `envelope` is
 /// checked by `mail::receive`. An `ack` or `receipt` names a state past `queued`, with a known
 /// reason exactly when it is `refused`, and a `limit` only on a `loop` refusal (that it is bound
-/// to this member is `outbox::acked`'s check). A `share_grant` passes `streams::grant_ok`. A
+/// to this member is `outbox::acked`'s check). A `share_grant` (retired) is ignored. A
 /// `stream` never rides the control stream, and a `hold_notice` or a
 /// `decision` (retired) is served nowhere. `Err` names the check.
-pub fn from_peer_ok(
-    f: &Frame,
-    peer: &Member,
-    daemon: &Daemon,
-) -> std::result::Result<(), &'static str> {
+pub fn from_peer_ok(f: &Frame, peer: &Member) -> std::result::Result<(), &'static str> {
     let check = |ok: bool, why| if ok { Ok(()) } else { Err(why) };
     match f {
         // Its `addrs` are a hint, checked where they are kept (`parse_addrs`).
@@ -418,9 +408,8 @@ pub fn from_peer_ok(
                 && known.iter().chain(kept).all(|a| own(&peer.short, a));
             check(ok, "presence")
         }
-        Frame::ShareGrant { .. } => {
-            crate::streams::grant_ok(f, peer, &daemon.identity.key, ipc::now() as i64)
-        }
+        // Retired with the desktop app's streams: decoded, then ignored.
+        Frame::ShareGrant { .. } => Ok(()),
         _ => Err("not served"),
     }
 }
@@ -428,8 +417,8 @@ pub fn from_peer_ok(
 #[cfg(test)]
 mod tests {
     #[test]
-    fn every_reason_is_in_the_a2a_binding_page() {
-        let page = include_str!("../../docs/a2a-binding.md");
+    fn every_reason_is_in_the_wire_page() {
+        let page = include_str!("../../docs/wire.md");
         for r in super::REASONS {
             assert!(
                 page.contains(&format!("`{r}`")),
@@ -746,7 +735,6 @@ mod tests {
             protocol: 1,
             heads: vec!["h".into()],
             addrs: vec!["127.0.0.1:1".into()],
-            proof: None,
             memory: true,
         };
         write(&mut a, &hello).await.unwrap();

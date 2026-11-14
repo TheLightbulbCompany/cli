@@ -1,18 +1,12 @@
 //! The one way the daemon asks the person a question: an `osascript` dialog, one on screen at
-//! a time, none while the Lightbulb app holds a `ui.claim` lease.
+//! a time.
 
-use crate::daemon::ipc::now;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicI64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot, Notify};
-
-/// A `ui.claim` lasts this long; the app heartbeats every 7 s.
-pub const LEASE_S: i64 = 20;
 
 /// Where answers arrive: `(id, Option<button>)`.
 pub type Answers = mpsc::UnboundedReceiver<(String, Option<String>)>;
@@ -49,7 +43,7 @@ pub fn args(title: &str, text: &str, buttons: &[&str]) -> Vec<String> {
     a
 }
 
-/// The dialog id of an agent's `team.join`: `show_over_claim`, one at a time (`Daemon::joining`).
+/// The dialog id of an agent's `team.join`: `show_next`, one at a time (`Daemon::joining`).
 pub const JOIN_CONFIRM: &str = "JC";
 
 /// Dialog id `<prefix><n>`'s `n` (`J` a join request, `H` a hold).
@@ -76,7 +70,6 @@ struct Inner {
     program: PathBuf,
     state: Mutex<State>,
     wake: Notify,
-    claim_until: AtomicI64,
     answers: mpsc::UnboundedSender<(String, Option<String>)>,
     /// `net::Knobs::dialog`: what every dialog answers in place of `osascript`.
     knob: OnceLock<Option<String>>,
@@ -99,7 +92,6 @@ impl Queue {
             program,
             state: Mutex::default(),
             wake: Notify::new(),
-            claim_until: AtomicI64::new(0),
             answers,
             knob: OnceLock::new(),
         });
@@ -126,9 +118,8 @@ impl Queue {
         self.0.wake.notify_one();
     }
 
-    /// Queues dialog `id` next, and shows it through a `ui.claim`: a page in the app that holds
-    /// the claim must not be what answers, or delays, this question.
-    pub fn show_over_claim(&self, id: &str, args: Vec<String>) {
+    /// Queues dialog `id` next.
+    pub fn show_next(&self, id: &str, args: Vec<String>) {
         let mut s = self.0.state.lock().unwrap();
         s.waiting.push_front((id.into(), args));
         drop(s);
@@ -158,15 +149,6 @@ impl Queue {
         let _ = q.0.knob.set(None);
         (q, a)
     }
-
-    /// `ui.claim` at `now`: no dialog opens for `LEASE_S`.
-    pub fn claim(&self, now: i64) {
-        self.0.claim_until.store(now + LEASE_S, Relaxed);
-    }
-
-    pub fn claim_live(&self, now: i64) -> bool {
-        self.0.claim_until.load(Relaxed) > now
-    }
 }
 
 impl Drop for Queue {
@@ -175,27 +157,16 @@ impl Drop for Queue {
     }
 }
 
-/// One dialog at a time, in order. While a claim is live the head waits for the claim to
-/// lapse (looking again at least each second), or to be withdrawn.
+/// One dialog at a time, in order.
 async fn run(inner: Arc<Inner>) {
     loop {
         // The queue is gone (`Drop`): so is its last dialog.
         if Arc::strong_count(&inner) == 1 {
             return;
         }
-        let left = inner.claim_until.load(Relaxed) - now() as i64;
-        let (idle, over_claim) = {
-            let s = inner.state.lock().unwrap();
-            let head = s.waiting.front();
-            (head.is_none(), head.is_some_and(|(i, _)| i == JOIN_CONFIRM))
-        };
+        let idle = inner.state.lock().unwrap().waiting.is_empty();
         if idle {
             inner.wake.notified().await;
-            continue;
-        }
-        if left > 0 && !over_claim {
-            let wait = Duration::from_secs(left.min(1) as u64);
-            let _ = tokio::time::timeout(wait, inner.wake.notified()).await;
             continue;
         }
         let (id, args, killed) = {

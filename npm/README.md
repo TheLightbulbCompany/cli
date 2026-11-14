@@ -11,7 +11,4 @@ npm install -g lightbulb-cli
 lightbulb setup
 ```
 
-It sends anonymous usage counts. Set `DO_NOT_TRACK=1` before installing to send nothing, or run
-`lightbulb telemetry off` later.
-
 Everything else is in the [repository README](https://github.com/TheLightbulbCompany/cli#readme).

@@ -1,8 +1,6 @@
 //! The network ops, reached from `ipc::handle`'s fallback arm.
 
-use super::ipc::{
-    refused, Caller, Response, BAD_REQUEST, INTERNAL, NOT_FOUND, UNKNOWN_OP, UNSUPPORTED,
-};
+use super::ipc::{refused, Caller, Response, BAD_REQUEST, INTERNAL, NOT_FOUND, UNKNOWN_OP};
 use super::{Daemon, TeamState};
 use crate::agents::caller;
 use crate::identity::Identity;
@@ -82,10 +80,6 @@ pub fn remove_member(d: &Daemon, key: &str) {
 }
 
 pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, caller: Caller) -> Response {
-    // Retired: the cloud-member unlink; any member is removed with `team.remove`.
-    if op == "team.unlink" {
-        return Response::err(id, UNSUPPORTED);
-    }
     if op.starts_with("team.") {
         let invite = if op == "team.invite" {
             match serde_json::from_value::<Option<Invite>>(body["mode"].clone()) {
@@ -95,14 +89,12 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, caller: Caller) 
         } else {
             Invite::default()
         };
-        // An agent's or a workspace member's link is for one join, whatever it asked for; only a
-        // person mints the rest.
+        // An agent's link is for one join, whatever it asked for; only a person mints the rest.
         let actor = caller.actor(&daemon.store.lock().unwrap());
         let agent = actor
             .clone()
             .filter(|a| op == "team.invite" && a != "local");
-        let instance = caller == Caller::Instance;
-        let invite = if agent.is_some() || (instance && op == "team.invite") {
+        let invite = if agent.is_some() {
             Invite::Once
         } else {
             invite
@@ -110,11 +102,11 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, caller: Caller) 
         let gate = gate(op);
         // Removal needs a person at the socket, before any authority check; an invite, a join
         // (on macOS once its person confirms) and an answer also take a resolved agent session
-        // (`Caller::actor`), and an invite the workspace's bridge, whose token is its authority.
+        // (`Caller::actor`).
         if gate.person_only && !caller.is_person() {
             return refused(id, "not_a_person");
         }
-        if op == "team.invite" && actor.is_none() && !instance {
+        if op == "team.invite" && actor.is_none() {
             return refused(id, "not_a_person");
         }
         let mut team = daemon.team.lock().unwrap();
@@ -136,15 +128,11 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, caller: Caller) 
         };
     }
     match op {
-        // `identity.get {}` -> who this computer (or instance, named for its workspace) is; its
-        // `person_id` is its own key.
+        // `identity.get {}` -> who this computer is; its `person_id` is its own key.
         "identity.get" => {
             let t = daemon.team.lock().unwrap();
             let me = &daemon.identity.key;
-            let name = match &daemon.cloud {
-                Some(c) => c.name.clone(),
-                None => super::user_name(),
-            };
+            let name = super::user_name();
             Response::ok(
                 id,
                 json!({
@@ -161,33 +149,6 @@ pub fn handle(id: u64, op: &str, body: &Value, daemon: &Daemon, caller: Caller) 
         // from (`config`, `team`, `default` or `none`); the snapshot `status` reads too.
         "relay.get" => Response::ok(id, json!(*daemon.peers.relays.lock().unwrap())),
         "relay.set" => relay_set(id, body, daemon, caller),
-        // `ui.claim {}` -> `{lease_s}`: the Lightbulb app shows the person's questions itself;
-        // no OS dialog opens until it stops heartbeating.
-        "ui.claim" if !caller.is_person() => refused(id, "not_a_person"),
-        "ui.claim" => {
-            daemon.dialogs.claim(super::ipc::now() as i64);
-            Response::ok(id, json!({ "lease_s": crate::dialog::LEASE_S }))
-        }
-        // `snapshot {path}` -> `{}`: a consistent copy of `state.db` at `path` (absolute, outside
-        // the state dir). On a computer a person only: it copies every message out.
-        "snapshot" if !(caller.is_person() || caller == Caller::Instance) => {
-            refused(id, "not_a_person")
-        }
-        "snapshot" => match body["path"].as_str().filter(|p| outside(&daemon.dir, p)) {
-            Some(p) => match daemon
-                .store
-                .lock()
-                .unwrap()
-                .snapshot(std::path::Path::new(p))
-            {
-                Ok(()) => Response::ok(id, json!({})),
-                Err(e) => {
-                    eprintln!("snapshot: {e}");
-                    Response::err(id, INTERNAL)
-                }
-            },
-            None => Response::err(id, BAD_REQUEST),
-        },
         "reload" => match reload(daemon) {
             Ok(()) => Response::ok(id, json!({})),
             Err(e) => {
@@ -264,8 +225,7 @@ const TELL_WAIT: Duration = Duration::from_secs(5);
 /// `team.leave {}` -> `{name, told}`: writes this computer's `leave` entry and sends it to the
 /// online members, waiting up to 5 s for one to take it (it then drops the connection, as to
 /// any computer no longer a member); `told` is false when none did. Then it forgets the team
-/// and starts this computer's solo network. `person`: a person asked (an embedded instance's caller
-/// counts as one: the bridge acts for a workspace admin who confirmed in the app).
+/// and starts this computer's solo network. `person`: a person asked.
 pub async fn leave(id: u64, daemon: &Daemon, person: bool) -> Response {
     if !person {
         return refused(id, "not_a_person");
@@ -304,9 +264,8 @@ pub async fn leave(id: u64, daemon: &Daemon, person: bool) -> Response {
         store.clear_roster()?;
         // Stamped after the old root, so the new network never repeats its `team_id`.
         let now = super::ipc::now() as i64;
-        let cloud = daemon.cloud.as_ref().map(|c| c.name.as_str());
         let at = now.max(root_at + 1);
-        let g = solo_genesis(&daemon.identity, cloud, &team.config.computer, at);
+        let g = solo_genesis(&daemon.identity, &team.config.computer, at);
         roster::accept(&store, &g, now)?;
         install(daemon, &mut team, &store, roster::replay(&[g]))
     };
@@ -360,26 +319,10 @@ pub fn genesis(me: &Identity, name: &str, computer: &str, team_name: &str, at: i
     Entry::signed(me, vec![], Kind::Admit, body, at)
 }
 
-/// This engine's solo network (`genesis`): a computer's, named for its user, or an instance's
-/// (`cloud`: the workspace's name, member and team alike).
-pub(crate) fn solo_genesis(me: &Identity, cloud: Option<&str>, computer: &str, at: i64) -> Entry {
-    let user = super::user_name();
-    let name = cloud.unwrap_or(&user);
-    genesis(me, name, computer, name, at)
-}
-
-/// Whether `path` is absolute and names nothing in (or of) state dir `dir`: a snapshot never
-/// lands on the live database.
-pub(crate) fn outside(dir: &std::path::Path, path: &str) -> bool {
-    let p = std::path::Path::new(path);
-    let canon = |q: &std::path::Path| std::fs::canonicalize(q).ok();
-    let (Some(dir), Some(parent)) = (canon(dir), p.parent().and_then(canon)) else {
-        return false;
-    };
-    p.is_absolute()
-        && p.file_name().is_some()
-        && !parent.starts_with(&dir)
-        && !canon(p).is_some_and(|c| c.starts_with(&dir))
+/// This computer's solo network (`genesis`), named for its user.
+pub(crate) fn solo_genesis(me: &Identity, computer: &str, at: i64) -> Entry {
+    let name = super::user_name();
+    genesis(me, &name, computer, &name, at)
 }
 
 /// Rewrites Plan A's `team` row from `new` when its id, name or founder differs from `old`'s.
@@ -502,9 +445,8 @@ fn removed_here(
         notice.team, notice.by
     );
     store.clear_roster()?;
-    let cloud = daemon.cloud.as_ref().map(|c| c.name.as_str());
     let at = (now as i64).max(root_at + 1);
-    let g = solo_genesis(&daemon.identity, cloud, &team.config.computer, at);
+    let g = solo_genesis(&daemon.identity, &team.config.computer, at);
     roster::accept(store, &g, now as i64)?;
     install(daemon, team, store, roster::replay(&[g]))?;
     std::fs::write(daemon.dir.join(REMOVED), serde_json::to_vec(&notice)?)?;
@@ -609,20 +551,10 @@ impl TeamOps<'_> {
                         .values()
                         .any(|l| l.signer == me_key && l.expires_at > self.now);
                 let t = match live {
-                    // Never an instance's: its links are all once, so none reprints.
                     Some(l) if invite != Invite::New => {
                         let hint = self.daemon.peers.hints();
                         let expires_at = l.expires_at;
-                        ticket::sign(
-                            identity,
-                            r,
-                            l.ticket_id,
-                            l.secret,
-                            mode,
-                            expires_at,
-                            hint,
-                            None,
-                        )
+                        ticket::sign(identity, r, l.ticket_id, l.secret, mode, expires_at, hint)
                     }
                     // `--new` ends every earlier link of this computer, `open` and once ones too.
                     _ => self.new_link(mode, invite.once(), invite == Invite::New)?,
@@ -673,8 +605,6 @@ impl TeamOps<'_> {
         once: bool,
         ends_all: bool,
     ) -> crate::Result<ticket::Ticket> {
-        // A workspace member's link rings its doorbell: it may be parked when the joiner dials.
-        let wake = (self.daemon.cloud.as_ref()).and_then(|c| c.wake.lock().unwrap().clone());
         let (t, hashed) = ticket::mint(
             &self.daemon.identity,
             &self.team.roster,
@@ -682,7 +612,6 @@ impl TeamOps<'_> {
             once,
             self.now,
             self.daemon.peers.hints(),
-            wake,
         );
         let mut body = ticket::link_body(&t, hashed.as_deref());
         if ends_all {
@@ -713,120 +642,6 @@ pub(crate) fn code_link(daemon: &Daemon) -> crate::Result<ticket::Ticket> {
         agent: None,
     };
     ops.new_link(LINK_MODE, true, false)
-}
-
-/// The published sessions of member `short` that `list` declares (`cloud.sessions.set`, the
-/// sessions file at start): each `{name, agent, title?}`, names valid and distinct, at most
-/// `presence::MAX`. `None` if any is not.
-pub(crate) fn remotes(short: &str, list: &[Value]) -> Option<Vec<crate::net::frames::Remote>> {
-    if list.len() > crate::presence::MAX {
-        return None;
-    }
-    let mut names = HashSet::new();
-    let mut out = vec![];
-    for s in list {
-        let (name, agent) = (s["name"].as_str()?, s["agent"].as_str()?);
-        if !crate::sessions::valid_name(name) || !names.insert(name) {
-            return None;
-        }
-        let r = crate::net::frames::Remote {
-            session_id: format!("{short}/{name}"),
-            agent: agent.into(),
-            repo: None,
-            branch: None,
-            folder: String::new(),
-            status: "idle".into(),
-            doing: None,
-            tier: crate::sessions::Tier::Pull.as_str().into(),
-            title: s["title"].as_str().map(String::from),
-            free: None,
-            waiting_for: None,
-        }
-        .clamp();
-        if !r.valid(short) {
-            return None;
-        }
-        out.push(r);
-    }
-    Some(out)
-}
-
-/// A present `members` value (the workspace's people): `null` is no gate, a list of strings is
-/// the gate; anything else (a non-list, or a list with a non-string) is `Err`.
-pub(crate) fn members_of(v: &Value) -> Result<Option<HashSet<String>>, ()> {
-    match v {
-        Value::Null => Ok(None),
-        Value::Array(l) => l
-            .iter()
-            .map(|p| p.as_str().map(String::from).ok_or(()))
-            .collect::<Result<_, _>>()
-            .map(Some),
-        _ => Err(()),
-    }
-}
-
-/// The member gate a sessions document (the file, or `cloud.sessions.set`'s body) sets: its
-/// `members`, the people (Lightbulb user ids) whose computers' sign-in proofs it admits
-/// (`proof::admitted`); `null` is no gate; absent names none (`Ok(None)`). Anything else is `Err`.
-/// The `revoked_keys` of a sessions document: computer keys refused with any proof; absent is none.
-pub(crate) fn revoked_of(doc: &Value) -> Result<HashSet<String>, ()> {
-    match doc.get("revoked_keys") {
-        None | Some(Value::Null) => Ok(HashSet::new()),
-        Some(v) => v
-            .as_array()
-            .ok_or(())?
-            .iter()
-            .map(|k| k.as_str().map(String::from).ok_or(()))
-            .collect(),
-    }
-}
-
-pub(crate) fn gate_of(doc: &Value) -> Result<Option<Option<HashSet<String>>>, ()> {
-    match doc.get("members") {
-        Some(v) => members_of(v).map(Some),
-        None => Ok(None),
-    }
-}
-
-/// `cloud.sessions.set {sessions: [{name, agent, title?}], members?}` -> `{}` (an embedded instance only;
-/// `unsupported` on a computer): the workspace's agents, published as `<short>/<name>` with
-/// `agent` and `title` (at most `presence::MAX`, each name a `valid_name`, once). Answers once
-/// the presence sender (`presence::run`) has handed on the presence carrying them, so a `send`
-/// from a name just declared is never refused as unadvertised by a peer the envelope reaches
-/// first; `internal` if that takes over 5 s (the list stands, and goes out on the next send).
-/// `members` replaces the sessions' member gate (`mail::receive`, by sign-in proof): a list sets
-/// it, `null` removes it, absent keeps it; anything else is `bad_request`, before anything changes.
-pub async fn cloud_sessions_set(id: u64, body: &Value, daemon: &Daemon) -> Response {
-    let Some(cloud) = &daemon.cloud else {
-        return Response::err(id, UNSUPPORTED);
-    };
-    let Some(out) = body["sessions"]
-        .as_array()
-        .and_then(|l| remotes(&daemon.identity.short, l))
-    else {
-        return Response::err(id, BAD_REQUEST);
-    };
-    let members = match gate_of(body) {
-        Ok(None) => cloud.declared().members.map(|m| (*m).clone()),
-        Ok(Some(m)) => m,
-        Err(()) => return Response::err(id, BAD_REQUEST),
-    };
-    let Ok(revoked) = revoked_of(body) else {
-        return Response::err(id, BAD_REQUEST);
-    };
-    let mut sent = cloud.sent.subscribe();
-    let version = cloud.set(out, members, revoked);
-    daemon.presence.notify_one();
-    let handed = sent.wait_for(|v| *v >= version);
-    let handed = matches!(
-        tokio::time::timeout(Duration::from_secs(5), handed).await,
-        Ok(Ok(_))
-    );
-    if handed {
-        Response::ok(id, json!({}))
-    } else {
-        Response::err(id, INTERNAL)
-    }
 }
 
 /// The session of the agent above `peer_pid`, as `<member>/<handle>`.
@@ -888,12 +703,9 @@ mod tests {
     fn an_unresolved_caller_is_nobody() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("state.db")).unwrap();
-        assert_eq!(super::super::ipc::Caller::Socket(None).actor(&store), None);
-        assert_eq!(super::super::ipc::Caller::Instance.actor(&store), None);
+        assert_eq!(super::super::ipc::Caller(None).actor(&store), None);
         assert_eq!(
-            super::super::ipc::Caller::Socket(Some(1))
-                .actor(&store)
-                .as_deref(),
+            super::super::ipc::Caller(Some(1)).actor(&store).as_deref(),
             Some("local")
         );
     }

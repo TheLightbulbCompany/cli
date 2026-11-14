@@ -8,7 +8,7 @@ use crate::Result;
 use data_encoding::HEXLOWER;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
@@ -129,126 +129,11 @@ pub struct Roster {
     pub heads: Vec<String>,
     pub links: BTreeMap<String, Link>,
     pub relay: Option<String>,
-    /// A parked member's doorbell, by member key: its own latest `meta` with one. Members only.
-    pub wakes: BTreeMap<String, Wake>,
-    /// A member's A2A Agent Card, by member key: its own latest `meta` with a `card` object.
-    pub cards: BTreeMap<String, Value>,
     /// The `remove` and `leave` entries replay applied (it took their member), by hash.
     pub ended: BTreeSet<String>,
     parents: BTreeMap<String, Vec<String>>,
     /// Every replayed entry with its hash, parents first.
     log: Vec<(String, Entry)>,
-}
-
-/// The A2A Agent Card a member publishes: `short`'s address, the authority extension, and the
-/// skills it offers (`assign` only when it offers workers). `name` is its roster name.
-pub fn own_card(short: &str, name: &str, offers_workers: bool) -> Value {
-    let skill = |id: &str, n: &str, d: &str, tag: &str| json!({"id": id, "name": n, "description": d, "tags": [tag]});
-    let mut skills = vec![
-        skill(
-            "message",
-            "Message",
-            "Send this computer's sessions a message.",
-            "message",
-        ),
-        skill(
-            "ask_session",
-            "Ask a session",
-            "Ask one of this computer's sessions to do something.",
-            "session",
-        ),
-    ];
-    if offers_workers {
-        skills.push(skill(
-            "assign",
-            "Start a worker",
-            "Start a worker on this computer.",
-            "worker",
-        ));
-    }
-    json!({
-        "name": name,
-        "description": format!("{name}'s computer on Lightbulb."),
-        "version": "1",
-        "supportedInterfaces": [{
-            "url": format!("lightbulb://{short}"),
-            "protocolBinding": "https://thelightbulb.company/a2a/binding/p2p/v1",
-            "protocolVersion": "1.0",
-        }],
-        "capabilities": {
-            "streaming": false,
-            "pushNotifications": false,
-            "extensions": [{
-                "uri": crate::authority::URI,
-                "required": true,
-                "description": "Signed authority on every message.",
-            }],
-        },
-        "defaultInputModes": ["text/plain"],
-        "defaultOutputModes": ["text/plain"],
-        "skills": skills,
-    })
-}
-
-/// Where a computer rings a parked member awake (`net`'s doorbell): `POST url` with
-/// `Authorization: Bearer <token>`. The URL carries no secret; the token is never logged
-/// (`Debug` hides it).
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
-pub struct Wake {
-    pub url: String,
-    pub token: String,
-}
-
-impl std::fmt::Debug for Wake {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Wake({})", self.url)
-    }
-}
-
-/// Whether `rest` (a URL after `https://`) names a DNS host: labels of letters, digits and
-/// hyphens, at least two, ending in an alphabetic label (so no IPv4 or other number form, and no
-/// IPv6 literal), not `localhost` or under it, with no userinfo; an optional port.
-fn wake_host(rest: &str) -> bool {
-    let auth = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    let (host, port) = match auth.split_once(':') {
-        Some((h, p)) => (h, Some(p)),
-        None => (auth, None),
-    };
-    let label = |l: &str| {
-        (1..=63).contains(&l.len())
-            && !l.starts_with('-')
-            && !l.ends_with('-')
-            && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-    };
-    let labels: Vec<&str> = host.split('.').collect();
-    let tld = labels.last().copied().unwrap_or_default();
-    port.is_none_or(|p| (1..=5).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_digit()))
-        && host.len() <= 253
-        && labels.len() >= 2
-        && labels.iter().all(|l| label(l))
-        && tld.len() >= 2
-        && tld.bytes().all(|b| b.is_ascii_alphabetic())
-        && !host.eq_ignore_ascii_case("localhost")
-        && !tld.eq_ignore_ascii_case("localhost")
-}
-
-impl Wake {
-    /// A `meta` body's `wake`: an https URL of printable ASCII with no space or quote, whose
-    /// host is a public-looking DNS name (`wake_host`), and a token of `[A-Za-z0-9._-]` (it is
-    /// written into curl's config, never a command line). A DNS name that resolves to a private
-    /// address is not filtered (accepted: only a member's own signed `meta` supplies it).
-    pub fn parse(v: &Value) -> Option<Wake> {
-        let (url, token) = (v["url"].as_str()?, v["token"].as_str()?);
-        let url_ok = url.strip_prefix("https://").is_some_and(wake_host)
-            && url.len() <= 2048
-            && url
-                .bytes()
-                .all(|b| b.is_ascii_graphic() && !b"\"'\\".contains(&b));
-        (url_ok && crate::sessions::word(token, 512)).then(|| Wake {
-            url: url.into(),
-            token: token.into(),
-        })
-    }
 }
 
 impl Roster {
@@ -521,19 +406,10 @@ fn pass(
                 if let Some(relay) = e.body["relay"].as_str() {
                     r.relay = Some(relay.to_string());
                 }
-                if let Some(w) = Wake::parse(&e.body["wake"]) {
-                    r.wakes.insert(e.signer.clone(), w);
-                }
-                // `accept` already refuses an oversized entry; a replay of one never replaces.
-                if e.body["card"].is_object() && canonical(&e.value()).len() <= MAX_ENTRY_BYTES {
-                    r.cards.insert(e.signer.clone(), e.body["card"].clone());
-                }
             }
             Kind::Link | Kind::Other => {}
         }
     }
-    r.wakes.retain(|k, _| r.members.contains_key(k));
-    r.cards.retain(|k, _| r.members.contains_key(k));
     r.admissions.retain(|k, _| r.members.contains_key(k));
     debug_assert!(r.members.keys().all(|key| r.admission_id(key).is_some()));
     // Live links: unused, not retired, and descended from every removal (a removal it did not
@@ -695,44 +571,6 @@ pub fn accept(store: &Store, entry: &Entry, now: i64) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn own_card_has_the_required_a2a_fields() {
-        let c = super::own_card("ab12", "bob", false);
-        assert_eq!(c["supportedInterfaces"][0]["url"], "lightbulb://ab12");
-        assert_eq!(
-            c["supportedInterfaces"][0]["protocolBinding"],
-            "https://thelightbulb.company/a2a/binding/p2p/v1"
-        );
-        assert_eq!(
-            c["capabilities"]["extensions"][0]["uri"],
-            crate::authority::URI
-        );
-        assert_eq!(c["capabilities"]["extensions"][0]["required"], true);
-        assert_eq!(c["supportedInterfaces"][0]["protocolVersion"], "1.0");
-        assert_eq!(c["defaultInputModes"], serde_json::json!(["text/plain"]));
-        assert_eq!(c["defaultOutputModes"], serde_json::json!(["text/plain"]));
-        assert_eq!(c["capabilities"]["streaming"], false);
-        let ids = |c: &serde_json::Value| -> Vec<String> {
-            c["skills"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|s| {
-                    for f in ["id", "name", "description"] {
-                        assert!(s[f].as_str().is_some_and(|x| !x.is_empty()), "{s}");
-                    }
-                    assert!(s["tags"].as_array().is_some_and(|t| !t.is_empty()), "{s}");
-                    s["id"].as_str().unwrap().to_string()
-                })
-                .collect()
-        };
-        assert_eq!(ids(&c), ["message", "ask_session"]);
-        assert_eq!(
-            ids(&super::own_card("ab12", "bob", true)),
-            ["message", "ask_session", "assign"]
-        );
-    }
-
     use super::*;
     use serde_json::json;
 
@@ -1140,62 +978,6 @@ mod tests {
             .unwrap()
             .exists([over.hash()])
             .unwrap());
-    }
-
-    #[test]
-    fn wake_parse_takes_http_s_and_a_plain_token_only() {
-        let w = |url: &str, token: &str| Wake::parse(&json!({"url": url, "token": token}));
-        let ok = w("https://example.test/api/v1/network/wake", "org_1.abc-D");
-        assert_eq!(
-            ok.map(|w| w.url),
-            Some("https://example.test/api/v1/network/wake".into())
-        );
-        for url in [
-            "http://example.test/w",
-            "https://127.0.0.1/w",
-            "https://[::1]/w",
-            "https://localhost/w",
-            "https://a.localhost/w",
-            "https://intranet/w",
-            "https://10.0.0.1:8443/w",
-            "https://example.test@evil.test.1/w",
-            "https://user@example.test/w",
-            "https://0x7f.1/w",
-            "https://example.test:/w",
-        ] {
-            assert!(w(url, "t").is_none(), "{url}");
-        }
-        assert!(w("https://wake.example.test:8443/w?x=1", "t").is_some());
-        for (url, token) in [
-            ("file:///etc/passwd", "t"),
-            ("https://example.test/a b", "t"),
-            ("https://example.test/\"x", "t"),
-            ("https://example.test/", "a\"b"),
-            ("https://example.test/", "a\nb"),
-            ("https://example.test/", ""),
-        ] {
-            assert!(w(url, token).is_none(), "{url} {token:?}");
-        }
-        assert!(w("https://example.test/", &"t".repeat(513)).is_none());
-        assert!(w("https://example.test/", &"t".repeat(512)).is_some());
-    }
-
-    #[test]
-    fn each_members_own_wake_is_taken() {
-        let (f, b) = (id(), id());
-        let g = genesis(&f);
-        let ab = admit(&f, &g, &b.key, "b");
-        let wake = json!({"wake": {"url": "https://example.test/w", "token": "o.s"}});
-        let m = op(&f, &ab, Kind::Meta, wake);
-        let mb = op(
-            &b,
-            &m,
-            Kind::Meta,
-            json!({"wake": {"url": "https://x.test/", "token": "b"}}),
-        );
-        let r = replay(&[g, ab, m, mb]);
-        assert_eq!(r.wakes.get(&f.key).map(|w| w.token.as_str()), Some("o.s"));
-        assert_eq!(r.wakes.get(&b.key).map(|w| w.token.as_str()), Some("b"));
     }
 
     #[test]

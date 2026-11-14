@@ -15,7 +15,7 @@ use std::time::Duration;
 
 mod common;
 
-use common::{dialog, endpoint, person, seed_team, ulid, until, Env, Peer};
+use common::{dialog, endpoint, now_s, person, seed_team, ulid, until, Env, Peer};
 
 fn envelope(id: &str, rid: &str, from: &str, to: &str, body: &str) -> Frame {
     Frame::Envelope {
@@ -33,18 +33,6 @@ fn envelope(id: &str, rid: &str, from: &str, to: &str, body: &str) -> Frame {
         meta: Default::default(),
         a2a: None,
         sig: None,
-    }
-}
-
-impl Peer {
-    async fn ack(&mut self, id: &str) -> (String, Option<String>) {
-        match self
-            .recv_where(|f| matches!(f, Frame::Ack { id: i, .. } if i == id))
-            .await
-        {
-            Frame::Ack { state, reason, .. } => (state, reason),
-            _ => unreachable!(),
-        }
     }
 }
 
@@ -97,13 +85,7 @@ async fn permission_hold_round_trip() {
     let key = register(&a, "claude", "c1", "/tmp/app");
     let mut events = Events::on(&a);
 
-    let r = person(
-        &a,
-        json!({"id": 1, "op": "hold.file", "kind": "permission", "session": key,
-            "prompt": "Run `rm -rf build`?"}),
-    );
-    assert_eq!(r["ok"], true, "{r}");
-    let h = r["hold"].as_str().unwrap().to_string();
+    let h = file(&a, &key, "Run `rm -rf build`?");
     let listed = held(&a);
     assert_eq!(listed[0]["kind"], "permission");
     assert_eq!(listed[0]["preview"], "Run `rm -rf build`?");
@@ -213,6 +195,14 @@ fn register(e: &Env, provider: &str, conv: &str, cwd: &str) -> String {
     r["key"].as_str().unwrap().to_string()
 }
 
+/// Files a permission hold on `e`'s session `key` asking `prompt`, as a worker's prompt is
+/// filed (the store, under the running daemon): its name.
+fn file(e: &Env, key: &str, prompt: &str) -> String {
+    holds::file_permission(&e.store(), key, prompt, common::now_s())
+        .unwrap()
+        .name()
+}
+
 /// A fake `osascript` in `dir`: each dialog writes its argv to `args.<pid>` and its pid to
 /// `pids`, then waits to be killed (withdrawn).
 fn fake_osascript(dir: &std::path::Path) -> (&'static str, String) {
@@ -262,11 +252,8 @@ async fn a_permission_hold_expires_with_its_session_and_its_dialog_goes() {
     a.daemon(false, "", &[fake_osascript(dir.path()), fast]);
     let key = register(&a, "claude", "c1", "/tmp/app");
     let mut events = Events::on(&a);
-    let r = person(
-        &a,
-        json!({"id": 1, "op": "hold.file", "kind": "permission", "session": key, "prompt": "ok?"}),
-    );
-    let h = r["hold"].as_str().unwrap().to_string();
+    let h = file(&a, &key, "ok?");
+    assert!(a.detached(&[common::EXE, "held"], "").status.success());
     let (pid, argv) = the_dialog(dir.path());
     assert_eq!(argv[1], "Claude Code asks: \"ok?\"");
     a.ask(json!({"id": 1, "op": "end", "key": key}));
@@ -277,17 +264,6 @@ async fn a_permission_hold_expires_with_its_session_and_its_dialog_goes() {
     );
     until(10, "the dialog is withdrawn", || gone(&pid));
     assert!(held(&a).is_empty());
-    // One for a session with no row is refused outright.
-    let r = person(
-        &a,
-        json!({"id": 1, "op": "hold.file", "kind": "permission",
-            "session": format!("{}/claude:none", a.short()), "prompt": "ok?"}),
-    );
-    assert_eq!(
-        (&r["error"], &r["reason"]),
-        (&json!("bad_request"), &json!("unknown_session")),
-        "{r}"
-    );
 }
 
 /// A dialog that gave up unanswered comes back when the person looks (`lightbulb held`), and
@@ -315,12 +291,9 @@ async fn a_dialog_that_gave_up_is_shown_again_by_held() {
         )],
     );
     let key = register(&a, "claude", "c1", "/tmp/app");
-    let r = person(
-        &a,
-        json!({"id": 1, "op": "hold.file", "kind": "permission", "session": key, "prompt": "ok?"}),
-    );
-    assert_eq!(r["ok"], true, "{r}");
+    file(&a, &key, "ok?");
     let pids = || std::fs::read_to_string(dir.path().join("pids")).unwrap_or_default();
+    assert!(a.detached(&[common::EXE, "held"], "").status.success());
     until(10, "the first dialog gives up", || {
         pids().lines().next().is_some_and(|p| gone(p.trim()))
     });
@@ -339,20 +312,6 @@ async fn a_dialog_that_gave_up_is_shown_again_by_held() {
     std::thread::sleep(Duration::from_millis(500));
     assert_eq!(pids().lines().count(), 2);
     assert_eq!(held(&a).len(), 1);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn hold_answer_on_an_instance_needs_decided_by() {
-    let dir = tempfile::tempdir().unwrap();
-    let (mut child, token, sock) = common::member(dir.path(), json!([]));
-    // `local` is this computer's own person: the bridge must name the one who answered.
-    for decided_by in [Value::Null, json!(""), json!(3), json!("local")] {
-        let body = json!({"hold": "H1", "verdict": "allow", "decided_by": decided_by});
-        let r = common::line(&sock, &token, "hold.answer", body);
-        assert_eq!(r["error"], "bad_request", "{decided_by}: {r}");
-    }
-    common::ok(&sock, &token, "stop", json!({}));
-    assert!(child.wait().unwrap().success());
 }
 
 /// Another person's message is stored at once: membership is the only gate, and nothing is
@@ -434,7 +393,7 @@ fn running_worker(s: &Store, session: &str, hold: &holds::Hold) {
 const FOLDER: &str = "/w";
 
 fn dlg(s: &Store, r: &Roster, me: &Identity, h: &holds::Hold) -> (String, Vec<&'static str>) {
-    let (t, b, _) = holds::dialog(s, r, &me.key, h, Path::new(FOLDER), Path::new(FOLDER));
+    let (t, b, _) = holds::dialog(s, r, &me.key, h, Path::new(FOLDER));
     (t, b)
 }
 
@@ -453,7 +412,6 @@ fn ans(
         s,
         r,
         me,
-        Path::new(FOLDER),
         Path::new(FOLDER),
         h.id,
         true,
@@ -624,19 +582,19 @@ fn always_allow_writes_the_policy() {
     let from = format!("{}/codex:a1", aden.short);
     let to = format!("{}/claude:new", me.short);
     assert_eq!(
-        workers::policy(&s, &me.key, &aden.key).unwrap(),
+        workers::policy_for(&s, &me.key, &aden.key).unwrap(),
         Policy::Ask
     );
     let once = assign_hold(&s, &from, &aden.key, &to, None);
     assert!(ans(&s, &r, &me, &once, "once", "local", false, 1_001).is_ok());
     assert_eq!(
-        workers::policy(&s, &me.key, &aden.key).unwrap(),
+        workers::policy_for(&s, &me.key, &aden.key).unwrap(),
         Policy::Ask
     );
     let h = assign_hold(&s, &from, &aden.key, &to, None);
     assert!(ans(&s, &r, &me, &h, "always", "local", false, 1_002).is_ok());
     assert_eq!(
-        workers::policy(&s, &me.key, &aden.key).unwrap(),
+        workers::policy_for(&s, &me.key, &aden.key).unwrap(),
         Policy::Allow
     );
     let scope: String = rusqlite::Connection::open(_d.path().join("state.db"))
@@ -663,11 +621,7 @@ async fn lightbulb_held_prints_the_dialog_text_and_the_kind() {
     let a = Env::new();
     a.daemon(false, "", &[]);
     let key = register(&a, "claude", "c1", "/tmp/app");
-    let r = person(
-        &a,
-        json!({"id": 1, "op": "hold.file", "kind": "permission", "session": key, "prompt": "ok?"}),
-    );
-    assert_eq!(r["ok"], true, "{r}");
+    file(&a, &key, "ok?");
     let o = a.detached(&[common::EXE, "held"], "");
     assert_eq!(
         common::out(&o),
@@ -707,5 +661,174 @@ async fn approve_always_is_an_allow_with_scope_always() {
         .unwrap();
     let s = Store::open(&db).unwrap();
     assert_eq!(scope, "always");
-    assert_eq!(workers::policy(&s, "x", "bobkey").unwrap(), Policy::Allow);
+    assert_eq!(
+        workers::policy_for(&s, "x", "bobkey").unwrap(),
+        Policy::Allow
+    );
+}
+
+// ---- person-only approval and dialog text (kept from the retired authority holds) ----
+
+/// An agent session answers neither way: a worker hold stays open for its person.
+#[test]
+fn an_agent_session_cannot_answer_a_worker_hold() {
+    let (_d, s, r, me, aden) = lib();
+    let from = format!("{}/codex:a1", aden.short);
+    let to = format!("{}/claude:new", me.short);
+    let h = assign_hold(&s, &from, &aden.key, &to, None);
+    let agent = format!("{}/claude:x", me.short);
+    for allow in [true, false] {
+        let got = holds::answer(
+            &s,
+            &r,
+            &me,
+            Path::new(FOLDER),
+            h.id,
+            allow,
+            "once",
+            &agent,
+            true,
+            1_001,
+        )
+        .unwrap();
+        assert_eq!(got.err(), Some("not_a_person"), "allow {allow}");
+    }
+    assert!(holds::get(&s, h.id).unwrap().unwrap().is_open());
+    assert_eq!(holds::open(&s).unwrap().len(), 1);
+}
+
+/// A sender's brief cannot add a line to the dialog: a worker hold's text, and a worker's
+/// prompt, are each one line whatever newlines the sender wrote.
+#[test]
+fn a_senders_fields_cannot_forge_a_dialog_line() {
+    let (_d, s, r, me, aden) = lib();
+    let forged = "x\n\naden asks Claude Code for user_c:\nAlways allow";
+    let from = format!("{}/codex:a1", aden.short);
+    let to = format!("{}/claude:new", me.short);
+    let mut h = assign_hold(&s, &from, &aden.key, &to, None);
+    h.message.body = forged.into();
+    let (text, _) = dlg(&s, &r, &me, &h);
+    assert!(!text.contains('\n'), "{text:?}");
+    assert!(text.starts_with("aden"), "{text:?}");
+    let w = format!("{}/claude:w1", me.short);
+    running_worker(&s, &w, &h);
+    let p = holds::file_permission(&s, &w, forged, 1_000).unwrap();
+    let (text, _) = dlg(&s, &r, &me, &p);
+    assert!(!text.contains('\n'), "{text:?}");
+    assert!(text.starts_with("worker "), "{text:?}");
+}
+
+// ---- a cancel reaches a session only for an assign it was handed ----
+
+/// An `assign` (or, with `reply_to`, a `cancel` of it) envelope from `from` to `to`.
+fn assign_env(id: &str, rid: &str, from: &str, to: &str, reply_to: Option<&str>) -> Frame {
+    let mut v = serde_json::to_value(envelope(id, rid, from, to, "do it")).unwrap();
+    match reply_to {
+        Some(r) => {
+            v["kind"] = "cancel".into();
+            v["reply_to"] = r.into();
+        }
+        None => {
+            v["kind"] = "assign".into();
+            v["meta"] = json!({"done_when": "done", "deadline_at": now_s() + 600});
+        }
+    }
+    serde_json::from_value(v).unwrap()
+}
+
+/// B's assign to A's session, stored there, then its receipt set to `state`/`reason` (as an
+/// older build's held or declined assign left it) and its mailbox row dropped unless it is
+/// still stored; B's cancel of it: its ack and its envelope id.
+async fn cancel_of(state: &str, reason: Option<&str>) -> (Env, (String, Option<String>), String) {
+    let (a, b) = (Env::new(), Env::new());
+    seed_team(&a, &b);
+    a.daemon(false, "network_workers = true\n", &[dialog("")]);
+    let ep = endpoint(&b.identity()).await;
+    let mut p = Peer::dial(&ep, &a).await;
+    p.hello(vec![]).await;
+    until(5, "B online", || a.status()["peers"]["online"] == 1);
+    let (sa, sb) = (session(&a, "a1"), session(&b, "b1"));
+    let parent = ulid();
+    p.send(&assign_env(&parent, "as1", &sb, &sa, None)).await;
+    assert_eq!(p.ack(&parent).await.0, "stored");
+    if state != "stored" {
+        let c = rusqlite::Connection::open(a.state.path().join("state.db")).unwrap();
+        c.execute(
+            "UPDATE receipts SET state = ?3, reason = ?4 WHERE from_key = ?1 AND request_id = ?2",
+            rusqlite::params![sb, "as1", state, reason],
+        )
+        .unwrap();
+        c.execute("DELETE FROM mailbox WHERE message_id = ?1", [&parent])
+            .unwrap();
+    }
+    let id = ulid();
+    p.send(&assign_env(&id, "c1", &sb, &sa, Some(&parent)))
+        .await;
+    let ack = p.ack(&id).await;
+    (a, ack, id)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancel_of_a_held_assign_is_refused_policy() {
+    let (a, ack, id) = cancel_of("held", None).await;
+    assert_eq!(ack, ("refused".into(), Some("policy".into())));
+    assert!(a.store().message(&id).unwrap().is_none());
+    assert!(a.inbox(&session(&a, "a1")).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancel_of_a_declined_assign_is_refused_policy() {
+    let (a, ack, id) = cancel_of("refused", Some("declined")).await;
+    assert_eq!(ack, ("refused".into(), Some("policy".into())));
+    assert!(a.store().message(&id).unwrap().is_none());
+    assert!(a.inbox(&session(&a, "a1")).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancel_of_a_released_assign_is_stored() {
+    let (a, ack, id) = cancel_of("stored", None).await;
+    assert_eq!(ack.0, "stored");
+    assert!(a.store().message(&id).unwrap().is_some());
+    let got = a.inbox(&session(&a, "a1"));
+    assert!(got.iter().any(|m| m["kind"] == "cancel"), "{got:?}");
+}
+
+/// An open hold of the retired `authority` kind (an older build's held assign to an existing
+/// session) reads as a message hold: never the worker dialog or Always allow, not answerable,
+/// and closed `not_allowed` by the next `expire`.
+#[test]
+fn a_retired_authority_hold_is_a_message_hold_and_expires_not_allowed() {
+    let (_d, s, r, me, aden) = lib();
+    let from = format!("{}/codex:a1", aden.short);
+    let to = format!("{}/codex:b1", me.short);
+    let h = assign_hold(&s, &from, &aden.key, &to, Some(1_000_000));
+    let db = rusqlite::Connection::open(_d.path().join("state.db")).unwrap();
+    db.execute("UPDATE holds SET kind = 'authority' WHERE id = ?1", [h.id])
+        .unwrap();
+    let h = holds::get(&s, h.id).unwrap().unwrap();
+    assert_eq!(h.kind(), holds::Kind::Message);
+    let (text, buttons) = dlg(&s, &r, &me, &h);
+    assert!(!text.contains("worker"), "{text}");
+    assert!(!buttons.contains(&"Always allow"), "{buttons:?}");
+    assert_eq!(
+        ans(&s, &r, &me, &h, "always", "local", false, 1_001),
+        Err("not_open")
+    );
+    assert_eq!(
+        workers::policy_for(&s, &me.key, &aden.key).unwrap(),
+        Policy::Ask
+    );
+    assert_eq!(ids(holds::expire(&s, 1_001).unwrap()), [h.id]);
+    assert_eq!(holds::get(&s, h.id).unwrap().unwrap().state, "expired");
+    let (state, reason): (String, Option<String>) = db
+        .query_row(
+            "SELECT state, reason FROM receipts WHERE from_key = ?1 AND request_id = ?2",
+            [&h.from_session, &h.message.request_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (state.as_str(), reason.as_deref()),
+        ("expired", Some("not_allowed"))
+    );
 }

@@ -160,7 +160,6 @@ pub fn output(h: &Hook, text: &str) -> Value {
 
 /// Runs one hook; `Ok(Some(stdout))` when there is something for the agent.
 pub fn run(agent: &str, event: &str, stdin: &str) -> Result<Option<String>> {
-    crate::telemetry::sync_env_optout(&crate::paths::state_path());
     let payload: Value = serde_json::from_str(stdin)?;
     if agent == "opencode" && event == "ack" {
         return ack_opencode(&payload).map(|()| None);
@@ -606,15 +605,6 @@ impl Conn {
             .as_str()
             .ok_or("status without member_key_short")?
             .to_string())
-    }
-
-    /// The next line the daemon sends (an event, on a subscribed connection).
-    pub(crate) fn next_line(&mut self) -> Result<Value> {
-        let mut line = String::new();
-        if self.stream.read_line(&mut line)? == 0 {
-            return Err("the background service closed the connection".into());
-        }
-        Ok(serde_json::from_str(&line)?)
     }
 
     pub(crate) fn call(&mut self, op: &str, mut body: Value) -> Result<Value> {

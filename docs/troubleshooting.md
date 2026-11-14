@@ -53,10 +53,7 @@ The line is named after the agent (`Claude Code`, `Codex`, `Cursor`, `Grok CLI`,
 `not installed` is fine: that agent's folder does not exist.
 
 - `hooks only — tools missing (run setup)`: the hooks are there, but the `lightbulb` tool
-  server entry is not. Fix: `lightbulb setup`. Before v0.3.4 the entry was named `lightbulb`, the
-  name the Lightbulb desktop app also uses, and the app replaced it whenever it relaunched (after a
-  restart, say), so agents lost these tools. From v0.3.4 the two entries sit side by side; if you
-  still see this line, update (`lightbulb update`) and update the app.
+  server entry is not. Fix: `lightbulb setup`.
 - `not connected`: the hooks are not there. Fix: `lightbulb setup`. If setup prints
   `<agent>: not connected — <file>: <error>`, that config file could not be read (for example,
   it is not valid JSON or TOML). Fix the file, then run `setup` again. The backup is beside it as
@@ -76,10 +73,9 @@ If the line reads `~/.local/bin/lightbulb is another program's; put ~/.lightbulb
 your PATH`, a real file (not a link) is there. Setup leaves it alone. Add
 `export PATH="$HOME/.lightbulb/connect/bin:$PATH"` to `~/.zshrc` and open a new terminal.
 
-### `Auto-update` and `Usage counts`
+### `Auto-update`
 
-These lines are never red. They show `on` or `off`. Change them with `lightbulb update --auto on|off`
-and `lightbulb telemetry on|off`.
+This line is never red. It shows `on` or `off`. Change it with `lightbulb update --auto on|off`.
 
 ### `Memory model`
 
@@ -130,7 +126,7 @@ is open, run `lightbulb doctor`.
 
 ### No dialog appears (Linux)
 
-There are no dialogs on Linux. If the Lightbulb app filed a permission prompt, run
+There are no dialogs on Linux. If a permission prompt is held, run
 `lightbulb held`, then `lightbulb approve H1` (or `decline`).
 
 ### Codex asks you to trust a hook

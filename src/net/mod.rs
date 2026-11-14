@@ -52,9 +52,6 @@ const REDIAL: Duration = Duration::from_secs(30);
 /// Entries one connection may hold waiting for their parents.
 const MAX_PENDING: usize = 10_000;
 const JOIN_WAIT: Duration = Duration::from_secs(600);
-/// How long a join keeps dialing after it rang a parked workspace's doorbell: the microVM's
-/// cold start (~55 s) plus the member's own start.
-const WAKE_WAIT: Duration = Duration::from_secs(150);
 const DIAL_WAIT: Duration = Duration::from_secs(30);
 
 const NOT_MEMBER: u32 = 1;
@@ -76,9 +73,6 @@ pub struct Knobs {
     /// How long a join request waits for its person (600 s), or
     /// `LIGHTBULB_CONNECT_DEBUG_JOIN_WAIT_S`.
     pub join_wait: Duration,
-    /// How long a join keeps dialing after ringing a workspace's doorbell (150 s), or
-    /// `LIGHTBULB_CONNECT_DEBUG_WAKE_WAIT_S`.
-    pub wake_wait: Duration,
     /// How long a join keeps dialing while no member has answered (30 s): a computer that has
     /// just started may not reach anyone on its first pass. `LIGHTBULB_CONNECT_DEBUG_DIAL_WAIT_S`.
     pub dial_wait: Duration,
@@ -141,9 +135,6 @@ impl Knobs {
             join_wait: var("LIGHTBULB_CONNECT_DEBUG_JOIN_WAIT_S")
                 .and_then(|v| v.parse().ok())
                 .map_or(JOIN_WAIT, Duration::from_secs),
-            wake_wait: var("LIGHTBULB_CONNECT_DEBUG_WAKE_WAIT_S")
-                .and_then(|v| v.parse().ok())
-                .map_or(WAKE_WAIT, Duration::from_secs),
             dial_wait: var("LIGHTBULB_CONNECT_DEBUG_DIAL_WAIT_S")
                 .and_then(|v| v.parse().ok())
                 .map_or(DIAL_WAIT, Duration::from_secs),
@@ -172,7 +163,6 @@ impl Knobs {
             gate_pause: None,
             dialog: None,
             join_wait: JOIN_WAIT,
-            wake_wait: WAKE_WAIT,
             dial_wait: DIAL_WAIT,
             osascript: OSASCRIPT.into(),
             drop_acks: false,
@@ -276,22 +266,134 @@ pub fn parse_addrs(v: &[String]) -> Option<Vec<SocketAddr>> {
         .collect()
 }
 
-/// A connection's outgoing frames, each with whoever waits to hear it was written.
-pub(crate) type Tx = mpsc::UnboundedSender<(Frame, Option<tokio::sync::oneshot::Sender<()>>)>;
+/// An outgoing frame, with whoever waits to hear it was written.
+type Queued = (Frame, Option<tokio::sync::oneshot::Sender<()>>);
+
+/// Frames one connection may have waiting for its writer.
+// ponytail: counted in frames, not bytes: the ceiling is SEND_QUEUE x MAX_FRAME (1 MiB), 256 MiB
+// per stalled peer, though its frames are mostly presence (~100 KB) and memory pages (≤512 KB),
+// and a full queue closes the connection (memory pages first wait `memsync::PAGE_WAIT` for
+// room). Budget bytes instead if a peer's queued bytes ever matter more than its frame count.
+const SEND_QUEUE: usize = 256;
+
+/// Free slots memory pages leave in a link's send queue, for the frames sent without waiting
+/// (presence, acks, envelopes, receipts, heads): bulk sync queues at most 16 pages (≤8 MB),
+/// enough to keep the writer busy, and never fills the queue the others close on.
+// ponytail: a fixed 16-page bulk depth; budget bytes if pages ever need to queue deeper.
+const HEADROOM: usize = SEND_QUEUE - 16;
+
+/// A connection's outgoing frames. A send finding the queue full refuses the frame and stops
+/// the connection's writer, which closes it: the peer redials and resyncs, instead of a peer
+/// that reads nothing growing our memory without bound.
+#[derive(Clone)]
+pub(crate) struct Tx {
+    q: mpsc::Sender<Queued>,
+    full: Arc<Notify>,
+    /// Per author, the memory the peer is known to hold: its last heads, plus what was queued
+    /// to it (`claim`). One per connection, so it goes when the connection does.
+    held: Arc<Mutex<BTreeMap<String, u64>>>,
+}
+
+impl Tx {
+    fn new() -> (Tx, mpsc::Receiver<Queued>) {
+        let (q, rx) = mpsc::channel(SEND_QUEUE);
+        let full = Arc::new(Notify::new());
+        let held = Arc::default();
+        (Tx { q, full, held }, rx)
+    }
+
+    /// Stops the connection's writer, which closes it. A permit: the writer stops even when it
+    /// is not waiting yet.
+    fn close(&self) {
+        self.full.notify_one();
+    }
+
+    /// Queues `item`; an error once the connection closed, or when its queue is full.
+    pub(crate) fn send(&self, item: Queued) -> std::result::Result<(), ()> {
+        match self.q.try_send(item) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.close();
+                Err(())
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(()),
+        }
+    }
+
+    /// Queues `item` once the queue has more than `HEADROOM` free slots, waiting up to `wait`
+    /// (a bulk sender, whose backlog may outrun a slow but reading link); past `wait` it closes
+    /// the connection, as `send` on a full queue. Blocking threads only: it sleeps the thread.
+    pub(crate) fn send_waiting(&self, item: Queued, wait: Duration) -> std::result::Result<(), ()> {
+        let deadline = std::time::Instant::now() + wait;
+        while self.q.capacity() <= HEADROOM {
+            if self.q.is_closed() {
+                return Err(());
+            }
+            if std::time::Instant::now() >= deadline {
+                self.close();
+                return Err(());
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        self.send(item)
+    }
+
+    /// Where memory pushed here starts, per author: past `theirs` (heads the peer just said)
+    /// and past all known held or queued before. Marks `ours` as held before its pages are
+    /// queued, so a second push (a repeated `MemoryHeads`, the memory loop) never queues them
+    /// again; a page that fails closes the connection, and the mark goes with it.
+    pub(crate) fn claim(
+        &self,
+        theirs: &BTreeMap<String, u64>,
+        ours: &BTreeMap<String, u64>,
+    ) -> BTreeMap<String, u64> {
+        fn raise(held: &mut BTreeMap<String, u64>, heads: &BTreeMap<String, u64>) {
+            for (a, n) in heads {
+                let h = held.entry(a.clone()).or_default();
+                *h = (*h).max(*n);
+            }
+        }
+        let mut held = self.held.lock().unwrap();
+        raise(&mut held, theirs);
+        let from = held.clone();
+        raise(&mut held, ours);
+        from
+    }
+}
+
+/// Writes what `tx` queues to `send` until a write fails or `tx` finds its queue full; `Err`
+/// when it was full.
+async fn write_queued(
+    tx: &Tx,
+    mut rx: mpsc::Receiver<Queued>,
+    send: &mut (impl tokio::io::AsyncWrite + Unpin),
+) -> std::result::Result<(), ()> {
+    let write = async {
+        while let Some((f, done)) = rx.recv().await {
+            if frames::write(send, &f).await.is_err() {
+                return;
+            }
+            if let Some(done) = done {
+                let _ = done.send(());
+            }
+        }
+    };
+    tokio::select! {
+        _ = write => Ok(()),
+        _ = tx.full.notified() => Err(()),
+    }
+}
 
 struct Link {
     conn: Connection,
-    // ponytail: unbounded; only members get a queue, bound it if one shows up growing.
     tx: Tx,
     /// The member key that dialed this connection.
     dialer: String,
     protocol: Protocol,
     /// Its last `hello` said it syncs memory.
     memory: bool,
-    /// The heads last sent here (`MemoryHeads` goes out only when ours differ), and what the
-    /// peer is known to hold: its last heads, plus what we pushed since.
+    /// The heads last sent here (`MemoryHeads` goes out only when ours differ).
     heads_sent: Option<BTreeMap<String, u64>>,
-    peer_heads: BTreeMap<String, u64>,
 }
 
 /// What a link's peer said in its last `hello`.
@@ -486,11 +588,6 @@ impl Peers {
             .map(f)
     }
 
-    /// `member`'s connection (`streams` opens on it).
-    pub fn conn(&self, member: &str) -> Option<Connection> {
-        self.ok_link(member, |l| l.conn.clone())
-    }
-
     /// Queues `f` on `member`'s connection; fails when it has none.
     pub fn send(&self, member: &str, f: Frame) -> Result<()> {
         match self.ok_link(member, |l| l.tx.send((f, None)).is_ok()) {
@@ -524,7 +621,6 @@ impl Peers {
             protocol: Protocol::Unknown,
             memory: false,
             heads_sent: None,
-            peer_heads: BTreeMap::new(),
         };
         live.insert(key.to_string(), link);
         true
@@ -537,18 +633,11 @@ impl Peers {
     }
 
     /// The links that said `hello` in our protocol with `memory`.
-    fn memory_links(&self) -> Vec<(String, Connection, Tx, BTreeMap<String, u64>)> {
+    fn memory_links(&self) -> Vec<(String, Connection, Tx)> {
         let live = self.live.lock().unwrap();
         live.iter()
             .filter(|(_, l)| l.memory && matches!(l.protocol, Protocol::Ok(_)))
-            .map(|(k, l)| {
-                (
-                    k.clone(),
-                    l.conn.clone(),
-                    l.tx.clone(),
-                    l.peer_heads.clone(),
-                )
-            })
+            .map(|(k, l)| (k.clone(), l.conn.clone(), l.tx.clone()))
             .collect()
     }
 
@@ -561,16 +650,6 @@ impl Peers {
                 eprintln!("net: sent memory heads to {}", short(key));
                 let heads = ours.clone();
                 let _ = l.tx.send((Frame::MemoryHeads { heads }, None));
-            }
-        });
-    }
-
-    /// Records that `key`'s peer holds `heads` (and `ours` where we pushed or kept back).
-    fn peer_holds(&self, key: &str, conn: &Connection, heads: &BTreeMap<String, u64>) {
-        self.with_link(key, conn, |l| {
-            for (a, n) in heads {
-                let h = l.peer_heads.entry(a.clone()).or_default();
-                *h = (*h).max(*n);
             }
         });
     }
@@ -636,36 +715,6 @@ struct Inner {
     endpoint: Endpoint,
     daemon: Arc<Daemon>,
     dials: Mutex<HashMap<String, DialState>>,
-    doorbells: Mutex<HashMap<String, Doorbell>>,
-}
-
-/// A member's doorbell on this computer (`ring`): when the next ring may go, and the wait after
-/// the last; back to none once a connection to that member is up.
-#[derive(Default)]
-struct Doorbell {
-    next: Option<std::time::Instant>,
-    wait: Duration,
-}
-
-impl Doorbell {
-    /// Whether a ring may go at `now`; if so, the next waits longer.
-    fn may_ring(&mut self, now: std::time::Instant) -> bool {
-        if self.next.is_some_and(|t| now < t) {
-            return false;
-        }
-        self.wait = doorbell_wait(self.wait);
-        self.next = Some(now + self.wait);
-        true
-    }
-}
-
-/// The wait after a ring that followed a wait of `w`: 30 s, doubling to 15 min.
-fn doorbell_wait(w: Duration) -> Duration {
-    if w.is_zero() {
-        Duration::from_secs(30)
-    } else {
-        (w * 2).min(Duration::from_secs(900))
-    }
 }
 
 impl Net {
@@ -720,7 +769,6 @@ impl Net {
             endpoint,
             daemon,
             dials: Mutex::default(),
-            doorbells: Mutex::default(),
         }));
         tokio::spawn(net.clone().accept_loop());
         tokio::spawn(net.clone().keep_up());
@@ -845,12 +893,9 @@ impl Net {
             }
             let dd = d.clone();
             let _ = tokio::task::spawn_blocking(move || {
-                for (key, conn, tx, theirs) in dd.peers.memory_links() {
+                for (key, conn, tx) in dd.peers.memory_links() {
                     dd.peers.send_heads(&key, &conn, &ours);
-                    match memsync::send_pages(&dd, &tx, &theirs, &key) {
-                        Ok(ours) => dd.peers.peer_holds(&key, &conn, &ours),
-                        Err(e) => eprintln!("net: memory pages: {e}"),
-                    }
+                    memsync::send_pages(&dd, &tx, &BTreeMap::new());
                 }
             })
             .await;
@@ -881,7 +926,7 @@ impl Net {
                 expired_at = Some(std::time::Instant::now());
             }
             match flush(d, all, expire) {
-                Ok(wake) => (wake.iter()).for_each(|(k, id)| ipc::stored(d, k, Some(id))),
+                Ok(wake) => (wake.iter()).for_each(|(k, _)| ipc::stored(d, k)),
                 Err(e) => eprintln!("net: outbox: {e}"),
             }
             if expire {
@@ -924,13 +969,7 @@ impl Net {
                 };
                 push_delta(&l.tx, r, heads, &mut memo, true);
                 let _ = l.tx.send((
-                    hello(
-                        r,
-                        protocol,
-                        addrs.clone(),
-                        own_proof(d),
-                        team.config.memory_sync,
-                    ),
+                    hello(r, protocol, addrs.clone(), team.config.memory_sync),
                     None,
                 ));
                 // After the push the peer holds all of ours: the next change sends only itself.
@@ -966,45 +1005,15 @@ impl Net {
                 if newly_failed {
                     eprintln!("net: dial {}: failed", short(&key));
                 }
-                self.ring(&key);
             }
         }
-    }
-
-    /// After a failed dial of `key` (a parked workspace member): when it published a doorbell
-    /// (`Roster::wakes`, its own), mail to it is due and the backoff allows
-    /// (`doorbell_wait`), one `curl` rings it in the background. A computer only.
-    fn ring(&self, key: &str) {
-        let d = &self.0.daemon;
-        if d.cloud.is_some() {
-            return;
-        }
-        let wake = {
-            let team = d.team.lock().unwrap();
-            let r = &team.roster;
-            match r.wakes.get(key) {
-                Some(w) => w.clone(),
-                None => return,
-            }
-        };
-        let due = d.store.lock().unwrap().outbox_due(&[key.into()], i64::MAX);
-        if !due.is_ok_and(|v| !v.is_empty()) {
-            return;
-        }
-        let now = std::time::Instant::now();
-        let mut bells = self.0.doorbells.lock().unwrap();
-        if !bells.entry(key.into()).or_default().may_ring(now) {
-            return;
-        }
-        drop(bells);
-        tokio::spawn(doorbell(wake, short(key).to_string()));
     }
 
     /// One member connection, from the gate to its close.
     async fn serve(&self, conn: Connection, key: String, outgoing: bool) {
         let d = &self.0.daemon;
         let me = d.identity.key.as_str();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, rx) = Tx::new();
         let dialer = if outgoing { me } else { key.as_str() };
         // The gate and the adoption are one section under `team`: a removal installed between
         // them would find nothing to close, and the ex-member's connection would be adopted.
@@ -1021,13 +1030,7 @@ impl Net {
                     let protocol = d.peers.knobs().protocol;
                     let addrs = d.peers.own_addrs();
                     let _ = tx.send((
-                        hello(
-                            &team.roster,
-                            protocol,
-                            addrs,
-                            own_proof(d),
-                            team.config.memory_sync,
-                        ),
+                        hello(&team.roster, protocol, addrs, team.config.memory_sync),
                         None,
                     ));
                     None
@@ -1055,15 +1058,9 @@ impl Net {
         };
         if let Ok((mut send, mut recv)) = streams {
             eprintln!("net: connected {}", short(&key));
-            self.0.doorbells.lock().unwrap().remove(&key);
             let writer = async {
-                while let Some((f, done)) = rx.recv().await {
-                    if frames::write(&mut send, &f).await.is_err() {
-                        return;
-                    }
-                    if let Some(done) = done {
-                        let _ = done.send(());
-                    }
+                if write_queued(&tx, rx, &mut send).await.is_err() {
+                    eprintln!("net: {}: send queue full: closing", short(&key));
                 }
             };
             let reader = async {
@@ -1076,26 +1073,9 @@ impl Net {
                     }
                 }
             };
-            // Every stream after the control one is a viewer's (`streams`); at most
-            // `streams::ACCEPTS` wait for their opener at once, the rest are reset.
-            let accepts = Arc::new(tokio::sync::Semaphore::new(crate::streams::ACCEPTS));
-            let viewers = async {
-                while let Ok((mut s, r)) = conn.accept_bi().await {
-                    let Ok(permit) = accepts.clone().try_acquire_owned() else {
-                        let _ = s.reset(VarInt::from_u32(crate::streams::BUSY));
-                        continue;
-                    };
-                    let (d, key) = (d.clone(), key.clone());
-                    tokio::spawn(async move {
-                        crate::streams::accept(d, key, s, r).await;
-                        drop(permit);
-                    });
-                }
-            };
             tokio::select! {
                 _ = writer => {}
                 _ = reader => {}
-                _ = viewers => {}
             }
         }
         // The peer took another connection from our key in this one's place: for a workspace's
@@ -1131,30 +1111,19 @@ impl Net {
         };
         let short = peer.short.clone();
         let mut synced = false;
-        // A sync's last page arrived (`more: false`), empty or not.
-        let mut complete = false;
         let mut hello_ok = false;
         let (mut presence, mut envelope, mut answer) = (None, None, None);
-        let mut grant = None;
         let (mut send_memory_heads, mut memory_heads, mut memory_entries) = (false, None, None);
-        if let Err(why) = frames::from_peer_ok(&f, peer, d) {
+        if let Err(why) = frames::from_peer_ok(&f, peer) {
             d.peers.dropped(f.kind());
             eprintln!("net: dropped a {} frame from {short} ({why})", f.kind());
         } else if let Frame::Hello {
             protocol: p,
             heads,
             addrs,
-            proof,
             memory,
         } = f
         {
-            // Its person, as Lightbulb signed it (`proof::admitted` verifies it when it counts).
-            let mut proofs = d.proofs.lock().unwrap();
-            match proof.filter(|t| t.len() <= crate::proof::MAX_TOKEN) {
-                Some(t) => proofs.insert(key.to_string(), t),
-                None => proofs.remove(key),
-            };
-            drop(proofs);
             // A hint: bad ones are dropped, the hello is served.
             let addrs = parse_addrs(&addrs).unwrap_or_default();
             d.peers.learn(&d.dir, key, addrs, &team.roster);
@@ -1181,7 +1150,6 @@ impl Net {
         } else if let Frame::Roster { entries, more } = f {
             sync.page.extend(entries);
             // A sync is applied once, at its last page (or when it alone would overflow).
-            complete = !more;
             if !more || sync.page.len() >= MAX_PENDING {
                 synced = !sync.page.is_empty();
                 sync.pending.append(&mut sync.page);
@@ -1191,7 +1159,7 @@ impl Net {
         } else if matches!(f, Frame::Envelope { .. }) {
             envelope = Some((f, raw));
         } else if matches!(f, Frame::ShareGrant { .. }) {
-            grant = Some(f);
+            // Retired with the desktop app's streams: an old peer's grant is decoded and ignored.
         } else if matches!(f, Frame::Ack { .. }) && d.peers.knobs().drop_acks {
             eprintln!("net: dropped an ack from {short} (debug)");
         } else if let Frame::Ack {
@@ -1231,7 +1199,7 @@ impl Net {
         if let Some(theirs) = memory_heads.filter(|_| {
             d.team.lock().unwrap().config.memory_sync && d.peers.speaks_memory(key, conn)
         }) {
-            let (d, tx, key, conn) = (d.clone(), tx.clone(), key.to_string(), conn.clone());
+            let (d, tx) = (d.clone(), tx.clone());
             tokio::task::spawn_blocking(move || {
                 // What the peer holds of ours numbers our next entry (`memory::saw`).
                 if let Some(&n) = theirs.get(&d.identity.key) {
@@ -1248,13 +1216,7 @@ impl Net {
                     }
                 }
                 // No answer with our own heads: they are sent when they change.
-                match memsync::send_pages(&d, &tx, &theirs, &key) {
-                    Ok(ours) => {
-                        d.peers.peer_holds(&key, &conn, &theirs);
-                        d.peers.peer_holds(&key, &conn, &ours);
-                    }
-                    Err(e) => eprintln!("net: memory pages: {e}"),
-                }
+                memsync::send_pages(&d, &tx, &theirs);
             });
         }
         if let Some(entries) = memory_entries.filter(|_| {
@@ -1269,11 +1231,6 @@ impl Net {
         }
         if let Some((env, raw)) = envelope.filter(|_| d.peers.speaks_ours(key, conn)) {
             receive(d, key, &env, &raw, tx);
-        }
-        if let Some(g) = grant.filter(|_| d.peers.speaks_ours(key, conn)) {
-            if let Err(e) = crate::streams::store(&d.store.lock().unwrap(), &g, ipc::now() as i64) {
-                eprintln!("net: a share_grant from {short}: {e}");
-            }
         }
         if let Some((id, state, reason, limit)) = answer {
             let store = d.store.lock().unwrap();
@@ -1292,7 +1249,7 @@ impl Net {
                             mail::expire_assignments(&store, &d.identity.short, ipc::now());
                         drop(store);
                         match closed {
-                            Ok(woken) => woken.iter().for_each(|(k, m)| ipc::stored(d, k, Some(m))),
+                            Ok(woken) => woken.iter().for_each(|(k, _)| ipc::stored(d, k)),
                             Err(e) => eprintln!("net: close declined: {e}"),
                         }
                     }
@@ -1307,13 +1264,6 @@ impl Net {
             match apply(d, &mut sync.pending, &short) {
                 Ok(heads) => sync.tried = heads,
                 Err(e) => eprintln!("net: applying roster from {short}: {e}"),
-            }
-        }
-        // In sync with this peer: its copy of our card is ours now, so one is written only when
-        // the team holds none or a stale one (`publish_card` compares).
-        if complete && sync.pending.is_empty() {
-            if let Err(e) = crate::embed::publish_card(d) {
-                eprintln!("card: {e}");
             }
         }
         true
@@ -1346,49 +1296,9 @@ fn receive(d: &Arc<Daemon>, key: &str, env: &Frame, raw: &serde_json::Value, tx:
         };
         let _ = tx.send((ack, None));
     };
-    // An instance's sessions are the ones it declared: new mail for any other is refused.
-    let declared = d.cloud.as_ref().map(|c| c.declared());
-    // `members` names people: the computers admitted are those whose proof names one.
-    let admitted = (declared.as_ref().and_then(|c| c.members.as_deref()))
-        .map(|people| crate::proof::admitted(d, people));
-    let (ids, members) = (declared.as_ref().map(|c| &*c.ids), admitted.as_ref());
     let store = d.store.lock().unwrap();
     let me = &d.identity.short;
     let now = ipc::now();
-    // The person the sender's `hello` proof names, when it verifies.
-    let proof = d.proofs.lock().unwrap().get(key).cloned();
-    let person = proof.and_then(|t| crate::proof::verify(&t, key, now as i64).ok());
-    // This computer's own person (`@session-person`), and the rules with their exceptions.
-    let mine = crate::holds::my_person(&d.dir);
-    // Fail closed: rules that cannot be read refuse every message.
-    let (workspace, rules, exceptions) = match (
-        crate::rules::load(&store),
-        crate::rules::exceptions(&store, me),
-    ) {
-        (Ok((w, r)), Ok(e)) => (w, r, e),
-        (r, e) => {
-            let why = r.err().or(e.err()).map(|e| e.to_string());
-            eprintln!(
-                "net: the rules are unreadable ({}): refusing",
-                why.unwrap_or_default()
-            );
-            let mut deny = crate::rules::default_rules();
-            (deny.rules, deny.default) = (vec![], crate::rules::Effect::Deny);
-            (None, deny, vec![])
-        }
-    };
-    let judge = mail::Judge {
-        sender_person: (person.as_ref())
-            .filter(|p| !crate::proof::is_workspace(p))
-            .map(|p| p.sub.as_str()),
-        sender_workspace: (person.as_ref())
-            .filter(|p| crate::proof::is_workspace(p))
-            .map(|p| p.sub.as_str()),
-        my_person: mine.as_deref(),
-        rules: &rules,
-        exceptions: &exceptions,
-        workspace: workspace.as_deref(),
-    };
     match mail::receive(
         &store,
         env,
@@ -1396,27 +1306,19 @@ fn receive(d: &Arc<Daemon>, key: &str, env: &Frame, raw: &serde_json::Value, tx:
         peer,
         &team.roster,
         me,
-        ids,
-        members,
         &team.config,
         now,
-        &judge,
     ) {
         Ok(mail::Answer {
             state,
             reason,
             limit,
-            fresh,
+            fresh: _,
             taken,
             cancelled,
-            held,
         }) => {
             eprintln!("net: envelope {id} from {short}: {}", state.name());
             ack(state, reason, limit);
-            // Shown to the person, as a worker hold is.
-            if let Some(Ok(Some(h))) = held.map(|h| holds::get(&store, h)) {
-                holds::shown(d, &team, &store, &h);
-            }
             // A fresh worker's address has no mailbox: nothing to wake, only a follow-up.
             match (taken, cancelled) {
                 (Some(Taken::Held { hold }), _) => {
@@ -1439,7 +1341,7 @@ fn receive(d: &Arc<Daemon>, key: &str, env: &Frame, raw: &serde_json::Value, tx:
                 }
                 _ if state == State::Stored => {
                     drop((store, team));
-                    ipc::stored(d, &Key(to.clone()), fresh.then_some(id.as_str()));
+                    ipc::stored(d, &Key(to.clone()));
                 }
                 _ => {}
             }
@@ -1458,7 +1360,7 @@ fn receipt_changed(d: &Daemon, id: &str, state: &str, reason: Option<&str>) {
 /// One flush (`Net::flush_loop`): with `all`, every queued envelope of an online member,
 /// whatever its backoff; with `expire`, first what waited too long.
 /// Returns the askers whose assignments just timed out, with each timeout result's id, for the
-/// caller to wake (`ipc::stored` needs the `Arc`; the id wakes a hosted app's bot).
+/// caller to wake (`ipc::stored` needs the `Arc`).
 fn flush(d: &Daemon, all: bool, expire: bool) -> Result<Vec<(Key, String)>> {
     let now = ipc::now();
     let online = d.peers.online();
@@ -1469,10 +1371,6 @@ fn flush(d: &Daemon, all: bool, expire: bool) -> Result<Vec<(Key, String)>> {
         match mail::expire_assignments(&store, &d.identity.short, now) {
             Ok(keys) => wake = keys,
             Err(e) => eprintln!("net: expire assignments: {e}"),
-        }
-        // An instance's delivered-unread mail (`inbox.peek` hands it out until it is read).
-        if d.cloud.is_some() {
-            mail::expire_delivered(&store, &d.identity.short, now)?;
         }
         for id in outbox::expire(&store, now, d.peers.knobs().outbox_s)? {
             receipt_changed(d, &id, State::Expired.name(), Some("unreachable"));
@@ -1496,47 +1394,6 @@ fn flush(d: &Daemon, all: bool, expire: bool) -> Result<Vec<(Key, String)>> {
         }
     }
     Ok(wake)
-}
-
-/// Rings `who`'s doorbell: `curl -q -g --proto =http,https -fsS -m 10 -X POST -K - <url>`, the bearer token handed on
-/// stdin as a config line, never on a command line (`ps`) or in a log; curl's output is not
-/// kept (an error could quote what it read).
-pub(crate) async fn doorbell(w: roster::Wake, who: String) {
-    use tokio::io::AsyncWriteExt;
-    let mut c = tokio::process::Command::new("curl");
-    // `-q` first: no `~/.curlrc` (a `trace` line there could write the header to a file);
-    // `-g`: no URL globbing; http(s) only, no redirects followed.
-    c.args([
-        "-q",
-        "-g",
-        "--proto",
-        "=http,https",
-        "-fsS",
-        "-m",
-        "10",
-        "-X",
-        "POST",
-        "-K",
-        "-",
-    ])
-    .arg(&w.url)
-    .stdin(std::process::Stdio::piped())
-    .stdout(std::process::Stdio::null())
-    .stderr(std::process::Stdio::null())
-    .kill_on_drop(true);
-    let rang = async {
-        let mut child = c.spawn()?;
-        let mut stdin = child.stdin.take().expect("piped");
-        let header = format!("header = \"Authorization: Bearer {}\"\n", w.token);
-        stdin.write_all(header.as_bytes()).await?;
-        drop(stdin);
-        child.wait().await
-    };
-    match rang.await {
-        Ok(s) if s.success() => eprintln!("net: rang {who}'s doorbell"),
-        Ok(s) => eprintln!("net: {who}'s doorbell: curl {s}"),
-        Err(e) => eprintln!("net: {who}'s doorbell: {e}"),
-    }
 }
 
 /// Accepts the waiting entries whose parents are known, in order, until none is left that
@@ -1583,25 +1440,13 @@ fn apply(d: &Daemon, pending: &mut Vec<Entry>, from: &str) -> Result<Vec<String>
     Ok(team.roster.heads.clone())
 }
 
-fn hello(
-    r: &Roster,
-    protocol: u32,
-    addrs: Vec<String>,
-    proof: Option<String>,
-    memory_sync: bool,
-) -> Frame {
+fn hello(r: &Roster, protocol: u32, addrs: Vec<String>, memory_sync: bool) -> Frame {
     Frame::Hello {
         protocol,
         heads: r.heads.clone(),
         addrs,
-        proof,
         memory: memory_sync,
     }
-}
-
-/// This computer's sign-in proof, shown in every `hello` (an instance's is its workspace's).
-fn own_proof(d: &Daemon) -> Option<String> {
-    crate::login::stored_proof(&d.dir)
 }
 
 /// Answers a removed member's `hello` with the roster pages it lacks, the removal among them,
@@ -1877,24 +1722,130 @@ mod local {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn a_doorbells_backoff_is_its_own_members() {
-        let now = std::time::Instant::now();
-        let (mut friday, mut other) = (super::Doorbell::default(), super::Doorbell::default());
-        assert!(friday.may_ring(now));
-        assert!(!friday.may_ring(now), "Friday waits 30 s");
-        assert!(other.may_ring(now), "ringing Friday holds no one else back");
-        assert!(friday.may_ring(now + std::time::Duration::from_secs(30)));
+    use super::*;
+
+    #[tokio::test]
+    async fn a_peer_that_reads_nothing_is_cut_off_at_a_full_queue() {
+        let (tx, rx) = Tx::new();
+        // The peer's end, never read: the writer blocks once 64 bytes are in flight.
+        let (mut ours, _theirs) = tokio::io::duplex(64);
+        let writer = tokio::spawn({
+            let tx = tx.clone();
+            async move { write_queued(&tx, rx, &mut ours).await }
+        });
+        let frame = || {
+            (
+                Frame::MemoryHeads {
+                    heads: BTreeMap::new(),
+                },
+                None,
+            )
+        };
+        let mut queued = 0;
+        while tx.send(frame()).is_ok() {
+            queued += 1;
+            assert!(queued <= SEND_QUEUE + 64, "the queue never filled");
+            tokio::task::yield_now().await;
+        }
+        assert!(queued >= SEND_QUEUE);
+        let stopped = tokio::time::timeout(Duration::from_secs(5), writer).await;
+        assert_eq!(stopped.expect("the writer stopped").unwrap(), Err(()));
+        // Once the writer is gone, sends fail instead of queueing.
+        assert!(tx.send(frame()).is_err());
+    }
+
+    fn page() -> Queued {
+        let f = Frame::Memory {
+            entries: vec![],
+            more: true,
+        };
+        (f, None)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn memory_pages_wait_for_a_slow_reader_past_the_queue() {
+        let (tx, rx) = Tx::new();
+        let (mut ours, mut theirs) = tokio::io::duplex(64);
+        let writer = tokio::spawn({
+            let tx = tx.clone();
+            async move { write_queued(&tx, rx, &mut ours).await }
+        });
+        const PAGES: usize = 3 * SEND_QUEUE;
+        const CONTROL: usize = 50;
+        // A peer that reads, a millisecond per frame: far slower than the pages are made.
+        let reader = tokio::spawn(async move {
+            for _ in 0..PAGES + CONTROL {
+                frames::read_raw(&mut theirs).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        });
+        let sent = tokio::task::spawn_blocking({
+            let tx = tx.clone();
+            move || (0..PAGES).all(|_| tx.send_waiting(page(), memsync::PAGE_WAIT).is_ok())
+        });
+        // Frames sent without waiting (presence, acks) find room while the pages wait.
+        let mut while_paging = 0;
+        for _ in 0..CONTROL {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            while_paging += usize::from(!sent.is_finished());
+            let heads = Frame::MemoryHeads {
+                heads: BTreeMap::new(),
+            };
+            assert!(
+                tx.send((heads, None)).is_ok(),
+                "a control frame was refused"
+            );
+        }
+        assert!(
+            while_paging > CONTROL / 2,
+            "the pages were done: {while_paging}"
+        );
+        assert!(sent.await.unwrap(), "a page was refused");
+        tokio::time::timeout(Duration::from_secs(10), reader)
+            .await
+            .expect("the peer got every page")
+            .unwrap();
+        assert!(!writer.is_finished(), "the link was closed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn memory_pages_to_a_peer_that_reads_nothing_close_it_after_the_wait() {
+        let (tx, rx) = Tx::new();
+        let (mut ours, _theirs) = tokio::io::duplex(64);
+        let writer = tokio::spawn({
+            let tx = tx.clone();
+            async move { write_queued(&tx, rx, &mut ours).await }
+        });
+        let wait = Duration::from_millis(100);
+        let sent = tokio::task::spawn_blocking(move || {
+            (0..2 * SEND_QUEUE)
+                .take_while(|_| tx.send_waiting(page(), wait).is_ok())
+                .count()
+        });
+        let sent = sent.await.unwrap();
+        // The pages stop short of the headroom, plus what the writer took off the queue.
+        assert!(
+            (SEND_QUEUE - HEADROOM..SEND_QUEUE).contains(&sent),
+            "{sent} sent"
+        );
+        let stopped = tokio::time::timeout(Duration::from_secs(5), writer).await;
+        assert_eq!(stopped.expect("the writer stopped").unwrap(), Err(()));
     }
 
     #[test]
-    fn the_doorbell_backs_off_from_30_s_to_15_min() {
-        let mut w = std::time::Duration::ZERO;
-        let mut got = vec![];
-        for _ in 0..7 {
-            w = super::doorbell_wait(w);
-            got.push(w.as_secs());
-        }
-        assert_eq!(got, [30, 60, 120, 240, 480, 900, 900]);
+    fn memory_queued_on_a_link_is_not_claimed_again() {
+        let (tx, _rx) = Tx::new();
+        let heads = |n| BTreeMap::from([("a".to_string(), n)]);
+        // The peer says it holds 3 of our 10: paging starts past 3, and 10 is marked.
+        assert_eq!(tx.claim(&heads(3), &heads(10)), heads(3));
+        // The same heads again (a repeated `MemoryHeads`), or the memory loop's push: nothing
+        // is paged again.
+        assert_eq!(tx.claim(&heads(3), &heads(10)), heads(10));
+        assert_eq!(tx.claim(&BTreeMap::new(), &heads(10)), heads(10));
+        // A new entry: only it.
+        assert_eq!(tx.claim(&BTreeMap::new(), &heads(11)), heads(10));
+        // A new connection knows nothing yet.
+        let (tx, _rx) = Tx::new();
+        assert_eq!(tx.claim(&heads(3), &heads(11)), heads(3));
     }
 }

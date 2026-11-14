@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use lightbulb::daemon::net_ops::Invite;
-use lightbulb::{cli, daemon, hook, mcp, member, paths, setup};
+use lightbulb::{cli, daemon, hook, mcp, paths, setup};
 use std::ffi::OsString;
 use std::io::{Read, Write};
 
@@ -16,7 +16,6 @@ Getting started:
   setup     Connect Claude Code, Codex, Cursor, Grok CLI and OpenCode here and start the background service
   doctor    Check that everything is connected, and say how to fix what is not
   invite    Print the join line that adds your other computer or a teammate
-            (invite --agents: add your Lightbulb workspace's agents, as a workspace admin)
   join      Join the team a join line is for: join '<ticket>'
   update    Install the latest release (or --version vX.Y.Z) and restart the background service
 
@@ -31,23 +30,15 @@ Everyday:
   config    Set a true/false or number setting: config set network_workers true
 
 Workers:
-  workers   Let teammates start Claude Code or Codex workers here: workers on|off, workers show <name>,
+  workers   Let teammates start Claude Code, Codex, Cursor, Grok CLI or OpenCode workers here: workers on|off, workers show <name>,
             workers stop <name>, workers policy, workers clean
 
 Team:
   team      The team and its computers
   remove    Remove a member
   leave     Leave the team
-  login     Sign this computer in to Lightbulb, so your workspace's agents answer it
-  logout    Sign this computer out
   folder    Show or hide the sessions in a folder from your teammates: folder <path> on|off
   relay     The relays used when no direct path exists; relay <url> sets yours
-  telemetry Show or set anonymous usage counts: telemetry on|off|status
-
-Apps you build:
-  app       Build, check, preview, publish and undo apps: app new|start|ask|pull|up|publish|rollback|status|destroy|check|test-link|evidence|report-broken-tool
-
-With the Lightbulb app on this Mac: claude, codex, continue '<link>', share on|off and pair
 
 Run lightbulb <command> --help for its options; lightbulb --version for the version.
 ";
@@ -86,16 +77,6 @@ enum MemoryCommand {
     },
     /// Print the memory block your last session was handed at its start.
     Last,
-    /// Lessons Lightbulb's evaluator suggests from sessions you uploaded in a workspace.
-    Drafts,
-    /// Keep a suggested lesson (`--team`: for the whole workspace).
-    Approve {
-        id: String,
-        #[arg(long)]
-        team: bool,
-    },
-    /// Throw a suggested lesson away.
-    Dismiss { id: String },
     /// Let agents write team memory (`on`) or not (`off`) from this computer.
     Team {
         #[arg(value_parser = ["on", "off"])]
@@ -117,11 +98,6 @@ enum SessionsCommand {
     Turns {
         #[arg(value_parser = ["on", "off"])]
         state: Option<String>,
-    },
-    /// Choose what is sent to Lightbulb: off (the default), metadata or full. No mode: say which.
-    Upload {
-        #[arg(value_parser = ["off", "metadata", "full"])]
-        mode: Option<String>,
     },
 }
 
@@ -191,20 +167,7 @@ enum Command {
         /// An invite for one join, valid 24 hours.
         #[arg(long)]
         once: bool,
-        /// Add your Lightbulb workspace's agents to this network (a workspace admin, signed in
-        /// with `lightbulb login`): confirm in the browser, and the workspace joins.
-        #[arg(long, conflicts_with_all = ["new", "once"])]
-        agents: bool,
     },
-    /// Sign this computer in to Lightbulb (confirm in the browser): your workspace's agents
-    /// answer the computers of its signed-in members. Then joins your workspace's network.
-    Login {
-        /// (The desktop app) Open nothing, ask nothing, join nothing: print `{"user_code"}`.
-        #[arg(long, hide = true)]
-        app: bool,
-    },
-    /// Sign this computer out of Lightbulb: workspaces stop answering it.
-    Logout,
     /// Show the team and its members.
     Team,
     /// Remove a member; the invite is replaced.
@@ -220,9 +183,6 @@ enum Command {
         #[arg(long)]
         name: Option<String>,
     },
-    /// Verified names are not available yet (they come with the issuer's real keys).
-    #[command(hide = true)]
-    Signin,
     /// Install the latest release (or `--version`) over this one, then run its `setup`.
     Update {
         /// The release to install, like v0.2.2 (default: the latest).
@@ -253,11 +213,6 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Anonymous usage counts: `on`, `off`, or (no argument) their state.
-    Telemetry {
-        #[arg(value_parser = ["on", "off", "status"])]
-        state: Option<String>,
-    },
     /// What your agents and your team remember: list, show, forget, share, export.
     Memory {
         #[command(subcommand)]
@@ -285,14 +240,6 @@ enum Command {
         #[arg(long)]
         local: bool,
     },
-    /// Apps you build: new, up, publish, rollback, status, destroy, check, evidence.
-    App {
-        #[command(subcommand)]
-        command: lightbulb::apps::AppCommand,
-        /// Print JSON (the default when stdout is not a terminal).
-        #[arg(long, global = true)]
-        json: bool,
-    },
     #[command(external_subcommand)]
     External(Vec<OsString>),
     /// Run by an agent's hook config: `hook <claude|codex|cursor|grok|opencode> <session-start|user-prompt-submit|post-tool-use|stop|session-end>`.
@@ -300,30 +247,6 @@ enum Command {
     /// Always exits 0; errors go to stderr.
     #[command(hide = true)]
     Hook { agent: String, event: String },
-    /// Run the engine as a cloud workspace's sidecar, driven over `--socket` by the Lightbulb
-    /// bridge; the socket's token is the first line of stdin.
-    #[command(hide = true)]
-    Member {
-        /// The instance's state dir.
-        #[arg(long)]
-        home: std::path::PathBuf,
-        /// Where the final copy of state.db goes at stop (outside --home).
-        #[arg(long)]
-        snapshot: std::path::PathBuf,
-        #[arg(long)]
-        socket: std::path::PathBuf,
-        /// The workspace's display name.
-        #[arg(long)]
-        name: String,
-        #[arg(long)]
-        relay: Option<String>,
-        /// Trusted origin for GooseTown binding proofs, if enabled.
-        #[arg(long)]
-        goosetown_origin: Option<String>,
-        /// The sessions file: {"workspace", "sessions": [{"name", "agent", "title"?}]}.
-        #[arg(long)]
-        sessions: std::path::PathBuf,
-    },
     /// Run the stdio MCP server an agent talks to (find_sessions, send_message, ...).
     #[command(hide = true)]
     Mcp {
@@ -416,10 +339,7 @@ fn run() -> lightbulb::Result<()> {
             json,
         } => exit(cli::receipt(&request_id, from, json)?),
         Command::Doctor => exit(cli::doctor()?),
-        Command::Invite { agents: true, .. } => exit(cli::invite_agents()?),
-        Command::Login { app } => exit(lightbulb::login::login(app)?),
-        Command::Logout => exit(lightbulb::login::logout()?),
-        Command::Invite { new, once, .. } => exit(cli::invite(match (new, once) {
+        Command::Invite { new, once } => exit(cli::invite(match (new, once) {
             (true, _) => Invite::New,
             (_, true) => Invite::Once,
             _ => Invite::Reusable,
@@ -428,7 +348,6 @@ fn run() -> lightbulb::Result<()> {
         Command::Remove { name } => exit(cli::remove(&name)?),
         Command::Leave => exit(cli::leave()?),
         Command::Join { link, name } => exit(cli::join(&link, name)?),
-        Command::Signin => exit(cli::signin()?),
         Command::Update { auto: Some(a), .. } => {
             let dir = lightbulb::paths::state_dir();
             lightbulb::config::Config::set(
@@ -444,10 +363,6 @@ fn run() -> lightbulb::Result<()> {
         Command::Held => exit(cli::held()?),
         Command::Workers { args } => exit(cli::workers(&args)?),
         Command::Config { args } => exit(cli::config(&args)?),
-        Command::Telemetry { state } => exit(lightbulb::telemetry::command(
-            &lightbulb::paths::state_dir(),
-            state.as_deref().filter(|s| *s != "status"),
-        )?),
         Command::Memory { command } => exit(cli::memory(match command {
             MemoryCommand::List { team, me, repo } => cli::Memory::List { team, me, repo },
             MemoryCommand::Show { id } => cli::Memory::Show(id),
@@ -455,9 +370,6 @@ fn run() -> lightbulb::Result<()> {
             MemoryCommand::Share { id } => cli::Memory::Share(id),
             MemoryCommand::Export { json } => cli::Memory::Export(json),
             MemoryCommand::Last => cli::Memory::Last,
-            MemoryCommand::Drafts => cli::Memory::Drafts,
-            MemoryCommand::Approve { id, team } => cli::Memory::Approve(id, team),
-            MemoryCommand::Dismiss { id } => cli::Memory::Dismiss(id),
             MemoryCommand::Team { state } => cli::Memory::Team(state == "on"),
         })?),
         Command::Sessions { command } => exit(cli::sessions(match command {
@@ -466,22 +378,10 @@ fn run() -> lightbulb::Result<()> {
             SessionsCommand::Forget { id } => cli::Sessions::Forget(id),
             SessionsCommand::Export => cli::Sessions::Export,
             SessionsCommand::Turns { state } => cli::Sessions::Turns(state.map(|s| s == "on")),
-            SessionsCommand::Upload { mode } => cli::Sessions::Upload(mode),
         })?),
         Command::Folder { path, state } => exit(cli::folder(&path, state == "on")?),
         Command::Relay { url, clear, local } => {
             exit(cli::relay(clear.then(String::new).or(url), local)?)
-        }
-        Command::App { command, json } => {
-            use std::io::IsTerminal;
-            let json = json || !std::io::stdout().is_terminal();
-            // Every app failure has the `{code, message, next}` shape, even an unexpected one.
-            exit(lightbulb::apps::run(command, json).unwrap_or_else(|e| {
-                lightbulb::apps::fail(json, "failed", &e.to_string(), "try again")
-            }))
-        }
-        Command::External(args) if cli::APP_WORDS.iter().any(|w| args[0] == *w) => {
-            exit(cli::app_command(&args)?)
         }
         Command::External(args) => {
             let verb = args
@@ -495,31 +395,6 @@ fn run() -> lightbulb::Result<()> {
             tools_json: true, ..
         } => print!("{}", mcp::TOOLS),
         Command::Mcp { server_name, .. } => mcp::run(server_name)?,
-        Command::Member {
-            home,
-            snapshot,
-            socket,
-            name,
-            relay,
-            sessions,
-            goosetown_origin,
-        } => {
-            let mut token = String::new();
-            std::io::stdin().read_line(&mut token)?;
-            let token = token.trim_end_matches(['\n', '\r']).to_string();
-            let opts = member::MemberOpts {
-                home,
-                snapshot,
-                socket,
-                name,
-                relay,
-                sessions,
-                goosetown_origin,
-            };
-            let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(member::run(opts, token))?;
-            rt.shutdown_timeout(std::time::Duration::from_secs(1));
-        }
         Command::Setup {
             remove,
             executable,

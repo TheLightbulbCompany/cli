@@ -19,11 +19,10 @@ use crate::daemon::{ipc, Daemon, TeamState};
 use crate::holds::{self, signed_record};
 use crate::identity::Identity;
 use crate::mail::{self, Meta, State};
-use crate::rules::{self, Effect};
 use crate::sessions::{self, Key, PROVIDERS};
 use crate::store::{Message, Store, Worker};
 use crate::{frame, label, Result};
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use std::collections::HashMap;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -40,66 +39,27 @@ pub enum Policy {
     Refuse,
 }
 
-/// `member`'s policy for any worker here (`policy_for` with provider `*`), judged as the
-/// member alone.
-pub fn policy(store: &Store, me: &str, member: &str) -> Result<Policy> {
-    policy_for(store, me, member, "*", None)
-}
-
-/// Who asks for a fresh worker as `mail::receive` judged them: the requester (`person:<sub>`
-/// when the sender's proof verified or an object is bound, else `member:<short>`), whether a
-/// person originated it, and the bound authority object.
-pub struct Asker<'a> {
-    pub requester: &'a str,
-    pub origin_is_person: bool,
-    pub authority: Option<&'a crate::authority::Authority>,
-}
-
-/// `member`'s policy for a `provider` worker on this computer `me`, judged by the rules
-/// (`rules::decide`, resource `worker:<me>/<provider>`, skill `assign`, requester `asker`'s,
-/// else `member:<member>`, the member matching too) with the standing rows as exceptions:
-/// allow is Allow, deny Refuse, hold Ask. This computer's own key may, unless a row of any
-/// kind names it.
-fn policy_for(
-    store: &Store,
-    me: &str,
-    member: &str,
-    provider: &str,
-    asker: Option<&Asker>,
-) -> Result<Policy> {
-    let exceptions = rules::exceptions(store, me)?;
-    let as_member = format!("member:{member}");
-    if member == me && !exceptions.iter().any(|e| e.requester == as_member) {
-        return Ok(Policy::Allow);
-    }
-    // Every asker reaching here is a roster member: its org is the workspace's, unless its
-    // object names another.
-    let (workspace, doc) = rules::load(store)?;
-    let resource = format!("worker:{me}/{provider}");
-    let a = asker.and_then(|k| k.authority);
-    let chain_agents: Vec<String> = a.map_or(vec![], |a| {
-        a.chain.iter().filter_map(|h| h.agent.clone()).collect()
-    });
-    let hash = a.map(|a| crate::authority::operands_hash(&a.operands));
-    let input = rules::Input {
-        org: workspace.as_deref(),
-        requester: asker.map_or(&as_member, |k| k.requester),
-        requester_member: Some(&as_member),
-        requester_org: a.map_or(workspace.as_deref(), |a| Some(&a.requester_org)),
-        chain_agents: &chain_agents,
-        resource: &resource,
-        skill: "assign",
-        session_person: None,
-        operands: a.map(|a| &a.operands),
-        intent: a.map(|a| a.intent.as_str()),
-        verified_by: a.map(|a| a.verified_by.as_str()),
-        operands_hash: hash.as_deref(),
-        origin_is_person: asker.is_some_and(|k| k.origin_is_person),
-    };
-    Ok(match rules::decide(&doc, &exceptions, &input).effect {
-        Effect::Allow => Policy::Allow,
-        Effect::Deny => Policy::Refuse,
-        Effect::Hold => Policy::Ask,
+/// `member`'s policy for starting workers on this computer `me`: its latest standing row
+/// (`set_policy`: `always` Allow, `refused` Refuse, `revoked` Ask), else Allow for this
+/// computer's own key and Ask for any other. A row naming `me` overrides the built-in Allow.
+/// A store error is an error, never an Allow: the caller's transaction rolls back.
+pub fn policy_for(store: &Store, me: &str, member: &str) -> Result<Policy> {
+    let scope: Option<String> = store
+        .conn()
+        .query_row(
+            "SELECT scope FROM approvals WHERE hold_id IS NULL AND resource IS NULL \
+             AND scope IN ('always', 'refused', 'revoked') \
+             AND json_extract(record, '$.member') = ?1 ORDER BY rowid DESC LIMIT 1",
+            [member],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(match scope.as_deref() {
+        Some("always") => Policy::Allow,
+        Some("refused") => Policy::Refuse,
+        Some(_) => Policy::Ask,
+        None if member == me => Policy::Allow,
+        None => Policy::Ask,
     })
 }
 
@@ -164,14 +124,12 @@ pub enum Taken {
 /// short key): refused when this computer does not offer the harness, is running `workers_max`
 /// workers, or refuses the asker; else stored (in no mailbox) and either held for the person
 /// (their policy for the asker is Ask) or ready to start; a deadline past `now +
-/// workers_max_deadline_s` is stored as that. `asker` is who `mail::receive` judged (none: the
-/// asking member alone). The caller holds the store lock and a transaction.
+/// workers_max_deadline_s` is stored as that. The caller holds the store lock and a transaction.
 pub fn take_assign(
     store: &Store,
     config: &Config,
     me: &str,
     assign: &Message,
-    asker: Option<&Asker>,
     now: i64,
 ) -> Result<Taken> {
     let provider = sessions::split_addr(&assign.to_key)
@@ -184,7 +142,7 @@ pub fn take_assign(
         return Ok(Taken::Refused("busy"));
     }
     let member = sessions::member_of(&assign.from_key).unwrap_or_default();
-    let verdict = policy_for(store, me, member, provider, asker)?;
+    let verdict = policy_for(store, me, member)?;
     if verdict == Policy::Refuse {
         return Ok(Taken::Refused("declined"));
     }
@@ -347,7 +305,7 @@ pub fn workspace(base: &Path, id: &str, meta: &Meta) -> Result<(PathBuf, bool)> 
 /// The worker's first prompt: assignment `a` framed as an agent gets it from `label`, its
 /// header line saying how to answer it.
 pub fn first_prompt(label: &str, a: &Message) -> String {
-    frame::framed_kind("assign", label, &a.request_id, None, &a.meta, None, &a.body)
+    frame::framed_kind("assign", label, &a.request_id, None, &a.meta, &a.body)
 }
 
 /// `start`'s half under the store lock, the one place the cap is kept: assignment `a`, not yet
@@ -415,7 +373,7 @@ pub fn start(d: &Arc<Daemon>, assign_id: &str) -> Result<Option<&'static str>> {
         return Ok(Some("no_worker"));
     };
     let label = ipc::sender_label(d, &a); // takes the team lock
-    let conv = crate::telemetry::uuid_v4();
+    let conv = uuid_v4();
     let key = Key::new(&d.identity.short, &provider, &conv);
     let (claimed, base, asker) = {
         let team = d.team.lock().unwrap();
@@ -841,7 +799,22 @@ fn result_for(
     })
 }
 
-/// The person-only ops of `lightbulb workers` (`caller` must be a person, as `hold.file`):
+/// A random (version 4) UUID: a worker's conversation id, as the harnesses expect one.
+fn uuid_v4() -> String {
+    let mut b = rand::random::<[u8; 16]>();
+    (b[6], b[8]) = ((b[6] & 0x0f) | 0x40, (b[8] & 0x3f) | 0x80);
+    let h = data_encoding::HEXLOWER.encode(&b);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &h[..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..]
+    )
+}
+
+/// The person-only ops of `lightbulb workers` (`caller` must be a person):
 /// `workers.list` -> `{workers: [{handle, asker, provider, folder, started_at, ended_at?, state,
 /// assignment, result_status?}]}`; `workers.show {worker}` -> that row (a handle or an assignment
 /// id) with `result`, `conversation`; `workers.stop {worker}`; `workers.off` (stops every running
@@ -980,7 +953,7 @@ pub fn op(
             let rows: Vec<_> = members
                 .iter()
                 .map(|m| {
-                    let p = policy(&store, me, &m.short).unwrap_or(Policy::Ask);
+                    let p = policy_for(&store, me, &m.short).unwrap_or(Policy::Ask);
                     json!({"name": label::name(m), "short": m.short, "self": m.short == *me,
                         "policy": match p { Policy::Allow => "always", Policy::Ask => "ask", Policy::Refuse => "refused" }})
                 })
@@ -1236,17 +1209,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = Store::open(&dir.path().join("state.db")).unwrap();
         let id = Identity::load_or_create(dir.path()).unwrap();
-        assert_eq!(policy(&s, "m", "m").unwrap(), Policy::Allow);
+        assert_eq!(policy_for(&s, "m", "m").unwrap(), Policy::Allow);
         set_policy(&s, &id, "m", "revoked", "me", 1).unwrap();
-        assert_eq!(policy(&s, "m", "m").unwrap(), Policy::Ask);
+        assert_eq!(policy_for(&s, "m", "m").unwrap(), Policy::Ask);
         set_policy(&s, &id, "m", "refused", "me", 2).unwrap();
-        assert_eq!(policy(&s, "m", "m").unwrap(), Policy::Refuse);
+        assert_eq!(policy_for(&s, "m", "m").unwrap(), Policy::Refuse);
         // Another member's row leaves mine alone.
         let t = tempfile::tempdir().unwrap();
         let s = Store::open(&t.path().join("state.db")).unwrap();
         set_policy(&s, &id, "q", "refused", "me", 1).unwrap();
-        assert_eq!(policy(&s, "m", "m").unwrap(), Policy::Allow);
-        assert_eq!(policy(&s, "m", "q").unwrap(), Policy::Refuse);
+        assert_eq!(policy_for(&s, "m", "m").unwrap(), Policy::Allow);
+        assert_eq!(policy_for(&s, "m", "q").unwrap(), Policy::Refuse);
     }
 
     /// A config offering Claude Code workers (the tests' assignments are to `m/claude:new`).
@@ -1670,24 +1643,57 @@ mod tests {
         assert!(s.workers(false).unwrap().is_empty());
     }
 
+    /// Only standing member rows count: a hold's answer (which names this computer as
+    /// `member`) and a retired rules exception (with a `resource`) do not. A store that cannot
+    /// be read is an error, never an Allow.
+    #[test]
+    fn policy_for_reads_standing_rows_only_and_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("state.db")).unwrap();
+        let me = Identity::load_or_create(dir.path()).unwrap();
+        let (mine, bob) = (me.key.as_str(), "bobkey");
+        let rec = |m: &str| serde_json::json!({"member": m}).to_string();
+        store
+            .conn()
+            .execute(
+                "INSERT INTO approvals (hold_id, verdict, scope, \"by\", nonce, decided_at, record) \
+                 VALUES (1, 'decline', 'refused', 'local', 'n1', 1, ?1)",
+                [rec(mine)],
+            )
+            .unwrap();
+        store
+            .conn()
+            .execute(
+                "INSERT INTO approvals (hold_id, verdict, scope, \"by\", nonce, decided_at, record, \
+                 resource) VALUES (NULL, 'allow', 'always', 'local', 'n2', 2, ?1, 'session:x')",
+                [rec(bob)],
+            )
+            .unwrap();
+        assert_eq!(policy_for(&store, mine, mine).unwrap(), Policy::Allow);
+        assert_eq!(policy_for(&store, mine, bob).unwrap(), Policy::Ask);
+        store.conn().execute("DROP TABLE approvals", []).unwrap();
+        assert!(policy_for(&store, mine, mine).is_err());
+        assert!(policy_for(&store, mine, bob).is_err());
+    }
+
     #[test]
     fn policy_defaults_and_latest_record_wins() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("state.db")).unwrap();
         let me = Identity::load_or_create(dir.path()).unwrap();
         let (mine, bob) = (me.key.as_str(), "bobkey");
-        assert_eq!(policy(&store, mine, mine).unwrap(), Policy::Allow);
-        assert_eq!(policy(&store, mine, bob).unwrap(), Policy::Ask);
+        assert_eq!(policy_for(&store, mine, mine).unwrap(), Policy::Allow);
+        assert_eq!(policy_for(&store, mine, bob).unwrap(), Policy::Ask);
         for (scope, want, now) in [
             ("always", Policy::Allow, 1),
             ("refused", Policy::Refuse, 2),
             ("revoked", Policy::Ask, 3),
         ] {
             set_policy(&store, &me, bob, scope, "me", now).unwrap();
-            assert_eq!(policy(&store, mine, bob).unwrap(), want, "{scope}");
+            assert_eq!(policy_for(&store, mine, bob).unwrap(), want, "{scope}");
         }
         // Another member's record does not touch bob's; the signature verifies.
-        assert_eq!(policy(&store, mine, "carol").unwrap(), Policy::Ask);
+        assert_eq!(policy_for(&store, mine, "carol").unwrap(), Policy::Ask);
         let rec: String = store
             .conn()
             .query_row(

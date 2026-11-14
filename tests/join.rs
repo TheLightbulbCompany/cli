@@ -154,7 +154,6 @@ fn an_expired_link_is_refused_by_the_inviters_clock() {
         "open",
         now - 60,
         (String::new(), vec![]),
-        None,
     );
     let link = ticket::link_body(&t, None);
     let entry = roster::Entry::signed(&ia, vec![g.hash()], roster::Kind::Link, link, now - 90);
@@ -208,7 +207,6 @@ fn forged_ticket_from_another_members_link_is_refused() {
         "open",
         xt.expires_at,
         (String::new(), vec![]),
-        None,
     );
     c.daemon(false, "", &[peers(&[&f])]);
     refused(&join(&c, &ticket::encode(&forged), "carol"), "bad_ticket");
@@ -341,11 +339,6 @@ async fn candidate_with_a_bad_signature_is_dropped() {
 fn admitted_candidate_that_lost_the_roster_rejoins() {
     let (a, b, t) = pair("Allow", "reusable");
     assert_eq!(join(&b, &t, "bob")["state"], "admitted");
-    // B's card reaches A after the join returns (it is written once B's roster is in sync).
-    let sb = b.short();
-    until(10, "A holds B's card", || {
-        a.ask(json!({"id": 1, "op": "card", "member": sb}))["ok"] == true
-    });
     let log = roster::entries(&a.store()).unwrap().len();
     // B loses its roster: back to a solo network.
     b.ask(json!({"id": 1, "op": "shutdown"}));

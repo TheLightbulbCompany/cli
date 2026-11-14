@@ -195,7 +195,6 @@ async fn codex_push_frames_an_assignment_as_one() {
             "as1",
             None,
             &meta,
-            None,
             "run the tests",
         );
         expected_argv("t4", &framed)

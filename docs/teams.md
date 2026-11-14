@@ -117,9 +117,3 @@ lightbulb relay --clear
 
 A relay URL must start with `https://`. A team that runs its own relay runs an iroh relay
 server (`iroh-relay`, from the iroh project).
-
-## Verified names
-
-Verified names (a check mark, `✓ sam`, instead of `(not verified)`, and your computers counting
-as one person) are not available yet. `lightbulb signin` is hidden from the help and prints
-`Verified names are not available yet.` Everything else works without them.
