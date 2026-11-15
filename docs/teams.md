@@ -28,7 +28,9 @@ lightbulb invite
 
 It prints a four-word code (`lightbulb join <code>`; it works once, for 10 minutes while your
 computer is on), a `https://thelightbulb.company/j#…` link, and the full join line,
-`lightbulb join '<ticket>'`. Send any of them to the person. The link and the line last as the
+`lightbulb join '<ticket>'`. Send any of them to the person. Its first line,
+`curl -fsSL https://thelightbulb.company/install.sh | sh -s -- join <code>`, also installs
+Lightbulb for someone who does not have it yet. The link and the line last as the
 table below says.
 
 | Command | The invite you get |
