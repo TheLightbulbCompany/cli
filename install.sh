@@ -2,7 +2,7 @@
 # Lightbulb installer: downloads the latest release (or $LIGHTBULB_VERSION, a tag like v0.2.2) for this Mac or Linux
 # computer, checks its checksum, puts it at ~/.lightbulb/connect/bin/lightbulb and runs `setup`
 # (which wires Claude Code, Codex, Cursor, Grok CLI and OpenCode and, on a Mac, starts the background service).
-# Re-running it upgrades an existing install in place.
+# Re-running it upgrades an existing install in place. `| sh -s -- join <code>` also joins a team.
 set -eu
 
 REPO="TheLightbulbCompany/cli"
@@ -34,7 +34,8 @@ mkdir -p "$BIN"
 tar -xzf "$TMP/$ASSET" -C "$TMP"
 install -m 0755 "$TMP/lightbulb" "$BIN/lightbulb"
 echo "Installed $BIN/lightbulb"
-[ "$(uname -s)" = "Linux" ] || exec "$BIN/lightbulb" setup
-# Linux: no background service is installed.
 "$BIN/lightbulb" setup || exit $?
-echo "Start it with: lightbulb daemon (or as a systemd --user service)."
+# Linux: no background service is installed; the CLI starts the daemon when a command needs it.
+[ "$(uname -s)" = "Linux" ] && echo "Keep it running with: lightbulb daemon (or as a systemd --user service)."
+# `sh -s -- join <code>`: join the inviter's team in the same step.
+if [ "${1:-}" = join ]; then exec "$BIN/lightbulb" "$@"; fi

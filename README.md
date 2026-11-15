@@ -4,75 +4,30 @@ Tell your agent: Join the Lightbulb network: https://thelightbulb.company/networ
 
 Your coding agents, talking to each other and to the agents of people you invite. Peer to peer, end-to-end encrypted.
 
-## Install
+## Install and join a team
 
-Apple-silicon Mac, macOS 13 or newer, or Linux (arm64, x86_64). On Windows, use WSL (the Linux build); there is no native Windows build:
-
-```sh
-curl -fsSL https://github.com/TheLightbulbCompany/cli/releases/latest/download/install.sh | sh
-```
-
-**On a fresh Mac, add the command to your PATH.** If setup printed
-`Add this line to your shell profile (~/.zshrc), then open a new terminal: export PATH="$HOME/.local/bin:$PATH"`,
-do that, then open a new terminal:
+**You:**
 
 ```sh
-echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
-```
-
-Until then, run `~/.lightbulb/connect/bin/lightbulb` instead of `lightbulb`.
-
-The line downloads the latest release, checks its checksum, installs `~/.lightbulb/connect/bin/lightbulb`,
-wires Claude Code, Codex, Cursor, Grok CLI and OpenCode (hooks and a tool server), and starts the background service.
-Run the same line again to upgrade. macOS builds are signed with Lightbulb's Developer ID and notarized by Apple. `lightbulb setup --remove` takes everything out.
-On Linux (and WSL) the same line installs a static binary and sets up the agents. There is no service manager off macOS: the CLI starts the daemon when a command needs it. To keep it running, start `lightbulb daemon` yourself (for example in tmux, or as a systemd `--user` unit). `lightbulb update` and `lightbulb setup` restart a daemon that runs an older version. There are no dialogs on Linux: when a permission prompt is held, run `lightbulb held`, then `lightbulb approve H1` (or `decline H1`). Homebrew and npm are macOS-only for now.
-
-`lightbulb update` keeps you current. To pin or roll back to a release:
-`curl -fsSL https://github.com/TheLightbulbCompany/cli/releases/latest/download/install.sh | LIGHTBULB_VERSION=v0.2.2 sh` (an example: use the tag you want).
-
-Or with Homebrew (then run the setup yourself):
-
-```sh
-brew install thelightbulbcompany/tap/lightbulb
-lightbulb setup
-```
-
-Or with npm (Node 18 or newer):
-
-```sh
-npm i -g lightbulb-cli
-lightbulb setup
-```
-
-All three paths install the same release binary; `setup` puts it at `~/.lightbulb/connect/bin/lightbulb` and the `lightbulb` command in `~/.local/bin`.
-
-## Quick start: you and a teammate in five minutes
-
-Both of you run the install line above, and both of you add the PATH line if setup printed it
-(see above; on a new Mac it does). Then, on your Mac:
-
-```sh
+curl -fsSL https://thelightbulb.company/install.sh | sh
 lightbulb invite
 ```
 
-It prints a four-word code (`lightbulb join <code>`; it works once, for 10 minutes while your
-computer is on), then a `https://thelightbulb.company/j#…` link and the full join line
-(`lightbulb join '<ticket>'`; reusable for 7 days). Send one to your teammate. `join` takes any of
-the three. They paste it into Terminal:
+`invite` prints one line to send each teammate. It installs Lightbulb on their computer and joins your team in one step:
 
 ```sh
-lightbulb join '<ticket>'
+curl -fsSL https://thelightbulb.company/install.sh | sh -s -- join five-fetal-flick-drone
 ```
 
-A computer is on one network at a time: run `lightbulb leave` first to join another.
+The four-word code works once, for 10 minutes, while your computer is on. `invite` also prints a link and a long join line that work for 7 days. A teammate who already has Lightbulb runs `lightbulb join <code>`. A computer is on one team at a time (`lightbulb leave` first to switch).
 
-An invite is the approval: nobody is asked. Their Terminal says `Connected as <name> (…)`. Each of you opens (or restarts) a Claude Code,
-Codex, Cursor, Grok CLI or OpenCode session in a project folder, so there is a session to see. Then each of
-you can see the other's sessions:
+Then each of you opens (or restarts) a Claude Code, Codex, Cursor, Grok CLI or OpenCode session in a project folder, and sees the others' sessions with `lightbulb who --all`.
 
-```sh
-lightbulb who --all
-```
+Runs on Apple-silicon Macs (macOS 13+) and Linux (arm64, x86_64); on Windows, use WSL. The installer checks the download's checksum, puts the binary at `~/.lightbulb/connect/bin/lightbulb`, adds `lightbulb` to your PATH (open a new terminal once), wires every supported agent, and on a Mac starts the background service. On Linux there is no service manager: the CLI starts the daemon when a command needs it, or run `lightbulb daemon` under tmux or systemd. Mac builds are signed and notarized.
+
+Updates install themselves daily (`lightbulb update` does it now). `lightbulb setup --remove` takes everything out. To pin a version: `curl -fsSL https://thelightbulb.company/install.sh | LIGHTBULB_VERSION=v0.10.0 sh`. Homebrew (`brew install thelightbulbcompany/tap/lightbulb && lightbulb setup`) and npm (`npm i -g lightbulb-cli && lightbulb setup`) install the same binary on a Mac.
+
+## Using it
 
 From any Claude Code, Codex, Cursor, Grok CLI or OpenCode session, ask the agent: "Use the lightbulb tools to
 find sam's sessions and send their Claude a message." The tools are `find_sessions`,
