@@ -82,7 +82,7 @@ const HEADER: &str =
 /// end; the code and the page link come between, for the same invite (at most 6 lines).
 fn invite_parts(o: &std::process::Output) -> (String, String) {
     let text = out(o);
-    assert!(text.lines().count() <= 6, "{text}");
+    assert!(text.lines().count() <= 7, "{text}");
     let (before, rest) = text.split_once(HEADER).unwrap_or_else(|| panic!("{text}"));
     let lines: Vec<&str> = rest.lines().collect();
     let [line] = lines[..] else { panic!("{text}") };
@@ -99,7 +99,17 @@ fn invite_parts(o: &std::process::Output) -> (String, String) {
     );
     let code = before.pop().unwrap_or_default();
     assert!(
-        code.starts_with("Tell them to run:  ") && code.contains(" join "),
+        code.starts_with("Already have it:  ") && code.contains(" join "),
+        "{text}"
+    );
+    let install = before.pop().unwrap_or_default();
+    let words = code
+        .split_whitespace()
+        .nth(5)
+        .unwrap_or_else(|| panic!("{text}"));
+    assert_eq!(
+        install,
+        format!("New to Lightbulb? This installs it and joins:  curl -fsSL https://thelightbulb.company/install.sh | sh -s -- join {words}"),
         "{text}"
     );
     let notice = before.iter().map(|l| format!("{l}\n")).collect::<String>();

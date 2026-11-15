@@ -867,6 +867,9 @@ fn refuse(r: &Value, texts: &[(&str, String)]) -> Result<i32> {
     Ok(1)
 }
 
+/// The install line; `install.sh` runs the arguments after `sh -s --` once it is set up.
+const INSTALL: &str = "curl -fsSL https://thelightbulb.company/install.sh | sh -s --";
+
 /// `invite [--new|--once|--open]`: this computer's invite line.
 pub fn invite(mode: Invite) -> Result<i32> {
     let r = connect()?.call("team.invite", json!({ "mode": mode }))?;
@@ -886,8 +889,9 @@ pub fn invite(mode: Invite) -> Result<i32> {
     }
     // Code first (the easy way), then the link, then the full line.
     if let Some(code) = r["code"].as_str() {
+        println!("New to Lightbulb? This installs it and joins:  {INSTALL} join {code}");
         println!(
-            "Tell them to run:  {} join {code}   (the code works for {} minutes)",
+            "Already have it:  {} join {code}   (the code works for {} minutes)",
             command(),
             (r["code_secs"].as_i64().unwrap_or(600) + 59) / 60
         );
