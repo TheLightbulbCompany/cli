@@ -17,7 +17,13 @@ It prints a four-word code (works once, for 10 minutes while your computer is on
 Tell your agent: `Join the Lightbulb network: https://thelightbulb.company/network`. On a Mac you
 confirm its `lightbulb join` in a dialog; where no dialog can show (over SSH), run it yourself.
 
-Or in Terminal, with any of the three:
+Not installed yet? One line installs Lightbulb and joins:
+
+```sh
+curl -fsSL https://thelightbulb.company/install.sh | sh -s -- join <four-word code>
+```
+
+Already installed, in Terminal, with any of the three:
 
 ```sh
 lightbulb join <four-word code>

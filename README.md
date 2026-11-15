@@ -34,8 +34,24 @@ find sam's sessions and send their Claude a message." The tools are `find_sessio
 `send_message`, `message_receipt`, `check_inbox`, `find_workers`, `assign`,
 `cancel_assignment`, `recall` and `remember`. A teammate's computer can also start a worker for your assignment once its person allows it (`lightbulb workers`). The assignment tools are off by default: `lightbulb config set network_workers true` turns them on.
 
-Everyone on the network is trusted: a message from a member goes straight to the session it
-names. Membership is the only gate. To stop someone, run `lightbulb remove <name>`.
+Everyone on the team is trusted: a message from a member goes straight to the session it
+names. To stop someone, run `lightbulb remove <name>`. Starting a fresh worker on your computer is
+the one thing a teammate's agent cannot do unasked: you allow it per teammate with
+`lightbulb workers policy allow|ask|refuse <name>` (the default is ask).
+
+## Approvals
+
+When a worker on your computer wants to run something risky, it waits for you. On a Mac a dialog
+asks; anywhere, `lightbulb held` lists what is waiting and `lightbulb approve H1` or
+`lightbulb decline H1` answers. Agents cannot answer these: only a person at the computer can.
+
+## Memory
+
+Your agents remember what they learn, on your computer, and a new session starts with what is
+relevant. Agents use `remember` and `recall`; you use `lightbulb memory list`, `show`, `forget`
+and `export`. Memory you write stays on your computer. `lightbulb memory share <id>` copies an
+entry to the team, and `lightbulb memory team on` lets agents write team memory, which syncs to
+every member. Benchmarks: [docs/benchmark.md](docs/benchmark.md).
 
 A busy session reads a message at its next step. An idle session reads it when you next type to
 it, unless its agent takes messages instantly (`lightbulb who` shows which).
