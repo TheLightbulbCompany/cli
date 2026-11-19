@@ -642,14 +642,22 @@ fn spawn_daemon(exe: &Path, dir: &Path) -> Result<Child> {
         .create(true)
         .append(true)
         .open(dir.join("daemon.log"))?;
-    Ok(Command::new(exe)
-        .arg("daemon")
+    let mut cmd = Command::new(exe);
+    cmd.arg("daemon")
         .env(paths::HOME_ENV, dir)
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
-        .stderr(log)
-        .process_group(0) // detached from the caller's terminal signals
-        .spawn()?)
+        .stderr(log);
+    // Its own session, not only its own group: an agent's sandbox that ends a command by
+    // killing that command's session (a VM's shell tool) leaves the daemon running.
+    // SAFETY: setsid is async-signal-safe and touches no memory.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    Ok(cmd.spawn()?)
 }
 
 /// A bare connect can land in the backlog of a daemon that is shutting down,

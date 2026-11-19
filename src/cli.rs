@@ -426,8 +426,15 @@ pub fn send(
         let agent = crate::frame::agent_name(provider.map_or("", |(p, _)| p));
         println!("Sent as this {agent} session.");
         own
+    } else if let Some(f) = from {
+        f
+    } else if crate::daemon::net_ops::person_only(std::process::id()) {
+        format!("{short}/terminal")
     } else {
-        from.unwrap_or_else(|| format!("{short}/terminal"))
+        // An agent the daemon cannot trace to a session (a sandboxed VM's) may not speak as
+        // the terminal: it speaks as the `agent` name, which it reads with `listen --as agent`.
+        println!("Sent as {short}/agent. Replies: {} listen --as agent", command());
+        format!("{short}/agent")
     };
     let rid = request_id.unwrap_or_else(|| ulid::Ulid::generate().to_string());
     // (address, its handle, request id)
