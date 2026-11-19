@@ -31,7 +31,7 @@ if command -v shasum >/dev/null; then SUM="shasum -a 256"; else SUM="sha256sum";
 
 BIN="$HOME/.lightbulb/connect/bin"
 mkdir -p "$BIN"
-tar -xzf "$TMP/$ASSET" -C "$TMP"
+tar --no-same-owner -xzf "$TMP/$ASSET" -C "$TMP"
 install -m 0755 "$TMP/lightbulb" "$BIN/lightbulb"
 echo "Installed $BIN/lightbulb"
 "$BIN/lightbulb" setup || exit $?
