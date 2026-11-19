@@ -330,12 +330,10 @@ pub async fn op(id: u64, op: &str, body: &Value, daemon: &Arc<Daemon>, caller: C
                 Err(_) => Response::err(id, INTERNAL),
             }
         }
-        // An agent fed a hostile link must not move this computer into another network: its
-        // person confirms (`admission::join`), and an unresolved caller is refused. The threat is
-        // a hosted page driving the desktop app, which exists only on macOS.
-        "team.join" if caller.actor(&daemon.store.lock().unwrap()).is_none() => {
-            refused(id, "not_a_person")
-        }
+        // An agent fed a hostile link must not move this computer into another network: on
+        // macOS its person confirms (`admission::join`). A caller that cannot be traced (a
+        // sandboxed agent) counts as an agent. The threat is a hosted page driving the desktop
+        // app, which exists only on macOS; elsewhere the signed invite is the approval.
         "team.join" => {
             let agent = cfg!(target_os = "macos") && !caller.is_person();
             crate::admission::join(id, body, daemon, agent).await

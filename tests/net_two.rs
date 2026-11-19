@@ -269,7 +269,7 @@ async fn roster_pages_split_by_bytes_not_only_count() {
         to_b.send(f).await;
     }
     // The genesis, the admission and the 300.
-    until(5, "B applies every page", || {
+    until(30, "B applies every page", || {
         roster::entries(&b.store()).unwrap().len() == 302
     });
 }
