@@ -1648,7 +1648,9 @@ fn install_release(home: &Path, base: &str, tag: &str) -> Result<bool> {
             return Ok(false);
         }
         fs::write(dir.join(ASSET), &tarball)?;
+        // `--no-same-owner`: as root in a VM's user namespace, keeping the archive's owner fails.
         let ok = Command::new("tar")
+            .arg("--no-same-owner")
             .arg("-xzf")
             .arg(dir.join(ASSET))
             .arg("-C")

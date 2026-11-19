@@ -120,6 +120,7 @@ pub async fn offer(d: &Daemon, body: &mut Value) {
         return;
     };
     let urls = d.peers.relays.lock().unwrap().urls.clone();
+    let urls_empty = urls.is_empty();
     let mut b = Endpoint::builder(presets::Minimal)
         // A VM whose only way out is an HTTP proxy (UDP blocked) still reaches the relay.
         .proxy_from_env()
@@ -128,7 +129,7 @@ pub async fn offer(d: &Daemon, body: &mut Value) {
         .relay_mode(RelayMode::Custom(
             urls.into_iter().map(net::relay_config).collect(),
         ));
-    if d.peers.knobs().relay_only {
+    if d.peers.knobs().relay_only || (net::proxied() && !urls_empty) {
         b = b.clear_ip_transports();
     }
     let Ok(ep) = b.bind().await else {

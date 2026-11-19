@@ -739,6 +739,7 @@ impl Net {
         // Always a relay transport (an empty map is direct only), so a relay set later can be
         // added at runtime.
         let urls = daemon.peers.relays.lock().unwrap().urls.clone();
+        let relay_only = daemon.peers.knobs().relay_only || (proxied() && !urls.is_empty());
         let map = urls.into_iter().map(relay_config);
         let mut b = Endpoint::builder(presets::Minimal)
             // A VM whose only way out is an HTTP proxy (UDP blocked) still reaches the relay.
@@ -746,7 +747,7 @@ impl Net {
             .secret_key(secret)
             .alpns(vec![ALPN.to_vec(), JOIN_ALPN.to_vec()])
             .relay_mode(RelayMode::Custom(map.collect()));
-        if daemon.peers.knobs().relay_only {
+        if relay_only {
             b = b.clear_ip_transports();
         }
         if lan {
@@ -1720,6 +1721,16 @@ mod local {
         crate::os::process(pid).ok()?;
         addr.parse().ok()
     }
+}
+
+/// Whether this computer reaches the internet through an HTTP(S) proxy (the variables iroh's
+/// `proxy_from_env` reads). Such a network (a hosted agent's VM) intercepts UDP, so a direct
+/// path there only breaks a connection the relay was carrying: use the relays alone, when
+/// there are any.
+pub(crate) fn proxied() -> bool {
+    ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"]
+        .iter()
+        .any(|k| std::env::var(k).is_ok_and(|v| !v.trim().is_empty()))
 }
 
 #[cfg(test)]
