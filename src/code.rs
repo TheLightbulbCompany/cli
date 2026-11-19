@@ -121,6 +121,8 @@ pub async fn offer(d: &Daemon, body: &mut Value) {
     };
     let urls = d.peers.relays.lock().unwrap().urls.clone();
     let mut b = Endpoint::builder(presets::Minimal)
+        // A VM whose only way out is an HTTP proxy (UDP blocked) still reaches the relay.
+        .proxy_from_env()
         .secret_key(key)
         .alpns(vec![ALPN.to_vec()])
         .relay_mode(RelayMode::Custom(

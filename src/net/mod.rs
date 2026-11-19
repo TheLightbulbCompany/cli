@@ -741,6 +741,8 @@ impl Net {
         let urls = daemon.peers.relays.lock().unwrap().urls.clone();
         let map = urls.into_iter().map(relay_config);
         let mut b = Endpoint::builder(presets::Minimal)
+            // A VM whose only way out is an HTTP proxy (UDP blocked) still reaches the relay.
+            .proxy_from_env()
             .secret_key(secret)
             .alpns(vec![ALPN.to_vec(), JOIN_ALPN.to_vec()])
             .relay_mode(RelayMode::Custom(map.collect()));
