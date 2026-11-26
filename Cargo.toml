@@ -44,5 +44,5 @@ security-framework = "3"
 
 [dev-dependencies]
 # A test relay server (`tests/relay.rs`).
-iroh-relay = { version = "=1.4.1", features = ["server"] }
+iroh-relay = { version = "=1.4.2", features = ["server"] }
 tempfile = "3"
