@@ -1753,12 +1753,7 @@ mod tests {
             presence: Default::default(),
             built: Mutex::default(),
             latest: Mutex::default(),
-            streams: Default::default(),
             workers: Default::default(),
-            cloud: None,
-            proofs: Mutex::default(),
-            link: Mutex::default(),
-            home_lock: None,
             listing: Default::default(),
         });
         let argv: Vec<String> = ["/bin/sleep", "30"].map(String::from).into();

@@ -433,7 +433,10 @@ pub fn send(
     } else {
         // An agent the daemon cannot trace to a session (a sandboxed VM's) may not speak as
         // the terminal: it speaks as the `agent` name, which it reads with `listen --as agent`.
-        println!("Sent as {short}/agent. Replies: {} listen --as agent", command());
+        println!(
+            "Sent as {short}/agent. Replies: {} listen --as agent",
+            command()
+        );
         format!("{short}/agent")
     };
     let rid = request_id.unwrap_or_else(|| ulid::Ulid::generate().to_string());
